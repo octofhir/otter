@@ -953,14 +953,14 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     };
     let recv_clone = recv.clone();
     let has_indices = re.flags(&*args.gc_heap).has_indices;
-    let heap = &mut *args.gc_heap;
     let arr = crate::regexp_prototype::build_match_result(
         &m,
         &recv_units,
         &recv_clone,
         has_indices,
-        args.string_heap,
-        heap,
+        args,
+        &[],
+        &[],
     )?;
     Ok(Value::Array(arr))
 }
@@ -998,14 +998,14 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     let recv_clone = recv.clone();
     let mut out: Vec<Value> = Vec::with_capacity(matches.len());
     for m in &matches {
-        let heap = &mut *args.gc_heap;
         let arr = crate::regexp_prototype::build_match_result(
             m,
             &recv_units,
             &recv_clone,
             has_indices,
-            args.string_heap,
-            heap,
+            args,
+            &[],
+            &[out.as_slice()],
         )?;
         out.push(Value::Array(arr));
     }

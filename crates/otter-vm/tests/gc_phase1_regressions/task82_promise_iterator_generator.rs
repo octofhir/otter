@@ -183,8 +183,12 @@ fn generator_and_parked_frame_roots_register_values() {
     let parked =
         otter_vm::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame).expect("park");
     let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
-    let capability =
-        otter_vm::promise_dispatch::make_capability(interp.gc_heap_mut()).expect("capability");
+    let capability = otter_vm::PromiseCapability {
+        promise: Value::Undefined,
+        resolve: Value::Undefined,
+        reject: Value::Undefined,
+        context: None,
+    };
     promise.perform_async_resume_then(interp.gc_heap_mut(), parked, 0, capability, None);
     otter_vm::object::set(
         global,

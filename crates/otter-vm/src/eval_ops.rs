@@ -18,6 +18,7 @@
 //! - [`crate::ExecutionContext`]
 
 use otter_bytecode::{BytecodeModule, Operand};
+use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
@@ -56,7 +57,13 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let top_idx = stack.len() - 1;
         let args = collect_new_function_args(&stack[top_idx], operands)?;
-        let result = self.build_function_constructor(context, &args)?;
+        let result = self.build_function_constructor_with_roots(
+            context,
+            &args,
+            Some(stack),
+            &[],
+            &[args.as_slice()],
+        )?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
         frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -131,10 +138,13 @@ impl Interpreter {
     /// running module, so wrapping in a native rather than
     /// returning the inner closure handle directly keeps the call
     /// surface correct.
-    pub(crate) fn build_function_constructor(
+    pub(crate) fn build_function_constructor_with_roots(
         &mut self,
         context: &ExecutionContext,
         args: &[Value],
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         // Coerce every argument to a string per §20.2.1.1 step 1.
         let mut parts: Vec<String> = Vec::with_capacity(args.len());
@@ -167,13 +177,22 @@ impl Interpreter {
             &mut self.gc_heap,
         )?);
         let value = self.dispatch_loop(&context, &mut stack)?;
-        self.wrap_eval_function_value(context, value)
+        self.wrap_eval_function_value_with_roots(
+            context,
+            value,
+            stack_roots,
+            value_roots,
+            slice_roots,
+        )
     }
 
-    fn wrap_eval_function_value(
+    fn wrap_eval_function_value_with_roots(
         &mut self,
         function_context: ExecutionContext,
         value: Value,
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
         if !matches!(value, Value::Function { .. } | Value::Closure { .. }) {
             return Ok(value);
@@ -191,16 +210,58 @@ impl Interpreter {
             function_metadata::callable_intrinsic_property(&metadata_ctx, &value, "length")?;
         let prototype_value = match &value {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                self.function_property_get(&function_context, *function_id, "prototype")?
+                let mut roots = Vec::with_capacity(value_roots.len() + 1);
+                roots.push(&value);
+                roots.extend_from_slice(value_roots);
+                match stack_roots {
+                    Some(stack) => self.function_property_get_stack_rooted(
+                        &function_context,
+                        stack,
+                        *function_id,
+                        "prototype",
+                    )?,
+                    None => self.function_property_get_runtime_rooted(
+                        &function_context,
+                        *function_id,
+                        "prototype",
+                        &roots,
+                        slice_roots,
+                    )?,
+                }
             }
             _ => Value::Undefined,
         };
         let target_capture = value.clone();
         let callback_context = function_context.clone();
-        let wrapper = native_function::native_constructor_value_with_captures_unchecked(
+        let stack_slots = stack_roots
+            .map(|stack| self.collect_allocation_roots(stack))
+            .unwrap_or_default();
+        let native_value_root = value.clone();
+        let name_root = name_value.clone();
+        let length_root = length_value.clone();
+        let prototype_root = prototype_value.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &stack_slots {
+                visitor(slot);
+            }
+            native_value_root.trace_value_slots(visitor);
+            name_root.trace_value_slots(visitor);
+            length_root.trace_value_slots(visitor);
+            prototype_root.trace_value_slots(visitor);
+            for root in value_roots {
+                root.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        let wrapper = native_function::native_constructor_value_with_captures_unchecked_with_roots(
             &mut self.gc_heap,
             "anonymous",
             smallvec::smallvec![target_capture],
+            &mut external_visit,
             move |ctx: &mut NativeCtx<'_>, call_args: &[Value], captures: &[Value]| {
                 let Some(target) = captures.first().cloned() else {
                     return Err(crate::native_function::NativeError::TypeError {
@@ -215,14 +276,20 @@ impl Interpreter {
                 let result = if is_construct_call {
                     interp.run_construct_sync(&callback_context, &target, target.clone(), args)
                 } else {
-                    interp.run_callable_sync(&callback_context, &target, this_value, args)
+                    interp.run_callable_sync(&callback_context, &target, this_value.clone(), args)
                 }
                 .map_err(|err| crate::native_function::NativeError::TypeError {
                     name: "anonymous",
                     reason: format!("{err}"),
                 })?;
                 interp
-                    .wrap_eval_function_value(callback_context.clone(), result)
+                    .wrap_eval_function_value_with_roots(
+                        callback_context.clone(),
+                        result,
+                        None,
+                        &[&target, &this_value],
+                        &[call_args],
+                    )
                     .map_err(|err| crate::native_function::NativeError::TypeError {
                         name: "anonymous",
                         reason: format!("{err}"),

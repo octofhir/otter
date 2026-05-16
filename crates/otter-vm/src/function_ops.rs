@@ -264,12 +264,27 @@ impl Interpreter {
             &target_length,
             bound_args.len(),
         );
-        let bound = BoundFunction::new_with_metadata(
+        let target_root = target.clone();
+        let bound_this_root = bound_this.clone();
+        let bound_args_root = bound_args.clone();
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            target_root.trace_value_slots(visitor);
+            bound_this_root.trace_value_slots(visitor);
+            for arg in &bound_args_root {
+                arg.trace_value_slots(visitor);
+            }
+        };
+        let bound = BoundFunction::new_with_metadata_and_roots(
             &mut self.gc_heap,
             target,
             bound_this,
             bound_args,
             metadata,
+            &mut external_visit,
         )?;
         let top_idx = stack.len() - 1;
         stack[top_idx].pending_bind_function = None;
@@ -326,12 +341,27 @@ impl Interpreter {
                 );
                 let metadata =
                     function_metadata::bound_create_metadata(&ctx, &this_value, bound_args.len())?;
-                let bound = BoundFunction::new_with_metadata(
+                let this_root = this_value.clone();
+                let receiver_root = receiver.clone();
+                let bound_args_root = bound_args.clone();
+                let roots = self.collect_runtime_roots();
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    this_root.trace_value_slots(visitor);
+                    receiver_root.trace_value_slots(visitor);
+                    for arg in &bound_args_root {
+                        arg.trace_value_slots(visitor);
+                    }
+                };
+                let bound = BoundFunction::new_with_metadata_and_roots(
                     &mut self.gc_heap,
                     this_value,
                     receiver,
                     bound_args,
                     metadata,
+                    &mut external_visit,
                 )?;
                 Ok(Value::BoundFunction(bound))
             }
@@ -413,6 +443,55 @@ impl Interpreter {
         self.value_has_proxy_aware_prototype(context, o.clone(), &prototype)
     }
 
+    pub(crate) fn ordinary_has_instance_stack_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        c: &Value,
+        o: &Value,
+    ) -> Result<bool, VmError> {
+        if !self.is_callable_runtime(c) {
+            return Ok(false);
+        }
+        if let Value::BoundFunction(bound) = c {
+            let (target, _, _) = bound.parts(&self.gc_heap);
+            return self.instanceof_operator_stack_rooted(context, stack, o, &target);
+        }
+        if !matches!(
+            o,
+            Value::Object(_)
+                | Value::Proxy(_)
+                | Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+        ) {
+            return Ok(false);
+        }
+        let Some(prototype) = self.instanceof_target_prototype_stack_rooted(context, stack, c)?
+        else {
+            return Ok(false);
+        };
+        if !matches!(prototype, Value::Object(_) | Value::Proxy(_)) {
+            return Err(VmError::TypeError {
+                message: "Function has non-object prototype 'undefined' in instanceof check"
+                    .to_string(),
+            });
+        }
+        self.value_has_proxy_aware_prototype(context, o.clone(), &prototype)
+    }
+
     /// ECMA-262 §13.10.2 `InstanceofOperator(V, target)`.
     ///
     /// # See also
@@ -471,6 +550,63 @@ impl Interpreter {
             });
         }
         self.ordinary_has_instance(context, target, v)
+    }
+
+    pub(crate) fn instanceof_operator_stack_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        v: &Value,
+        target: &Value,
+    ) -> Result<bool, VmError> {
+        if !matches!(
+            target,
+            Value::Object(_)
+                | Value::Proxy(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+        ) {
+            return Err(VmError::TypeError {
+                message: "Right-hand side of instanceof is not an object".to_string(),
+            });
+        }
+        let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
+        let key = VmPropertyKey::Symbol(has_instance_sym);
+        let handler =
+            match self.ordinary_get_value(context, target.clone(), target.clone(), &key, 0)? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, target.clone(), SmallVec::new())?
+                }
+            };
+        if !matches!(handler, Value::Undefined | Value::Null) {
+            if !self.is_callable_runtime(&handler) {
+                return Err(VmError::TypeError {
+                    message: "@@hasInstance must be callable".to_string(),
+                });
+            }
+            if let Value::NativeFunction(native) = &handler
+                && native.is_vm_intrinsic(
+                    &self.gc_heap,
+                    VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
+                )
+            {
+                return self.ordinary_has_instance_stack_rooted(context, stack, target, v);
+            }
+            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+            args.push(v.clone());
+            let result = self.run_callable_sync(context, &handler, target.clone(), args)?;
+            return Ok(result.to_boolean());
+        }
+        if !self.is_callable_runtime(target) {
+            return Err(VmError::TypeError {
+                message: "Right-hand side of instanceof is not callable".to_string(),
+            });
+        }
+        self.ordinary_has_instance_stack_rooted(context, stack, target, v)
     }
 
     pub(crate) fn create_list_from_array_like(
@@ -590,6 +726,38 @@ impl Interpreter {
         }
     }
 
+    pub(crate) fn function_user_bag_stack_rooted(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        function_id: u32,
+        value_roots: &[&Value],
+    ) -> Result<JsObject, VmError> {
+        match self.function_user_props.get(&function_id).copied() {
+            Some(bag) => Ok(bag),
+            None => {
+                let bag = self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots)?;
+                self.function_user_props.insert(function_id, bag);
+                Ok(bag)
+            }
+        }
+    }
+
+    pub(crate) fn function_user_bag_runtime_rooted(
+        &mut self,
+        function_id: u32,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<JsObject, VmError> {
+        match self.function_user_props.get(&function_id).copied() {
+            Some(bag) => Ok(bag),
+            None => {
+                let bag = self.alloc_runtime_rooted_object_with_roots(value_roots, slice_roots)?;
+                self.function_user_props.insert(function_id, bag);
+                Ok(bag)
+            }
+        }
+    }
+
     pub(crate) fn ordinary_function_own_property_descriptor(
         &self,
         context: Option<&ExecutionContext>,
@@ -635,6 +803,27 @@ impl Interpreter {
         desc_obj: Option<JsObject>,
         descriptor: object::PropertyDescriptor,
     ) -> Result<bool, VmError> {
+        self.ordinary_function_define_own_property_with_roots(
+            context,
+            function_id,
+            key,
+            desc_obj,
+            descriptor,
+            None,
+            &[],
+        )
+    }
+
+    fn ordinary_function_define_own_property_with_roots(
+        &mut self,
+        context: Option<&ExecutionContext>,
+        function_id: u32,
+        key: &str,
+        desc_obj: Option<JsObject>,
+        descriptor: object::PropertyDescriptor,
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        value_roots: &[&Value],
+    ) -> Result<bool, VmError> {
         let descriptor =
             match self.ordinary_function_own_property_descriptor(context, function_id, key)? {
                 Some(existing) => {
@@ -659,7 +848,27 @@ impl Interpreter {
                 }
                 None => descriptor,
             };
-        let bag = self.function_user_bag(function_id)?;
+        let mut roots = Vec::with_capacity(value_roots.len() + 3);
+        roots.extend_from_slice(value_roots);
+        let desc_obj_root = desc_obj.map(Value::Object);
+        if let Some(value) = &desc_obj_root {
+            roots.push(value);
+        }
+        match &descriptor.kind {
+            object::DescriptorKind::Data { value } => roots.push(value),
+            object::DescriptorKind::Accessor { getter, setter } => {
+                if let Some(getter) = getter {
+                    roots.push(getter);
+                }
+                if let Some(setter) = setter {
+                    roots.push(setter);
+                }
+            }
+        }
+        let bag = match stack_roots {
+            Some(stack) => self.function_user_bag_stack_rooted(stack, function_id, &roots)?,
+            None => self.function_user_bag(function_id)?,
+        };
         let ok = crate::object::define_own_property(bag, &mut self.gc_heap, key, descriptor);
         if ok && let Some(metadata_key) = function_metadata::ordinary_function_metadata_key(key) {
             self.function_deleted_metadata
@@ -699,6 +908,7 @@ impl Interpreter {
     pub(crate) fn try_function_object_static_call(
         &mut self,
         context: Option<&ExecutionContext>,
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -749,9 +959,11 @@ impl Interpreter {
                             values.push(key);
                         }
                     }
-                    return Ok(Some(Value::Array(array::from_elements(
-                        &mut self.gc_heap,
+                    return Ok(Some(Value::Array(self.function_static_array_from_values(
+                        stack_roots,
                         values,
+                        &[&target],
+                        &[args],
                     )?)));
                 }
                 let keys = self.enumerable_own_string_keys_for_value(context, target.clone(), 0)?;
@@ -762,9 +974,11 @@ impl Interpreter {
                             .map_err(|_| VmError::TypeMismatch)?,
                     ));
                 }
-                return Ok(Some(Value::Array(array::from_elements(
-                    &mut self.gc_heap,
+                return Ok(Some(Value::Array(self.function_static_array_from_values(
+                    stack_roots,
                     values,
+                    &[&target],
+                    &[args],
                 )?)));
             }
             let desc =
@@ -773,10 +987,14 @@ impl Interpreter {
                 return Ok(Some(Value::Boolean(desc.is_some())));
             }
             return match desc {
-                Some(desc) => Ok(Some(Value::Object(object_statics::descriptor_to_object(
-                    &desc,
-                    &mut self.gc_heap,
-                )?))),
+                Some(desc) => Ok(Some(Value::Object(
+                    self.function_static_descriptor_to_object(
+                        stack_roots,
+                        &desc,
+                        &[&target],
+                        args,
+                    )?,
+                ))),
                 None => Ok(Some(Value::Undefined)),
             };
         }
@@ -798,7 +1016,12 @@ impl Interpreter {
                 let completed = descriptor.complete_for_new_property();
                 let ok = match (&target, function_id, &key) {
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
-                        let bag = self.function_user_bag(function_id)?;
+                        let bag = match stack_roots {
+                            Some(stack) => {
+                                self.function_user_bag_stack_rooted(stack, function_id, &[&target])?
+                            }
+                            None => self.function_user_bag(function_id)?,
+                        };
                         crate::object::define_own_symbol_property_partial(
                             bag,
                             &mut self.gc_heap,
@@ -806,14 +1029,17 @@ impl Interpreter {
                             descriptor,
                         )
                     }
-                    (_, Some(function_id), _) => self.ordinary_function_define_own_property(
-                        context,
-                        function_id,
-                        key.string_name()
-                            .expect("non-symbol key has string spelling"),
-                        Some(desc_obj),
-                        completed,
-                    )?,
+                    (_, Some(function_id), _) => self
+                        .ordinary_function_define_own_property_with_roots(
+                            context,
+                            function_id,
+                            key.string_name()
+                                .expect("non-symbol key has string spelling"),
+                            Some(desc_obj),
+                            completed,
+                            stack_roots,
+                            &[&target],
+                        )?,
                     (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
                     (Value::BoundFunction(bound), None, _) => {
                         function_metadata::bound_define_own_property(
@@ -860,10 +1086,14 @@ impl Interpreter {
                     _ => return Ok(None),
                 };
                 match desc {
-                    Some(desc) => Ok(Some(Value::Object(object_statics::descriptor_to_object(
-                        &desc,
-                        &mut self.gc_heap,
-                    )?))),
+                    Some(desc) => Ok(Some(Value::Object(
+                        self.function_static_descriptor_to_object(
+                            stack_roots,
+                            &desc,
+                            &[&target],
+                            args,
+                        )?,
+                    ))),
                     None => Ok(Some(Value::Undefined)),
                 }
             }
@@ -933,6 +1163,90 @@ impl Interpreter {
             | M::Seal
             | M::Values => Ok(None),
         }
+    }
+
+    fn function_static_array_from_values(
+        &mut self,
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        values: Vec<Value>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<array::JsArray, VmError> {
+        match stack_roots {
+            Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
+                stack,
+                values,
+                value_roots,
+                slice_roots,
+            ),
+            None => Ok(array::from_elements(&mut self.gc_heap, values)?),
+        }
+    }
+
+    fn function_static_descriptor_to_object(
+        &mut self,
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        desc: &object::PropertyDescriptor,
+        value_roots: &[&Value],
+        slice_roots: &[Value],
+    ) -> Result<JsObject, VmError> {
+        let Some(stack) = stack_roots else {
+            return object_statics::descriptor_to_object(desc, &mut self.gc_heap);
+        };
+
+        let mut roots = Vec::with_capacity(value_roots.len() + 2);
+        roots.extend_from_slice(value_roots);
+        match &desc.kind {
+            object::DescriptorKind::Data { value } => roots.push(value),
+            object::DescriptorKind::Accessor { getter, setter } => {
+                if let Some(getter) = getter {
+                    roots.push(getter);
+                }
+                if let Some(setter) = setter {
+                    roots.push(setter);
+                }
+            }
+        }
+        let result =
+            self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
+        match &desc.kind {
+            object::DescriptorKind::Data { value } => {
+                object::set(result, &mut self.gc_heap, "value", value.clone());
+                object::set(
+                    result,
+                    &mut self.gc_heap,
+                    "writable",
+                    Value::Boolean(desc.writable()),
+                );
+            }
+            object::DescriptorKind::Accessor { getter, setter } => {
+                object::set(
+                    result,
+                    &mut self.gc_heap,
+                    "get",
+                    getter.clone().unwrap_or(Value::Undefined),
+                );
+                object::set(
+                    result,
+                    &mut self.gc_heap,
+                    "set",
+                    setter.clone().unwrap_or(Value::Undefined),
+                );
+            }
+        }
+        object::set(
+            result,
+            &mut self.gc_heap,
+            "enumerable",
+            Value::Boolean(desc.enumerable()),
+        );
+        object::set(
+            result,
+            &mut self.gc_heap,
+            "configurable",
+            Value::Boolean(desc.configurable()),
+        );
+        Ok(result)
     }
 
     /// Preflight dispatcher for `Object.<X>(target)` calls whose
@@ -1020,6 +1334,95 @@ impl Interpreter {
             return Ok(value);
         }
         Ok(Value::Undefined)
+    }
+
+    pub(crate) fn function_property_get_stack_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        function_id: u32,
+        name: &str,
+    ) -> Result<Value, VmError> {
+        if name != "prototype" {
+            return self.function_property_get(context, function_id, name);
+        }
+        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+            && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
+        {
+            return Ok(v);
+        }
+
+        let function_root = Value::Function { function_id };
+        let bag = self.function_user_bag_stack_rooted(stack, function_id, &[&function_root])?;
+        if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
+            return Ok(existing);
+        }
+
+        let bag_root = Value::Object(bag);
+        let proto =
+            self.alloc_stack_rooted_object_with_extra_roots(stack, &[&function_root, &bag_root])?;
+        if let Some(Value::Object(object_ctor)) =
+            crate::object::get(self.global_this, &self.gc_heap, "Object")
+            && let Some(Value::Object(object_proto)) =
+                crate::object::get(object_ctor, &self.gc_heap, "prototype")
+        {
+            crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
+        }
+        let proto_value = Value::Object(proto);
+        let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
+        let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+        let prototype_desc =
+            object::PropertyDescriptor::data(proto_value.clone(), true, false, false);
+        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
+        Ok(proto_value)
+    }
+
+    pub(crate) fn function_property_get_runtime_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        name: &str,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        if name != "prototype" {
+            return self.function_property_get(context, function_id, name);
+        }
+        if let Some(bag) = self.function_user_props.get(&function_id).copied()
+            && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
+        {
+            return Ok(v);
+        }
+
+        let function_root = Value::Function { function_id };
+        let mut bag_roots = Vec::with_capacity(value_roots.len() + 1);
+        bag_roots.push(&function_root);
+        bag_roots.extend_from_slice(value_roots);
+        let bag = self.function_user_bag_runtime_rooted(function_id, &bag_roots, slice_roots)?;
+        if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
+            return Ok(existing);
+        }
+
+        let bag_root = Value::Object(bag);
+        let mut proto_roots = Vec::with_capacity(value_roots.len() + 2);
+        proto_roots.push(&function_root);
+        proto_roots.push(&bag_root);
+        proto_roots.extend_from_slice(value_roots);
+        let proto = self.alloc_runtime_rooted_object_with_roots(&proto_roots, slice_roots)?;
+        if let Some(Value::Object(object_ctor)) =
+            crate::object::get(self.global_this, &self.gc_heap, "Object")
+            && let Some(Value::Object(object_proto)) =
+                crate::object::get(object_ctor, &self.gc_heap, "prototype")
+        {
+            crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
+        }
+        let proto_value = Value::Object(proto);
+        let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
+        let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
+        let prototype_desc =
+            object::PropertyDescriptor::data(proto_value.clone(), true, false, false);
+        let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
+        Ok(proto_value)
     }
 
     pub(crate) fn load_global_prototype_method(

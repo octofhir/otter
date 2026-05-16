@@ -42,8 +42,11 @@ pub use parse::{ParseError, parse};
 pub use stringify::{StringifyOptions, stringify, stringify_with_options};
 
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
+use crate::runtime_cx::visit_native_roots;
 use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError, Value};
+use otter_gc::heap::RootSlotVisitor;
+use otter_gc::raw::RawGc;
 
 /// Static namespace spec installed by the centralized bootstrap
 /// registry.
@@ -171,6 +174,22 @@ pub fn call(
     }
 }
 
+/// Dispatch a `JSON.<method>` call with an explicit root visitor for callers
+/// that have a live VM stack or native root set.
+pub(crate) fn call_with_roots(
+    method: otter_bytecode::method_id::JsonMethod,
+    args: &[Value],
+    string_heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<Value, JsonError> {
+    use otter_bytecode::method_id::JsonMethod;
+    match method {
+        JsonMethod::Stringify => json_stringify(args, string_heap, gc_heap),
+        JsonMethod::Parse => json_parse_with_roots(args, string_heap, gc_heap, external_visit),
+    }
+}
+
 fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Parse, args)
 }
@@ -184,9 +203,28 @@ fn native_json_call(
     method: otter_bytecode::method_id::JsonMethod,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let interp = ctx.interp_mut();
-    let string_heap = interp.string_heap.clone();
-    call(method, args, &string_heap, interp.gc_heap_mut()).map_err(|err| NativeError::TypeError {
+    let string_heap = ctx.interp_mut().string_heap.clone();
+    let runtime_roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let new_target = ctx.new_target().cloned();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_native_roots(
+            visitor,
+            &runtime_roots,
+            &this_value,
+            new_target.as_ref(),
+            &[],
+            &[args],
+        );
+    };
+    call_with_roots(
+        method,
+        args,
+        &string_heap,
+        ctx.heap_mut(),
+        &mut external_visit,
+    )
+    .map_err(|err| NativeError::TypeError {
         name: method.name(),
         reason: err.to_string(),
     })
@@ -222,6 +260,26 @@ fn json_parse(
         }
     };
     let value = parse(&text, heap, gc_heap)?;
+    Ok(value)
+}
+
+fn json_parse_with_roots(
+    args: &[Value],
+    heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<Value, JsonError> {
+    let text = match args.first() {
+        Some(Value::String(s)) => s.to_lossy_string(),
+        _ => {
+            return Err(JsonError::BadArgument {
+                name: "parse",
+                index: 0,
+                reason: "must be a string",
+            });
+        }
+    };
+    let value = parse::parse_with_roots(&text, heap, gc_heap, external_visit)?;
     Ok(value)
 }
 

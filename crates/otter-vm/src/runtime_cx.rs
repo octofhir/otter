@@ -39,7 +39,8 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ExecutionContext, Interpreter, IteratorHandle, IteratorState, Value, array, collections, object,
+    ExecutionContext, Interpreter, IteratorHandle, IteratorState, Value, array, collections,
+    object, weak_refs,
 };
 
 /// Internal VM context. Carried explicitly through the dispatch
@@ -363,6 +364,58 @@ impl<'rt> NativeCtx<'rt> {
         collections::alloc_weak_set_with_roots(self.heap_mut(), &mut external_visit)
     }
 
+    /// Allocate a `WeakRef` body through the native root contract.
+    pub fn alloc_weak_ref(
+        &mut self,
+        target: &Value,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<weak_refs::JsWeakRef, crate::VmError> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        weak_refs::alloc_weak_ref_with_roots(self.heap_mut(), target, &mut external_visit)
+    }
+
+    /// Allocate a `FinalizationRegistry` body through the native root contract.
+    pub fn alloc_finalization_registry(
+        &mut self,
+        cleanup_callback: Value,
+        cleanup_context: Option<ExecutionContext>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<weak_refs::JsFinalizationRegistry, crate::VmError> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        weak_refs::alloc_finalization_registry_with_context_and_roots(
+            self.heap_mut(),
+            cleanup_callback,
+            cleanup_context,
+            &mut external_visit,
+        )
+    }
+
     /// Insert into a `Map` through the native root contract.
     pub fn map_set(
         &mut self,
@@ -588,7 +641,9 @@ pub(crate) fn visit_native_roots(
 #[cfg(test)]
 mod tests {
     use super::{NativeCallInfo, NativeCtx};
-    use crate::{Interpreter, NumberValue, Value};
+    use crate::{
+        Interpreter, NativeError, NumberValue, Value, error_classes::ErrorKind, native_value_static,
+    };
 
     #[test]
     fn native_ctx_object_allocation_uses_young_space() {
@@ -656,6 +711,93 @@ mod tests {
         assert!(
             after > before,
             "NativeCtx collection helpers should allocate through root-aware young allocation"
+        );
+    }
+
+    #[test]
+    fn native_ctx_weak_ref_allocation_uses_young_space() {
+        fn cleanup(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::Undefined)
+        }
+
+        let mut interp = Interpreter::new();
+        let cleanup =
+            native_value_static(interp.gc_heap_mut(), "cleanup", 0, cleanup).expect("cleanup");
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+        {
+            let mut ctx = NativeCtx::new_with_call_info(
+                &mut interp,
+                NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
+            );
+            let target = Value::Object(ctx.alloc_object().expect("target"));
+            let _weak_ref = ctx
+                .alloc_weak_ref(&target, &[], &[])
+                .expect("native weak ref allocation");
+            let _registry = ctx
+                .alloc_finalization_registry(cleanup, None, &[], &[])
+                .expect("native finalization registry allocation");
+        }
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "NativeCtx weak-ref helpers should allocate through root-aware young allocation"
+        );
+    }
+
+    #[test]
+    fn native_ctx_error_allocation_uses_young_space() {
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+        {
+            let mut ctx = NativeCtx::new_with_call_info(
+                &mut interp,
+                NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
+            );
+            let registry = ctx.interp_mut().error_classes_clone();
+            let error = registry
+                .make_instance_native_rooted(&mut ctx, ErrorKind::TypeError, Some("boom"), &[], &[])
+                .expect("native error allocation");
+            assert!(matches!(
+                crate::object::get(error, ctx.heap(), "message"),
+                Some(Value::String(_))
+            ));
+        }
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Native error constructors should allocate through root-aware young allocation"
+        );
+    }
+
+    #[test]
+    fn native_ctx_aggregate_error_allocation_roots_errors_array() {
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap().stats().new_allocated_bytes;
+        {
+            let mut ctx = NativeCtx::new_with_call_info(
+                &mut interp,
+                NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
+            );
+            let registry = ctx.interp_mut().error_classes_clone();
+            let errors = [Value::Number(NumberValue::from_i32(1))];
+            let error = registry
+                .make_aggregate_instance_native_rooted(
+                    &mut ctx,
+                    errors.as_slice(),
+                    Some("all rejected"),
+                    &[],
+                    &[],
+                )
+                .expect("native aggregate error allocation");
+            assert!(matches!(
+                crate::object::get(error, ctx.heap(), "errors"),
+                Some(Value::Array(_))
+            ));
+        }
+        let after = interp.gc_heap().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Native AggregateError should allocate the error and errors array through root-aware young allocation"
         );
     }
 }

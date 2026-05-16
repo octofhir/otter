@@ -23,7 +23,7 @@
 //! # Invariants
 //! - Each `new <T>(...)` call routes through the real
 //!   `NativeFunction` ctor and delegates to
-//!   [`crate::binary::dispatch::typed_array_call`] with the
+//!   [`crate::binary::dispatch::typed_array_call_with_roots`] with the
 //!   per-kind discriminant.
 //! - Bare call (e.g. `Uint8Array(4)` without `new`) throws
 //!   `TypeError` per §23.2.5.1 step 2.
@@ -317,8 +317,27 @@ fn ta_ctor_dispatch(
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    dispatch::typed_array_call(kind, TypedArrayMethod::Construct, args, ctx.heap())
-        .map_err(|e| vm_to_native(e, typed_array_name(kind)))
+    let roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let new_target = ctx.new_target().cloned();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        crate::runtime_cx::visit_native_roots(
+            visitor,
+            &roots,
+            &this_value,
+            new_target.as_ref(),
+            &[],
+            &[args],
+        );
+    };
+    dispatch::typed_array_call_with_roots(
+        kind,
+        TypedArrayMethod::Construct,
+        args,
+        ctx.heap_mut(),
+        &mut external_visit,
+    )
+    .map_err(|e| vm_to_native(e, typed_array_name(kind)))
 }
 
 const fn typed_array_name(kind: TypedArrayKind) -> &'static str {

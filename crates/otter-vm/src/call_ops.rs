@@ -694,7 +694,11 @@ impl Interpreter {
         }
 
         self.record_runtime_construct_call();
-        let proto = self.construct_prototype_for_callee(context, &effective_new_target)?;
+        let proto = self.construct_prototype_for_callee_stack_rooted(
+            context,
+            stack,
+            &effective_new_target,
+        )?;
         let receiver = match proto.as_ref() {
             Some(proto_value) => {
                 self.alloc_stack_rooted_object_with_extra_roots(stack, &[proto_value])?
@@ -824,7 +828,8 @@ impl Interpreter {
         // the new frame. The constructor might mutate the receiver
         // immediately, so the prototype link must already be in
         // place.
-        let proto = self.construct_prototype_for_callee(context, &new_target)?;
+        let proto =
+            self.construct_prototype_for_callee_stack_rooted(context, stack, &new_target)?;
         let receiver = {
             let mut value_roots: SmallVec<[&Value; 4]> = smallvec::smallvec![&callee, &new_target];
             if let Some(proto_value) = proto.as_ref() {
@@ -916,14 +921,20 @@ impl Interpreter {
         Ok(())
     }
 
-    pub(crate) fn construct_prototype_for_callee(
+    pub(crate) fn construct_prototype_for_callee_stack_rooted(
         &mut self,
         context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         match callee {
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                match self.function_property_get(context, *function_id, "prototype")? {
+                match self.function_property_get_stack_rooted(
+                    context,
+                    stack,
+                    *function_id,
+                    "prototype",
+                )? {
                     proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
                     _ => Ok(None),
                 }
@@ -935,7 +946,46 @@ impl Interpreter {
             }),
             Value::BoundFunction(b) => {
                 let (target, _, _) = b.parts(&self.gc_heap);
-                self.construct_prototype_for_callee(context, &target)
+                self.construct_prototype_for_callee_stack_rooted(context, stack, &target)
+            }
+            Value::NativeFunction(_) => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
+    pub(crate) fn construct_prototype_for_callee_runtime_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        callee: &Value,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Option<Value>, VmError> {
+        match callee {
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                match self.function_property_get_runtime_rooted(
+                    context,
+                    *function_id,
+                    "prototype",
+                    value_roots,
+                    slice_roots,
+                )? {
+                    proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
+                    _ => Ok(None),
+                }
+            }
+            Value::ClassConstructor(c) => Ok(Some(Value::Object(c.prototype(&self.gc_heap)))),
+            Value::Object(obj) => Ok(match crate::object::get(*obj, &self.gc_heap, "prototype") {
+                Some(proto) if constructor_return_is_object(&proto) => Some(proto),
+                _ => None,
+            }),
+            Value::BoundFunction(b) => {
+                let (target, _, _) = b.parts(&self.gc_heap);
+                self.construct_prototype_for_callee_runtime_rooted(
+                    context,
+                    &target,
+                    value_roots,
+                    slice_roots,
+                )
             }
             Value::NativeFunction(_) => Ok(None),
             _ => Ok(None),
@@ -1267,7 +1317,12 @@ impl Interpreter {
             }
         }
 
-        let proto = self.construct_prototype_for_callee(context, &effective_new_target)?;
+        let proto = self.construct_prototype_for_callee_runtime_rooted(
+            context,
+            &effective_new_target,
+            &[&current, &effective_new_target],
+            &[effective_args.as_slice()],
+        )?;
         let receiver = {
             let mut value_roots: SmallVec<[&Value; 4]> =
                 smallvec::smallvec![&current, &effective_new_target];

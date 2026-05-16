@@ -19,8 +19,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use otter_vm::{
-    Attr, Interpreter, JsString, NativeCall, NativeCtx, NativeError, NativeFn, NativeFunction,
-    NumberValue, ObjectBuilder, Value,
+    Attr, Interpreter, JsString, NativeCall, NativeCtx, NativeError, NativeFn, NumberValue, Value,
 };
 use sysinfo::{ProcessesToUpdate, System};
 
@@ -46,7 +45,10 @@ pub(crate) fn install_global(
     let snapshot = runtime_process_snapshot();
     let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
-    let process = otter_vm::object::alloc_object(interp.gc_heap_mut()).map_err(gc_oom_to_error)?;
+    let process = interp
+        .alloc_host_object_with_roots(&[], &[])
+        .map_err(gc_oom_to_error)?;
+    let process_root = Value::Object(process);
     let argv_values = process_argv
         .iter()
         .map(|arg| {
@@ -55,7 +57,12 @@ pub(crate) fn install_global(
                 .map_err(string_oom_to_error)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let argv = otter_vm::array::from_elements(interp.gc_heap_mut(), argv_values)
+    let argv = interp
+        .array_from_elements_host_rooted(
+            argv_values.iter().cloned(),
+            &[&process_root],
+            &[&argv_values],
+        )
         .map_err(gc_oom_to_error)?;
     otter_vm::object::set(
         process,
@@ -64,8 +71,9 @@ pub(crate) fn install_global(
         otter_vm::Value::Array(argv),
     );
 
-    let exec_argv =
-        otter_vm::array::from_elements(interp.gc_heap_mut(), []).map_err(gc_oom_to_error)?;
+    let exec_argv = interp
+        .array_from_elements_host_rooted([], &[&process_root], &[])
+        .map_err(gc_oom_to_error)?;
     otter_vm::object::set(
         process,
         interp.gc_heap_mut(),
@@ -89,7 +97,9 @@ pub(crate) fn install_global(
     let version = string_value(interp, concat!("v", env!("CARGO_PKG_VERSION")))?;
     otter_vm::object::set(process, interp.gc_heap_mut(), "version", version);
 
-    let versions = otter_vm::object::alloc_object(interp.gc_heap_mut()).map_err(gc_oom_to_error)?;
+    let versions = interp
+        .alloc_host_object_with_roots(&[&process_root], &[])
+        .map_err(gc_oom_to_error)?;
     let otter_version = string_value(interp, env!("CARGO_PKG_VERSION"))?;
     otter_vm::object::set(versions, interp.gc_heap_mut(), "otter", otter_version);
     let node_version = string_value(interp, env!("CARGO_PKG_VERSION"))?;
@@ -101,7 +111,9 @@ pub(crate) fn install_global(
         otter_vm::Value::Object(versions),
     );
 
-    let release = otter_vm::object::alloc_object(interp.gc_heap_mut()).map_err(gc_oom_to_error)?;
+    let release = interp
+        .alloc_host_object_with_roots(&[&process_root], &[])
+        .map_err(gc_oom_to_error)?;
     let release_name = string_value(interp, "node")?;
     otter_vm::object::set(release, interp.gc_heap_mut(), "name", release_name);
     otter_vm::object::set(
@@ -133,7 +145,9 @@ pub(crate) fn install_global(
         otter_vm::Value::Undefined,
     );
 
-    let env = otter_vm::object::alloc_object(interp.gc_heap_mut()).map_err(gc_oom_to_error)?;
+    let env = interp
+        .alloc_host_object_with_roots(&[&process_root], &[])
+        .map_err(gc_oom_to_error)?;
     for (name, value) in std::env::vars() {
         if !default_check_capability(
             capabilities,
@@ -154,53 +168,75 @@ pub(crate) fn install_global(
         otter_vm::Value::Object(env),
     );
 
-    ObjectBuilder::from_object(interp.gc_heap_mut(), process)
-        .method(
-            "cwd",
-            0,
-            cwd_call(process_cwd.to_string_lossy().to_string()),
-            Attr::builtin_function(),
-        )
-        .and_then(|builder| {
-            builder.method(
-                "exit",
-                1,
-                NativeCall::Static(process_exit),
-                Attr::builtin_function(),
-            )
-        })
-        .and_then(|builder| {
-            builder.method(
-                "nextTick",
-                1,
-                NativeCall::Static(process_next_tick),
-                Attr::builtin_function(),
-            )
-        })
-        .and_then(|builder| {
-            builder.method(
-                "uptime",
-                0,
-                uptime_call(start, uptime_base_secs),
-                Attr::builtin_function(),
-            )
-        })
-        .and_then(|builder| {
-            builder.method(
-                "memoryUsage",
-                0,
-                NativeCall::Static(process_memory_usage),
-                Attr::builtin_function(),
-            )
-        })
-        .map_err(|err| OtterError::Internal {
-            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-            message: err.to_string(),
-        })?;
+    define_process_method(
+        interp,
+        process,
+        &process_root,
+        "cwd",
+        0,
+        cwd_call(process_cwd.to_string_lossy().to_string()),
+    )?;
+    define_process_method(
+        interp,
+        process,
+        &process_root,
+        "exit",
+        1,
+        NativeCall::Static(process_exit),
+    )?;
+    define_process_method(
+        interp,
+        process,
+        &process_root,
+        "nextTick",
+        1,
+        NativeCall::Static(process_next_tick),
+    )?;
+    define_process_method(
+        interp,
+        process,
+        &process_root,
+        "uptime",
+        0,
+        uptime_call(start, uptime_base_secs),
+    )?;
+    define_process_method(
+        interp,
+        process,
+        &process_root,
+        "memoryUsage",
+        0,
+        NativeCall::Static(process_memory_usage),
+    )?;
     let hrtime = hrtime_value(interp, start).map_err(gc_oom_to_error)?;
     otter_vm::object::set(process, interp.gc_heap_mut(), "hrtime", hrtime);
     interp.set_global("process", otter_vm::Value::Object(process));
     Ok(())
+}
+
+fn define_process_method(
+    interp: &mut Interpreter,
+    process: otter_vm::object::JsObject,
+    process_root: &Value,
+    name: &'static str,
+    length: u8,
+    call: NativeCall,
+) -> Result<(), OtterError> {
+    let value = interp
+        .native_function_from_call_host_rooted(name, length, call, &[process_root], &[])
+        .map_err(gc_oom_to_error)?;
+    let descriptor = otter_vm::object::PropertyDescriptor {
+        kind: otter_vm::object::DescriptorKind::Data { value },
+        flags: Attr::builtin_function().to_flags(),
+    };
+    if otter_vm::object::define_own_property(process, interp.gc_heap_mut(), name, descriptor) {
+        Ok(())
+    } else {
+        Err(OtterError::Internal {
+            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+            message: format!("failed to define process.{name}"),
+        })
+    }
 }
 
 pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
@@ -281,12 +317,11 @@ fn process_memory_usage(
     _args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
     let snapshot = runtime_process_snapshot();
-    let interp = ctx.interp_mut();
-    let heap_stats = interp.gc_heap_mut().gc_stats();
-    let heap_used = heap_stats.live_bytes as f64;
-    let heap_total = heap_used;
     let rss = snapshot.memory_bytes.unwrap_or(0) as f64;
-    let object = otter_vm::object::alloc_object(interp.gc_heap_mut())?;
+    let heap_used = ctx.interp_mut().gc_heap_mut().gc_stats().live_bytes as f64;
+    let heap_total = heap_used;
+    let object = ctx.alloc_object()?;
+    let interp = ctx.interp_mut();
     set_number_property(interp, object, "rss", rss);
     set_number_property(interp, object, "heapTotal", heap_total);
     set_number_property(interp, object, "heapUsed", heap_used);
@@ -297,21 +332,17 @@ fn process_memory_usage(
 
 fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter_gc::OutOfMemory> {
     let function =
-        NativeFunction::from_call(interp.gc_heap_mut(), "hrtime", 1, hrtime_call(start))?;
-    let bigint =
-        NativeFunction::from_call(interp.gc_heap_mut(), "bigint", 0, hrtime_bigint_call(start))?;
-    let object = otter_vm::object::alloc_object(interp.gc_heap_mut())?;
-    otter_vm::object::set_call_native(
-        object,
-        interp.gc_heap_mut(),
-        Value::NativeFunction(function),
-    );
-    otter_vm::object::set(
-        object,
-        interp.gc_heap_mut(),
+        interp.native_function_from_call_host_rooted("hrtime", 1, hrtime_call(start), &[], &[])?;
+    let bigint = interp.native_function_from_call_host_rooted(
         "bigint",
-        Value::NativeFunction(bigint),
-    );
+        0,
+        hrtime_bigint_call(start),
+        &[&function],
+        &[],
+    )?;
+    let object = interp.alloc_host_object_with_roots(&[&function, &bigint], &[])?;
+    otter_vm::object::set_call_native(object, interp.gc_heap_mut(), function);
+    otter_vm::object::set(object, interp.gc_heap_mut(), "bigint", bigint);
     Ok(Value::Object(object))
 }
 
@@ -337,7 +368,7 @@ fn hrtime_call(start: Instant) -> NativeCall {
             Value::Number(NumberValue::from_f64(seconds.max(0) as f64)),
             Value::Number(NumberValue::from_f64(nanos.max(0) as f64)),
         ];
-        let array = otter_vm::array::from_elements(ctx.interp_mut().gc_heap_mut(), values)?;
+        let array = ctx.array_from_elements_with_roots(values, &[], &[args])?;
         Ok(Value::Array(array))
     });
     NativeCall::Dynamic(call)

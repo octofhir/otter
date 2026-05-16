@@ -161,8 +161,9 @@ fn weak_ref_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "target must be an object".to_string(),
         });
     }
-    let weak_ref =
-        weak_refs::alloc_weak_ref(ctx.heap_mut(), &target).map_err(|_| oom("WeakRef"))?;
+    let weak_ref = ctx
+        .alloc_weak_ref(&target, &[], &[args])
+        .map_err(|_| oom("WeakRef"))?;
     Ok(Value::WeakRef(weak_ref))
 }
 
@@ -181,9 +182,9 @@ fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         });
     }
     let context = ctx.execution_context().cloned();
-    let registry =
-        weak_refs::alloc_finalization_registry_with_context(ctx.heap_mut(), cleanup, context)
-            .map_err(|_| oom("FinalizationRegistry"))?;
+    let registry = ctx
+        .alloc_finalization_registry(cleanup, context, &[], &[args])
+        .map_err(|_| oom("FinalizationRegistry"))?;
     Ok(Value::FinalizationRegistry(registry))
 }
 

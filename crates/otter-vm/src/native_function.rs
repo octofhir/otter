@@ -266,6 +266,57 @@ impl std::fmt::Debug for NativeFunction {
 }
 
 impl NativeFunction {
+    fn allocate_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeCallStorage,
+        captures: SmallVec<[Value; 4]>,
+        trace: Option<Rc<NativeTraceFn>>,
+        metadata: NativeFunctionMetadata,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let own_properties = {
+            let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                external_visit(visitor);
+                for value in &captures {
+                    value.trace_value_slots(visitor);
+                }
+                if let Some(trace) = &trace {
+                    trace(visitor);
+                }
+            };
+            crate::object::alloc_object_with_roots(heap, &mut visit)?
+        };
+        let own_properties_root = Value::Object(own_properties);
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            own_properties_root.trace_value_slots(visitor);
+            for value in &captures {
+                value.trace_value_slots(visitor);
+            }
+            if let Some(trace) = &trace {
+                trace(visitor);
+            }
+        };
+        Ok(Self {
+            inner: heap.alloc_with_roots(
+                NativeFunctionBody {
+                    name,
+                    length,
+                    call,
+                    captures: captures.clone(),
+                    trace: trace.clone(),
+                    name_property: default_name_property(),
+                    length_property: default_length_property(),
+                    metadata,
+                    own_properties,
+                },
+                &mut visit,
+            )?,
+        })
+    }
+
     /// Build a native function with a static name and an `Fn`
     /// payload.
     pub fn new<F>(
@@ -303,6 +354,27 @@ impl NativeFunction {
                 own_properties,
             })?,
         })
+    }
+
+    /// Build a static native function while exposing caller-owned
+    /// roots across the metadata property-bag and body allocations.
+    pub fn new_static_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeFastFn,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Self::allocate_with_roots(
+            heap,
+            name,
+            length,
+            NativeCallStorage::Static(call),
+            SmallVec::new(),
+            None,
+            NativeFunctionMetadata::BUILTIN,
+            external_visit,
+        )
     }
 
     /// Build a static native function that has `[[Construct]]`.
@@ -350,6 +422,28 @@ impl NativeFunction {
                 own_properties,
             })?,
         })
+    }
+
+    /// Build a native function from an already-classified call
+    /// target while exposing caller-owned roots across the metadata
+    /// property-bag and body allocations.
+    pub fn from_call_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Self::allocate_with_roots(
+            heap,
+            name,
+            length,
+            call.into(),
+            SmallVec::new(),
+            None,
+            NativeFunctionMetadata::BUILTIN,
+            external_visit,
+        )
     }
 
     /// Build the realm's `%ThrowTypeError%` intrinsic function.
@@ -769,29 +863,26 @@ where
     native_value_with_captures_unchecked(heap, name, SmallVec::new(), call)
 }
 
-pub(crate) fn native_constructor_value_with_captures_unchecked<F>(
+pub(crate) fn native_constructor_value_with_captures_unchecked_with_roots<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     captures: SmallVec<[Value; 4]>,
+    external_visit: &mut RootSlotVisitor<'_>,
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    let own_properties = crate::object::alloc_object(heap)?;
-    Ok(Value::NativeFunction(NativeFunction {
-        inner: heap.alloc_old(NativeFunctionBody {
-            name,
-            length: 0,
-            call: NativeCallStorage::LocalDynamic(Rc::new(call)),
-            captures,
-            trace: None,
-            name_property: default_name_property(),
-            length_property: default_length_property(),
-            metadata: NativeFunctionMetadata::CONSTRUCTOR,
-            own_properties,
-        })?,
-    }))
+    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
+        heap,
+        name,
+        0,
+        NativeCallStorage::LocalDynamic(Rc::new(call)),
+        captures,
+        None,
+        NativeFunctionMetadata::CONSTRUCTOR,
+        external_visit,
+    )?))
 }
 
 pub(crate) fn native_value_with_captures_unchecked<F>(
@@ -829,31 +920,16 @@ pub(crate) fn native_value_with_captures_unchecked_with_roots<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    let own_properties = {
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            for value in &captures {
-                value.trace_value_slots(visitor);
-            }
-        };
-        crate::object::alloc_object_with_roots(heap, &mut visit)?
-    };
-    Ok(Value::NativeFunction(NativeFunction {
-        inner: heap.alloc_with_roots(
-            NativeFunctionBody {
-                name,
-                length: 0,
-                call: NativeCallStorage::LocalDynamic(Rc::new(call)),
-                captures,
-                trace: None,
-                name_property: default_name_property(),
-                length_property: default_length_property(),
-                metadata: NativeFunctionMetadata::BUILTIN,
-                own_properties,
-            },
-            external_visit,
-        )?,
-    }))
+    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
+        heap,
+        name,
+        0,
+        NativeCallStorage::LocalDynamic(Rc::new(call)),
+        captures,
+        None,
+        NativeFunctionMetadata::BUILTIN,
+        external_visit,
+    )?))
 }
 
 pub(crate) fn native_value_with_trace_unchecked_with_roots<F>(
@@ -867,32 +943,16 @@ pub(crate) fn native_value_with_trace_unchecked_with_roots<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    let own_properties = {
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            for value in &captures {
-                value.trace_value_slots(visitor);
-            }
-            trace(visitor);
-        };
-        crate::object::alloc_object_with_roots(heap, &mut visit)?
-    };
-    Ok(Value::NativeFunction(NativeFunction {
-        inner: heap.alloc_with_roots(
-            NativeFunctionBody {
-                name,
-                length: 0,
-                call: NativeCallStorage::LocalDynamic(Rc::new(call)),
-                captures,
-                trace: Some(trace),
-                name_property: default_name_property(),
-                length_property: default_length_property(),
-                metadata: NativeFunctionMetadata::BUILTIN,
-                own_properties,
-            },
-            external_visit,
-        )?,
-    }))
+    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
+        heap,
+        name,
+        0,
+        NativeCallStorage::LocalDynamic(Rc::new(call)),
+        captures,
+        Some(trace),
+        NativeFunctionMetadata::BUILTIN,
+        external_visit,
+    )?))
 }
 
 fn native_builtin_descriptor(

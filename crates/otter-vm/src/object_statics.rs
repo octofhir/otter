@@ -128,10 +128,15 @@ fn native_call(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
+    if let Some(result) = native_rooted_call(method, ctx, context.as_ref(), args)
+        .map_err(|err| object_native_error(method.name(), err))?
+    {
+        return Ok(result);
+    }
     if let Some(result) = ctx
         .cx
         .interp
-        .try_function_object_static_call(context.as_ref(), method, args)
+        .try_function_object_static_call(context.as_ref(), None, method, args)
         .map_err(|err| object_native_error(method.name(), err))?
     {
         return Ok(result);
@@ -140,7 +145,7 @@ fn native_call(
         && let Some(result) = ctx
             .cx
             .interp
-            .try_proxy_object_static_call(context, method, args)
+            .try_proxy_object_static_call(context, None, method, args)
             .map_err(|err| object_native_error(method.name(), err))?
     {
         return Ok(result);
@@ -148,6 +153,497 @@ fn native_call(
     let string_heap = ctx.cx.interp.string_heap_clone();
     call(method, args, &string_heap, ctx.heap_mut())
         .map_err(|err| object_native_error(method.name(), err))
+}
+
+fn native_rooted_call(
+    method: otter_bytecode::method_id::ObjectMethod,
+    ctx: &mut NativeCtx<'_>,
+    context: Option<&crate::ExecutionContext>,
+    args: &[Value],
+) -> Result<Option<Value>, VmError> {
+    use otter_bytecode::method_id::ObjectMethod as M;
+    match method {
+        M::Create => native_create_rooted(ctx, args).map(Some),
+        M::Keys => native_keys_rooted(ctx, context, args).map(Some),
+        M::Values => native_values_rooted(ctx, args).map(Some),
+        M::Entries => native_entries_rooted(ctx, args).map(Some),
+        M::FromEntries => native_from_entries_rooted(ctx, args).map(Some),
+        M::GetOwnPropertyDescriptor => {
+            native_get_own_property_descriptor_rooted(ctx, context, args).map(Some)
+        }
+        M::GetOwnPropertyDescriptors => {
+            native_get_own_property_descriptors_rooted(ctx, args).map(Some)
+        }
+        M::GetOwnPropertyNames => {
+            native_get_own_property_names_rooted(ctx, context, args).map(Some)
+        }
+        M::GetOwnPropertySymbols => {
+            native_get_own_property_symbols_rooted(ctx, context, args).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let proto = args.first().cloned().unwrap_or(Value::Undefined);
+    let proto_obj = match proto {
+        Value::Object(object) => Some(object),
+        Value::Null => None,
+        _ => return Err(VmError::TypeMismatch),
+    };
+    let obj = ctx.alloc_object_with_roots(&[&proto], &[args])?;
+    crate::object::set_prototype(obj, ctx.heap_mut(), proto_obj);
+    if let Some(props_arg) = args.get(1)
+        && !matches!(props_arg, Value::Undefined)
+    {
+        let props = match props_arg {
+            Value::Object(object) => *object,
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let entries: Vec<(String, Value)> =
+            crate::object::with_properties(props, ctx.heap(), |p| {
+                p.enumerable_data_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect()
+            });
+        for (key, desc_value) in entries {
+            let desc_obj = match desc_value {
+                Value::Object(object) => object,
+                _ => return Err(VmError::TypeMismatch),
+            };
+            let descriptor = coerce_to_descriptor(&desc_obj, ctx.heap())?;
+            if !crate::object::define_own_property_partial(obj, ctx.heap_mut(), &key, descriptor) {
+                return Err(VmError::TypeMismatch);
+            }
+        }
+    }
+    Ok(Value::Object(obj))
+}
+
+fn native_keys_rooted(
+    ctx: &mut NativeCtx<'_>,
+    context: Option<&crate::ExecutionContext>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
+    if matches!(
+        target,
+        Value::Proxy(_)
+            | Value::Array(_)
+            | Value::RegExp(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::NativeFunction(_)
+    ) {
+        let Some(context) = context else {
+            return Err(VmError::InvalidOperand);
+        };
+        let values = if matches!(target, Value::Proxy(_)) {
+            let string_heap = ctx.cx.interp.string_heap_clone();
+            let trap_keys =
+                ctx.cx
+                    .interp
+                    .own_property_keys_value(context, &target, &string_heap)?;
+            let mut values = Vec::with_capacity(trap_keys.len());
+            for key in trap_keys {
+                let Value::String(_) = &key else { continue };
+                let vm_key = match &key {
+                    Value::String(s) => crate::VmPropertyKey::OwnedString(s.to_lossy_string()),
+                    Value::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                let desc = ctx.cx.interp.ordinary_get_own_property_descriptor_value(
+                    context,
+                    target.clone(),
+                    &vm_key,
+                    0,
+                )?;
+                if desc.as_ref().is_some_and(PropertyDescriptor::enumerable) {
+                    values.push(key);
+                }
+            }
+            values
+        } else {
+            let keys =
+                ctx.cx
+                    .interp
+                    .enumerable_own_string_keys_for_value(context, target.clone(), 0)?;
+            let string_heap = ctx.cx.interp.string_heap_clone();
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(string_value(&key, &string_heap)?);
+            }
+            values
+        };
+        let array = ctx.array_from_elements_with_roots(values, &[&target], &[args])?;
+        return Ok(Value::Array(array));
+    }
+
+    let owned: Vec<String> = match args.first() {
+        Some(Value::Object(target)) => crate::object::with_properties(*target, ctx.heap(), |p| {
+            p.enumerable_keys().map(|k| k.to_string()).collect()
+        }),
+        Some(Value::NativeFunction(native)) => native
+            .enumerable_own_property_keys(ctx.heap())
+            .into_iter()
+            .collect(),
+        Some(Value::BoundFunction(bound)) => {
+            crate::function_metadata::bound_enumerable_own_property_keys(bound, ctx.heap())
+                .into_iter()
+                .collect()
+        }
+        _ => return Err(VmError::TypeMismatch),
+    };
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    let mut names = Vec::with_capacity(owned.len());
+    for key in owned {
+        names.push(string_value(&key, &string_heap)?);
+    }
+    Ok(Value::Array(ctx.array_from_elements_with_roots(
+        names,
+        &[],
+        &[args],
+    )?))
+}
+
+fn native_values_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let target = expect_object(args.first())?;
+    let values: Vec<Value> = crate::object::with_properties(target, ctx.heap(), |p| {
+        p.enumerable_data_iter().map(|(_, value)| value).collect()
+    });
+    let target_root = Value::Object(target);
+    Ok(Value::Array(ctx.array_from_elements_with_roots(
+        values,
+        &[&target_root],
+        &[args],
+    )?))
+}
+
+fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let target = expect_object(args.first())?;
+    let raw: Vec<(String, Value)> = crate::object::with_properties(target, ctx.heap(), |p| {
+        p.enumerable_data_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect()
+    });
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    let target_root = Value::Object(target);
+    let mut pairs = Vec::with_capacity(raw.len());
+    for (key, value) in raw {
+        let key_value = string_value(&key, &string_heap)?;
+        let pair = ctx.array_from_elements_with_roots(
+            [key_value, value],
+            &[&target_root],
+            &[args, pairs.as_slice()],
+        )?;
+        pairs.push(Value::Array(pair));
+    }
+    Ok(Value::Array(ctx.array_from_elements_with_roots(
+        pairs,
+        &[&target_root],
+        &[args],
+    )?))
+}
+
+fn native_from_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
+    let iter = args.first().cloned().unwrap_or(Value::Undefined);
+    let result = ctx.alloc_object_with_roots(&[], &[args])?;
+    match iter {
+        Value::Array(arr) => {
+            let snapshot: Vec<Value> =
+                crate::array::with_elements(arr, ctx.heap(), |elements| elements.to_vec());
+            for entry in snapshot {
+                match entry {
+                    Value::Array(pair) => {
+                        let key = crate::array::get(pair, ctx.heap(), 0);
+                        let value = crate::array::get(pair, ctx.heap(), 1);
+                        let key_str = property_key_from_value(&key)?;
+                        crate::object::set(result, ctx.heap_mut(), &key_str, value);
+                    }
+                    _ => return Err(VmError::TypeMismatch),
+                }
+            }
+        }
+        Value::Map(map) => {
+            for (key, value) in crate::collections::map_entries(map, ctx.heap()) {
+                let key_str = property_key_from_value(&key)?;
+                crate::object::set(result, ctx.heap_mut(), &key_str, value);
+            }
+        }
+        _ => return Err(VmError::TypeMismatch),
+    }
+    Ok(Value::Object(result))
+}
+
+fn native_get_own_property_descriptor_rooted(
+    ctx: &mut NativeCtx<'_>,
+    context: Option<&crate::ExecutionContext>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
+    if matches!(
+        target,
+        Value::Proxy(_)
+            | Value::Array(_)
+            | Value::RegExp(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::NativeFunction(_)
+    ) {
+        let Some(context) = context else {
+            return Err(VmError::InvalidOperand);
+        };
+        let desc = ctx.cx.interp.get_own_property_descriptor_for_value(
+            context,
+            target.clone(),
+            args.get(1),
+        )?;
+        return match desc {
+            Some(desc) => Ok(Value::Object(native_descriptor_to_object_rooted(
+                ctx,
+                &desc,
+                &[&target],
+                args,
+            )?)),
+            None => Ok(Value::Undefined),
+        };
+    }
+
+    let key = expect_property_key(args.get(1))?;
+    let desc = match args.first() {
+        Some(Value::Object(target)) => match &key {
+            PropertyKey::String(key) => crate::object::get_own_descriptor(*target, ctx.heap(), key),
+            PropertyKey::Symbol(sym) => {
+                crate::object::get_own_symbol_descriptor(*target, ctx.heap(), sym)
+            }
+        },
+        Some(Value::ClassConstructor(class)) => match &key {
+            PropertyKey::String(key) => {
+                crate::object::get_own_descriptor(class.statics(ctx.heap()), ctx.heap(), key)
+            }
+            PropertyKey::Symbol(sym) => {
+                crate::object::get_own_symbol_descriptor(class.statics(ctx.heap()), ctx.heap(), sym)
+            }
+        },
+        Some(Value::NativeFunction(native)) => {
+            let PropertyKey::String(key) = &key else {
+                return Ok(Value::Undefined);
+            };
+            native.own_property_descriptor(ctx.heap(), &ctx.cx.interp.string_heap_clone(), key)?
+        }
+        _ => {
+            return Err(VmError::TypeError {
+                message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
+            });
+        }
+    };
+    match desc {
+        Some(desc) => Ok(Value::Object(native_descriptor_to_object_rooted(
+            ctx,
+            &desc,
+            &[],
+            args,
+        )?)),
+        None => Ok(Value::Undefined),
+    }
+}
+
+fn native_get_own_property_descriptors_rooted(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let target = expect_object(args.first())?;
+    let target_root = Value::Object(target);
+    let result = ctx.alloc_object_with_roots(&[&target_root], &[args])?;
+    let result_root = Value::Object(result);
+    let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
+        crate::object::with_properties(target, ctx.heap(), |p| {
+            (
+                p.keys().map(|s| s.to_string()).collect(),
+                p.symbol_keys().collect(),
+            )
+        });
+    for key in keys {
+        if let Some(desc) = crate::object::get_own_descriptor(target, ctx.heap(), &key) {
+            let desc_obj = native_descriptor_to_object_rooted(
+                ctx,
+                &desc,
+                &[&target_root, &result_root],
+                args,
+            )?;
+            crate::object::set(result, ctx.heap_mut(), &key, Value::Object(desc_obj));
+        }
+    }
+    for sym in symbols {
+        if let Some(desc) = crate::object::get_own_symbol_descriptor(target, ctx.heap(), &sym) {
+            let desc_obj = native_descriptor_to_object_rooted(
+                ctx,
+                &desc,
+                &[&target_root, &result_root],
+                args,
+            )?;
+            if !crate::object::set_symbol(result, ctx.heap_mut(), sym, Value::Object(desc_obj)) {
+                return Err(VmError::TypeMismatch);
+            }
+        }
+    }
+    Ok(Value::Object(result))
+}
+
+fn native_get_own_property_names_rooted(
+    ctx: &mut NativeCtx<'_>,
+    context: Option<&crate::ExecutionContext>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    if let Some(target @ Value::Proxy(_)) = args.first() {
+        let Some(context) = context else {
+            return Err(VmError::InvalidOperand);
+        };
+        let target = target.clone();
+        let string_heap = ctx.cx.interp.string_heap_clone();
+        let trap_keys = ctx
+            .cx
+            .interp
+            .own_property_keys_value(context, &target, &string_heap)?;
+        let values: Vec<Value> = trap_keys
+            .into_iter()
+            .filter(|v| matches!(v, Value::String(_)))
+            .collect();
+        return Ok(Value::Array(ctx.array_from_elements_with_roots(
+            values,
+            &[&target],
+            &[args],
+        )?));
+    }
+    let owned: Vec<String> = match args.first() {
+        Some(Value::Object(target)) => crate::object::with_properties(*target, ctx.heap(), |p| {
+            p.keys().map(|k| k.to_string()).collect()
+        }),
+        Some(Value::NativeFunction(native)) => {
+            native.own_property_keys(ctx.heap()).into_iter().collect()
+        }
+        Some(Value::BoundFunction(bound)) => {
+            crate::function_metadata::bound_own_property_keys(bound, ctx.heap())
+                .into_iter()
+                .collect()
+        }
+        Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
+        Some(Value::String(s)) => {
+            let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
+            keys.push("length".to_string());
+            keys
+        }
+        _ => return Err(VmError::TypeMismatch),
+    };
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    let mut names = Vec::with_capacity(owned.len());
+    for key in owned {
+        names.push(string_value(&key, &string_heap)?);
+    }
+    Ok(Value::Array(ctx.array_from_elements_with_roots(
+        names,
+        &[],
+        &[args],
+    )?))
+}
+
+fn native_get_own_property_symbols_rooted(
+    ctx: &mut NativeCtx<'_>,
+    context: Option<&crate::ExecutionContext>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    if let Some(target @ Value::Proxy(_)) = args.first() {
+        let Some(context) = context else {
+            return Err(VmError::InvalidOperand);
+        };
+        let target = target.clone();
+        let string_heap = ctx.cx.interp.string_heap_clone();
+        let trap_keys = ctx
+            .cx
+            .interp
+            .own_property_keys_value(context, &target, &string_heap)?;
+        let values: Vec<Value> = trap_keys
+            .into_iter()
+            .filter(|v| matches!(v, Value::Symbol(_)))
+            .collect();
+        return Ok(Value::Array(ctx.array_from_elements_with_roots(
+            values,
+            &[&target],
+            &[args],
+        )?));
+    }
+    let target = expect_object(args.first())?;
+    let syms: Vec<Value> = crate::object::with_properties(target, ctx.heap(), |p| {
+        p.symbol_keys().map(Value::Symbol).collect()
+    });
+    let target_root = Value::Object(target);
+    Ok(Value::Array(ctx.array_from_elements_with_roots(
+        syms,
+        &[&target_root],
+        &[args],
+    )?))
+}
+
+fn native_descriptor_to_object_rooted(
+    ctx: &mut NativeCtx<'_>,
+    desc: &PropertyDescriptor,
+    value_roots: &[&Value],
+    args: &[Value],
+) -> Result<JsObject, VmError> {
+    let mut roots = Vec::with_capacity(value_roots.len() + 2);
+    roots.extend_from_slice(value_roots);
+    match &desc.kind {
+        DescriptorKind::Data { value } => roots.push(value),
+        DescriptorKind::Accessor { getter, setter } => {
+            if let Some(getter) = getter {
+                roots.push(getter);
+            }
+            if let Some(setter) = setter {
+                roots.push(setter);
+            }
+        }
+    }
+    let result = ctx.alloc_object_with_roots(roots.as_slice(), &[args])?;
+    match &desc.kind {
+        DescriptorKind::Data { value } => {
+            crate::object::set(result, ctx.heap_mut(), "value", value.clone());
+            crate::object::set(
+                result,
+                ctx.heap_mut(),
+                "writable",
+                Value::Boolean(desc.writable()),
+            );
+        }
+        DescriptorKind::Accessor { getter, setter } => {
+            crate::object::set(
+                result,
+                ctx.heap_mut(),
+                "get",
+                getter.clone().unwrap_or(Value::Undefined),
+            );
+            crate::object::set(
+                result,
+                ctx.heap_mut(),
+                "set",
+                setter.clone().unwrap_or(Value::Undefined),
+            );
+        }
+    }
+    crate::object::set(
+        result,
+        ctx.heap_mut(),
+        "enumerable",
+        Value::Boolean(desc.enumerable()),
+    );
+    crate::object::set(
+        result,
+        ctx.heap_mut(),
+        "configurable",
+        Value::Boolean(desc.configurable()),
+    );
+    Ok(result)
 }
 
 fn object_native_error(name: &'static str, err: VmError) -> NativeError {

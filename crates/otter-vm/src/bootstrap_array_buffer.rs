@@ -259,8 +259,26 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    dispatch::array_buffer_call(ArrayBufferMethod::Construct, args, ctx.heap())
-        .map_err(|e| vm_to_native(e, "ArrayBuffer"))
+    let roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let new_target = ctx.new_target().cloned();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        crate::runtime_cx::visit_native_roots(
+            visitor,
+            &roots,
+            &this_value,
+            new_target.as_ref(),
+            &[],
+            &[args],
+        );
+    };
+    dispatch::array_buffer_call_with_roots(
+        ArrayBufferMethod::Construct,
+        args,
+        ctx.heap_mut(),
+        &mut external_visit,
+    )
+    .map_err(|e| vm_to_native(e, "ArrayBuffer"))
 }
 
 fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

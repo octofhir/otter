@@ -224,13 +224,15 @@ impl Interpreter {
     pub(crate) fn run_load_property_reg(
         &mut self,
         context: &ExecutionContext,
-        frame: &mut Frame,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
         dst: u16,
         obj_reg: u16,
         key: AtomizedPropertyKey<'_>,
     ) -> Result<(), VmError> {
         let name = key.name();
-        let value = match read_register(frame, obj_reg)? {
+        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let value = match &receiver {
             Value::Object(o) => {
                 crate::object::get(*o, &self.gc_heap, name).unwrap_or(Value::Undefined)
             }
@@ -281,11 +283,11 @@ impl Interpreter {
             }
             Value::Function { function_id } => {
                 let fid = *function_id;
-                self.function_property_get(context, fid, name)?
+                self.function_property_get_stack_rooted(context, stack, fid, name)?
             }
             Value::Closure { function_id, .. } => {
                 let fid = *function_id;
-                self.function_property_get(context, fid, name)?
+                self.function_property_get_stack_rooted(context, stack, fid, name)?
             }
             Value::NativeFunction(native) => {
                 match native.own_property_descriptor(&self.gc_heap, &self.string_heap, name)? {
@@ -324,8 +326,7 @@ impl Interpreter {
             Value::Symbol(s) => symbol_prototype::load_property(s, name),
             Value::Iterator(_) => match name {
                 "next" | "return" | "throw" => {
-                    let receiver_value = read_register(frame, obj_reg)?.clone();
-                    self.synthesize_iterator_method(name, receiver_value)?
+                    self.synthesize_iterator_method(name, receiver.clone())?
                 }
                 _ => Value::Undefined,
             },
@@ -418,6 +419,7 @@ impl Interpreter {
                 });
             }
         };
+        let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())
@@ -1239,7 +1241,7 @@ impl Interpreter {
                 return Ok(false);
             }
         }
-        let result = self.instanceof_operator(context, &lhs, &rhs)?;
+        let result = self.instanceof_operator_stack_rooted(context, stack, &lhs, &rhs)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         write_register(&mut stack[top_idx], dst, Value::Boolean(result))?;

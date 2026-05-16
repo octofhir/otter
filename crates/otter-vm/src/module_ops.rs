@@ -98,15 +98,19 @@ impl Interpreter {
                     loader.schedule(token, specifier, referrer.as_ref().to_string());
                     pending
                 } else {
-                    let reason = self.make_type_error(&format!(
-                        "dynamic import: module not resolvable: \"{specifier}\""
-                    ))?;
+                    let reason = self.make_type_error_with_stack_roots(
+                        stack,
+                        &format!("dynamic import: module not resolvable: \"{specifier}\""),
+                    )?;
                     promise_dispatch::PromiseBuilder::with_context(import_context.clone())
                         .rejected_stack_rooted(self, stack, reason, &[], &[])?
                 }
             }
             _ => {
-                let reason = self.make_type_error("dynamic import: specifier must be a string")?;
+                let reason = self.make_type_error_with_stack_roots(
+                    stack,
+                    "dynamic import: specifier must be a string",
+                )?;
                 promise_dispatch::PromiseBuilder::with_context(import_context)
                     .rejected_stack_rooted(self, stack, reason, &[], &[])?
             }

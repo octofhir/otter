@@ -419,7 +419,7 @@ impl Interpreter {
             // happens below if we hand back `Undefined`.
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let fid = *function_id;
-                Some(self.function_property_get(context, fid, &name)?)
+                Some(self.function_property_get_stack_rooted(context, stack, fid, &name)?)
             }
             // Native callable receiver (e.g. global `Promise` /
             // `Map` constructors). Look up `name` on the function
@@ -926,12 +926,27 @@ impl Interpreter {
                 );
                 let metadata =
                     function_metadata::bound_create_metadata(&ctx, callee, bound_args.len())?;
-                let bound = BoundFunction::new_with_metadata(
+                let callee_root = callee.clone();
+                let this_root = this_value.clone();
+                let bound_args_root = bound_args.clone();
+                let roots = self.collect_allocation_roots(stack);
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for &slot in &roots {
+                        visitor(slot);
+                    }
+                    callee_root.trace_value_slots(visitor);
+                    this_root.trace_value_slots(visitor);
+                    for arg in &bound_args_root {
+                        arg.trace_value_slots(visitor);
+                    }
+                };
+                let bound = BoundFunction::new_with_metadata_and_roots(
                     &mut self.gc_heap,
                     callee.clone(),
                     this_value,
                     bound_args,
                     metadata,
+                    &mut external_visit,
                 )?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::BoundFunction(bound))?;

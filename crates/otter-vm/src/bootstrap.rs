@@ -1525,7 +1525,7 @@ fn install_function(
             });
         };
         interp
-            .build_function_constructor(&context, args)
+            .build_function_constructor_with_roots(&context, args, None, &[], &[args])
             .map_err(|err| {
                 let reason = format!("{err}");
                 match err {

@@ -39,7 +39,12 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let clamped_end = end.clamp(clamped_start as i64, len) as usize;
     let bytes = buf.borrow_bytes();
     let copy: Vec<u8> = bytes[clamped_start..clamped_end].to_vec();
-    Ok(Value::ArrayBuffer(JsArrayBuffer::from_bytes(copy)))
+    drop(bytes);
+    Ok(Value::ArrayBuffer(args.array_buffer_from_bytes_rooted(
+        copy,
+        &[],
+        &[],
+    )?))
 }
 
 /// §25.1.5.6 `resize(newByteLength)` — only valid for resizable
@@ -83,7 +88,7 @@ fn impl_transfer_to_fixed_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, 
     transfer_inner(args, /* fixed = */ true)
 }
 
-fn transfer_inner(args: &IntrinsicArgs<'_>, fixed: bool) -> Result<Value, IntrinsicError> {
+fn transfer_inner(args: &mut IntrinsicArgs<'_>, fixed: bool) -> Result<Value, IntrinsicError> {
     let buf = receiver(args)?;
     if buf.is_detached() {
         return Err(IntrinsicError::BadReceiver {
@@ -110,14 +115,19 @@ fn transfer_inner(args: &IntrinsicArgs<'_>, fixed: bool) -> Result<Value, Intrin
         new_bytes[..copy_len].copy_from_slice(&src[..copy_len]);
     }
     let new_buffer = if fixed {
-        JsArrayBuffer::from_bytes(new_bytes)
+        args.array_buffer_from_bytes_rooted(new_bytes, &[], &[])?
     } else if buf.is_resizable() {
         let max = buf.max_byte_length().max(new_len);
-        let result = JsArrayBuffer::new_resizable(new_len, max);
+        let result = args
+            .array_buffer_resizable_rooted(new_len, max, &[], &[])?
+            .ok_or(IntrinsicError::OutOfRange {
+                index: 0,
+                reason: "allocation failed",
+            })?;
         result.borrow_bytes_mut().copy_from_slice(&new_bytes);
         result
     } else {
-        JsArrayBuffer::from_bytes(new_bytes)
+        args.array_buffer_from_bytes_rooted(new_bytes, &[], &[])?
     };
     buf.detach();
     Ok(Value::ArrayBuffer(new_buffer))

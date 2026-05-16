@@ -85,6 +85,11 @@ pub struct LocalBody {
     /// fixed-length buffer. When set, [`Self::bytes`] never grows
     /// beyond `n`.
     max_byte_length: Option<usize>,
+    /// GC-budget reservation for the off-heap byte storage. Older
+    /// fixture-only constructors leave this empty; active runtime
+    /// constructors install a token so backing stores participate in
+    /// heap pressure.
+    external: RefCell<Option<otter_gc::ExternalMemory>>,
 }
 
 /// Storage for a `SharedArrayBuffer`.
@@ -190,6 +195,7 @@ impl JsArrayBuffer {
                 bytes: RefCell::new(Vec::new()),
                 detached: Cell::new(true),
                 max_byte_length: None,
+                external: RefCell::new(None),
             })
         })
     }
@@ -207,7 +213,30 @@ impl JsArrayBuffer {
             bytes: RefCell::new(bytes),
             detached: Cell::new(false),
             max_byte_length: None,
+            external: RefCell::new(None),
         }))
+    }
+
+    /// Fallible fixed-length allocation that accounts the backing
+    /// store as external memory and visits caller-provided roots if
+    /// booking triggers emergency GC.
+    pub fn try_new_with_roots(
+        len: usize,
+        heap: &mut otter_gc::GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
+        let external = heap.reserve_external_with_roots(len as u64, external_visit)?;
+        let mut bytes: Vec<u8> = Vec::new();
+        if bytes.try_reserve_exact(len).is_err() {
+            return Ok(None);
+        }
+        bytes.resize(len, 0u8);
+        Ok(Some(Self::local(LocalBody {
+            bytes: RefCell::new(bytes),
+            detached: Cell::new(false),
+            max_byte_length: None,
+            external: RefCell::new(Some(external)),
+        })))
     }
 
     /// Allocate a resizable buffer with initial length `len` and the
@@ -221,7 +250,32 @@ impl JsArrayBuffer {
             bytes: RefCell::new(bytes),
             detached: Cell::new(false),
             max_byte_length: Some(max_byte_length),
+            external: RefCell::new(None),
         })
+    }
+
+    /// Accounted resizable allocation. The reservation covers
+    /// `max_byte_length` because the vector reserves that capacity
+    /// up front and later `resize` calls only publish bytes already
+    /// booked against the heap.
+    pub fn new_resizable_with_roots(
+        len: usize,
+        max_byte_length: usize,
+        heap: &mut otter_gc::GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Option<Self>, otter_gc::OutOfMemory> {
+        let external = heap.reserve_external_with_roots(max_byte_length as u64, external_visit)?;
+        let mut bytes: Vec<u8> = Vec::new();
+        if bytes.try_reserve_exact(max_byte_length).is_err() {
+            return Ok(None);
+        }
+        bytes.resize(len, 0u8);
+        Ok(Some(Self::local(LocalBody {
+            bytes: RefCell::new(bytes),
+            detached: Cell::new(false),
+            max_byte_length: Some(max_byte_length),
+            external: RefCell::new(Some(external)),
+        })))
     }
 
     /// Wrap an existing byte vector. Used by [`JsArrayBuffer::slice`]
@@ -232,7 +286,24 @@ impl JsArrayBuffer {
             bytes: RefCell::new(bytes),
             detached: Cell::new(false),
             max_byte_length: None,
+            external: RefCell::new(None),
         })
+    }
+
+    /// Wrap an existing byte vector and account its current length as
+    /// external memory.
+    pub fn from_bytes_with_roots(
+        bytes: Vec<u8>,
+        heap: &mut otter_gc::GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let external = heap.reserve_external_with_roots(bytes.len() as u64, external_visit)?;
+        Ok(Self::local(LocalBody {
+            bytes: RefCell::new(bytes),
+            detached: Cell::new(false),
+            max_byte_length: None,
+            external: RefCell::new(Some(external)),
+        }))
     }
 
     /// Allocate a fixed-length `SharedArrayBuffer`. Cannot be
@@ -411,6 +482,7 @@ impl JsArrayBuffer {
         };
         if !body.detached.replace(true) {
             body.bytes.borrow_mut().clear();
+            let _ = body.external.borrow_mut().take();
         }
     }
 

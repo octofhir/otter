@@ -148,8 +148,9 @@ pub enum VmError {
     /// Tried to call a value that is not callable.
     NotCallable,
     /// `LoadGlobalOrThrow` (or another lookup site) hit an
-    /// unbound free identifier in strict mode. Convertible to a
-    /// real `ReferenceError` instance via `vm_error_to_throwable`.
+    /// unbound free identifier in strict mode. Convertible to a real
+    /// `ReferenceError` instance through the dispatch loop's stack-rooted
+    /// throwable conversion.
     UndefinedIdentifier {
         /// Name of the unbound identifier.
         name: String,

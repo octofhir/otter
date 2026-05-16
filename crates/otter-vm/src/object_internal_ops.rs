@@ -24,8 +24,8 @@
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Interpreter, JsObject, JsString, NumberValue, Value, VmError, VmGetOutcome,
-    VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata,
+    ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value, VmError,
+    VmGetOutcome, VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata,
     make_array_iterator_factory, object, object_statics, proxy, regexp_prototype, string, symbol,
     to_length,
 };
@@ -1359,6 +1359,58 @@ impl Interpreter {
         }
     }
 
+    pub(crate) fn instanceof_target_prototype_stack_rooted(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        rhs: &Value,
+    ) -> Result<Option<Value>, VmError> {
+        match rhs {
+            Value::Object(_) | Value::Proxy(_) => {
+                let key = VmPropertyKey::String("prototype");
+                match self.ordinary_get_value(context, rhs.clone(), rhs.clone(), &key, 0)? {
+                    VmGetOutcome::Value(Value::Undefined) => Ok(Some(rhs.clone())),
+                    VmGetOutcome::Value(value @ (Value::Object(_) | Value::Proxy(_))) => {
+                        Ok(Some(value))
+                    }
+                    VmGetOutcome::Value(_) => Err(VmError::TypeError {
+                        message: "instanceof prototype is not an object".to_string(),
+                    }),
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        let value = self.run_callable_sync(context, &getter, rhs.clone(), args)?;
+                        if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                            Ok(Some(value))
+                        } else {
+                            Err(VmError::TypeError {
+                                message: "instanceof prototype is not an object".to_string(),
+                            })
+                        }
+                    }
+                }
+            }
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let value = self.function_property_get_stack_rooted(
+                    context,
+                    stack,
+                    *function_id,
+                    "prototype",
+                )?;
+                if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                    Ok(Some(value))
+                } else {
+                    Err(VmError::TypeError {
+                        message: "instanceof prototype is not an object".to_string(),
+                    })
+                }
+            }
+            Value::ClassConstructor(class) => {
+                Ok(Some(Value::Object(class.prototype(&self.gc_heap))))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn value_has_proxy_aware_prototype(
         &mut self,
         context: &ExecutionContext,
@@ -1784,6 +1836,7 @@ impl Interpreter {
     pub(crate) fn try_proxy_object_static_call(
         &mut self,
         context: &ExecutionContext,
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
         method: otter_bytecode::method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
@@ -1803,8 +1856,6 @@ impl Interpreter {
                     | Value::Function { .. }
                     | Value::Closure { .. }
                     | Value::BoundFunction(_)
-                    | Value::NativeFunction(_)
-                    | Value::ClassConstructor(_)
             )
         {
             let key =
@@ -1865,10 +1916,16 @@ impl Interpreter {
                     .into_iter()
                     .filter(|v| matches!(v, Value::String(_)))
                     .collect();
-                Ok(Some(Value::Array(array::from_elements(
-                    &mut self.gc_heap,
-                    values,
-                )?)))
+                let array = match stack_roots {
+                    Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        values,
+                        &[&target_clone],
+                        &[args],
+                    )?,
+                    None => array::from_elements(&mut self.gc_heap, values)?,
+                };
+                Ok(Some(Value::Array(array)))
             }
             M::GetOwnPropertySymbols => {
                 let string_heap = self.string_heap.clone();
@@ -1879,10 +1936,16 @@ impl Interpreter {
                     .into_iter()
                     .filter(|v| matches!(v, Value::Symbol(_)))
                     .collect();
-                Ok(Some(Value::Array(array::from_elements(
-                    &mut self.gc_heap,
-                    values,
-                )?)))
+                let array = match stack_roots {
+                    Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        values,
+                        &[&target_clone],
+                        &[args],
+                    )?,
+                    None => array::from_elements(&mut self.gc_heap, values)?,
+                };
+                Ok(Some(Value::Array(array)))
             }
             _ => Ok(None),
         }

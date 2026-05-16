@@ -19,7 +19,6 @@ use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::string::JsString;
 
-use super::array_buffer::JsArrayBuffer;
 use super::typed_array::{JsTypedArray, TypedArrayKind};
 use super::{number_value, smi};
 
@@ -101,14 +100,30 @@ fn build_subarray(t: &JsTypedArray, start: usize, len: usize) -> Value {
     ))
 }
 
-fn build_new_typed_array(kind: TypedArrayKind, values: &[Value]) -> Value {
+fn build_new_typed_array_rooted(
+    args: &mut IntrinsicArgs<'_>,
+    kind: TypedArrayKind,
+    values: &[Value],
+) -> Result<Value, IntrinsicError> {
     let bpe = kind.bytes_per_element();
-    let buf = JsArrayBuffer::new(values.len() * bpe);
+    let byte_len = values
+        .len()
+        .checked_mul(bpe)
+        .ok_or(IntrinsicError::OutOfRange {
+            index: 0,
+            reason: "byte length overflow",
+        })?;
+    let buf = args
+        .array_buffer_zeroed_rooted(byte_len, &[], &[values])?
+        .ok_or(IntrinsicError::OutOfRange {
+            index: 0,
+            reason: "allocation failed",
+        })?;
     let view = JsTypedArray::new(buf, kind, 0, values.len());
     for (i, v) in values.iter().enumerate() {
         view.set(i, v);
     }
-    Value::TypedArray(view)
+    Ok(Value::TypedArray(view))
 }
 
 // ---- pure-functional methods --------------------------------------------
@@ -155,7 +170,16 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let final_end = end.clamp(start, len) as usize;
     let new_len = final_end.saturating_sub(final_start);
     let bpe = t.kind().bytes_per_element();
-    let new_buf = JsArrayBuffer::new(new_len * bpe);
+    let byte_len = new_len.checked_mul(bpe).ok_or(IntrinsicError::OutOfRange {
+        index: 0,
+        reason: "byte length overflow",
+    })?;
+    let new_buf =
+        args.array_buffer_zeroed_rooted(byte_len, &[], &[])?
+            .ok_or(IntrinsicError::OutOfRange {
+                index: 0,
+                reason: "allocation failed",
+            })?;
     {
         let src = t.buffer().borrow_bytes();
         let mut dst = new_buf.borrow_bytes_mut();
@@ -404,7 +428,7 @@ fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     check_not_detached(&t)?;
     let mut snapshot = copy_view(&t);
     snapshot.reverse();
-    Ok(build_new_typed_array(t.kind(), &snapshot))
+    build_new_typed_array_rooted(args, t.kind(), &snapshot)
 }
 
 fn impl_to_sorted_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -412,7 +436,7 @@ fn impl_to_sorted_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrins
     check_not_detached(&t)?;
     let mut snapshot = copy_view(&t);
     sort_default(&mut snapshot, t.kind().is_bigint());
-    Ok(build_new_typed_array(t.kind(), &snapshot))
+    build_new_typed_array_rooted(args, t.kind(), &snapshot)
 }
 
 fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -441,7 +465,7 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
     let mut snapshot = copy_view(&t);
     snapshot[resolved as usize] = value;
-    Ok(build_new_typed_array(t.kind(), &snapshot))
+    build_new_typed_array_rooted(args, t.kind(), &snapshot)
 }
 
 /// Wrap a snapshot of values in a `Value::Iterator`. Mirrors the
@@ -601,16 +625,9 @@ pub fn load_property(t: &JsTypedArray, name: &str) -> Value {
     }
 }
 
-/// Build a fresh TypedArray of `kind` containing `values`. Used by
-/// `Array.from` / `from` / `of` paths and by the no-callback subset
-/// of the prototype.
-#[must_use]
-pub fn from_values(kind: TypedArrayKind, values: &[Value]) -> Value {
-    build_new_typed_array(kind, values)
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::array_buffer::JsArrayBuffer;
     use super::*;
     use crate::string::StringHeap;
 
@@ -637,5 +654,31 @@ mod tests {
             "TypedArray.prototype.entries should allocate pair arrays, snapshot array, and iterator state in young space"
         );
         assert!(matches!(result, Value::Iterator(_)));
+    }
+
+    #[test]
+    fn typed_array_slice_uses_intrinsic_rooted_backing_store_reservation() {
+        let strings = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("gc heap");
+        let buffer = JsArrayBuffer::new(4);
+        let source = JsTypedArray::new(buffer, TypedArrayKind::Int16, 0, 2);
+        source.set(0, &smi(7));
+        source.set(1, &smi(11));
+        let receiver = Value::TypedArray(source);
+        let before = gc_heap.tracked_bytes();
+
+        let result = impl_slice(&mut IntrinsicArgs {
+            receiver: &receiver,
+            args: &[],
+            string_heap: &strings,
+            gc_heap: &mut gc_heap,
+            allocation_roots: &[],
+        })
+        .expect("slice");
+
+        assert!(matches!(result, Value::TypedArray(_)));
+        assert_eq!(gc_heap.tracked_bytes() - before, 4);
+        drop(result);
+        assert_eq!(gc_heap.tracked_bytes(), before);
     }
 }

@@ -127,7 +127,7 @@ impl RuntimeModuleRecords {
                         reason: ConfigError::ConflictingCapabilities { message },
                     })?
             } else {
-                otter_vm::object::alloc_object(interp.gc_heap_mut())?
+                interp.alloc_host_object_with_roots(&[], &[])?
             };
             interp.register_module_env(Rc::from(init.url.as_str()), env);
             // The graph load + linker pipeline has already done

@@ -829,6 +829,55 @@ impl BoundFunction {
         })
     }
 
+    /// Build a bound function while exposing caller-owned roots
+    /// across the function's ordinary property bag and body
+    /// allocations.
+    pub(crate) fn new_with_metadata_and_roots(
+        heap: &mut otter_gc::GcHeap,
+        target: Value,
+        bound_this: Value,
+        bound_args: SmallVec<[Value; 4]>,
+        metadata: function_metadata::BoundFunctionCreateMetadata,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let own_properties = {
+            let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                external_visit(visitor);
+                target.trace_value_slots(visitor);
+                bound_this.trace_value_slots(visitor);
+                for arg in &bound_args {
+                    arg.trace_value_slots(visitor);
+                }
+            };
+            object::alloc_object_with_roots(heap, &mut visit)?
+        };
+        let own_properties_root = Value::Object(own_properties);
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            own_properties_root.trace_value_slots(visitor);
+            target.trace_value_slots(visitor);
+            bound_this.trace_value_slots(visitor);
+            for arg in &bound_args {
+                arg.trace_value_slots(visitor);
+            }
+        };
+        Ok(Self {
+            inner: heap.alloc_with_roots(
+                BoundFunctionBody {
+                    target: target.clone(),
+                    bound_this: bound_this.clone(),
+                    bound_args: bound_args.clone(),
+                    builtin_name: metadata.name,
+                    builtin_length: metadata.length,
+                    name_property: BoundFunctionMetadataProperty::Builtin,
+                    length_property: BoundFunctionMetadataProperty::Builtin,
+                    own_properties,
+                },
+                &mut visit,
+            )?,
+        })
+    }
+
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
     pub(crate) fn raw(&self) -> RawGc {
@@ -3115,7 +3164,7 @@ impl Interpreter {
                         }
                         continue;
                     }
-                    if let Some(thrown) = self.vm_error_to_throwable(&err) {
+                    if let Some(thrown) = self.vm_error_to_throwable_with_stack_roots(stack, &err) {
                         let uncaught = if matches!(err, VmError::OutOfMemory { .. }) {
                             Some(err.clone())
                         } else {
@@ -3843,8 +3892,7 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_property_reg(context, frame, dst, obj_reg, key)?;
+                    self.run_load_property_reg(context, &mut *stack, top_idx, dst, obj_reg, key)?;
                     continue;
                 }
                 Op::StoreProperty => {
@@ -4595,13 +4643,22 @@ impl Interpreter {
                 | Op::SameValue => {
                     unreachable!("register binary ops handled earlier in this loop")
                 }
+                Op::JsonCall => {
+                    self.run_json_static_call_operands(stack, operands)?;
+                    continue;
+                }
+                Op::ArrayBufferCall => {
+                    self.run_array_buffer_static_call_operands(stack, operands)?;
+                    continue;
+                }
+                Op::TypedArrayCall => {
+                    self.run_typed_array_static_call_operands(stack, operands)?;
+                    continue;
+                }
                 Op::MathCall
-                | Op::JsonCall
                 | Op::DateCall
                 | Op::BigIntCall
-                | Op::ArrayBufferCall
                 | Op::DataViewCall
-                | Op::TypedArrayCall
                 | Op::SharedArrayBufferCall => {
                     self.run_static_call_operands(op, context, frame, operands)?;
                 }
@@ -4628,7 +4685,8 @@ impl Interpreter {
                     continue;
                 }
                 Op::ObjectCall => {
-                    self.run_static_call_operands(op, context, frame, operands)?;
+                    self.run_object_static_call_operands(context, stack, operands)?;
+                    continue;
                 }
                 Op::QueueMicrotask => {
                     self.run_queue_microtask_operands(context, frame, operands)?;
@@ -5793,6 +5851,165 @@ mod tests {
     }
 
     #[test]
+    fn bytecode_function_prototype_uses_young_allocation_with_frame_roots() {
+        let module = module_with(Vec::new(), 4);
+        let context = ExecutionContext::from_module(module.clone());
+        let mut interp = Interpreter::new();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Function { function_id: 1 };
+        stack.push(frame);
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let prototype = interp
+            .function_property_get_stack_rooted(&context, &stack, 1, "prototype")
+            .expect("prototype");
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Function .prototype should allocate user bag and prototype object in young space"
+        );
+
+        let Value::Object(proto) = prototype else {
+            panic!("function prototype should be an object");
+        };
+        assert_eq!(
+            object::get(proto, interp.gc_heap(), "constructor"),
+            Some(Value::Function { function_id: 1 })
+        );
+    }
+
+    #[test]
+    fn runtime_function_prototype_uses_young_allocation_with_explicit_roots() {
+        let module = module_with(Vec::new(), 4);
+        let context = ExecutionContext::from_module(module);
+        let mut interp = Interpreter::new();
+        let target = Value::Function { function_id: 1 };
+        let arg = Value::String(JsString::from_str("rooted-arg", &interp.string_heap).unwrap());
+        let args = [arg.clone()];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let prototype = interp
+            .function_property_get_runtime_rooted(&context, 1, "prototype", &[&target], &[&args])
+            .expect("prototype");
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Function .prototype should allocate through runtime roots when no VM frame is active"
+        );
+
+        let Value::Object(proto) = prototype else {
+            panic!("function prototype should be an object");
+        };
+        assert_eq!(
+            object::get(proto, interp.gc_heap(), "constructor"),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn bytecode_instanceof_function_prototype_uses_stack_roots() {
+        let module = module_with(Vec::new(), 4);
+        let context = ExecutionContext::from_module(module.clone());
+        let mut interp = Interpreter::new();
+        let lhs = object::alloc_object(interp.gc_heap_mut()).expect("lhs");
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[1] = Value::Object(lhs);
+        frame.registers[2] = Value::Function { function_id: 1 };
+        stack.push(frame);
+        let operands = vec![
+            Operand::Register(0),
+            Operand::Register(1),
+            Operand::Register(2),
+        ];
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            interp
+                .drive_instanceof(&mut stack, &context, operands.as_slice())
+                .expect("instanceof")
+        );
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "instanceof should lazily allocate function .prototype through stack roots"
+        );
+        assert_eq!(stack[0].registers[0], Value::Boolean(false));
+        let desc = interp
+            .ordinary_function_own_property_descriptor(Some(&context), 1, "prototype")
+            .unwrap()
+            .expect("prototype descriptor");
+        assert!(matches!(descriptor_value(&desc), Value::Object(_)));
+    }
+
+    #[test]
+    fn new_function_wrapper_uses_rooted_prototype_and_native_allocation() {
+        let compiled_main = vec![
+            Instruction {
+                pc: 0,
+                op: Op::MakeFunction,
+                operands: vec![Operand::Register(0), Operand::ConstIndex(0)].into(),
+            },
+            Instruction {
+                pc: 1,
+                op: Op::Return,
+                operands: vec![Operand::Register(0)].into(),
+            },
+        ];
+        let inner = test_function(1, "anonymous", 0, 1, Vec::new());
+        let compiled = BytecodeModule {
+            module: "eval.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 1, compiled_main), inner],
+            constants: vec![Constant::FunctionId { index: 1 }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let outer = module_with(Vec::new(), 4);
+        let context = ExecutionContext::from_module(outer.clone());
+        let mut interp = Interpreter::new();
+        interp.set_eval_hook(Some(std::rc::Rc::new(move |_, _| Ok(compiled.clone()))));
+        let arg = Value::String(JsString::from_str("", &interp.string_heap).unwrap());
+        let args = [arg];
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&outer.functions[0]);
+        frame.registers[0] = args[0].clone();
+        stack.push(frame);
+
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+        let wrapper = interp
+            .build_function_constructor_with_roots(
+                &context,
+                args.as_slice(),
+                Some(&stack),
+                &[],
+                &[args.as_slice()],
+            )
+            .expect("Function constructor");
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "new Function wrapper should allocate prototype and native metadata through roots"
+        );
+
+        let Value::NativeFunction(native) = wrapper else {
+            panic!("new Function should return a native wrapper");
+        };
+        let desc = native
+            .own_property_descriptor(interp.gc_heap(), &interp.string_heap, "prototype")
+            .unwrap()
+            .expect("prototype descriptor");
+        let Value::Object(proto) = descriptor_value(&desc) else {
+            panic!("prototype should be an object");
+        };
+        assert_eq!(
+            object::get(proto, interp.gc_heap(), "constructor"),
+            Some(Value::NativeFunction(native))
+        );
+    }
+
+    #[test]
     fn get_iterator_map_snapshot_uses_young_allocation_with_frame_roots() {
         let module = module_with(Vec::new(), 5);
         let mut interp = Interpreter::new();
@@ -6421,6 +6638,103 @@ mod tests {
     }
 
     #[test]
+    fn vm_error_throwable_uses_stack_rooted_allocation() {
+        let module = module_with(Vec::new(), 1);
+        let mut interp = Interpreter::new();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(&module.functions[0]));
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let Some(Value::Object(error)) =
+            interp.vm_error_to_throwable_with_stack_roots(&stack, &VmError::TypeMismatch)
+        else {
+            panic!("TypeMismatch should convert to a throwable object");
+        };
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "VM error throwable conversion should allocate through stack roots"
+        );
+        assert!(matches!(
+            object::get(error, interp.gc_heap(), "message"),
+            Some(Value::String(message)) if message
+                .to_lossy_string()
+                .contains("type mismatch")
+        ));
+    }
+
+    #[test]
+    fn host_rooted_object_and_array_helpers_use_young_allocation() {
+        let mut interp = Interpreter::new();
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        let host = interp
+            .alloc_host_object_with_roots(&[], &[])
+            .expect("host object allocation");
+        let host_root = Value::Object(host);
+        let elements = [Value::Number(NumberValue::from_i32(1))];
+        let array = interp
+            .array_from_elements_host_rooted(
+                elements.iter().cloned(),
+                &[&host_root],
+                &[elements.as_slice()],
+            )
+            .expect("host array allocation");
+        object::set(host, interp.gc_heap_mut(), "items", Value::Array(array));
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "host-rooted object and array helpers should allocate in young space"
+        );
+        assert!(matches!(
+            object::get(host, interp.gc_heap(), "items"),
+            Some(Value::Array(_))
+        ));
+    }
+
+    #[test]
+    fn json_parse_uses_stack_rooted_container_allocation() {
+        let module = module_with(Vec::new(), 3);
+        let mut interp = Interpreter::new();
+        let input = Value::String(
+            JsString::from_str("{\"items\":[1,{\"nested\":2}]}", &interp.string_heap).unwrap(),
+        );
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = input;
+        stack.push(frame);
+        let operands = vec![
+            Operand::Register(1),
+            Operand::ConstIndex(0),
+            Operand::ConstIndex(1),
+            Operand::Register(0),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_json_static_call_operands(&mut stack, operands.as_slice())
+            .expect("JSON.parse");
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "JSON.parse should allocate result containers through stack roots"
+        );
+        let Value::Object(obj) = stack[0].registers[1] else {
+            panic!("JSON.parse should return an object");
+        };
+        let Some(Value::Array(items)) = object::get(obj, interp.gc_heap(), "items") else {
+            panic!("parsed object should contain items array");
+        };
+        assert_eq!(
+            array::get(items, interp.gc_heap(), 0),
+            Value::Number(NumberValue::from_i32(1))
+        );
+    }
+
+    #[test]
     fn bytecode_new_weak_ref_uses_young_allocation_with_frame_roots() {
         let module = module_with(
             vec![
@@ -6769,9 +7083,11 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let result_promise = promise_dispatch::PromiseBuilder::new()
-            .pending(interp.gc_heap_mut())
-            .expect("result promise");
+        let result_promise = {
+            let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+            JsPromiseHandle::pending_with_roots(interp.gc_heap_mut(), &mut external_visit)
+                .expect("result promise")
+        };
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.async_state = Some(AsyncFrameState { result_promise });
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
@@ -6849,14 +7165,21 @@ mod tests {
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;
         assert!(
             after > before,
-            "dynamic import rejection should allocate the promise body in young space"
+            "dynamic import rejection should allocate the TypeError and promise body through stack roots"
         );
         let Value::Promise(promise) = stack[0].registers[0] else {
             panic!("expected promise");
         };
+        let crate::promise::PromiseState::Rejected(Value::Object(reason)) =
+            promise.state(interp.gc_heap())
+        else {
+            panic!("expected TypeError rejection object");
+        };
         assert!(matches!(
-            promise.state(interp.gc_heap()),
-            crate::promise::PromiseState::Rejected(_)
+            object::get(reason, interp.gc_heap(), "message"),
+            Some(Value::String(message)) if message
+                .to_lossy_string()
+                .contains("specifier must be a string")
         ));
     }
 
@@ -7661,6 +7984,348 @@ mod tests {
         assert!(matches!(
             object::get(record, interp.gc_heap(), "revoke"),
             Some(Value::NativeFunction(_))
+        ));
+    }
+
+    #[test]
+    fn object_entries_uses_stack_rooted_result_allocation() {
+        let module = module_with(vec![], 5);
+        let mut interp = Interpreter::new();
+        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(
+            target,
+            interp.gc_heap_mut(),
+            "answer",
+            Value::Number(NumberValue::Smi(42)),
+        );
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Object(target);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![
+            Operand::Register(1),
+            Operand::ConstIndex(4),
+            Operand::ConstIndex(1),
+            Operand::Register(0),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_object_static_call_operands(&context, &mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Object.entries should allocate pair and result arrays through stack roots"
+        );
+        let Value::Array(entries) = stack[0].registers[1] else {
+            panic!("Object.entries should return an array");
+        };
+        let Value::Array(pair) = array::get(entries, interp.gc_heap(), 0) else {
+            panic!("Object.entries should contain pair arrays");
+        };
+        assert!(matches!(
+            array::get(pair, interp.gc_heap(), 0),
+            Value::String(name) if name.to_lossy_string() == "answer"
+        ));
+        assert_eq!(
+            array::get(pair, interp.gc_heap(), 1),
+            Value::Number(NumberValue::Smi(42))
+        );
+    }
+
+    #[test]
+    fn object_get_own_property_descriptors_uses_stack_rooted_allocation() {
+        let module = module_with(vec![], 5);
+        let mut interp = Interpreter::new();
+        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let descriptor =
+            object::PropertyDescriptor::data(Value::Number(NumberValue::Smi(7)), true, false, true);
+        assert!(object::define_own_property(
+            target,
+            interp.gc_heap_mut(),
+            "answer",
+            descriptor,
+        ));
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Object(target);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![
+            Operand::Register(1),
+            Operand::ConstIndex(8),
+            Operand::ConstIndex(1),
+            Operand::Register(0),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_object_static_call_operands(&context, &mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Object.getOwnPropertyDescriptors should allocate result and descriptor objects through stack roots"
+        );
+        let Value::Object(result) = stack[0].registers[1] else {
+            panic!("Object.getOwnPropertyDescriptors should return an object");
+        };
+        let Some(Value::Object(desc_obj)) = object::get(result, interp.gc_heap(), "answer") else {
+            panic!("Object.getOwnPropertyDescriptors should expose a descriptor object");
+        };
+        assert_eq!(
+            object::get(desc_obj, interp.gc_heap(), "value"),
+            Some(Value::Number(NumberValue::Smi(7)))
+        );
+        assert_eq!(
+            object::get(desc_obj, interp.gc_heap(), "enumerable"),
+            Some(Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn object_from_entries_uses_stack_rooted_result_allocation() {
+        let module = module_with(vec![], 5);
+        let mut interp = Interpreter::new();
+        let key = Value::String(JsString::from_str("answer", &interp.string_heap).unwrap());
+        let pair = array::from_elements(
+            interp.gc_heap_mut(),
+            vec![key, Value::Number(NumberValue::Smi(9))],
+        )
+        .unwrap();
+        let entries = array::from_elements(interp.gc_heap_mut(), vec![Value::Array(pair)]).unwrap();
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Array(entries);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![
+            Operand::Register(1),
+            Operand::ConstIndex(6),
+            Operand::ConstIndex(1),
+            Operand::Register(0),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_object_static_call_operands(&context, &mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Object.fromEntries should allocate the result object through stack roots"
+        );
+        let Value::Object(result) = stack[0].registers[1] else {
+            panic!("Object.fromEntries should return an object");
+        };
+        assert_eq!(
+            object::get(result, interp.gc_heap(), "answer"),
+            Some(Value::Number(NumberValue::Smi(9)))
+        );
+    }
+
+    #[test]
+    fn object_create_with_properties_uses_stack_rooted_result_allocation() {
+        let module = module_with(vec![], 6);
+        let mut interp = Interpreter::new();
+        let proto = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(
+            proto,
+            interp.gc_heap_mut(),
+            "inherited",
+            Value::Boolean(true),
+        );
+        let descriptor = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(
+            descriptor,
+            interp.gc_heap_mut(),
+            "value",
+            Value::Number(NumberValue::Smi(11)),
+        );
+        let props = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(
+            props,
+            interp.gc_heap_mut(),
+            "answer",
+            Value::Object(descriptor),
+        );
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Object(proto);
+        frame.registers[1] = Value::Object(props);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![
+            Operand::Register(2),
+            Operand::ConstIndex(1),
+            Operand::ConstIndex(2),
+            Operand::Register(0),
+            Operand::Register(1),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_object_static_call_operands(&context, &mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Object.create with descriptors should allocate the result object through stack roots"
+        );
+        let Value::Object(created) = stack[0].registers[2] else {
+            panic!("Object.create should return an object");
+        };
+        assert_eq!(
+            object::prototype_value(created, interp.gc_heap()),
+            Some(Value::Object(proto))
+        );
+        assert_eq!(
+            object::get(created, interp.gc_heap(), "answer"),
+            Some(Value::Number(NumberValue::Smi(11)))
+        );
+    }
+
+    #[test]
+    fn object_function_descriptor_uses_stack_rooted_result_allocation() {
+        let module = module_with(vec![], 5);
+        let mut interp = Interpreter::new();
+        let key = Value::String(JsString::from_str("name", &interp.string_heap).unwrap());
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Function { function_id: 0 };
+        frame.registers[1] = key;
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![
+            Operand::Register(2),
+            Operand::ConstIndex(7),
+            Operand::ConstIndex(2),
+            Operand::Register(0),
+            Operand::Register(1),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_object_static_call_operands(&context, &mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Object.getOwnPropertyDescriptor(function, key) should allocate the descriptor object through stack roots"
+        );
+        let Value::Object(desc) = stack[0].registers[2] else {
+            panic!("Object.getOwnPropertyDescriptor should return a descriptor object");
+        };
+        assert!(matches!(
+            object::get(desc, interp.gc_heap(), "value"),
+            Some(Value::String(_))
+        ));
+    }
+
+    #[test]
+    fn object_define_property_function_bag_uses_stack_rooted_allocation() {
+        let module = module_with(vec![], 6);
+        let mut interp = Interpreter::new();
+        let key = Value::String(JsString::from_str("custom", &interp.string_heap).unwrap());
+        let desc = object::alloc_object(interp.gc_heap_mut()).expect("descriptor");
+        object::set(
+            desc,
+            interp.gc_heap_mut(),
+            "value",
+            Value::Number(NumberValue::from_i32(7)),
+        );
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::Function { function_id: 0 };
+        frame.registers[1] = key;
+        frame.registers[2] = Value::Object(desc);
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![
+            Operand::Register(3),
+            Operand::ConstIndex(2),
+            Operand::ConstIndex(3),
+            Operand::Register(0),
+            Operand::Register(1),
+            Operand::Register(2),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_object_static_call_operands(&context, &mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Object.defineProperty(function, key, desc) should allocate the function bag through stack roots"
+        );
+        assert_eq!(stack[0].registers[3], Value::Function { function_id: 0 });
+        let desc = interp
+            .ordinary_function_own_property_descriptor(Some(&context), 0, "custom")
+            .unwrap()
+            .expect("custom descriptor");
+        assert_eq!(
+            descriptor_value(&desc),
+            Value::Number(NumberValue::from_i32(7))
+        );
+    }
+
+    #[test]
+    fn object_proxy_property_names_use_stack_rooted_result_allocation() {
+        let module = module_with(vec![], 5);
+        let mut interp = Interpreter::new();
+        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        object::set(
+            target,
+            interp.gc_heap_mut(),
+            "answer",
+            Value::Number(NumberValue::Smi(42)),
+        );
+        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(Value::Object(target), handler));
+
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = proxy;
+        stack.push(frame);
+        let context = ExecutionContext::from_module(module);
+        let operands = vec![
+            Operand::Register(1),
+            Operand::ConstIndex(9),
+            Operand::ConstIndex(1),
+            Operand::Register(0),
+        ];
+        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
+
+        interp
+            .run_object_static_call_operands(&context, &mut stack, &operands)
+            .unwrap();
+
+        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+        assert!(
+            after > before,
+            "Object.getOwnPropertyNames(proxy) should allocate the result array through stack roots"
+        );
+        let Value::Array(names) = stack[0].registers[1] else {
+            panic!("Object.getOwnPropertyNames(proxy) should return an array");
+        };
+        assert!(matches!(
+            array::get(names, interp.gc_heap(), 0),
+            Value::String(name) if name.to_lossy_string() == "answer"
         ));
     }
 

@@ -12,13 +12,12 @@
 //! - <https://tc39.es/ecma262/#sec-dataview-constructor>
 //! - <https://tc39.es/ecma262/#sec-typedarray-constructors>
 
-use crate::array::JsArray;
 use crate::{Value, VmError};
 
 use super::array_buffer::JsArrayBuffer;
 use super::data_view::JsDataView;
+use super::to_index;
 use super::typed_array::{JsTypedArray, TypedArrayKind};
-use super::{to_index, typed_array_prototype};
 
 // =========================================================================
 // ArrayBuffer
@@ -32,13 +31,35 @@ use super::{to_index, typed_array_prototype};
 pub fn array_buffer_call(
     method: otter_bytecode::method_id::ArrayBufferMethod,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    _gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ArrayBufferMethod as M;
     match method {
-        // §25.1.4 `new ArrayBuffer(length [, options])`. The second
-        // argument is an options bag with an optional `maxByteLength`
-        // property; when present, the buffer is resizable.
+        M::Construct => Err(VmError::TypeError {
+            message: "ArrayBuffer construction requires rooted dispatch".to_string(),
+        }),
+        // §25.1.3.1 ArrayBuffer.isView(arg) — returns `true` when
+        // arg is a TypedArray or DataView.
+        M::IsView => {
+            let v = args.first().cloned().unwrap_or(Value::Undefined);
+            Ok(Value::Boolean(matches!(
+                v,
+                Value::TypedArray(_) | Value::DataView(_)
+            )))
+        }
+    }
+}
+
+/// Root-aware ArrayBuffer dispatcher for active VM/native constructor paths
+/// that can expose live roots while reserving off-heap backing storage.
+pub fn array_buffer_call_with_roots(
+    method: otter_bytecode::method_id::ArrayBufferMethod,
+    args: &[Value],
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<Value, VmError> {
+    use otter_bytecode::method_id::ArrayBufferMethod as M;
+    match method {
         M::Construct => {
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
@@ -61,18 +82,24 @@ pub fn array_buffer_call(
                     if max < len {
                         return Err(VmError::TypeMismatch);
                     }
-                    JsArrayBuffer::new_resizable(len, max)
+                    JsArrayBuffer::new_resizable_with_roots(len, max, gc_heap, external_visit)
+                        .map_err(oom_to_vm)?
+                        .ok_or_else(|| VmError::RangeError {
+                            message: format!(
+                                "ArrayBuffer allocation of {max} bytes exceeds the available heap"
+                            ),
+                        })?
                 }
-                None => JsArrayBuffer::try_new(len).ok_or_else(|| VmError::RangeError {
-                    message: format!(
-                        "ArrayBuffer allocation of {len} bytes exceeds the available heap"
-                    ),
-                })?,
+                None => JsArrayBuffer::try_new_with_roots(len, gc_heap, external_visit)
+                    .map_err(oom_to_vm)?
+                    .ok_or_else(|| VmError::RangeError {
+                        message: format!(
+                            "ArrayBuffer allocation of {len} bytes exceeds the available heap"
+                        ),
+                    })?,
             };
             Ok(Value::ArrayBuffer(buf))
         }
-        // §25.1.3.1 ArrayBuffer.isView(arg) — returns `true` when
-        // arg is a TypedArray or DataView.
         M::IsView => {
             let v = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(matches!(
@@ -185,43 +212,86 @@ pub fn data_view_call(
 // TypedArray
 // =========================================================================
 
-/// Dispatch `new <T>(...)` / `<T>.from(...)` / `<T>.of(...)` for one
-/// of the eleven concrete TypedArray classes via the typed
-/// [`TypedArrayMethod`].
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-typedarray-constructors>
-/// - <https://tc39.es/ecma262/#sec-%25typedarray%25.from>
-/// - <https://tc39.es/ecma262/#sec-%25typedarray%25.of>
-pub fn typed_array_call(
+/// Root-aware variant for active VM/native TypedArray constructor/static paths
+/// that allocate fresh backing stores.
+pub fn typed_array_call_with_roots(
     kind: TypedArrayKind,
     method: otter_bytecode::method_id::TypedArrayMethod,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::TypedArrayMethod as M;
     match method {
-        M::Construct => construct_typed_array(kind, args, gc_heap),
-        M::From => from_static(kind, args, gc_heap),
-        M::Of => of_static(kind, args),
+        M::Construct => construct_typed_array_with_roots(kind, args, gc_heap, external_visit),
+        M::From => from_static_with_roots(kind, args, gc_heap, external_visit),
+        M::Of => of_static_with_roots(kind, args, gc_heap, external_visit),
     }
 }
 
-fn construct_typed_array(
+fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
+    VmError::OutOfMemory {
+        requested_bytes: err.requested_bytes(),
+        heap_limit_bytes: err.heap_limit_bytes(),
+    }
+}
+
+fn typed_array_byte_len(len: usize, bpe: usize) -> Result<usize, VmError> {
+    len.checked_mul(bpe).ok_or_else(|| VmError::RangeError {
+        message: "TypedArray byte length overflow".to_string(),
+    })
+}
+
+fn typed_array_from_values_with_roots(
+    kind: TypedArrayKind,
+    values: &[Value],
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<Value, VmError> {
+    let bpe = kind.bytes_per_element();
+    let byte_len = typed_array_byte_len(values.len(), bpe)?;
+    let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, external_visit)
+        .map_err(oom_to_vm)?
+        .ok_or_else(|| VmError::RangeError {
+            message: format!(
+                "TypedArray allocation of {byte_len} bytes exceeds the available heap"
+            ),
+        })?;
+    let view = JsTypedArray::new(new_buf, kind, 0, values.len());
+    for (i, value) in values.iter().enumerate() {
+        view.set(i, value);
+    }
+    Ok(Value::TypedArray(view))
+}
+
+fn new_zeroed_typed_array_with_roots(
+    kind: TypedArrayKind,
+    len: usize,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<Value, VmError> {
+    let byte_len = typed_array_byte_len(len, kind.bytes_per_element())?;
+    let new_buf = JsArrayBuffer::try_new_with_roots(byte_len, gc_heap, external_visit)
+        .map_err(oom_to_vm)?
+        .ok_or_else(|| VmError::RangeError {
+            message: format!(
+                "TypedArray allocation of {byte_len} bytes exceeds the available heap"
+            ),
+        })?;
+    Ok(Value::TypedArray(JsTypedArray::new(new_buf, kind, 0, len)))
+}
+
+fn construct_typed_array_with_roots(
     kind: TypedArrayKind,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let bpe = kind.bytes_per_element();
     match args.first() {
-        // §23.2.5.1.1 `new T()` / `new T(undefined)` — zero-length view.
-        None | Some(Value::Undefined) => Ok(Value::TypedArray(JsTypedArray::new(
-            JsArrayBuffer::new(0),
-            kind,
-            0,
-            0,
-        ))),
-        // §23.2.5.1.4 `new T(buffer, byteOffset?, length?)`.
+        None | Some(Value::Undefined) => {
+            new_zeroed_typed_array_with_roots(kind, 0, gc_heap, external_visit)
+        }
         Some(Value::ArrayBuffer(buf)) => {
             if buf.is_detached() {
                 return Err(VmError::TypeMismatch);
@@ -260,77 +330,56 @@ fn construct_typed_array(
                 length,
             )))
         }
-        // §23.2.5.1.3 `new T(typedArray)` — copy elements with element-
-        // type conversion.
         Some(Value::TypedArray(src)) => {
             if src.buffer().is_detached() {
                 return Err(VmError::TypeMismatch);
             }
             let len = src.length();
-            let new_buf = JsArrayBuffer::new(len * bpe);
-            let view = JsTypedArray::new(new_buf, kind, 0, len);
+            let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v = src.get(i);
-                let coerced = coerce_for_kind(kind, &v)?;
-                view.set(i, &coerced);
+                values.push(coerce_for_kind(kind, &v)?);
             }
-            Ok(Value::TypedArray(view))
+            typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
-        // §23.2.5.1.5 `new T(object)` — array-like / iterable copy.
         Some(Value::Array(arr)) => {
             let len = crate::array::len(*arr, gc_heap);
-            let new_buf = JsArrayBuffer::new(len * bpe);
-            let view = JsTypedArray::new(new_buf, kind, 0, len);
+            let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v = crate::array::get(*arr, gc_heap, i);
-                let coerced = coerce_for_kind(kind, &v)?;
-                view.set(i, &coerced);
+                values.push(coerce_for_kind(kind, &v)?);
             }
-            Ok(Value::TypedArray(view))
+            typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
-        // §23.2.5.1.2 `new T(length)`.
         Some(Value::Number(_) | Value::Boolean(_) | Value::Null) => {
             let length = to_index(args.first().unwrap()).ok_or(VmError::TypeMismatch)? as usize;
-            let new_buf = JsArrayBuffer::new(length * bpe);
-            Ok(Value::TypedArray(JsTypedArray::new(
-                new_buf, kind, 0, length,
-            )))
+            new_zeroed_typed_array_with_roots(kind, length, gc_heap, external_visit)
         }
-        // String "5" coerces to length 5 via ToIndex.
         Some(Value::String(_)) => {
             let length = to_index(args.first().unwrap()).ok_or(VmError::TypeMismatch)? as usize;
-            let new_buf = JsArrayBuffer::new(length * bpe);
-            Ok(Value::TypedArray(JsTypedArray::new(
-                new_buf, kind, 0, length,
-            )))
+            new_zeroed_typed_array_with_roots(kind, length, gc_heap, external_visit)
         }
-        // Generic object — read `.length` then index 0..length per the
-        // array-like path.
         Some(Value::Object(obj)) => {
             let length_value =
                 crate::object::get(*obj, gc_heap, "length").unwrap_or(Value::Undefined);
             let len = to_index(&length_value).ok_or(VmError::TypeMismatch)? as usize;
-            let new_buf = JsArrayBuffer::new(len * bpe);
-            let view = JsTypedArray::new(new_buf, kind, 0, len);
+            let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v =
                     crate::object::get(*obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
-                let coerced = coerce_for_kind(kind, &v)?;
-                view.set(i, &coerced);
+                values.push(coerce_for_kind(kind, &v)?);
             }
-            Ok(Value::TypedArray(view))
+            typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
         _ => Err(VmError::TypeMismatch),
     }
 }
 
-/// §23.2.2.1 `%TypedArray%.from(source)` — synchronous, no map fn.
-/// Map function and `thisArg` are filed for the callback-driven
-/// dispatcher in `lib.rs::typed_array_callback_dispatch`.
-fn from_static(
+fn from_static_with_roots(
     kind: TypedArrayKind,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let source = args.first().cloned().unwrap_or(Value::Undefined);
     match source {
@@ -344,7 +393,7 @@ fn from_static(
                 let v = src.get(i);
                 values.push(coerce_for_kind(kind, &v)?);
             }
-            Ok(typed_array_prototype::from_values(kind, &values))
+            typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
         Value::Array(arr) => {
             let len = crate::array::len(arr, gc_heap);
@@ -353,12 +402,9 @@ fn from_static(
                 let v = crate::array::get(arr, gc_heap, i);
                 values.push(coerce_for_kind(kind, &v)?);
             }
-            Ok(typed_array_prototype::from_values(kind, &values))
+            typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
         Value::String(s) => {
-            // Spread the string by code units (code-point semantics
-            // belong to the iterator path; the no-callback `from`
-            // here matches the array-like length walk).
             let text = s.to_lossy_string();
             let chars: Vec<Value> = text
                 .chars()
@@ -370,7 +416,7 @@ fn from_static(
                     }
                 })
                 .collect();
-            Ok(typed_array_prototype::from_values(kind, &chars))
+            typed_array_from_values_with_roots(kind, &chars, gc_heap, external_visit)
         }
         Value::Object(obj) => {
             let len_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::Undefined);
@@ -381,19 +427,23 @@ fn from_static(
                     crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
                 values.push(coerce_for_kind(kind, &v)?);
             }
-            Ok(typed_array_prototype::from_values(kind, &values))
+            typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
         _ => Err(VmError::TypeMismatch),
     }
 }
 
-/// §23.2.2.2 `%TypedArray%.of(...items)`.
-fn of_static(kind: TypedArrayKind, args: &[Value]) -> Result<Value, VmError> {
+fn of_static_with_roots(
+    kind: TypedArrayKind,
+    args: &[Value],
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+) -> Result<Value, VmError> {
     let mut values: Vec<Value> = Vec::with_capacity(args.len());
     for v in args {
         values.push(coerce_for_kind(kind, v)?);
     }
-    Ok(typed_array_prototype::from_values(kind, &values))
+    typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
 }
 
 /// §6.2.10 SetValueFromBuffer's element-type conversion gates: a
@@ -439,14 +489,52 @@ pub fn snapshot_elements(t: &JsTypedArray) -> Vec<Value> {
     (0..t.length()).map(|i| t.get(i)).collect()
 }
 
-/// Convenience: build a TypedArray from a slice of arrays. Used by
-/// the iterator-based path in `Array.from`.
-#[must_use]
-pub fn from_arr(kind: TypedArrayKind, arr: &JsArray, gc_heap: &otter_gc::GcHeap) -> Value {
-    let len = crate::array::len(*arr, gc_heap);
-    let mut values: Vec<Value> = Vec::with_capacity(len);
-    for i in 0..len {
-        values.push(crate::array::get(*arr, gc_heap, i));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::NumberValue;
+    use otter_bytecode::method_id::{ArrayBufferMethod, TypedArrayMethod};
+
+    #[test]
+    fn array_buffer_constructor_with_roots_accounts_backing_store() {
+        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
+        let args = [Value::Number(NumberValue::from_i32(64))];
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+
+        let before = heap.tracked_bytes();
+        let value = array_buffer_call_with_roots(
+            ArrayBufferMethod::Construct,
+            &args,
+            &mut heap,
+            &mut external_visit,
+        )
+        .expect("array buffer");
+
+        assert!(matches!(value, Value::ArrayBuffer(_)));
+        assert_eq!(heap.tracked_bytes() - before, 64);
+        drop(value);
+        assert_eq!(heap.tracked_bytes(), before);
     }
-    typed_array_prototype::from_values(kind, &values)
+
+    #[test]
+    fn typed_array_constructor_with_roots_accounts_backing_store() {
+        let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
+        let args = [Value::Number(NumberValue::from_i32(4))];
+        let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+
+        let before = heap.tracked_bytes();
+        let value = typed_array_call_with_roots(
+            TypedArrayKind::Int16,
+            TypedArrayMethod::Construct,
+            &args,
+            &mut heap,
+            &mut external_visit,
+        )
+        .expect("typed array");
+
+        assert!(matches!(value, Value::TypedArray(_)));
+        assert_eq!(heap.tracked_bytes() - before, 8);
+        drop(value);
+        assert_eq!(heap.tracked_bytes(), before);
+    }
 }

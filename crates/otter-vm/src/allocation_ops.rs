@@ -24,7 +24,8 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, Value, VmError,
+    ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeFastFn,
+    NativeFunction, Value, VmError,
     operand_decode::{const_operand, register_operand},
     read_register, regexp,
     runtime_state::RuntimeState,
@@ -68,6 +69,33 @@ impl Interpreter {
         };
         crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
             .map_err(VmError::from)
+    }
+
+    /// Allocate a host-created object while exposing runtime roots and
+    /// caller-owned pending values.
+    ///
+    /// Runtime integration code uses this instead of borrowing the raw GC heap
+    /// when it creates JS objects outside a VM frame stack.
+    pub fn alloc_host_object_with_roots(
+        &mut self,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
     }
 
     pub(crate) fn alloc_runtime_rooted_object_with_proto(
@@ -124,6 +152,107 @@ impl Interpreter {
         };
         crate::array::from_elements_with_roots(&mut self.gc_heap, elements, &mut external_visit)
             .map_err(VmError::from)
+    }
+
+    /// Allocate a host-created array while exposing runtime roots and
+    /// caller-owned pending values.
+    ///
+    /// The array payload itself is traced by the GC allocation API; `slice_roots`
+    /// covers sibling buffers and host-local values that are not part of the
+    /// returned array.
+    pub fn array_from_elements_host_rooted<I>(
+        &mut self,
+        elements: I,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::array::JsArray, otter_gc::OutOfMemory>
+    where
+        I: IntoIterator<Item = Value>,
+    {
+        let elements: Vec<Value> = elements.into_iter().collect();
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        crate::array::from_elements_with_roots(&mut self.gc_heap, elements, &mut external_visit)
+    }
+
+    /// Allocate a host-created static native function while exposing
+    /// runtime roots and caller-owned pending values.
+    pub fn native_function_static_host_rooted(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: NativeFastFn,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, otter_gc::OutOfMemory> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        Ok(Value::NativeFunction(
+            NativeFunction::new_static_with_roots(
+                &mut self.gc_heap,
+                name,
+                length,
+                call,
+                &mut external_visit,
+            )?,
+        ))
+    }
+
+    /// Allocate a host-created native function while exposing runtime
+    /// roots and caller-owned pending values.
+    pub fn native_function_from_call_host_rooted(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        call: NativeCall,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, otter_gc::OutOfMemory> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        Ok(Value::NativeFunction(NativeFunction::from_call_with_roots(
+            &mut self.gc_heap,
+            name,
+            length,
+            call,
+            &mut external_visit,
+        )?))
     }
 
     pub(crate) fn alloc_runtime_rooted_iterator_state(

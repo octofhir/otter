@@ -29,9 +29,10 @@
 //!   resolves to `Error.prototype`, and every constructor's
 //!   `prototype` own property points to the matching prototype
 //!   object.
-//! - The registry never re-allocates after construction — calling
-//!   `make_instance` reuses the per-kind prototype object as the
-//!   instance's `[[Prototype]]`.
+//! - The registry never re-allocates its prototype/constructor table after
+//!   construction. Active native constructor paths allocate instances through
+//!   `NativeCtx` so receiver, `new.target`, arguments, pending causes, and
+//!   AggregateError element buffers stay visible across young allocation.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-error-objects>
@@ -413,11 +414,13 @@ impl ErrorClassRegistry {
                 _ => args.get(1),
             };
             let cause = read_options_cause(options, ctx.heap());
-            let interp = ctx.interp_mut();
-            let registry = interp.error_classes_clone();
-            let string_heap = interp.string_heap_clone();
+            let registry = ctx.interp_mut().error_classes_clone();
+            let mut extra_roots = Vec::with_capacity(1);
+            if let Some(cause) = &cause {
+                extra_roots.push(cause);
+            }
             let obj = registry
-                .make_instance(kind, message.as_deref(), &string_heap, ctx.heap_mut())
+                .make_instance_native_rooted(ctx, kind, message.as_deref(), &extra_roots, &[args])
                 .map_err(|err| NativeError::TypeError {
                     name: kind.class_name(),
                     reason: err.to_string(),
@@ -498,20 +501,24 @@ impl ErrorClassRegistry {
             let errors_arg = a.first().cloned().unwrap_or(Value::Undefined);
             let cause = read_options_cause(a.get(2), c.heap());
 
-            let interp = c.interp_mut();
-            let registry = interp.error_classes_clone();
-            let string_heap = interp.string_heap_clone();
             // §20.5.7.1 step 4 — IterableToList(errors). Spec
             // throws `TypeError` for `null`/`undefined`. Spread
             // through a dense array fast path before falling back
             // to the iterator protocol.
             let errors_list = iterable_to_value_list(c, &errors_arg)?;
+            let registry = c.interp_mut().error_classes_clone();
+            let mut extra_roots = Vec::with_capacity(2);
+            extra_roots.push(&errors_arg);
+            if let Some(cause) = &cause {
+                extra_roots.push(cause);
+            }
             let obj = registry
-                .make_aggregate_instance(
-                    errors_list,
+                .make_aggregate_instance_native_rooted(
+                    c,
+                    errors_list.as_slice(),
                     message.as_deref(),
-                    &string_heap,
-                    c.heap_mut(),
+                    &extra_roots,
+                    &[a],
                 )
                 .map_err(|err| NativeError::TypeError {
                     name: "AggregateError",
@@ -782,16 +789,15 @@ impl ErrorClassRegistry {
     }
 
     /// Borrow the `prototype` object for `kind`. Exposed for
-    /// callers that build instances out-of-band (e.g. the
-    /// dispatcher's TypeMismatch → throwable conversion in a
-    /// later slice).
+    /// callers that build instances out-of-band through an explicit root
+    /// contract (e.g. stack-rooted VM error throwable conversion).
     #[must_use]
     pub fn prototype(&self, kind: ErrorKind) -> JsObject {
         self.entry(kind).prototype
     }
 
-    /// Allocate a fresh error instance of the given kind with the
-    /// supplied message.
+    /// Allocate a fresh error instance of the given kind with the supplied
+    /// message through the native root contract.
     ///
     /// # Algorithm
     /// 1. Allocate a plain `JsObject`.
@@ -811,21 +817,30 @@ impl ErrorClassRegistry {
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-message>
-    pub fn make_instance(
+    pub(crate) fn make_instance_native_rooted(
         &self,
+        ctx: &mut NativeCtx<'_>,
         kind: ErrorKind,
         message: Option<&str>,
-        heap: &StringHeap,
-        gc_heap: &mut otter_gc::GcHeap,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
     ) -> Result<JsObject, StringError> {
-        let obj = crate::object::alloc_object(gc_heap).map_err(|_| StringError::OutOfMemory {
-            requested_bytes: 0,
-            heap_limit_bytes: 0,
-        })?;
-        crate::object::set_prototype(obj, gc_heap, Some(self.prototype(kind)));
+        let proto = self.prototype(kind);
+        let proto_value = Value::Object(proto);
+        let mut roots = Vec::with_capacity(value_roots.len() + 1);
+        roots.push(&proto_value);
+        roots.extend_from_slice(value_roots);
+        let obj = ctx
+            .alloc_object_with_roots(roots.as_slice(), slice_roots)
+            .map_err(|_| StringError::OutOfMemory {
+                requested_bytes: 0,
+                heap_limit_bytes: ctx.heap().max_heap_bytes(),
+            })?;
+        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
         if let Some(text) = message {
-            let s = JsString::from_str(text, heap)?;
-            crate::object::set(obj, gc_heap, "message", Value::String(s));
+            let heap = ctx.interp_mut().string_heap_clone();
+            let s = JsString::from_str(text, &heap)?;
+            crate::object::set(obj, ctx.heap_mut(), "message", Value::String(s));
         }
         Ok(obj)
     }
@@ -837,20 +852,39 @@ impl ErrorClassRegistry {
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-aggregate-error>
-    pub fn make_aggregate_instance(
+    pub(crate) fn make_aggregate_instance_native_rooted(
         &self,
-        errors: Vec<Value>,
+        ctx: &mut NativeCtx<'_>,
+        errors: &[Value],
         message: Option<&str>,
-        heap: &StringHeap,
-        gc_heap: &mut otter_gc::GcHeap,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
     ) -> Result<JsObject, StringError> {
-        let obj = self.make_instance(ErrorKind::AggregateError, message, heap, gc_heap)?;
-        let arr =
-            crate::array::from_elements(gc_heap, errors).map_err(|_| StringError::OutOfMemory {
+        let mut object_slice_roots = Vec::with_capacity(slice_roots.len() + 1);
+        object_slice_roots.push(errors);
+        object_slice_roots.extend_from_slice(slice_roots);
+        let obj = self.make_instance_native_rooted(
+            ctx,
+            ErrorKind::AggregateError,
+            message,
+            value_roots,
+            object_slice_roots.as_slice(),
+        )?;
+        let obj_value = Value::Object(obj);
+        let mut array_roots = Vec::with_capacity(value_roots.len() + 1);
+        array_roots.push(&obj_value);
+        array_roots.extend_from_slice(value_roots);
+        let arr = ctx
+            .array_from_elements_with_roots(
+                errors.iter().cloned(),
+                array_roots.as_slice(),
+                slice_roots,
+            )
+            .map_err(|_| StringError::OutOfMemory {
                 requested_bytes: 0,
-                heap_limit_bytes: gc_heap.max_heap_bytes(),
+                heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;
-        crate::object::set(obj, gc_heap, "errors", Value::Array(arr));
+        crate::object::set(obj, ctx.heap_mut(), "errors", Value::Array(arr));
         Ok(obj)
     }
 }

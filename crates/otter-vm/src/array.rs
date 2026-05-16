@@ -178,6 +178,32 @@ pub fn from_elements_with_source(
     heap.alloc_old(body)
 }
 
+/// Construct an array from initial elements, attach source bytes, and expose
+/// caller-owned roots during dense-storage reservation and array shell
+/// allocation.
+pub(crate) fn from_elements_with_source_and_roots(
+    heap: &mut GcHeap,
+    values: impl IntoIterator<Item = Value>,
+    source_bytes: Arc<[u8]>,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
+    let collected: Vec<Value> = values.into_iter().collect();
+    let mut body = ArrayBody::default();
+    {
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            for value in &collected {
+                value.trace_value_slots(visitor);
+            }
+        };
+        reserve_elements_for_len_with_roots(&mut body, heap, collected.len(), &mut reserve_roots)?;
+    }
+    body.elements.extend(collected);
+    body.source_bytes = Some(source_bytes);
+    body.dirty = false;
+    heap.alloc_with_roots(body, external_visit)
+}
+
 /// Length in elements (O(1)).
 #[must_use]
 pub fn len(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {

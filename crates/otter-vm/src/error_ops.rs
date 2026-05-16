@@ -106,32 +106,32 @@ impl Interpreter {
         frame.pc += 1;
         Ok(())
     }
-    /// Build a freshly-allocated `TypeError` instance with the
-    /// supplied message. Mirrors the shape produced by
-    /// [`Self::vm_error_to_throwable`] for `VmError::TypeError`
-    /// but skips the `VmError` wrapping — useful when the dispatch
-    /// path already knows it wants a `TypeError` rejection (e.g.
-    /// `Op::ImportNamespaceDynamic` building a rejected promise).
-    pub(crate) fn make_type_error(&mut self, message: &str) -> Result<Value, VmError> {
-        let proto = self
-            .error_classes
-            .prototype(error_classes::ErrorKind::TypeError);
-        let obj = crate::object::alloc_object(&mut self.gc_heap).map_err(VmError::from)?;
-        crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-        let message_str =
-            JsString::from_str(message, &self.string_heap).map_err(|_| VmError::TypeMismatch)?;
-        crate::object::set(
-            obj,
-            &mut self.gc_heap,
-            "message",
-            Value::String(message_str),
-        );
+    /// Build a freshly-allocated `TypeError` instance through the live frame
+    /// stack. Mirrors the shape produced by
+    /// [`Self::vm_error_to_throwable_with_stack_roots`] for `VmError::TypeError`
+    /// but skips the `VmError` wrapping.
+    pub(crate) fn make_type_error_with_stack_roots(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        message: &str,
+    ) -> Result<Value, VmError> {
+        let message_root = Value::Undefined;
+        let obj = self.make_error_instance_with_stack_roots(
+            stack,
+            ErrorKind::TypeError,
+            Some(message.to_string()),
+            &message_root,
+        )?;
         Ok(Value::Object(obj))
     }
 
     /// `Error` instance. Returns `None` for variants that should
     /// keep propagating as host errors (StackOverflow, etc.).
-    pub(crate) fn vm_error_to_throwable(&mut self, err: &VmError) -> Option<Value> {
+    pub(crate) fn vm_error_to_throwable_with_stack_roots(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        err: &VmError,
+    ) -> Option<Value> {
         let dynamic_message: String;
         let is_oom = matches!(err, VmError::OutOfMemory { .. });
         let (kind, message) = match err {
@@ -198,22 +198,28 @@ impl Interpreter {
             // catching them as `try { ... } catch`.
             _ => return None,
         };
-        let proto = self.error_classes.prototype(kind);
         let obj = if is_oom {
             crate::object::alloc_diagnostic_object(&mut self.gc_heap).ok()?
         } else {
-            crate::object::alloc_object(&mut self.gc_heap).ok()?
+            self.make_error_instance_with_stack_roots(
+                stack,
+                kind,
+                Some(message.to_string()),
+                &Value::Undefined,
+            )
+            .ok()?
         };
-        crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-        if let Ok(message_str) = JsString::from_str(message, &self.string_heap) {
+        if is_oom {
+            let proto = self.error_classes.prototype(kind);
+            crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
+        }
+        if is_oom && let Ok(message_str) = JsString::from_str(message, &self.string_heap) {
             crate::object::set(
                 obj,
                 &mut self.gc_heap,
                 "message",
                 Value::String(message_str),
             );
-        } else if !is_oom {
-            return None;
         }
         Some(Value::Object(obj))
     }

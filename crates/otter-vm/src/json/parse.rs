@@ -22,6 +22,8 @@
 
 use std::sync::Arc;
 
+use otter_gc::heap::RootSlotVisitor;
+
 use crate::Value;
 use crate::number::NumberValue;
 use crate::string::{JsString, StringHeap};
@@ -78,10 +80,22 @@ pub fn parse(
     heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, ParseError> {
+    let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+    parse_with_roots(text, heap, gc_heap, &mut external_visit)
+}
+
+/// Strict `JSON.parse` with an explicit GC root visitor for caller-owned
+/// runtime/native/frame roots.
+pub(crate) fn parse_with_roots(
+    text: &str,
+    heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<Value, ParseError> {
     let bytes = text.as_bytes();
     let mut cursor = Cursor { bytes, pos: 0 };
     cursor.skip_ws();
-    let value = read_value(&mut cursor, heap, gc_heap)?;
+    let value = read_value(&mut cursor, heap, gc_heap, external_visit)?;
     cursor.skip_ws();
     if cursor.pos != bytes.len() {
         return Err(ParseError::at(cursor.pos, "unexpected trailing content"));
@@ -130,13 +144,14 @@ fn read_value(
     cursor: &mut Cursor<'_>,
     heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
     let mut stack: Vec<Builder> = Vec::with_capacity(8);
-    let result = read_step(cursor, &mut stack, heap, gc_heap)?;
+    let result = read_step(cursor, &mut stack, heap, gc_heap, external_visit)?;
     let mut current = result;
     while stack.last().is_some() {
         cursor.skip_ws();
-        current = continue_container(cursor, &mut stack, current, heap, gc_heap)?;
+        current = continue_container(cursor, &mut stack, current, heap, gc_heap, external_visit)?;
     }
     Ok(current)
 }
@@ -149,6 +164,7 @@ fn read_step(
     stack: &mut Vec<Builder>,
     heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
     cursor.skip_ws();
     let b = cursor
@@ -171,7 +187,7 @@ fn read_step(
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
                 let bytes = cursor.bytes;
-                return finish_builder(frame, bytes, gc_heap, cursor.pos);
+                return finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit);
             }
             // Otherwise read the first key.
             let key = read_object_key(cursor)?;
@@ -182,7 +198,7 @@ fn read_step(
             cursor.expect(b':', "':' after object key")?;
             cursor.skip_ws();
             // Recurse into the value.
-            read_step(cursor, stack, heap, gc_heap)
+            read_step(cursor, stack, heap, gc_heap, external_visit)
         }
         b'[' => {
             let array_start = cursor.pos;
@@ -200,9 +216,9 @@ fn read_step(
                 cursor.pos += 1;
                 let frame = stack.pop().expect("just pushed");
                 let bytes = cursor.bytes;
-                return finish_builder(frame, bytes, gc_heap, cursor.pos);
+                return finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit);
             }
-            read_step(cursor, stack, heap, gc_heap)
+            read_step(cursor, stack, heap, gc_heap, external_visit)
         }
         b'"' => Ok(Value::String(read_string(cursor, heap)?)),
         b't' => {
@@ -233,6 +249,7 @@ fn continue_container(
     just_read: Value,
     heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
     let frame = stack.last_mut().expect("non-empty stack");
     match frame {
@@ -251,13 +268,13 @@ fn continue_container(
                     if matches!(cursor.peek(), Some(b']')) {
                         return Err(ParseError::at(cursor.pos, "trailing comma"));
                     }
-                    read_step(cursor, stack, heap, gc_heap)
+                    read_step(cursor, stack, heap, gc_heap, external_visit)
                 }
                 Some(b']') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
                     let bytes = cursor.bytes;
-                    finish_builder(frame, bytes, gc_heap, cursor.pos)
+                    finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit)
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -291,13 +308,13 @@ fn continue_container(
                     cursor.skip_ws();
                     cursor.expect(b':', "':' after object key")?;
                     cursor.skip_ws();
-                    read_step(cursor, stack, heap, gc_heap)
+                    read_step(cursor, stack, heap, gc_heap, external_visit)
                 }
                 Some(b'}') => {
                     cursor.pos += 1;
                     let frame = stack.pop().expect("just had it");
                     let bytes = cursor.bytes;
-                    finish_builder(frame, bytes, gc_heap, cursor.pos)
+                    finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit)
                 }
                 Some(other) => Err(ParseError::at(
                     cursor.pos,
@@ -311,9 +328,11 @@ fn continue_container(
 
 fn finish_builder(
     builder: Builder,
+    stack: &[Builder],
     bytes: &[u8],
     gc_heap: &mut otter_gc::GcHeap,
     pos: usize,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
     match builder {
         Builder::Array {
@@ -327,18 +346,54 @@ fn finish_builder(
             // freshly-cloned (not aliased into the input) so the
             // input buffer is free to drop independently.
             let source: Arc<[u8]> = Arc::from(&bytes[array_start..pos]);
+            let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                external_visit(visitor);
+                trace_builder_stack(stack, visitor);
+                for value in &elements {
+                    value.trace_value_slots(visitor);
+                }
+            };
             Ok(Value::Array(
-                crate::array::from_elements_with_source(gc_heap, elements, source)
-                    .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?,
+                crate::array::from_elements_with_source_and_roots(
+                    gc_heap,
+                    elements.iter().cloned(),
+                    source,
+                    &mut roots,
+                )
+                .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?,
             ))
         }
         Builder::Object { entries, .. } => {
-            let obj = crate::object::alloc_object(gc_heap)
+            let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                external_visit(visitor);
+                trace_builder_stack(stack, visitor);
+                for (_, value) in &entries {
+                    value.trace_value_slots(visitor);
+                }
+            };
+            let obj = crate::object::alloc_object_with_roots(gc_heap, &mut roots)
                 .map_err(|_| ParseError::at(pos, "JSON.parse: out of memory"))?;
             for (k, v) in entries {
                 crate::object::set(obj, gc_heap, &k, v);
             }
             Ok(Value::Object(obj))
+        }
+    }
+}
+
+fn trace_builder_stack(stack: &[Builder], visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+    for builder in stack {
+        match builder {
+            Builder::Array { elements, .. } => {
+                for value in elements {
+                    value.trace_value_slots(visitor);
+                }
+            }
+            Builder::Object { entries, .. } => {
+                for (_, value) in entries {
+                    value.trace_value_slots(visitor);
+                }
+            }
         }
     }
 }

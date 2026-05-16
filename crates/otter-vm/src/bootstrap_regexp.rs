@@ -217,7 +217,7 @@ fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let text = args.first().cloned().unwrap_or(Value::Undefined);
     let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.exec")?;
     let string_heap = ctx.interp_mut().string_heap_clone();
-    crate::regexp_prototype::exec_once(&re, &text_str, &string_heap, ctx.heap_mut())
+    crate::regexp_prototype::exec_once_native(&re, &text_str, &string_heap, ctx, &[args])
         .map_err(|e| intrinsic_to_native(e, "RegExp.prototype.exec"))
 }
 

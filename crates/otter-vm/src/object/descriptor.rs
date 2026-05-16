@@ -181,6 +181,8 @@ impl PropertyDescriptor {
         enumerable: bool,
         configurable: bool,
     ) -> Self {
+        let getter = getter.filter(|value| !matches!(value, Value::Undefined));
+        let setter = setter.filter(|value| !matches!(value, Value::Undefined));
         Self {
             kind: DescriptorKind::Accessor { getter, setter },
             // accessor flags never carry the writable bit

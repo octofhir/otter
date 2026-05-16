@@ -1486,7 +1486,10 @@ impl Runtime {
             .interp
             .error_classes_for_trace()
             .prototype(otter_vm::ErrorKind::TypeError);
-        let obj = otter_vm::object::alloc_object(self.interp.gc_heap_mut())?;
+        let proto_root = otter_vm::Value::Object(proto);
+        let obj = self
+            .interp
+            .alloc_host_object_with_roots(&[&proto_root], &[])?;
         otter_vm::object::set_prototype(obj, self.interp.gc_heap_mut(), Some(proto));
         let message_str =
             otter_vm::JsString::from_str(&message, &heap).map_err(|err| OtterError::Internal {
@@ -1560,9 +1563,12 @@ impl Runtime {
             if self.interp.module_env(&init.url).is_some() {
                 continue;
             }
-            let env = otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
-                DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
-            })?;
+            let env = self
+                .interp
+                .alloc_host_object_with_roots(&[], &[])
+                .map_err(|e| {
+                    DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
+                })?;
             self.interp
                 .register_module_env(std::rc::Rc::from(init.url.as_str()), env);
         }
@@ -1581,8 +1587,11 @@ impl Runtime {
                 continue;
             }
             otter_vm_init_marker_install(&mut self.interp, env);
-            let import_meta =
-                otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
+            let env_root = otter_vm::Value::Object(env);
+            let import_meta = self
+                .interp
+                .alloc_host_object_with_roots(&[&env_root], &[])
+                .map_err(|e| {
                     DynLoadError::Diagnostic(format!(
                         "dynamic import: alloc import_meta failed: {e}"
                     ))
@@ -1675,14 +1684,20 @@ impl Runtime {
             )));
         }
         let context = ExecutionContext::from_module(fragment);
-        let env = otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
-            DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
-        })?;
+        let env = self
+            .interp
+            .alloc_host_object_with_roots(&[], &[])
+            .map_err(|e| {
+                DynLoadError::Diagnostic(format!("dynamic import: alloc env failed: {e}"))
+            })?;
         self.interp
             .register_module_env(std::rc::Rc::from(target_url), env);
         otter_vm_init_marker_install(&mut self.interp, env);
-        let import_meta =
-            otter_vm::object::alloc_object(self.interp.gc_heap_mut()).map_err(|e| {
+        let env_root = otter_vm::Value::Object(env);
+        let import_meta = self
+            .interp
+            .alloc_host_object_with_roots(&[&env_root], &[])
+            .map_err(|e| {
                 DynLoadError::Diagnostic(format!("dynamic import: alloc import_meta failed: {e}"))
             })?;
         let callee = otter_vm::Value::Function { function_id: 0 };
@@ -1740,7 +1755,9 @@ impl Runtime {
         length: u8,
         call: RuntimeNativeFastFn,
     ) -> Result<(), OtterError> {
-        let value = otter_vm::native_value_static(self.interp.gc_heap_mut(), name, length, call)
+        let value = self
+            .interp
+            .native_function_static_host_rooted(name, length, call, &[], &[])
             .map_err(|oom| OtterError::OutOfMemory {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
@@ -1774,8 +1791,7 @@ impl Runtime {
     pub fn register_pending_promise(
         &mut self,
     ) -> Result<(promise_registry::PromiseId, otter_vm::Value), OtterError> {
-        let handle = otter_vm::promise_dispatch::PromiseBuilder::new()
-            .pending(self.interp.gc_heap_mut())
+        let handle = otter_vm::promise_dispatch::pending_runtime_rooted(&mut self.interp, &[], &[])
             .map_err(|oom| OtterError::OutOfMemory {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),

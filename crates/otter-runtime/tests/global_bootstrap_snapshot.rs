@@ -55,68 +55,63 @@ fn global_this_default_snapshot() {
     // - Every default global is `{ writable: true, enumerable: false,
     //   configurable: true }` per §17 / §19.{2,4}. The only enumerable
     //   own property is `globalThis` itself (§19.4.1).
-    // - Foundation gap: `Array` / `Object` / `Function` / `Number` /
-    //   `Boolean` / `String` / `JSON` / `Math` etc. land as
-    //   `Value::Object` (`typeof === "object"`). The native-error
-    //   stack and dynamic-`new`-able callables (`Error` family,
-    //   `Date`, `Proxy`, …) carry a real `[[Call]]` slot via
-    //   `set_constructor_native` and report `typeof === "function"`.
-    //   Aligning the bare-Object constructors to function-typed
-    //   values is filed against the remaining P1.2 metadata work.
-    // - Every placeholder (`BigInt`, `RegExp`, `Map`, `Set`, …)
-    //   surfaces today through the placeholder install pipeline.
+    // - Constructors that carry a real `[[Call]]` / `[[Construct]]`
+    //   surface report `typeof === "function"`; namespace objects
+    //   and internal prototype markers remain object-typed.
     let expected = "\
+@@%TypedArrayPrototype% ... object
 AggregateError w.c function
 Array w.c function
-ArrayBuffer w.c object
+ArrayBuffer w.c function
 Atomics w.c object
-BigInt w.c object
-BigInt64Array w.c object
-BigUint64Array w.c object
+BigInt w.c function
+BigInt64Array w.c function
+BigUint64Array w.c function
 Boolean w.c function
-DataView w.c object
+DataView w.c function
 Date w.c function
 Error w.c function
 EvalError w.c function
-FinalizationRegistry w.c object
-Float32Array w.c object
-Float64Array w.c object
+FinalizationRegistry w.c function
+Float32Array w.c function
+Float64Array w.c function
 Function w.c function
-Int16Array w.c object
-Int32Array w.c object
-Int8Array w.c object
+Int16Array w.c function
+Int32Array w.c function
+Int8Array w.c function
 Intl w.c object
 Iterator w.c object
 JSON w.c object
-Map w.c object
+Map w.c function
 Math w.c object
 Number w.c function
 Object w.c function
-Promise w.c object
+Promise w.c function
 Proxy w.c function
 RangeError w.c function
 ReferenceError w.c function
 Reflect w.c object
-RegExp w.c object
-Set w.c object
-SharedArrayBuffer w.c object
+RegExp w.c function
+Set w.c function
+SharedArrayBuffer w.c function
 String w.c function
-Symbol w.c object
+Symbol w.c function
 SyntaxError w.c function
 Temporal w.c object
 TypeError w.c function
 URIError w.c function
-Uint16Array w.c object
-Uint32Array w.c object
-Uint8Array w.c object
-Uint8ClampedArray w.c object
-WeakMap w.c object
-WeakRef w.c object
-WeakSet w.c object
+Uint16Array w.c function
+Uint32Array w.c function
+Uint8Array w.c function
+Uint8ClampedArray w.c function
+WeakMap w.c function
+WeakRef w.c function
+WeakSet w.c function
 clearInterval w.c function
 clearTimeout w.c function
 console w.c object
 globalThis wec object
+process w.c object
 setInterval w.c function
 setTimeout w.c function";
     assert_eq!(dump, expected, "default globalThis own properties drifted");

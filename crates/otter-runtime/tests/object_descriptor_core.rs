@@ -146,6 +146,44 @@ fn symbol_define_property_descriptor_is_enforced() {
 }
 
 #[test]
+fn extracted_object_descriptor_helpers_preserve_native_surface() {
+    let completion = run(r#"
+        const getDesc = Object.getOwnPropertyDescriptor;
+        const getDescs = Object.getOwnPropertyDescriptors;
+        const create = Object.create;
+        const entries = Object.entries;
+        const props = {
+            answer: { value: 42, enumerable: true, configurable: true }
+        };
+        const proto = { inherited: true };
+        const obj = create(proto, props);
+        const one = getDesc(obj, "answer");
+        const all = getDescs(obj).answer;
+        const listed = entries(obj)[0];
+        (Object.getPrototypeOf(obj) === proto) + ":" +
+            one.value + ":" + all.configurable + ":" +
+            listed[0] + ":" + listed[1];
+    "#);
+    assert_eq!(completion, "true:42:true:answer:42");
+}
+
+#[test]
+fn extracted_object_property_names_preserve_proxy_surface() {
+    let completion = run(r#"
+        const getOwnPropertyNames = Object.getOwnPropertyNames;
+        const target = {};
+        Object.defineProperty(target, "answer", {
+            value: 42,
+            enumerable: false,
+            configurable: true,
+        });
+        const proxy = new Proxy(target, {});
+        getOwnPropertyNames(proxy).join(",");
+    "#);
+    assert_eq!(completion, "answer");
+}
+
+#[test]
 fn computed_symbol_assignment_invokes_setter() {
     let completion = run(r#"
         let seen = false;

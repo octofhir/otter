@@ -38,6 +38,7 @@
 //! - [Architecture](../../../docs/book/src/engine/architecture.md)
 
 use crate::array::{self, JsArray};
+use crate::binary::JsArrayBuffer;
 use crate::collections::{self, JsMap, JsSet};
 use crate::object::{self, JsObject};
 use crate::string::StringHeap;
@@ -303,6 +304,85 @@ impl IntrinsicArgs<'_> {
             );
         };
         self.gc_heap.alloc_with_roots(state, &mut external_visit)
+    }
+
+    /// Wrap a freshly copied `ArrayBuffer` backing store while exposing the
+    /// intrinsic receiver, arguments, caller roots, and local values if the
+    /// external-memory reservation triggers GC.
+    pub fn array_buffer_from_bytes_rooted(
+        &mut self,
+        bytes: Vec<u8>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<JsArrayBuffer, otter_gc::OutOfMemory> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(
+                visitor,
+                allocation_roots,
+                receiver,
+                args,
+                value_roots,
+                slice_roots,
+            );
+        };
+        JsArrayBuffer::from_bytes_with_roots(bytes, self.gc_heap, &mut external_visit)
+    }
+
+    /// Allocate a resizable `ArrayBuffer` backing store under the intrinsic
+    /// root contract.
+    pub fn array_buffer_resizable_rooted(
+        &mut self,
+        len: usize,
+        max_byte_length: usize,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Option<JsArrayBuffer>, otter_gc::OutOfMemory> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(
+                visitor,
+                allocation_roots,
+                receiver,
+                args,
+                value_roots,
+                slice_roots,
+            );
+        };
+        JsArrayBuffer::new_resizable_with_roots(
+            len,
+            max_byte_length,
+            self.gc_heap,
+            &mut external_visit,
+        )
+    }
+
+    /// Allocate a zero-filled fixed-length `ArrayBuffer` backing store under
+    /// the intrinsic root contract.
+    pub fn array_buffer_zeroed_rooted(
+        &mut self,
+        len: usize,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Option<JsArrayBuffer>, otter_gc::OutOfMemory> {
+        let allocation_roots = self.allocation_roots;
+        let receiver = self.receiver;
+        let args = self.args;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_intrinsic_allocation_roots(
+                visitor,
+                allocation_roots,
+                receiver,
+                args,
+                value_roots,
+                slice_roots,
+            );
+        };
+        JsArrayBuffer::try_new_with_roots(len, self.gc_heap, &mut external_visit)
     }
 }
 

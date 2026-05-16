@@ -28,7 +28,8 @@ use crate::array::JsArray;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
 use crate::regexp::JsRegExp;
-use crate::string::JsString;
+use crate::runtime_cx::NativeCtx;
+use crate::string::{JsString, StringHeap};
 
 fn receiver_regexp<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsRegExp, IntrinsicError> {
     match args.receiver {
@@ -63,39 +64,38 @@ fn arg_string<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Result<&'a JsStrin
 pub(crate) fn exec_once(
     re: &JsRegExp,
     text: &JsString,
-    string_heap: &crate::string::StringHeap,
-    gc_heap: &mut otter_gc::GcHeap,
+    args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     let units = text.to_utf16_vec();
     let len = units.len();
-    let flags = re.flags(gc_heap);
-    let mut start = re.last_index(gc_heap) as usize;
+    let flags = re.flags(args.gc_heap);
+    let mut start = re.last_index(args.gc_heap) as usize;
     if (flags.global || flags.sticky) && start > len {
-        re.set_last_index(gc_heap, 0);
+        re.set_last_index(args.gc_heap, 0);
         return Ok(Value::Null);
     }
     if !flags.global && !flags.sticky {
         start = 0;
     }
     let m = re
-        .find_from_utf16(gc_heap, &units, start)
+        .find_from_utf16(args.gc_heap, &units, start)
         .into_iter()
         .next();
     let m = match m {
         Some(m) => m,
         None => {
             if flags.global || flags.sticky {
-                re.set_last_index(gc_heap, 0);
+                re.set_last_index(args.gc_heap, 0);
             }
             return Ok(Value::Null);
         }
     };
     if flags.sticky && m.range.start != start {
-        re.set_last_index(gc_heap, 0);
+        re.set_last_index(args.gc_heap, 0);
         return Ok(Value::Null);
     }
     if flags.global || flags.sticky {
-        re.set_last_index(gc_heap, m.range.end as u32);
+        re.set_last_index(args.gc_heap, m.range.end as u32);
     }
 
     Ok(Value::Array(build_match_result(
@@ -103,8 +103,60 @@ pub(crate) fn exec_once(
         &units,
         text,
         flags.has_indices,
+        args,
+        &[],
+        &[],
+    )?))
+}
+
+pub(crate) fn exec_once_native(
+    re: &JsRegExp,
+    text: &JsString,
+    string_heap: &StringHeap,
+    ctx: &mut NativeCtx<'_>,
+    slice_roots: &[&[Value]],
+) -> Result<Value, IntrinsicError> {
+    let units = text.to_utf16_vec();
+    let len = units.len();
+    let flags = re.flags(ctx.heap());
+    let mut start = re.last_index(ctx.heap()) as usize;
+    if (flags.global || flags.sticky) && start > len {
+        re.set_last_index(ctx.heap_mut(), 0);
+        return Ok(Value::Null);
+    }
+    if !flags.global && !flags.sticky {
+        start = 0;
+    }
+    let m = re
+        .find_from_utf16(ctx.heap(), &units, start)
+        .into_iter()
+        .next();
+    let m = match m {
+        Some(m) => m,
+        None => {
+            if flags.global || flags.sticky {
+                re.set_last_index(ctx.heap_mut(), 0);
+            }
+            return Ok(Value::Null);
+        }
+    };
+    if flags.sticky && m.range.start != start {
+        re.set_last_index(ctx.heap_mut(), 0);
+        return Ok(Value::Null);
+    }
+    if flags.global || flags.sticky {
+        re.set_last_index(ctx.heap_mut(), m.range.end as u32);
+    }
+
+    Ok(Value::Array(build_match_result_native(
+        &m,
+        &units,
+        text,
+        flags.has_indices,
         string_heap,
-        gc_heap,
+        ctx,
+        &[],
+        slice_roots,
     )?))
 }
 
@@ -118,8 +170,161 @@ pub(crate) fn build_match_result(
     units: &[u16],
     input: &JsString,
     has_indices: bool,
-    string_heap: &crate::string::StringHeap,
-    gc_heap: &mut otter_gc::GcHeap,
+    args: &mut IntrinsicArgs<'_>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<JsArray, IntrinsicError> {
+    let full = JsString::from_utf16_units(&units[m.range.clone()], args.string_heap)?;
+    let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
+    out.push(Value::String(full));
+    for cap in &m.captures {
+        match cap {
+            Some(r) => {
+                let s = JsString::from_utf16_units(&units[r.clone()], args.string_heap)?;
+                out.push(Value::String(s));
+            }
+            None => out.push(Value::Undefined),
+        }
+    }
+    let input_value = Value::String(input.clone());
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&input_value);
+    roots.extend_from_slice(value_roots);
+    let mut slices = Vec::with_capacity(slice_roots.len() + 1);
+    slices.push(out.as_slice());
+    slices.extend_from_slice(slice_roots);
+    let arr = args.array_from_elements_rooted(out.iter().cloned(), &roots, &slices)?;
+
+    crate::array::set_named_property(
+        arr,
+        args.gc_heap,
+        "index",
+        Value::Number(NumberValue::from_i32(m.range.start as i32)),
+    )?;
+    crate::array::set_named_property(arr, args.gc_heap, "input", input_value.clone())?;
+
+    let mut named_iter = m.named_groups();
+    let first_named = named_iter.next();
+    if let Some((name, range)) = first_named {
+        let arr_value = Value::Array(arr);
+        let mut roots = Vec::with_capacity(value_roots.len() + 2);
+        roots.push(&input_value);
+        roots.push(&arr_value);
+        roots.extend_from_slice(value_roots);
+        let groups_obj = args.alloc_object_rooted(&roots, &slices)?;
+        crate::object::set_prototype(groups_obj, args.gc_heap, None);
+        let value = match range {
+            Some(r) => Value::String(JsString::from_utf16_units(&units[r], args.string_heap)?),
+            None => Value::Undefined,
+        };
+        crate::object::set(groups_obj, args.gc_heap, name, value);
+        for (name, range) in named_iter {
+            let value = match range {
+                Some(r) => Value::String(JsString::from_utf16_units(&units[r], args.string_heap)?),
+                None => Value::Undefined,
+            };
+            crate::object::set(groups_obj, args.gc_heap, name, value);
+        }
+        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::Object(groups_obj))?;
+    } else {
+        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::Undefined)?;
+    }
+
+    if has_indices {
+        let arr_value = Value::Array(arr);
+        let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
+        indices_elems.push(pair_array(
+            m.range.start,
+            m.range.end,
+            args,
+            &[&input_value, &arr_value],
+            &[out.as_slice()],
+        )?);
+        for cap in &m.captures {
+            match cap {
+                Some(r) => indices_elems.push(pair_array(
+                    r.start,
+                    r.end,
+                    args,
+                    &[&input_value, &arr_value],
+                    &[out.as_slice(), indices_elems.as_slice()],
+                )?),
+                None => indices_elems.push(Value::Undefined),
+            }
+        }
+        let mut roots = Vec::with_capacity(value_roots.len() + 2);
+        roots.push(&input_value);
+        roots.push(&arr_value);
+        roots.extend_from_slice(value_roots);
+        let mut index_slices = Vec::with_capacity(slice_roots.len() + 2);
+        index_slices.push(out.as_slice());
+        index_slices.push(indices_elems.as_slice());
+        index_slices.extend_from_slice(slice_roots);
+        let indices_arr =
+            args.array_from_elements_rooted(indices_elems.iter().cloned(), &roots, &index_slices)?;
+        let mut named_iter = m.named_groups();
+        let first_named = named_iter.next();
+        if let Some((name, range)) = first_named {
+            let indices_value = Value::Array(indices_arr);
+            let mut roots = Vec::with_capacity(value_roots.len() + 3);
+            roots.push(&input_value);
+            roots.push(&arr_value);
+            roots.push(&indices_value);
+            roots.extend_from_slice(value_roots);
+            let g_obj = args.alloc_object_rooted(&roots, &index_slices)?;
+            crate::object::set_prototype(g_obj, args.gc_heap, None);
+            let v = match range {
+                Some(r) => pair_array(
+                    r.start,
+                    r.end,
+                    args,
+                    &roots,
+                    &[out.as_slice(), indices_elems.as_slice()],
+                )?,
+                None => Value::Undefined,
+            };
+            crate::object::set(g_obj, args.gc_heap, name, v);
+            for (name, range) in named_iter {
+                let v = match range {
+                    Some(r) => pair_array(
+                        r.start,
+                        r.end,
+                        args,
+                        &roots,
+                        &[out.as_slice(), indices_elems.as_slice()],
+                    )?,
+                    None => Value::Undefined,
+                };
+                crate::object::set(g_obj, args.gc_heap, name, v);
+            }
+            crate::array::set_named_property(
+                indices_arr,
+                args.gc_heap,
+                "groups",
+                Value::Object(g_obj),
+            )?;
+        } else {
+            crate::array::set_named_property(
+                indices_arr,
+                args.gc_heap,
+                "groups",
+                Value::Undefined,
+            )?;
+        }
+        crate::array::set_named_property(arr, args.gc_heap, "indices", Value::Array(indices_arr))?;
+    }
+    Ok(arr)
+}
+
+pub(crate) fn build_match_result_native(
+    m: &regress::Match,
+    units: &[u16],
+    input: &JsString,
+    has_indices: bool,
+    string_heap: &StringHeap,
+    ctx: &mut NativeCtx<'_>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
 ) -> Result<JsArray, IntrinsicError> {
     let full = JsString::from_utf16_units(&units[m.range.clone()], string_heap)?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
@@ -133,70 +338,140 @@ pub(crate) fn build_match_result(
             None => out.push(Value::Undefined),
         }
     }
-    let arr = crate::array::from_elements(gc_heap, out)?;
+    let input_value = Value::String(input.clone());
+    let mut roots = Vec::with_capacity(value_roots.len() + 1);
+    roots.push(&input_value);
+    roots.extend_from_slice(value_roots);
+    let mut slices = Vec::with_capacity(slice_roots.len() + 1);
+    slices.push(out.as_slice());
+    slices.extend_from_slice(slice_roots);
+    let arr = ctx.array_from_elements_with_roots(out.iter().cloned(), &roots, &slices)?;
 
     crate::array::set_named_property(
         arr,
-        gc_heap,
+        ctx.heap_mut(),
         "index",
         Value::Number(NumberValue::from_i32(m.range.start as i32)),
     )?;
-    crate::array::set_named_property(arr, gc_heap, "input", Value::String(input.clone()))?;
+    crate::array::set_named_property(arr, ctx.heap_mut(), "input", input_value.clone())?;
 
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
     if let Some((name, range)) = first_named {
-        let groups_obj = crate::object::alloc_object(gc_heap)?;
-        crate::object::set_prototype(groups_obj, gc_heap, None);
+        let arr_value = Value::Array(arr);
+        let mut roots = Vec::with_capacity(value_roots.len() + 2);
+        roots.push(&input_value);
+        roots.push(&arr_value);
+        roots.extend_from_slice(value_roots);
+        let groups_obj = ctx.alloc_object_with_roots(&roots, &slices)?;
+        crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
         let value = match range {
             Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
             None => Value::Undefined,
         };
-        crate::object::set(groups_obj, gc_heap, name, value);
+        crate::object::set(groups_obj, ctx.heap_mut(), name, value);
         for (name, range) in named_iter {
             let value = match range {
                 Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
                 None => Value::Undefined,
             };
-            crate::object::set(groups_obj, gc_heap, name, value);
+            crate::object::set(groups_obj, ctx.heap_mut(), name, value);
         }
-        crate::array::set_named_property(arr, gc_heap, "groups", Value::Object(groups_obj))?;
+        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::Object(groups_obj))?;
     } else {
-        crate::array::set_named_property(arr, gc_heap, "groups", Value::Undefined)?;
+        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::Undefined)?;
     }
 
     if has_indices {
+        let arr_value = Value::Array(arr);
         let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-        indices_elems.push(pair_array(m.range.start, m.range.end, gc_heap)?);
+        indices_elems.push(pair_array_native(
+            m.range.start,
+            m.range.end,
+            ctx,
+            &[&input_value, &arr_value],
+            &[out.as_slice()],
+        )?);
         for cap in &m.captures {
             match cap {
-                Some(r) => indices_elems.push(pair_array(r.start, r.end, gc_heap)?),
+                Some(r) => indices_elems.push(pair_array_native(
+                    r.start,
+                    r.end,
+                    ctx,
+                    &[&input_value, &arr_value],
+                    &[out.as_slice(), indices_elems.as_slice()],
+                )?),
                 None => indices_elems.push(Value::Undefined),
             }
         }
-        let indices_arr = crate::array::from_elements(gc_heap, indices_elems)?;
+        let mut roots = Vec::with_capacity(value_roots.len() + 2);
+        roots.push(&input_value);
+        roots.push(&arr_value);
+        roots.extend_from_slice(value_roots);
+        let mut index_slices = Vec::with_capacity(slice_roots.len() + 2);
+        index_slices.push(out.as_slice());
+        index_slices.push(indices_elems.as_slice());
+        index_slices.extend_from_slice(slice_roots);
+        let indices_arr = ctx.array_from_elements_with_roots(
+            indices_elems.iter().cloned(),
+            &roots,
+            &index_slices,
+        )?;
         let mut named_iter = m.named_groups();
         let first_named = named_iter.next();
         if let Some((name, range)) = first_named {
-            let g_obj = crate::object::alloc_object(gc_heap)?;
-            crate::object::set_prototype(g_obj, gc_heap, None);
+            let indices_value = Value::Array(indices_arr);
+            let mut roots = Vec::with_capacity(value_roots.len() + 3);
+            roots.push(&input_value);
+            roots.push(&arr_value);
+            roots.push(&indices_value);
+            roots.extend_from_slice(value_roots);
+            let g_obj = ctx.alloc_object_with_roots(&roots, &index_slices)?;
+            crate::object::set_prototype(g_obj, ctx.heap_mut(), None);
             let v = match range {
-                Some(r) => pair_array(r.start, r.end, gc_heap)?,
+                Some(r) => pair_array_native(
+                    r.start,
+                    r.end,
+                    ctx,
+                    &roots,
+                    &[out.as_slice(), indices_elems.as_slice()],
+                )?,
                 None => Value::Undefined,
             };
-            crate::object::set(g_obj, gc_heap, name, v);
+            crate::object::set(g_obj, ctx.heap_mut(), name, v);
             for (name, range) in named_iter {
                 let v = match range {
-                    Some(r) => pair_array(r.start, r.end, gc_heap)?,
+                    Some(r) => pair_array_native(
+                        r.start,
+                        r.end,
+                        ctx,
+                        &roots,
+                        &[out.as_slice(), indices_elems.as_slice()],
+                    )?,
                     None => Value::Undefined,
                 };
-                crate::object::set(g_obj, gc_heap, name, v);
+                crate::object::set(g_obj, ctx.heap_mut(), name, v);
             }
-            crate::array::set_named_property(indices_arr, gc_heap, "groups", Value::Object(g_obj))?;
+            crate::array::set_named_property(
+                indices_arr,
+                ctx.heap_mut(),
+                "groups",
+                Value::Object(g_obj),
+            )?;
         } else {
-            crate::array::set_named_property(indices_arr, gc_heap, "groups", Value::Undefined)?;
+            crate::array::set_named_property(
+                indices_arr,
+                ctx.heap_mut(),
+                "groups",
+                Value::Undefined,
+            )?;
         }
-        crate::array::set_named_property(arr, gc_heap, "indices", Value::Array(indices_arr))?;
+        crate::array::set_named_property(
+            arr,
+            ctx.heap_mut(),
+            "indices",
+            Value::Array(indices_arr),
+        )?;
     }
     Ok(arr)
 }
@@ -206,14 +481,34 @@ pub(crate) fn build_match_result(
 fn pair_array(
     start: usize,
     end: usize,
-    gc_heap: &mut otter_gc::GcHeap,
+    args: &mut IntrinsicArgs<'_>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::Array(crate::array::from_elements(
-        gc_heap,
+    Ok(Value::Array(args.array_from_elements_rooted(
         [
             Value::Number(NumberValue::from_i32(start as i32)),
             Value::Number(NumberValue::from_i32(end as i32)),
         ],
+        value_roots,
+        slice_roots,
+    )?))
+}
+
+fn pair_array_native(
+    start: usize,
+    end: usize,
+    ctx: &mut NativeCtx<'_>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<Value, otter_gc::OutOfMemory> {
+    Ok(Value::Array(ctx.array_from_elements_with_roots(
+        [
+            Value::Number(NumberValue::from_i32(start as i32)),
+            Value::Number(NumberValue::from_i32(end as i32)),
+        ],
+        value_roots,
+        slice_roots,
     )?))
 }
 
@@ -221,16 +516,14 @@ fn impl_exec(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
     let text = arg_string(args, 0)?.clone();
     let re_clone = *re;
-    let heap = &mut *args.gc_heap;
-    exec_once(&re_clone, &text, args.string_heap, heap)
+    exec_once(&re_clone, &text, args)
 }
 
 fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
     let text = arg_string(args, 0)?.clone();
     let re_clone = *re;
-    let heap = &mut *args.gc_heap;
-    let result = exec_once(&re_clone, &text, args.string_heap, heap)?;
+    let result = exec_once(&re_clone, &text, args)?;
     Ok(Value::Boolean(!matches!(result, Value::Null)))
 }
 
@@ -367,6 +660,33 @@ mod tests {
             &mut gc_heap,
         );
         assert_eq!(miss, Value::Null);
+    }
+
+    #[test]
+    fn exec_result_arrays_use_intrinsic_rooted_allocation() {
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let re = make("(?<first>a)(b)", "d", &mut gc_heap);
+        let text = Value::String(JsString::from_str("ab", &heap).unwrap());
+        let before = gc_heap.stats().new_allocated_bytes;
+        let result = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
+        let after = gc_heap.stats().new_allocated_bytes;
+
+        assert!(
+            after > before,
+            "RegExp exec result arrays, groups, and indices should allocate through intrinsic roots"
+        );
+        let Value::Array(arr) = result else {
+            panic!("expected RegExp exec result array");
+        };
+        assert!(matches!(
+            crate::array::get_named_property(arr, &gc_heap, "indices"),
+            Some(Value::Array(_))
+        ));
+        assert!(matches!(
+            crate::array::get_named_property(arr, &gc_heap, "groups"),
+            Some(Value::Object(_))
+        ));
     }
 
     #[test]

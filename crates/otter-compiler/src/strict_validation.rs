@@ -26,7 +26,9 @@
 //!   <https://tc39.es/ecma262/#sec-strict-mode-code>
 
 use otter_syntax::SyntaxDiagnostic;
-use oxc_ast::ast::{ArrowFunctionExpression, Class, Function, NumericLiteral, Program};
+use oxc_ast::ast::{
+    ArrowFunctionExpression, Class, Function, NumericLiteral, Program, StringLiteral,
+};
 use oxc_ast_visit::{Visit, walk};
 use oxc_syntax::scope::ScopeFlags;
 
@@ -129,6 +131,82 @@ impl<'a> Visit<'a> for StrictValidator {
             });
         }
     }
+
+    fn visit_string_literal(&mut self, it: &StringLiteral<'a>) {
+        if !self.is_strict() {
+            return;
+        }
+        let Some(raw) = it.raw else {
+            return;
+        };
+        if let Some((rel_start, rel_end)) = find_legacy_string_escape(raw.as_str()) {
+            let abs_start = it.span.start + rel_start as u32;
+            let abs_end = it.span.start + rel_end as u32;
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_LEGACY_ESCAPE".to_string(),
+                message:
+                    "SyntaxError: legacy octal or non-octal-decimal escape sequence is not allowed in strict mode string literal"
+                        .to_string(),
+                range: Some((abs_start, abs_end)),
+                help: Some(
+                    "use the `\\xNN` or `\\uNNNN` escape forms in strict mode code".to_string(),
+                ),
+            });
+        }
+    }
+}
+
+/// Locate the first `LegacyOctalEscapeSequence` or
+/// `NonOctalDecimalEscapeSequence` inside a raw string-literal source
+/// fragment (including the enclosing quotes).
+///
+/// Returns the relative byte range of the offending escape so the
+/// caller can map it back to absolute source positions via
+/// [`oxc_span::Span::start`].
+///
+/// # Algorithm (ECMA-262 §12.9.4.1 Static Semantics: Early Errors)
+/// Walk the raw bytes with a backslash flag. On encountering an
+/// unescaped `\`:
+/// - `\` followed by `1..=9` is always rejected
+///   (LegacyOctalEscapeSequence for `1..=7`, NonOctalDecimalEscapeSequence
+///   for `8..=9`).
+/// - `\0` followed by an ASCII digit is rejected
+///   (`\05`, `\012`, ... — LegacyOctalEscapeSequence variant
+///   starting with the `0` octet).
+/// - `\0` followed by anything else (or end of string) is the legal
+///   `<NUL>` escape and is skipped.
+/// - `\\` consumes both bytes (escaped backslash, not a new escape
+///   start).
+/// - All other escapes (`\n`, `\t`, `\x..`, `\u..`, `\'`, `\"`, ...)
+///   skip the two-byte escape pair.
+///
+/// Byte-level scanning is safe because every relevant prefix is
+/// pure ASCII; multi-byte UTF-8 sequences cannot start with `\` or
+/// an ASCII digit.
+fn find_legacy_string_escape(raw: &str) -> Option<(usize, usize)> {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            i += 1;
+            continue;
+        }
+        let next = bytes[i + 1];
+        match next {
+            b'\\' => i += 2,
+            b'1'..=b'9' => return Some((i, i + 2)),
+            b'0' => {
+                if let Some(&after) = bytes.get(i + 2)
+                    && after.is_ascii_digit()
+                {
+                    return Some((i, i + 3));
+                }
+                i += 2;
+            }
+            _ => i += 2,
+        }
+    }
+    None
 }
 
 /// Detect `LegacyOctalIntegerLiteral` and `NonOctalDecimalIntegerLiteral`
@@ -172,5 +250,42 @@ mod tests {
         assert!(!is_legacy_numeric_form("0e1"));
         assert!(!is_legacy_numeric_form("123"));
         assert!(!is_legacy_numeric_form(""));
+    }
+
+    #[test]
+    fn detects_legacy_string_escapes() {
+        // \1..\7 — LegacyOctalEscapeSequence
+        assert!(find_legacy_string_escape("\"\\1\"").is_some());
+        assert!(find_legacy_string_escape("'\\7'").is_some());
+        // \05 — LegacyOctalEscapeSequence starting with 0
+        assert!(find_legacy_string_escape("\"\\05\"").is_some());
+        assert!(find_legacy_string_escape("\"\\012\"").is_some());
+        // \8, \9 — NonOctalDecimalEscapeSequence
+        assert!(find_legacy_string_escape("\"\\8\"").is_some());
+        assert!(find_legacy_string_escape("\"\\9\"").is_some());
+        // Mid-string occurrence
+        assert!(find_legacy_string_escape("\"abc\\1def\"").is_some());
+    }
+
+    #[test]
+    fn ignores_modern_string_escapes() {
+        // Bare NUL — allowed when followed by non-digit / end.
+        assert!(find_legacy_string_escape("\"\\0\"").is_none());
+        // Standard escapes.
+        for s in [
+            "\"\\n\"", "\"\\t\"", "\"\\r\"", "\"\\b\"", "\"\\f\"", "\"\\v\"",
+        ] {
+            assert!(find_legacy_string_escape(s).is_none(), "rejected {s}");
+        }
+        // Hex / unicode escapes.
+        assert!(find_legacy_string_escape("\"\\x41\"").is_none());
+        assert!(find_legacy_string_escape("\"\\u0041\"").is_none());
+        assert!(find_legacy_string_escape("\"\\u{41}\"").is_none());
+        // Escaped backslash — must not be treated as a fresh escape.
+        assert!(find_legacy_string_escape("\"\\\\1\"").is_none());
+        assert!(find_legacy_string_escape("\"\\\\\"").is_none());
+        // Quoted regular text.
+        assert!(find_legacy_string_escape("\"hello world\"").is_none());
+        assert!(find_legacy_string_escape("''").is_none());
     }
 }

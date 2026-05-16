@@ -644,6 +644,24 @@ impl Interpreter {
             {
                 make_array_iterator_factory(*arr, &mut self.gc_heap)?
             }
+            // Computed string-key access on RegExp must observe the
+            // same own/prototype lookup as `re.lastIndex` (member
+            // access). Without this arm, `re["lastIndex"]` falls
+            // through to the numeric-index default and surfaces a
+            // bogus `TypeMismatch` (see ECMA-262 §22.2.5 — RegExp
+            // exposes `source`, `flags`, `global`, `lastIndex`, etc.
+            // as proper own/prototype properties).
+            (Value::RegExp(r), Value::String(key)) => {
+                let name = key.to_lossy_string();
+                let direct =
+                    regexp_prototype::load_property(r, &self.gc_heap, &name, &self.string_heap);
+                match direct {
+                    Value::Undefined => {
+                        self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
+                    }
+                    value => value,
+                }
+            }
             (Value::Map(m), Value::Symbol(sym))
                 if sym
                     .well_known_tag()

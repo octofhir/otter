@@ -42,6 +42,7 @@
 
 mod capture;
 mod compiled_module;
+mod strict_validation;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -206,6 +207,10 @@ fn compile_program(
     // §16.2.1.7 — top-level `await` upgrades `<main>` to async so
     // the dispatch loop's async machinery parks / resumes the
     // entry frame on suspension points.
+    // §12.9.3.1 + §15.7 strict-mode early errors that oxc_parser
+    // does not flag on its own (legacy octal / non-octal-decimal
+    // integer literals, etc.).
+    strict_validation::validate_strict_mode_early_errors(program, force_strict)?;
     let main_is_async = module_body_uses_top_level_await(&program.body);
     let main_is_strict = force_strict || program.has_use_strict_directive();
     // Reserve slot 0 for `<main>` so nested function compilation
@@ -346,6 +351,7 @@ fn compile_program(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-modules>
 /// - <https://tc39.es/ecma262/#sec-source-text-module-records>
+///
 /// Compile an already parsed OXC program as one ES-module fragment.
 ///
 /// This is the module-graph hot path: callers that already borrowed an AST for
@@ -360,6 +366,9 @@ pub fn compile_module_program(
     source_kind: SyntaxSourceKind,
     host: &ModuleHostInfo,
 ) -> Result<BytecodeModule, CompileError> {
+    // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
+    // always strict mode code (§10.2.10).
+    strict_validation::validate_strict_mode_early_errors(program, true)?;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let init_is_async = module_body_uses_top_level_await(&program.body);
     module.borrow_mut().functions.push(Function {

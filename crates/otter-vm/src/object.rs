@@ -677,22 +677,13 @@ fn empty_object_body() -> ObjectBody {
     }
 }
 
-/// Allocate a fresh empty extensible object on the root shape.
+/// Allocate an old-space object for raw GC fixtures.
 ///
-/// Routes through [`otter_gc::GcHeap::alloc_old`] so the body is allocated
-/// directly in old-space. Stack-aware bytecode allocation sites should use the
-/// narrower young-generation helper once they can expose their live frame
-/// roots.
-///
-/// # Errors
-///
-/// Surfaces [`otter_gc::OutOfMemory`] verbatim; runtime callers translate it
-/// into [`crate::VmError::OutOfMemory`].
-///
-/// # Spec
-///
-/// - <https://tc39.es/ecma262/#sec-ordinaryobjectcreate>
-pub fn alloc_object(heap: &mut GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+/// Production VM allocation paths must use stack/runtime/native root contracts.
+#[cfg(test)]
+pub(crate) fn alloc_object_old_for_fixture(
+    heap: &mut GcHeap,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
     heap.alloc_old(empty_object_body())
 }
 
@@ -712,10 +703,9 @@ pub(crate) fn alloc_object_with_roots(
 /// Allocate a fresh empty object for diagnostic delivery after the
 /// heap cap has already fired.
 ///
-/// This mirrors [`alloc_object`] but uses
-/// [`otter_gc::GcHeap::alloc_old_diagnostic`] so the VM can throw a
-/// catchable `RangeError` for an allocation failure instead of
-/// immediately losing the error object to the same cap.
+/// This uses [`otter_gc::GcHeap::alloc_old_diagnostic`] so the VM can throw a
+/// catchable `RangeError` for an allocation failure instead of immediately
+/// losing the error object to the same cap.
 ///
 /// # Errors
 ///
@@ -761,30 +751,6 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
         },
         external_visit,
     )
-}
-
-/// Allocate a fresh empty object whose prototype is `proto`.
-///
-/// Convenience wrapper around [`alloc_object`] that fires the
-/// generational write barrier on the freshly-installed prototype
-/// link.
-///
-/// # Errors
-///
-/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-///
-/// # Spec
-///
-/// - <https://tc39.es/ecma262/#sec-ordinaryobjectcreate>
-pub fn alloc_object_with_proto(
-    heap: &mut otter_gc::GcHeap,
-    proto: Option<JsObject>,
-) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let obj = alloc_object(heap)?;
-    if let Some(p) = proto {
-        set_prototype(obj, heap, Some(p));
-    }
-    Ok(obj)
 }
 
 pub(crate) fn install_mapped_arguments(
@@ -2181,7 +2147,7 @@ mod tests {
     #[test]
     fn empty_object_starts_with_zero_props() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(is_empty(o, &heap));
         assert_eq!(len(o, &heap), 0);
     }
@@ -2189,7 +2155,7 @@ mod tests {
     #[test]
     fn set_then_get_roundtrip() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(true))));
     }
@@ -2197,7 +2163,7 @@ mod tests {
     #[test]
     fn atom_lookup_reports_shape_and_slot_metadata() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         let shape = shape_id(o, &heap);
         let key = AtomizedPropertyKey::new(
@@ -2227,7 +2193,7 @@ mod tests {
     #[test]
     fn atom_slot_guard_rejects_shape_change() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2247,7 +2213,7 @@ mod tests {
     #[test]
     fn atom_slot_store_updates_guarded_data_slot() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2275,8 +2241,8 @@ mod tests {
     #[test]
     fn atom_add_transition_replays_on_matching_direct_prototype_shape() {
         let mut heap = fresh_heap();
-        let proto = alloc_object(&mut heap).unwrap();
-        let first = alloc_object(&mut heap).unwrap();
+        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2290,7 +2256,7 @@ mod tests {
             StorePropertyTransitionKind::DirectPrototypeMissing { .. }
         ));
 
-        let second = alloc_object(&mut heap).unwrap();
+        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
@@ -2309,8 +2275,8 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_changed_direct_prototype_shape() {
         let mut heap = fresh_heap();
-        let proto = alloc_object(&mut heap).unwrap();
-        let first = alloc_object(&mut heap).unwrap();
+        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2321,7 +2287,7 @@ mod tests {
                 .expect("transition install");
         set(proto, &mut heap, "x", Value::Null);
 
-        let second = alloc_object(&mut heap).unwrap();
+        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
@@ -2339,8 +2305,8 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_deeper_prototype_after_mutation() {
         let mut heap = fresh_heap();
-        let proto = alloc_object(&mut heap).unwrap();
-        let first = alloc_object(&mut heap).unwrap();
+        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
+        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2349,10 +2315,10 @@ mod tests {
         let transition =
             capture_store_property_transition(first, &mut heap, key, &Value::Boolean(true))
                 .expect("transition install");
-        let deep_proto = alloc_object(&mut heap).unwrap();
+        let deep_proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(proto, &mut heap, Some(deep_proto));
 
-        let second = alloc_object(&mut heap).unwrap();
+        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
@@ -2370,9 +2336,9 @@ mod tests {
     #[test]
     fn atom_add_transition_replays_inherited_writable_data_store() {
         let mut heap = fresh_heap();
-        let proto = alloc_object(&mut heap).unwrap();
+        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(proto, &mut heap, "x", Value::Boolean(true));
-        let first = alloc_object(&mut heap).unwrap();
+        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2386,7 +2352,7 @@ mod tests {
             StorePropertyTransitionKind::DirectPrototypeWritableData { .. }
         ));
 
-        let second = alloc_object(&mut heap).unwrap();
+        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
@@ -2400,9 +2366,9 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_inherited_data_after_writable_change() {
         let mut heap = fresh_heap();
-        let proto = alloc_object(&mut heap).unwrap();
+        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(proto, &mut heap, "x", Value::Boolean(true));
-        let first = alloc_object(&mut heap).unwrap();
+        let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2418,7 +2384,7 @@ mod tests {
             PropertyDescriptor::data(Value::Boolean(true), false, true, true),
         ));
 
-        let second = alloc_object(&mut heap).unwrap();
+        let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
@@ -2430,14 +2396,14 @@ mod tests {
     #[test]
     fn atom_add_transition_rejects_inherited_non_writable_data() {
         let mut heap = fresh_heap();
-        let proto = alloc_object(&mut heap).unwrap();
+        let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(define_own_property(
             proto,
             &mut heap,
             "x",
             PropertyDescriptor::data(Value::Boolean(true), false, true, true),
         ));
-        let receiver = alloc_object(&mut heap).unwrap();
+        let receiver = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(receiver, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2482,7 +2448,7 @@ mod tests {
     #[test]
     fn shape_id_changes_on_new_property_not_overwrite() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let empty = shape_id(o, &heap);
         set(o, &mut heap, "x", Value::Boolean(true));
         let with_x = shape_id(o, &heap);
@@ -2495,14 +2461,14 @@ mod tests {
     #[test]
     fn missing_key_is_none() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(get(o, &heap, "missing").is_none());
     }
 
     #[test]
     fn insertion_order_is_preserved() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "a", Value::Boolean(true));
         set(o, &mut heap, "b", Value::Boolean(false));
         set(o, &mut heap, "c", Value::Null);
@@ -2514,7 +2480,7 @@ mod tests {
     #[test]
     fn integer_index_keys_sort_before_strings() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "b", Value::Boolean(true));
         set(o, &mut heap, "10", Value::Boolean(true));
         set(o, &mut heap, "2", Value::Boolean(true));
@@ -2531,7 +2497,7 @@ mod tests {
     #[test]
     fn delete_removes_property() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         assert!(delete(o, &mut heap, "x"));
         assert!(get(o, &heap, "x").is_none());
@@ -2543,7 +2509,7 @@ mod tests {
     #[test]
     fn handle_copy_shares_storage() {
         let mut heap = fresh_heap();
-        let a = alloc_object(&mut heap).unwrap();
+        let a = alloc_object_old_for_fixture(&mut heap).unwrap();
         let b = a; // Copy
         set(a, &mut heap, "x", Value::Boolean(true));
         assert_eq!(a, b);
@@ -2579,7 +2545,7 @@ mod tests {
     #[test]
     fn host_object_data_reports_missing_or_wrong_type() {
         let mut heap = fresh_heap();
-        let ordinary = alloc_object(&mut heap).unwrap();
+        let ordinary = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert_eq!(
             with_host_data::<Counter, _>(ordinary, &heap, |_| ()).unwrap_err(),
             HostObjectError::Missing
@@ -2596,14 +2562,14 @@ mod tests {
     #[test]
     fn two_literals_share_shape() {
         let mut heap = fresh_heap();
-        let a = alloc_object(&mut heap).unwrap();
+        let a = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(a, &mut heap, "x", Value::Boolean(true));
         set(a, &mut heap, "y", Value::Null);
-        let b = alloc_object(&mut heap).unwrap();
+        let b = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(b, &mut heap, "x", Value::Boolean(false));
         set(b, &mut heap, "y", Value::Undefined);
         assert!(Rc::ptr_eq(&shape(a, &heap), &shape(b, &heap)));
-        let c = alloc_object(&mut heap).unwrap();
+        let c = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(c, &mut heap, "y", Value::Null);
         set(c, &mut heap, "x", Value::Boolean(true));
         assert!(!Rc::ptr_eq(&shape(a, &heap), &shape(c, &heap)));
@@ -2612,7 +2578,7 @@ mod tests {
     #[test]
     fn overwrite_does_not_grow_shape() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         let s1 = shape(o, &heap);
         set(o, &mut heap, "x", Value::Null);
@@ -2624,7 +2590,7 @@ mod tests {
     #[test]
     fn delete_switches_to_dictionary_shape() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "a", Value::Boolean(true));
         set(o, &mut heap, "b", Value::Null);
         let before = shape(o, &heap);
@@ -2641,7 +2607,7 @@ mod tests {
     #[test]
     fn define_property_with_default_attrs() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let desc = PropertyDescriptor::data(Value::Boolean(true), false, false, false);
         assert!(define_own_property(o, &mut heap, "x", desc));
         let got = get_own_descriptor(o, &heap, "x").unwrap();
@@ -2654,7 +2620,7 @@ mod tests {
     #[test]
     fn define_property_rejects_non_configurable_kind_change() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         define_own_property(
             o,
             &mut heap,
@@ -2669,7 +2635,7 @@ mod tests {
     #[test]
     fn ordinary_set_data_property_preserves_existing_attrs() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(define_own_property(
             o,
             &mut heap,
@@ -2694,7 +2660,7 @@ mod tests {
     #[test]
     fn ordinary_set_data_property_rejects_non_writable_data() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(define_own_property(
             o,
             &mut heap,
@@ -2715,7 +2681,7 @@ mod tests {
     #[test]
     fn ordinary_set_data_property_respects_extensibility_for_new_keys() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
 
         assert!(ordinary_set_data_property(o, &mut heap, "x", Value::Null));
         assert!(matches!(get(o, &heap, "x"), Some(Value::Null)));
@@ -2733,7 +2699,7 @@ mod tests {
     #[test]
     fn freeze_makes_object_non_writable() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
         freeze(o, &mut heap);
         assert!(is_frozen(o, &heap));
@@ -2753,7 +2719,7 @@ mod tests {
     #[test]
     fn seal_blocks_new_properties() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "a", Value::Null);
         seal(o, &mut heap);
         assert!(is_sealed(o, &heap));
@@ -2769,7 +2735,7 @@ mod tests {
     #[test]
     fn delete_respects_configurable() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         define_own_property(
             o,
             &mut heap,
@@ -2783,7 +2749,7 @@ mod tests {
     #[test]
     fn delete_symbol_missing_key_succeeds() {
         let mut heap = fresh_heap();
-        let o = alloc_object(&mut heap).unwrap();
+        let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let sym = JsSymbol::new(None);
         assert!(delete_symbol(o, &mut heap, &sym));
     }

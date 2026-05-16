@@ -141,6 +141,7 @@ pub(crate) fn alloc_weak_ref_with_roots(
     Ok(weak_ref)
 }
 
+#[cfg(test)]
 pub(crate) fn alloc_weak_ref_for_mark_sweep_fixture(
     heap: &mut otter_gc::GcHeap,
     target: &Value,
@@ -191,6 +192,7 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
     Ok(registry)
 }
 
+#[cfg(test)]
 pub(crate) fn alloc_finalization_registry_for_mark_sweep_fixture(
     heap: &mut otter_gc::GcHeap,
     cleanup_callback: Value,

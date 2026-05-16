@@ -405,6 +405,7 @@ impl PurePromise {
         self.inner.as_header_ptr() as *const ()
     }
 
+    #[cfg(test)]
     pub(crate) fn debug_fulfill_reactions(&self, heap: &otter_gc::GcHeap) -> Vec<PromiseReaction> {
         heap.read_payload(self.inner, |body| body.fulfill_reactions.clone())
     }
@@ -705,6 +706,7 @@ impl JsPromiseHandle {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn debug_fulfill_reactions(&self, heap: &otter_gc::GcHeap) -> Vec<PromiseReaction> {
         match self.inner {
             PromiseRepr::Pure(p) => p.debug_fulfill_reactions(heap),

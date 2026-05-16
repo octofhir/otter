@@ -599,10 +599,10 @@ mod tests {
     fn is_array_recognises_array_only() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         assert!(is_array(&Value::Array(
-            crate::array::alloc_array(&mut heap).unwrap()
+            crate::array::alloc_array_old_for_fixture(&mut heap).unwrap()
         )));
         assert!(!is_array(&Value::Object(
-            crate::object::alloc_object(&mut heap).unwrap()
+            crate::object::alloc_object_old_for_fixture(&mut heap).unwrap()
         )));
         assert!(!is_array(&Value::Undefined));
     }
@@ -612,7 +612,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         assert!(is_callable(&Value::Function { function_id: 0 }));
         assert!(!is_callable(&Value::Object(
-            crate::object::alloc_object(&mut heap).unwrap()
+            crate::object::alloc_object_old_for_fixture(&mut heap).unwrap()
         )));
         assert!(!is_callable(&Value::Undefined));
     }

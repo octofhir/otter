@@ -885,8 +885,8 @@ impl GcHeap {
             }
             external_visit(visitor);
         };
-        let mut weak_registry_slots = self.ephemerons.handle_slots();
-        weak_registry_slots.extend(self.weak_finalization.handle_slots());
+        let ephemeron_registry_slots = self.ephemerons.handle_slots();
+        let weak_registry_slots = self.weak_finalization.handle_slots();
         // SAFETY: STW pause for the duration of the call;
         // every type tag in from-space is registered.
         let stats = unsafe {
@@ -896,6 +896,7 @@ impl GcHeap {
                 &self.trace_table,
                 &[],
                 &mut combined,
+                &ephemeron_registry_slots,
                 &weak_registry_slots,
             )
         };

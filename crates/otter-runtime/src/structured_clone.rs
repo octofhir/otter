@@ -593,12 +593,31 @@ fn value_type_name(value: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use otter_vm::number::NumberValue;
-    use otter_vm::string::{JsString, StringHeap};
+    use otter_vm::{ExecutionContext, Interpreter};
 
     use super::*;
 
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+    fn clone_js_value(source: &str) -> Result<StructuredCloneValue, StructuredCloneError> {
+        clone_js_value_with_options(source, StructuredCloneOptions::default())
+    }
+
+    fn clone_js_value_with_options(
+        source: &str,
+        options: StructuredCloneOptions,
+    ) -> Result<StructuredCloneValue, StructuredCloneError> {
+        let compiled = otter_compiler::compile_script_source_to_module(
+            source,
+            otter_syntax::SourceKind::JavaScript,
+            "<structured-clone-test>",
+        )
+        .expect("compile fixture");
+        let context = ExecutionContext::from_module(compiled.bytecode);
+        let mut interp = Interpreter::new();
+        let value = interp.run(&context).expect("run fixture");
+        clone_vm_value_with_options(&value, interp.gc_heap(), options)
+    }
 
     #[test]
     fn public_payload_is_send_sync_static_owned_data() {
@@ -610,35 +629,20 @@ mod tests {
 
     #[test]
     fn clones_owned_primitives_and_collections() {
-        let mut heap = GcHeap::new().unwrap();
-        let string_heap = StringHeap::default();
-
-        let array = array::from_elements(
-            &mut heap,
-            [
-                Value::Number(NumberValue::from_i32(7)),
-                Value::String(JsString::from_str("array", &string_heap).unwrap()),
-            ],
+        let cloned = clone_js_value(
+            r#"
+            const array = [7, "array"];
+            const map = new Map();
+            map.set("key", array);
+            const set = new Set();
+            set.add(true);
+            const object = {};
+            object.map = map;
+            object.set = set;
+            object;
+            "#,
         )
         .unwrap();
-
-        let map = collections::alloc_map(&mut heap).unwrap();
-        collections::map_set(
-            map,
-            &mut heap,
-            Value::String(JsString::from_str("key", &string_heap).unwrap()),
-            Value::Array(array),
-        )
-        .unwrap();
-
-        let set = collections::alloc_set(&mut heap).unwrap();
-        collections::set_add(set, &mut heap, Value::Boolean(true)).unwrap();
-
-        let object = object::alloc_object(&mut heap).unwrap();
-        object::set(object, &mut heap, "map", Value::Map(map));
-        object::set(object, &mut heap, "set", Value::Set(set));
-
-        let cloned = clone_vm_value(&Value::Object(object), &heap).unwrap();
 
         assert_eq!(
             cloned,
@@ -663,11 +667,14 @@ mod tests {
 
     #[test]
     fn rejects_cycles_with_stable_path() {
-        let mut heap = GcHeap::new().unwrap();
-        let object = object::alloc_object(&mut heap).unwrap();
-        object::set(object, &mut heap, "self", Value::Object(object));
-
-        let err = clone_vm_value(&Value::Object(object), &heap).unwrap_err();
+        let err = clone_js_value(
+            r#"
+            const object = {};
+            object.self = object;
+            object;
+            "#,
+        )
+        .unwrap_err();
 
         assert_eq!(
             err,
@@ -679,16 +686,8 @@ mod tests {
 
     #[test]
     fn rejects_values_beyond_depth_limit() {
-        let mut heap = GcHeap::new().unwrap();
-        let inner = array::from_elements(&mut heap, [Value::Null]).unwrap();
-        let outer = array::from_elements(&mut heap, [Value::Array(inner)]).unwrap();
-
-        let err = clone_vm_value_with_options(
-            &Value::Array(outer),
-            &heap,
-            StructuredCloneOptions { max_depth: 0 },
-        )
-        .unwrap_err();
+        let err = clone_js_value_with_options("[[null]];", StructuredCloneOptions { max_depth: 0 })
+            .unwrap_err();
 
         assert_eq!(
             err,
@@ -701,10 +700,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_values_with_stable_path() {
-        let mut heap = GcHeap::new().unwrap();
-        let array = array::from_elements(&mut heap, [Value::Function { function_id: 1 }]).unwrap();
-
-        let err = clone_vm_value(&Value::Array(array), &heap).unwrap_err();
+        let err = clone_js_value("[function unsupported() {}];").unwrap_err();
 
         assert_eq!(
             err,
@@ -717,29 +713,16 @@ mod tests {
 
     #[test]
     fn clones_error_like_objects_as_diagnostics() {
-        let mut heap = GcHeap::new().unwrap();
-        let string_heap = StringHeap::default();
-        let error = object::alloc_object(&mut heap).unwrap();
-        object::set(
-            error,
-            &mut heap,
-            "name",
-            Value::String(JsString::from_str("TypeError", &string_heap).unwrap()),
-        );
-        object::set(
-            error,
-            &mut heap,
-            "message",
-            Value::String(JsString::from_str("bad value", &string_heap).unwrap()),
-        );
-        object::set(
-            error,
-            &mut heap,
-            "stack",
-            Value::String(JsString::from_str("TypeError: bad value", &string_heap).unwrap()),
-        );
-
-        let cloned = clone_vm_value(&Value::Object(error), &heap).unwrap();
+        let cloned = clone_js_value(
+            r#"
+            const error = {};
+            error.name = "TypeError";
+            error.message = "bad value";
+            error.stack = "TypeError: bad value";
+            error;
+            "#,
+        )
+        .unwrap();
 
         assert_eq!(
             cloned,

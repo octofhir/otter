@@ -1,17 +1,17 @@
-//! Weak collection GC regressions for task 80.
+//! Weak collection ephemeron invariants.
 //!
 //! `WeakMap` / `WeakSet` entries are ephemerons: the collection
 //! table can stay live without keeping its keys alive. `WeakMap`
 //! values become strong only after their key is marked through
 //! another path.
 
-use otter_gc::raw::RawGc;
-use otter_vm::Value;
-use otter_vm::collections::{
+use crate::Value;
+use crate::collections::{
     alloc_weak_map, alloc_weak_set, run_ephemeron_fixpoint, weak_map_get, weak_map_has,
     weak_map_set, weak_set_add, weak_set_has,
 };
-use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+use crate::object::OBJECT_BODY_TYPE_TAG;
+use otter_gc::raw::RawGc;
 
 fn collect_with_roots(heap: &mut otter_gc::GcHeap, roots: &mut [&mut RawGc]) {
     let mut visit = |sv: &mut dyn FnMut(*mut RawGc)| {
@@ -28,8 +28,8 @@ fn collect_with_roots(heap: &mut otter_gc::GcHeap, roots: &mut [&mut RawGc]) {
 fn weakmap_dead_key_entry_is_pruned_and_value_reaped() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
     let wm = alloc_weak_map(&mut heap).expect("weak map");
-    let key = otter_vm::object::alloc_object(&mut heap).expect("key");
-    let value = otter_vm::object::alloc_object(&mut heap).expect("value");
+    let key = crate::test_support::alloc_old_object(&mut heap).expect("key");
+    let value = crate::test_support::alloc_old_object(&mut heap).expect("value");
 
     weak_map_set(wm, &mut heap, Value::Object(key), Value::Object(value)).expect("weak map set");
     let mut wm_root = wm.raw();
@@ -50,8 +50,8 @@ fn weakmap_dead_key_entry_is_pruned_and_value_reaped() {
 fn weakmap_live_key_marks_value_through_fixpoint() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
     let wm = alloc_weak_map(&mut heap).expect("weak map");
-    let key = otter_vm::object::alloc_object(&mut heap).expect("key");
-    let value = otter_vm::object::alloc_object(&mut heap).expect("value");
+    let key = crate::test_support::alloc_old_object(&mut heap).expect("key");
+    let value = crate::test_support::alloc_old_object(&mut heap).expect("value");
 
     weak_map_set(wm, &mut heap, Value::Object(key), Value::Object(value)).expect("weak map set");
     let mut wm_root = wm.raw();
@@ -69,9 +69,9 @@ fn weakmap_live_key_marks_value_through_fixpoint() {
 fn weakmap_ephemeron_chain_reaches_fixpoint() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
     let wm = alloc_weak_map(&mut heap).expect("weak map");
-    let k1 = otter_vm::object::alloc_object(&mut heap).expect("k1");
-    let k2 = otter_vm::object::alloc_object(&mut heap).expect("k2");
-    let value = otter_vm::object::alloc_object(&mut heap).expect("value");
+    let k1 = crate::test_support::alloc_old_object(&mut heap).expect("k1");
+    let k2 = crate::test_support::alloc_old_object(&mut heap).expect("k2");
+    let value = crate::test_support::alloc_old_object(&mut heap).expect("value");
 
     weak_map_set(wm, &mut heap, Value::Object(k1), Value::Object(k2)).expect("weak map k1");
     weak_map_set(wm, &mut heap, Value::Object(k2), Value::Object(value)).expect("weak map k2");
@@ -90,9 +90,9 @@ fn weakmap_ephemeron_chain_reaches_fixpoint() {
 fn weakmap_dead_ephemeron_chain_is_reaped() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
     let wm = alloc_weak_map(&mut heap).expect("weak map");
-    let k1 = otter_vm::object::alloc_object(&mut heap).expect("k1");
-    let k2 = otter_vm::object::alloc_object(&mut heap).expect("k2");
-    let value = otter_vm::object::alloc_object(&mut heap).expect("value");
+    let k1 = crate::test_support::alloc_old_object(&mut heap).expect("k1");
+    let k2 = crate::test_support::alloc_old_object(&mut heap).expect("k2");
+    let value = crate::test_support::alloc_old_object(&mut heap).expect("value");
 
     weak_map_set(wm, &mut heap, Value::Object(k1), Value::Object(k2)).expect("weak map k1");
     weak_map_set(wm, &mut heap, Value::Object(k2), Value::Object(value)).expect("weak map k2");
@@ -112,7 +112,7 @@ fn weakmap_dead_ephemeron_chain_is_reaped() {
 fn weakmap_self_reference_does_not_keep_key_alive() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
     let wm = alloc_weak_map(&mut heap).expect("weak map");
-    let obj = otter_vm::object::alloc_object(&mut heap).expect("obj");
+    let obj = crate::test_support::alloc_old_object(&mut heap).expect("obj");
 
     weak_map_set(wm, &mut heap, Value::Object(obj), Value::Object(obj)).expect("weak map set");
     let mut wm_root = wm.raw();
@@ -130,16 +130,16 @@ fn weakmap_self_reference_does_not_keep_key_alive() {
 fn weakmap_replacement_and_delete_do_not_leave_stale_ephemerons() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
     let wm = alloc_weak_map(&mut heap).expect("weak map");
-    let key = otter_vm::object::alloc_object(&mut heap).expect("key");
-    let old_value = otter_vm::object::alloc_object(&mut heap).expect("old value");
-    let new_value = otter_vm::object::alloc_object(&mut heap).expect("new value");
+    let key = crate::test_support::alloc_old_object(&mut heap).expect("key");
+    let old_value = crate::test_support::alloc_old_object(&mut heap).expect("old value");
+    let new_value = crate::test_support::alloc_old_object(&mut heap).expect("new value");
 
     weak_map_set(wm, &mut heap, Value::Object(key), Value::Object(old_value))
         .expect("weak map old");
     weak_map_set(wm, &mut heap, Value::Object(key), Value::Object(new_value))
         .expect("weak map replacement");
     assert!(
-        otter_vm::collections::weak_map_delete(wm, &mut heap, &Value::Object(key))
+        crate::collections::weak_map_delete(wm, &mut heap, &Value::Object(key))
             .expect("weak map delete")
     );
     let mut wm_root = wm.raw();
@@ -155,14 +155,14 @@ fn weakmap_replacement_and_delete_do_not_leave_stale_ephemerons() {
 #[test]
 fn dropped_weakmap_prunes_registry_and_does_not_retain_values() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-    let key = otter_vm::object::alloc_object(&mut heap).expect("key");
+    let key = crate::test_support::alloc_old_object(&mut heap).expect("key");
     let key_bytes = {
         let mut key_raw = key.raw();
         collect_with_roots(&mut heap, &mut [&mut key_raw]);
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes
     };
     let wm = alloc_weak_map(&mut heap).expect("weak map");
-    let value = otter_vm::object::alloc_object(&mut heap).expect("value");
+    let value = crate::test_support::alloc_old_object(&mut heap).expect("value");
 
     weak_map_set(wm, &mut heap, Value::Object(key), Value::Object(value)).expect("weak map set");
     assert_eq!(heap.ephemeron_table_count(), 1);
@@ -194,8 +194,8 @@ fn allocation_during_mark_phase_registers_ephemerons_after_active_snapshot() {
     heap.mark_phase(&mut visit);
     let snapshot_before = heap.ephemeron_tables_snapshot();
     let late = alloc_weak_map(&mut heap).expect("late weak map");
-    let key = otter_vm::object::alloc_object(&mut heap).expect("late key");
-    let value = otter_vm::object::alloc_object(&mut heap).expect("late value");
+    let key = crate::test_support::alloc_old_object(&mut heap).expect("late key");
+    let value = crate::test_support::alloc_old_object(&mut heap).expect("late value");
     weak_map_set(late, &mut heap, Value::Object(key), Value::Object(value))
         .expect("late weak map set");
 
@@ -222,7 +222,7 @@ fn allocation_during_mark_phase_registers_ephemerons_after_active_snapshot() {
 fn weakset_dead_key_entry_is_pruned() {
     let mut heap = otter_gc::GcHeap::new().expect("gc heap");
     let ws = alloc_weak_set(&mut heap).expect("weak set");
-    let key = otter_vm::object::alloc_object(&mut heap).expect("key");
+    let key = crate::test_support::alloc_old_object(&mut heap).expect("key");
 
     weak_set_add(ws, &mut heap, Value::Object(key)).expect("weak set add");
     let mut ws_root = ws.raw();

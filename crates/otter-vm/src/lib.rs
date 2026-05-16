@@ -115,10 +115,13 @@ pub mod symbol;
 pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
-#[doc(hidden)]
-pub mod test_support;
 pub mod timers;
 pub mod weak_refs;
+
+#[cfg(test)]
+mod gc_invariants;
+#[cfg(test)]
+mod test_support;
 
 pub use execution_context::ExecutionContext;
 pub use frame_state::{
@@ -5966,7 +5969,7 @@ mod tests {
         let module = module_with(Vec::new(), 4);
         let context = ExecutionContext::from_module(module.clone());
         let mut interp = Interpreter::new();
-        let lhs = object::alloc_object(interp.gc_heap_mut()).expect("lhs");
+        let lhs = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("lhs");
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[1] = Value::Object(lhs);
@@ -6169,7 +6172,7 @@ mod tests {
     fn get_iterator_user_resume_uses_young_allocation_with_frame_roots() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
-        let iterator_obj = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let iterator_obj = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -6201,7 +6204,7 @@ mod tests {
     fn iterator_helper_next_uses_young_allocation_with_frame_roots() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(7))],
         )
@@ -6253,7 +6256,7 @@ mod tests {
 
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(5))],
         )
@@ -6293,12 +6296,12 @@ mod tests {
     fn iterator_flat_map_inner_array_uses_runtime_rooted_iterator_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(1))],
         )
         .unwrap();
-        let mapped = crate::array::from_elements(
+        let mapped = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(99))],
         )
@@ -6364,7 +6367,7 @@ mod tests {
             module_inits: Vec::new(),
         };
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(12))],
         )
@@ -6412,7 +6415,7 @@ mod tests {
     fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(21))],
         )
@@ -6457,7 +6460,7 @@ mod tests {
         let module = module_with(Vec::new(), 2);
         let context = ExecutionContext::from_module(module);
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(21))],
         )
@@ -6532,7 +6535,7 @@ mod tests {
     fn synthesized_iterator_next_uses_runtime_rooted_young_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(NumberValue::from_i32(17))],
         )
@@ -6601,7 +6604,7 @@ mod tests {
     #[test]
     fn new_collection_map_uses_root_aware_allocation_with_frame_roots() {
         let mut interp = Interpreter::new();
-        let pair = crate::array::from_elements(
+        let pair = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [
                 Value::Number(NumberValue::from_i32(1)),
@@ -6609,7 +6612,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let seed = crate::array::from_elements(interp.gc_heap_mut(), [Value::Array(pair)]).unwrap();
+        let seed =
+            crate::array::from_elements_old_for_fixture(interp.gc_heap_mut(), [Value::Array(pair)])
+                .unwrap();
         let module = BytecodeModule {
             module: "test.ts".to_string(),
             source_kind: BcSourceKind::TypeScript,
@@ -7923,7 +7928,7 @@ mod tests {
         assert!(is_callable(&Value::BoundFunction(bound)));
         assert!(!is_callable(&Value::Number(NumberValue::Smi(1))));
         assert!(!is_callable(&Value::Object(
-            crate::object::alloc_object(&mut heap).unwrap()
+            crate::object::alloc_object_old_for_fixture(&mut heap).unwrap()
         )));
     }
 
@@ -7937,7 +7942,9 @@ mod tests {
         let mut interp = Interpreter::new();
         let callee = native_value_static(interp.gc_heap_mut(), "returnThis", 0, return_this)
             .expect("native");
-        let receiver = Value::Object(crate::object::alloc_object(interp.gc_heap_mut()).unwrap());
+        let receiver = Value::Object(
+            crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap(),
+        );
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let context = ExecutionContext::from_module(module.clone());
@@ -8002,8 +8009,8 @@ mod tests {
     fn proxy_revocable_uses_stack_rooted_result_allocation() {
         let module = module_with(vec![], 4);
         let mut interp = Interpreter::new();
-        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
-        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let target = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
+        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -8045,7 +8052,7 @@ mod tests {
     fn object_entries_uses_stack_rooted_result_allocation() {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
-        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let target = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(
             target,
             interp.gc_heap_mut(),
@@ -8095,7 +8102,7 @@ mod tests {
     fn object_get_own_property_descriptors_uses_stack_rooted_allocation() {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
-        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let target = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         let descriptor =
             object::PropertyDescriptor::data(Value::Number(NumberValue::Smi(7)), true, false, true);
         assert!(object::define_own_property(
@@ -8148,12 +8155,14 @@ mod tests {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
         let key = Value::String(JsString::from_str("answer", &interp.string_heap).unwrap());
-        let pair = array::from_elements(
+        let pair = array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             vec![key, Value::Number(NumberValue::Smi(9))],
         )
         .unwrap();
-        let entries = array::from_elements(interp.gc_heap_mut(), vec![Value::Array(pair)]).unwrap();
+        let entries =
+            array::from_elements_old_for_fixture(interp.gc_heap_mut(), vec![Value::Array(pair)])
+                .unwrap();
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -8190,21 +8199,21 @@ mod tests {
     fn object_create_with_properties_uses_stack_rooted_result_allocation() {
         let module = module_with(vec![], 6);
         let mut interp = Interpreter::new();
-        let proto = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let proto = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(
             proto,
             interp.gc_heap_mut(),
             "inherited",
             Value::Boolean(true),
         );
-        let descriptor = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let descriptor = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(
             descriptor,
             interp.gc_heap_mut(),
             "value",
             Value::Number(NumberValue::Smi(11)),
         );
-        let props = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let props = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(
             props,
             interp.gc_heap_mut(),
@@ -8293,7 +8302,7 @@ mod tests {
         let module = module_with(vec![], 6);
         let mut interp = Interpreter::new();
         let key = Value::String(JsString::from_str("custom", &interp.string_heap).unwrap());
-        let desc = object::alloc_object(interp.gc_heap_mut()).expect("descriptor");
+        let desc = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("descriptor");
         object::set(
             desc,
             interp.gc_heap_mut(),
@@ -8342,14 +8351,14 @@ mod tests {
     fn object_proxy_property_names_use_stack_rooted_result_allocation() {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
-        let target = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let target = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(
             target,
             interp.gc_heap_mut(),
             "answer",
             Value::Number(NumberValue::Smi(42)),
         );
-        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         let proxy = Value::Proxy(crate::proxy::JsProxy::new(Value::Object(target), handler));
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
@@ -8398,7 +8407,7 @@ mod tests {
         let apply =
             native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
-        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
         let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, handler));
 
@@ -8473,7 +8482,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let construct =
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_proxy_arg).unwrap();
-        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
         let proxy = Value::Proxy(crate::proxy::JsProxy::new(
             Value::Function { function_id: 1 },
@@ -8520,7 +8529,7 @@ mod tests {
         let apply =
             native_value_static(interp.gc_heap_mut(), "apply", 3, return_argv_array).unwrap();
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
-        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
         let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, handler));
         let args: SmallVec<[Value; 8]> = smallvec::smallvec![
@@ -8632,7 +8641,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let construct =
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_argv_array).unwrap();
-        let handler = object::alloc_object(interp.gc_heap_mut()).unwrap();
+        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
         let proxy = Value::Proxy(crate::proxy::JsProxy::new(
             Value::Function { function_id: 1 },

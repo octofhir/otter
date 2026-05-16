@@ -1,15 +1,15 @@
-//! GC regressions for task 82 promise / iterator / generator bodies.
+//! Promise, iterator, generator, and microtask GC invariants.
 
 use smallvec::smallvec;
 
-use otter_bytecode::Function;
-use otter_vm::generator::GENERATOR_BODY_TYPE_TAG;
-use otter_vm::promise::{JsPromise, PURE_PROMISE_BODY_TYPE_TAG};
-use otter_vm::test_support::{
+use crate::generator::GENERATOR_BODY_TYPE_TAG;
+use crate::promise::{JsPromise, PURE_PROMISE_BODY_TYPE_TAG};
+use crate::test_support::{
     promise_fulfill_reaction_count, promise_fulfill_reaction_debug,
     promise_has_object_fulfill_capability,
 };
-use otter_vm::{Frame, ITERATOR_STATE_TYPE_TAG, Interpreter, IteratorState, Value};
+use crate::{Frame, ITERATOR_STATE_TYPE_TAG, Interpreter, IteratorState, Value};
+use otter_bytecode::Function;
 
 fn empty_function() -> Function {
     Function {
@@ -29,9 +29,9 @@ fn live_bytes(interp: &mut Interpreter, tag: u8) -> usize {
 fn promise_reaction_graph_survives_force_gc_when_rooted() {
     let mut interp = Interpreter::new();
 
-    let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
-    let retained = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
-    let capability = otter_vm::PromiseCapability {
+    let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+    let retained = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
+    let capability = crate::PromiseCapability {
         promise: Value::Object(retained),
         resolve: Value::Undefined,
         reject: Value::Undefined,
@@ -40,7 +40,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
     promise.perform_then(interp.gc_heap_mut(), None, None, capability);
 
     let global = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global,
         interp.gc_heap_mut(),
         "promise",
@@ -49,7 +49,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
     let _ = retained;
     interp.force_gc();
 
-    let rooted = otter_vm::object::get(global, interp.gc_heap(), "promise")
+    let rooted = crate::object::get(global, interp.gc_heap(), "promise")
         .expect("promise root survives force_gc");
     let Value::Promise(promise) = rooted else {
         panic!("expected rooted promise after force_gc")
@@ -66,10 +66,10 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
     interp.force_gc();
     let baseline = live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG);
 
-    let mut current = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+    let mut current = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     for _ in 0..100_000 {
-        let next = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
-        let capability = otter_vm::PromiseCapability {
+        let next = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+        let capability = crate::PromiseCapability {
             promise: Value::Promise(next),
             resolve: Value::Undefined,
             reject: Value::Undefined,
@@ -95,14 +95,14 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
 #[test]
 fn pending_promise_microtask_payload_roots_until_drained() {
     let mut interp = Interpreter::new();
-    let payload = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
-    interp.microtasks_mut().enqueue(otter_vm::Microtask {
+    let payload = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
+    interp.microtasks_mut().enqueue(crate::Microtask {
         callee: Value::Undefined,
         this_value: Value::Undefined,
         args: smallvec![Value::Object(payload)],
         context: None,
         result_capability: None,
-        kind: otter_vm::MicrotaskKind::Call,
+        kind: crate::MicrotaskKind::Call,
     });
 
     let _ = payload;
@@ -123,22 +123,23 @@ fn pending_promise_microtask_payload_roots_until_drained() {
 #[test]
 fn iterator_state_holding_array_object_survives_force_gc() {
     let mut interp = Interpreter::new();
-    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
-    let array = otter_vm::array::from_elements(interp.gc_heap_mut(), [Value::Object(object)])
-        .expect("array");
+    let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
+    let array =
+        crate::test_support::array_from_elements_old(interp.gc_heap_mut(), [Value::Object(object)])
+            .expect("array");
     let iter = interp
         .gc_heap_mut()
         .alloc_old(IteratorState::Array { array, index: 0 })
         .expect("iterator");
     let global = *interp.global_this();
-    otter_vm::object::set(global, interp.gc_heap_mut(), "iter", Value::Iterator(iter));
+    crate::object::set(global, interp.gc_heap_mut(), "iter", Value::Iterator(iter));
 
     let _ = object;
     let _ = array;
     let _ = iter;
     interp.force_gc();
 
-    let rooted = otter_vm::object::get(global, interp.gc_heap(), "iter").expect("iter");
+    let rooted = crate::object::get(global, interp.gc_heap(), "iter").expect("iter");
     let Value::Iterator(iter) = rooted else {
         panic!("expected iterator root")
     };
@@ -147,7 +148,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
         other => panic!("expected array iterator, got {other:?}"),
     });
     assert!(matches!(
-        otter_vm::array::get(array, interp.gc_heap(), 0),
+        crate::array::get(array, interp.gc_heap(), 0),
         Value::Object(_)
     ));
 }
@@ -157,12 +158,12 @@ fn generator_and_parked_frame_roots_register_values() {
     let mut interp = Interpreter::new();
     let function = empty_function();
     let mut frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
-    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
+    let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     frame.registers[0] = Value::Object(object);
     let generator =
-        otter_vm::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
+        crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
     let global = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global,
         interp.gc_heap_mut(),
         "generator",
@@ -178,19 +179,20 @@ fn generator_and_parked_frame_roots_register_values() {
 
     let mut parked_frame =
         Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("parked frame");
-    let parked_object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
+    let parked_object =
+        crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     parked_frame.registers[0] = Value::Object(parked_object);
     let parked =
-        otter_vm::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame).expect("park");
-    let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
-    let capability = otter_vm::PromiseCapability {
+        crate::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame).expect("park");
+    let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+    let capability = crate::PromiseCapability {
         promise: Value::Undefined,
         resolve: Value::Undefined,
         reject: Value::Undefined,
         context: None,
     };
     promise.perform_async_resume_then(interp.gc_heap_mut(), parked, 0, capability, None);
-    otter_vm::object::set(
+    crate::object::set(
         global,
         interp.gc_heap_mut(),
         "awaitPromise",
@@ -199,7 +201,7 @@ fn generator_and_parked_frame_roots_register_values() {
 
     let _ = parked_object;
     interp.force_gc();
-    let rooted = otter_vm::object::get(global, interp.gc_heap(), "awaitPromise")
+    let rooted = crate::object::get(global, interp.gc_heap(), "awaitPromise")
         .expect("await promise root survives force_gc");
     let Value::Promise(promise) = rooted else {
         panic!("expected rooted await promise after force_gc")
@@ -221,7 +223,7 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     let iter_baseline = live_bytes(&mut interp, ITERATOR_STATE_TYPE_TAG);
     let gen_baseline = live_bytes(&mut interp, GENERATOR_BODY_TYPE_TAG);
 
-    let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+    let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     promise.fulfill(interp.gc_heap_mut(), Value::Promise(promise));
 
     let iter = interp
@@ -239,7 +241,7 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     let function = empty_function();
     let frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
     let generator =
-        otter_vm::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
+        crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
     generator.install_owner_on_frame(interp.gc_heap_mut());
 
     let _ = promise;

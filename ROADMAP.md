@@ -52,6 +52,13 @@ Work proceeds on eleven parallel tracks. Tracks share the same VM but can usuall
 | E9  | Error.cause + AggregateError + structuredClone (HTML standard, spec-compliant)                   | [ ]    |        |
 | E10 | Test262 conformance pass: target **≥95% language, ≥90% built-ins**                               | [ ]    |        |
 
+Current foundation status:
+- WeakRef / FinalizationRegistry GC liveness machinery exists, including weak
+  registry fixup and finalization jobs; full Test262 timing/conformance remains
+  tracked by E3.
+- Error.cause, AggregateError, and structured-clone owned payload foundations
+  exist; full HTML structuredClone conformance remains tracked by E9.
+
 Acceptance per milestone: `just test262` pass-rate delta > 0 on the relevant sub-tree, no regressions elsewhere.
 
 ---
@@ -83,16 +90,34 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 
 | ID  | Scope                                                                                               | Status | Commit |
 |-----|-----------------------------------------------------------------------------------------------------|--------|--------|
-| G1  | Generational GC: young gen nursery (2 MB), bump-pointer alloc, copy collector with remembered set  | [ ]    |        |
+| G1  | Generational GC: young gen nursery (2 MB), bump-pointer alloc, copy collector with remembered set  | [x]    | pending |
 | G2  | Incremental marking for old gen (tri-colour, write barrier, 5 ms slice budget)                     | [ ]    |        |
 | G3  | Parallel mark (2+ worker threads per isolate)                                                      | [ ]    |        |
 | G4  | Compact on fragmentation: old gen slab compaction behind a budget                                  | [ ]    |        |
-| G5  | Weak-ref + finalization callbacks fire on a microtask (spec-compliant timing)                       | [ ]    |        |
-| G6  | Per-isolate heap cap enforcement (catchable RangeError, like `--max-heap-bytes` today)              | [ ]    |        |
-| G7  | Heap snapshot format compatible with Chrome DevTools (`.heapsnapshot`)                             | [ ]    |        |
+| G5  | Weak-ref + finalization callbacks fire on a microtask (spec-compliant timing)                       | [x]    | pending |
+| G6  | Per-isolate heap cap enforcement (catchable RangeError, like `--max-heap-bytes` today)              | [x]    | pending |
+| G7  | Heap snapshot format compatible with Chrome DevTools (`.heapsnapshot`)                             | [x]    | pending |
 | G8  | Memory profiling: allocation sampling + retention analysis (feeds into D5 profiler UI)              | [ ]    |        |
 | G9  | Off-heap storage for ArrayBuffer backing stores (mmap + lazy-commit)                               | [ ]    |        |
 | G10 | Escape analysis → stack-allocated short-lived objects                                              | [ ]    |        |
+
+Current foundation status:
+- Young allocation is now the default for active VM allocation paths that can
+  expose roots. Bytecode, runtime re-entry, native, intrinsic, and bootstrap
+  paths use explicit stack/runtime/native/global root contracts instead of
+  rootless heap allocation.
+- Young-generation scavenging updates strong slots, weak registry slots, and
+  ephemeron registry slots. WeakMap/WeakSet use ephemeron tracing: weak keys do
+  not keep targets alive, and WeakMap values are traced only after keys are live
+  through ordinary reachability.
+- Public rootless object/array allocation wrappers, public heap-only
+  WeakRef/FinalizationRegistry wrappers, rootless collection reserve helpers,
+  and the unused FunctionBuilder compatibility surface are gone from the
+  production/developer VM API.
+- Raw old-space setup hooks are crate-internal `otter-vm` unit-test harness
+  only. Historical task-numbered GC integration tests were replaced by
+  invariant/domain tests under `gc_invariants`, with no ignored placeholder GC
+  tests.
 
 ---
 
@@ -131,6 +156,11 @@ Each milestone ships microbenchmarks + criterion results vs `bun run` / `node`.
 | W8  | File + Blob + FormData + URL.createObjectURL                                                        | [ ]    |        |
 | W9  | WebAssembly: `WebAssembly.compile`, `instantiate`, `Memory`, `Table`, streaming                     | [ ]    |        |
 | W10 | AbortController + AbortSignal propagating into fetch/streams/setTimeout (no orphan tasks)           | [ ]    |        |
+
+Current foundation status:
+- Worker message payloads use owned structured-clone values and reject VM
+  handles/roots at the public boundary. The full Worker API and HTML
+  structuredClone algorithm remain open under W6/E9.
 
 ---
 

@@ -570,7 +570,7 @@ mod tests {
     use crate::string::StringHeap;
 
     fn make_arr(gc_heap: &mut otter_gc::GcHeap, values: &[i32]) -> Value {
-        let arr = crate::array::from_elements(
+        let arr = crate::array::from_elements_old_for_fixture(
             gc_heap,
             values
                 .iter()

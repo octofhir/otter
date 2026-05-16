@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn cycle_detection_handles_self_reference() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        let obj = crate::object::alloc_object(&mut heap).unwrap();
+        let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         crate::object::set(obj, &mut heap, "self", Value::Object(obj));
         let err = stringify(&Value::Object(obj), &heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));

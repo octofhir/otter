@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn array_from_sync_uses_runtime_rooted_result_allocation() {
         let mut interp = Interpreter::new();
-        let source = crate::array::from_elements(
+        let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             [Value::Number(crate::NumberValue::from_i32(7))],
         )

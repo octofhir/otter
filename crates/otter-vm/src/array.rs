@@ -88,13 +88,16 @@ impl otter_gc::SafeTraceable for ArrayBody {
     }
 }
 
-/// Allocate a fresh empty array.
+/// Allocate an old-space empty array for raw GC fixtures.
 ///
 /// # Errors
 ///
 /// Returns [`otter_gc::OutOfMemory`] if the array shell allocation
 /// would exceed the configured heap cap.
-pub fn alloc_array(heap: &mut GcHeap) -> Result<JsArray, otter_gc::OutOfMemory> {
+#[cfg(test)]
+pub(crate) fn alloc_array_old_for_fixture(
+    heap: &mut GcHeap,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
     heap.alloc_old(ArrayBody::default())
 }
 
@@ -106,13 +109,14 @@ pub(crate) fn alloc_array_with_roots(
     heap.alloc_with_roots(ArrayBody::default(), external_visit)
 }
 
-/// Construct an array from initial elements.
+/// Construct an old-space fixture array from initial elements.
 ///
 /// # Errors
 ///
 /// Returns [`otter_gc::OutOfMemory`] if either the array shell or
 /// off-slot dense storage reservation would exceed the heap cap.
-pub fn from_elements(
+#[cfg(test)]
+pub(crate) fn from_elements_old_for_fixture(
     heap: &mut GcHeap,
     values: impl IntoIterator<Item = Value>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
@@ -164,7 +168,8 @@ pub(crate) fn from_elements_with_roots(
 ///
 /// Returns [`otter_gc::OutOfMemory`] if either the array shell or
 /// off-slot dense storage reservation would exceed the heap cap.
-pub fn from_elements_with_source(
+#[cfg(test)]
+fn from_elements_with_source_old_for_fixture(
     heap: &mut GcHeap,
     values: impl IntoIterator<Item = Value>,
     source_bytes: Arc<[u8]>,
@@ -594,14 +599,13 @@ pub fn index_from_number(n: NumberValue) -> Option<usize> {
     Some(raw as usize)
 }
 
-/// Stable identity token for hash tables that still key object-like
-/// values by address. Once Map/Set migrate in task 79 this can become
-/// a `Gc`-native key instead of a pointer-shaped token.
+/// Stable identity token for legacy address-keyed tables.
 #[must_use]
 pub fn identity_addr(arr: JsArray) -> *const () {
     (arr.offset() as usize) as *const ()
 }
 
+#[cfg(test)]
 fn reserve_elements_for_len(
     body: &mut ArrayBody,
     heap: &mut otter_gc::GcHeap,
@@ -722,7 +726,7 @@ mod tests {
     #[test]
     fn literal_constructor() {
         let mut heap = fresh_heap();
-        let a = from_elements(
+        let a = from_elements_old_for_fixture(
             &mut heap,
             [Value::Boolean(true), Value::Null, Value::Boolean(false)],
         )
@@ -736,14 +740,14 @@ mod tests {
     #[test]
     fn out_of_range_read_is_undefined() {
         let mut heap = fresh_heap();
-        let a = alloc_array(&mut heap).unwrap();
+        let a = alloc_array_old_for_fixture(&mut heap).unwrap();
         assert_eq!(get(a, &heap, 0), Value::Undefined);
     }
 
     #[test]
     fn out_of_range_write_extends_with_holes() {
         let mut heap = fresh_heap();
-        let a = alloc_array(&mut heap).unwrap();
+        let a = alloc_array_old_for_fixture(&mut heap).unwrap();
         set(a, &mut heap, 2, Value::Boolean(true)).unwrap();
         assert_eq!(len(a, &heap), 3);
         // Public reads observe `Value::Undefined` for absent slots,
@@ -763,7 +767,7 @@ mod tests {
     #[test]
     fn explicit_undefined_distinguished_from_hole() {
         let mut heap = fresh_heap();
-        let a = from_elements(&mut heap, [Value::Undefined]).unwrap();
+        let a = from_elements_old_for_fixture(&mut heap, [Value::Undefined]).unwrap();
         // Explicit undefined is a real own element.
         assert!(has_own_element(a, &heap, 0));
         assert_eq!(get(a, &heap, 0), Value::Undefined);
@@ -772,7 +776,7 @@ mod tests {
     #[test]
     fn hole_does_not_escape_via_pop() {
         let mut heap = fresh_heap();
-        let a = alloc_array(&mut heap).unwrap();
+        let a = alloc_array_old_for_fixture(&mut heap).unwrap();
         set(a, &mut heap, 1, Value::Boolean(true)).unwrap();
         // Tail is the explicit value.
         assert_eq!(pop(a, &mut heap), Value::Boolean(true));
@@ -785,7 +789,7 @@ mod tests {
     #[test]
     fn named_property_lookup_skips_holes() {
         let mut heap = fresh_heap();
-        let a = alloc_array(&mut heap).unwrap();
+        let a = alloc_array_old_for_fixture(&mut heap).unwrap();
         set(a, &mut heap, 2, Value::Boolean(true)).unwrap();
         // Hole index — own-property lookup returns `None` so
         // callers can fall back to the prototype chain.
@@ -800,7 +804,7 @@ mod tests {
     #[test]
     fn push_and_pop() {
         let mut heap = fresh_heap();
-        let a = alloc_array(&mut heap).unwrap();
+        let a = alloc_array_old_for_fixture(&mut heap).unwrap();
         assert_eq!(push(a, &mut heap, Value::Boolean(true)).unwrap(), 1);
         assert_eq!(push(a, &mut heap, Value::Null).unwrap(), 2);
         assert_eq!(pop(a, &mut heap), Value::Null);
@@ -813,7 +817,7 @@ mod tests {
     fn clean_source_bytes_fast_path_for_unmutated_primitive_array() {
         let mut heap = fresh_heap();
         let bytes: Arc<[u8]> = Arc::from(&b"[1,2,3]"[..]);
-        let a = from_elements_with_source(
+        let a = from_elements_with_source_old_for_fixture(
             &mut heap,
             [
                 Value::Number(NumberValue::from_i32(1)),
@@ -832,7 +836,7 @@ mod tests {
     fn clean_source_bytes_disqualified_after_mutation() {
         let mut heap = fresh_heap();
         let bytes: Arc<[u8]> = Arc::from(&b"[1,2,3]"[..]);
-        let a = from_elements_with_source(
+        let a = from_elements_with_source_old_for_fixture(
             &mut heap,
             [
                 Value::Number(NumberValue::from_i32(1)),
@@ -853,17 +857,21 @@ mod tests {
         // the fast path even when its own dirty bit is clear, because
         // the nested array can mutate independently and would render
         // the captured `[…]` slice stale.
-        let inner = alloc_array(&mut heap).unwrap();
+        let inner = alloc_array_old_for_fixture(&mut heap).unwrap();
         let bytes: Arc<[u8]> = Arc::from(&b"[[]]"[..]);
-        let outer = from_elements_with_source(&mut heap, [Value::Array(inner)], Arc::clone(&bytes))
-            .unwrap();
+        let outer = from_elements_with_source_old_for_fixture(
+            &mut heap,
+            [Value::Array(inner)],
+            Arc::clone(&bytes),
+        )
+        .unwrap();
         assert!(clean_source_bytes(outer, &heap).is_none());
     }
 
     #[test]
     fn copying_handle_shares_storage() {
         let mut heap = fresh_heap();
-        let a = alloc_array(&mut heap).unwrap();
+        let a = alloc_array_old_for_fixture(&mut heap).unwrap();
         let b = a;
         push(a, &mut heap, Value::Boolean(true)).unwrap();
         assert!(ptr_eq(a, b));

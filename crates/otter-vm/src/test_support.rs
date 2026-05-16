@@ -1,15 +1,16 @@
-//! Focused test hooks for VM integration tests.
+//! Focused test hooks for internal VM unit tests.
 //!
 //! # Contents
 //!
-//! - Old-space WeakRef and FinalizationRegistry constructors for raw
-//!   mark/sweep regression fixtures that operate directly on a `GcHeap`.
-//! - Read-only inspectors for integration tests that need to assert internal
+//! - Old-space object, array, WeakRef, and FinalizationRegistry constructors
+//!   for raw mark/sweep regression fixtures that operate directly on a
+//!   `GcHeap`.
+//! - Read-only inspectors for invariant tests that need to assert internal
 //!   rooted payloads without exposing those payloads through production APIs.
 //!
 //! # Invariants
 //!
-//! - Helpers in this module exist only for integration tests that exercise raw
+//! - Helpers in this module exist only for unit tests that exercise raw
 //!   mark/sweep phases without an interpreter frame/root stack.
 //! - Production paths must use stack, runtime, or native root contracts instead
 //!   of these old-space fixture helpers.
@@ -22,9 +23,28 @@
 
 use crate::execution_context::ExecutionContext;
 use crate::native_function::{NativeCallTarget, NativeFunction};
-use crate::promise::{JsPromiseHandle, PromiseReactionHandler};
+use crate::object::JsObject;
+use crate::promise::JsPromiseHandle;
 use crate::weak_refs::{self, JsFinalizationRegistry, JsWeakRef};
-use crate::{Value, VmError};
+use crate::{JsArray, Value, VmError};
+
+/// Allocate an old-space object for raw mark/sweep regression fixtures.
+pub fn alloc_old_object(heap: &mut otter_gc::GcHeap) -> Result<JsObject, otter_gc::OutOfMemory> {
+    crate::object::alloc_object_old_for_fixture(heap)
+}
+
+/// Allocate an old-space array for raw mark/sweep regression fixtures.
+pub fn alloc_old_array(heap: &mut otter_gc::GcHeap) -> Result<JsArray, otter_gc::OutOfMemory> {
+    crate::array::alloc_array_old_for_fixture(heap)
+}
+
+/// Allocate an old-space array from elements for raw mark/sweep fixtures.
+pub fn array_from_elements_old(
+    heap: &mut otter_gc::GcHeap,
+    values: impl IntoIterator<Item = Value>,
+) -> Result<JsArray, otter_gc::OutOfMemory> {
+    crate::array::from_elements_old_for_fixture(heap, values)
+}
 
 /// Allocate an old-space WeakRef for raw mark/sweep regression fixtures.
 pub fn alloc_weak_ref(heap: &mut otter_gc::GcHeap, target: &Value) -> Result<JsWeakRef, VmError> {
@@ -62,39 +82,6 @@ pub fn promise_has_object_fulfill_capability(
         .debug_fulfill_reactions(heap)
         .iter()
         .any(|reaction| matches!(reaction.capability.promise, Value::Object(_)))
-}
-
-pub fn promise_has_parked_object_register(
-    promise: JsPromiseHandle,
-    heap: &otter_gc::GcHeap,
-    register: usize,
-) -> bool {
-    promise
-        .debug_fulfill_reactions(heap)
-        .iter()
-        .any(|reaction| match &reaction.handler {
-            PromiseReactionHandler::AsyncResume { parked, .. }
-            | PromiseReactionHandler::AsyncGenResume { parked, .. } => {
-                crate::generator::parked_frame_register_is_object(*parked, heap, register)
-            }
-            PromiseReactionHandler::Call(_) => false,
-        })
-}
-
-pub fn promise_has_parked_fulfill_reaction(
-    promise: JsPromiseHandle,
-    heap: &otter_gc::GcHeap,
-) -> bool {
-    promise
-        .debug_fulfill_reactions(heap)
-        .iter()
-        .any(|reaction| {
-            matches!(
-                &reaction.handler,
-                PromiseReactionHandler::AsyncResume { .. }
-                    | PromiseReactionHandler::AsyncGenResume { .. }
-            )
-        })
 }
 
 pub fn promise_fulfill_reaction_count(promise: JsPromiseHandle, heap: &otter_gc::GcHeap) -> usize {

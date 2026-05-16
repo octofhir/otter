@@ -7,8 +7,8 @@
 //!
 //! # Contents
 //!
-//! - [`TraceFn`] — the function-pointer signature stored in the
-//!   table.
+//! - [`TraceFn`] / [`EphemeronTraceFn`] — function-pointer
+//!   signatures stored in the table.
 //! - [`SlotVisitor`] — visitor type alias the marker / scavenger
 //!   pass to a `TraceFn`. Each call hands the visitor a `*mut
 //!   RawGc` so the GC can update the slot in place when an object
@@ -21,9 +21,11 @@
 //! - Two registrations under the same `T::TYPE_TAG` must agree on
 //!   the trace function. `register` enforces this with a
 //!   `debug_assert`.
-//! - A `TraceFn` may not allocate, may not run user JS, and may
-//!   not enter the same heap recursively. It must visit every
-//!   slot that holds a [`crate::compressed::RawGc`] / `Gc<T>`.
+//! - A trace function may not allocate, may not run user JS, and
+//!   may not enter the same heap recursively. Ordinary tracing
+//!   must visit every strong [`crate::compressed::RawGc`] / `Gc<T>`
+//!   slot. Ephemeron tracing must expose weak keys separately from
+//!   conditionally-strong values.
 //!
 //! # See also
 //!
@@ -39,6 +41,15 @@ use crate::header::GcHeader;
 /// in place when the scavenger relocates an object.
 pub type SlotVisitor<'a> = dyn FnMut(*mut RawGc) + 'a;
 
+/// Visits value slots associated with one ephemeron key.
+pub type EphemeronValueVisitor<'a> = dyn FnMut(&mut SlotVisitor<'_>) + 'a;
+
+/// Visitor passed into an ephemeron trace function. The first
+/// argument is a weak key slot; the second callback visits the
+/// value slots that become strong only if that key has already
+/// survived through ordinary reachability.
+pub type EphemeronVisitor<'a> = dyn FnMut(*mut RawGc, &mut EphemeronValueVisitor<'_>) + 'a;
+
 /// Function-pointer signature for `type_tag → trace` table
 /// entries. The function reads the object's slots and yields
 /// `*mut RawGc` to the visitor, one per child reference.
@@ -51,6 +62,9 @@ pub type SlotVisitor<'a> = dyn FnMut(*mut RawGc) + 'a;
 /// enforces this invariant by storing only generated wrappers
 /// keyed by the registering type.
 pub type TraceFn = unsafe fn(header: *mut GcHeader, visitor: &mut SlotVisitor<'_>);
+
+/// Function-pointer signature for type-specific ephemeron tracing.
+pub type EphemeronTraceFn = unsafe fn(header: *mut GcHeader, visitor: &mut EphemeronVisitor<'_>);
 
 /// Trait every heap-allocated type implements so the GC knows how
 /// to (a) tag its allocations and (b) walk its outgoing
@@ -82,6 +96,16 @@ pub trait Traceable: 'static {
     /// - not retain references to the visitor,
     /// - not read past the object's payload.
     unsafe fn trace_slots(this: *mut Self, visitor: &mut SlotVisitor<'_>);
+
+    /// Walk weak ephemeron entries. The default is no ephemeron
+    /// edges. Collectors must not treat keys as ordinary strong
+    /// slots; values become strong only when the key has already
+    /// survived through another path.
+    ///
+    /// # Safety
+    ///
+    /// Same payload-validity contract as [`Self::trace_slots`].
+    unsafe fn trace_ephemeron_slots(_this: *mut Self, _visitor: &mut EphemeronVisitor<'_>) {}
 }
 
 /// Safe-only counterpart of [`Traceable`] — the trait downstream
@@ -102,6 +126,11 @@ pub trait SafeTraceable: 'static {
     /// as [`Traceable::trace_slots`], minus the pointer-validity
     /// precondition).
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>);
+
+    /// Safe counterpart to [`Traceable::trace_ephemeron_slots`].
+    /// Most heap objects are not ephemeron tables and keep this
+    /// no-op implementation.
+    fn trace_ephemeron_slots_safe(&mut self, _visitor: &mut EphemeronVisitor<'_>) {}
 }
 
 impl<T: SafeTraceable> Traceable for T {
@@ -121,12 +150,20 @@ impl<T: SafeTraceable> Traceable for T {
             (*this).trace_slots_safe(visitor);
         }
     }
+
+    unsafe fn trace_ephemeron_slots(this: *mut Self, visitor: &mut EphemeronVisitor<'_>) {
+        // SAFETY: same bridge contract as `trace_slots`.
+        unsafe {
+            (*this).trace_ephemeron_slots_safe(visitor);
+        }
+    }
 }
 
 /// A 256-entry array of [`TraceFn`] pointers, indexed by
 /// [`GcHeader::type_tag`]. Empty slots stay `None`.
 pub struct TraceTable {
     table: [Option<TraceFn>; 256],
+    ephemeron_table: [Option<EphemeronTraceFn>; 256],
     /// Drop functions used by the sweeper to invoke `T`'s `Drop`
     /// on dead objects (so e.g. boxed strings get their backing
     /// freed). `None` for plain-old-data types.
@@ -144,6 +181,7 @@ impl TraceTable {
     pub const fn new() -> Self {
         Self {
             table: [None; 256],
+            ephemeron_table: [None; 256],
             drop_table: [None; 256],
         }
     }
@@ -174,6 +212,19 @@ impl TraceTable {
                 core::ptr::drop_in_place(payload);
             }
         }
+        unsafe fn ephemeron_wrapper<T: Traceable>(
+            header: *mut GcHeader,
+            visitor: &mut EphemeronVisitor<'_>,
+        ) {
+            // SAFETY: by the [`Traceable`] safety contract,
+            // `header` precedes a valid `T` payload.
+            unsafe {
+                let payload = (header as *mut u8)
+                    .add(std::mem::size_of::<GcHeader>())
+                    .cast::<T>();
+                T::trace_ephemeron_slots(payload, visitor);
+            }
+        }
         let tag = T::TYPE_TAG as usize;
         if let Some(existing) = self.table[tag] {
             debug_assert!(
@@ -182,6 +233,7 @@ impl TraceTable {
             );
         }
         self.table[tag] = Some(trace_wrapper::<T>);
+        self.ephemeron_table[tag] = Some(ephemeron_wrapper::<T>);
         // Only set drop if needed — saves one indirect call per
         // dead object on plain-old-data types.
         if std::mem::needs_drop::<T>() {
@@ -214,6 +266,26 @@ impl TraceTable {
         unsafe {
             let tag = (*header).type_tag();
             if let Some(f) = self.table[tag as usize] {
+                f(header, visitor);
+            }
+        }
+    }
+
+    /// Invoke the ephemeron trace function for `header`, if registered.
+    ///
+    /// # Safety
+    ///
+    /// Same payload-validity contract as [`Self::trace`].
+    #[inline]
+    pub unsafe fn trace_ephemerons(
+        &self,
+        header: *mut GcHeader,
+        visitor: &mut EphemeronVisitor<'_>,
+    ) {
+        // SAFETY: precondition delegated to the caller.
+        unsafe {
+            let tag = (*header).type_tag();
+            if let Some(f) = self.ephemeron_table[tag as usize] {
                 f(header, visitor);
             }
         }

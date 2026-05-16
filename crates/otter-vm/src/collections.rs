@@ -546,7 +546,7 @@ pub type JsWeakMap = otter_gc::Gc<WeakMapBody>;
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsWeakMap`] handle.
 pub struct WeakMapBody {
-    entries: IndexMap<RawGc, Value>,
+    entries: Vec<(RawGc, Value)>,
 }
 
 impl otter_gc::SafeTraceable for WeakMapBody {
@@ -555,6 +555,15 @@ impl otter_gc::SafeTraceable for WeakMapBody {
     fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
         // Ephemeron entries are not ordinary strong edges. The VM
         // fixpoint marks values only after the key is already live.
+    }
+
+    fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
+        for (key, value) in &mut self.entries {
+            let key_slot = key as *mut RawGc;
+            let mut visit_value_slots =
+                |slot_visitor: &mut SlotVisitor<'_>| value.trace_value_slots(slot_visitor);
+            visitor(key_slot, &mut visit_value_slots);
+        }
     }
 }
 
@@ -582,7 +591,11 @@ pub fn weak_map_get(
     key: &Value,
 ) -> Result<Option<Value>, CollectionError> {
     let key = object_gc_key(key)?;
-    Ok(heap.read_payload(map, |body| body.entries.get(&key).cloned()))
+    Ok(heap.read_payload(map, |body| {
+        body.entries
+            .iter()
+            .find_map(|(entry_key, value)| (*entry_key == key).then(|| value.clone()))
+    }))
 }
 
 /// `WeakMap.prototype.has` — Spec §24.3.3.4.
@@ -592,13 +605,20 @@ pub fn weak_map_has(
     key: &Value,
 ) -> Result<bool, CollectionError> {
     let key = object_gc_key(key)?;
-    Ok(heap.read_payload(map, |body| body.entries.contains_key(&key)))
+    Ok(heap.read_payload(map, |body| {
+        body.entries.iter().any(|(entry_key, _)| *entry_key == key)
+    }))
 }
 
 /// Number of weak-map entries currently stored.
 #[must_use]
 pub fn weak_map_len(map: JsWeakMap, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(map, |body| body.entries.len())
+    heap.read_payload(map, |body| {
+        body.entries
+            .iter()
+            .filter(|(entry_key, _)| !entry_key.is_null())
+            .count()
+    })
 }
 
 /// `WeakMap.prototype.set` — Spec §24.3.3.5.
@@ -612,7 +632,11 @@ pub fn weak_map_set(
     let key_root = key.clone();
     let value_root = value.clone();
     let key_raw = object_gc_key(&key)?;
-    let exists = heap.read_payload(map, |body| body.entries.contains_key(&key_raw));
+    let exists = heap.read_payload(map, |body| {
+        body.entries
+            .iter()
+            .any(|(entry_key, _)| *entry_key == key_raw)
+    });
     if !exists {
         let target_len = weak_map_len(map, heap).saturating_add(1);
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -623,7 +647,15 @@ pub fn weak_map_set(
     }
     let key = object_gc_key(&key)?;
     heap.with_payload(map, |body| {
-        body.entries.insert(key, value);
+        if let Some((_, existing)) = body
+            .entries
+            .iter_mut()
+            .find(|(entry_key, _)| *entry_key == key)
+        {
+            *existing = value;
+        } else {
+            body.entries.push((key, value));
+        }
     });
     heap.record_write(map, &barrier_value);
     Ok(())
@@ -641,7 +673,9 @@ pub(crate) fn weak_map_set_with_roots(
     let key_root = key.clone();
     let value_root = value.clone();
     let key = object_gc_key(&key)?;
-    let exists = heap.read_payload(*map, |body| body.entries.contains_key(&key));
+    let exists = heap.read_payload(*map, |body| {
+        body.entries.iter().any(|(entry_key, _)| *entry_key == key)
+    });
     if !exists {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -656,7 +690,15 @@ pub(crate) fn weak_map_set_with_roots(
         )?;
     }
     heap.with_payload(*map, |body| {
-        body.entries.insert(key, value);
+        if let Some((_, existing)) = body
+            .entries
+            .iter_mut()
+            .find(|(entry_key, _)| *entry_key == key)
+        {
+            *existing = value;
+        } else {
+            body.entries.push((key, value));
+        }
     });
     heap.record_write(*map, &barrier_value);
     Ok(())
@@ -669,7 +711,18 @@ pub fn weak_map_delete(
     key: &Value,
 ) -> Result<bool, CollectionError> {
     let key = object_gc_key(key)?;
-    Ok(heap.with_payload(map, |body| body.entries.shift_remove(&key).is_some()))
+    Ok(heap.with_payload(map, |body| {
+        if let Some(index) = body
+            .entries
+            .iter()
+            .position(|(entry_key, _)| *entry_key == key)
+        {
+            body.entries.remove(index);
+            true
+        } else {
+            false
+        }
+    }))
 }
 
 /// JS `WeakSet` — object-keyed weak set.
@@ -678,7 +731,7 @@ pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsWeakSet`] handle.
 pub struct WeakSetBody {
-    entries: IndexMap<RawGc, ()>,
+    entries: Vec<RawGc>,
 }
 
 impl otter_gc::SafeTraceable for WeakSetBody {
@@ -686,6 +739,14 @@ impl otter_gc::SafeTraceable for WeakSetBody {
 
     fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
         // WeakSet keys are weak and never traced as strong edges.
+    }
+
+    fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
+        for key in &mut self.entries {
+            let key_slot = key as *mut RawGc;
+            let mut visit_value_slots = |_slot_visitor: &mut SlotVisitor<'_>| {};
+            visitor(key_slot, &mut visit_value_slots);
+        }
     }
 }
 
@@ -713,13 +774,20 @@ pub fn weak_set_has(
     value: &Value,
 ) -> Result<bool, CollectionError> {
     let key = object_gc_key(value)?;
-    Ok(heap.read_payload(set, |body| body.entries.contains_key(&key)))
+    Ok(heap.read_payload(set, |body| {
+        body.entries.iter().any(|entry_key| *entry_key == key)
+    }))
 }
 
 /// Number of weak-set entries currently stored.
 #[must_use]
 pub fn weak_set_len(set: JsWeakSet, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(set, |body| body.entries.len())
+    heap.read_payload(set, |body| {
+        body.entries
+            .iter()
+            .filter(|entry_key| !entry_key.is_null())
+            .count()
+    })
 }
 
 /// `WeakSet.prototype.add` — Spec §24.4.3.1.
@@ -730,7 +798,7 @@ pub fn weak_set_add(
 ) -> Result<(), CollectionError> {
     let value_root = value.clone();
     let key_raw = object_gc_key(&value)?;
-    let exists = heap.read_payload(set, |body| body.entries.contains_key(&key_raw));
+    let exists = heap.read_payload(set, |body| body.entries.contains(&key_raw));
     if !exists {
         let target_len = weak_set_len(set, heap).saturating_add(1);
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -740,7 +808,9 @@ pub fn weak_set_add(
     }
     let key = object_gc_key(&value)?;
     heap.with_payload(set, |body| {
-        body.entries.insert(key, ());
+        if !body.entries.contains(&key) {
+            body.entries.push(key);
+        }
     });
     Ok(())
 }
@@ -754,7 +824,7 @@ pub(crate) fn weak_set_add_with_roots(
 ) -> Result<(), CollectionError> {
     let value_root = value.clone();
     let key = object_gc_key(&value)?;
-    let exists = heap.read_payload(*set, |body| body.entries.contains_key(&key));
+    let exists = heap.read_payload(*set, |body| body.entries.contains(&key));
     if !exists {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -768,7 +838,9 @@ pub(crate) fn weak_set_add_with_roots(
         )?;
     }
     heap.with_payload(*set, |body| {
-        body.entries.insert(key, ());
+        if !body.entries.contains(&key) {
+            body.entries.push(key);
+        }
     });
     Ok(())
 }
@@ -780,7 +852,14 @@ pub fn weak_set_delete(
     value: &Value,
 ) -> Result<bool, CollectionError> {
     let key = object_gc_key(value)?;
-    Ok(heap.with_payload(set, |body| body.entries.shift_remove(&key).is_some()))
+    Ok(heap.with_payload(set, |body| {
+        if let Some(index) = body.entries.iter().position(|entry_key| *entry_key == key) {
+            body.entries.remove(index);
+            true
+        } else {
+            false
+        }
+    }))
 }
 
 /// Run the WeakMap / WeakSet ephemeron fixpoint after ordinary mark.
@@ -797,7 +876,7 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
                         continue;
                     };
                     heap.read_payload(map, |body| {
-                        for (key, value) in &body.entries {
+                        for (key, value) in body.entries.iter().filter(|(key, _)| !key.is_null()) {
                             if heap.is_marked(*key)
                                 && let Some(value_raw) = value.as_gc_raw()
                             {
@@ -825,12 +904,15 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
                     continue;
                 };
                 let live_keys: std::collections::HashSet<_> = heap
-                    .read_payload(map, |body| body.entries.keys().copied().collect::<Vec<_>>())
+                    .read_payload(map, |body| {
+                        body.entries.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+                    })
                     .into_iter()
+                    .filter(|key| !key.is_null())
                     .filter(|key| heap.is_marked(*key))
                     .collect();
                 heap.with_payload(map, |body| {
-                    body.entries.retain(|key, _| live_keys.contains(key));
+                    body.entries.retain(|(key, _)| live_keys.contains(key));
                 });
             }
             Some(WEAK_SET_BODY_TYPE_TAG) => {
@@ -838,12 +920,13 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
                     continue;
                 };
                 let live_keys: std::collections::HashSet<_> = heap
-                    .read_payload(set, |body| body.entries.keys().copied().collect::<Vec<_>>())
+                    .read_payload(set, |body| body.entries.clone())
                     .into_iter()
+                    .filter(|key| !key.is_null())
                     .filter(|key| heap.is_marked(*key))
                     .collect();
                 heap.with_payload(set, |body| {
-                    body.entries.retain(|key, _| live_keys.contains(key));
+                    body.entries.retain(|key| live_keys.contains(key));
                 });
             }
             _ => {}
@@ -979,7 +1062,7 @@ fn weak_map_capacity_bytes(capacity: usize) -> usize {
 }
 
 fn weak_set_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<(RawGc, ())>())
+    capacity.saturating_mul(std::mem::size_of::<RawGc>())
 }
 
 #[cfg(test)]
@@ -1106,12 +1189,76 @@ mod tests {
     fn weakmap_object_key_roundtrips() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let wm = alloc_weak_map(&mut heap).unwrap();
-        let obj = Value::Object(crate::object::alloc_object(&mut heap).unwrap());
+        let obj = Value::Object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
         weak_map_set(wm, &mut heap, obj.clone(), n(42)).unwrap();
         assert!(weak_map_has(wm, &heap, &obj).unwrap());
         assert_eq!(weak_map_get(wm, &heap, &obj).unwrap(), Some(n(42)));
-        let other = Value::Object(crate::object::alloc_object(&mut heap).unwrap());
+        let other = Value::Object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
         assert!(!weak_map_has(wm, &heap, &other).unwrap());
+    }
+
+    #[test]
+    fn weakmap_young_key_and_value_survive_minor_relocation_when_key_rooted() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut wm = alloc_weak_map(&mut heap).unwrap();
+        let key = young_object_value(&mut heap);
+        let value = young_object_value(&mut heap);
+        let key_before = key.as_gc_raw().unwrap();
+        let value_before = value.as_gc_raw().unwrap();
+
+        weak_map_set(wm, &mut heap, key.clone(), value).unwrap();
+
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(std::ptr::addr_of_mut!(wm) as *mut RawGc);
+            key.trace_value_slots(visitor);
+        };
+        heap.collect_minor_with_roots(&mut roots);
+
+        let key_after = key.as_gc_raw().unwrap();
+        let value_after = weak_map_get(wm, &heap, &key)
+            .unwrap()
+            .and_then(|value| value.as_gc_raw())
+            .unwrap();
+        assert_ne!(key_after, key_before);
+        assert_ne!(value_after, value_before);
+        assert!(weak_map_has(wm, &heap, &key).unwrap());
+    }
+
+    #[test]
+    fn weakmap_dead_young_key_is_not_observable_after_minor_gc() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut wm = alloc_weak_map(&mut heap).unwrap();
+        let key = young_object_value(&mut heap);
+        let value = young_object_value(&mut heap);
+
+        weak_map_set(wm, &mut heap, key, value).unwrap();
+
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(std::ptr::addr_of_mut!(wm) as *mut RawGc);
+        };
+        heap.collect_minor_with_roots(&mut roots);
+
+        assert_eq!(weak_map_len(wm, &heap), 0);
+    }
+
+    #[test]
+    fn weakset_young_key_survives_minor_relocation_when_rooted() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let mut ws = alloc_weak_set(&mut heap).unwrap();
+        let key = young_object_value(&mut heap);
+        let before = key.as_gc_raw().unwrap();
+
+        weak_set_add(ws, &mut heap, key.clone()).unwrap();
+
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visitor(std::ptr::addr_of_mut!(ws) as *mut RawGc);
+            key.trace_value_slots(visitor);
+        };
+        heap.collect_minor_with_roots(&mut roots);
+
+        let after = key.as_gc_raw().unwrap();
+        assert_ne!(after, before);
+        assert!(weak_set_has(ws, &heap, &key).unwrap());
     }
 
     #[test]

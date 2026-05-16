@@ -16,12 +16,11 @@
 //! # See also
 //!
 //! - GC architecture plan §4.1 (cycle handling).
-//! - Task 77 — JsObject migration.
-//! - Companion: `gc_roots.rs::globals_keep_object_alive` for
-//!   the *survival* side of the same root walker.
+//! - Companion: `root_enumeration::globals_keep_object_alive` for the
+//!   survival side of the same root walker.
 
-use otter_vm::Interpreter;
-use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+use crate::Interpreter;
+use crate::object::OBJECT_BODY_TYPE_TAG;
 
 /// `let a = {}; let b = {}; b.__proto__ = a; a.__proto__ = b; drop a, b;`
 /// — after a forced full GC, the per-tag `live_bytes` row for
@@ -43,10 +42,10 @@ fn proto_cycle_reaped() {
     // `alloc_object` → `alloc_old`, so they live in old-space
     // and stay pinned across collections; sweep is what reaps
     // them once they are unmarked.
-    let a = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc a");
-    let b = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc b");
-    otter_vm::object::set_prototype(b, interp.gc_heap_mut(), Some(a));
-    otter_vm::object::set_prototype(a, interp.gc_heap_mut(), Some(b));
+    let a = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc a");
+    let b = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc b");
+    crate::object::set_prototype(b, interp.gc_heap_mut(), Some(a));
+    crate::object::set_prototype(a, interp.gc_heap_mut(), Some(b));
 
     let with_cycle =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;

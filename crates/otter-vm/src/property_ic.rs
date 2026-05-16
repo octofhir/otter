@@ -683,10 +683,10 @@ mod tests {
     #[test]
     fn direct_prototype_load_ic_rejects_dictionary_compatible_prototype() {
         let mut heap = fresh_heap();
-        let proto = object::alloc_object(&mut heap).unwrap();
+        let proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set(proto, &mut heap, "x", Value::Boolean(true));
         object::set(proto, &mut heap, "y", Value::Null);
-        let receiver = object::alloc_object(&mut heap).unwrap();
+        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
         let (ic, value) =
             LoadPropertyIc::install_candidate(receiver, &heap, key("x")).expect("load ic");
@@ -700,10 +700,10 @@ mod tests {
     #[test]
     fn direct_prototype_has_ic_rejects_dictionary_compatible_prototype() {
         let mut heap = fresh_heap();
-        let proto = object::alloc_object(&mut heap).unwrap();
+        let proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set(proto, &mut heap, "x", Value::Boolean(true));
         object::set(proto, &mut heap, "y", Value::Null);
-        let receiver = object::alloc_object(&mut heap).unwrap();
+        let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
         let string_heap = crate::StringHeap::with_cap(1024);
         let key_string = JsString::from_str("x", &string_heap).expect("string");
@@ -717,10 +717,10 @@ mod tests {
     #[test]
     fn direct_prototype_store_transition_rejects_dictionary_compatible_prototype() {
         let mut heap = fresh_heap();
-        let proto = object::alloc_object(&mut heap).unwrap();
+        let proto = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set(proto, &mut heap, "x", Value::Boolean(true));
         object::set(proto, &mut heap, "y", Value::Null);
-        let first = object::alloc_object(&mut heap).unwrap();
+        let first = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(first, &mut heap, Some(proto));
         let transition = object::capture_store_property_transition(
             first,
@@ -730,7 +730,7 @@ mod tests {
         )
         .expect("store transition");
         let ic = StorePropertyIc::transition(transition);
-        let second = object::alloc_object(&mut heap).unwrap();
+        let second = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(second, &mut heap, Some(proto));
 
         assert!(object::delete(proto, &mut heap, "y"));
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn existing_own_store_candidate_rejects_non_writable_data() {
         let mut heap = fresh_heap();
-        let obj = object::alloc_object(&mut heap).unwrap();
+        let obj = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(object::define_own_property(
             obj,
             &mut heap,

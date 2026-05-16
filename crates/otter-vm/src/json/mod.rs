@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn stringify_object_preserves_insertion_order() {
         let mut heap = make_heap();
-        let obj = crate::object::alloc_object(&mut heap).unwrap();
+        let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         crate::object::set(obj, &mut heap, "b", n(1));
         crate::object::set(obj, &mut heap, "a", n(2));
         let s = stringify(&Value::Object(obj), &heap).unwrap().unwrap();
@@ -396,7 +396,7 @@ mod tests {
         // Cyclic — no path walk (cheap identity-pointer set on the
         // hot path; full path tracking can layer on later).
         let mut heap = make_heap();
-        let obj = crate::object::alloc_object(&mut heap).unwrap();
+        let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         crate::object::set(obj, &mut heap, "self", Value::Object(obj));
         let err = stringify(&Value::Object(obj), &heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));

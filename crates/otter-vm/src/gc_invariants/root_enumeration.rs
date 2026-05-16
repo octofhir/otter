@@ -1,42 +1,37 @@
-//! Per-root regression coverage for the GC root walker
-//! ([`otter_vm::runtime_state::RuntimeState::trace_roots`]).
+//! Per-root coverage for the GC root walker
+//! ([`crate::runtime_state::RuntimeState::trace_roots`]).
 //!
-//! Tasks 76–83 enabled the root cases for their migrated value
-//! bodies. The remaining ignored entries are intentionally outside
-//! Phase 1 (`active call frame` still needs a suspension harness;
-//! symbols remain leaf interned values).
+//! This module tests the root families that are live in the current VM:
+//! globals, arrays, collections, weak registries, promises, iterators,
+//! generators, callables, and error registries. Symbols remain interned leaf
+//! values, so they do not need GC slot coverage here.
 //!
 //! # Mapping
 //!
-//! | Root | Migration task |
+//! | Root | Invariant |
 //! | --- | --- |
-//! | upvalue cell | 76 |
-//! | global object | 77 |
-//! | array element | 78 |
-//! | map entry | 79 |
-//! | weak-map / weak-set | 80 |
-//! | weak-ref / finalization registry | 81 |
-//! | promise / iterator / generator | 82 |
-//! | bound / native / regexp | 83 |
-//! | active call frame | 76 (concurrently with upvalue) |
-//! | microtask queue | 82 |
+//! | upvalue cell | unrooted cells are reclaimed |
+//! | global object | global properties keep values alive |
+//! | array element | element slots trace values |
+//! | map entry | key/value slots trace values |
+//! | weak-map / weak-set | keys stay weak; live keys update values |
+//! | weak-ref / finalization registry | targets stay weak; jobs keep held values |
+//! | promise / iterator / generator | async state traces parked values |
+//! | bound / native / regexp | callable metadata traces captured values |
+//! | microtask queue | queued jobs trace argument values |
 //! | symbol registry | out of scope while symbols stay leaf interned values |
-//! | error-class registry | 77 |
+//! | error-class registry | constructor/prototype registries are roots |
 //!
 //! # See also
 //!
 //! - GC architecture plan §4.2.
-//! - Task 75 — root enumeration.
 
-use otter_vm::Interpreter;
-use otter_vm::runtime_state::RuntimeState;
+use crate::Interpreter;
+use crate::runtime_state::RuntimeState;
 
-/// Sanity check: the walker compiles and runs. As of task 77
-/// the `JsObject` arm of [`GcTrace`] emits its slot pointer,
-/// so a fresh interpreter yields at least one slot —
-/// `globalThis`. The exact count is not load-bearing; what
-/// matters is that the walker terminates without panicking
-/// and emits *some* roots once the JsObject migration lands.
+/// Sanity check: the walker compiles and runs. A fresh interpreter
+/// yields at least `globalThis`. The exact count is not load-bearing;
+/// what matters is that the walker terminates and emits some roots.
 #[test]
 fn root_walker_runs_with_empty_state() {
     let interp = Interpreter::default();
@@ -47,29 +42,26 @@ fn root_walker_runs_with_empty_state() {
     });
     assert!(
         count >= 1,
-        "post-task-77 walker must surface at least globalThis (got {count})"
+        "root walker must surface at least globalThis (got {count})"
     );
 }
 
 #[test]
 fn upvalue_cell_root_survives_force_gc() {
-    use otter_gc::Traceable;
-    use otter_vm::{
+    use crate::{
         UPVALUE_CELL_TYPE_TAG, UpvalueCellBody, Value, alloc_upvalue, read_upvalue, store_upvalue,
     };
+    use otter_gc::Traceable;
 
     let mut interp = Interpreter::new();
-    // Allocate a fresh upvalue cell carrying a primitive
-    // payload (Number); the cell is rooted only via the local
-    // handle here. After we drop the handle and force a full
-    // GC, the body should be reclaimed because no walker root
-    // reaches it (task 76 stops at the leaf cell — closure-
-    // chain reachability through `JsObject` lands in task 77).
+    // Allocate a fresh upvalue cell carrying a primitive payload. The cell is
+    // rooted only via the local handle here. After we drop the handle and force
+    // a full GC, the body should be reclaimed because no walker root reaches it.
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[UPVALUE_CELL_TYPE_TAG as usize].live_bytes;
     let cell = alloc_upvalue(
         interp.gc_heap_mut(),
-        Value::Number(otter_vm::NumberValue::Smi(42)),
+        Value::Number(crate::NumberValue::Smi(42)),
     )
     .expect("alloc_upvalue");
     let stats_with_cell =
@@ -103,13 +95,6 @@ fn upvalue_cell_root_survives_force_gc() {
     );
 }
 
-#[test]
-#[ignore = "un-ignore in task 76 (active call frame trace)"]
-fn active_frame_local_root_survives_force_gc() {
-    // task 76: call into bytecode that allocs into a local,
-    // suspend mid-frame, force_gc, assert local readable.
-}
-
 /// Globals act as a strong root: an object stamped onto
 /// `globalThis` survives a forced full GC even after every
 /// host-side handle is dropped.
@@ -118,7 +103,7 @@ fn active_frame_local_root_survives_force_gc() {
 /// Walker root source: GC architecture plan §4.2.
 #[test]
 fn globals_keep_object_alive() {
-    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+    use crate::object::OBJECT_BODY_TYPE_TAG;
 
     let mut interp = Interpreter::new();
 
@@ -127,13 +112,14 @@ fn globals_keep_object_alive() {
     // is through globalThis → property slot → ObjectBody.
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    let stashed = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc_object");
+    let stashed =
+        crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
     let global = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global,
         interp.gc_heap_mut(),
         "__gc_roots_test_stash",
-        otter_vm::Value::Object(stashed),
+        crate::Value::Object(stashed),
     );
     let after_alloc =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
@@ -151,10 +137,10 @@ fn globals_keep_object_alive() {
     // and `ObjectBody::trace_slots_safe` walking property
     // values, the global's property must still resolve.
     interp.force_gc();
-    let resolved = otter_vm::object::get(global, interp.gc_heap(), "__gc_roots_test_stash")
+    let resolved = crate::object::get(global, interp.gc_heap(), "__gc_roots_test_stash")
         .expect("globalThis property survives force_gc");
     match resolved {
-        otter_vm::Value::Object(_) => {}
+        crate::Value::Object(_) => {}
         other => panic!("expected Value::Object after force_gc, got {other:?}"),
     }
 }
@@ -167,7 +153,7 @@ fn globals_keep_object_alive() {
 /// Walker root source: GC architecture plan §4.2.
 #[test]
 fn module_env_keeps_object_alive() {
-    use otter_vm::object::OBJECT_BODY_TYPE_TAG;
+    use crate::object::OBJECT_BODY_TYPE_TAG;
 
     let mut interp = Interpreter::new();
 
@@ -178,16 +164,18 @@ fn module_env_keeps_object_alive() {
     //   module_environments[url] → module_env → property slot.
     let baseline =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    let module_env = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc_object");
+    let module_env =
+        crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
     let url: std::rc::Rc<str> = std::rc::Rc::from("file:///gc_roots_test.js");
     interp.register_module_env(std::rc::Rc::clone(&url), module_env);
 
-    let stashed = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc_object");
-    otter_vm::object::set(
+    let stashed =
+        crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc_object");
+    crate::object::set(
         module_env,
         interp.gc_heap_mut(),
         "stash",
-        otter_vm::Value::Object(stashed),
+        crate::Value::Object(stashed),
     );
     let after_alloc =
         interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
@@ -201,10 +189,10 @@ fn module_env_keeps_object_alive() {
     let env_handle = interp
         .module_env(&url)
         .expect("module env still registered");
-    let resolved = otter_vm::object::get(env_handle, interp.gc_heap(), "stash")
+    let resolved = crate::object::get(env_handle, interp.gc_heap(), "stash")
         .expect("module-env property survives force_gc");
     match resolved {
-        otter_vm::Value::Object(_) => {}
+        crate::Value::Object(_) => {}
         other => panic!("expected Value::Object after force_gc, got {other:?}"),
     }
 }
@@ -215,12 +203,12 @@ fn error_class_registry_prototypes_survive_force_gc() {
     interp.force_gc();
 
     let registry = interp.error_classes_clone();
-    let proto = registry.prototype(otter_vm::ErrorKind::TypeError);
-    let name = otter_vm::object::get(proto, interp.gc_heap(), "name")
+    let proto = registry.prototype(crate::ErrorKind::TypeError);
+    let name = crate::object::get(proto, interp.gc_heap(), "name")
         .expect("TypeError.prototype.name survives force_gc");
 
     match name {
-        otter_vm::Value::String(s) => assert_eq!(s.to_lossy_string(), "TypeError"),
+        crate::Value::String(s) => assert_eq!(s.to_lossy_string(), "TypeError"),
         other => panic!("expected TypeError.prototype.name string, got {other:?}"),
     }
 }
@@ -228,27 +216,27 @@ fn error_class_registry_prototypes_survive_force_gc() {
 #[test]
 fn array_element_root_survives_force_gc() {
     let mut interp = Interpreter::new();
-    let arr = otter_vm::array::alloc_array(interp.gc_heap_mut()).expect("alloc array");
-    otter_vm::array::push(arr, interp.gc_heap_mut(), otter_vm::Value::Boolean(true))
+    let arr = crate::test_support::alloc_old_array(interp.gc_heap_mut()).expect("alloc array");
+    crate::array::push(arr, interp.gc_heap_mut(), crate::Value::Boolean(true))
         .expect("push element");
     let global_this = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__array_root",
-        otter_vm::Value::Array(arr),
+        crate::Value::Array(arr),
     );
 
     let _ = arr;
     interp.force_gc();
 
-    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__array_root")
+    let rooted = crate::object::get(global_this, interp.gc_heap(), "__array_root")
         .expect("array root survives force_gc");
     match rooted {
-        otter_vm::Value::Array(array) => {
+        crate::Value::Array(array) => {
             assert_eq!(
-                otter_vm::array::get(array, interp.gc_heap(), 0),
-                otter_vm::Value::Boolean(true)
+                crate::array::get(array, interp.gc_heap(), 0),
+                crate::Value::Boolean(true)
             );
         }
         other => panic!("expected Value::Array after force_gc, got {other:?}"),
@@ -258,36 +246,37 @@ fn array_element_root_survives_force_gc() {
 #[test]
 fn map_entry_root_survives_force_gc() {
     let mut interp = Interpreter::new();
-    let map = otter_vm::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");
-    let stashed = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc object");
-    let key = otter_vm::Value::Number(otter_vm::NumberValue::Smi(7));
-    otter_vm::collections::map_set(
+    let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");
+    let stashed =
+        crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc object");
+    let key = crate::Value::Number(crate::NumberValue::Smi(7));
+    crate::collections::map_set(
         map,
         interp.gc_heap_mut(),
         key.clone(),
-        otter_vm::Value::Object(stashed),
+        crate::Value::Object(stashed),
     )
     .expect("map set");
 
     let global_this = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__map_root",
-        otter_vm::Value::Map(map),
+        crate::Value::Map(map),
     );
 
     let _ = map;
     let _ = stashed;
     interp.force_gc();
 
-    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__map_root")
+    let rooted = crate::object::get(global_this, interp.gc_heap(), "__map_root")
         .expect("map root survives force_gc");
     match rooted {
-        otter_vm::Value::Map(rooted_map) => {
-            let value = otter_vm::collections::map_get(rooted_map, interp.gc_heap(), &key)
+        crate::Value::Map(rooted_map) => {
+            let value = crate::collections::map_get(rooted_map, interp.gc_heap(), &key)
                 .expect("map entry survives force_gc");
-            assert!(matches!(value, otter_vm::Value::Object(_)));
+            assert!(matches!(value, crate::Value::Object(_)));
         }
         other => panic!("expected Value::Map after force_gc, got {other:?}"),
     }
@@ -296,39 +285,39 @@ fn map_entry_root_survives_force_gc() {
 #[test]
 fn weak_collections_root_survives_force_gc() {
     let mut interp = Interpreter::new();
-    let map = otter_vm::collections::alloc_weak_map(interp.gc_heap_mut()).expect("alloc WeakMap");
-    let set = otter_vm::collections::alloc_weak_set(interp.gc_heap_mut()).expect("alloc WeakSet");
-    let key = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc key");
-    let value = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("alloc value");
+    let map = crate::collections::alloc_weak_map(interp.gc_heap_mut()).expect("alloc WeakMap");
+    let set = crate::collections::alloc_weak_set(interp.gc_heap_mut()).expect("alloc WeakSet");
+    let key = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc key");
+    let value = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("alloc value");
 
-    otter_vm::collections::weak_map_set(
+    crate::collections::weak_map_set(
         map,
         interp.gc_heap_mut(),
-        otter_vm::Value::Object(key),
-        otter_vm::Value::Object(value),
+        crate::Value::Object(key),
+        crate::Value::Object(value),
     )
     .expect("weak map set");
-    otter_vm::collections::weak_set_add(set, interp.gc_heap_mut(), otter_vm::Value::Object(key))
+    crate::collections::weak_set_add(set, interp.gc_heap_mut(), crate::Value::Object(key))
         .expect("weak set add");
 
     let global_this = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__weak_map_root",
-        otter_vm::Value::WeakMap(map),
+        crate::Value::WeakMap(map),
     );
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__weak_set_root",
-        otter_vm::Value::WeakSet(set),
+        crate::Value::WeakSet(set),
     );
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__weak_key_root",
-        otter_vm::Value::Object(key),
+        crate::Value::Object(key),
     );
 
     let _ = map;
@@ -337,21 +326,21 @@ fn weak_collections_root_survives_force_gc() {
     let _ = value;
     interp.force_gc();
 
-    let rooted_key = otter_vm::object::get(global_this, interp.gc_heap(), "__weak_key_root")
+    let rooted_key = crate::object::get(global_this, interp.gc_heap(), "__weak_key_root")
         .expect("weak key root survives force_gc");
-    let rooted_map = otter_vm::object::get(global_this, interp.gc_heap(), "__weak_map_root")
+    let rooted_map = crate::object::get(global_this, interp.gc_heap(), "__weak_map_root")
         .expect("weak map root survives force_gc");
-    let rooted_set = otter_vm::object::get(global_this, interp.gc_heap(), "__weak_set_root")
+    let rooted_set = crate::object::get(global_this, interp.gc_heap(), "__weak_set_root")
         .expect("weak set root survives force_gc");
 
     match (rooted_map, rooted_set) {
-        (otter_vm::Value::WeakMap(map), otter_vm::Value::WeakSet(set)) => {
+        (crate::Value::WeakMap(map), crate::Value::WeakSet(set)) => {
             assert!(
-                otter_vm::collections::weak_map_has(map, interp.gc_heap(), &rooted_key)
+                crate::collections::weak_map_has(map, interp.gc_heap(), &rooted_key)
                     .expect("weak map has")
             );
             assert!(
-                otter_vm::collections::weak_set_has(set, interp.gc_heap(), &rooted_key)
+                crate::collections::weak_set_has(set, interp.gc_heap(), &rooted_key)
                     .expect("weak set has")
             );
         }
@@ -364,31 +353,31 @@ fn weak_collections_root_survives_force_gc() {
 /// collection after the transient host handles are gone.
 #[test]
 fn promise_resolution_root_survives_force_gc() {
-    use otter_vm::promise::{JsPromise, PromiseState};
+    use crate::promise::{JsPromise, PromiseState};
 
     let mut interp = Interpreter::new();
 
-    let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
-    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
-    promise.fulfill(interp.gc_heap_mut(), otter_vm::Value::Object(object));
+    let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+    let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
+    promise.fulfill(interp.gc_heap_mut(), crate::Value::Object(object));
 
     let global_this = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__promise_root",
-        otter_vm::Value::Promise(promise),
+        crate::Value::Promise(promise),
     );
 
     let _ = object;
     let _ = promise;
     interp.force_gc();
 
-    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__promise_root")
+    let rooted = crate::object::get(global_this, interp.gc_heap(), "__promise_root")
         .expect("promise root survives force_gc");
     match rooted {
-        otter_vm::Value::Promise(promise) => match promise.state(interp.gc_heap()) {
-            PromiseState::Fulfilled(otter_vm::Value::Object(_)) => {}
+        crate::Value::Promise(promise) => match promise.state(interp.gc_heap()) {
+            PromiseState::Fulfilled(crate::Value::Object(_)) => {}
             other => panic!("expected fulfilled object promise after force_gc, got {other:?}"),
         },
         other => panic!("expected Value::Promise after force_gc, got {other:?}"),
@@ -402,14 +391,14 @@ fn promise_resolution_root_survives_force_gc() {
 fn microtask_payload_root_survives_force_gc() {
     let mut interp = Interpreter::new();
 
-    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
-    interp.microtasks_mut().enqueue(otter_vm::Microtask {
-        callee: otter_vm::Value::Undefined,
-        this_value: otter_vm::Value::Undefined,
-        args: smallvec::smallvec![otter_vm::Value::Object(object)],
+    let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
+    interp.microtasks_mut().enqueue(crate::Microtask {
+        callee: crate::Value::Undefined,
+        this_value: crate::Value::Undefined,
+        args: smallvec::smallvec![crate::Value::Object(object)],
         context: None,
         result_capability: None,
-        kind: otter_vm::MicrotaskKind::Call,
+        kind: crate::MicrotaskKind::Call,
     });
 
     let _ = object;
@@ -421,7 +410,7 @@ fn microtask_payload_root_survives_force_gc() {
         .expect("outer drain batch");
     let task = batch.tasks.pop_front().expect("queued task");
     assert!(
-        matches!(task.args.first(), Some(otter_vm::Value::Object(_))),
+        matches!(task.args.first(), Some(crate::Value::Object(_))),
         "microtask payload remains observable after force_gc"
     );
     interp.microtasks_mut().end_drain();
@@ -429,9 +418,9 @@ fn microtask_payload_root_survives_force_gc() {
 
 #[test]
 fn parked_frame_keeps_alive() {
+    use crate::generator::PARKED_FRAME_BODY_TYPE_TAG;
+    use crate::{Frame, PromiseCapability, Value};
     use otter_bytecode::Function;
-    use otter_vm::generator::PARKED_FRAME_BODY_TYPE_TAG;
-    use otter_vm::{Frame, PromiseCapability, Value};
 
     let mut interp = Interpreter::new();
     interp.force_gc();
@@ -446,12 +435,12 @@ fn parked_frame_keeps_alive() {
         ..Function::default()
     };
     let mut frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
-    let object = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("object");
+    let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     frame.registers[0] = Value::Object(object);
 
     let parked =
-        otter_vm::generator::alloc_parked_frame(interp.gc_heap_mut(), frame).expect("parked frame");
-    let promise = otter_vm::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
+        crate::generator::alloc_parked_frame(interp.gc_heap_mut(), frame).expect("parked frame");
+    let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     promise.perform_async_resume_then(
         interp.gc_heap_mut(),
         parked,
@@ -466,7 +455,7 @@ fn parked_frame_keeps_alive() {
     );
 
     let global_this = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__parked_frame_promise_root",
@@ -487,30 +476,23 @@ fn parked_frame_keeps_alive() {
 }
 
 #[test]
-#[ignore = "symbols remain leaf interned values; no GC body to root yet"]
-fn symbol_registry_root_survives_force_gc() {
-    // Future symbol-body migration: Symbol.for("k") retains the
-    // registered symbol across force_gc and Symbol.keyFor returns "k".
-}
-
-#[test]
 fn bound_function_root_survives_force_gc() {
     let mut interp = Interpreter::new();
-    let target = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("target");
-    let bound_this = otter_vm::object::alloc_object(interp.gc_heap_mut()).expect("this");
-    let bound = otter_vm::BoundFunction::new(
+    let target = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("target");
+    let bound_this = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("this");
+    let bound = crate::BoundFunction::new(
         interp.gc_heap_mut(),
-        otter_vm::Value::Object(target),
-        otter_vm::Value::Object(bound_this),
-        smallvec::smallvec![otter_vm::Value::Boolean(true)],
+        crate::Value::Object(target),
+        crate::Value::Object(bound_this),
+        smallvec::smallvec![crate::Value::Boolean(true)],
     )
     .expect("bound");
     let global_this = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__bound_root",
-        otter_vm::Value::BoundFunction(bound),
+        crate::Value::BoundFunction(bound),
     );
 
     let _ = target;
@@ -518,14 +500,14 @@ fn bound_function_root_survives_force_gc() {
     let _ = bound;
     interp.force_gc();
 
-    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__bound_root")
+    let rooted = crate::object::get(global_this, interp.gc_heap(), "__bound_root")
         .expect("bound root survives force_gc");
     match rooted {
-        otter_vm::Value::BoundFunction(bound) => {
+        crate::Value::BoundFunction(bound) => {
             let (target, bound_this, args) = bound.parts(interp.gc_heap());
-            assert!(matches!(target, otter_vm::Value::Object(_)));
-            assert!(matches!(bound_this, otter_vm::Value::Object(_)));
-            assert!(matches!(args.first(), Some(otter_vm::Value::Boolean(true))));
+            assert!(matches!(target, crate::Value::Object(_)));
+            assert!(matches!(bound_this, crate::Value::Object(_)));
+            assert!(matches!(args.first(), Some(crate::Value::Boolean(true))));
         }
         other => panic!("expected Value::BoundFunction after force_gc, got {other:?}"),
     }
@@ -535,22 +517,22 @@ fn bound_function_root_survives_force_gc() {
 fn regexp_root_survives_force_gc() {
     let mut interp = Interpreter::new();
     let pattern: Vec<u16> = "a+".encode_utf16().collect();
-    let re = otter_vm::JsRegExp::compile(interp.gc_heap_mut(), &pattern, "g").expect("regexp");
+    let re = crate::JsRegExp::compile(interp.gc_heap_mut(), &pattern, "g").expect("regexp");
     let global_this = *interp.global_this();
-    otter_vm::object::set(
+    crate::object::set(
         global_this,
         interp.gc_heap_mut(),
         "__regexp_root",
-        otter_vm::Value::RegExp(re),
+        crate::Value::RegExp(re),
     );
 
     let _ = re;
     interp.force_gc();
 
-    let rooted = otter_vm::object::get(global_this, interp.gc_heap(), "__regexp_root")
+    let rooted = crate::object::get(global_this, interp.gc_heap(), "__regexp_root")
         .expect("regexp root survives force_gc");
     match rooted {
-        otter_vm::Value::RegExp(re) => {
+        crate::Value::RegExp(re) => {
             let text: Vec<u16> = "aaab".encode_utf16().collect();
             let first = re
                 .find_from_utf16(interp.gc_heap(), &text, 0)

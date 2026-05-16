@@ -661,7 +661,8 @@ mod tests {
     #[test]
     fn get_own_property_descriptor_uses_runtime_rooted_object_allocation() {
         let mut interp = Interpreter::new();
-        let target = crate::object::alloc_object(interp.gc_heap_mut()).expect("target");
+        let target =
+            crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("target");
         crate::object::set(
             target,
             interp.gc_heap_mut(),
@@ -693,7 +694,8 @@ mod tests {
     #[test]
     fn own_keys_uses_runtime_rooted_array_allocation() {
         let mut interp = Interpreter::new();
-        let target = crate::object::alloc_object(interp.gc_heap_mut()).expect("target");
+        let target =
+            crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("target");
         crate::object::set(target, interp.gc_heap_mut(), "a", Value::Boolean(true));
         let context = empty_context();
         let strings = interp.string_heap_clone();

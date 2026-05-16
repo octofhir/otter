@@ -585,7 +585,7 @@ mod tests {
     #[test]
     fn shared_array_buffer_growable_accounts_max_backing_store() {
         let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
-        let options = crate::object::alloc_object(&mut heap).expect("options");
+        let options = crate::object::alloc_object_old_for_fixture(&mut heap).expect("options");
         crate::object::set(
             options,
             &mut heap,

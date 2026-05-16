@@ -58,7 +58,7 @@ use std::ptr::NonNull;
 use crate::compressed::{RawGc, cage_base};
 use crate::header::GcHeader;
 use crate::heap::RootSlotVisitor;
-use crate::page::{CARD_SIZE, CELL_SIZE, PAGE_HEADER_SIZE, Page, PageHeader, align_up};
+use crate::page::{CARD_SIZE, CELL_SIZE, PAGE_HEADER_SIZE, Page, PageHeader, SpaceKind, align_up};
 use crate::space::{NewSpace, OldSpace};
 use crate::trace::TraceTable;
 
@@ -66,7 +66,7 @@ use crate::trace::TraceTable;
 pub const PROMOTE_AFTER_SURVIVALS: u32 = 1;
 
 /// Stats returned by [`scavenge`].
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ScavengeStats {
     /// Bytes copied to to-space (survived but not promoted).
     pub copied_bytes: usize,
@@ -104,9 +104,12 @@ impl ScavCtx {
 /// scavenger may rewrite each in place. `external_visit` is a
 /// hook for additional root sources (handle stack, global
 /// handles); each call yields the additional slots.
-/// `weak_registry_slots` are non-root registry entries: a slot is
-/// rewritten only if its target was already forwarded by strong
-/// reachability; otherwise it is nulled for later pruning.
+/// `ephemeron_registry_slots` and `weak_registry_slots` are non-root registry
+/// entries. Ephemeron tables are scanned after ordinary strong reachability:
+/// their keys are updated only if already live, and their values become strong
+/// only for such live keys. Remaining weak registry slots are rewritten only
+/// when their target was already forwarded; otherwise they are nulled for later
+/// pruning.
 ///
 /// # Safety
 ///
@@ -121,6 +124,7 @@ pub unsafe fn scavenge(
     trace_table: &TraceTable,
     root_slots: &[*mut RawGc],
     external_visit: &mut RootSlotVisitor<'_>,
+    ephemeron_registry_slots: &[*mut RawGc],
     weak_registry_slots: &[*mut RawGc],
 ) -> ScavengeStats {
     let mut ctx = ScavCtx {
@@ -154,15 +158,20 @@ pub unsafe fn scavenge(
     // SAFETY: STW + raw-pointer state.
     unsafe { cheney_scan(&mut ctx) };
 
-    // 5) Rewrite non-root weak registry entries after all strong
-    // reachability has been evacuated, but before from-space is
+    // 5) Run minor-GC ephemeron processing. This may evacuate values for
+    // keys that were already kept alive by ordinary reachability.
+    // SAFETY: registry slots are valid non-root slots supplied by the heap.
+    unsafe { process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots) };
+
+    // 6) Rewrite non-root weak registry entries after all strong and
+    // ephemeron reachability has been evacuated, but before from-space is
     // recycled by the flip below.
     for &slot in weak_registry_slots {
         // SAFETY: caller guarantees slot is a valid registry slot.
         unsafe { process_weak_registry_slot(&mut ctx, slot) };
     }
 
-    // 6) Bump survival ages on to-space pages — those are
+    // 7) Bump survival ages on to-space pages — those are
     // the pages that received survivors during this scavenge.
     // After the flip below they become the new from-space; the
     // next scavenge reads their (now-bumped) survival_age and
@@ -174,7 +183,7 @@ pub unsafe fn scavenge(
         }
     }
 
-    // 7) Flip from↔to.
+    // 8) Flip from↔to.
     ctx.new_space().flip();
 
     ctx.stats
@@ -196,6 +205,9 @@ unsafe fn process_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
         let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
         if !(*header_ptr).is_young() {
             return; // old / large objects do not move on scavenge.
+        }
+        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
+            return; // already evacuated during this scavenge.
         }
         let new_offset = evacuate(ctx, header_ptr);
         (*slot).0 = new_offset;
@@ -221,12 +233,136 @@ unsafe fn process_weak_registry_slot(ctx: &mut ScavCtx, slot: *mut RawGc) {
         if !(*header_ptr).is_young() {
             return;
         }
+        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
+            return;
+        }
         if (*header_ptr).is_forwarded() {
             (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
             ctx.stats.slot_updates += 1;
         } else {
             *slot = RawGc::NULL;
         }
+    }
+}
+
+/// Update a non-root registry slot if it is currently known live.
+///
+/// Returns `true` when the slot points at an old object or a forwarded young
+/// object. Young objects that have not been forwarded are left untouched here
+/// because an ephemeron value discovered later in the same fixpoint may still
+/// make the table reachable.
+unsafe fn update_registry_slot_if_forwarded(ctx: &mut ScavCtx, slot: *mut RawGc) -> bool {
+    // SAFETY: slot is dereferenceable per precondition.
+    unsafe {
+        let raw = (*slot).0;
+        if raw == 0 {
+            return false;
+        }
+        let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+        if !(*header_ptr).is_young() {
+            return true;
+        }
+        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
+            return true;
+        }
+        if (*header_ptr).is_forwarded() {
+            (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
+            ctx.stats.slot_updates += 1;
+            return true;
+        }
+        false
+    }
+}
+
+/// Update a weak ephemeron key slot.
+///
+/// Returns `true` when the key is live for this minor collection. Dead young
+/// keys are nulled in place so VM weak-table lookups stop observing them.
+unsafe fn process_ephemeron_key_slot(ctx: &mut ScavCtx, slot: *mut RawGc) -> bool {
+    // SAFETY: slot is dereferenceable per precondition.
+    unsafe {
+        let raw = (*slot).0;
+        if raw == 0 {
+            return false;
+        }
+        let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+        if !(*header_ptr).is_young() {
+            return true;
+        }
+        if Page::header_of(header_ptr as *const u8).space == SpaceKind::NewTo {
+            return true;
+        }
+        if (*header_ptr).is_forwarded() {
+            (*slot).0 = GcHeader::read_forwarding_offset(header_ptr);
+            ctx.stats.slot_updates += 1;
+            return true;
+        }
+        *slot = RawGc::NULL;
+        ctx.stats.slot_updates += 1;
+        false
+    }
+}
+
+/// Process ephemeron tables until no more young keys/tables/values are
+/// forwarded. This is a young-generation analogue of the old-generation
+/// ephemeron fixpoint: keys are weak, values become strong only for keys
+/// already proven live.
+///
+/// # Safety
+///
+/// `ephemeron_registry_slots` must address valid non-root registry slots.
+unsafe fn process_ephemeron_fixpoint(ctx: &mut ScavCtx, ephemeron_registry_slots: &[*mut RawGc]) {
+    // SAFETY: caller guarantees slot validity under STW.
+    unsafe {
+        loop {
+            let before = ctx.stats;
+
+            for &slot in ephemeron_registry_slots {
+                if !update_registry_slot_if_forwarded(ctx, slot) {
+                    continue;
+                }
+                let raw = (*slot).0;
+                if raw == 0 {
+                    continue;
+                }
+                let header_ptr = cage_base().add(raw as usize) as *mut GcHeader;
+                trace_ephemeron_table(ctx, header_ptr);
+            }
+
+            cheney_scan(ctx);
+
+            if ctx.stats == before {
+                break;
+            }
+        }
+
+        for &slot in ephemeron_registry_slots {
+            process_weak_registry_slot(ctx, slot);
+        }
+    }
+}
+
+/// Trace one live ephemeron table.
+///
+/// # Safety
+///
+/// `header` is a live table header whose type tag is registered.
+unsafe fn trace_ephemeron_table(ctx: &mut ScavCtx, header: *mut GcHeader) {
+    // SAFETY: per docstring.
+    unsafe {
+        let table_ptr = ctx.trace_table.as_ptr();
+        let ctx_ptr = ctx as *mut ScavCtx;
+        let mut visitor =
+            move |key_slot: *mut RawGc,
+                  visit_value_slots: &mut crate::trace::EphemeronValueVisitor<'_>| {
+                if process_ephemeron_key_slot(&mut *ctx_ptr, key_slot) {
+                    let mut strong_visitor = |slot: *mut RawGc| {
+                        process_slot(&mut *ctx_ptr, slot);
+                    };
+                    visit_value_slots(&mut strong_visitor);
+                }
+            };
+        (*table_ptr).trace_ephemerons(header, &mut visitor);
     }
 }
 

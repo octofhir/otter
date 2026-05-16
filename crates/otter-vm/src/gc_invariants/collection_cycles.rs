@@ -1,12 +1,12 @@
-//! Map/Set GC regressions for task 79.
+//! Map/Set GC invariants.
 //!
 //! `Map` and `Set` are GC-managed handles. Their entries can point
 //! back to the collection itself, so mark-sweep must reclaim the
 //! cycle once no runtime root retains it.
 
-use otter_vm::Interpreter;
-use otter_vm::Value;
-use otter_vm::collections::{MAP_BODY_TYPE_TAG, SET_BODY_TYPE_TAG};
+use crate::Interpreter;
+use crate::Value;
+use crate::collections::{MAP_BODY_TYPE_TAG, SET_BODY_TYPE_TAG};
 
 fn assert_map_self_value_reaped() {
     let mut interp = Interpreter::new();
@@ -14,11 +14,11 @@ fn assert_map_self_value_reaped() {
     interp.force_gc();
     let baseline = interp.gc_heap_mut().gc_stats().by_type[MAP_BODY_TYPE_TAG as usize].live_bytes;
 
-    let map = otter_vm::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");
-    otter_vm::collections::map_set(
+    let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("alloc map");
+    crate::collections::map_set(
         map,
         interp.gc_heap_mut(),
-        Value::Number(otter_vm::NumberValue::Smi(1)),
+        Value::Number(crate::NumberValue::Smi(1)),
         Value::Map(map),
     )
     .expect("map self value");
@@ -44,8 +44,8 @@ fn assert_set_self_value_reaped() {
     interp.force_gc();
     let baseline = interp.gc_heap_mut().gc_stats().by_type[SET_BODY_TYPE_TAG as usize].live_bytes;
 
-    let set = otter_vm::collections::alloc_set(interp.gc_heap_mut()).expect("alloc set");
-    otter_vm::collections::set_add(set, interp.gc_heap_mut(), Value::Set(set))
+    let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("alloc set");
+    crate::collections::set_add(set, interp.gc_heap_mut(), Value::Set(set))
         .expect("set self value");
 
     let with_set = interp.gc_heap_mut().gc_stats().by_type[SET_BODY_TYPE_TAG as usize].live_bytes;

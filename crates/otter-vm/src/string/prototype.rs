@@ -625,6 +625,85 @@ fn impl_trim(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     trim_impl(args, TrimSide::Both)
 }
 
+/// §B.2.3.1 `CreateHTML(string, tag, attribute, value)`.
+///
+/// Wraps the receiver string in an HTML tag, optionally with a
+/// single `attribute="value"` pair (double-quoted, `"` in the value
+/// escaped to `&quot;`). Implements the foundation of the
+/// `String.prototype.{anchor, big, blink, bold, fixed, fontcolor,
+/// fontsize, italics, link, small, strike, sub, sup}` AnnexB shims.
+fn create_html(
+    args: &mut IntrinsicArgs<'_>,
+    tag: &str,
+    attribute: Option<&str>,
+) -> Result<Value, IntrinsicError> {
+    let recv = receiver_string(args)?;
+    let body = recv.to_lossy_string();
+    let mut out = String::with_capacity(body.len() + tag.len() * 2 + 5);
+    out.push('<');
+    out.push_str(tag);
+    if let Some(attr) = attribute {
+        let raw = match args.args.first() {
+            None | Some(Value::Undefined) => "undefined".to_string(),
+            Some(Value::String(s)) => s.to_lossy_string(),
+            Some(other) => other.display_string(),
+        };
+        let escaped = raw.replace('"', "&quot;");
+        out.push(' ');
+        out.push_str(attr);
+        out.push('=');
+        out.push('"');
+        out.push_str(&escaped);
+        out.push('"');
+    }
+    out.push('>');
+    out.push_str(&body);
+    out.push_str("</");
+    out.push_str(tag);
+    out.push('>');
+    Ok(Value::String(JsString::from_str(&out, args.string_heap)?))
+}
+
+fn impl_anchor(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "a", Some("name"))
+}
+fn impl_big(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "big", None)
+}
+fn impl_blink(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "blink", None)
+}
+fn impl_bold(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "b", None)
+}
+fn impl_fixed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "tt", None)
+}
+fn impl_fontcolor(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "font", Some("color"))
+}
+fn impl_fontsize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "font", Some("size"))
+}
+fn impl_italics(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "i", None)
+}
+fn impl_link(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "a", Some("href"))
+}
+fn impl_small(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "small", None)
+}
+fn impl_strike(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "strike", None)
+}
+fn impl_sub(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "sub", None)
+}
+fn impl_sup(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    create_html(args, "sup", None)
+}
+
 fn impl_trim_start(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     trim_impl(args, TrimSide::Start)
 }
@@ -1246,6 +1325,26 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "trim"          / 0 => impl_trim,
             "trimStart"     / 0 => impl_trim_start,
             "trimEnd"       / 0 => impl_trim_end,
+            // §B.2.3.2 / §B.2.3.3 — `trimLeft` is the AnnexB alias
+            // for `trimStart`; `trimRight` is the alias for
+            // `trimEnd`. Spec carries the same algorithm body, so
+            // route both through the same intrinsic impls.
+            "trimLeft"      / 0 => impl_trim_start,
+            "trimRight"     / 0 => impl_trim_end,
+            // §B.2.3 AnnexB HTML wrappers.
+            "anchor"        / 1 => impl_anchor,
+            "big"           / 0 => impl_big,
+            "blink"         / 0 => impl_blink,
+            "bold"          / 0 => impl_bold,
+            "fixed"         / 0 => impl_fixed,
+            "fontcolor"     / 1 => impl_fontcolor,
+            "fontsize"      / 1 => impl_fontsize,
+            "italics"       / 0 => impl_italics,
+            "link"          / 1 => impl_link,
+            "small"         / 0 => impl_small,
+            "strike"        / 0 => impl_strike,
+            "sub"           / 0 => impl_sub,
+            "sup"           / 0 => impl_sup,
             "toLowerCase"   / 0 => impl_to_lower_case,
             "toUpperCase"   / 0 => impl_to_upper_case,
             // §22.1.3.21 / §22.1.3.23 — `toLocaleLowerCase` /
@@ -1668,6 +1767,21 @@ string_prototype_methods!(
     bridge_trim            => "trim",           0;
     bridge_trim_start      => "trimStart",      0;
     bridge_trim_end        => "trimEnd",        0;
+    bridge_trim_left       => "trimLeft",       0;
+    bridge_trim_right      => "trimRight",      0;
+    bridge_anchor          => "anchor",         1;
+    bridge_big             => "big",            0;
+    bridge_blink           => "blink",          0;
+    bridge_bold            => "bold",           0;
+    bridge_fixed           => "fixed",          0;
+    bridge_fontcolor       => "fontcolor",      1;
+    bridge_fontsize        => "fontsize",       1;
+    bridge_italics         => "italics",        0;
+    bridge_link            => "link",           1;
+    bridge_small           => "small",          0;
+    bridge_strike          => "strike",         0;
+    bridge_sub             => "sub",            0;
+    bridge_sup             => "sup",            0;
     bridge_to_lower_case   => "toLowerCase",    0;
     bridge_to_upper_case   => "toUpperCase",    0;
     bridge_to_locale_lower => "toLocaleLowerCase", 0;

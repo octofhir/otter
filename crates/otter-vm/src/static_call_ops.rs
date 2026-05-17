@@ -272,6 +272,10 @@ impl Interpreter {
                 let result = self.do_object_define_properties(context, stack, &args)?;
                 return finish_static_call(&mut stack[top_idx], dst, result);
             }
+            method_id::ObjectMethod::Assign => {
+                let result = self.do_object_assign(context, stack, &args)?;
+                return finish_static_call(&mut stack[top_idx], dst, result);
+            }
             _ => {}
         }
         let result = if let Some(result) =
@@ -440,6 +444,121 @@ impl Interpreter {
             }
         }
         Ok(target_value)
+    }
+
+    /// §20.1.2.1 Object.assign(target, ...sources).
+    ///
+    /// 1. `target = ? ToObject(target)` — primitive targets coerce to
+    ///    their wrapper objects per §7.1.18.
+    /// 2. For each source: ignore `undefined` / `null`; otherwise
+    ///    enumerate the source's own enumerable string-keyed
+    ///    properties (foundation walks `with_properties(...)
+    ///    .enumerable_data_iter`) and `Set(target, key, value)`.
+    /// 3. Return `target`.
+    ///
+    /// Sources of any object-typed kind are accepted (Array,
+    /// Function, ClassConstructor, NativeFunction, etc.). Symbol
+    /// sources are accepted but their symbol-keyed properties aren't
+    /// copied yet — filed as a follow-up.
+    fn do_object_assign(
+        &mut self,
+        _context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let target_input = args.first().cloned().unwrap_or(Value::Undefined);
+        let target = match &target_input {
+            Value::Object(o) => *o,
+            Value::Null | Value::Undefined => {
+                return Err(VmError::TypeError {
+                    message: "Object.assign called on null or undefined".to_string(),
+                });
+            }
+            _ => {
+                // §7.1.18 ToObject — wrap primitives. We thread the
+                // arg slice + a temporary target root through the
+                // boxing helper so a mid-allocation GC sees both the
+                // primitive value and the in-progress sources.
+                let arg_slice = args;
+                let boxed = self.box_sloppy_this_primitive_stack_rooted(
+                    stack,
+                    target_input.clone(),
+                    &[arg_slice],
+                )?;
+                match boxed {
+                    Value::Object(o) => o,
+                    _ => {
+                        return Err(VmError::TypeError {
+                            message: "Object.assign: ToObject failed".to_string(),
+                        });
+                    }
+                }
+            }
+        };
+        for src in args.iter().skip(1) {
+            match src {
+                Value::Undefined | Value::Null => continue,
+                Value::Object(o) => {
+                    let entries: Vec<(String, Value)> =
+                        object::with_properties(*o, self.gc_heap(), |p| {
+                            p.enumerable_data_iter()
+                                .map(|(k, v)| (k.to_string(), v))
+                                .collect()
+                        });
+                    for (k, v) in entries {
+                        object::set(target, &mut self.gc_heap, &k, v);
+                    }
+                }
+                Value::Array(arr) => {
+                    // §22.1.3.3 — Array EnumerableOwnPropertyNames:
+                    // dense indices then named extra slots.
+                    let dense: Vec<Value> = array::with_elements(*arr, self.gc_heap(), |els| {
+                        els.iter().cloned().collect()
+                    });
+                    for (idx, v) in dense.into_iter().enumerate() {
+                        object::set(target, &mut self.gc_heap, &idx.to_string(), v);
+                    }
+                    let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
+                        body.named_properties.as_ref().map_or_else(Vec::new, |m| {
+                            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                        })
+                    });
+                    for (k, v) in named {
+                        object::set(target, &mut self.gc_heap, &k, v);
+                    }
+                }
+                Value::String(s) => {
+                    // §22.1.4 — String exotic exposes its code units
+                    // as own indexed properties plus a `length`. The
+                    // latter is read-only on the wrapper, so we copy
+                    // only the indexed slots.
+                    let lossy = s.to_lossy_string();
+                    for (idx, ch) in lossy.chars().enumerate() {
+                        let mut buf = [0u16; 2];
+                        let units = ch.encode_utf16(&mut buf);
+                        let unit_string = crate::string::JsString::from_utf16_units(
+                            units,
+                            &self.string_heap,
+                        )
+                        .map_err(|_| VmError::TypeMismatch)?;
+                        object::set(
+                            target,
+                            &mut self.gc_heap,
+                            &idx.to_string(),
+                            Value::String(unit_string),
+                        );
+                    }
+                }
+                _ => {
+                    // Other object-typed sources: skip the spread for
+                    // now (no observable own enumerable string keys
+                    // exposed through the legacy `with_properties`
+                    // probe). Sym sources are intentionally skipped.
+                    continue;
+                }
+            }
+        }
+        Ok(Value::Object(target))
     }
 
     fn object_static_call_stack_rooted(

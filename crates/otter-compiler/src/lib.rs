@@ -3273,13 +3273,14 @@ fn compile_assignment(
                     span,
                 );
                 let rhs = compile_expr(cx, &a.right, span)?;
+                let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
                     vec![
                         Operand::Register(dst),
-                        Operand::Register(current),
-                        Operand::Register(rhs),
+                        Operand::Register(cur_p),
+                        Operand::Register(rhs_p),
                     ],
                     span,
                 );
@@ -3322,13 +3323,14 @@ fn compile_assignment(
                     span,
                 );
                 let rhs = compile_expr(cx, &a.right, span)?;
+                let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
                     vec![
                         Operand::Register(dst),
-                        Operand::Register(current),
-                        Operand::Register(rhs),
+                        Operand::Register(cur_p),
+                        Operand::Register(rhs_p),
                     ],
                     span,
                 );
@@ -3365,13 +3367,14 @@ fn compile_assignment(
                     span,
                 );
                 let rhs = compile_expr(cx, &a.right, span)?;
+                let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     op,
                     vec![
                         Operand::Register(dst),
-                        Operand::Register(current),
-                        Operand::Register(rhs),
+                        Operand::Register(cur_p),
+                        Operand::Register(rhs_p),
                     ],
                     span,
                 );
@@ -3435,13 +3438,14 @@ fn compile_assignment(
                 }
             }
             let rhs = compile_expr(cx, &a.right, span)?;
+            let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
             let dst = cx.alloc_scratch();
             cx.emit(
                 op,
                 vec![
                     Operand::Register(dst),
-                    Operand::Register(current),
-                    Operand::Register(rhs),
+                    Operand::Register(cur_p),
+                    Operand::Register(rhs_p),
                 ],
                 span,
             );
@@ -9841,6 +9845,54 @@ fn expression_span(expr: &oxc_ast::ast::Expression<'_>) -> (u32, u32) {
     use oxc_span::GetSpan;
     let s = expr.span();
     (s.start, s.end)
+}
+
+/// Pre-coerce the loaded current value and RHS register of a compound
+/// assignment through `Op::ToPrimitive`, mirroring the
+/// [`Expression::BinaryExpression`] lowering for the equivalent
+/// operator.
+///
+/// Compound assignment is specified as `x op= y` ⇒ `x = x op y`,
+/// so the operand-coercion rules are identical to the plain
+/// `BinaryExpression` rules (§13.15.4 step 1, §13.15.3
+/// ApplyStringOrNumericBinaryOperator, §7.2.13 / §7.2.14 for the
+/// relational and equality coercion ladders). Without this pass the
+/// runtime sees a raw object operand (e.g. `new Boolean(true)`
+/// receiver of `x ^= true`) and bails out of the type-checked numeric
+/// opcode with `TypeMismatch`.
+///
+/// The `Op::ToPrimitive` runtime helper short-circuits on already
+/// primitive operands, so the extra instruction is cheap on the
+/// common path.
+fn coerce_compound_operands(
+    cx: &mut Compiler,
+    op: Op,
+    current: u16,
+    rhs: u16,
+    span: (u32, u32),
+) -> (u16, u16) {
+    let hint = match op {
+        Op::Add => Some("default"),
+        Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Rem
+        | Op::Pow
+        | Op::BitwiseAnd
+        | Op::BitwiseOr
+        | Op::BitwiseXor
+        | Op::Shl
+        | Op::Shr
+        | Op::Ushr => Some("number"),
+        _ => None,
+    };
+    match hint {
+        Some(h) => (
+            emit_to_primitive(cx, current, h, span),
+            emit_to_primitive(cx, rhs, h, span),
+        ),
+        None => (current, rhs),
+    }
 }
 
 /// Emit `Op::ToPrimitive(hint)` reading from `src_reg` and writing

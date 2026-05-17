@@ -64,18 +64,32 @@ impl Interpreter {
         lhs: Value,
         rhs: Value,
     ) -> Result<(), VmError> {
+        // §13.15.4 ApplyStringOrNumericBinaryOperator for `+`:
+        // already-primitive operands enter here (the compiler emits
+        // `Op::ToPrimitive(default)` ahead of `Op::Add`). If either
+        // primitive is a String, concatenate; otherwise apply ToNumeric
+        // to each primitive and fold via the numeric / BigInt rules.
         let result = if matches!(lhs, Value::String(_)) || matches!(rhs, Value::String(_)) {
             let l_str = conversion::to_js_string_primitive(&lhs, &self.string_heap)?;
             let r_str = conversion::to_js_string_primitive(&rhs, &self.string_heap)?;
             Value::String(JsString::concat(&l_str, &r_str, &self.string_heap)?)
         } else {
-            match (&lhs, &rhs) {
-                (Value::Number(a), Value::Number(b)) => Value::Number(number::add(*a, *b)),
-                (Value::BigInt(a), Value::BigInt(b)) => Value::BigInt(bigint::ops::add(a, b)),
-                (Value::Number(_), Value::BigInt(_)) | (Value::BigInt(_), Value::Number(_)) => {
+            let lk = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
+            let rk = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
+            match (lk, rk) {
+                (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
+                    Value::Number(number::add(a, b))
+                }
+                (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
+                    Value::BigInt(bigint::ops::add(&a, &b))
+                }
+                // §6.1.6.2 Numeric Type Conversion forbids mixing
+                // Number and BigInt operands without an explicit
+                // coercion — raise a TypeError per §13.15.4 step 1.b.
+                (abstract_ops::NumericKind::Num(_), abstract_ops::NumericKind::Big(_))
+                | (abstract_ops::NumericKind::Big(_), abstract_ops::NumericKind::Num(_)) => {
                     return Err(VmError::TypeMismatch);
                 }
-                _ => return Err(VmError::TypeMismatch),
             }
         };
         write_register(frame, dst, result)?;

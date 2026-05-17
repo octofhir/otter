@@ -203,12 +203,39 @@ fn arg_signed_index(
     index: u16,
     default: i64,
 ) -> Result<i64, IntrinsicError> {
+    // §7.1.5 ToIntegerOrInfinity — coerce the spec-relevant operand
+    // set (Number / Boolean / Null / String) before treating
+    // non-finite / NaN / non-integer as defaults.
     match args.args.get(index as usize) {
-        None => Ok(default),
+        None | Some(Value::Undefined) => Ok(default),
         Some(Value::Number(n)) => match n.as_smi() {
             Some(v) => Ok(v as i64),
-            None => Ok(n.as_f64() as i64),
+            None => {
+                let f = n.as_f64();
+                if f.is_nan() {
+                    Ok(0)
+                } else if f.is_infinite() {
+                    Ok(if f.is_sign_negative() {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    })
+                } else {
+                    Ok(f.trunc() as i64)
+                }
+            }
         },
+        Some(Value::Boolean(true)) => Ok(1),
+        Some(Value::Boolean(false)) | Some(Value::Null) => Ok(0),
+        Some(Value::String(s)) => {
+            let text = s.to_lossy_string();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(0)
+            } else {
+                Ok(trimmed.parse::<i64>().unwrap_or(0))
+            }
+        }
         Some(_) => Err(IntrinsicError::BadArgument {
             index,
             reason: "must be a number",

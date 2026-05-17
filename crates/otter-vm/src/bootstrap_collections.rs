@@ -34,7 +34,6 @@
 
 use smallvec::SmallVec;
 
-use crate::bootstrap::BootstrapEntry;
 use crate::collections::{self, CollectionError};
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
@@ -44,44 +43,49 @@ use crate::{NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey}
 // Public bootstrap install entry points
 // ---------------------------------------------------------------
 
-/// §24.1 Map — install the global `Map` constructor and its
-/// prototype.
-pub(crate) fn install_map(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    install_collection(entry, heap, global, CollectionKind::Map)
+/// `BuiltinIntrinsic` adapter for `Map`. Routes through the shared
+/// `install_collection` helper with `CollectionKind::Map`.
+pub struct MapIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for MapIntrinsic {
+    const NAME: &'static str = "Map";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_collection(Self::NAME, heap, global, CollectionKind::Map)
+    }
 }
 
-/// §24.2 Set — install the global `Set` constructor and its
-/// prototype.
-pub(crate) fn install_set(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    install_collection(entry, heap, global, CollectionKind::Set)
+/// `BuiltinIntrinsic` adapter for `Set`.
+pub struct SetIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for SetIntrinsic {
+    const NAME: &'static str = "Set";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_collection(Self::NAME, heap, global, CollectionKind::Set)
+    }
 }
 
-/// §24.3 WeakMap — install the global `WeakMap` constructor and
-/// its prototype.
-pub(crate) fn install_weak_map(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    install_collection(entry, heap, global, CollectionKind::WeakMap)
+/// `BuiltinIntrinsic` adapter for `WeakMap`.
+pub struct WeakMapIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for WeakMapIntrinsic {
+    const NAME: &'static str = "WeakMap";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_collection(Self::NAME, heap, global, CollectionKind::WeakMap)
+    }
 }
 
-/// §24.4 WeakSet — install the global `WeakSet` constructor and
-/// its prototype.
-pub(crate) fn install_weak_set(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    install_collection(entry, heap, global, CollectionKind::WeakSet)
+/// `BuiltinIntrinsic` adapter for `WeakSet`.
+pub struct WeakSetIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for WeakSetIntrinsic {
+    const NAME: &'static str = "WeakSet";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_collection(Self::NAME, heap, global, CollectionKind::WeakSet)
+    }
 }
 
 /// Post-bootstrap fixup: install `@@toStringTag` on each
@@ -207,7 +211,7 @@ fn ctor_prototype(global: JsObject, heap: &otter_gc::GcHeap, ctor_name: &str) ->
 }
 
 fn install_collection(
-    entry: &BootstrapEntry,
+    name: &'static str,
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
     kind: CollectionKind,
@@ -258,7 +262,7 @@ fn install_collection(
         PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
     );
 
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(global, heap, name, Value::NativeFunction(ctor));
     Ok(())
 }
 

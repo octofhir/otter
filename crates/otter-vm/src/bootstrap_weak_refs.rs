@@ -25,19 +25,25 @@
 //! - <https://tc39.es/ecma262/#sec-weak-ref-constructor>
 //! - <https://tc39.es/ecma262/#sec-finalization-registry-constructor>
 
-use crate::bootstrap::BootstrapEntry;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::weak_refs::{self, JsFinalizationRegistry, JsWeakRef};
 use crate::{NativeCtx, NativeError, Value};
 
-/// §26.1 WeakRef — bootstrap install.
-pub(crate) fn install_weak_ref(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+/// `BuiltinIntrinsic` adapter for `WeakRef`.
+pub struct WeakRefIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for WeakRefIntrinsic {
+    const NAME: &'static str = "WeakRef";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_weak_ref(heap, global)
+    }
+}
+
+/// §26.1 WeakRef — installer body, called through [`WeakRefIntrinsic`].
+fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     let global_root = Value::Object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     link_object_prototype(heap, prototype, global);
@@ -71,13 +77,29 @@ pub(crate) fn install_weak_ref(
         "constructor",
         PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
     );
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(
+        global,
+        heap,
+        <WeakRefIntrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+        Value::NativeFunction(ctor),
+    );
     Ok(())
 }
 
-/// §26.2 FinalizationRegistry — bootstrap install.
-pub(crate) fn install_finalization_registry(
-    entry: &BootstrapEntry,
+/// `BuiltinIntrinsic` adapter for `FinalizationRegistry`.
+pub struct FinalizationRegistryIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for FinalizationRegistryIntrinsic {
+    const NAME: &'static str = "FinalizationRegistry";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_finalization_registry(heap, global)
+    }
+}
+
+/// §26.2 FinalizationRegistry — installer body, called through
+/// [`FinalizationRegistryIntrinsic`].
+fn install_finalization_registry(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
@@ -120,7 +142,12 @@ pub(crate) fn install_finalization_registry(
         "constructor",
         PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
     );
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(
+        global,
+        heap,
+        <FinalizationRegistryIntrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+        Value::NativeFunction(ctor),
+    );
     Ok(())
 }
 

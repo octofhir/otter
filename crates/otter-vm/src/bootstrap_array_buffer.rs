@@ -18,7 +18,7 @@ use smallvec::SmallVec;
 
 use crate::binary::{array_buffer_prototype, dispatch};
 use crate::bootstrap::{
-    BootstrapEntry, alloc_object_with_value_roots, native_constructor_static_with_value_roots,
+    alloc_object_with_value_roots, native_constructor_static_with_value_roots,
     native_static_with_value_roots,
 };
 use crate::intrinsics::IntrinsicArgs;
@@ -35,9 +35,21 @@ const AB_METHODS: &[(&str, u8, crate::native_function::NativeFastFn)] = &[
     ("transferToFixedLength", 1, ab_transfer_to_fixed_length),
 ];
 
-/// §25.1 ArrayBuffer — bootstrap install.
-pub(crate) fn install_array_buffer(
-    entry: &BootstrapEntry,
+/// `BuiltinIntrinsic` adapter for `ArrayBuffer`.
+pub struct ArrayBufferIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for ArrayBufferIntrinsic {
+    const NAME: &'static str = "ArrayBuffer";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_array_buffer(Self::NAME, heap, global)
+    }
+}
+
+/// §25.1 ArrayBuffer — installer body, called through
+/// [`ArrayBufferIntrinsic`].
+fn install_array_buffer(
+    name: &'static str,
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
@@ -131,15 +143,27 @@ pub(crate) fn install_array_buffer(
         "constructor",
         PropertyDescriptor::data(ctor_root.clone(), true, false, true),
     );
-    crate::bootstrap::define_global_value(global, heap, entry.name, ctor_root);
+    crate::bootstrap::define_global_value(global, heap, name, ctor_root);
     Ok(())
 }
 
-/// §25.2 SharedArrayBuffer — bootstrap install. Shares the
-/// underlying `JsArrayBuffer` substrate with `ArrayBuffer` —
-/// `is_shared` distinguishes the two on the value side.
-pub(crate) fn install_shared_array_buffer(
-    entry: &BootstrapEntry,
+/// `BuiltinIntrinsic` adapter for `SharedArrayBuffer`.
+pub struct SharedArrayBufferIntrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for SharedArrayBufferIntrinsic {
+    const NAME: &'static str = "SharedArrayBuffer";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_shared_array_buffer(Self::NAME, heap, global)
+    }
+}
+
+/// §25.2 SharedArrayBuffer — installer body, called through
+/// [`SharedArrayBufferIntrinsic`]. Shares the underlying
+/// `JsArrayBuffer` substrate with `ArrayBuffer` — `is_shared`
+/// distinguishes the two on the value side.
+fn install_shared_array_buffer(
+    name: &'static str,
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
@@ -211,7 +235,7 @@ pub(crate) fn install_shared_array_buffer(
         "constructor",
         PropertyDescriptor::data(ctor_root.clone(), true, false, true),
     );
-    crate::bootstrap::define_global_value(global, heap, entry.name, ctor_root);
+    crate::bootstrap::define_global_value(global, heap, name, ctor_root);
     Ok(())
 }
 

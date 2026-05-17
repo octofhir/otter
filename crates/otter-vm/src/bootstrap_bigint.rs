@@ -22,18 +22,25 @@
 use otter_bytecode::method_id::BigIntMethod;
 
 use crate::bigint;
-use crate::bootstrap::BootstrapEntry;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::{NativeCall, NativeFunction};
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
 
-/// §21.2 BigInt — bootstrap install.
-pub(crate) fn install_bigint(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+/// `BuiltinIntrinsic` adapter for the global `BigInt` constructor.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = "BigInt";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install(heap, global)
+    }
+}
+
+/// §21.2 BigInt — installer body, called through [`Intrinsic`].
+fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     let global_root = Value::Object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
@@ -90,7 +97,12 @@ pub(crate) fn install_bigint(
         "constructor",
         PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
     );
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(
+        global,
+        heap,
+        <Intrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+        Value::NativeFunction(ctor),
+    );
     Ok(())
 }
 

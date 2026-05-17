@@ -33,19 +33,26 @@
 use otter_bytecode::method_id::PromiseMethod;
 use smallvec::SmallVec;
 
-use crate::bootstrap::BootstrapEntry;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::{NativeCall, NativeFunction};
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::promise_dispatch::{self, PromiseBuilder};
 use crate::{NativeCtx, NativeError, Value, VmError};
 
-/// §27.2 Promise — bootstrap install.
-pub(crate) fn install_promise(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+/// `BuiltinIntrinsic` adapter for the global `Promise` constructor.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = "Promise";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install(heap, global)
+    }
+}
+
+/// §27.2 Promise — installer body, called through [`Intrinsic`].
+fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     // Prototype object linked to %Object.prototype%.
     let global_root = Value::Object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
@@ -137,7 +144,12 @@ pub(crate) fn install_promise(
         PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
     );
 
-    crate::bootstrap::define_global_value(global, heap, entry.name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(
+        global,
+        heap,
+        <Intrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+        Value::NativeFunction(ctor),
+    );
     Ok(())
 }
 

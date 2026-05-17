@@ -126,16 +126,18 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    // §22.2.6.{8,10} `RegExp.prototype[@@match]` /
-    // `RegExp.prototype[@@search]` — install native functions so user
-    // calls like `re[Symbol.match]("…")` and `re[Symbol.search]("…")`
-    // resolve through the spec-mandated algorithm. The remaining
-    // symbol-keyed methods (`@@matchAll`, `@@replace`, `@@split`)
-    // remain foundation-driven through their `String.prototype.*`
+    // §22.2.6.{8,10,11} `RegExp.prototype[@@match]` /
+    // `RegExp.prototype[@@search]` / `RegExp.prototype[@@replace]` —
+    // install native functions so user calls like
+    // `re[Symbol.match]("…")` / `re[Symbol.search]("…")` /
+    // `re[Symbol.replace]("…", repl)` resolve through the
+    // spec-mandated algorithm. `@@matchAll` and `@@split` remain
+    // foundation-driven through their `String.prototype.*`
     // counterparts and will land in follow-up commits.
     let prototype_root = Value::Object(prototype);
     let match_sym = well_known.get(WellKnown::Match);
     let search_sym = well_known.get(WellKnown::Search);
+    let replace_sym = well_known.get(WellKnown::Replace);
     let match_fn = crate::bootstrap::native_static_with_value_roots(
         heap,
         "[Symbol.match]",
@@ -149,6 +151,14 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         "[Symbol.search]",
         1,
         crate::regexp_prototype::native_regexp_symbol_search,
+        &[&prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let replace_fn = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "[Symbol.replace]",
+        2,
+        crate::regexp_prototype::native_regexp_symbol_replace,
         &[&prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
@@ -170,6 +180,18 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         &search_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::NativeFunction(search_fn)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &replace_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::NativeFunction(replace_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),

@@ -55,6 +55,14 @@ pub struct ArrayBody {
     pub(crate) sparse_elements: Option<HashMap<usize, Value>>,
     /// Optional non-index string-keyed own properties.
     pub(crate) named_properties: Option<HashMap<String, Value>>,
+    /// Accessor descriptors installed via
+    /// `Object.defineProperty` on the array. Keyed by string key
+    /// (covers both indexed and named keys). `(getter, setter)` —
+    /// either may be `None`. Indexed accessors override the dense /
+    /// sparse element value for that slot; named accessors override
+    /// the `named_properties` data entry. Spec: §10.4.2.1
+    /// ArrayExoticObject [[DefineOwnProperty]].
+    pub(crate) accessors: Option<HashMap<String, (Option<Value>, Option<Value>)>>,
     /// Verbatim slice of input text captured by `JSON.parse` for the
     /// lazy stringify memcpy fast-path. `Some` only when the array
     /// originated from `JSON.parse`; the slice spans the closing
@@ -83,6 +91,16 @@ impl otter_gc::SafeTraceable for ArrayBody {
         if let Some(named) = &self.named_properties {
             for value in named.values() {
                 value.trace_value_slots(visitor);
+            }
+        }
+        if let Some(accessors) = &self.accessors {
+            for (get, set) in accessors.values() {
+                if let Some(g) = get {
+                    g.trace_value_slots(visitor);
+                }
+                if let Some(s) = set {
+                    s.trace_value_slots(visitor);
+                }
             }
         }
     }
@@ -481,6 +499,74 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
         body.named_properties
             .as_ref()
             .and_then(|m| m.get(key).cloned())
+    })
+}
+
+/// Install an accessor descriptor on the array at `key`. Used by
+/// `Object.defineProperty(arr, key, { get, set, … })`. Indexed
+/// accessors and named accessors are both stored here; the read /
+/// write paths consult this table before falling back to dense
+/// element storage or the `named_properties` side-table.
+pub fn set_accessor(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    getter: Option<Value>,
+    setter: Option<Value>,
+) {
+    heap.with_payload(arr, |body| {
+        let map = body.accessors.get_or_insert_with(HashMap::new);
+        map.insert(key.to_string(), (getter.clone(), setter.clone()));
+        // Hide the underlying dense / sparse / named data slot so
+        // subsequent ordinary reads see the accessor instead of the
+        // previous data value.
+        if let Ok(idx) = key.parse::<usize>() {
+            if let Some(slot) = body.elements.get_mut(idx) {
+                *slot = Value::Hole;
+            }
+            if let Some(sparse) = body.sparse_elements.as_mut() {
+                sparse.remove(&idx);
+            }
+        }
+        if let Some(named) = body.named_properties.as_mut() {
+            named.remove(key);
+        }
+        body.dirty = true;
+    });
+    if let Some(g) = &getter {
+        heap.record_write(arr, g);
+    }
+    if let Some(s) = &setter {
+        heap.record_write(arr, s);
+    }
+}
+
+/// Look up an accessor descriptor previously installed via
+/// [`set_accessor`]. Returns `Some((getter, setter))` when an entry
+/// exists; either slot may be `None`.
+#[must_use]
+pub fn get_accessor(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    key: &str,
+) -> Option<(Option<Value>, Option<Value>)> {
+    heap.read_payload(arr, |body| {
+        body.accessors.as_ref().and_then(|m| m.get(key).cloned())
+    })
+}
+
+/// Remove a previously installed accessor descriptor. Returns `true`
+/// when an entry existed and was removed.
+pub fn delete_accessor(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
+    heap.with_payload(arr, |body| {
+        let removed = body
+            .accessors
+            .as_mut()
+            .is_some_and(|m| m.remove(key).is_some());
+        if removed {
+            body.dirty = true;
+        }
+        removed
     })
 }
 

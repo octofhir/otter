@@ -799,7 +799,14 @@ impl Interpreter {
                     return Ok(false);
                 };
                 if descriptor.is_accessor() {
-                    return Ok(false);
+                    // §10.4.2.1 Array exotic [[DefineOwnProperty]] —
+                    // store accessor descriptor in the per-array
+                    // accessor side-table. The dense / named slot is
+                    // hidden so subsequent reads invoke the getter.
+                    let getter = descriptor.get.clone();
+                    let setter = descriptor.set.clone();
+                    array::set_accessor(*arr, &mut self.gc_heap, k, getter, setter);
+                    return Ok(true);
                 }
                 if let Ok(idx) = k.parse::<usize>() {
                     let value = descriptor
@@ -811,6 +818,9 @@ impl Interpreter {
                             })
                         })
                         .unwrap_or(Value::Undefined);
+                    // Defining a data descriptor replaces any prior
+                    // accessor at this slot.
+                    array::delete_accessor(*arr, &mut self.gc_heap, k);
                     array::set(*arr, &mut self.gc_heap, idx, value)
                         .map_err(|_| VmError::TypeMismatch)?;
                     return Ok(true);
@@ -824,6 +834,7 @@ impl Interpreter {
                     }
                     return Ok(true);
                 }
+                array::delete_accessor(*arr, &mut self.gc_heap, k);
                 let value = descriptor.value.clone().unwrap_or(Value::Undefined);
                 array::set_named_property(*arr, &mut self.gc_heap, k, value)
                     .map_err(|_| VmError::TypeMismatch)?;
@@ -1655,6 +1666,18 @@ impl Interpreter {
                         let key_str = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
+                        // §10.4.2 — installed accessor descriptors
+                        // take precedence over dense / named data.
+                        if let Some((getter, _)) =
+                            crate::array::get_accessor(arr, &self.gc_heap, key_str)
+                        {
+                            match getter {
+                                Some(callable) if abstract_ops::is_callable(&callable) => {
+                                    return Ok(VmGetOutcome::InvokeGetter { getter: callable });
+                                }
+                                _ => return Ok(VmGetOutcome::Value(Value::Undefined)),
+                            }
+                        }
                         match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
                             Some(v) => v,
                             None => {

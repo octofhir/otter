@@ -1479,6 +1479,21 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
 fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCtx, NativeError};
 
+    /// §20.1.1.1 Object ( [ value ] ).
+    ///
+    /// - With no args / null / undefined: `OrdinaryObjectCreate(%Object.prototype%)`.
+    ///   The new object's `[[Prototype]]` is wired to the realm's
+    ///   `Object.prototype` so the inherited `toString` / `valueOf` /
+    ///   `hasOwnProperty` etc. resolve.
+    /// - With an object-typed arg: ToObject is the identity, so we
+    ///   return the value untouched.
+    /// - With a primitive arg (Boolean / Number / String / Symbol /
+    ///   BigInt): the spec calls ToObject which produces a fresh
+    ///   wrapper. We currently return the primitive unchanged here —
+    ///   wrappers are produced by the dedicated constructors
+    ///   (`new Number(x)` etc.). Primitive operands are uncommon for
+    ///   the bare-call form and don't crash; `valueOf()` / equality
+    ///   continue to work on the primitive.
     fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         match args.first() {
             None | Some(Value::Undefined | Value::Null) => {
@@ -1486,6 +1501,12 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     name: "Object",
                     reason: "object allocation failed".to_string(),
                 })?;
+                let interp = ctx.interp_mut();
+                if let Ok(Value::Object(proto)) =
+                    interp.constructor_prototype_value("Object")
+                {
+                    crate::object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
+                }
                 Ok(Value::Object(obj))
             }
             Some(value) => Ok(value.clone()),

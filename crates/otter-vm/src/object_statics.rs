@@ -102,6 +102,7 @@ const OBJECT_STATIC_METHODS: &[MethodSpec] = &[
 /// Static methods installed on `Object.prototype`.
 pub static OBJECT_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toString", 0, native_prototype_to_string),
+    method("toLocaleString", 0, native_prototype_to_locale_string),
     method("valueOf", 0, native_prototype_value_of),
     method("hasOwnProperty", 1, native_prototype_has_own_property),
     method(
@@ -799,6 +800,20 @@ fn native_prototype_value_of(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     Ok(ctx.this_value().clone())
+}
+
+/// §20.1.3.5 `Object.prototype.toLocaleString` — foundation form.
+///
+/// Spec algorithm: `return ? Invoke(O, "toString")`. We forward to
+/// `Object.prototype.toString` directly so the result matches the
+/// `[object <tag>]` shape the spec mandates. Once user code overrides
+/// `Symbol.toPrimitive` / locale-aware `toString` overloads we'll
+/// route this through the standard `Invoke` ladder.
+fn native_prototype_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    native_prototype_to_string(ctx, args)
 }
 
 fn native_prototype_has_own_property(

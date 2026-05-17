@@ -276,6 +276,71 @@ impl Interpreter {
                 let result = self.do_object_assign(context, stack, &args)?;
                 return finish_static_call(&mut stack[top_idx], dst, result);
             }
+            method_id::ObjectMethod::GetOwnPropertyDescriptor => {
+                // §20.1.2.10 step 2: `key = ? ToPropertyKey(P)`.
+                // The ToPrimitive ladder may invoke user
+                // `Symbol.toPrimitive` / `toString` / `valueOf`, so
+                // we route through the context-aware path *only*
+                // when the arg isn't already a String / Symbol /
+                // Number / Boolean / Null / Undefined primitive
+                // that the free coercion handles directly.
+                let key_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let needs_coercion = !matches!(
+                    &key_arg,
+                    Value::String(_)
+                        | Value::Number(_)
+                        | Value::Boolean(_)
+                        | Value::Null
+                        | Value::Undefined
+                        | Value::Symbol(_)
+                );
+                if needs_coercion {
+                    let coerced_key =
+                        self.evaluate_to_property_key(context, &key_arg)?;
+                    let coerced_value = match &coerced_key {
+                        crate::VmPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
+                        other => Value::String(crate::string::JsString::from_str(
+                            other.string_name()
+                                .expect("non-symbol key has string spelling"),
+                            &self.string_heap,
+                        )?),
+                    };
+                    let mut rewritten: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+                    if rewritten.len() >= 2 {
+                        rewritten[1] = coerced_value;
+                    } else {
+                        rewritten.push(coerced_value);
+                    }
+                    let result =
+                        if let Some(result) = self.try_function_object_static_call(
+                            Some(context),
+                            Some(stack),
+                            method,
+                            &rewritten,
+                        )? {
+                            result
+                        } else if let Some(result) = self.try_proxy_object_static_call(
+                            context,
+                            Some(stack),
+                            method,
+                            &rewritten,
+                        )? {
+                            result
+                        } else if let Some(result) = self
+                            .object_static_call_stack_rooted(stack, method, &rewritten)?
+                        {
+                            result
+                        } else {
+                            object_statics::call(
+                                method,
+                                &rewritten,
+                                &self.string_heap,
+                                &mut self.gc_heap,
+                            )?
+                        };
+                    return finish_static_call(&mut stack[top_idx], dst, result);
+                }
+            }
             _ => {}
         }
         let result = if let Some(result) =

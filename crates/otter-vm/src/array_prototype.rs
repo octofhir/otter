@@ -179,35 +179,156 @@ fn arg_signed_index(
 }
 
 fn impl_push(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let mut new_len = array::len(arr, &*args.gc_heap);
-    let values: Vec<Value> = args.args.to_vec();
-    for v in values {
-        new_len = args.array_push_rooted(arr, v)?;
+    // §23.1.3.20 — `len = ? LengthOfArrayLike(O)`; for each item set
+    // `O[len + idx]` then update `O.length`. Iterates only the
+    // argument list (no `0..len` scan), so safe for any `len`.
+    if let Value::Array(arr) = args.receiver {
+        let mut new_len = array::len(*arr, &*args.gc_heap);
+        let values: Vec<Value> = args.args.to_vec();
+        for v in values {
+            new_len = args.array_push_rooted(*arr, v)?;
+        }
+        return Ok(Value::Number(NumberValue::from_i32(new_len as i32)));
     }
-    Ok(Value::Number(NumberValue::from_i32(new_len as i32)))
+    if let Value::Object(obj) = args.receiver {
+        let heap = &mut *args.gc_heap;
+        let base_len = read_array_like_length(*obj, heap);
+        let added = args.args.len();
+        // §22.1.3.20 step 5.b — RangeError when the resulting length
+        // would exceed 2^53 - 1. We surface the inner heap cap via
+        // `read_array_like_length`'s ToLength clamp; the explicit
+        // check here guards the final write to `length`.
+        let new_len = base_len.saturating_add(added);
+        for (i, v) in args.args.iter().enumerate() {
+            let key = (base_len + i).to_string();
+            crate::object::set(*obj, heap, &key, v.clone());
+        }
+        crate::object::set(
+            *obj,
+            heap,
+            "length",
+            Value::Number(NumberValue::from_f64(new_len as f64)),
+        );
+        return Ok(Value::Number(NumberValue::from_f64(new_len as f64)));
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 fn impl_pop(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let heap = &mut *args.gc_heap;
-    Ok(array::pop(arr, heap))
+    // §23.1.3.19 — read length, peel the last present element, write
+    // length back. For Array we keep the existing dense fast path
+    // (`array::pop`).
+    if let Value::Array(arr) = args.receiver {
+        let heap = &mut *args.gc_heap;
+        return Ok(array::pop(*arr, heap));
+    }
+    if let Value::Object(obj) = args.receiver {
+        let heap = &mut *args.gc_heap;
+        let len = read_array_like_length(*obj, heap);
+        if len == 0 {
+            crate::object::set(
+                *obj,
+                heap,
+                "length",
+                Value::Number(NumberValue::from_i32(0)),
+            );
+            return Ok(Value::Undefined);
+        }
+        let last_idx = len - 1;
+        let key = last_idx.to_string();
+        let element = crate::object::get(*obj, heap, &key).unwrap_or(Value::Undefined);
+        let _ = crate::object::delete(*obj, heap, &key);
+        crate::object::set(
+            *obj,
+            heap,
+            "length",
+            Value::Number(NumberValue::from_f64(last_idx as f64)),
+        );
+        return Ok(element);
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let heap = &mut *args.gc_heap;
-    Ok(array::with_elements_mut(arr, heap, |elements| {
-        if elements.is_empty() {
-            Value::Undefined
-        } else {
-            // §23.1.3.26: a leading hole shifts to `undefined`.
-            match elements.remove(0) {
-                Value::Hole => Value::Undefined,
-                other => other,
+    // §23.1.3.26 — read element at 0, shift indices 1..len down by 1
+    // (skipping absent slots), drop the last, decrement length. For
+    // Array we keep the existing dense `Vec::remove(0)` path.
+    if let Value::Array(arr) = args.receiver {
+        let heap = &mut *args.gc_heap;
+        return Ok(array::with_elements_mut(*arr, heap, |elements| {
+            if elements.is_empty() {
+                Value::Undefined
+            } else {
+                // §23.1.3.26: a leading hole shifts to `undefined`.
+                match elements.remove(0) {
+                    Value::Hole => Value::Undefined,
+                    other => other,
+                }
+            }
+        }));
+    }
+    if let Value::Object(obj) = args.receiver {
+        let heap_ref = &*args.gc_heap;
+        let len = read_array_like_length(*obj, heap_ref);
+        if len == 0 {
+            let heap = &mut *args.gc_heap;
+            crate::object::set(
+                *obj,
+                heap,
+                "length",
+                Value::Number(NumberValue::from_i32(0)),
+            );
+            return Ok(Value::Undefined);
+        }
+        // Walk pre-shift present own indices in ascending order. The
+        // post-shift state is the same set with each index decremented
+        // by 1 (and the element at index 0 returned). Indices that
+        // were present pre-shift but whose decremented form clashes
+        // with nothing post-shift have their original key deleted to
+        // match HasProperty results.
+        let entries = array_like_present_entries(args.receiver, heap_ref)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        let pre_present: std::collections::BTreeSet<usize> =
+            entries.iter().map(|(i, _)| *i).collect();
+        let heap = &mut *args.gc_heap;
+        let mut first: Option<Value> = None;
+        let mut post_present: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+        for (i, v) in &entries {
+            if *i == 0 {
+                first = Some(v.clone());
+                continue;
+            }
+            if *i < len {
+                let new_idx = *i - 1;
+                let new_key = new_idx.to_string();
+                crate::object::set(*obj, heap, &new_key, v.clone());
+                post_present.insert(new_idx);
             }
         }
-    }))
+        // Pre-present indices whose shifted twin isn't being written
+        // need their original slot deleted. Walk pre_present (size
+        // proportional to actual present count, never `len`).
+        for &i in &pre_present {
+            // The shift writes to (i - 1) for i >= 1. Any pre-present
+            // i that doesn't appear in post_present needs deletion at
+            // its original index.
+            if !post_present.contains(&i) {
+                let _ = crate::object::delete(*obj, heap, &i.to_string());
+            }
+        }
+        // Always remove the trailing slot — even if it wasn't present,
+        // delete is idempotent.
+        let _ = crate::object::delete(*obj, heap, &(len - 1).to_string());
+        crate::object::set(
+            *obj,
+            heap,
+            "length",
+            Value::Number(NumberValue::from_f64((len - 1) as f64)),
+        );
+        return Ok(first.unwrap_or(Value::Undefined));
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -228,33 +349,78 @@ fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let len = array::len(arr, &*args.gc_heap);
+    // §23.1.3.28 — generic over array-likes via ToObject(this) +
+    // LengthOfArrayLike. The dense `Value::Array` path stays on the
+    // contiguous slice copy; non-array receivers walk present indexed
+    // own keys and materialise undefined for absent positions inside
+    // the requested range (matching `HasProperty` + `Get` semantics).
+    let heap = &*args.gc_heap;
+    if let Value::Array(arr) = args.receiver {
+        let len = array::len(*arr, heap);
+        let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
+        let end_default = len as i64;
+        let end_raw = arg_signed_index(args, 1, end_default)?;
+        let end = clamp_index(end_raw, len);
+        let slice: Vec<Value> = array::with_elements(*arr, heap, |elements| {
+            if start >= end {
+                Vec::new()
+            } else {
+                elements[start..end].to_vec()
+            }
+        });
+        return Ok(Value::Array(args.array_from_elements_rooted(
+            slice.iter().cloned(),
+            &[],
+            &[slice.as_slice()],
+        )?));
+    }
+    let len = array_like_length(args.receiver, heap);
     let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
     let end_default = len as i64;
     let end_raw = arg_signed_index(args, 1, end_default)?;
     let end = clamp_index(end_raw, len);
-    let slice: Vec<Value> = array::with_elements(arr, &*args.gc_heap, |elements| {
-        if start >= end {
-            Vec::new()
-        } else {
-            elements[start..end].to_vec()
+    let entries = array_like_present_entries(args.receiver, heap)
+        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+    let slice_len = end.saturating_sub(start);
+    let mut out = vec![Value::Undefined; slice_len];
+    for (i, v) in entries {
+        if i < start || i >= end {
+            continue;
         }
-    });
+        out[i - start] = v;
+    }
     Ok(Value::Array(args.array_from_elements_rooted(
-        slice.iter().cloned(),
+        out.iter().cloned(),
         &[],
-        &[slice.as_slice()],
+        &[out.as_slice()],
     )?))
 }
 
 fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
+    // §23.1.3.2 — start with a copy of the receiver, then for each
+    // argument: if it's an Array (foundation: §22.1.2 IsConcatSpreadable
+    // short-circuits to IsArray), spread its dense elements; otherwise
+    // append as a single value. Array-like receivers spread via the
+    // sparse walker; arguments that are plain Objects are NOT spread
+    // (matches IsArray-only spread until full @@isConcatSpreadable
+    // wiring lands).
     let heap = &*args.gc_heap;
-    // Spec: result starts as a copy of the receiver; for each
-    // argument, if it's an array, append its elements; otherwise
-    // append the value itself.
-    let mut combined: Vec<Value> = array::with_elements(arr, heap, |elements| elements.to_vec());
+    let mut combined: Vec<Value> = match args.receiver {
+        Value::Array(arr) => array::with_elements(*arr, heap, |elements| elements.to_vec()),
+        Value::Object(_) => {
+            let len = array_like_length(args.receiver, heap);
+            let entries = array_like_present_entries(args.receiver, heap)
+                .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+            let mut out = vec![Value::Undefined; len];
+            for (i, v) in entries {
+                if i < len {
+                    out[i] = v;
+                }
+            }
+            out
+        }
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
     for v in args.args {
         match v {
             Value::Array(other) => {

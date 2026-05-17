@@ -1145,6 +1145,88 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
+/// §23.1.3.40 `Array.prototype.toSpliced(start, skipCount?, ...items)`
+/// — non-mutating splice. Returns a fresh dense Array with the spec
+/// `[len - skipCount + itemCount]` shape.
+/// <https://tc39.es/ecma262/#sec-array.prototype.tospliced>
+fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let heap = &*args.gc_heap;
+    let len = match args.receiver {
+        Value::Array(arr) => array::len(*arr, heap),
+        Value::Object(_) => array_like_length(args.receiver, heap),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
+    let skip_count = match args.args.get(1) {
+        None | Some(Value::Undefined) => len.saturating_sub(start),
+        Some(Value::Number(n)) => {
+            let raw = match n.as_smi() {
+                Some(v) => v as i64,
+                None => n.as_f64() as i64,
+            };
+            if raw < 0 {
+                0
+            } else if (raw as usize) > len.saturating_sub(start) {
+                len.saturating_sub(start)
+            } else {
+                raw as usize
+            }
+        }
+        _ => 0,
+    };
+    let item_count = args.args.len().saturating_sub(2);
+    let new_len = len - skip_count + item_count;
+    let mut out: Vec<Value> = vec![Value::Undefined; new_len];
+    // Materialise present source values into `src[0..len]`.
+    let mut src: Vec<Value> = vec![Value::Undefined; len];
+    match args.receiver {
+        Value::Array(arr) => {
+            array::with_elements(*arr, heap, |elements| {
+                for (i, slot) in src.iter_mut().enumerate() {
+                    if let Some(v) = elements.get(i) {
+                        *slot = match v {
+                            Value::Hole => Value::Undefined,
+                            other => other.clone(),
+                        };
+                    }
+                }
+            });
+        }
+        Value::Object(_) => {
+            let entries = array_like_present_entries(args.receiver, heap)
+                .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+            for (i, v) in entries {
+                if i < len {
+                    src[i] = v;
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    // Write the head [0, start).
+    for k in 0..start {
+        out[k] = src[k].clone();
+    }
+    // Write the inserts at [start, start+item_count).
+    for (k, v) in args.args.iter().skip(2).enumerate() {
+        out[start + k] = v.clone();
+    }
+    // Write the tail [start+skip_count, len) shifted to
+    // [start+item_count, new_len).
+    let mut dst = start + item_count;
+    let mut srcidx = start + skip_count;
+    while srcidx < len {
+        out[dst] = src[srcidx].clone();
+        dst += 1;
+        srcidx += 1;
+    }
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
+}
+
 /// §23.1.3.39 `Array.prototype.toReversed()` — non-mutating reverse.
 /// Returns a fresh dense Array.
 /// <https://tc39.es/ecma262/#sec-array.prototype.toreversed>
@@ -1260,6 +1342,7 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "toString"    / 0 => impl_to_string,
             "copyWithin"  / 2 => impl_copy_within,
             "toReversed"  / 0 => impl_to_reversed,
+            "toSpliced"   / 2 => impl_to_spliced,
             "with"        / 2 => impl_with,
             // §23.1.3.32 toLocaleString — foundation form delegates
             // to the default `join(",")` shape until per-locale
@@ -1299,6 +1382,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toString", 0, native_to_string),
     method("copyWithin", 2, native_copy_within),
     method("toReversed", 0, native_to_reversed),
+    method("toSpliced", 2, native_to_spliced),
     method("with", 2, native_with),
     method("toLocaleString", 0, native_to_locale_string),
 ];
@@ -1370,6 +1454,7 @@ native_array!(native_sort, "sort");
 native_array!(native_to_string, "toString");
 native_array!(native_copy_within, "copyWithin");
 native_array!(native_to_reversed, "toReversed");
+native_array!(native_to_spliced, "toSpliced");
 native_array!(native_with, "with");
 native_array!(native_to_locale_string, "toLocaleString");
 

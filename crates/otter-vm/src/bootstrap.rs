@@ -2072,7 +2072,7 @@ mod tests {
         // `copyWithin` / `toReversed` / `with` additions.
         assert_eq!(
             telemetry.native_functions_installed(),
-            110 + reflect::REFLECT_SPEC.methods.len(),
+            111 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

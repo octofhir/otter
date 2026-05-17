@@ -336,13 +336,31 @@ fn coerce_all(name: &'static str, args: &[Value]) -> Result<Vec<NumberValue>, Ma
             Value::Boolean(true) => NumberValue::Smi(1),
             Value::Boolean(false) | Value::Null => NumberValue::Smi(0),
             Value::Undefined => NumberValue::Double(f64::NAN),
-            _ => {
+            // §7.1.4 ToNumber on String → parse numeric literal,
+            // NaN on failure.
+            Value::String(s) => crate::number::parse::to_number_from_string(&s.to_lossy_string()),
+            // §7.1.4 ToNumber on BigInt / Symbol throws.
+            Value::BigInt(_) => {
                 return Err(MathError::BadArgument {
                     name,
                     index: idx as u16,
-                    reason: "must be a number",
+                    reason: "cannot convert a BigInt to a number",
                 });
             }
+            Value::Symbol(_) => {
+                return Err(MathError::BadArgument {
+                    name,
+                    index: idx as u16,
+                    reason: "cannot convert a Symbol to a number",
+                });
+            }
+            // Non-primitive operands should have been routed through
+            // `Interpreter::math_coerce_args` before reaching this
+            // table. Anything that lands here is a bytecode path
+            // that bypassed the coercion (or a residual type we
+            // don't model); surface a soft NaN so Math.max / Math.min
+            // still produce the §21.3.2.{24,25} step 3 NaN result.
+            _ => NumberValue::Double(f64::NAN),
         };
         out.push(n);
     }

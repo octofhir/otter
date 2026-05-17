@@ -36,7 +36,7 @@ impl Interpreter {
     pub(crate) fn run_static_call_operands(
         &mut self,
         op: Op,
-        _context: &ExecutionContext,
+        context: &ExecutionContext,
         frame: &mut Frame,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -45,7 +45,15 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
                     method_id::MathMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result = math::call(method, &args).map_err(math_to_vm_error)?;
+                // §21.3.2.{24,25} — `Math.max` / `Math.min` and every
+                // other unary / binary Math method call `ToNumber` on
+                // each arg, which runs `ToPrimitive(arg, "number")`
+                // for non-primitives. Pre-coerce here so the
+                // `coerce_all` table below sees primitives and the
+                // user-installed `@@toPrimitive` / `valueOf` /
+                // `toString` ladder fires per spec.
+                let coerced = self.math_coerce_args(context, args)?;
+                let result = math::call(method, &coerced).map_err(math_to_vm_error)?;
                 finish_static_call(frame, dst, result)
             }
             Op::JsonCall => {
@@ -107,6 +115,45 @@ impl Interpreter {
             }
             _ => Err(VmError::InvalidOperand),
         }
+    }
+
+    /// Run `ToNumber` on each Math arg by routing non-primitives
+    /// through `evaluate_to_primitive(arg, Number)`. Primitives pass
+    /// through untouched so the spec's BigInt / Symbol error arms
+    /// surface from inside `coerce_all` rather than this prelude.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-math.max>
+    /// - <https://tc39.es/ecma262/#sec-math.min>
+    fn math_coerce_args(
+        &mut self,
+        context: &ExecutionContext,
+        args: SmallVec<[Value; 4]>,
+    ) -> Result<SmallVec<[Value; 4]>, VmError> {
+        let mut out: SmallVec<[Value; 4]> = SmallVec::with_capacity(args.len());
+        for arg in args {
+            if matches!(
+                arg,
+                Value::Object(_)
+                    | Value::Array(_)
+                    | Value::Function { .. }
+                    | Value::Closure { .. }
+                    | Value::NativeFunction(_)
+                    | Value::BoundFunction(_)
+                    | Value::ClassConstructor(_)
+                    | Value::Proxy(_)
+                    | Value::RegExp(_)
+            ) {
+                out.push(self.evaluate_to_primitive(
+                    context,
+                    &arg,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )?);
+            } else {
+                out.push(arg);
+            }
+        }
+        Ok(out)
     }
 
     pub(crate) fn run_json_static_call_operands(

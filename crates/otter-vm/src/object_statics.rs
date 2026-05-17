@@ -111,6 +111,10 @@ pub static OBJECT_PROTOTYPE_METHODS: &[MethodSpec] = &[
         native_prototype_property_is_enumerable,
     ),
     method("isPrototypeOf", 1, native_prototype_is_prototype_of),
+    method("__defineGetter__", 2, native_prototype_define_getter),
+    method("__defineSetter__", 2, native_prototype_define_setter),
+    method("__lookupGetter__", 1, native_prototype_lookup_getter),
+    method("__lookupSetter__", 1, native_prototype_lookup_setter),
 ];
 
 const fn method(
@@ -1075,6 +1079,167 @@ fn native_prototype_is_prototype_of(
         _ => false,
     };
     Ok(Value::Boolean(result))
+}
+
+/// §B.2.2.2 `Object.prototype.__defineGetter__(P, getter)`.
+///
+/// 1. Let `O` be `? ToObject(this value)`.
+/// 2. If `IsCallable(getter)` is false, throw a TypeError.
+/// 3. Let `desc` be `PropertyDescriptor { [[Get]]: getter, [[Enumerable]]: true,
+///    [[Configurable]]: true }`.
+/// 4. Let `key` be `? ToPropertyKey(P)`.
+/// 5. Perform `? DefinePropertyOrThrow(O, key, desc)`.
+/// 6. Return undefined.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-object.prototype.__defineGetter__>
+fn native_prototype_define_getter(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    define_accessor_helper(ctx, args, /* is_setter */ false, "__defineGetter__")
+}
+
+/// §B.2.2.3 `Object.prototype.__defineSetter__(P, setter)`.
+///
+/// Mirror of [`native_prototype_define_getter`] for `[[Set]]`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-object.prototype.__defineSetter__>
+fn native_prototype_define_setter(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    define_accessor_helper(ctx, args, /* is_setter */ true, "__defineSetter__")
+}
+
+fn define_accessor_helper(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    is_setter: bool,
+    method_name: &'static str,
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let target = match &this_value {
+        Value::Object(o) => *o,
+        Value::Null | Value::Undefined => {
+            return Err(NativeError::TypeError {
+                name: method_name,
+                reason: "cannot convert null or undefined to object".to_string(),
+            });
+        }
+        _ => {
+            // §7.1.18 ToObject — primitives wrap. The accessor lands
+            // on the transient wrapper which is discarded once the
+            // call returns, mirroring V8/JSC. Tests against
+            // Object.prototype.__defineGetter__ use plain objects.
+            return Ok(Value::Undefined);
+        }
+    };
+    let callable = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if !crate::is_callable_value(&callable) {
+        return Err(NativeError::TypeError {
+            name: method_name,
+            reason: "argument is not a function".to_string(),
+        });
+    }
+    let key =
+        expect_property_key(args.first()).map_err(|err| object_native_error(method_name, err))?;
+    let desc = if is_setter {
+        PropertyDescriptor::accessor(None, Some(callable), true, true)
+    } else {
+        PropertyDescriptor::accessor(Some(callable), None, true, true)
+    };
+    let ok = match key {
+        PropertyKey::String(name) => {
+            crate::object::define_own_property(target, ctx.heap_mut(), &name, desc)
+        }
+        PropertyKey::Symbol(sym) => {
+            crate::object::define_own_symbol_property(target, ctx.heap_mut(), &sym, desc)
+        }
+    };
+    if !ok {
+        return Err(NativeError::TypeError {
+            name: method_name,
+            reason: "cannot redefine property".to_string(),
+        });
+    }
+    Ok(Value::Undefined)
+}
+
+/// §B.2.2.4 `Object.prototype.__lookupGetter__(P)`.
+///
+/// 1. Let `O` be `? ToObject(this value)`.
+/// 2. Let `key` be `? ToPropertyKey(P)`.
+/// 3. Repeat:
+///    a. Let `desc` be `? O.[[GetOwnProperty]](key)`.
+///    b. If `desc` is not undefined, then
+///       i. If `IsAccessorDescriptor(desc)` is true, return `desc.[[Get]]`.
+///       ii. Return undefined.
+///    c. Let `O` be `? O.[[GetPrototypeOf]]()`.
+///    d. If `O` is null, return undefined.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-object.prototype.__lookupGetter__>
+fn native_prototype_lookup_getter(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    lookup_accessor_helper(
+        ctx,
+        args,
+        /* lookup_setter */ false,
+        "__lookupGetter__",
+    )
+}
+
+/// §B.2.2.5 `Object.prototype.__lookupSetter__(P)`. Mirror for `[[Set]]`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-object.prototype.__lookupSetter__>
+fn native_prototype_lookup_setter(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    lookup_accessor_helper(ctx, args, /* lookup_setter */ true, "__lookupSetter__")
+}
+
+fn lookup_accessor_helper(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    lookup_setter: bool,
+    method_name: &'static str,
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let mut current = match this_value {
+        Value::Object(o) => Some(o),
+        Value::Null | Value::Undefined => {
+            return Err(NativeError::TypeError {
+                name: method_name,
+                reason: "cannot convert null or undefined to object".to_string(),
+            });
+        }
+        _ => return Ok(Value::Undefined),
+    };
+    let key =
+        expect_property_key(args.first()).map_err(|err| object_native_error(method_name, err))?;
+    while let Some(obj) = current {
+        let lookup = match &key {
+            PropertyKey::String(name) => crate::object::lookup_own(obj, ctx.heap(), name),
+            PropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(obj, ctx.heap(), sym),
+        };
+        match lookup {
+            PropertyLookup::Accessor { getter, setter, .. } => {
+                let value = if lookup_setter { setter } else { getter };
+                return Ok(value.unwrap_or(Value::Undefined));
+            }
+            PropertyLookup::Data { .. } => return Ok(Value::Undefined),
+            PropertyLookup::Absent => {
+                current = crate::object::prototype(obj, ctx.heap());
+            }
+        }
+    }
+    Ok(Value::Undefined)
 }
 
 fn value_has_prototype_in_chain(

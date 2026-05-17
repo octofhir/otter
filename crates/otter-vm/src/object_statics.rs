@@ -364,19 +364,51 @@ fn native_from_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result
                 crate::array::with_elements(arr, ctx.heap(), |elements| elements.to_vec());
             for entry in snapshot {
                 let (key, value) = read_entry_pair(ctx, &entry)?;
-                let key_str = property_key_from_value(&key)?;
-                crate::object::set(result, ctx.heap_mut(), &key_str, value);
+                set_from_entries_key(result, &key, value, ctx)?;
             }
         }
         Value::Map(map) => {
             for (key, value) in crate::collections::map_entries(map, ctx.heap()) {
-                let key_str = property_key_from_value(&key)?;
-                crate::object::set(result, ctx.heap_mut(), &key_str, value);
+                set_from_entries_key(result, &key, value, ctx)?;
             }
         }
         _ => return Err(VmError::TypeMismatch),
     }
     Ok(Value::Object(result))
+}
+
+/// §20.1.2.7 step 5.b.iii — `CreateDataPropertyOrThrow(obj, key, value)`.
+/// Supports both string-keyed and Symbol-keyed entry pairs so
+/// `Object.fromEntries([[Symbol(), v]])` round-trips per
+/// `built-ins/Object/fromEntries/supports-symbols.js`.
+fn set_from_entries_key(
+    target: crate::object::JsObject,
+    key: &Value,
+    value: Value,
+    ctx: &mut NativeCtx<'_>,
+) -> Result<(), VmError> {
+    set_from_entries_key_heap(target, key, value, ctx.heap_mut())
+}
+
+/// Heap-only variant of [`set_from_entries_key`] used by the
+/// context-less `object_statics::call` fallback path.
+fn set_from_entries_key_heap(
+    target: crate::object::JsObject,
+    key: &Value,
+    value: Value,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(), VmError> {
+    match key {
+        Value::Symbol(sym) => {
+            crate::object::set_symbol(target, heap, sym.clone(), value);
+            Ok(())
+        }
+        _ => {
+            let key_str = property_key_from_value(key)?;
+            crate::object::set(target, heap, &key_str, value);
+            Ok(())
+        }
+    }
 }
 
 /// §20.1.2.7 step 5.b — read indices `"0"` and `"1"` from an entry
@@ -1652,14 +1684,12 @@ pub fn call(
                         crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
                     for entry in snapshot {
                         let (key, value) = read_entry_pair_heap(&entry, gc_heap, string_heap)?;
-                        let key_str = property_key_from_value(&key)?;
-                        crate::object::set(result, gc_heap, &key_str, value);
+                        set_from_entries_key_heap(result, &key, value, gc_heap)?;
                     }
                 }
                 Value::Map(m) => {
                     for (key, value) in crate::collections::map_entries(m, gc_heap) {
-                        let key_str = property_key_from_value(&key)?;
-                        crate::object::set(result, gc_heap, &key_str, value);
+                        set_from_entries_key_heap(result, &key, value, gc_heap)?;
                     }
                 }
                 _ => return Err(VmError::TypeMismatch),

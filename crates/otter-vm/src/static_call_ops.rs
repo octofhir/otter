@@ -1071,14 +1071,38 @@ impl Interpreter {
                                 }
                                 _ => return Err(VmError::TypeMismatch),
                             };
-                            let key_str = object_static_property_key_from_value(&key)?;
-                            object::set(result, &mut self.gc_heap, &key_str, value);
+                            match &key {
+                                Value::Symbol(sym) => {
+                                    object::set_symbol(
+                                        result,
+                                        &mut self.gc_heap,
+                                        sym.clone(),
+                                        value,
+                                    );
+                                }
+                                _ => {
+                                    let key_str = object_static_property_key_from_value(&key)?;
+                                    object::set(result, &mut self.gc_heap, &key_str, value);
+                                }
+                            }
                         }
                     }
                     Value::Map(map) => {
                         for (key, value) in collections::map_entries(map, self.gc_heap()) {
-                            let key_str = object_static_property_key_from_value(&key)?;
-                            object::set(result, &mut self.gc_heap, &key_str, value);
+                            match &key {
+                                Value::Symbol(sym) => {
+                                    object::set_symbol(
+                                        result,
+                                        &mut self.gc_heap,
+                                        sym.clone(),
+                                        value,
+                                    );
+                                }
+                                _ => {
+                                    let key_str = object_static_property_key_from_value(&key)?;
+                                    object::set(result, &mut self.gc_heap, &key_str, value);
+                                }
+                            }
                         }
                     }
                     _ => return Err(VmError::TypeMismatch),

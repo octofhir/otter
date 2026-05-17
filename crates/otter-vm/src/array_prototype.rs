@@ -1951,16 +1951,13 @@ fn array_callback_native_dispatch(
                 // raw value is appended.
                 match result {
                     Value::Array(inner) => {
-                        let inner_vals: Vec<Value> = crate::array::with_elements(
-                            inner,
-                            interp.gc_heap(),
-                            |els| {
+                        let inner_vals: Vec<Value> =
+                            crate::array::with_elements(inner, interp.gc_heap(), |els| {
                                 els.iter()
                                     .filter(|v| !matches!(v, Value::Hole))
                                     .cloned()
                                     .collect()
-                            },
-                        );
+                            });
                         for v in inner_vals {
                             out.push((out.len(), v));
                         }

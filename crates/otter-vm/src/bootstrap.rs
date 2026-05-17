@@ -1170,7 +1170,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
                 crate::number::NumberValue::from_f64(f)
             } else {
-                crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(&args[0]))
+                crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(
+                    &args[0],
+                ))
             }
         };
         if ctx.is_construct_call() {

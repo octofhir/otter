@@ -5224,10 +5224,7 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// shim that materialises a string iterator from the calling
 /// `this` value. Installed as the realm's iterator method per
 /// §22.1.3.34.
-fn string_proto_iterator(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
+fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let string = match ctx.this_value() {
         Value::String(s) => s.clone(),
         Value::Object(obj) => match crate::object::string_data(*obj, ctx.heap()) {

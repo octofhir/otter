@@ -813,10 +813,8 @@ impl Interpreter {
     ) -> Vec<String> {
         let mut keys = Vec::new();
         let is_arrow = context.function_is_arrow(function_id);
-        let deleted = |key: &'static str| {
-            self.function_deleted_metadata
-                .contains(&(function_id, key))
-        };
+        let deleted =
+            |key: &'static str| self.function_deleted_metadata.contains(&(function_id, key));
         if !deleted("length") {
             keys.push("length".to_string());
         }
@@ -1031,11 +1029,13 @@ impl Interpreter {
                 // descriptor-table-driven enumerations elsewhere, so
                 // route per-shape here.
                 let names: Vec<String> = match &target {
-                    Value::Function { function_id } | Value::Closure { function_id, .. } => self
-                        .ordinary_function_own_property_keys(context, *function_id),
-                    Value::NativeFunction(native) => {
-                        native.own_property_keys(&self.gc_heap).into_iter().collect()
+                    Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                        self.ordinary_function_own_property_keys(context, *function_id)
                     }
+                    Value::NativeFunction(native) => native
+                        .own_property_keys(&self.gc_heap)
+                        .into_iter()
+                        .collect(),
                     Value::BoundFunction(bound) => {
                         function_metadata::bound_own_property_keys(bound, &self.gc_heap)
                             .into_iter()

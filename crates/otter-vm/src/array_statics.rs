@@ -141,7 +141,10 @@ fn construct_and_fill(
 
 fn vm_to_native_array_static(name: &'static str, err: VmError) -> NativeError {
     match err {
-        VmError::Uncaught { value } => NativeError::Thrown { name, message: value },
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
         VmError::TypeError { message } => NativeError::TypeError {
             name,
             reason: message,

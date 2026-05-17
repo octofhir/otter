@@ -297,8 +297,7 @@ impl Interpreter {
             // `valueOf` / `toString`. Pre-coerce here before the
             // intrinsic so the spec ladder fires and Symbol / BigInt
             // surface the correct error class.
-            let mut small_args: SmallVec<[Value; 4]> =
-                arg_values.iter().cloned().collect();
+            let mut small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
             if matches!(&recv_value, Value::Number(_))
                 && matches!(&*name, "toFixed" | "toExponential" | "toPrecision")
             {
@@ -384,9 +383,7 @@ impl Interpreter {
             // when the receiver is a String primitive so user
             // `@@toPrimitive` / `valueOf` / `toString` fires per spec.
             let (string_int_coerce, string_str_coerce): (&[usize], &[usize]) = match &*name {
-                "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => {
-                    (&[1], &[0])
-                }
+                "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => (&[1], &[0]),
                 "slice" | "substring" | "substr" => (&[0, 1], &[]),
                 "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
                 "repeat" => (&[0], &[]),

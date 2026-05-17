@@ -393,9 +393,14 @@ impl Interpreter {
     /// `valueOf` / `toString` callables) and treat accessor hits as
     /// "no callable found" so the next stage runs.
     fn get_proto_string_for_to_primitive(&self, base: &Value, name: &str) -> Option<Value> {
-        let proto = match base {
+        // §10.5.5 [[Get]] on a trap-less Proxy falls through to the
+        // target. Unwrap proxy chains so `ToPrimitive(new Proxy(fn,
+        // {}))` walks Function.prototype just like `ToPrimitive(fn)`.
+        let unwrapped = self.unwrap_trapless_proxy(base);
+        let effective = unwrapped.as_ref().unwrap_or(base);
+        let proto = match effective {
             Value::Object(o) => Some(*o),
-            _ => self.intrinsic_prototype_object_for(base),
+            other => self.intrinsic_prototype_object_for(other),
         };
         proto.and_then(|o| object::get(o, &self.gc_heap, name))
     }
@@ -409,11 +414,36 @@ impl Interpreter {
         base: &Value,
         sym: &symbol::JsSymbol,
     ) -> Option<Value> {
-        let proto = match base {
+        let unwrapped = self.unwrap_trapless_proxy(base);
+        let effective = unwrapped.as_ref().unwrap_or(base);
+        let proto = match effective {
             Value::Object(o) => Some(*o),
-            _ => self.intrinsic_prototype_object_for(base),
+            other => self.intrinsic_prototype_object_for(other),
         };
         proto.and_then(|o| object::get_symbol(o, &self.gc_heap, sym))
+    }
+
+    /// Walk a Proxy chain through trap-less handlers and return the
+    /// underlying target, or `None` if `base` is not a Proxy / the
+    /// chain encounters a handler with a `get` trap (where spec
+    /// behaviour requires actually invoking the trap — handled at
+    /// the call site).
+    fn unwrap_trapless_proxy(&self, base: &Value) -> Option<Value> {
+        let mut current = base.clone();
+        let mut unwrapped = false;
+        while let Value::Proxy(p) = &current {
+            if p.is_revoked() {
+                return None;
+            }
+            let handler = p.handler();
+            match object::get(handler, &self.gc_heap, "get") {
+                Some(Value::Undefined) | None => {}
+                _ => return None,
+            }
+            current = p.target();
+            unwrapped = true;
+        }
+        if unwrapped { Some(current) } else { None }
     }
 
     /// Run a single stage of the §7.1.1 / §7.1.1.1 ladder, falling

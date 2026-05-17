@@ -272,58 +272,56 @@ fn native_number_method(
     // ToPrimitive(number). Pre-coerce here so the intrinsic table
     // sees a primitive and surfaces RangeError / OK in line with
     // the spec ladder.
-    let coerced: smallvec::SmallVec<[Value; 4]> = if matches!(
-        name,
-        "toFixed" | "toExponential" | "toPrecision"
-    ) {
-        let exec = ctx.execution_context().cloned();
-        let mut out: smallvec::SmallVec<[Value; 4]> =
-            smallvec::SmallVec::with_capacity(args.len());
-        for arg in args {
-            if matches!(
-                arg,
-                Value::Object(_)
-                    | Value::Array(_)
-                    | Value::Function { .. }
-                    | Value::Closure { .. }
-                    | Value::NativeFunction(_)
-                    | Value::BoundFunction(_)
-                    | Value::ClassConstructor(_)
-                    | Value::Proxy(_)
-                    | Value::RegExp(_)
-            ) {
-                let Some(exec) = &exec else {
-                    out.push(arg.clone());
-                    continue;
-                };
-                let interp = ctx.interp_mut();
-                match interp.evaluate_to_primitive(
-                    exec,
+    let coerced: smallvec::SmallVec<[Value; 4]> =
+        if matches!(name, "toFixed" | "toExponential" | "toPrecision") {
+            let exec = ctx.execution_context().cloned();
+            let mut out: smallvec::SmallVec<[Value; 4]> =
+                smallvec::SmallVec::with_capacity(args.len());
+            for arg in args {
+                if matches!(
                     arg,
-                    crate::abstract_ops::ToPrimitiveHint::Number,
+                    Value::Object(_)
+                        | Value::Array(_)
+                        | Value::Function { .. }
+                        | Value::Closure { .. }
+                        | Value::NativeFunction(_)
+                        | Value::BoundFunction(_)
+                        | Value::ClassConstructor(_)
+                        | Value::Proxy(_)
+                        | Value::RegExp(_)
                 ) {
-                    Ok(primitive) => out.push(primitive),
-                    Err(crate::VmError::Uncaught { value }) => {
-                        return Err(NativeError::Thrown {
-                            name,
-                            message: value,
-                        });
+                    let Some(exec) = &exec else {
+                        out.push(arg.clone());
+                        continue;
+                    };
+                    let interp = ctx.interp_mut();
+                    match interp.evaluate_to_primitive(
+                        exec,
+                        arg,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    ) {
+                        Ok(primitive) => out.push(primitive),
+                        Err(crate::VmError::Uncaught { value }) => {
+                            return Err(NativeError::Thrown {
+                                name,
+                                message: value,
+                            });
+                        }
+                        Err(err) => {
+                            return Err(NativeError::TypeError {
+                                name,
+                                reason: err.to_string(),
+                            });
+                        }
                     }
-                    Err(err) => {
-                        return Err(NativeError::TypeError {
-                            name,
-                            reason: err.to_string(),
-                        });
-                    }
+                } else {
+                    out.push(arg.clone());
                 }
-            } else {
-                out.push(arg.clone());
             }
-        }
-        out
-    } else {
-        args.iter().cloned().collect()
-    };
+            out
+        } else {
+            args.iter().cloned().collect()
+        };
     let (string_heap, allocation_roots) = {
         let interp = ctx.interp_mut();
         (interp.string_heap_clone(), interp.collect_runtime_roots())

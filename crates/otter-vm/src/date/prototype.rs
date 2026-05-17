@@ -596,10 +596,7 @@ date_prototype_methods!(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-date.prototype.tojson>
 /// - <https://tc39.es/ecma262/#sec-invoke>
-fn date_prototype_to_json(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
+fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "Date.prototype.toJSON";
     let receiver = ctx.this_value().clone();
     // §7.1.18 ToObject(undefined / null) → TypeError.

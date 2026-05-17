@@ -363,8 +363,7 @@ impl Interpreter {
                 let result = self.do_object_assign(context, stack, &args)?;
                 return finish_static_call(&mut stack[top_idx], dst, result);
             }
-            method_id::ObjectMethod::GetOwnPropertyDescriptor
-            | method_id::ObjectMethod::HasOwn => {
+            method_id::ObjectMethod::GetOwnPropertyDescriptor | method_id::ObjectMethod::HasOwn => {
                 // §20.1.2.10 / §20.1.2.13 step 2: `key = ? ToPropertyKey(P)`.
                 // The ToPrimitive ladder may invoke user
                 // `Symbol.toPrimitive` / `toString` / `valueOf`, so
@@ -435,7 +434,9 @@ impl Interpreter {
             self.try_proxy_object_static_call(context, Some(stack), method, &args)?
         {
             result
-        } else if let Some(result) = self.object_static_call_stack_rooted(context, stack, method, &args)? {
+        } else if let Some(result) =
+            self.object_static_call_stack_rooted(context, stack, method, &args)?
+        {
             result
         } else {
             object_statics::call(method, &args, &self.string_heap, &mut self.gc_heap)?
@@ -568,15 +569,12 @@ impl Interpreter {
                 // properties surface, then each value is read with
                 // observable `[[Get]]` semantics (accessors fire).
                 Value::RegExp(_) => {
-                    let keys = self
-                        .enumerable_own_string_keys_for_value(context, props_arg.clone(), 0)?;
+                    let keys =
+                        self.enumerable_own_string_keys_for_value(context, props_arg.clone(), 0)?;
                     let mut out = Vec::with_capacity(keys.len());
                     for key in keys {
-                        let value = self.get_property_value_for_call(
-                            context,
-                            props_arg.clone(),
-                            &key,
-                        )?;
+                        let value =
+                            self.get_property_value_for_call(context, props_arg.clone(), &key)?;
                         out.push((key, value));
                     }
                     out
@@ -588,11 +586,8 @@ impl Interpreter {
                     );
                     let mut out = Vec::with_capacity(names.len());
                     for key in names {
-                        let value = self.get_property_value_for_call(
-                            context,
-                            props_arg.clone(),
-                            &key,
-                        )?;
+                        let value =
+                            self.get_property_value_for_call(context, props_arg.clone(), &key)?;
                         out.push((key, value));
                     }
                     out
@@ -982,11 +977,13 @@ impl Interpreter {
                     // enumerable keys come from
                     // [`Interpreter::enumerable_own_string_keys_for_value`]
                     // and per-key values from `get_property_value_for_call`.
-                    Some(target @ (Value::Function { .. }
-                    | Value::Closure { .. }
-                    | Value::NativeFunction(_)
-                    | Value::BoundFunction(_)
-                    | Value::ClassConstructor(_))) => {
+                    Some(
+                        target @ (Value::Function { .. }
+                        | Value::Closure { .. }
+                        | Value::NativeFunction(_)
+                        | Value::BoundFunction(_)
+                        | Value::ClassConstructor(_)),
+                    ) => {
                         let target_value = target.clone();
                         let keys = self.enumerable_own_string_keys_for_value(
                             context,
@@ -1276,8 +1273,8 @@ impl Interpreter {
                         let proxy_value = Value::Proxy(proxy.clone());
                         let result_root = Value::Object(result);
                         let string_heap = self.string_heap.clone();
-                        let trap_keys = self
-                            .own_property_keys_value(context, &proxy_value, &string_heap)?;
+                        let trap_keys =
+                            self.own_property_keys_value(context, &proxy_value, &string_heap)?;
                         for key in trap_keys {
                             let vm_key = match &key {
                                 Value::String(s) => {
@@ -1294,7 +1291,7 @@ impl Interpreter {
                                     &vm_key,
                                     0,
                                 )?;
-                                let Some(desc) = desc else {
+                            let Some(desc) = desc else {
                                 continue;
                             };
                             let desc_obj = self.descriptor_to_object_stack_rooted(

@@ -81,10 +81,7 @@ pub fn install_date_well_knowns_post_bootstrap(
 /// 4. Else if `hint` is `"number"`, let `tryFirst` be `"number"`.
 /// 5. Else throw **TypeError**.
 /// 6. Return `? OrdinaryToPrimitive(O, tryFirst)`.
-fn date_proto_to_primitive(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
+fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "Date.prototype[Symbol.toPrimitive]";
     let receiver = ctx.this_value().clone();
     if !matches!(receiver, Value::Object(_)) {

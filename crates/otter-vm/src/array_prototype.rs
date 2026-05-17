@@ -874,50 +874,177 @@ fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 /// §23.1.3.31 `Array.prototype.splice(start, deleteCount?, ...items)`.
 /// Mutates the receiver in place; returns the removed elements.
+/// Generic over array-likes; Object receivers use a sparse-aware
+/// shift so pathological `length` values never trigger an `O(len)`
+/// walk.
 /// <https://tc39.es/ecma262/#sec-array.prototype.splice>
 fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let len = array::len(arr, &*args.gc_heap);
-    let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
-    // §23.1.3.31 step 6 — when `deleteCount` is omitted (foundation
-    // accepts `undefined`), splice removes through the tail.
-    let delete_count = match args.args.get(1) {
-        None | Some(Value::Undefined) => len.saturating_sub(start),
-        Some(Value::Number(n)) => {
-            let raw = match n.as_smi() {
-                Some(v) => v as i64,
-                None => n.as_f64() as i64,
-            };
-            if raw < 0 {
-                0
-            } else if (raw as usize) > len.saturating_sub(start) {
-                len.saturating_sub(start)
-            } else {
-                raw as usize
+    if let Value::Array(arr) = args.receiver {
+        let len = array::len(*arr, &*args.gc_heap);
+        let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
+        let delete_count = match args.args.get(1) {
+            None | Some(Value::Undefined) => len.saturating_sub(start),
+            Some(Value::Number(n)) => {
+                let raw = match n.as_smi() {
+                    Some(v) => v as i64,
+                    None => n.as_f64() as i64,
+                };
+                if raw < 0 {
+                    0
+                } else if (raw as usize) > len.saturating_sub(start) {
+                    len.saturating_sub(start)
+                } else {
+                    raw as usize
+                }
+            }
+            _ => 0,
+        };
+        let inserts: Vec<Value> = args.args.iter().skip(2).cloned().collect();
+        let heap = &mut *args.gc_heap;
+        let removed = array::with_elements_mut(*arr, heap, |elements| {
+            let mut removed: Vec<Value> = Vec::with_capacity(delete_count);
+            for _ in 0..delete_count {
+                removed.push(elements.remove(start));
+            }
+            for (i, v) in inserts.into_iter().enumerate() {
+                elements.insert(start + i, v);
+            }
+            removed
+        });
+        return Ok(Value::Array(args.array_from_elements_rooted(
+            removed.iter().cloned(),
+            &[],
+            &[removed.as_slice()],
+        )?));
+    }
+    if let Value::Object(obj) = args.receiver {
+        let heap_ref = &*args.gc_heap;
+        let len = read_array_like_length(*obj, heap_ref);
+        let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
+        let delete_count = match args.args.get(1) {
+            None | Some(Value::Undefined) => len.saturating_sub(start),
+            Some(Value::Number(n)) => {
+                let raw = match n.as_smi() {
+                    Some(v) => v as i64,
+                    None => n.as_f64() as i64,
+                };
+                if raw < 0 {
+                    0
+                } else if (raw as usize) > len.saturating_sub(start) {
+                    len.saturating_sub(start)
+                } else {
+                    raw as usize
+                }
+            }
+            _ => 0,
+        };
+        let item_count = args.args.len().saturating_sub(2);
+        let inserts: Vec<Value> = args.args.iter().skip(2).cloned().collect();
+        // Pre-shift present indices.
+        let entries = array_like_present_entries(args.receiver, heap_ref)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        let pre_present: std::collections::BTreeSet<usize> =
+            entries.iter().map(|(i, _)| *i).collect();
+        // Snapshot the deleted region so we can return it.
+        let mut removed: Vec<Value> = vec![Value::Undefined; delete_count];
+        for (i, v) in &entries {
+            if *i >= start && *i < start + delete_count {
+                removed[*i - start] = v.clone();
             }
         }
-        _ => 0,
-    };
-    let inserts: Vec<Value> = args.args.iter().skip(2).cloned().collect();
-    // `SmallVec` lacks a `splice` API — perform the equivalent by
-    // hand: drain the removed slice, then insert the new items at
-    // `start`.
-    let heap = &mut *args.gc_heap;
-    let removed = array::with_elements_mut(arr, heap, |elements| {
-        let mut removed: Vec<Value> = Vec::with_capacity(delete_count);
-        for _ in 0..delete_count {
-            removed.push(elements.remove(start));
+        let heap = &mut *args.gc_heap;
+        // Shift tail.
+        if item_count < delete_count {
+            // Shrink — walk present indices in [start+delete_count, len)
+            // ascending; new index = i - (delete_count - item_count).
+            let shift = delete_count - item_count;
+            for (i, v) in entries
+                .iter()
+                .filter(|(i, _)| *i >= start + delete_count && *i < len)
+            {
+                let new_idx = i - shift;
+                crate::object::set(*obj, heap, &new_idx.to_string(), v.clone());
+            }
+            // Delete pre-present positions that no longer hold a
+            // value. Post-present positions = {i - shift for i in
+            // pre_present where i >= start + delete_count} ∪
+            // {i for i in pre_present where i < start} ∪
+            // {start..start+item_count from inserts}.
+            let mut post_present: std::collections::BTreeSet<usize> =
+                std::collections::BTreeSet::new();
+            for &i in &pre_present {
+                if i < start {
+                    post_present.insert(i);
+                } else if i >= start + delete_count && i < len {
+                    post_present.insert(i - shift);
+                }
+            }
+            for k in 0..item_count {
+                post_present.insert(start + k);
+            }
+            for &i in &pre_present {
+                if !post_present.contains(&i) {
+                    let _ = crate::object::delete(*obj, heap, &i.to_string());
+                }
+            }
+        } else if item_count > delete_count {
+            // Grow — walk present indices in [start+delete_count, len)
+            // descending so writes don't clobber yet-to-relocate values.
+            let shift = item_count - delete_count;
+            let tail: Vec<(usize, Value)> = entries
+                .iter()
+                .filter(|(i, _)| *i >= start + delete_count && *i < len)
+                .map(|(i, v)| (*i, v.clone()))
+                .collect();
+            for (i, v) in tail.iter().rev() {
+                let new_idx = i + shift;
+                crate::object::set(*obj, heap, &new_idx.to_string(), v.clone());
+            }
+            let mut post_present: std::collections::BTreeSet<usize> =
+                std::collections::BTreeSet::new();
+            for &i in &pre_present {
+                if i < start {
+                    post_present.insert(i);
+                } else if i >= start + delete_count && i < len {
+                    post_present.insert(i + shift);
+                }
+            }
+            for k in 0..item_count {
+                post_present.insert(start + k);
+            }
+            for &i in &pre_present {
+                if !post_present.contains(&i) {
+                    let _ = crate::object::delete(*obj, heap, &i.to_string());
+                }
+            }
+        } else {
+            // item_count == delete_count — no tail shift needed.
+            // Pre-present indices in [start, start+delete_count) get
+            // overwritten by inserts (or kept if insert is absent).
+            // Nothing to delete unless start..start+delete_count had
+            // present positions that aren't being rewritten — but
+            // since item_count == delete_count, all of them are. So
+            // no deletes needed beyond the insert overwrite.
         }
-        for (i, v) in inserts.into_iter().enumerate() {
-            elements.insert(start + i, v);
+        // Write the new items.
+        for (k, v) in inserts.into_iter().enumerate() {
+            crate::object::set(*obj, heap, &(start + k).to_string(), v);
         }
-        removed
-    });
-    Ok(Value::Array(args.array_from_elements_rooted(
-        removed.iter().cloned(),
-        &[],
-        &[removed.as_slice()],
-    )?))
+        // Update length.
+        let new_len = len - delete_count + item_count;
+        crate::object::set(
+            *obj,
+            heap,
+            "length",
+            Value::Number(NumberValue::from_f64(new_len as f64)),
+        );
+        return Ok(Value::Array(args.array_from_elements_rooted(
+            removed.iter().cloned(),
+            &[],
+            &[removed.as_slice()],
+        )?));
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 /// §23.1.3.30 `Array.prototype.sort()` — default lexicographic

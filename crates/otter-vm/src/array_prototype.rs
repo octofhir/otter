@@ -1083,6 +1083,159 @@ fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     }
 }
 
+/// §23.1.3.5 `Array.prototype.copyWithin(target, start, end?)` —
+/// in-place block copy. The receiver itself is returned. Generic
+/// over array-likes via ToObject + LengthOfArrayLike.
+/// <https://tc39.es/ecma262/#sec-array.prototype.copywithin>
+fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let heap_ref = &*args.gc_heap;
+    let len = match args.receiver {
+        Value::Array(arr) => array::len(*arr, heap_ref),
+        Value::Object(_) => array_like_length(args.receiver, heap_ref),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let to_raw = arg_signed_index(args, 0, 0)?;
+    let from_raw = arg_signed_index(args, 1, 0)?;
+    let end_raw = arg_signed_index(args, 2, len as i64)?;
+    let to = clamp_index(to_raw, len);
+    let from = clamp_index(from_raw, len);
+    let end = clamp_index(end_raw, len);
+    let count = end.saturating_sub(from).min(len.saturating_sub(to));
+    if count == 0 {
+        return Ok(args.receiver.clone());
+    }
+    if let Value::Array(arr) = args.receiver {
+        let heap = &mut *args.gc_heap;
+        array::with_elements_mut(*arr, heap, |elements| {
+            // Snapshot source range — std::vec::Vec doesn't have
+            // `copy_within` for non-Copy types, so a transient
+            // buffer is the cleanest correct path.
+            let src: Vec<Value> = elements[from..from + count].to_vec();
+            for (i, v) in src.into_iter().enumerate() {
+                elements[to + i] = v;
+            }
+        });
+        return Ok(Value::Array(*arr));
+    }
+    if let Value::Object(obj) = args.receiver {
+        // Snapshot the source range using only present indices so
+        // pathological-sparse receivers don't trigger an
+        // `O(count)` HasProperty scan; afterwards write to `to..`,
+        // deleting positions whose source was absent.
+        let entries = array_like_present_entries(args.receiver, heap_ref)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        let mut src: Vec<Option<Value>> = vec![None; count];
+        for (i, v) in &entries {
+            if *i >= from && *i < from + count {
+                src[*i - from] = Some(v.clone());
+            }
+        }
+        let heap = &mut *args.gc_heap;
+        for (i, slot) in src.into_iter().enumerate() {
+            let key = (to + i).to_string();
+            match slot {
+                Some(v) => crate::object::set(*obj, heap, &key, v),
+                None => {
+                    let _ = crate::object::delete(*obj, heap, &key);
+                }
+            }
+        }
+        return Ok(args.receiver.clone());
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
+}
+
+/// §23.1.3.39 `Array.prototype.toReversed()` — non-mutating reverse.
+/// Returns a fresh dense Array.
+/// <https://tc39.es/ecma262/#sec-array.prototype.toreversed>
+fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let heap = &*args.gc_heap;
+    let len = match args.receiver {
+        Value::Array(arr) => array::len(*arr, heap),
+        Value::Object(_) => array_like_length(args.receiver, heap),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let mut out: Vec<Value> = vec![Value::Undefined; len];
+    if let Value::Array(arr) = args.receiver {
+        array::with_elements(*arr, heap, |elements| {
+            for (i, slot) in out.iter_mut().enumerate() {
+                if let Some(v) = elements.get(len - 1 - i) {
+                    *slot = match v {
+                        Value::Hole => Value::Undefined,
+                        other => other.clone(),
+                    };
+                }
+            }
+        });
+    } else if let Value::Object(_) = args.receiver {
+        let entries = array_like_present_entries(args.receiver, heap)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        for (i, v) in entries {
+            if i >= len {
+                continue;
+            }
+            out[len - 1 - i] = v;
+        }
+    }
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
+}
+
+/// §23.1.3.42 `Array.prototype.with(index, value)` — non-mutating
+/// element replacement at `index`. Returns a fresh dense Array.
+/// <https://tc39.es/ecma262/#sec-array.prototype.with>
+fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let heap = &*args.gc_heap;
+    let len = match args.receiver {
+        Value::Array(arr) => array::len(*arr, heap),
+        Value::Object(_) => array_like_length(args.receiver, heap),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let raw = arg_signed_index(args, 0, 0)?;
+    let actual = if raw < 0 { raw + len as i64 } else { raw };
+    if actual < 0 || (actual as usize) >= len {
+        return Err(IntrinsicError::OutOfRange {
+            index: 0,
+            reason: "index out of bounds for Array.prototype.with",
+        });
+    }
+    let replacement = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let actual = actual as usize;
+    let mut out: Vec<Value> = vec![Value::Undefined; len];
+    if let Value::Array(arr) = args.receiver {
+        array::with_elements(*arr, heap, |elements| {
+            for (i, slot) in out.iter_mut().enumerate() {
+                if i == actual {
+                    *slot = replacement.clone();
+                } else if let Some(v) = elements.get(i) {
+                    *slot = match v {
+                        Value::Hole => Value::Undefined,
+                        other => other.clone(),
+                    };
+                }
+            }
+        });
+    } else if let Value::Object(_) = args.receiver {
+        let entries = array_like_present_entries(args.receiver, heap)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        for (i, v) in entries {
+            if i >= len {
+                continue;
+            }
+            out[i] = v;
+        }
+        out[actual] = replacement;
+    }
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
+}
+
 /// Declarative `Array.prototype` table.
 pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
     std::sync::LazyLock::new(|| {
@@ -1105,6 +1258,9 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "splice"      / 2 => impl_splice,
             "sort"        / 1 => impl_sort_default,
             "toString"    / 0 => impl_to_string,
+            "copyWithin"  / 2 => impl_copy_within,
+            "toReversed"  / 0 => impl_to_reversed,
+            "with"        / 2 => impl_with,
         )
     });
 
@@ -1134,6 +1290,9 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("splice", 2, native_splice),
     method("sort", 1, native_sort),
     method("toString", 0, native_to_string),
+    method("copyWithin", 2, native_copy_within),
+    method("toReversed", 0, native_to_reversed),
+    method("with", 2, native_with),
 ];
 
 const fn method(
@@ -1201,6 +1360,9 @@ native_array!(native_flat, "flat");
 native_array!(native_splice, "splice");
 native_array!(native_sort, "sort");
 native_array!(native_to_string, "toString");
+native_array!(native_copy_within, "copyWithin");
+native_array!(native_to_reversed, "toReversed");
+native_array!(native_with, "with");
 
 #[cfg(test)]
 mod tests {

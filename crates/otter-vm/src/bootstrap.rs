@@ -2066,10 +2066,13 @@ mod tests {
         // `OBJECT_SPEC` namespace spec and therefore counted in
         // `native_functions_installed`. Date's static / prototype
         // methods are still installed via `ObjectBuilder::method_from_spec`
-        // and don't bump the namespace counter.
+        // and don't bump the namespace counter. Array entry uses an
+        // ad-hoc `record_installed_entry` branch that adds
+        // `ARRAY_PROTOTYPE_METHODS.len()`, which grew by 3 with the
+        // `copyWithin` / `toReversed` / `with` additions.
         assert_eq!(
             telemetry.native_functions_installed(),
-            106 + reflect::REFLECT_SPEC.methods.len(),
+            109 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

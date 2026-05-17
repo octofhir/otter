@@ -1379,6 +1379,85 @@ fn native_string_method(
         return native_string_replace_callable(name == "replaceAll", ctx, args);
     }
     let receiver = ctx.this_value().clone();
+    // §22.1.3.* String.prototype.* int / string arg coercion.
+    // Mirrors the `Op::CallMethodValue` String arm in
+    // `method_ops.rs` so `.call(...)` / `.apply(...)` invocations
+    // run the spec `ToIntegerOrInfinity` / `ToString` ladders on
+    // non-primitive operands and observe user `@@toPrimitive` /
+    // `valueOf` / `toString`.
+    let (string_int_coerce, string_str_coerce): (&[usize], &[usize]) = match name {
+        "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => (&[1], &[0]),
+        "slice" | "substring" | "substr" => (&[0, 1], &[]),
+        "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
+        "repeat" => (&[0], &[]),
+        "padStart" | "padEnd" => (&[0], &[1]),
+        "replace" | "replaceAll" => (&[], &[0]),
+        _ => (&[], &[]),
+    };
+    let coerced_args: smallvec::SmallVec<[Value; 4]> = if string_int_coerce.is_empty()
+        && string_str_coerce.is_empty()
+    {
+        args.iter().cloned().collect()
+    } else {
+        let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
+        if let Some(exec) = ctx.execution_context().cloned() {
+            let is_non_primitive = |v: &Value| {
+                matches!(
+                    v,
+                    Value::Object(_)
+                        | Value::Array(_)
+                        | Value::Function { .. }
+                        | Value::Closure { .. }
+                        | Value::NativeFunction(_)
+                        | Value::BoundFunction(_)
+                        | Value::ClassConstructor(_)
+                        | Value::Proxy(_)
+                        | Value::RegExp(_)
+                )
+            };
+            for &idx in string_int_coerce {
+                let Some(slot) = out.get_mut(idx) else {
+                    continue;
+                };
+                if !is_non_primitive(slot) {
+                    continue;
+                }
+                let interp = ctx.interp_mut();
+                let primitive = interp
+                    .evaluate_to_primitive(
+                        &exec,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                    .map_err(|e| NativeError::TypeError {
+                        name,
+                        reason: e.to_string(),
+                    })?;
+                *slot = primitive;
+            }
+            for &idx in string_str_coerce {
+                let Some(slot) = out.get_mut(idx) else {
+                    continue;
+                };
+                if !is_non_primitive(slot) {
+                    continue;
+                }
+                let interp = ctx.interp_mut();
+                let primitive = interp
+                    .evaluate_to_primitive(
+                        &exec,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )
+                    .map_err(|e| NativeError::TypeError {
+                        name,
+                        reason: e.to_string(),
+                    })?;
+                *slot = primitive;
+            }
+        }
+        out
+    };
     let (string_heap, allocation_roots) = {
         let interp = ctx.interp_mut();
         (interp.string_heap_clone(), interp.collect_runtime_roots())
@@ -1389,7 +1468,7 @@ fn native_string_method(
     })?;
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
-        args,
+        args: &coerced_args,
         string_heap: &string_heap,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),

@@ -377,6 +377,69 @@ impl Interpreter {
                     *slot = primitive;
                 }
             }
+            // §22.1.3.* String.prototype.* `position` / `start` /
+            // `end` args run `ToIntegerOrInfinity(arg)`; searchString
+            // operands run `ToString(arg)` which itself starts with
+            // `ToPrimitive(arg, "string")`. Pre-coerce both shapes
+            // when the receiver is a String primitive so user
+            // `@@toPrimitive` / `valueOf` / `toString` fires per spec.
+            let (string_int_coerce, string_str_coerce): (&[usize], &[usize]) = match &*name {
+                "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => {
+                    (&[1], &[0])
+                }
+                "slice" | "substring" | "substr" => (&[0, 1], &[]),
+                "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
+                "repeat" => (&[0], &[]),
+                "padStart" | "padEnd" => (&[0], &[1]),
+                "replace" | "replaceAll" => (&[], &[0]),
+                _ => (&[], &[]),
+            };
+            if matches!(&recv_value, Value::String(_))
+                && (!string_int_coerce.is_empty() || !string_str_coerce.is_empty())
+            {
+                let is_non_primitive = |v: &Value| {
+                    matches!(
+                        v,
+                        Value::Object(_)
+                            | Value::Array(_)
+                            | Value::Function { .. }
+                            | Value::Closure { .. }
+                            | Value::NativeFunction(_)
+                            | Value::BoundFunction(_)
+                            | Value::ClassConstructor(_)
+                            | Value::Proxy(_)
+                            | Value::RegExp(_)
+                    )
+                };
+                for &idx in string_int_coerce {
+                    let Some(slot) = small_args.get_mut(idx) else {
+                        continue;
+                    };
+                    if !is_non_primitive(slot) {
+                        continue;
+                    }
+                    let primitive = self.evaluate_to_primitive(
+                        context,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )?;
+                    *slot = primitive;
+                }
+                for &idx in string_str_coerce {
+                    let Some(slot) = small_args.get_mut(idx) else {
+                        continue;
+                    };
+                    if !is_non_primitive(slot) {
+                        continue;
+                    }
+                    let primitive = self.evaluate_to_primitive(
+                        context,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )?;
+                    *slot = primitive;
+                }
+            }
             let result = {
                 let string_heap = self.string_heap.clone();
                 let allocation_roots = self.collect_allocation_roots(stack);

@@ -3621,6 +3621,31 @@ fn compile_logical_assignment(
             );
             load
         }
+        AssignmentTarget::PrivateFieldExpression(m) => {
+            // §13.15.4 LogicalAssignment with a private-field target.
+            // Mangle the `#name` to its synthesised property key and
+            // route through ordinary load/store so the foundation
+            // doesn't pay for a dedicated `Op::LoadPrivate` slot.
+            let mangled =
+                cx.mangle_private(m.field.name.as_str())
+                    .ok_or(CompileError::Unsupported {
+                        node: "LogicalAssignment: private field outside class".to_string(),
+                        span,
+                    })?;
+            let obj_reg = compile_expr(cx, &m.object, span)?;
+            let name_idx = cx.intern_string_constant(&mangled);
+            let load = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(load),
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            load
+        }
         other => {
             return Err(CompileError::Unsupported {
                 node: format!("LogicalAssignment target ({other:?})"),
@@ -3775,6 +3800,30 @@ fn assign_to_target(
             let obj_reg = compile_expr(cx, &member.object, span)?;
             let key_reg = compile_expr(cx, &member.expression, span)?;
             cx.emit_store_element(obj_reg, key_reg, value_reg, span);
+            Ok(())
+        }
+        AssignmentTarget::PrivateFieldExpression(member) => {
+            // §13.15.4 LogicalAssignment store leg — mirror the
+            // synthesised property key used by the load leg above.
+            let mangled =
+                cx.mangle_private(member.field.name.as_str())
+                    .ok_or(CompileError::Unsupported {
+                        node: "PrivateFieldExpression assignment outside class".to_string(),
+                        span,
+                    })?;
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            let name_idx = cx.intern_string_constant(&mangled);
+            let scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(value_reg),
+                    Operand::Register(scratch),
+                ],
+                span,
+            );
             Ok(())
         }
         other => Err(CompileError::Unsupported {

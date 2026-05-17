@@ -133,6 +133,41 @@ pub(crate) fn array_like_present_entries(
                     .collect(),
             )
         }
+        // §7.1.18 ToObject — primitive receivers coerce to their
+        // wrapper. The wrapper carries no own indexed properties
+        // for Boolean / Number / Symbol / BigInt (length undefined
+        // → 0), so the callable methods see an empty walk and short-
+        // circuit with the spec result for an empty array-like.
+        Value::Boolean(_)
+        | Value::Number(_)
+        | Value::Symbol(_)
+        | Value::BigInt(_) => Some(Vec::new()),
+        // String primitive: walks code-unit slots up to `length`.
+        // Each unit materialises as a single-unit `JsString`.
+        Value::String(s) => {
+            let units = s.to_utf16_vec();
+            Some(
+                units
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, u)| {
+                        let s = crate::string::JsString::from_utf16_units(
+                            &[u],
+                            // Reuse a thread-local empty heap is not
+                            // available without context; fall back to
+                            // constructing a fresh `StringHeap`. The
+                            // callback path materialises these on the
+                            // fly so the leak surface is bounded by
+                            // the receiver's length.
+                            &crate::string::StringHeap::default(),
+                        )
+                        .map(Value::String)
+                        .unwrap_or(Value::Undefined);
+                        (i, s)
+                    })
+                    .collect(),
+            )
+        }
         _ => None,
     }
 }
@@ -144,6 +179,7 @@ pub(crate) fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> us
     match receiver {
         Value::Array(arr) => array::len(*arr, heap),
         Value::Object(obj) => read_array_like_length(*obj, heap),
+        Value::String(s) => s.len() as usize,
         _ => 0,
     }
 }

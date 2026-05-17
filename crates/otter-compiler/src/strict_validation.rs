@@ -27,9 +27,9 @@
 
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, Class, Expression, Function,
-    NumericLiteral, Program, SimpleAssignmentTarget, StringLiteral, UnaryExpression, UnaryOperator,
-    UpdateExpression, UpdateOperator,
+    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier, Class,
+    Expression, Function, NumericLiteral, Program, SimpleAssignmentTarget, StringLiteral,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_syntax::scope::ScopeFlags;
@@ -129,6 +129,35 @@ impl<'a> Visit<'a> for StrictValidator {
                 range: Some((it.span.start, it.span.end)),
                 help: Some(
                     "use the `0o` prefix for octal literals in strict mode code".to_string(),
+                ),
+            });
+        }
+    }
+
+    fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
+        // ECMA-262 §13.1.1 Static Semantics: Early Errors for
+        // BindingIdentifier — in strict mode code, the binding name
+        // must not be `eval` or `arguments` (§10.2.1, the strict-mode
+        // restriction repeated across §14.1.2, §14.7.4, §15.7.1,
+        // §15.10.1, etc.). One hook covers `var eval`, `let
+        // arguments`, `function eval() {}`, `class eval {}`, formal
+        // parameter `function f(eval) {}`, catch parameter `try {}
+        // catch (arguments) {}`, destructuring target names, etc.
+        if !self.is_strict() {
+            return;
+        }
+        let name = it.name.as_str();
+        if is_reserved_strict_assignment_target(name) {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_RESERVED_BINDING".to_string(),
+                message: format!(
+                    "SyntaxError: cannot bind name `{name}` in strict mode code \
+                     (§13.1.1 BindingIdentifier reserves `eval` and `arguments`)"
+                ),
+                range: Some((it.span.start, it.span.end)),
+                help: Some(
+                    "rename the binding; `eval` and `arguments` cannot be declared in strict code"
+                        .to_string(),
                 ),
             });
         }

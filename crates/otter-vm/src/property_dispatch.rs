@@ -678,6 +678,25 @@ impl Interpreter {
             {
                 make_array_iterator_factory(*arr, &mut self.gc_heap)?
             }
+            // Computed string-key access on Array exotic objects:
+            // `arr["0"]`, `arr["length"]`, `arr[i]` after `for (i in
+            // arr)` (where `i` is a string property key) must observe
+            // the spec's `Array` [[Get]] internal method — integer-
+            // index strings route to dense / sparse element storage,
+            // `length` returns the length, and anything else falls
+            // through to the named-property table plus the Array
+            // prototype chain (so `arr["push"]` resolves to
+            // `Array.prototype.push`). Without this arm the default
+            // branch demanded a numeric key and surfaced a bogus
+            // `TypeMismatch` for `for-in` body access.
+            // <https://tc39.es/ecma262/#sec-array-exotic-objects-get-p-receiver>
+            (Value::Array(arr), Value::String(key)) => {
+                let name = key.to_lossy_string();
+                match crate::array::get_named_property(*arr, &self.gc_heap, &name) {
+                    Some(v) => v,
+                    None => self.load_from_constructor_prototype(context, "Array", &recv, &name)?,
+                }
+            }
             // Computed string-key access on RegExp must observe the
             // same own/prototype lookup as `re.lastIndex` (member
             // access). Without this arm, `re["lastIndex"]` falls

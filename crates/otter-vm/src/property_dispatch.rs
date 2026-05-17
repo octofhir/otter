@@ -729,6 +729,47 @@ impl Interpreter {
             {
                 collections_prototype::make_set_iterator_factory(*s, &mut self.gc_heap)?
             }
+            // §7.1.18 ToObject — primitive receivers walk their
+            // wrapper prototype for both string- and symbol-keyed
+            // access. Mirrors V8 / JSC where `Symbol()[
+            // Symbol.toPrimitive]` resolves to
+            // `Symbol.prototype[Symbol.toPrimitive]` rather than
+            // throwing. The wrapper itself is not materialized; the
+            // primitive flows through as `this` to any subsequent
+            // call.
+            (
+                Value::Symbol(_)
+                | Value::Boolean(_)
+                | Value::Number(_)
+                | Value::BigInt(_),
+                Value::Symbol(_) | Value::String(_) | Value::Number(_),
+            ) => {
+                let ctor_name = match &recv {
+                    Value::Symbol(_) => "Symbol",
+                    Value::Boolean(_) => "Boolean",
+                    Value::Number(_) => "Number",
+                    Value::BigInt(_) => "BigInt",
+                    _ => unreachable!(),
+                };
+                let key = match &idx_value {
+                    Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+                    Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+                    Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
+                    _ => unreachable!(),
+                };
+                let proto = self.constructor_prototype_value(ctor_name)?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    Value::Undefined
+                } else {
+                    match self.ordinary_get_value(context, proto, recv.clone(), &key, 0)? {
+                        crate::VmGetOutcome::Value(v) => v,
+                        crate::VmGetOutcome::InvokeGetter { getter } => {
+                            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                            self.run_callable_sync(context, &getter, recv.clone(), args)?
+                        }
+                    }
+                }
+            }
             _ => {
                 let idx = match &idx_value {
                     Value::Number(n) => {

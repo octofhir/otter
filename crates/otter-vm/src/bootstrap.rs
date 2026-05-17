@@ -333,23 +333,23 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::ArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::SharedArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_data_view::Intrinsic),
-    typed_array_entry("Int8Array"),
-    typed_array_entry("Uint8Array"),
-    typed_array_entry("Uint8ClampedArray"),
-    typed_array_entry("Int16Array"),
-    typed_array_entry("Uint16Array"),
-    typed_array_entry("Int32Array"),
-    typed_array_entry("Uint32Array"),
-    typed_array_entry("Float32Array"),
-    typed_array_entry("Float64Array"),
-    typed_array_entry("BigInt64Array"),
-    typed_array_entry("BigUint64Array"),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Int8ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint8ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint8ClampedArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Int16ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint16ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Int32ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint32ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Float32ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::Float64ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::BigInt64ArrayIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::BigUint64ArrayIntrinsic),
     crate::bootstrap_entry!(crate::atomics::Intrinsic),
-    placeholder("Intl"),
-    placeholder("Temporal"),
-    placeholder("AggregateError"),
+    crate::bootstrap_entry!(crate::bootstrap::IntlIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap::TemporalIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap::AggregateErrorIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_weak_refs::FinalizationRegistryIntrinsic),
-    placeholder("Iterator"),
+    crate::bootstrap_entry!(crate::bootstrap::IteratorIntrinsic),
     crate::bootstrap_entry!(crate::console::Intrinsic),
     crate::bootstrap_entry!(crate::timers::Intrinsic),
 ];
@@ -425,27 +425,11 @@ fn build_global_this_impl(
     Ok(global)
 }
 
-const fn placeholder(name: &'static str) -> BootstrapEntry {
-    BootstrapEntry {
-        name,
-        feature: BootstrapFeatures::CORE,
-        install: install_placeholder,
-    }
-}
-
 /// Build a bootstrap entry for one of the 11 concrete TypedArray
 /// constructors. Routes to
 /// [`crate::bootstrap_typed_array::install_typed_array_entry`].
-const fn typed_array_entry(name: &'static str) -> BootstrapEntry {
-    BootstrapEntry {
-        name,
-        feature: BootstrapFeatures::CORE,
-        install: crate::bootstrap_typed_array::install_typed_array_entry,
-    }
-}
-
 fn install_placeholder(
-    entry: &BootstrapEntry,
+    name: &'static str,
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
@@ -454,7 +438,7 @@ fn install_placeholder(
     let placeholder_root = Value::Object(placeholder);
     let proto = alloc_object_with_value_roots(heap, &[&global_root, &placeholder_root])?;
     object::set(placeholder, heap, "prototype", Value::Object(proto));
-    define_global(global, heap, entry.name, Value::Object(placeholder));
+    define_global(global, heap, name, Value::Object(placeholder));
     Ok(())
 }
 
@@ -1705,6 +1689,48 @@ impl crate::intrinsic_install::BuiltinIntrinsic for FunctionIntrinsic {
     const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
         install_function(heap, global)
+    }
+}
+
+/// Placeholder `BuiltinIntrinsic` for `Intl` — empty object with a
+/// prototype slot. Real Intl integration ships separately.
+pub struct IntlIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for IntlIntrinsic {
+    const NAME: &'static str = "Intl";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_placeholder(Self::NAME, heap, global)
+    }
+}
+
+/// Placeholder `BuiltinIntrinsic` for `Temporal`.
+pub struct TemporalIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for TemporalIntrinsic {
+    const NAME: &'static str = "Temporal";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_placeholder(Self::NAME, heap, global)
+    }
+}
+
+/// Placeholder `BuiltinIntrinsic` for `AggregateError`.
+pub struct AggregateErrorIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for AggregateErrorIntrinsic {
+    const NAME: &'static str = "AggregateError";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_placeholder(Self::NAME, heap, global)
+    }
+}
+
+/// Placeholder `BuiltinIntrinsic` for `Iterator` (the ES2025
+/// constructor; iterator-helpers proposal not yet implemented).
+pub struct IteratorIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
+    const NAME: &'static str = "Iterator";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_placeholder(Self::NAME, heap, global)
     }
 }
 

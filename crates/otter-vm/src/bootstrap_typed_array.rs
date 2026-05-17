@@ -40,9 +40,7 @@ use smallvec::SmallVec;
 
 use crate::binary::typed_array::TypedArrayKind;
 use crate::binary::{dispatch, typed_array_prototype};
-use crate::bootstrap::{
-    BootstrapEntry, alloc_object_with_value_roots, native_constructor_static_with_value_roots,
-};
+use crate::bootstrap::{alloc_object_with_value_roots, native_constructor_static_with_value_roots};
 use crate::intrinsics::IntrinsicArgs;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::NativeCall;
@@ -92,11 +90,11 @@ const TYPED_ARRAY_CTORS: &[(&str, TypedArrayKind, crate::native_function::Native
     ("BigUint64Array", TypedArrayKind::BigUint64, ctor_biguint64),
 ];
 
-/// Entry point used by [`crate::bootstrap::BOOTSTRAP_ENTRIES`].
-/// Looks up the per-kind ctor for `entry.name` from the static
-/// table and routes to the shared install path.
+/// Entry point invoked by the per-kind `BuiltinIntrinsic` adapter.
+/// Looks up the per-kind ctor for `name` from the static table and
+/// routes to the shared install path.
 pub(crate) fn install_typed_array_entry(
-    entry: &BootstrapEntry,
+    name: &'static str,
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
@@ -104,9 +102,9 @@ pub(crate) fn install_typed_array_entry(
     // Look up this entry's kind + ctor fn from the static table.
     let (_, kind, ctor_call) = TYPED_ARRAY_CTORS
         .iter()
-        .find(|(name, _, _)| *name == entry.name)
+        .find(|(entry_name, _, _)| *entry_name == name)
         .copied()
-        .expect("entry name must match TYPED_ARRAY_CTORS");
+        .expect("name must match TYPED_ARRAY_CTORS");
 
     // Ensure %TypedArray%.prototype exists on the realm (allocated
     // lazily the first time we install a concrete TypedArray).
@@ -134,7 +132,7 @@ pub(crate) fn install_typed_array_entry(
 
     let ctor = native_constructor_static_with_value_roots(
         heap,
-        entry.name,
+        name,
         3,
         ctor_call,
         &[&global_root, &abstract_proto_root, &prototype_root],
@@ -162,7 +160,7 @@ pub(crate) fn install_typed_array_entry(
         PropertyDescriptor::data(ctor_root.clone(), true, false, true),
     );
 
-    crate::bootstrap::define_global_value(global, heap, entry.name, ctor_root);
+    crate::bootstrap::define_global_value(global, heap, name, ctor_root);
     Ok(())
 }
 
@@ -457,3 +455,45 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
         },
     }
 }
+
+// ---------------------------------------------------------------
+// BuiltinIntrinsic adapters — one zero-sized struct per TypedArray
+// variant.
+// ---------------------------------------------------------------
+
+/// Generate per-kind `BuiltinIntrinsic` adapter types. Each ZST
+/// pins its JS name and dispatches through
+/// [`install_typed_array_entry`].
+macro_rules! typed_array_intrinsic {
+    ($($ty:ident => $name:literal),* $(,)?) => {
+        $(
+            #[doc = concat!("`BuiltinIntrinsic` adapter for the `", $name, "` constructor.")]
+            pub struct $ty;
+            impl crate::intrinsic_install::BuiltinIntrinsic for $ty {
+                const NAME: &'static str = $name;
+                const FEATURE: crate::bootstrap::BootstrapFeatures =
+                    crate::bootstrap::BootstrapFeatures::CORE;
+                fn install(
+                    heap: &mut otter_gc::GcHeap,
+                    global: JsObject,
+                ) -> Result<(), JsSurfaceError> {
+                    install_typed_array_entry(Self::NAME, heap, global)
+                }
+            }
+        )*
+    };
+}
+
+typed_array_intrinsic!(
+    Int8ArrayIntrinsic         => "Int8Array",
+    Uint8ArrayIntrinsic        => "Uint8Array",
+    Uint8ClampedArrayIntrinsic => "Uint8ClampedArray",
+    Int16ArrayIntrinsic        => "Int16Array",
+    Uint16ArrayIntrinsic       => "Uint16Array",
+    Int32ArrayIntrinsic        => "Int32Array",
+    Uint32ArrayIntrinsic       => "Uint32Array",
+    Float32ArrayIntrinsic      => "Float32Array",
+    Float64ArrayIntrinsic      => "Float64Array",
+    BigInt64ArrayIntrinsic     => "BigInt64Array",
+    BigUint64ArrayIntrinsic    => "BigUint64Array",
+);

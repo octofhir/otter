@@ -792,7 +792,8 @@ impl Interpreter {
                 Value::Symbol(_)
                 | Value::Boolean(_)
                 | Value::Number(_)
-                | Value::BigInt(_),
+                | Value::BigInt(_)
+                | Value::String(_),
                 Value::Symbol(_) | Value::String(_) | Value::Number(_),
             ) => {
                 let ctor_name = match &recv {
@@ -800,6 +801,7 @@ impl Interpreter {
                     Value::Boolean(_) => "Boolean",
                     Value::Number(_) => "Number",
                     Value::BigInt(_) => "BigInt",
+                    Value::String(_) => "String",
                     _ => unreachable!(),
                 };
                 let key = match &idx_value {

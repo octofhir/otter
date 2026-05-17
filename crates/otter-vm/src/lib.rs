@@ -5220,6 +5220,78 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 ///   subsequent in-place mutations through the same `JsArray`,
 ///   matching real-engine `Array.prototype[Symbol.iterator]`
 ///   semantics.
+/// `String.prototype[Symbol.iterator]()` — receiver-dispatched
+/// shim that materialises a string iterator from the calling
+/// `this` value. Installed as the realm's iterator method per
+/// §22.1.3.34.
+fn string_proto_iterator(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let string = match ctx.this_value() {
+        Value::String(s) => s.clone(),
+        Value::Object(obj) => match crate::object::string_data(*obj, ctx.heap()) {
+            Some(s) => s,
+            None => {
+                return Err(NativeError::TypeError {
+                    name: "String.prototype[Symbol.iterator]",
+                    reason: "this is not a String".to_string(),
+                });
+            }
+        },
+        _ => {
+            return Err(NativeError::TypeError {
+                name: "String.prototype[Symbol.iterator]",
+                reason: "this is not a String".to_string(),
+            });
+        }
+    };
+    let state = IteratorState::String { string, index: 0 };
+    Ok(Value::Iterator(ctx.alloc_iterator_state(
+        state,
+        &[],
+        &[],
+    )?))
+}
+
+/// Install `String.prototype[Symbol.iterator]` per §22.1.3.34.
+pub(crate) fn install_string_iterator_post_bootstrap(
+    heap: &mut otter_gc::GcHeap,
+    global: crate::object::JsObject,
+    well_known: &symbol::WellKnownSymbols,
+) -> Result<(), crate::js_surface::JsSurfaceError> {
+    let Some(Value::Object(string_ctor)) = crate::object::get(global, heap, "String") else {
+        return Ok(());
+    };
+    let Some(Value::Object(prototype)) = crate::object::get(string_ctor, heap, "prototype") else {
+        return Ok(());
+    };
+    let global_root = Value::Object(global);
+    let prototype_root = Value::Object(prototype);
+    let getter = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "[Symbol.iterator]",
+        0,
+        string_proto_iterator,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| crate::js_surface::JsSurfaceError::OutOfMemory)?;
+    let sym = well_known.get(symbol::WellKnown::Iterator);
+    crate::object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::NativeFunction(getter)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    Ok(())
+}
+
 fn make_array_iterator_factory(
     array: JsArray,
     heap: &mut otter_gc::GcHeap,

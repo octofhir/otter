@@ -680,6 +680,59 @@ fn create_html(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-string.prototype.substr>
+
+/// §22.1.3.10 `String.prototype.isWellFormed()`. Returns `true` if
+/// every surrogate code unit is part of a valid pair.
+fn impl_is_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = receiver_string(args)?;
+    let units = recv.to_utf16_vec();
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..=0xDBFF).contains(&u) {
+            if i + 1 >= units.len() || !(0xDC00..=0xDFFF).contains(&units[i + 1]) {
+                return Ok(Value::Boolean(false));
+            }
+            i += 2;
+        } else if (0xDC00..=0xDFFF).contains(&u) {
+            return Ok(Value::Boolean(false));
+        } else {
+            i += 1;
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
+/// §22.1.3.11 `String.prototype.toWellFormed()`. Replaces every
+/// unpaired surrogate with `U+FFFD` (REPLACEMENT CHARACTER).
+fn impl_to_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = receiver_string(args)?;
+    let units = recv.to_utf16_vec();
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..=0xDBFF).contains(&u) {
+            if i + 1 < units.len() && (0xDC00..=0xDFFF).contains(&units[i + 1]) {
+                out.push(u);
+                out.push(units[i + 1]);
+                i += 2;
+                continue;
+            }
+            out.push(0xFFFD);
+        } else if (0xDC00..=0xDFFF).contains(&u) {
+            out.push(0xFFFD);
+        } else {
+            out.push(u);
+        }
+        i += 1;
+    }
+    Ok(Value::String(JsString::from_utf16_units(
+        &out,
+        args.string_heap,
+    )?))
+}
+
 fn impl_substr(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let size = recv.len() as i64;
@@ -1375,6 +1428,9 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             // route both through the same intrinsic impls.
             "trimLeft"      / 0 => impl_trim_start,
             "trimRight"     / 0 => impl_trim_end,
+            // §22.1.3.10 / .11 — Well-Formed Unicode Strings.
+            "isWellFormed"  / 0 => impl_is_well_formed,
+            "toWellFormed"  / 0 => impl_to_well_formed,
             // §B.2.3.1 AnnexB legacy substr(start, length).
             "substr"        / 2 => impl_substr,
             // §B.2.3 AnnexB HTML wrappers.
@@ -1816,6 +1872,8 @@ string_prototype_methods!(
     bridge_trim_end        => "trimEnd",        0;
     bridge_trim_left       => "trimLeft",       0;
     bridge_trim_right      => "trimRight",      0;
+    bridge_is_well_formed  => "isWellFormed",   0;
+    bridge_to_well_formed  => "toWellFormed",   0;
     bridge_substr          => "substr",         2;
     bridge_anchor          => "anchor",         1;
     bridge_big             => "big",            0;

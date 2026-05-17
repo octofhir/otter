@@ -1081,6 +1081,92 @@ fn native_prototype_is_prototype_of(
     Ok(Value::Boolean(result))
 }
 
+/// §B.2.2.1.1 `get Object.prototype.__proto__` — returns the
+/// receiver's `[[Prototype]]`.
+///
+/// 1. Let `O` be `? ToObject(this value)`.
+/// 2. Return `? O.[[GetPrototypeOf]]()`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-get-object.prototype.__proto__>
+pub fn native_prototype_proto_get(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let obj = match this_value {
+        Value::Object(o) => o,
+        Value::Null | Value::Undefined => {
+            return Err(NativeError::TypeError {
+                name: "get __proto__",
+                reason: "cannot convert null or undefined to object".to_string(),
+            });
+        }
+        // Primitives ToObject-coerce; the wrapper's prototype is the
+        // constructor's `%Prototype%`. The Object intrinsic gives us
+        // that resolution path directly without materialising the
+        // wrapper.
+        _ => {
+            let name = match ctx.this_value() {
+                Value::Boolean(_) => "Boolean",
+                Value::Number(_) => "Number",
+                Value::String(_) => "String",
+                Value::Symbol(_) => "Symbol",
+                Value::BigInt(_) => "BigInt",
+                _ => return Ok(Value::Null),
+            };
+            return Ok(ctx
+                .cx
+                .interp
+                .constructor_prototype_value(name)
+                .unwrap_or(Value::Null));
+        }
+    };
+    Ok(crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::Null))
+}
+
+/// §B.2.2.1.2 `set Object.prototype.__proto__` — installs a new
+/// `[[Prototype]]`.
+///
+/// 1. Let `O` be `? RequireObjectCoercible(this value)`.
+/// 2. If `Type(proto)` is neither Object nor Null, return undefined.
+/// 3. If `Type(O)` is not Object, return undefined.
+/// 4. Let `status` be `? O.[[SetPrototypeOf]](proto)`.
+/// 5. If `status` is false, throw a TypeError.
+/// 6. Return undefined.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set-object.prototype.__proto__>
+pub fn native_prototype_proto_set(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    if matches!(this_value, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: "set __proto__",
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
+    let obj = match this_value {
+        Value::Object(o) => o,
+        _ => return Ok(Value::Undefined),
+    };
+    let proto_value = args.first().cloned().unwrap_or(Value::Undefined);
+    let proto_arg = match &proto_value {
+        Value::Object(_) | Value::Null | Value::Proxy(_) => Some(proto_value.clone()),
+        _ => return Ok(Value::Undefined),
+    };
+    let ok = crate::object::set_prototype_value(obj, ctx.heap_mut(), proto_arg);
+    if !ok {
+        return Err(NativeError::TypeError {
+            name: "set __proto__",
+            reason: "cyclic or non-extensible prototype chain".to_string(),
+        });
+    }
+    Ok(Value::Undefined)
+}
+
 /// §B.2.2.2 `Object.prototype.__defineGetter__(P, getter)`.
 ///
 /// 1. Let `O` be `? ToObject(this value)`.

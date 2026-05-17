@@ -1673,9 +1673,39 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
         for method in object_statics::OBJECT_PROTOTYPE_METHODS {
             builder.method_from_spec(method)?;
+        }
+    }
+    // §B.2.2.1 Object.prototype.__proto__ — accessor pair.
+    // <https://tc39.es/ecma262/#sec-object.prototype.__proto__>
+    {
+        let proto_root = Value::Object(prototype);
+        let getter = native_static_with_value_roots(
+            heap,
+            "get __proto__",
+            0,
+            object_statics::native_prototype_proto_get,
+            &[&global_root, &proto_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let setter = native_static_with_value_roots(
+            heap,
+            "set __proto__",
+            1,
+            object_statics::native_prototype_proto_set,
+            &[&global_root, &proto_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let desc = PropertyDescriptor::accessor(
+            Some(Value::NativeFunction(getter)),
+            Some(Value::NativeFunction(setter)),
+            false,
+            true,
+        );
+        if !object::define_own_property(prototype, heap, "__proto__", desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed("__proto__"));
         }
     }
     object::set(prototype, heap, "constructor", Value::Object(object));
@@ -2069,7 +2099,7 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 910;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 915;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 400 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

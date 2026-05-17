@@ -1706,6 +1706,60 @@ fn native_array_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
+    // Pre-coerce integer-typed args via `ToPrimitive(Number)` so the
+    // intrinsic's strict `arg_signed_index` guard observes user
+    // `@@toPrimitive` / `valueOf` / `toString` side effects per spec.
+    // Mirrors the matching arm in `Op::CallMethodValue`; this path
+    // handles `Array.prototype.<x>.call(...)` / `.apply(...)` /
+    // `.bind(...)` invocations that bypass the receiver fast path.
+    let int_coerce_indices: &[usize] = match name {
+        "indexOf" | "lastIndexOf" | "includes" => &[1],
+        "fill" => &[1, 2],
+        "copyWithin" => &[0, 1, 2],
+        "slice" => &[0, 1],
+        "at" => &[0],
+        _ => &[],
+    };
+    let coerced_args: smallvec::SmallVec<[Value; 4]> = if int_coerce_indices.is_empty() {
+        args.iter().cloned().collect()
+    } else {
+        let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            for &idx in int_coerce_indices {
+                let Some(slot) = out.get_mut(idx) else {
+                    continue;
+                };
+                if !matches!(
+                    slot,
+                    Value::Object(_)
+                        | Value::Array(_)
+                        | Value::Function { .. }
+                        | Value::Closure { .. }
+                        | Value::NativeFunction(_)
+                        | Value::BoundFunction(_)
+                        | Value::ClassConstructor(_)
+                        | Value::Proxy(_)
+                        | Value::RegExp(_)
+                ) {
+                    continue;
+                }
+                let interp = ctx.interp_mut();
+                let primitive = interp
+                    .evaluate_to_primitive(
+                        &exec,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                    .map_err(|e| NativeError::TypeError {
+                        name,
+                        reason: e.to_string(),
+                    })?;
+                *slot = primitive;
+            }
+        }
+        out
+    };
     let (string_heap, allocation_roots) = {
         let interp = ctx.interp_mut();
         (interp.string_heap_clone(), interp.collect_runtime_roots())
@@ -1716,7 +1770,7 @@ fn native_array_method(
     })?;
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
-        args,
+        args: &coerced_args,
         string_heap: &string_heap,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),

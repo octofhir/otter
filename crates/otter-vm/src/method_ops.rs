@@ -344,6 +344,8 @@ impl Interpreter {
                 "copyWithin" => &[0, 1, 2],
                 // §23.1.3.26 slice(start, end)
                 "slice" => &[0, 1],
+                // §23.1.3.1 at(index)
+                "at" => &[0],
                 _ => &[],
             };
             if !int_coerce_indices.is_empty()

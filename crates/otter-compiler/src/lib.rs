@@ -4602,6 +4602,21 @@ fn compile_arrow_function(
         let reg = compile_expr(parent, &es.expression, inner_span)?;
         parent.emit(Op::ReturnValue, [Operand::Register(reg)], inner_span);
     } else {
+        // §10.2.11 FunctionDeclarationInstantiation — block-body
+        // arrow functions own a regular function scope and must
+        // pre-hoist `var` / lexical / function-declaration bindings
+        // before walking the body, exactly like the regular
+        // `compile_function_declaration_body` pass above. Without
+        // this, nested `var x = …` inside the arrow body fails the
+        // `var \`x\` not pre-hoisted` invariant check at the
+        // `Statement::VariableDeclaration` arm.
+        let mut var_names: Vec<String> = Vec::new();
+        hoist_var_names(&arrow.body.statements, &mut var_names);
+        pre_declare_var_bindings(parent, &var_names, span)?;
+        let mut lex_names: Vec<(String, bool)> = Vec::new();
+        hoist_lexical_names(&arrow.body.statements, &mut lex_names);
+        pre_declare_lexical_bindings(parent, &lex_names, span)?;
+        hoist_function_declarations(parent, &arrow.body.statements)?;
         for stmt in &arrow.body.statements {
             compile_statement(parent, stmt)?;
         }

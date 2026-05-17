@@ -324,35 +324,56 @@ impl Interpreter {
                     }
                 }
             }
-            // §23.1.3.14 / .17 — `Array.prototype.indexOf` /
-            // `lastIndexOf` run `ToIntegerOrInfinity(fromIndex)`,
-            // which itself starts with `ToNumber` →
-            // `ToPrimitive(arg, "number")`. Non-primitive fromIndex
-            // must observe `@@toPrimitive` / `valueOf` / `toString`
-            // per spec — pre-coerce here so user `valueOf` side
-            // effects fire before the intrinsic walks elements.
-            if matches!(&recv_value, Value::Array(_) | Value::Object(_))
-                && matches!(&*name, "indexOf" | "lastIndexOf" | "includes")
-                && let Some(slot) = small_args.get_mut(1)
-                && matches!(
-                    slot,
-                    Value::Object(_)
-                        | Value::Array(_)
-                        | Value::Function { .. }
-                        | Value::Closure { .. }
-                        | Value::NativeFunction(_)
-                        | Value::BoundFunction(_)
-                        | Value::ClassConstructor(_)
-                        | Value::Proxy(_)
-                        | Value::RegExp(_)
-                )
+            // Pre-coerce integer-typed args through the
+            // `ToNumber` → `ToPrimitive(Number)` ladder so the
+            // intrinsic's `arg_signed_index` strict guard observes
+            // user `@@toPrimitive` / `valueOf` / `toString` side
+            // effects per spec rather than tripping
+            // `TypeMismatch`. Each tuple lists the argument indices
+            // whose `ToIntegerOrInfinity(…)` invocation lives at
+            // the top of the algorithm header. Method receivers are
+            // intentionally restricted to Array / Object — the
+            // primitive-receiver short-circuit returns the unmodified
+            // value before the intrinsic body runs.
+            let int_coerce_indices: &[usize] = match &*name {
+                // §23.1.3.14 / .17 / .15
+                "indexOf" | "lastIndexOf" | "includes" => &[1],
+                // §23.1.3.7 fill(value, start, end)
+                "fill" => &[1, 2],
+                // §23.1.3.4 copyWithin(target, start, end)
+                "copyWithin" => &[0, 1, 2],
+                // §23.1.3.26 slice(start, end)
+                "slice" => &[0, 1],
+                _ => &[],
+            };
+            if !int_coerce_indices.is_empty()
+                && matches!(&recv_value, Value::Array(_) | Value::Object(_))
             {
-                let primitive = self.evaluate_to_primitive(
-                    context,
-                    slot,
-                    crate::abstract_ops::ToPrimitiveHint::Number,
-                )?;
-                *slot = primitive;
+                for &idx in int_coerce_indices {
+                    let Some(slot) = small_args.get_mut(idx) else {
+                        continue;
+                    };
+                    if !matches!(
+                        slot,
+                        Value::Object(_)
+                            | Value::Array(_)
+                            | Value::Function { .. }
+                            | Value::Closure { .. }
+                            | Value::NativeFunction(_)
+                            | Value::BoundFunction(_)
+                            | Value::ClassConstructor(_)
+                            | Value::Proxy(_)
+                            | Value::RegExp(_)
+                    ) {
+                        continue;
+                    }
+                    let primitive = self.evaluate_to_primitive(
+                        context,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )?;
+                    *slot = primitive;
+                }
             }
             let result = {
                 let string_heap = self.string_heap.clone();

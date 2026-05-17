@@ -1,9 +1,11 @@
 //! JavaScript `Date` value (ECMA-262 §21.4).
 //!
-//! A Date carries an `f64` time value (UTC milliseconds since the
-//! Unix epoch, with `NaN` representing an invalid date). Cloning
-//! shares storage so `setX` / `setY` mutations are observable
-//! through every handle, matching spec mutation semantics.
+//! Date instances are ordinary objects with a `[[DateValue]]`
+//! internal slot per §21.4.5. The slot is stored on
+//! [`crate::object::ObjectBody::date_data`] — same shape as
+//! [[BooleanData]] / [[NumberData]] / [[StringData]] — so Date
+//! reuses the standard property machinery (V8 `JSDate` and JSC
+//! `DateInstance` follow the same model).
 //!
 //! All broken-down accessors (year / month / hours / …) lower
 //! through self-contained proleptic Gregorian arithmetic in
@@ -11,10 +13,11 @@
 //! provider isn't needed for the foundation surface.
 //!
 //! # Contents
-//! - [`JsDate`] — heap-shared handle.
 //! - [`broken_down`] — convert epoch ms to UTC components.
 //! - [`make_date`] — convert wall-clock components back to ms.
 //! - [`to_iso_string`] — `Date.prototype.toISOString` body.
+//! - [`now_ms`] — host clock epoch milliseconds for `Date.now` /
+//!   the 0-argument constructor.
 //! - [`dispatch`] — `Date(...)` / `Date.<static>(...)` entry.
 //! - [`prototype`] — `Date.prototype.<method>` lookup table.
 //!
@@ -24,81 +27,15 @@
 pub mod dispatch;
 pub mod prototype;
 
-use std::cell::Cell;
-use std::rc::Rc;
-
-/// Heap-shared `Date` handle. Cloning shares storage; mutation via
-/// [`Self::set_time`] is observable through every clone.
-#[derive(Debug, Clone)]
-pub struct JsDate {
-    inner: Rc<Cell<f64>>,
-}
-
-impl JsDate {
-    /// Allocate a new Date from raw epoch milliseconds.
-    #[must_use]
-    pub fn from_ms(ms: f64) -> Self {
-        // §21.4.1.6 TimeClip — values outside ±8.64e15 ms (≈ ±100 M
-        // days) collapse to NaN.
-        let clipped = if !ms.is_finite() || ms.abs() > 8.64e15 {
-            f64::NAN
-        } else {
-            // Spec says the time value is an integer; truncate
-            // toward zero.
-            ms.trunc()
-        };
-        Self {
-            inner: Rc::new(Cell::new(clipped)),
-        }
-    }
-
-    /// Allocate a Date for "now" (the host's current epoch ms).
-    #[must_use]
-    pub fn now() -> Self {
-        let ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .unwrap_or(f64::NAN);
-        Self::from_ms(ms)
-    }
-
-    /// Allocate an Invalid Date — the canonical NaN-time form.
-    #[must_use]
-    pub fn invalid() -> Self {
-        Self::from_ms(f64::NAN)
-    }
-
-    /// Read the raw time value (NaN for Invalid Date).
-    #[must_use]
-    pub fn time(&self) -> f64 {
-        self.inner.get()
-    }
-
-    /// Update the time value. Mutation is observable through every
-    /// clone of this handle.
-    pub fn set_time(&self, ms: f64) {
-        let clipped = if !ms.is_finite() || ms.abs() > 8.64e15 {
-            f64::NAN
-        } else {
-            ms.trunc()
-        };
-        self.inner.set(clipped);
-    }
-
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
-    }
-}
-
-impl PartialEq for JsDate {
-    fn eq(&self, other: &Self) -> bool {
-        // Two distinct Dates with the same time value compare equal
-        // for `==` purposes when used through `Value::PartialEq`.
-        // Identity comparison is exposed via `ptr_eq`.
-        self.time() == other.time()
-    }
+/// Host wall-clock epoch milliseconds. Used by `Date.now` and the
+/// 0-argument `new Date()` form. Falls back to `NaN` if the host
+/// clock is misbehaving.
+#[must_use]
+pub fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(f64::NAN)
 }
 
 /// Broken-down UTC components of a Date's time value. All ranges

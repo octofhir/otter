@@ -1,5 +1,11 @@
 //! `Date.prototype.<name>` intrinsic table.
 //!
+//! Date instances are ordinary objects with a `[[DateValue]]`
+//! internal slot per §21.4.5. The receiver helpers in this module
+//! validate that brand by checking
+//! [`crate::object::date_data`]; ordinary objects without the
+//! slot trigger `TypeError`.
+//!
 //! Foundation surface (UTC-only — host timezone integration is
 //! filed). Every accessor returns the broken-down UTC component
 //! per ECMA-262 §21.4.4.x; the `getUTC*` and "local" `get*` shapes
@@ -10,24 +16,38 @@
 //! - [`DATE_PROTOTYPE_TABLE`] — declarative table built with the
 //!   [`crate::intrinsics!`] macro.
 //! - [`lookup`] — convenience accessor used by the dispatcher.
+//! - [`DATE_PROTOTYPE_METHODS`] — JS-visible method specs installed
+//!   on `Date.prototype` during bootstrap.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-date-prototype-object>
+//! - <https://tc39.es/ecma262/#sec-thistimevalue>
 
-use super::{JsDate, broken_down, to_iso_string};
+use super::{broken_down, to_iso_string};
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::number::NumberValue;
+use crate::object::{self, JsObject};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError};
 
-fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsDate, IntrinsicError> {
-    match args.receiver {
-        Value::Date(d) => Ok(d.clone()),
-        _ => Err(IntrinsicError::BadReceiver { expected: "date" }),
+/// `thisTimeValue` (§21.4.1.1): validate the receiver brand and
+/// extract the `[[DateValue]]` slot. Returns the JsObject handle
+/// (for setters that need to write back) and the current time.
+fn receiver_handle(args: &IntrinsicArgs<'_>) -> Result<(JsObject, f64), IntrinsicError> {
+    if let Value::Object(o) = args.receiver
+        && let Some(time) = object::date_data(*o, args.gc_heap)
+    {
+        return Ok((*o, time));
     }
+    Err(IntrinsicError::BadReceiver { expected: "date" })
+}
+
+/// Read-only `thisTimeValue` — getters only need the time.
+fn receiver_time(args: &IntrinsicArgs<'_>) -> Result<f64, IntrinsicError> {
+    receiver_handle(args).map(|(_, t)| t)
 }
 
 fn nan() -> Value {
@@ -41,68 +61,71 @@ fn smi(n: i32) -> Value {
 /// §21.4.4.10 / §21.4.4.44 — `getTime()` / `valueOf()` return the
 /// raw time value.
 fn impl_get_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::Number(NumberValue::from_f64(receiver(args)?.time())))
+    Ok(Value::Number(NumberValue::from_f64(receiver_time(args)?)))
 }
 
 fn impl_get_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.year))
         .unwrap_or_else(nan))
 }
 
 fn impl_get_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.month as i32))
         .unwrap_or_else(nan))
 }
 
 fn impl_get_date(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.day as i32))
         .unwrap_or_else(nan))
 }
 
 fn impl_get_day(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.weekday as i32))
         .unwrap_or_else(nan))
 }
 
 fn impl_get_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.hour as i32))
         .unwrap_or_else(nan))
 }
 
 fn impl_get_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.minute as i32))
         .unwrap_or_else(nan))
 }
 
 fn impl_get_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.second as i32))
         .unwrap_or_else(nan))
 }
 
 fn impl_get_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver(args)?.time())
+    Ok(broken_down(receiver_time(args)?)
         .map(|bd| smi(bd.millisecond as i32))
         .unwrap_or_else(nan))
 }
 
 /// §21.4.4.21 — `getTimezoneOffset()`. Foundation treats local time
 /// as UTC, so the offset is always `0`.
-fn impl_get_timezone_offset(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn impl_get_timezone_offset(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    // Validate brand even though the result is constant — `Date.prototype.getTimezoneOffset.call({})`
+    // must throw, not return 0.
+    receiver_time(args)?;
     Ok(smi(0))
 }
 
 /// §21.4.4.36 — `toISOString()`. Throws RangeError on Invalid Date
 /// per spec; the foundation surfaces that via `BadArgument`.
 fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    let s = to_iso_string(date.time()).ok_or(IntrinsicError::BadArgument {
+    let time = receiver_time(args)?;
+    let s = to_iso_string(time).ok_or(IntrinsicError::OutOfRange {
         index: 0,
         reason: "Invalid Date",
     })?;
@@ -112,8 +135,8 @@ fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 /// §21.4.4.41 — `toJSON()`. Returns `toISOString()` for finite
 /// dates and `null` for Invalid Date.
 fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    match to_iso_string(date.time()) {
+    let time = receiver_time(args)?;
+    match to_iso_string(time) {
         Some(s) => Ok(Value::String(JsString::from_str(&s, args.string_heap)?)),
         None => Ok(Value::Null),
     }
@@ -123,8 +146,8 @@ fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// (matching `toISOString` shape; spec uses a locale-friendly
 /// rendering that requires host integration).
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    let s = to_iso_string(date.time()).unwrap_or_else(|| "Invalid Date".to_string());
+    let time = receiver_time(args)?;
+    let s = to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
     Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
 }
 
@@ -134,8 +157,8 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// for backward compatibility with `toString`. Locale-aware
 /// rendering ships once Intl lands.
 fn impl_to_date_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    let s = match crate::date::broken_down(date.time()) {
+    let time = receiver_time(args)?;
+    let s = match broken_down(time) {
         Some(bd) => format!("{:04}-{:02}-{:02}", bd.year, bd.month + 1, bd.day),
         None => "Invalid Date".to_string(),
     };
@@ -143,8 +166,8 @@ fn impl_to_date_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 }
 
 fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    let s = match crate::date::broken_down(date.time()) {
+    let time = receiver_time(args)?;
+    let s = match broken_down(time) {
         Some(bd) => format!(
             "{:02}:{:02}:{:02}.{:03}Z",
             bd.hour, bd.minute, bd.second, bd.millisecond
@@ -155,9 +178,9 @@ fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 }
 
 /// Helper for `setX`-family methods. Reads each `args.args[idx]` as
-/// a `f64` via `ToNumber`; missing args fall back to the current
-/// broken-down component supplied by `defaults`. Returns `NaN` if
-/// any provided arg is non-finite.
+/// a `f64` via `ToNumber`; missing args fall back to the value
+/// supplied by `fallback`. Returns `NaN` if any provided arg is
+/// non-finite or `undefined`.
 fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
     match args.args.get(idx) {
         None => fallback,
@@ -171,22 +194,20 @@ fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
 
 /// §21.4.4.27 — `setTime(ms)`. Direct write, returns the time value.
 fn impl_set_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
+    let (obj, _) = receiver_handle(args)?;
     let ms = read_arg_number(args, 0, f64::NAN);
-    date.set_time(ms);
-    Ok(Value::Number(NumberValue::from_f64(date.time())))
+    object::set_date_data(obj, args.gc_heap, ms);
+    let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
+    Ok(Value::Number(NumberValue::from_f64(written)))
 }
 
-/// Common body for the `setX` setter family: read current
-/// broken-down components (or epoch defaults for an Invalid Date),
-/// apply the user-supplied overrides via the closure, run
-/// `MakeDate`, write `set_time`, return the new time value.
-fn write_components<F>(date: &JsDate, _args: &IntrinsicArgs<'_>, update: F) -> f64
-where
-    F: FnOnce(&mut (f64, f64, f64, f64, f64, f64, f64)),
-{
-    let bd = crate::date::broken_down(date.time());
-    let mut components: (f64, f64, f64, f64, f64, f64, f64) = match bd {
+/// Broken-down components packaged as a 7-tuple for the setter
+/// closure pattern. Avoids needing to capture mutable component
+/// references across the `args` borrow.
+type Components = (f64, f64, f64, f64, f64, f64, f64);
+
+fn current_components(time: f64) -> Components {
+    match broken_down(time) {
         Some(b) => (
             b.year as f64,
             b.month as f64,
@@ -197,116 +218,115 @@ where
             b.millisecond as f64,
         ),
         None => (f64::NAN, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
-    };
-    update(&mut components);
-    let (year, month, day, hour, minute, second, ms) = components;
-    let new_ms = crate::date::make_date(year, month, day, hour, minute, second, ms);
-    date.set_time(new_ms);
-    new_ms
+    }
+}
+
+fn finish_set(
+    obj: JsObject,
+    args: &mut IntrinsicArgs<'_>,
+    c: Components,
+) -> Result<Value, IntrinsicError> {
+    let (year, month, day, hour, minute, second, ms) = c;
+    let new_ms = super::make_date(year, month, day, hour, minute, second, ms);
+    object::set_date_data(obj, args.gc_heap, new_ms);
+    let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
+    Ok(Value::Number(NumberValue::from_f64(written)))
 }
 
 fn impl_set_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    let ms = write_components(&date, args, |c| {
-        c.0 = read_arg_number(args, 0, c.0);
-        if args.args.len() >= 2 {
-            c.1 = read_arg_number(args, 1, c.1);
-        }
-        if args.args.len() >= 3 {
-            c.2 = read_arg_number(args, 2, c.2);
-        }
-    });
-    Ok(Value::Number(NumberValue::from_f64(ms)))
+    let (obj, time) = receiver_handle(args)?;
+    let mut c = current_components(time);
+    c.0 = read_arg_number(args, 0, c.0);
+    if args.args.len() >= 2 {
+        c.1 = read_arg_number(args, 1, c.1);
+    }
+    if args.args.len() >= 3 {
+        c.2 = read_arg_number(args, 2, c.2);
+    }
+    finish_set(obj, args, c)
 }
 
 fn impl_set_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
+    let (obj, time) = receiver_handle(args)?;
     // §21.4.4.21 — `setMonth(month [, date])`. Invalid Date passes
     // through (NaN year → NaN result).
-    let bd = crate::date::broken_down(date.time());
-    if bd.is_none() {
+    if broken_down(time).is_none() {
         return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
     }
-    let ms = write_components(&date, args, |c| {
-        c.1 = read_arg_number(args, 0, c.1);
-        if args.args.len() >= 2 {
-            c.2 = read_arg_number(args, 1, c.2);
-        }
-    });
-    Ok(Value::Number(NumberValue::from_f64(ms)))
+    let mut c = current_components(time);
+    c.1 = read_arg_number(args, 0, c.1);
+    if args.args.len() >= 2 {
+        c.2 = read_arg_number(args, 1, c.2);
+    }
+    finish_set(obj, args, c)
 }
 
 fn impl_set_date(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    if crate::date::broken_down(date.time()).is_none() {
+    let (obj, time) = receiver_handle(args)?;
+    if broken_down(time).is_none() {
         return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
     }
-    let ms = write_components(&date, args, |c| {
-        c.2 = read_arg_number(args, 0, c.2);
-    });
-    Ok(Value::Number(NumberValue::from_f64(ms)))
+    let mut c = current_components(time);
+    c.2 = read_arg_number(args, 0, c.2);
+    finish_set(obj, args, c)
 }
 
 fn impl_set_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    if crate::date::broken_down(date.time()).is_none() {
+    let (obj, time) = receiver_handle(args)?;
+    if broken_down(time).is_none() {
         return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
     }
-    let ms = write_components(&date, args, |c| {
-        c.3 = read_arg_number(args, 0, c.3);
-        if args.args.len() >= 2 {
-            c.4 = read_arg_number(args, 1, c.4);
-        }
-        if args.args.len() >= 3 {
-            c.5 = read_arg_number(args, 2, c.5);
-        }
-        if args.args.len() >= 4 {
-            c.6 = read_arg_number(args, 3, c.6);
-        }
-    });
-    Ok(Value::Number(NumberValue::from_f64(ms)))
+    let mut c = current_components(time);
+    c.3 = read_arg_number(args, 0, c.3);
+    if args.args.len() >= 2 {
+        c.4 = read_arg_number(args, 1, c.4);
+    }
+    if args.args.len() >= 3 {
+        c.5 = read_arg_number(args, 2, c.5);
+    }
+    if args.args.len() >= 4 {
+        c.6 = read_arg_number(args, 3, c.6);
+    }
+    finish_set(obj, args, c)
 }
 
 fn impl_set_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    if crate::date::broken_down(date.time()).is_none() {
+    let (obj, time) = receiver_handle(args)?;
+    if broken_down(time).is_none() {
         return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
     }
-    let ms = write_components(&date, args, |c| {
-        c.4 = read_arg_number(args, 0, c.4);
-        if args.args.len() >= 2 {
-            c.5 = read_arg_number(args, 1, c.5);
-        }
-        if args.args.len() >= 3 {
-            c.6 = read_arg_number(args, 2, c.6);
-        }
-    });
-    Ok(Value::Number(NumberValue::from_f64(ms)))
+    let mut c = current_components(time);
+    c.4 = read_arg_number(args, 0, c.4);
+    if args.args.len() >= 2 {
+        c.5 = read_arg_number(args, 1, c.5);
+    }
+    if args.args.len() >= 3 {
+        c.6 = read_arg_number(args, 2, c.6);
+    }
+    finish_set(obj, args, c)
 }
 
 fn impl_set_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    if crate::date::broken_down(date.time()).is_none() {
+    let (obj, time) = receiver_handle(args)?;
+    if broken_down(time).is_none() {
         return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
     }
-    let ms = write_components(&date, args, |c| {
-        c.5 = read_arg_number(args, 0, c.5);
-        if args.args.len() >= 2 {
-            c.6 = read_arg_number(args, 1, c.6);
-        }
-    });
-    Ok(Value::Number(NumberValue::from_f64(ms)))
+    let mut c = current_components(time);
+    c.5 = read_arg_number(args, 0, c.5);
+    if args.args.len() >= 2 {
+        c.6 = read_arg_number(args, 1, c.6);
+    }
+    finish_set(obj, args, c)
 }
 
 fn impl_set_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let date = receiver(args)?;
-    if crate::date::broken_down(date.time()).is_none() {
+    let (obj, time) = receiver_handle(args)?;
+    if broken_down(time).is_none() {
         return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
     }
-    let ms = write_components(&date, args, |c| {
-        c.6 = read_arg_number(args, 0, c.6);
-    });
-    Ok(Value::Number(NumberValue::from_f64(ms)))
+    let mut c = current_components(time);
+    c.6 = read_arg_number(args, 0, c.6);
+    finish_set(obj, args, c)
 }
 
 /// Declarative `Date.prototype` table. Local-time getters share

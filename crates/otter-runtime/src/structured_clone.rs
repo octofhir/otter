@@ -569,7 +569,6 @@ fn value_type_name(value: &Value) -> &'static str {
         Value::WeakRef(_) => "weak_ref",
         Value::FinalizationRegistry(_) => "finalization_registry",
         Value::Temporal(_) => "temporal",
-        Value::Date(_) => "date",
         Value::Intl(_) => "intl",
         Value::ArrayBuffer(_) => "array_buffer",
         Value::DataView(_) => "data_view",

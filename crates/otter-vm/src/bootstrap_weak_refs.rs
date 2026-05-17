@@ -348,7 +348,6 @@ fn target_can_be_weak(v: &Value) -> bool {
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
-            | Value::Date(_)
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)

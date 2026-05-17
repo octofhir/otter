@@ -332,9 +332,7 @@ fn impl_set_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 
 /// §24.2.4.6 `Set.prototype.symmetricDifference(other)` — values in
 /// `this` xor `other`.
-fn impl_set_symmetric_difference(
-    args: &mut IntrinsicArgs<'_>,
-) -> Result<Value, IntrinsicError> {
+fn impl_set_symmetric_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
     let other = args.args.first().cloned().unwrap_or(Value::Undefined);
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
@@ -393,7 +391,9 @@ fn impl_set_is_superset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrin
     let other = args.args.first().cloned().unwrap_or(Value::Undefined);
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let heap = &*args.gc_heap;
-    let all_in_this = other_values.iter().all(|v| collections::set_has(s, heap, v));
+    let all_in_this = other_values
+        .iter()
+        .all(|v| collections::set_has(s, heap, v));
     Ok(Value::Boolean(all_in_this))
 }
 
@@ -404,7 +404,9 @@ fn impl_set_is_disjoint_from(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intr
     let other = args.args.first().cloned().unwrap_or(Value::Undefined);
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let heap = &*args.gc_heap;
-    let any_shared = other_values.iter().any(|v| collections::set_has(s, heap, v));
+    let any_shared = other_values
+        .iter()
+        .any(|v| collections::set_has(s, heap, v));
     Ok(Value::Boolean(!any_shared))
 }
 

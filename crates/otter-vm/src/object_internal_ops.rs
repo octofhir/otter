@@ -975,7 +975,6 @@ impl Interpreter {
                 | Value::WeakRef(_)
                 | Value::FinalizationRegistry(_)
                 | Value::RegExp(_)
-                | Value::Date(_)
                 | Value::Promise(_)
                 | Value::ArrayBuffer(_)
                 | Value::DataView(_)
@@ -1849,15 +1848,6 @@ impl Interpreter {
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
-            // §21.4.4 — Date instances have no own string-keyed data
-            // properties; everything routes through `Date.prototype`.
-            Value::Date(_) => {
-                let proto = self.constructor_prototype_value("Date")?;
-                if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
-            }
             // ArrayBuffer / DataView / TypedArray — walk their realm
             // prototypes for instance method lookups.
             Value::ArrayBuffer(_) | Value::DataView(_) | Value::TypedArray(_) => {
@@ -1994,7 +1984,6 @@ impl Interpreter {
             | Value::WeakMap(_)
             | Value::WeakSet(_)
             | Value::Promise(_)
-            | Value::Date(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
             | Value::TypedArray(_)

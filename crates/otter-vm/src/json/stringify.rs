@@ -295,6 +295,18 @@ fn emit_value(
             });
         }
         Value::Object(obj) => {
+            // §25.5.2 Date instances are ordinary objects with a
+            // `[[DateValue]]` internal slot — emit the ISO 8601
+            // form before falling into the generic object branch.
+            // Mirrors `Date.prototype.toJSON` (§21.4.4.41).
+            // <https://tc39.es/ecma262/#sec-date.prototype.tojson>
+            if let Some(time) = crate::object::date_data(*obj, gc_heap) {
+                match crate::date::to_iso_string(time) {
+                    Some(s) => write_string_literal(out, &s),
+                    None => out.push_str("null"),
+                }
+                return Ok(());
+            }
             if stack.len() >= MAX_NESTING_DEPTH {
                 return Err(JsonError::TooDeep {
                     limit: MAX_NESTING_DEPTH,
@@ -371,13 +383,6 @@ fn emit_value(
             }
             out.push(']');
         }
-        // §25.5.2 Date — emit the ISO-8601 representation as a JSON
-        // string, mirroring `Date.prototype.toJSON`.
-        // <https://tc39.es/ecma262/#sec-date.prototype.tojson>
-        Value::Date(d) => match crate::date::to_iso_string(d.time()) {
-            Some(s) => write_string_literal(out, &s),
-            None => out.push_str("null"),
-        },
     }
     let _ = options;
     Ok(())

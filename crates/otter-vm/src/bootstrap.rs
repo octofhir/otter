@@ -465,7 +465,6 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 | Value::WeakRef(_)
                 | Value::FinalizationRegistry(_)
                 | Value::Temporal(_)
-                | Value::Date(_)
                 | Value::Intl(_)
                 | Value::ArrayBuffer(_)
                 | Value::DataView(_)
@@ -1616,9 +1615,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     reason: "object allocation failed".to_string(),
                 })?;
                 let interp = ctx.interp_mut();
-                if let Ok(Value::Object(proto)) =
-                    interp.constructor_prototype_value("Object")
-                {
+                if let Ok(Value::Object(proto)) = interp.constructor_prototype_value("Object") {
                     crate::object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
                 }
                 Ok(Value::Object(obj))
@@ -1674,7 +1671,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
     // `[[Construct]]` / `[[Call]]` slot still handles the
     // `Date(...)` and `new Date(...)` shapes via `date_ctor_call`.
     fn date_now_call(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::Now, &[]).map_err(
+        crate::date::dispatch::call_static(otter_bytecode::method_id::DateMethod::Now, &[]).map_err(
             |err| NativeError::TypeError {
                 name: "Date.now",
                 reason: err.to_string(),
@@ -1682,38 +1679,42 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         )
     }
     fn date_parse_call(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::Parse, args).map_err(
-            |err| NativeError::TypeError {
+        crate::date::dispatch::call_static(otter_bytecode::method_id::DateMethod::Parse, args)
+            .map_err(|err| NativeError::TypeError {
                 name: "Date.parse",
                 reason: err.to_string(),
-            },
-        )
+            })
     }
     fn date_utc_call(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::UTC, args).map_err(
-            |err| NativeError::TypeError {
+        crate::date::dispatch::call_static(otter_bytecode::method_id::DateMethod::UTC, args)
+            .map_err(|err| NativeError::TypeError {
                 name: "Date.UTC",
                 reason: err.to_string(),
-            },
-        )
+            })
     }
 
     fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let date =
-            crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::Construct, args)
-                .map_err(|err| NativeError::TypeError {
-                    name: "Date",
-                    reason: err.to_string(),
-                })?;
-        if ctx.is_construct_call() {
-            return Ok(date);
-        }
-        let text = match &date {
-            Value::Date(d) => {
-                crate::date::to_iso_string(d.time()).unwrap_or_else(|| "Invalid Date".to_string())
-            }
-            other => other.display_string(),
+        let time = {
+            let heap = ctx.heap_mut();
+            crate::date::dispatch::construct_time_value(args, heap)
         };
+        if ctx.is_construct_call() {
+            // §21.4.2.1 — `new Date(...)`. The construct receiver
+            // is already a freshly allocated JsObject (via
+            // OrdinaryCreateFromConstructor on `Date`). Install
+            // the `[[DateValue]]` internal slot and return it.
+            if let Value::Object(obj) = ctx.this_value().clone() {
+                crate::object::set_date_data(obj, ctx.heap_mut(), time);
+                return Ok(Value::Object(obj));
+            }
+            return Err(NativeError::TypeError {
+                name: "Date",
+                reason: "expected object receiver in `new Date(...)`".to_string(),
+            });
+        }
+        // §21.4.2.2 — `Date()` without `new` returns the current
+        // time rendered as an ISO string.
+        let text = crate::date::to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
         let string_heap = ctx.interp_mut().string_heap_clone();
         let value =
             JsString::from_str(&text, &string_heap).map_err(|err| NativeError::TypeError {

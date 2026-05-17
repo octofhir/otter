@@ -191,7 +191,6 @@ fn is_prototype_object_value(value: &Value) -> bool {
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
-            | Value::Date(_)
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
@@ -536,6 +535,12 @@ pub struct ObjectBody {
     number_data: Option<NumberValue>,
     /// `[[StringData]]` internal slot for String wrapper objects.
     string_data: Option<JsString>,
+    /// `[[DateValue]]` internal slot for Date instances per
+    /// ECMA-262 §21.4.5. Holds the time value as UTC epoch
+    /// milliseconds (or `NaN` for an Invalid Date). Mutation goes
+    /// through [`set_date_data`] which applies TimeClip
+    /// (§21.4.1.6).
+    date_data: Option<f64>,
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
     extensible: bool,
@@ -566,6 +571,7 @@ impl std::fmt::Debug for ObjectBody {
             .field("has_boolean_data", &self.boolean_data.is_some())
             .field("has_number_data", &self.number_data.is_some())
             .field("has_string_data", &self.string_data.is_some())
+            .field("has_date_data", &self.date_data.is_some())
             .field("extensible", &self.extensible)
             .finish()
     }
@@ -673,6 +679,7 @@ fn empty_object_body() -> ObjectBody {
         boolean_data: None,
         number_data: None,
         string_data: None,
+        date_data: None,
         extensible: true,
     }
 }
@@ -747,6 +754,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             boolean_data: None,
             number_data: None,
             string_data: None,
+            date_data: None,
             extensible: true,
         },
         external_visit,
@@ -1354,6 +1362,36 @@ pub fn set_string_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: JsStri
 #[must_use]
 pub fn string_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
     heap.read_payload(obj, |body| body.string_data.clone())
+}
+
+/// §21.4.1.6 TimeClip — every store into a `[[DateValue]]` internal
+/// slot must clip non-finite values and values past ±8.64×10¹⁵ ms
+/// to `NaN`, then truncate toward zero so the spec invariant "the
+/// time value is an integer" holds.
+#[must_use]
+pub fn clip_date_value(ms: f64) -> f64 {
+    if !ms.is_finite() || ms.abs() > 8.64e15 {
+        f64::NAN
+    } else {
+        ms.trunc()
+    }
+}
+
+/// Store the `[[DateValue]]` internal slot for a Date instance.
+/// Applies §21.4.1.6 TimeClip before writing.
+pub fn set_date_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: f64) {
+    let clipped = clip_date_value(value);
+    heap.with_payload(obj, |body| {
+        body.date_data = Some(clipped);
+    });
+}
+
+/// Read the `[[DateValue]]` internal slot for a Date instance.
+/// Returns `None` for non-Date objects so callers can detect a
+/// receiver-brand mismatch (§21.4.1.1 `thisTimeValue` step 3).
+#[must_use]
+pub fn date_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<f64> {
+    heap.read_payload(obj, |body| body.date_data)
 }
 
 /// Borrow typed host data attached to `obj`.

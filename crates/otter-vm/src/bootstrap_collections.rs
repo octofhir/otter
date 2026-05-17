@@ -1130,7 +1130,6 @@ fn value_is_object_like(v: &Value) -> bool {
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
-            | Value::Date(_)
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)

@@ -138,10 +138,9 @@ pub(crate) fn array_like_present_entries(
         // for Boolean / Number / Symbol / BigInt (length undefined
         // → 0), so the callable methods see an empty walk and short-
         // circuit with the spec result for an empty array-like.
-        Value::Boolean(_)
-        | Value::Number(_)
-        | Value::Symbol(_)
-        | Value::BigInt(_) => Some(Vec::new()),
+        Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_) => {
+            Some(Vec::new())
+        }
         // Callable receivers (Function / Closure / NativeFunction /
         // BoundFunction / ClassConstructor) carry a `length` and no
         // observable own indexed properties unless the user
@@ -369,8 +368,7 @@ fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             entries.iter().map(|(i, _)| *i).collect();
         let heap = &mut *args.gc_heap;
         let mut first: Option<Value> = None;
-        let mut post_present: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
+        let mut post_present: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for (i, v) in &entries {
             if *i == 0 {
                 first = Some(v.clone());
@@ -613,7 +611,10 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 .collect()
         });
         let joined = parts.join(&separator);
-        return Ok(Value::String(JsString::from_str(&joined, args.string_heap)?));
+        return Ok(Value::String(JsString::from_str(
+            &joined,
+            args.string_heap,
+        )?));
     }
     if let Value::Object(obj) = args.receiver {
         let len = read_array_like_length(*obj, heap);
@@ -638,7 +639,10 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             };
         }
         let joined = parts.join(&separator);
-        return Ok(Value::String(JsString::from_str(&joined, args.string_heap)?));
+        return Ok(Value::String(JsString::from_str(
+            &joined,
+            args.string_heap,
+        )?));
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -1346,9 +1350,7 @@ fn impl_is_prototype_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
 
 /// §20.1.3.4 — `Array.prototype.propertyIsEnumerable(V)`. Indexed
 /// slots + named props are enumerable; `length` is not.
-fn impl_property_is_enumerable(
-    args: &mut IntrinsicArgs<'_>,
-) -> Result<Value, IntrinsicError> {
+fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let Value::Array(arr) = args.receiver else {
         return Err(IntrinsicError::BadReceiver { expected: "array" });
     };
@@ -1811,14 +1813,12 @@ fn array_callback_native_dispatch(
             Value::Undefined
         };
     }
-    let iter: Box<dyn Iterator<Item = (usize, Value)>> = if name == "reduceRight"
-        || name == "findLast"
-        || name == "findLastIndex"
-    {
-        Box::new(entries.into_iter().rev())
-    } else {
-        Box::new(entries.into_iter())
-    };
+    let iter: Box<dyn Iterator<Item = (usize, Value)>> =
+        if name == "reduceRight" || name == "findLast" || name == "findLastIndex" {
+            Box::new(entries.into_iter().rev())
+        } else {
+            Box::new(entries.into_iter())
+        };
     for (idx, v) in iter {
         let cb_args: SmallVec<[Value; 8]> = match name {
             "reduce" | "reduceRight" => {

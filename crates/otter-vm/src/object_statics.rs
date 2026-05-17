@@ -468,20 +468,14 @@ fn read_entry_pair(ctx: &NativeCtx<'_>, entry: &Value) -> Result<(Value, Value),
         Value::String(s) => {
             let units = s.to_utf16_vec();
             let zero = units.first().copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(
-                    &[u],
-                    &ctx.cx.interp.string_heap_clone(),
-                )
-                .map(Value::String)
-                .unwrap_or(Value::Undefined)
+                crate::string::JsString::from_utf16_units(&[u], &ctx.cx.interp.string_heap_clone())
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)
             });
             let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(
-                    &[u],
-                    &ctx.cx.interp.string_heap_clone(),
-                )
-                .map(Value::String)
-                .unwrap_or(Value::Undefined)
+                crate::string::JsString::from_utf16_units(&[u], &ctx.cx.interp.string_heap_clone())
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)
             });
             Ok((zero, one))
         }
@@ -831,24 +825,21 @@ fn native_is(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 /// §20.1.2.12 `Object.getPrototypeOf(O)` — `[[Prototype]]` of `O`
 /// after ToObject coercion. Primitive operands resolve to their
 /// respective `%X.prototype%` per §7.1.18.
-fn native_get_prototype_of(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
+fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let interp = ctx.interp_mut();
     interp.get_prototype_for_op(&target).map_err(|err| {
-        object_native_error(otter_bytecode::method_id::ObjectMethod::PreventExtensions.name(), err)
+        object_native_error(
+            otter_bytecode::method_id::ObjectMethod::PreventExtensions.name(),
+            err,
+        )
     })
 }
 
 /// §20.1.2.21 `Object.setPrototypeOf(O, proto)` — assigns the
 /// `[[Prototype]]` of `O` to `proto` (which must be Object or Null)
 /// and returns `O` after ToObject coercion checks.
-fn native_set_prototype_of(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
+fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let proto = args.get(1).cloned().unwrap_or(Value::Undefined);
     match (&target, &proto) {
@@ -1093,7 +1084,6 @@ fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         | Value::ClassConstructor(_) => "Function",
         Value::Array(_) => "Array",
         Value::RegExp(_) => "RegExp",
-        Value::Date(_) => "Date",
         Value::Promise(_) => "Promise",
         Value::Map(_) => "Map",
         Value::Set(_) => "Set",
@@ -1404,12 +1394,11 @@ pub fn call(
                     | Value::Symbol(_)
                     | Value::BigInt(_),
                 ) => Ok(Value::Undefined),
-                Some(Value::Null) | Some(Value::Undefined) | None => {
-                    Err(VmError::TypeError {
-                        message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
+                Some(Value::Null) | Some(Value::Undefined) | None => Err(VmError::TypeError {
+                    message:
+                        "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
                             .to_string(),
-                    })
-                }
+                }),
                 _ => Err(VmError::TypeError {
                     message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
                 }),

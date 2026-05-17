@@ -1,59 +1,98 @@
 //! `Date(...)` / `Date.<static>(...)` dispatcher per ECMA-262
 //! §21.4.2 / §21.4.3. Routed through
-//! [`crate::otter_bytecode::Op::DateCall`] by the compiler.
+//! [`crate::otter_bytecode::Op::DateCall`] by the compiler and
+//! through the `Date` native constructor installed by
+//! [`crate::bootstrap`].
 //!
 //! # Contents
-//! - [`call`] — single entry point used by the dispatch loop.
+//! - [`call`] — main entry point. Allocates a fresh Date instance
+//!   (`Value::Object` with the `[[DateValue]]` internal slot) for
+//!   the `Construct` method; returns `Value::Number` for the
+//!   `Now` / `Parse` / `UTC` statics.
+//! - [`construct_time_value`] — pure helper that derives the time
+//!   value for `new Date(...)` from its arguments.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-date-constructor>
+//! - <https://tc39.es/ecma262/#sec-date.now>
+//! - <https://tc39.es/ecma262/#sec-date.parse>
+//! - <https://tc39.es/ecma262/#sec-date.utc>
 
-use super::{JsDate, make_date};
+use otter_gc::GcHeap;
+use otter_gc::heap::RootSlotVisitor;
+
+use super::{make_date, now_ms};
 use crate::number::NumberValue;
+use crate::object::{self, JsObject};
 use crate::{Value, VmError};
 
-/// Dispatch `Date(...)` ([`DateMethod::Construct`]) /
-/// `Date.<method>(...)`. Routes the typed [`DateMethod`] emitted
-/// by the compiler.
+/// Dispatch `Date(...)` ([`otter_bytecode::method_id::DateMethod::Construct`])
+/// / `Date.<method>(...)`. Routes the typed
+/// [`otter_bytecode::method_id::DateMethod`] emitted by the
+/// compiler.
+///
+/// `prototype` is the realm's `%Date.prototype%` (resolved by the
+/// caller via [`crate::Interpreter::constructor_prototype_value`]).
+/// Construct allocates a fresh ordinary object, sets its
+/// `[[Prototype]]` to that handle, and installs the time value
+/// in the `[[DateValue]]` slot.
 ///
 /// # Errors
-/// - [`VmError::TypeMismatch`] for malformed inputs.
+/// - [`VmError::OutOfMemory`] if allocation of the instance fails.
+///
+/// # Spec
+/// - <https://tc39.es/ecma262/#sec-date-constructor>
 pub fn call(
     method: otter_bytecode::method_id::DateMethod,
     args: &[Value],
+    heap: &mut GcHeap,
+    prototype: Option<JsObject>,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::DateMethod as M;
     match method {
         // §21.4.2 — `new Date(...)`. Forms:
         //   - 0 args: now.
         //   - 1 arg (string): parse via Date.parse.
-        //   - 1 arg (number / Date): epoch ms.
+        //   - 1 arg (number / Date / Object-with-[[DateValue]]):
+        //     epoch ms (Date / wrapper) or ToPrimitive→Number for
+        //     ordinary objects.
         //   - 2+ args: (year, month, day?, hr?, min?, sec?, ms?).
-        M::Construct => match args.len() {
-            0 => Ok(Value::Date(JsDate::now())),
-            1 => match &args[0] {
-                Value::String(s) => Ok(Value::Date(JsDate::from_ms(parse_date(
-                    &s.to_lossy_string(),
-                )))),
-                Value::Number(n) => Ok(Value::Date(JsDate::from_ms(n.as_f64()))),
-                Value::Date(d) => Ok(Value::Date(JsDate::from_ms(d.time()))),
-                _ => Ok(Value::Date(JsDate::invalid())),
-            },
-            _ => {
-                let year = number_arg(args, 0);
-                let month = number_arg(args, 1);
-                let day = number_or(args, 2, 1.0);
-                let hours = number_or(args, 3, 0.0);
-                let minutes = number_or(args, 4, 0.0);
-                let seconds = number_or(args, 5, 0.0);
-                let ms = number_or(args, 6, 0.0);
-                Ok(Value::Date(JsDate::from_ms(make_date(
-                    year, month, day, hours, minutes, seconds, ms,
-                ))))
+        M::Construct => {
+            let time = construct_time_value(args, heap);
+            let obj = object::alloc_object_with_roots(heap, external_visit).map_err(|err| {
+                VmError::OutOfMemory {
+                    requested_bytes: err.requested_bytes(),
+                    heap_limit_bytes: err.heap_limit_bytes(),
+                }
+            })?;
+            object::set_date_data(obj, heap, time);
+            if let Some(proto) = prototype {
+                object::set_prototype(obj, heap, Some(proto));
             }
-        },
+            Ok(Value::Object(obj))
+        }
+        M::Now | M::Parse | M::UTC => call_static(method, args),
+    }
+}
+
+/// Non-allocating Date statics. Used by the NativeFunction
+/// wrappers installed on the global `Date` constructor (which
+/// cannot easily reach the GC heap from inside a `NativeCtx`
+/// without re-entering the interpreter).
+///
+/// # Spec
+/// - <https://tc39.es/ecma262/#sec-date.now>
+/// - <https://tc39.es/ecma262/#sec-date.parse>
+/// - <https://tc39.es/ecma262/#sec-date.utc>
+pub fn call_static(
+    method: otter_bytecode::method_id::DateMethod,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    use otter_bytecode::method_id::DateMethod as M;
+    match method {
         // §21.4.3.1 Date.now() — current epoch ms as a Number.
-        M::Now => Ok(Value::Number(NumberValue::from_f64(JsDate::now().time()))),
+        M::Now => Ok(Value::Number(NumberValue::from_f64(now_ms()))),
         // §21.4.3.2 Date.parse(str).
         M::Parse => {
             let s = match args.first() {
@@ -77,6 +116,43 @@ pub fn call(
             Ok(Value::Number(NumberValue::from_f64(make_date(
                 year, month, day, hours, minutes, seconds, ms,
             ))))
+        }
+        // Construct is allocating — must go through `call(...)`.
+        M::Construct => Err(VmError::InvalidOperand),
+    }
+}
+
+/// Derive the time value (epoch ms) for `new Date(...)`. Pure
+/// function of the arguments + heap (only read for the
+/// 1-argument-is-Object case, where we inspect the `[[DateValue]]`
+/// slot).
+///
+/// # Spec
+/// - <https://tc39.es/ecma262/#sec-date>
+pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
+    match args.len() {
+        0 => now_ms(),
+        1 => match &args[0] {
+            Value::String(s) => parse_date(&s.to_lossy_string()),
+            Value::Number(n) => n.as_f64(),
+            // §21.4.2.2 step 3.b — if value has [[DateValue]], use
+            // that. Other objects fall back to ToPrimitive→Number;
+            // primitive coercion outside the fast path lands as
+            // NaN here (foundation behaviour).
+            Value::Object(o) => object::date_data(*o, heap).unwrap_or(f64::NAN),
+            Value::Boolean(true) => 1.0,
+            Value::Boolean(false) | Value::Null => 0.0,
+            _ => f64::NAN,
+        },
+        _ => {
+            let year = number_arg(args, 0);
+            let month = number_arg(args, 1);
+            let day = number_or(args, 2, 1.0);
+            let hours = number_or(args, 3, 0.0);
+            let minutes = number_or(args, 4, 0.0);
+            let seconds = number_or(args, 5, 0.0);
+            let ms = number_or(args, 6, 0.0);
+            make_date(year, month, day, hours, minutes, seconds, ms)
         }
     }
 }

@@ -265,7 +265,14 @@ impl Interpreter {
             Value::Number(_) => number::prototype_lookup(&name),
             Value::Boolean(_) => boolean_prototype::lookup(&name),
             Value::BigInt(_) => bigint::prototype::lookup(&name),
-            Value::Date(_) => date::prototype::lookup(&name),
+            // Date instances are ordinary objects with a
+            // `[[DateValue]]` internal slot — when the receiver
+            // is an Object we probe `crate::object::date_data` to
+            // brand-check and route through the Date intrinsic
+            // table.
+            Value::Object(o) if crate::object::date_data(*o, &self.gc_heap).is_some() => {
+                date::prototype::lookup(&name)
+            }
             Value::RegExp(_) => regexp_prototype::lookup(&name),
             Value::Symbol(_) => symbol_prototype::lookup(&name),
             Value::Map(_) => collections_prototype::lookup_map(&name),
@@ -429,7 +436,6 @@ impl Interpreter {
             Value::Object(_)
             | Value::Proxy(_)
             | Value::Array(_)
-            | Value::Date(_)
             | Value::RegExp(_)
             | Value::Map(_)
             | Value::Set(_)
@@ -557,18 +563,11 @@ impl Interpreter {
                     Value::Number(NumberValue::from_f64(pos as f64)),
                     recv_value.clone(),
                 ];
-                let raw = self.run_callable_sync(
-                    context,
-                    &callback,
-                    Value::Undefined,
-                    cb_args,
-                )?;
+                let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
                 let raw_string = match raw {
                     Value::String(s) => s,
-                    other => {
-                        JsString::from_str(&other.display_string(), &string_heap)
-                            .map_err(|_| VmError::TypeMismatch)?
-                    }
+                    other => JsString::from_str(&other.display_string(), &string_heap)
+                        .map_err(|_| VmError::TypeMismatch)?,
                 };
                 out.extend_from_slice(&raw_string.to_utf16_vec());
                 if pos < recv_units.len() {
@@ -593,18 +592,11 @@ impl Interpreter {
                     Value::Number(NumberValue::from_f64(cursor as f64)),
                     recv_value.clone(),
                 ];
-                let raw = self.run_callable_sync(
-                    context,
-                    &callback,
-                    Value::Undefined,
-                    cb_args,
-                )?;
+                let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
                 let raw_string = match raw {
                     Value::String(s) => s,
-                    other => {
-                        JsString::from_str(&other.display_string(), &string_heap)
-                            .map_err(|_| VmError::TypeMismatch)?
-                    }
+                    other => JsString::from_str(&other.display_string(), &string_heap)
+                        .map_err(|_| VmError::TypeMismatch)?,
                 };
                 out.extend_from_slice(&raw_string.to_utf16_vec());
                 cursor += needle_len;
@@ -618,8 +610,7 @@ impl Interpreter {
         }
         out.extend_from_slice(&recv_units[cursor..]);
         Ok(Value::String(
-            JsString::from_utf16_units(&out, &string_heap)
-                .map_err(|_| VmError::TypeMismatch)?,
+            JsString::from_utf16_units(&out, &string_heap).map_err(|_| VmError::TypeMismatch)?,
         ))
     }
 

@@ -110,7 +110,11 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
                         Value::String(s) => s.to_lossy_string(),
                         Value::Number(n) => n.to_display_string(),
                         Value::Boolean(b) => {
-                            if *b { "true".to_string() } else { "false".to_string() }
+                            if *b {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            }
                         }
                         _ => v.display_string(),
                     })
@@ -1470,24 +1474,27 @@ fn native_string_replace_callable(
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string = match raw {
-                Value::String(s) => s,
-                other => JsString::from_str(&other.display_string(), &string_heap).map_err(
-                    |err| NativeError::TypeError {
-                        name: if replace_all { "replaceAll" } else { "replace" },
-                        reason: err.to_string(),
-                    },
-                )?,
-            };
+            let raw_string =
+                match raw {
+                    Value::String(s) => s,
+                    other => JsString::from_str(&other.display_string(), &string_heap).map_err(
+                        |err| NativeError::TypeError {
+                            name: if replace_all { "replaceAll" } else { "replace" },
+                            reason: err.to_string(),
+                        },
+                    )?,
+                };
             out.extend_from_slice(&raw_string.to_utf16_vec());
             if pos < recv_units.len() {
                 out.push(recv_units[pos]);
             }
         }
         return Ok(Value::String(
-            JsString::from_utf16_units(&out, &string_heap).map_err(|err| NativeError::TypeError {
-                name: if replace_all { "replaceAll" } else { "replace" },
-                reason: err.to_string(),
+            JsString::from_utf16_units(&out, &string_heap).map_err(|err| {
+                NativeError::TypeError {
+                    name: if replace_all { "replaceAll" } else { "replace" },
+                    reason: err.to_string(),
+                }
             })?,
         ));
     }
@@ -1505,15 +1512,16 @@ fn native_string_replace_callable(
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string = match raw {
-                Value::String(s) => s,
-                other => JsString::from_str(&other.display_string(), &string_heap).map_err(
-                    |err| NativeError::TypeError {
-                        name: if replace_all { "replaceAll" } else { "replace" },
-                        reason: err.to_string(),
-                    },
-                )?,
-            };
+            let raw_string =
+                match raw {
+                    Value::String(s) => s,
+                    other => JsString::from_str(&other.display_string(), &string_heap).map_err(
+                        |err| NativeError::TypeError {
+                            name: if replace_all { "replaceAll" } else { "replace" },
+                            reason: err.to_string(),
+                        },
+                    )?,
+                };
             out.extend_from_slice(&raw_string.to_utf16_vec());
             cursor += needle_len;
             if !replace_all {

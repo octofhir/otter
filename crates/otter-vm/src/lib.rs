@@ -343,12 +343,6 @@ pub enum Value {
     /// # See also
     /// - <https://tc39.es/proposal-temporal/>
     Temporal(JsTemporal),
-    /// JS `Date` — mutable epoch-millisecond timestamp per
-    /// ECMA-262 §21.4. See [`crate::date::JsDate`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-date-objects>
-    Date(crate::date::JsDate),
     /// `Intl.*` value — `Collator` / `NumberFormat` /
     /// `DateTimeFormat`. Backed by ICU 4X. See [`JsIntl`].
     ///
@@ -1220,9 +1214,13 @@ impl Value {
             Value::WeakRef(_) => "[object WeakRef]".to_string(),
             Value::FinalizationRegistry(_) => "[object FinalizationRegistry]".to_string(),
             Value::Temporal(t) => format!("[object Temporal.{}]", t.kind().class_name()),
-            Value::Date(d) => date::to_iso_string(d.time())
-                .map(|s| format!("Date({s})"))
-                .unwrap_or_else(|| "Invalid Date".to_string()),
+            // Date instances are now `Value::Object` with a
+            // `[[DateValue]]` internal slot — reading the slot
+            // requires the GC heap, which this free helper does
+            // not have. Falls through to `[object Object]` via
+            // the `Value::Object` arm below; higher-level callers
+            // (e.g. `Date.prototype.toString`) format the slot
+            // themselves with heap access.
             Value::Intl(i) => format!("[object Intl.{}]", i.kind().class_name()),
             Value::ArrayBuffer(b) => {
                 if b.is_shared() {
@@ -1277,7 +1275,6 @@ impl Value {
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
-            | Value::Date(_)
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
@@ -1383,7 +1380,6 @@ impl Value {
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
-            | Value::Date(_)
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
@@ -2160,8 +2156,7 @@ impl Interpreter {
             | Value::Promise(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Date(_) => match self.intrinsic_prototype_object_for(value) {
+            | Value::TypedArray(_) => match self.intrinsic_prototype_object_for(value) {
                 Some(o) => Ok(Value::Object(o)),
                 None => Ok(Value::Null),
             },
@@ -4746,7 +4741,11 @@ impl Interpreter {
                     self.run_shared_array_buffer_static_call_operands(stack, operands)?;
                     continue;
                 }
-                Op::MathCall | Op::DateCall | Op::BigIntCall | Op::DataViewCall => {
+                Op::DateCall => {
+                    self.run_date_static_call_operands(stack, operands)?;
+                    continue;
+                }
+                Op::MathCall | Op::BigIntCall | Op::DataViewCall => {
                     self.run_static_call_operands(op, context, frame, operands)?;
                 }
                 Op::ProxyCall => {
@@ -5122,7 +5121,6 @@ pub(crate) fn value_kind_name(value: &Value) -> &'static str {
         Value::BoundFunction(_) => "function",
         Value::ClassConstructor(_) => "class constructor",
         Value::RegExp(_) => "regexp",
-        Value::Date(_) => "date",
         Value::Promise(_) => "promise",
         Value::Proxy(_) => "proxy",
         Value::Map(_) => "map",
@@ -5326,9 +5324,7 @@ fn step_iterator(
 
     let snapshot = gc_heap.read_payload(iter, |state| match state {
         IteratorState::Array { array, index } => FastIteratorSnapshot::Array(*array, *index),
-        IteratorState::ArrayKey { array, index } => {
-            FastIteratorSnapshot::ArrayKey(*array, *index)
-        }
+        IteratorState::ArrayKey { array, index } => FastIteratorSnapshot::ArrayKey(*array, *index),
         IteratorState::ArrayEntry { array, index } => {
             FastIteratorSnapshot::ArrayEntry(*array, *index)
         }
@@ -5384,12 +5380,11 @@ fn step_iterator(
                 // sees them.
                 let pair = {
                     let array_root = Value::Array(array);
-                    let mut visitor =
-                        |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                            array_root.trace_value_slots(visit);
-                            index_val.trace_value_slots(visit);
-                            v.trace_value_slots(visit);
-                        };
+                    let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                        array_root.trace_value_slots(visit);
+                        index_val.trace_value_slots(visit);
+                        v.trace_value_slots(visit);
+                    };
                     crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
                         .map_err(|_| VmError::TypeMismatch)?
                 };
@@ -5461,7 +5456,6 @@ fn constructor_return_is_object(value: &Value) -> bool {
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_)
             | Value::Temporal(_)
-            | Value::Date(_)
             | Value::Intl(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)

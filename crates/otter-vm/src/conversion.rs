@@ -64,7 +64,6 @@ pub(crate) fn to_number_primitive(value: &Value) -> Result<NumberValue, VmError>
         | Value::TypedArray(_)
         | Value::Generator(_)
         | Value::Proxy(_) => NumberValue::Double(f64::NAN),
-        Value::Date(d) => NumberValue::from_f64(d.time()),
         Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
     };
     Ok(number)
@@ -363,13 +362,14 @@ impl Interpreter {
             }
             Value::DataView(_) => "DataView",
             Value::TypedArray(t) => t.kind().name(),
-            // §10.4 Date is an exotic object; §20.1.2.10
-            // Object.getPrototypeOf also accepts primitives by
-            // routing through ToObject (§7.1.18), so we hand
+            // §20.1.2.10 Object.getPrototypeOf accepts primitives
+            // by routing through ToObject (§7.1.18), so we hand
             // primitive values their own constructor's
             // `%X.prototype%` here. Callers that only deal with
             // exotic-object shapes already filter out primitives.
-            Value::Date(_) => "Date",
+            // (Date is now `Value::Object` with a `[[DateValue]]`
+            // internal slot — see `crate::object::date_data` — so
+            // it falls through to the Object branch below.)
             Value::Symbol(_) => "Symbol",
             Value::String(_) => "String",
             Value::Number(_) => "Number",

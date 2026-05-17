@@ -229,6 +229,34 @@ impl Interpreter {
         {
             return Ok(());
         }
+        // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
+        // `replaceAll` with a callable replaceValue dispatch through
+        // the interpreter to invoke the callback. The intrinsic
+        // table can't run callbacks (it lacks an
+        // `ExecutionContext`), so intercept here before the table
+        // lookup and route through the dedicated bridge.
+        if matches!(&recv_value, Value::String(_))
+            && (name == "replace" || name == "replaceAll")
+            && arg_values.len() >= 2
+            && self.is_callable_runtime(&arg_values[1])
+            && matches!(arg_values.first(), Some(Value::String(_)))
+        {
+            stack[top_idx].pc = stack[top_idx]
+                .pc
+                .checked_add(1)
+                .ok_or(VmError::InvalidOperand)?;
+            let result = self
+                .dispatch_string_callable_replace(
+                    context,
+                    &recv_value,
+                    &arg_values,
+                    name == "replaceAll",
+                )
+                .map_err(VmError::from)?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            return Ok(());
+        }
         // Primitive prototypes go through the intrinsic table —
         // synchronous, no frame push, advance pc and write directly.
         let intrinsic = match &recv_value {
@@ -467,6 +495,113 @@ impl Interpreter {
         Err(VmError::UnknownIntrinsic {
             name: name.to_string(),
         })
+    }
+
+    /// §22.1.3.18 / §22.1.3.19 callable replaceValue path. Walks
+    /// the receiver string's UTF-16 units, locates each
+    /// non-overlapping match of the (String-coerced) needle, and
+    /// invokes the callback with `(matched, position, fullString)`
+    /// per spec step 6.h. Returns the spliced result string.
+    pub(crate) fn dispatch_string_callable_replace(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: &Value,
+        args: &SmallVec<[Value; 8]>,
+        replace_all: bool,
+    ) -> Result<Value, VmError> {
+        use crate::number::NumberValue;
+        use crate::string::JsString;
+        let recv = match receiver {
+            Value::String(s) => s.clone(),
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let needle = match args.first() {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let recv_units = recv.to_utf16_vec();
+        let needle_units = needle.to_utf16_vec();
+        let needle_len = needle_units.len();
+        let recv_value = Value::String(recv.clone());
+        let string_heap = self.string_heap.clone();
+        let mut out: Vec<u16> = Vec::with_capacity(recv_units.len());
+        if needle_len == 0 {
+            let positions: Vec<usize> = if replace_all {
+                (0..=recv_units.len()).collect()
+            } else {
+                vec![0]
+            };
+            for pos in positions {
+                let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                    Value::String(needle.clone()),
+                    Value::Number(NumberValue::from_f64(pos as f64)),
+                    recv_value.clone(),
+                ];
+                let raw = self.run_callable_sync(
+                    context,
+                    &callback,
+                    Value::Undefined,
+                    cb_args,
+                )?;
+                let raw_string = match raw {
+                    Value::String(s) => s,
+                    other => {
+                        JsString::from_str(&other.display_string(), &string_heap)
+                            .map_err(|_| VmError::TypeMismatch)?
+                    }
+                };
+                out.extend_from_slice(&raw_string.to_utf16_vec());
+                if pos < recv_units.len() {
+                    out.push(recv_units[pos]);
+                }
+            }
+            return Ok(Value::String(
+                JsString::from_utf16_units(&out, &string_heap)
+                    .map_err(|_| VmError::TypeMismatch)?,
+            ));
+        }
+        if recv_units.len() < needle_len {
+            // Needle longer than receiver — no match possible.
+            return Ok(Value::String(recv));
+        }
+        let last_start = recv_units.len() - needle_len;
+        let mut cursor: usize = 0;
+        while cursor <= last_start {
+            if recv_units[cursor..cursor + needle_len] == needle_units[..] {
+                let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                    Value::String(needle.clone()),
+                    Value::Number(NumberValue::from_f64(cursor as f64)),
+                    recv_value.clone(),
+                ];
+                let raw = self.run_callable_sync(
+                    context,
+                    &callback,
+                    Value::Undefined,
+                    cb_args,
+                )?;
+                let raw_string = match raw {
+                    Value::String(s) => s,
+                    other => {
+                        JsString::from_str(&other.display_string(), &string_heap)
+                            .map_err(|_| VmError::TypeMismatch)?
+                    }
+                };
+                out.extend_from_slice(&raw_string.to_utf16_vec());
+                cursor += needle_len;
+                if !replace_all {
+                    break;
+                }
+            } else {
+                out.push(recv_units[cursor]);
+                cursor += 1;
+            }
+        }
+        out.extend_from_slice(&recv_units[cursor..]);
+        Ok(Value::String(
+            JsString::from_utf16_units(&out, &string_heap)
+                .map_err(|_| VmError::TypeMismatch)?,
+        ))
     }
 
     /// Dispatch `call` / `apply` / `bind` on a callable receiver.

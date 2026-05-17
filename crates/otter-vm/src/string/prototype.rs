@@ -27,6 +27,8 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-string-prototype-object>
 
+use smallvec::SmallVec;
+
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
@@ -1299,6 +1301,19 @@ fn native_string_method(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    // §22.1.3.18 `replace` / §22.1.3.19 `replaceAll` — when the
+    // replaceValue argument is callable, the intrinsic-table path
+    // can't drive the replacement (no interpreter context). Intercept
+    // here so `'abc'.replace('b', fn)` and `'abc'.replaceAll('b', fn)`
+    // dispatch the callback with `(matched, position, string)` and
+    // splice the result string.
+    if (name == "replace" || name == "replaceAll")
+        && args.len() >= 2
+        && ctx.cx.interp.is_callable_runtime(args.get(1).unwrap())
+        && matches!(args.first(), Some(Value::String(_)))
+    {
+        return native_string_replace_callable(name == "replaceAll", ctx, args);
+    }
     let receiver = ctx.this_value().clone();
     let (string_heap, allocation_roots) = {
         let interp = ctx.interp_mut();
@@ -1325,6 +1340,137 @@ fn native_string_method(
             reason: err.to_string(),
         },
     })
+}
+
+/// Drive `String.prototype.replace` / `replaceAll` when
+/// `replaceValue` is callable. Walks the receiver's UTF-16 units in
+/// place, locates each non-overlapping match of the
+/// string-coerced needle, invokes the callback with
+/// `(matched, position, fullString)` per §22.1.3.{18,19} step 6.h,
+/// and splices the returned string back in.
+fn native_string_replace_callable(
+    replace_all: bool,
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let receiver = ctx.this_value().clone();
+    let string_heap = ctx.interp_mut().string_heap_clone();
+    let intrinsic_args = IntrinsicArgs {
+        receiver: &receiver,
+        args,
+        string_heap: &string_heap,
+        gc_heap: ctx.heap_mut(),
+        allocation_roots: &[],
+    };
+    let recv = receiver_string(&intrinsic_args).map_err(|err| NativeError::TypeError {
+        name: if replace_all { "replaceAll" } else { "replace" },
+        reason: err.to_string(),
+    })?;
+    let needle = match args.first() {
+        Some(Value::String(s)) => s.clone(),
+        _ => unreachable!("guarded by caller — args[0] is Value::String"),
+    };
+    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let recv_units = recv.to_utf16_vec();
+    let needle_units = needle.to_utf16_vec();
+    let needle_len = needle_units.len();
+    let recv_str = recv.clone();
+    let recv_value = Value::String(recv_str);
+    let context = ctx.execution_context().cloned();
+    let context = match context {
+        Some(c) => c,
+        None => {
+            return Err(NativeError::TypeError {
+                name: if replace_all { "replaceAll" } else { "replace" },
+                reason: "missing execution context".to_string(),
+            });
+        }
+    };
+    let interp = ctx.interp_mut();
+    let mut out: Vec<u16> = Vec::with_capacity(recv_units.len());
+    let mut cursor: usize = 0;
+    // Edge case: empty needle splices the callback result at every
+    // unit boundary plus the end (matches §22.1.3.19 step 12.b /
+    // §22.1.3.18 step 12.b).
+    if needle_len == 0 {
+        let positions: Vec<usize> = if replace_all {
+            (0..=recv_units.len()).collect()
+        } else {
+            vec![0]
+        };
+        for pos in positions {
+            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                Value::String(needle.clone()),
+                Value::Number(crate::number::NumberValue::from_f64(pos as f64)),
+                recv_value.clone(),
+            ];
+            let raw = interp
+                .run_callable_sync(&context, &callback, Value::Undefined, cb_args)
+                .map_err(|err| NativeError::TypeError {
+                    name: if replace_all { "replaceAll" } else { "replace" },
+                    reason: err.to_string(),
+                })?;
+            let raw_string = match raw {
+                Value::String(s) => s,
+                other => JsString::from_str(&other.display_string(), &string_heap).map_err(
+                    |err| NativeError::TypeError {
+                        name: if replace_all { "replaceAll" } else { "replace" },
+                        reason: err.to_string(),
+                    },
+                )?,
+            };
+            out.extend_from_slice(&raw_string.to_utf16_vec());
+            if pos < recv_units.len() {
+                out.push(recv_units[pos]);
+            }
+        }
+        return Ok(Value::String(
+            JsString::from_utf16_units(&out, &string_heap).map_err(|err| NativeError::TypeError {
+                name: if replace_all { "replaceAll" } else { "replace" },
+                reason: err.to_string(),
+            })?,
+        ));
+    }
+    let last_start = recv_units.len().saturating_sub(needle_len);
+    while cursor <= last_start {
+        if recv_units[cursor..cursor + needle_len] == needle_units[..] {
+            let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                Value::String(needle.clone()),
+                Value::Number(crate::number::NumberValue::from_f64(cursor as f64)),
+                recv_value.clone(),
+            ];
+            let raw = interp
+                .run_callable_sync(&context, &callback, Value::Undefined, cb_args)
+                .map_err(|err| NativeError::TypeError {
+                    name: if replace_all { "replaceAll" } else { "replace" },
+                    reason: err.to_string(),
+                })?;
+            let raw_string = match raw {
+                Value::String(s) => s,
+                other => JsString::from_str(&other.display_string(), &string_heap).map_err(
+                    |err| NativeError::TypeError {
+                        name: if replace_all { "replaceAll" } else { "replace" },
+                        reason: err.to_string(),
+                    },
+                )?,
+            };
+            out.extend_from_slice(&raw_string.to_utf16_vec());
+            cursor += needle_len;
+            if !replace_all {
+                break;
+            }
+        } else {
+            out.push(recv_units[cursor]);
+            cursor += 1;
+        }
+    }
+    out.extend_from_slice(&recv_units[cursor..]);
+    Ok(Value::String(
+        JsString::from_utf16_units(&out, &string_heap).map_err(|err| NativeError::TypeError {
+            name: if replace_all { "replaceAll" } else { "replace" },
+            reason: err.to_string(),
+        })?,
+    ))
 }
 
 /// Generate a per-method trampoline + spec-table entry. The

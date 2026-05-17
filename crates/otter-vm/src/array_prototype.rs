@@ -1352,6 +1352,82 @@ fn impl_entries_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     Ok(Value::Iterator(handle))
 }
 
+/// §23.1.3.41 `Array.prototype.toSorted(compareFn?)` — non-mutating
+/// sort. Returns a fresh dense Array of `len` slots with absent
+/// indices materialised as `undefined`, then sorted via the default
+/// lexicographic comparator. A comparator argument routes through
+/// the interpreter `array_callback_dispatch` path before this entry
+/// is reached.
+fn impl_to_sorted(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    // Reject non-callable, non-undefined comparator per §23.1.3.41
+    // step 2 (`if not undefined and not callable → TypeError`). The
+    // callable branch is dispatched by the interpreter; if it reaches
+    // here with a callable argument, we still treat it as the
+    // default form (best-effort foundation).
+    if let Some(first) = args.args.first()
+        && !matches!(first, Value::Undefined)
+        && !matches!(
+            first,
+            Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+        )
+    {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "comparator must be a function",
+        });
+    }
+    let heap = &*args.gc_heap;
+    let len = match args.receiver {
+        Value::Array(arr) => array::len(*arr, heap),
+        Value::Object(_) => array_like_length(args.receiver, heap),
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let mut out: Vec<Value> = vec![Value::Undefined; len];
+    match args.receiver {
+        Value::Array(arr) => {
+            array::with_elements(*arr, heap, |elements| {
+                for (i, slot) in out.iter_mut().enumerate() {
+                    if let Some(v) = elements.get(i) {
+                        *slot = match v {
+                            Value::Hole => Value::Undefined,
+                            other => other.clone(),
+                        };
+                    }
+                }
+            });
+        }
+        Value::Object(_) => {
+            let entries = array_like_present_entries(args.receiver, heap)
+                .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+            for (i, v) in entries {
+                if i < len {
+                    out[i] = v;
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+    out.sort_by(|a, b| {
+        let a_undef = matches!(a, Value::Undefined);
+        let b_undef = matches!(b, Value::Undefined);
+        match (a_undef, b_undef) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => a.display_string().cmp(&b.display_string()),
+        }
+    });
+    Ok(Value::Array(args.array_from_elements_rooted(
+        out.iter().cloned(),
+        &[],
+        &[out.as_slice()],
+    )?))
+}
+
 /// §23.1.3.39 `Array.prototype.toReversed()` — non-mutating reverse.
 /// Returns a fresh dense Array.
 /// <https://tc39.es/ecma262/#sec-array.prototype.toreversed>
@@ -1468,6 +1544,7 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "copyWithin"  / 2 => impl_copy_within,
             "toReversed"  / 0 => impl_to_reversed,
             "toSpliced"   / 2 => impl_to_spliced,
+            "toSorted"    / 1 => impl_to_sorted,
             "with"        / 2 => impl_with,
             "keys"        / 0 => impl_keys_iter,
             "values"      / 0 => impl_values_iter,
@@ -1514,6 +1591,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("copyWithin", 2, native_copy_within),
     method("toReversed", 0, native_to_reversed),
     method("toSpliced", 2, native_to_spliced),
+    method("toSorted", 1, native_to_sorted),
     method("with", 2, native_with),
     method("toLocaleString", 0, native_to_locale_string),
     method("keys", 0, native_keys_iter),
@@ -1600,6 +1678,7 @@ native_array!(native_to_string, "toString");
 native_array!(native_copy_within, "copyWithin");
 native_array!(native_to_reversed, "toReversed");
 native_array!(native_to_spliced, "toSpliced");
+native_array!(native_to_sorted, "toSorted");
 native_array!(native_with, "with");
 native_array!(native_to_locale_string, "toLocaleString");
 native_array!(native_keys_iter, "keys");

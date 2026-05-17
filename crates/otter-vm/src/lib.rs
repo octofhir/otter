@@ -563,6 +563,22 @@ pub type IteratorHandle = otter_gc::Gc<IteratorState>;
 /// minimum information needed to advance one step at a time. Once
 /// the iterator reports `done`, subsequent calls keep returning
 /// `done = true` with `value = undefined` (per spec §7.4.2 step 6).
+/// Kind discriminator for `Array.prototype.{values, keys, entries}`
+/// iterators, matching `CreateArrayIterator(O, kind)` per §23.1.5.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayIterKind {
+    /// `values()` — yields each element (matches the historical
+    /// `IteratorState::Array` shape).
+    Value,
+    /// `keys()` — yields the numeric index.
+    Key,
+    /// `entries()` — yields a fresh `[index, value]` Array.
+    Entry,
+}
+
+/// Runtime state for iterator handles driven via `Op::IteratorNext`.
+/// Covers both built-in array / string iterators and the lazy
+/// iterator-helpers wrappers per the proposal.
 #[derive(Debug)]
 pub enum IteratorState {
     /// Walks `array`'s dense storage in insertion order.
@@ -573,6 +589,23 @@ pub enum IteratorState {
         /// Next element index to read. Compared against the
         /// array's `len()` at every step so resizing the array
         /// during iteration is observed correctly.
+        index: usize,
+    },
+    /// Walks `array` yielding only its numeric indices —
+    /// `Array.prototype.keys()` per §23.1.3.18.
+    ArrayKey {
+        /// Backing array — same semantics as
+        /// [`IteratorState::Array`].
+        array: JsArray,
+        /// Next index to yield.
+        index: usize,
+    },
+    /// Walks `array` yielding `[index, value]` pairs per
+    /// §23.1.3.7 `Array.prototype.entries()`.
+    ArrayEntry {
+        /// Backing array.
+        array: JsArray,
+        /// Next index to yield.
         index: usize,
     },
     /// Walks `string`'s WTF-16 code units, yielding one-unit
@@ -669,7 +702,9 @@ impl otter_gc::SafeTraceable for IteratorState {
 
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         match self {
-            IteratorState::Array { array, .. } => {
+            IteratorState::Array { array, .. }
+            | IteratorState::ArrayKey { array, .. }
+            | IteratorState::ArrayEntry { array, .. } => {
                 let p = array as *const JsArray as *mut RawGc;
                 visitor(p);
             }
@@ -5282,6 +5317,8 @@ fn step_iterator(
 ) -> Result<(Value, bool), VmError> {
     enum FastIteratorSnapshot {
         Array(JsArray, usize),
+        ArrayKey(JsArray, usize),
+        ArrayEntry(JsArray, usize),
         String(JsString, u32),
         Exhausted,
         Slow,
@@ -5289,6 +5326,12 @@ fn step_iterator(
 
     let snapshot = gc_heap.read_payload(iter, |state| match state {
         IteratorState::Array { array, index } => FastIteratorSnapshot::Array(*array, *index),
+        IteratorState::ArrayKey { array, index } => {
+            FastIteratorSnapshot::ArrayKey(*array, *index)
+        }
+        IteratorState::ArrayEntry { array, index } => {
+            FastIteratorSnapshot::ArrayEntry(*array, *index)
+        }
         IteratorState::String { string, index } => {
             FastIteratorSnapshot::String(string.clone(), *index)
         }
@@ -5314,6 +5357,52 @@ fn step_iterator(
                     }
                 });
                 Some(v)
+            }
+        }
+        FastIteratorSnapshot::ArrayKey(array, index) => {
+            if index >= crate::array::len(array, gc_heap) {
+                None
+            } else {
+                gc_heap.with_payload(iter, |state| {
+                    if let IteratorState::ArrayKey { index, .. } = state {
+                        *index += 1;
+                    }
+                });
+                Some(Value::Number(crate::number::NumberValue::from_f64(
+                    index as f64,
+                )))
+            }
+        }
+        FastIteratorSnapshot::ArrayEntry(array, index) => {
+            if index >= crate::array::len(array, gc_heap) {
+                None
+            } else {
+                let v = crate::array::get(array, gc_heap, index);
+                let index_val = Value::Number(crate::number::NumberValue::from_f64(index as f64));
+                // Materialise [index, value] dense array. Roots both
+                // operands via the visitor so a GC during allocation
+                // sees them.
+                let pair = {
+                    let array_root = Value::Array(array);
+                    let mut visitor =
+                        |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                            array_root.trace_value_slots(visit);
+                            index_val.trace_value_slots(visit);
+                            v.trace_value_slots(visit);
+                        };
+                    crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
+                        .map_err(|_| VmError::TypeMismatch)?
+                };
+                crate::array::with_elements_mut(pair, gc_heap, |elements| {
+                    elements.push(index_val);
+                    elements.push(v);
+                });
+                gc_heap.with_payload(iter, |state| {
+                    if let IteratorState::ArrayEntry { index, .. } = state {
+                        *index += 1;
+                    }
+                });
+                Some(Value::Array(pair))
             }
         }
         FastIteratorSnapshot::String(string, index) => {

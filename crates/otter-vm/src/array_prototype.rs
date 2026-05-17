@@ -1227,6 +1227,60 @@ fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
     )?))
 }
 
+/// §23.1.3.{18,35,8} — `Array.prototype.keys()` / `.values()` /
+/// `.entries()`. Each constructs an `ArrayIterator` backed by the
+/// receiver: `keys()` yields the numeric indices, `values()` yields
+/// each element, `entries()` yields fresh `[index, value]` arrays.
+/// The result is a `Value::Iterator` driven by `Op::IteratorNext`.
+/// <https://tc39.es/ecma262/#sec-array.prototype.keys>
+fn impl_keys_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = match args.receiver {
+        Value::Array(arr) => *arr,
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let handle = args.alloc_iterator_state_rooted(
+        crate::IteratorState::ArrayKey {
+            array: arr,
+            index: 0,
+        },
+        &[],
+        &[],
+    )?;
+    Ok(Value::Iterator(handle))
+}
+
+fn impl_values_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = match args.receiver {
+        Value::Array(arr) => *arr,
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let handle = args.alloc_iterator_state_rooted(
+        crate::IteratorState::Array {
+            array: arr,
+            index: 0,
+        },
+        &[],
+        &[],
+    )?;
+    Ok(Value::Iterator(handle))
+}
+
+fn impl_entries_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let arr = match args.receiver {
+        Value::Array(arr) => *arr,
+        _ => return Err(IntrinsicError::BadReceiver { expected: "array" }),
+    };
+    let handle = args.alloc_iterator_state_rooted(
+        crate::IteratorState::ArrayEntry {
+            array: arr,
+            index: 0,
+        },
+        &[],
+        &[],
+    )?;
+    Ok(Value::Iterator(handle))
+}
+
 /// §23.1.3.39 `Array.prototype.toReversed()` — non-mutating reverse.
 /// Returns a fresh dense Array.
 /// <https://tc39.es/ecma262/#sec-array.prototype.toreversed>
@@ -1344,6 +1398,9 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "toReversed"  / 0 => impl_to_reversed,
             "toSpliced"   / 2 => impl_to_spliced,
             "with"        / 2 => impl_with,
+            "keys"        / 0 => impl_keys_iter,
+            "values"      / 0 => impl_values_iter,
+            "entries"     / 0 => impl_entries_iter,
             // §23.1.3.32 toLocaleString — foundation form delegates
             // to the default `join(",")` shape until per-locale
             // formatting + element `toLocaleString` invocation lands
@@ -1385,6 +1442,9 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toSpliced", 2, native_to_spliced),
     method("with", 2, native_with),
     method("toLocaleString", 0, native_to_locale_string),
+    method("keys", 0, native_keys_iter),
+    method("values", 0, native_values_iter),
+    method("entries", 0, native_entries_iter),
 ];
 
 const fn method(
@@ -1457,6 +1517,9 @@ native_array!(native_to_reversed, "toReversed");
 native_array!(native_to_spliced, "toSpliced");
 native_array!(native_with, "with");
 native_array!(native_to_locale_string, "toLocaleString");
+native_array!(native_keys_iter, "keys");
+native_array!(native_values_iter, "values");
+native_array!(native_entries_iter, "entries");
 
 #[cfg(test)]
 mod tests {

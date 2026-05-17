@@ -31,9 +31,10 @@ use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier,
     BindingPattern, Class, DoWhileStatement, Expression, ForInStatement, ForOfStatement,
-    ForStatement, ForStatementLeft, Function, IfStatement, LabeledStatement, NumericLiteral,
-    Program, SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement, UnaryExpression,
-    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind, WhileStatement,
+    ForStatement, ForStatementLeft, FormalParameters, Function, IfStatement, LabeledStatement,
+    NumericLiteral, Program, SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind,
+    WhileStatement,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -88,6 +89,28 @@ struct StrictValidator {
 impl StrictValidator {
     fn is_strict(&self) -> bool {
         self.strict_stack.last().copied().unwrap_or(false)
+    }
+
+    /// Flag a function with a `"use strict"` directive in its body
+    /// AND a non-simple parameter list. ECMA-262 §15.2.1, §15.3.1,
+    /// §15.4.1, §15.6.1 reject the combination because the strict
+    /// directive cannot apply to the parameter-initialization step
+    /// (which may already have started running expressions through
+    /// default values, destructuring binds, etc.).
+    fn flag_non_simple_use_strict(&mut self, span: oxc_span::Span) {
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "STRICT_DIRECTIVE_WITH_NON_SIMPLE_PARAMS".to_string(),
+            message: "SyntaxError: `\"use strict\"` directive cannot appear in a function with a \
+                 non-simple parameter list (rest, default, or destructuring) \
+                 (§15.2.1 / §15.3.1 / §15.4.1 / §15.6.1)"
+                .to_string(),
+            range: Some((span.start, span.end)),
+            help: Some(
+                "remove the `\"use strict\"` directive — the function inherits strictness from \
+                 the enclosing scope; or rewrite the parameter list as plain identifiers"
+                    .to_string(),
+            ),
+        });
     }
 
     /// Flag a `for-in` / `for-of` head whose ForBinding declarator
@@ -171,6 +194,28 @@ impl StrictValidator {
             ),
         });
     }
+}
+
+/// ECMA-262 §15.1.3 IsSimpleParameterList.
+///
+/// A FormalParameterList is "simple" iff every entry is a bare
+/// `BindingIdentifier` with no initializer and no rest parameter is
+/// present. Anything else — `{a}`, `[b]`, `x = 1`, `...rest`, an
+/// AssignmentPattern wrapper — produces `false`.
+///
+/// The result drives §15.2.1 / §15.3.1 / §15.4.1 / §15.6.1 early
+/// errors: a function with a `"use strict"` directive in its body
+/// must have a simple parameter list, otherwise the directive
+/// cannot consistently apply to default-value / destructuring
+/// initialization that runs before the body.
+fn is_simple_parameter_list(params: &FormalParameters<'_>) -> bool {
+    if params.rest.is_some() {
+        return false;
+    }
+    params
+        .items
+        .iter()
+        .all(|p| matches!(p.pattern, BindingPattern::BindingIdentifier(_)))
 }
 
 /// Collect names introduced by **lexical** declarations directly
@@ -345,6 +390,15 @@ impl<'a> Visit<'a> for StrictValidator {
             .body
             .as_ref()
             .is_some_and(|b| b.has_use_strict_directive());
+        // §15.2.1 FunctionDeclaration / §15.3.1 FunctionExpression
+        // Static Semantics: Early Errors — a `"use strict"` directive
+        // is forbidden inside a function whose FormalParameterList is
+        // non-simple (rest parameter, default initializer, or
+        // destructuring pattern). The directive itself would be a
+        // SyntaxError so we flag at the function span.
+        if body_strict && !is_simple_parameter_list(&it.params) {
+            self.flag_non_simple_use_strict(it.span);
+        }
         let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);
         walk::walk_function(self, it, flags);
@@ -352,7 +406,14 @@ impl<'a> Visit<'a> for StrictValidator {
     }
 
     fn visit_arrow_function_expression(&mut self, it: &ArrowFunctionExpression<'a>) {
-        let inner_strict = self.is_strict() || it.body.has_use_strict_directive();
+        let body_strict = it.body.has_use_strict_directive();
+        // §15.4.1 ArrowFunction / §15.6.1 AsyncArrowFunction Static
+        // Semantics: Early Errors — same `"use strict"` /
+        // non-simple-params restriction applies.
+        if body_strict && !is_simple_parameter_list(&it.params) {
+            self.flag_non_simple_use_strict(it.span);
+        }
+        let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);
         walk::walk_arrow_function_expression(self, it);
         self.strict_stack.pop();

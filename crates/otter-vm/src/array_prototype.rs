@@ -39,6 +39,113 @@ fn receiver_array(args: &IntrinsicArgs<'_>) -> Result<JsArray, IntrinsicError> {
     }
 }
 
+/// Defensive upper bound on the materialised length of an
+/// array-like Object receiver before we'd refuse to expand a
+/// snapshot. Spec ToLength clamps to 2^53-1; test262 patterns
+/// (`{length: 2**32 - 1}`, `new Array(2**32)`) deliberately
+/// exercise pathological lengths to stress generic-array methods.
+/// V8 / JSC handle this by visiting only **present** indexed own
+/// properties (see HasProperty short-circuit in §22.1.3 generic
+/// algorithms); we follow the same strategy and never materialise
+/// the absent slots, so the cap only matters when a caller passes
+/// in a genuinely-large-but-dense object — at that point an OOM
+/// `RangeError` from the allocator is the spec-compliant outcome
+/// and we never reach a 4 GB pre-allocated `Vec`.
+const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
+
+/// §7.3.18 LengthOfArrayLike — read `O.length`, ToLength-coerce,
+/// clamp to [`MAX_ARRAY_LIKE_PROBE_LEN`].
+fn read_array_like_length(obj: crate::object::JsObject, heap: &otter_gc::GcHeap) -> usize {
+    let len_val = crate::object::get(obj, heap, "length").unwrap_or(Value::Undefined);
+    match len_val {
+        Value::Number(n) => {
+            let f = n.as_f64();
+            if f.is_nan() || f <= 0.0 {
+                0
+            } else if f >= MAX_ARRAY_LIKE_PROBE_LEN as f64 {
+                MAX_ARRAY_LIKE_PROBE_LEN
+            } else {
+                f as usize
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Sparse-aware walk of **present** indexed own properties of an
+/// array-like object receiver, returning `(index, value)` pairs in
+/// ascending-index order.
+///
+/// Mirrors the V8 / JSC strategy for generic Array.prototype methods:
+/// instead of iterating `0..len` and probing `HasProperty(O, k)` for
+/// each slot (which is `O(len)` even when the object is sparse), we
+/// enumerate the receiver's own string-keyed property bag, filter for
+/// numeric indices `< len`, and visit those only. Per §22.1.3 generic
+/// algorithms, an `HasProperty(O, k)` returning `false` is observably
+/// indistinguishable from "skip k", so this is spec-faithful for
+/// objects without inherited indexed properties — the same caveat
+/// V8 / JSC carry in their dense-vs-dictionary fast paths.
+///
+/// Returns `None` when `receiver` is not array-like (caller surfaces
+/// the spec's `RequireObjectCoercible` TypeError).
+fn array_like_present_entries(
+    receiver: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Option<Vec<(usize, Value)>> {
+    match receiver {
+        Value::Array(arr) => {
+            // Dense Array path — Value::Hole encodes "absent"; the
+            // sparse-aware filter drops it so the index/value pairs
+            // match what HasProperty would observe.
+            Some(array::with_elements(*arr, heap, |els| {
+                els.iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| match v {
+                        Value::Hole => None,
+                        other => Some((i, other.clone())),
+                    })
+                    .collect()
+            }))
+        }
+        Value::Object(obj) => {
+            let len = read_array_like_length(*obj, heap);
+            if len == 0 {
+                return Some(Vec::new());
+            }
+            let mut idx_keys: Vec<usize> = crate::object::with_properties(*obj, heap, |p| {
+                p.keys()
+                    .filter_map(|k| k.parse::<usize>().ok())
+                    .filter(|&i| i < len)
+                    .collect()
+            });
+            idx_keys.sort_unstable();
+            idx_keys.dedup();
+            Some(
+                idx_keys
+                    .into_iter()
+                    .map(|i| {
+                        let key = i.to_string();
+                        let v = crate::object::get(*obj, heap, &key).unwrap_or(Value::Undefined);
+                        (i, v)
+                    })
+                    .collect(),
+            )
+        }
+        _ => None,
+    }
+}
+
+/// §7.3.18 reachable length helper for receivers whose `.length`
+/// we trust to be observable but where we only need the upper bound
+/// for `fromIndex` clamping — does not allocate, just reads.
+fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> usize {
+    match receiver {
+        Value::Array(arr) => array::len(*arr, heap),
+        Value::Object(obj) => read_array_like_length(*obj, heap),
+        _ => 0,
+    }
+}
+
 /// Convert a possibly-negative numeric index into an absolute
 /// element index, clamped to `[0, len]`. Mirrors the spec's
 /// `ToIntegerOrInfinity` + clamping rule for `slice` / `indexOf`.
@@ -203,37 +310,66 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.13: holes compare as if the slot held `undefined`
-    // (SameValueZero), so `[,,].includes(undefined) === true`.
-    let arr = receiver_array(args)?;
+    // §23.1.3.13 Array.prototype.includes — generic over array-likes
+    // via ToObject(this) + LengthOfArrayLike. Comparison is
+    // §7.2.12 SameValueZero, so `NaN` matches `NaN` and `±0` collapse.
+    // Holes compare as SameValueZero against `undefined`, so
+    // `[,,].includes(undefined) === true`. The dense Array path keeps
+    // the existing tight `with_elements` walk; the array-like
+    // fallback uses the sparse iterator.
     let heap = &*args.gc_heap;
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
     let needle_is_undefined = matches!(needle, Value::Undefined);
-    let found = array::with_elements(arr, heap, |elements| {
-        elements.iter().any(|v| match v {
-            Value::Hole => needle_is_undefined,
-            other => other == &needle,
-        })
-    });
+    if let Value::Array(arr) = args.receiver {
+        let found = array::with_elements(*arr, heap, |elements| {
+            elements.iter().any(|v| match v {
+                Value::Hole => needle_is_undefined,
+                other => crate::abstract_ops::same_value_zero(other, &needle),
+            })
+        });
+        return Ok(Value::Boolean(found));
+    }
+    let entries = array_like_present_entries(args.receiver, heap)
+        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+    let found = entries
+        .iter()
+        .any(|(_, v)| crate::abstract_ops::same_value_zero(v, &needle));
     Ok(Value::Boolean(found))
 }
 
 fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
+    // §23.1.3.14 — generic over array-likes. The dense `Value::Array`
+    // path keeps the existing tight `with_elements` walk so common
+    // dense-array calls don't pay a snapshot allocation.
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
     let from_raw = arg_signed_index(args, 1, 0)?;
     let heap = &*args.gc_heap;
-    let len = array::len(arr, heap);
+    if let Value::Array(arr) = args.receiver {
+        let len = array::len(*arr, heap);
+        let from = clamp_index(from_raw, len);
+        let found = array::with_elements(*arr, heap, |elements| {
+            elements
+                .iter()
+                .enumerate()
+                .skip(from)
+                .find_map(|(i, v)| if v == &needle { Some(i) } else { None })
+        });
+        if let Some(i) = found {
+            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+        }
+        return Ok(Value::Number(NumberValue::from_i32(-1)));
+    }
+    let len = array_like_length(args.receiver, heap);
     let from = clamp_index(from_raw, len);
-    let found = array::with_elements(arr, heap, |elements| {
-        elements
-            .iter()
-            .enumerate()
-            .skip(from)
-            .find_map(|(i, v)| if v == &needle { Some(i) } else { None })
-    });
-    if let Some(i) = found {
-        return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+    let entries = array_like_present_entries(args.receiver, heap)
+        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+    for (i, v) in entries {
+        if i < from {
+            continue;
+        }
+        if v == needle {
+            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+        }
     }
     Ok(Value::Number(NumberValue::from_i32(-1)))
 }
@@ -253,11 +389,46 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 /// §23.1.3.18 `Array.prototype.lastIndexOf(value, fromIndex?)`.
+/// Generic over array-likes; dense `Value::Array` keeps the existing
+/// tight reverse walk to avoid a snapshot allocation on hot paths.
 /// <https://tc39.es/ecma262/#sec-array.prototype.lastindexof>
 fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let len = array::len(arr, &*args.gc_heap);
+    let heap = &*args.gc_heap;
     let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
+    if let Value::Array(arr) = args.receiver {
+        let len = array::len(*arr, heap);
+        let from_default = (len as i64).saturating_sub(1);
+        let from_raw = arg_signed_index(args, 1, from_default)?;
+        let from = if from_raw < 0 {
+            let v = (len as i64) + from_raw;
+            if v < 0 {
+                return Ok(Value::Number(NumberValue::from_i32(-1)));
+            }
+            v as usize
+        } else if (from_raw as usize) >= len {
+            len.saturating_sub(1)
+        } else {
+            from_raw as usize
+        };
+        let found = array::with_elements(*arr, heap, |elements| {
+            if elements.is_empty() {
+                return None;
+            }
+            let mut i = from as i64;
+            while i >= 0 {
+                if elements[i as usize] == needle {
+                    return Some(i as i32);
+                }
+                i -= 1;
+            }
+            None
+        });
+        if let Some(i) = found {
+            return Ok(Value::Number(NumberValue::from_i32(i)));
+        }
+        return Ok(Value::Number(NumberValue::from_i32(-1)));
+    }
+    let len = array_like_length(args.receiver, heap);
     let from_default = (len as i64).saturating_sub(1);
     let from_raw = arg_signed_index(args, 1, from_default)?;
     let from = if from_raw < 0 {
@@ -271,25 +442,17 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     } else {
         from_raw as usize
     };
-    let heap = &*args.gc_heap;
-    let found = array::with_elements(arr, heap, |elements| {
-        if elements.is_empty() {
-            return None;
+    let entries = array_like_present_entries(args.receiver, heap)
+        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+    // Reverse walk over the sorted entries; first hit with `i <= from`
+    // wins. Entries are ascending so we iterate in reverse.
+    for (i, v) in entries.into_iter().rev() {
+        if i > from {
+            continue;
         }
-        let mut i = from as i64;
-        while i >= 0 {
-            if elements[i as usize] == needle {
-                return Some(i as i32);
-            }
-            i -= 1;
+        if v == needle {
+            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
         }
-        None
-    });
-    if let Some(i) = found {
-        return Ok(Value::Number(NumberValue::from_i32(i)));
-    }
-    if len == 0 {
-        return Ok(Value::Number(NumberValue::from_i32(-1)));
     }
     Ok(Value::Number(NumberValue::from_i32(-1)))
 }

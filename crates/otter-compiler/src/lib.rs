@@ -7580,28 +7580,26 @@ fn compile_method_call(
     // The opcode handler in `crates/otter-vm/src/lib.rs` remains
     // for backwards-compatibility with older bytecode.
     // <https://tc39.es/ecma262/#sec-string-constructor>
-    // §21.1.1 `Number(value)` — coerce to a primitive number per
-    // ToNumber. Bare-call form (no `new`) yields the primitive
-    // result; foundation hands it back via `Op::ToNumber`.
+    // §21.1.1 `Number(value)` fast path — folds to `Op::LoadInt32 0`
+    // for the bare zero-arg form, or to `Op::ToNumber` for a single
+    // primitive arg. The BigInt arm of §21.1.1.1 step 5 takes a
+    // different shape than generic §7.1.4 ToNumber (which throws on
+    // BigInt — see `language/expressions/unary-plus/bigint-throws.js`).
+    // BigInt arity can't be observed at compile time, so callers with
+    // any argument fall through to the ordinary call dispatch which
+    // routes to `number_ctor_call` and the spec-correct BigInt arm.
     if let Expression::Identifier(id) = callee
         && id.name.as_str() == "Number"
         && cx.lookup_binding("Number").is_none()
         && find_module_import_binding(cx, "Number").is_none()
+        && call.arguments.is_empty()
     {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         let dst = cx.alloc_scratch();
-        match arg_regs.first().copied() {
-            Some(src) => cx.emit(
-                Op::ToNumber,
-                [Operand::Register(dst), Operand::Register(src)],
-                span,
-            ),
-            None => cx.emit(
-                Op::LoadInt32,
-                [Operand::Register(dst), Operand::Imm32(0)],
-                span,
-            ),
-        }
+        cx.emit(
+            Op::LoadInt32,
+            [Operand::Register(dst), Operand::Imm32(0)],
+            span,
+        );
         return Ok(dst);
     }
     // §20.3.1 `Boolean(value)` — primitive ToBoolean.

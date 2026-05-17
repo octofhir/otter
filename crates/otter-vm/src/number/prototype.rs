@@ -263,6 +263,67 @@ fn native_number_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
+    // §21.1.3.{3,4,5} — `toFixed` / `toExponential` / `toPrecision`
+    // route their fractional-digits / precision argument through
+    // `ToIntegerOrInfinity`, which itself starts with `ToNumber`.
+    // For non-primitive args (`(123).toPrecision([2])`,
+    // `(0).toFixed(new Number(3))`) ToNumber observes
+    // `@@toPrimitive` / `valueOf` / `toString` via §7.1.1
+    // ToPrimitive(number). Pre-coerce here so the intrinsic table
+    // sees a primitive and surfaces RangeError / OK in line with
+    // the spec ladder.
+    let coerced: smallvec::SmallVec<[Value; 4]> = if matches!(
+        name,
+        "toFixed" | "toExponential" | "toPrecision"
+    ) {
+        let exec = ctx.execution_context().cloned();
+        let mut out: smallvec::SmallVec<[Value; 4]> =
+            smallvec::SmallVec::with_capacity(args.len());
+        for arg in args {
+            if matches!(
+                arg,
+                Value::Object(_)
+                    | Value::Array(_)
+                    | Value::Function { .. }
+                    | Value::Closure { .. }
+                    | Value::NativeFunction(_)
+                    | Value::BoundFunction(_)
+                    | Value::ClassConstructor(_)
+                    | Value::Proxy(_)
+                    | Value::RegExp(_)
+            ) {
+                let Some(exec) = &exec else {
+                    out.push(arg.clone());
+                    continue;
+                };
+                let interp = ctx.interp_mut();
+                match interp.evaluate_to_primitive(
+                    exec,
+                    arg,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                ) {
+                    Ok(primitive) => out.push(primitive),
+                    Err(crate::VmError::Uncaught { value }) => {
+                        return Err(NativeError::Thrown {
+                            name,
+                            message: value,
+                        });
+                    }
+                    Err(err) => {
+                        return Err(NativeError::TypeError {
+                            name,
+                            reason: err.to_string(),
+                        });
+                    }
+                }
+            } else {
+                out.push(arg.clone());
+            }
+        }
+        out
+    } else {
+        args.iter().cloned().collect()
+    };
     let (string_heap, allocation_roots) = {
         let interp = ctx.interp_mut();
         (interp.string_heap_clone(), interp.collect_runtime_roots())
@@ -273,7 +334,7 @@ fn native_number_method(
     })?;
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
-        args,
+        args: &coerced,
         string_heap: &string_heap,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),

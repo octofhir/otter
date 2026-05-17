@@ -1158,7 +1158,18 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         let value = if args.is_empty() {
             crate::number::NumberValue::from_i32(0)
         } else {
-            crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(&args[0]))
+            // §21.1.1.1 step 5 — `Number(bigint)` does NOT throw; it
+            // converts to the nearest f64 representation. Generic
+            // §7.1.4 ToNumber on BigInt throws TypeError (see
+            // `language/expressions/unary-plus/bigint-throws.js`),
+            // so the constructor diverges here from `Op::ToNumber`.
+            // <https://tc39.es/ecma262/#sec-number-constructor-number-value>
+            if let Value::BigInt(b) = &args[0] {
+                let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
+                crate::number::NumberValue::from_f64(f)
+            } else {
+                crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(&args[0]))
+            }
         };
         if ctx.is_construct_call() {
             let this = ctx.this_value().clone();

@@ -289,7 +289,41 @@ impl Interpreter {
             _ => None,
         };
         if let Some(entry) = intrinsic {
-            let small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
+            // §21.1.3.{3,4,5} — `Number.prototype.{toFixed,
+            // toExponential, toPrecision}` start with
+            // `ToIntegerOrInfinity` on their argument, which runs
+            // `ToNumber` → `ToPrimitive(arg, "number")`. Non-
+            // primitive arguments must observe `@@toPrimitive` /
+            // `valueOf` / `toString`. Pre-coerce here before the
+            // intrinsic so the spec ladder fires and Symbol / BigInt
+            // surface the correct error class.
+            let mut small_args: SmallVec<[Value; 4]> =
+                arg_values.iter().cloned().collect();
+            if matches!(&recv_value, Value::Number(_))
+                && matches!(&*name, "toFixed" | "toExponential" | "toPrecision")
+            {
+                for slot in small_args.iter_mut() {
+                    if matches!(
+                        slot,
+                        Value::Object(_)
+                            | Value::Array(_)
+                            | Value::Function { .. }
+                            | Value::Closure { .. }
+                            | Value::NativeFunction(_)
+                            | Value::BoundFunction(_)
+                            | Value::ClassConstructor(_)
+                            | Value::Proxy(_)
+                            | Value::RegExp(_)
+                    ) {
+                        let primitive = self.evaluate_to_primitive(
+                            context,
+                            slot,
+                            crate::abstract_ops::ToPrimitiveHint::Number,
+                        )?;
+                        *slot = primitive;
+                    }
+                }
+            }
             let result = {
                 let string_heap = self.string_heap.clone();
                 let allocation_roots = self.collect_allocation_roots(stack);

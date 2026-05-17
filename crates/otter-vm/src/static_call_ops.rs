@@ -255,6 +255,25 @@ impl Interpreter {
         };
         let method =
             method_id::ObjectMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
+        // §20.1.2.2 Object.create / §20.1.2.3 Object.defineProperties
+        // run ToPropertyDescriptor (§6.2.5.5) on the descriptor
+        // source, which must invoke accessor getters and walk the
+        // prototype chain. Route them through context-aware helpers
+        // before the rooted/free fallbacks. Object.defineProperty is
+        // already handled in `try_proxy_object_static_call` (which is
+        // not actually Proxy-specific — it runs the full spec
+        // descriptor coercion for any Object-typed target).
+        match method {
+            method_id::ObjectMethod::Create => {
+                let result = self.do_object_create_with_descriptors(context, stack, &args)?;
+                return finish_static_call(&mut stack[top_idx], dst, result);
+            }
+            method_id::ObjectMethod::DefineProperties => {
+                let result = self.do_object_define_properties(context, stack, &args)?;
+                return finish_static_call(&mut stack[top_idx], dst, result);
+            }
+            _ => {}
+        }
         let result = if let Some(result) =
             self.try_function_object_static_call(Some(context), Some(stack), method, &args)?
         {
@@ -271,56 +290,133 @@ impl Interpreter {
         finish_static_call(&mut stack[top_idx], dst, result)
     }
 
+    /// §20.1.2.2 Object.create(O, Properties).
+    ///
+    /// Implements the spec algorithm including accessor-aware
+    /// ToPropertyDescriptor (§6.2.5.5) on each value drawn from the
+    /// `Properties` source — which is itself read via
+    /// `EnumerableOwnPropertyNames` plus full `[[Get]]`, so getter
+    /// invocation on `Properties` (and on each descriptor value) is
+    /// observable as required.
+    ///
+    /// Descriptor values are accepted whenever they are of type
+    /// Object — any callable / array / class-constructor / map / set /
+    /// regexp form qualifies, matching `evaluate_to_property_descriptor`
+    /// step 1.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-object.create>
+    /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
+    fn do_object_create_with_descriptors(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let proto = args.first().cloned().unwrap_or(Value::Undefined);
+        let proto_obj = match proto {
+            Value::Object(object) => Some(object),
+            Value::Null => None,
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let obj = self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?;
+        object::set_prototype(obj, &mut self.gc_heap, proto_obj);
+        if let Some(props_arg) = args.get(1)
+            && !matches!(props_arg, Value::Undefined)
+        {
+            let props = match props_arg {
+                Value::Object(object) => *object,
+                _ => return Err(VmError::TypeMismatch),
+            };
+            let entries: Vec<(String, Value)> =
+                object::with_properties(props, self.gc_heap(), |p| {
+                    p.enumerable_data_iter()
+                        .map(|(key, value)| (key.to_string(), value))
+                        .collect()
+                });
+            for (key, desc_value) in entries {
+                let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
+                if !object::define_own_property_partial(
+                    obj,
+                    &mut self.gc_heap,
+                    &key,
+                    descriptor,
+                ) {
+                    return Err(VmError::TypeError {
+                        message: format!("Cannot define property '{key}'"),
+                    });
+                }
+            }
+        }
+        Ok(Value::Object(obj))
+    }
+
+    /// §20.1.2.3 Object.defineProperties(O, Properties).
+    ///
+    /// Routes through `evaluate_to_property_descriptor` (§6.2.5.5) so
+    /// each descriptor source is read with full `[[Get]]` semantics
+    /// — accessor getters observe, prototype chain walks. Accepts
+    /// arbitrary object-typed descriptor sources (functions, arrays,
+    /// regexps, …) since `Type(desc)` is the only spec restriction.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-object.defineproperties>
+    fn do_object_define_properties(
+        &mut self,
+        context: &ExecutionContext,
+        _stack: &SmallVec<[Frame; 8]>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let target = match args.first() {
+            Some(Value::Object(target)) => *target,
+            Some(Value::ClassConstructor(class)) => class.statics(self.gc_heap()),
+            _ => {
+                return Err(VmError::TypeError {
+                    message: "Object.defineProperties target must be an object".to_string(),
+                });
+            }
+        };
+        let props = match args.get(1) {
+            Some(Value::Object(o)) => *o,
+            Some(Value::ClassConstructor(class)) => class.statics(self.gc_heap()),
+            _ => {
+                return Err(VmError::TypeError {
+                    message: "Object.defineProperties properties must be an object".to_string(),
+                });
+            }
+        };
+        let entries: Vec<(String, Value)> =
+            object::with_properties(props, self.gc_heap(), |p| {
+                p.enumerable_data_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect()
+            });
+        for (key, desc_value) in entries {
+            let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
+            if !object::define_own_property_partial(target, &mut self.gc_heap, &key, descriptor) {
+                return Err(VmError::TypeError {
+                    message: format!("Cannot define property '{key}'"),
+                });
+            }
+        }
+        Ok(Value::Object(target))
+    }
+
     fn object_static_call_stack_rooted(
         &mut self,
         stack: &SmallVec<[Frame; 8]>,
         method: method_id::ObjectMethod,
         args: &[Value],
     ) -> Result<Option<Value>, VmError> {
+        // M::Create needs an `ExecutionContext` to run accessor-aware
+        // ToPropertyDescriptor in `run_object_static_call_operands`;
+        // signal "not handled here" so the caller routes to the
+        // context-aware path.
+        if matches!(method, method_id::ObjectMethod::Create) {
+            return Ok(None);
+        }
         use method_id::ObjectMethod as M;
         match method {
-            M::Create => {
-                let proto = args.first().cloned().unwrap_or(Value::Undefined);
-                let proto_obj = match proto {
-                    Value::Object(object) => Some(object),
-                    Value::Null => None,
-                    _ => return Err(VmError::TypeMismatch),
-                };
-                let obj =
-                    self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?;
-                object::set_prototype(obj, &mut self.gc_heap, proto_obj);
-                if let Some(props_arg) = args.get(1)
-                    && !matches!(props_arg, Value::Undefined)
-                {
-                    let props = match props_arg {
-                        Value::Object(object) => *object,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
-                    let entries: Vec<(String, Value)> =
-                        object::with_properties(props, self.gc_heap(), |p| {
-                            p.enumerable_data_iter()
-                                .map(|(key, value)| (key.to_string(), value))
-                                .collect()
-                        });
-                    for (key, desc_value) in entries {
-                        let desc_obj = match desc_value {
-                            Value::Object(object) => object,
-                            _ => return Err(VmError::TypeMismatch),
-                        };
-                        let descriptor =
-                            object_statics::coerce_to_descriptor(&desc_obj, self.gc_heap())?;
-                        if !object::define_own_property_partial(
-                            obj,
-                            &mut self.gc_heap,
-                            &key,
-                            descriptor,
-                        ) {
-                            return Err(VmError::TypeMismatch);
-                        }
-                    }
-                }
-                Ok(Some(Value::Object(obj)))
-            }
             M::Keys => {
                 let owned: Vec<String> = match args.first() {
                     Some(Value::Object(target)) => {

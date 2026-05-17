@@ -1939,8 +1939,24 @@ impl Interpreter {
             | Value::Closure { .. }
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
-            | Value::ClassConstructor(_) => {
-                // Probe via Get; presence ↔ defined value.
+            | Value::ClassConstructor(_)
+            // §22.2.6 / §24.* / §27.2.5 — exotic objects whose own
+            // string-keyed surface lives on the prototype. Probing
+            // via Get keeps `HasProperty` consistent with the
+            // `[[GetOwnProperty]] + walk-prototype` ladder these
+            // value kinds expose elsewhere.
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::Promise(_)
+            | Value::Date(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_) => {
                 match self.ordinary_get_value(context, base.clone(), base, key, hops + 1)? {
                     VmGetOutcome::Value(Value::Undefined) => Ok(false),
                     _ => Ok(true),

@@ -1266,6 +1266,66 @@ impl Interpreter {
                             Value::Object(length_obj),
                         );
                     }
+                    Some(Value::Proxy(proxy)) => {
+                        // §20.1.2.10.1 step 3 — drive the spec
+                        // ladder via `own_property_keys_value`
+                        // (full §10.5.11 trap + invariant validation),
+                        // read each descriptor through the
+                        // `getOwnPropertyDescriptor` trap, and skip
+                        // any key whose descriptor is `undefined`.
+                        let proxy_value = Value::Proxy(proxy.clone());
+                        let result_root = Value::Object(result);
+                        let string_heap = self.string_heap.clone();
+                        let trap_keys = self
+                            .own_property_keys_value(context, &proxy_value, &string_heap)?;
+                        for key in trap_keys {
+                            let vm_key = match &key {
+                                Value::String(s) => {
+                                    crate::VmPropertyKey::OwnedString(s.to_lossy_string())
+                                }
+                                Value::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
+                                _ => continue,
+                            };
+                            let desc = self
+                                .ordinary_get_own_property_descriptor_value_stack_rooted(
+                                    context,
+                                    stack,
+                                    proxy_value.clone(),
+                                    &vm_key,
+                                    0,
+                                )?;
+                                let Some(desc) = desc else {
+                                continue;
+                            };
+                            let desc_obj = self.descriptor_to_object_stack_rooted(
+                                stack,
+                                &desc,
+                                &[&proxy_value, &result_root],
+                                args,
+                            )?;
+                            match &key {
+                                Value::String(s) => {
+                                    object::set(
+                                        result,
+                                        &mut self.gc_heap,
+                                        &s.to_lossy_string(),
+                                        Value::Object(desc_obj),
+                                    );
+                                }
+                                Value::Symbol(sym) => {
+                                    if !object::set_symbol(
+                                        result,
+                                        &mut self.gc_heap,
+                                        sym.clone(),
+                                        Value::Object(desc_obj),
+                                    ) {
+                                        return Err(VmError::TypeMismatch);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     Some(Value::Object(target)) => {
                         let target = *target;
                         let target_root = Value::Object(target);

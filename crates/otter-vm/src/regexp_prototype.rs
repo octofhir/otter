@@ -1187,6 +1187,321 @@ pub fn native_regexp_symbol_replace(
     ))
 }
 
+/// `? Get(value, Symbol.someKey)` driven through `ordinary_get_value`
+/// so accessor getters on symbol-keyed slots fire observably. Mirror
+/// of [`get_property_runtime`] for `Symbol.species` /
+/// `Symbol.toPrimitive` resolution inside @@split.
+fn get_symbol_property_runtime(
+    ctx: &mut NativeCtx<'_>,
+    receiver: &Value,
+    sym: &crate::symbol::JsSymbol,
+    name: &'static str,
+) -> Result<Value, crate::NativeError> {
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+        name,
+        reason: "missing execution context".to_string(),
+    })?;
+    let outcome = interp
+        .ordinary_get_value(
+            &exec,
+            receiver.clone(),
+            receiver.clone(),
+            &crate::VmPropertyKey::Symbol(sym.clone()),
+            0,
+        )
+        .map_err(vm_err_to_native(name))?;
+    match outcome {
+        crate::VmGetOutcome::Value(v) => Ok(v),
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+            interp
+                .run_callable_sync(&exec, &getter, receiver.clone(), args)
+                .map_err(vm_err_to_native(name))
+        }
+    }
+}
+
+/// §7.3.21 `SpeciesConstructor(O, defaultConstructor)`. Resolves the
+/// constructor to use when an algorithm needs to materialise a new
+/// instance derived from `O`. Returns the default when `constructor`
+/// is absent / undefined, throws TypeError on the spec-mandated
+/// invalid shapes, and otherwise hands back `Symbol.species` (or the
+/// constructor itself when species is absent / nullish).
+fn species_constructor_runtime(
+    ctx: &mut NativeCtx<'_>,
+    obj: &Value,
+    default_ctor: &Value,
+    name: &'static str,
+) -> Result<Value, crate::NativeError> {
+    let c = get_property_runtime(ctx, obj, "constructor", name)?;
+    if matches!(c, Value::Undefined) {
+        return Ok(default_ctor.clone());
+    }
+    if !is_object_kind(&c) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "constructor is not an Object".to_string(),
+        });
+    }
+    let species_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Species);
+    let s = get_symbol_property_runtime(ctx, &c, &species_sym, name)?;
+    if matches!(s, Value::Undefined | Value::Null) {
+        return Ok(c);
+    }
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+        name,
+        reason: "missing execution context".to_string(),
+    })?;
+    if crate::abstract_ops::is_constructor(&s, &exec, &interp.gc_heap) {
+        return Ok(s);
+    }
+    Err(crate::NativeError::TypeError {
+        name,
+        reason: "Symbol.species is not a constructor".to_string(),
+    })
+}
+
+/// §22.2.6.14 `RegExp.prototype[@@split](string, limit)`.
+///
+/// Walks the spec-mandated `SpeciesConstructor` → `Construct(C, [rx,
+/// newFlags])` → looped `RegExpExec(splitter, S)` ladder. The
+/// splitter is forced into sticky mode so each step probes one
+/// position; `lastIndex` is read / written observably through the
+/// interpreter helpers so user-defined accessors / proxies see every
+/// transition. Empty-match positions advance via
+/// `AdvanceStringIndex` (§22.2.7.3) keyed off the `u` / `v` flags.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@split>
+pub fn native_regexp_symbol_split(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let name = "RegExp.prototype[@@split]";
+    let receiver = ctx.this_value().clone();
+    if !is_object_kind(&receiver) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "called on a non-object receiver".to_string(),
+        });
+    }
+    let string_arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let limit_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+
+    // Step 4 — S = ? ToString(string).
+    let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
+    let s_units = s.to_utf16_vec();
+    let size = s_units.len();
+
+    // Step 5 — C = ? SpeciesConstructor(rx, %RegExp%).
+    let default_ctor = {
+        let interp = &ctx.cx.interp;
+        crate::object::get(interp.global_this, &interp.gc_heap, "RegExp").ok_or_else(|| {
+            crate::NativeError::TypeError {
+                name,
+                reason: "%RegExp% intrinsic missing".to_string(),
+            }
+        })?
+    };
+    let c = species_constructor_runtime(ctx, &receiver, &default_ctor, name)?;
+
+    // Step 6-8 — flags = ToString(Get(rx, "flags")). newFlags appends
+    // `y` so the splitter probes exactly the requested position each
+    // step. `unicodeMatching` keys off `u` or `v`.
+    let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
+    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string();
+    let unicode_matching = flags_str.contains('u') || flags_str.contains('v');
+    let new_flags = if flags_str.contains('y') {
+        flags_str.clone()
+    } else {
+        let mut combined = String::with_capacity(flags_str.len() + 1);
+        combined.push_str(&flags_str);
+        combined.push('y');
+        combined
+    };
+    let new_flags_js = {
+        let string_heap = ctx.cx.interp.string_heap_clone();
+        JsString::from_str(&new_flags, &string_heap).map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "out of memory".to_string(),
+        })?
+    };
+
+    // Step 9 — splitter = ? Construct(C, [rx, newFlags]).
+    let splitter = {
+        let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        ctor_args.push(receiver.clone());
+        ctor_args.push(Value::String(new_flags_js));
+        let (interp, exec_ctx) = ctx.interp_mut_and_context();
+        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        interp
+            .run_construct_sync(&exec_ctx, &c, c.clone(), ctor_args)
+            .map_err(vm_err_to_native(name))?
+    };
+
+    // Step 13 — lim = limit === undefined ? 2^32 - 1 : ToUint32(limit).
+    let lim: u32 = if matches!(limit_arg, Value::Undefined) {
+        u32::MAX
+    } else {
+        let primitive = if crate::abstract_ops::is_primitive(&limit_arg) {
+            limit_arg.clone()
+        } else {
+            let (interp, exec) = ctx.interp_mut_and_context();
+            let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+            interp
+                .evaluate_to_primitive(&exec, &limit_arg, crate::abstract_ops::ToPrimitiveHint::Number)
+                .map_err(vm_err_to_native(name))?
+        };
+        let n = crate::number::to_number_value(&primitive);
+        if n.is_nan() {
+            0
+        } else {
+            // ToUint32 modulo 2^32.
+            let truncated = n.trunc();
+            let modulo = truncated.rem_euclid(4_294_967_296.0);
+            modulo as u32
+        }
+    };
+
+    let mut out_elements: Vec<Value> = Vec::new();
+
+    // Step 14 — lim == 0 short-circuits to an empty array.
+    if lim == 0 {
+        let arr = ctx
+            .array_from_elements_with_roots(out_elements.into_iter(), &[&splitter], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "array allocation failed".to_string(),
+            })?;
+        return Ok(Value::Array(arr));
+    }
+
+    // Step 16 — empty S: one probe; if exec yields a match, return
+    // empty array, otherwise return `[S]`.
+    if size == 0 {
+        let z = regexp_exec_runtime(ctx, &splitter, &s, name)?;
+        if !matches!(z, Value::Null) {
+            let arr = ctx
+                .array_from_elements_with_roots(out_elements.into_iter(), &[&splitter], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name,
+                    reason: "array allocation failed".to_string(),
+                })?;
+            return Ok(Value::Array(arr));
+        }
+        out_elements.push(Value::String(s.clone()));
+        let arr = ctx
+            .array_from_elements_with_roots(
+                out_elements.iter().cloned(),
+                &[&splitter],
+                &[out_elements.as_slice()],
+            )
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "array allocation failed".to_string(),
+            })?;
+        return Ok(Value::Array(arr));
+    }
+
+    // Step 17-21 — main loop.
+    let mut p: usize = 0;
+    let mut q: usize = 0;
+    while q < size {
+        set_property_runtime(
+            ctx,
+            &splitter,
+            "lastIndex",
+            Value::Number(NumberValue::from_f64(q as f64)),
+            name,
+        )?;
+        let z = regexp_exec_runtime(ctx, &splitter, &s, name)?;
+        if matches!(z, Value::Null) {
+            q = advance_string_index(&s_units, q, unicode_matching);
+            continue;
+        }
+        let last_index_val = get_property_runtime(ctx, &splitter, "lastIndex", name)?;
+        let e_raw = to_length_runtime(ctx, &last_index_val, name)? as usize;
+        let e = e_raw.min(size);
+        if e == p {
+            q = advance_string_index(&s_units, q, unicode_matching);
+            continue;
+        }
+        let part = JsString::from_utf16_units(&s_units[p..q], &ctx.cx.interp.string_heap_clone())
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "out of memory".to_string(),
+            })?;
+        out_elements.push(Value::String(part));
+        if out_elements.len() as u32 == lim {
+            let arr = ctx
+                .array_from_elements_with_roots(
+                    out_elements.iter().cloned(),
+                    &[&splitter],
+                    &[out_elements.as_slice()],
+                )
+                .map_err(|_| crate::NativeError::TypeError {
+                    name,
+                    reason: "array allocation failed".to_string(),
+                })?;
+            return Ok(Value::Array(arr));
+        }
+        p = e;
+        let length_val = get_property_runtime(ctx, &z, "length", name)?;
+        let number_of_captures =
+            (to_length_runtime(ctx, &length_val, name)? as usize).saturating_sub(1);
+        for i in 1..=number_of_captures {
+            let cap_key = i.to_string();
+            let next_capture = get_property_runtime(ctx, &z, &cap_key, name)?;
+            out_elements.push(next_capture);
+            if out_elements.len() as u32 == lim {
+                let arr = ctx
+                    .array_from_elements_with_roots(
+                        out_elements.iter().cloned(),
+                        &[&splitter],
+                        &[out_elements.as_slice()],
+                    )
+                    .map_err(|_| crate::NativeError::TypeError {
+                        name,
+                        reason: "array allocation failed".to_string(),
+                    })?;
+                return Ok(Value::Array(arr));
+            }
+        }
+        q = p;
+    }
+
+    // Step 22 — trailing slice from `p` to end.
+    let tail = JsString::from_utf16_units(&s_units[p..size], &ctx.cx.interp.string_heap_clone())
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "out of memory".to_string(),
+        })?;
+    out_elements.push(Value::String(tail));
+    let arr = ctx
+        .array_from_elements_with_roots(
+            out_elements.iter().cloned(),
+            &[&splitter],
+            &[out_elements.as_slice()],
+        )
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "array allocation failed".to_string(),
+        })?;
+    Ok(Value::Array(arr))
+}
+
 /// §22.2.6.11.1 `GetSubstitution(matched, str, position, captures,
 /// namedCaptures, replacementTemplate)`. Translates the `$$`, `$&`,
 /// `` $` ``, `$'`, `$n`, `$nn`, `$<name>` substitution markers into

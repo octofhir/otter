@@ -138,6 +138,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     let match_sym = well_known.get(WellKnown::Match);
     let search_sym = well_known.get(WellKnown::Search);
     let replace_sym = well_known.get(WellKnown::Replace);
+    let split_sym = well_known.get(WellKnown::Split);
     let match_fn = crate::bootstrap::native_static_with_value_roots(
         heap,
         "[Symbol.match]",
@@ -159,6 +160,14 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         "[Symbol.replace]",
         2,
         crate::regexp_prototype::native_regexp_symbol_replace,
+        &[&prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let split_fn = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "[Symbol.split]",
+        2,
+        crate::regexp_prototype::native_regexp_symbol_split,
         &[&prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
@@ -192,6 +201,18 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         &replace_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::NativeFunction(replace_fn)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &split_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::NativeFunction(split_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),

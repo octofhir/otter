@@ -334,12 +334,95 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
     ))
 }
 
+/// §22.2.6.4 `get RegExp.prototype.flags`. Generic over any
+/// receiver: reads each flag property via `[[Get]]`, applies
+/// `ToBoolean`, and concatenates the flag letter when truthy.
+/// Spec order is `d g i m s u v y` (hasIndices, global, ignoreCase,
+/// multiline, dotAll, unicode, unicodeSets, sticky).
 fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let re = receiver_regexp(ctx, "get RegExp.prototype.flags")?;
-    let flags = re.flags(ctx.heap()).to_js_string();
+    let receiver = ctx.this_value().clone();
+    if !matches!(
+        receiver,
+        Value::Object(_)
+            | Value::RegExp(_)
+            | Value::Proxy(_)
+            | Value::Array(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::Promise(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+    ) {
+        return Err(NativeError::TypeError {
+            name: "get RegExp.prototype.flags",
+            reason: "this value must be an Object".to_string(),
+        });
+    }
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| NativeError::TypeError {
+        name: "get RegExp.prototype.flags",
+        reason: "missing execution context".to_string(),
+    })?;
+    let mut out = String::with_capacity(8);
+    let map_err = |e: crate::VmError| match e {
+        crate::VmError::Uncaught { value } => NativeError::Thrown {
+            name: "get RegExp.prototype.flags",
+            message: value,
+        },
+        crate::VmError::TypeError { message } => NativeError::TypeError {
+            name: "get RegExp.prototype.flags",
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name: "get RegExp.prototype.flags",
+            reason: other.to_string(),
+        },
+    };
+    for &(prop, letter) in &[
+        ("hasIndices", 'd'),
+        ("global", 'g'),
+        ("ignoreCase", 'i'),
+        ("multiline", 'm'),
+        ("dotAll", 's'),
+        ("unicode", 'u'),
+        ("unicodeSets", 'v'),
+        ("sticky", 'y'),
+    ] {
+        let outcome = interp
+            .ordinary_get_value(
+                &exec,
+                receiver.clone(),
+                receiver.clone(),
+                &crate::VmPropertyKey::String(prop),
+                0,
+            )
+            .map_err(map_err)?;
+        let value = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp
+                    .run_callable_sync(&exec, &getter, receiver.clone(), args)
+                    .map_err(map_err)?
+            }
+        };
+        if value.to_boolean() {
+            out.push(letter);
+        }
+    }
     let string_heap = ctx.interp_mut().string_heap_clone();
     Ok(Value::String(
-        JsString::from_str(&flags, &string_heap).map_err(|_| oom("flags"))?,
+        JsString::from_str(&out, &string_heap).map_err(|_| oom("flags"))?,
     ))
 }
 

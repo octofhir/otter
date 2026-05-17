@@ -1763,7 +1763,10 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
             prototype,
             vec![global_root.clone(), constructor_root.clone()],
         );
-        for spec in crate::date::prototype::DATE_PROTOTYPE_METHODS {
+        for spec in crate::date::prototype::DATE_PROTOTYPE_METHODS
+            .iter()
+            .chain(crate::date::prototype::DATE_PROTOTYPE_EXTRA_METHODS)
+        {
             builder.method_from_spec(spec)?;
         }
     }

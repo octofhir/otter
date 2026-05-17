@@ -18,20 +18,27 @@
 //! - [`lookup`] — convenience accessor used by the dispatcher.
 //! - [`DATE_PROTOTYPE_METHODS`] — JS-visible method specs installed
 //!   on `Date.prototype` during bootstrap.
+//! - [`DATE_PROTOTYPE_EXTRA_METHODS`] — JS-visible specs that need
+//!   the full [`crate::lib::Interpreter`] entry path (currently
+//!   `toJSON`, which must run a generic `Invoke(O, "toISOString")`
+//!   per §21.4.4.41 step 4).
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-date-prototype-object>
 //! - <https://tc39.es/ecma262/#sec-thistimevalue>
 
+use smallvec::SmallVec;
+
 use super::{broken_down, to_iso_string};
 use crate::Value;
+use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject};
 use crate::string::JsString;
-use crate::{NativeCtx, NativeError};
+use crate::{NativeCtx, NativeError, VmError, VmGetOutcome, VmPropertyKey};
 
 /// `thisTimeValue` (§21.4.1.1): validate the receiver brand and
 /// extract the `[[DateValue]]` slot. Returns the JsObject handle
@@ -521,7 +528,6 @@ date_prototype_methods!(
     bridge_get_utc_milliseconds  => "getUTCMilliseconds",  0;
     bridge_get_timezone_offset   => "getTimezoneOffset",   0;
     bridge_to_iso_string         => "toISOString",         0;
-    bridge_to_json               => "toJSON",              0;
     bridge_to_string             => "toString",            0;
     bridge_to_utc_string         => "toUTCString",         0;
     bridge_to_date_string        => "toDateString",        0;
@@ -547,3 +553,131 @@ date_prototype_methods!(
     bridge_get_year              => "getYear",             0;
     bridge_set_year              => "setYear",             1;
 );
+
+/// §21.4.4.41 — generic `Date.prototype.toJSON(key)`.
+///
+/// 1. Let `O` be `? ToObject(this value)`.
+/// 2. Let `tv` be `? ToPrimitive(O, number)`.
+/// 3. If `tv` is a Number and `tv` is not finite, return `null`.
+/// 4. Return `? Invoke(O, "toISOString")`.
+///
+/// The implementation routes coercion through
+/// [`Interpreter::evaluate_to_primitive`] (so user-installed
+/// `@@toPrimitive` / `valueOf` / `toString` overrides fire per spec)
+/// and re-enters the interpreter to call `toISOString` so subclass
+/// overrides and primitive wrappers (`Number.prototype.toISOString`,
+/// `Symbol.prototype.toISOString`) are observable.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-date.prototype.tojson>
+/// - <https://tc39.es/ecma262/#sec-invoke>
+fn date_prototype_to_json(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    const NAME: &str = "Date.prototype.toJSON";
+    let receiver = ctx.this_value().clone();
+    // §7.1.18 ToObject(undefined / null) → TypeError.
+    if matches!(receiver, Value::Undefined | Value::Null) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "Cannot convert undefined or null to object".to_string(),
+        });
+    }
+
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| NativeError::TypeError {
+        name: NAME,
+        reason: "missing execution context".to_string(),
+    })?;
+
+    // Step 2 — ToPrimitive(O, number).
+    let tv = interp
+        .evaluate_to_primitive(&exec, &receiver, ToPrimitiveHint::Number)
+        .map_err(|err| vm_to_native(NAME, err))?;
+    // Step 3 — non-finite Number → null.
+    if let Value::Number(n) = &tv
+        && !n.as_f64().is_finite()
+    {
+        return Ok(Value::Null);
+    }
+
+    // Step 4 — Invoke(O, "toISOString").
+    let method = match &receiver {
+        Value::Number(_) | Value::Boolean(_) | Value::String(_) | Value::Symbol(_) => {
+            // Primitive: walk the per-realm wrapper prototype so
+            // `Number.prototype.toISOString` / similar resolve, but
+            // pass the primitive as the observable `this`.
+            let proto = interp
+                .intrinsic_prototype_object_for(&receiver)
+                .ok_or_else(|| NativeError::TypeError {
+                    name: NAME,
+                    reason: "no intrinsic prototype for receiver".to_string(),
+                })?;
+            interp.ordinary_get_value(
+                &exec,
+                Value::Object(proto),
+                receiver.clone(),
+                &VmPropertyKey::String("toISOString"),
+                0,
+            )
+        }
+        _ => interp.ordinary_get_value(
+            &exec,
+            receiver.clone(),
+            receiver.clone(),
+            &VmPropertyKey::String("toISOString"),
+            0,
+        ),
+    }
+    .map_err(|err| vm_to_native(NAME, err))?;
+    let method = match method {
+        VmGetOutcome::Value(v) => v,
+        VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(&exec, &getter, receiver.clone(), SmallVec::new())
+            .map_err(|err| vm_to_native(NAME, err))?,
+    };
+    if !abstract_ops::is_callable(&method) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "toISOString is not callable".to_string(),
+        });
+    }
+    interp
+        .run_callable_sync(&exec, &method, receiver, SmallVec::new())
+        .map_err(|err| vm_to_native(NAME, err))
+}
+
+/// `VmError → NativeError` mapper used by the generic `toJSON` bridge.
+/// Preserves user-thrown values via `NativeError::Thrown` so the
+/// outer runtime mapper rebuilds the original JS exception payload.
+fn vm_to_native(name: &'static str, err: VmError) -> NativeError {
+    match err {
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name,
+            reason: other.to_string(),
+        },
+    }
+}
+
+/// Extra method specs that need the full interpreter entry path
+/// (cannot be expressed through the
+/// [`IntrinsicArgs`]-based `native_date_method` bridge).
+pub static DATE_PROTOTYPE_EXTRA_METHODS: &[MethodSpec] = &[MethodSpec {
+    name: "toJSON",
+    length: 1,
+    attrs: Attr::builtin_function(),
+    call: NativeCall::Static(date_prototype_to_json),
+}];

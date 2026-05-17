@@ -38,20 +38,6 @@ fn receiver_regexp<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsRegExp, Intr
     }
 }
 
-fn arg_string<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Result<&'a JsString, IntrinsicError> {
-    match args.args.get(index as usize) {
-        Some(Value::String(s)) => Ok(s),
-        Some(_) => Err(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a string",
-        }),
-        None => Err(IntrinsicError::BadArgument {
-            index,
-            reason: "is required",
-        }),
-    }
-}
-
 /// Run a single match attempt and return the resulting JS array
 /// (`[fullMatch, ...captureGroups]`) or `Value::Null` for no match.
 /// Honours the `g` / `y` flag state stored on the receiver.
@@ -514,17 +500,48 @@ fn pair_array_native(
 
 fn impl_exec(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
-    let text = arg_string(args, 0)?.clone();
+    let text = arg_to_string_primitive(args, 0)?;
     let re_clone = *re;
     exec_once(&re_clone, &text, args)
 }
 
 fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re = receiver_regexp(args)?;
-    let text = arg_string(args, 0)?.clone();
+    let text = arg_to_string_primitive(args, 0)?;
     let re_clone = *re;
     let result = exec_once(&re_clone, &text, args)?;
     Ok(Value::Boolean(!matches!(result, Value::Null)))
+}
+
+/// §22.2.7.1 step 4 — `Let S be ? ToString(string)`. Coerces every
+/// primitive shape (Number / Boolean / Null / Undefined / BigInt /
+/// String) to a fresh `JsString`. Object operands fall back to
+/// "[object Object]" matching V8 for the no-context intrinsic path
+/// (full `@@toPrimitive` / `valueOf` / `toString` coercion belongs
+/// in the runtime entry point that already routes
+/// `RegExp.prototype.exec` calls through `evaluate_to_primitive`).
+fn arg_to_string_primitive(
+    args: &IntrinsicArgs<'_>,
+    index: usize,
+) -> Result<JsString, IntrinsicError> {
+    let raw = args.args.get(index).cloned().unwrap_or(Value::Undefined);
+    let text: String = match &raw {
+        Value::String(s) => return Ok(s.clone()),
+        Value::Undefined => "undefined".to_string(),
+        Value::Null => "null".to_string(),
+        Value::Boolean(true) => "true".to_string(),
+        Value::Boolean(false) => "false".to_string(),
+        Value::Number(n) => n.to_display_string(),
+        Value::BigInt(b) => b.to_decimal_string(),
+        Value::Symbol(_) => {
+            return Err(IntrinsicError::BadArgument {
+                index: index as u16,
+                reason: "cannot convert a Symbol to a string",
+            });
+        }
+        other => other.display_string(),
+    };
+    Ok(JsString::from_str(&text, args.string_heap)?)
 }
 
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

@@ -1530,7 +1530,38 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
 }
 
 fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+    use crate::js_surface::MethodSpec;
+    use crate::native_function::NativeCall;
     use crate::{JsString, NativeCtx, NativeError};
+
+    // §21.4.3 Date statics — trampolines that route to the typed
+    // dispatcher with no `this`. The constructor's
+    // `[[Construct]]` / `[[Call]]` slot still handles the
+    // `Date(...)` and `new Date(...)` shapes via `date_ctor_call`.
+    fn date_now_call(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::Now, &[]).map_err(
+            |err| NativeError::TypeError {
+                name: "Date.now",
+                reason: err.to_string(),
+            },
+        )
+    }
+    fn date_parse_call(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::Parse, args).map_err(
+            |err| NativeError::TypeError {
+                name: "Date.parse",
+                reason: err.to_string(),
+            },
+        )
+    }
+    fn date_utc_call(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        crate::date::dispatch::call(otter_bytecode::method_id::DateMethod::UTC, args).map_err(
+            |err| NativeError::TypeError {
+                name: "Date.UTC",
+                reason: err.to_string(),
+            },
+        )
+    }
 
     fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let date =
@@ -1592,6 +1623,33 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         for spec in crate::date::prototype::DATE_PROTOTYPE_METHODS {
             builder.method_from_spec(spec)?;
         }
+    }
+
+    // §21.4.3 statics — `Date.now()`, `Date.parse(str)`, `Date.UTC(...)`.
+    {
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            constructor,
+            vec![global_root.clone(), prototype_root.clone()],
+        );
+        builder.method_from_spec(&MethodSpec {
+            name: "now",
+            length: 0,
+            attrs: Attr::builtin_function(),
+            call: NativeCall::Static(date_now_call),
+        })?;
+        builder.method_from_spec(&MethodSpec {
+            name: "parse",
+            length: 1,
+            attrs: Attr::builtin_function(),
+            call: NativeCall::Static(date_parse_call),
+        })?;
+        builder.method_from_spec(&MethodSpec {
+            name: "UTC",
+            length: 7,
+            attrs: Attr::builtin_function(),
+            call: NativeCall::Static(date_utc_call),
+        })?;
     }
 
     let date_value = Value::Object(constructor);

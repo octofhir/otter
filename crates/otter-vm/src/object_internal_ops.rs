@@ -1867,6 +1867,25 @@ impl Interpreter {
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
+            // §7.1.18 ToObject — primitive Boolean / Number / Symbol
+            // receivers walk the matching wrapper prototype so
+            // inherited `Object.prototype.*` methods surface for
+            // direct property reads (`(true).toLocaleString`,
+            // `(1).hasOwnProperty`, …). Strings have a richer custom
+            // path (indexed chars + `length`) higher up.
+            Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) => {
+                let proto_name = match base {
+                    Value::Boolean(_) => "Boolean",
+                    Value::Number(_) => "Number",
+                    Value::Symbol(_) => "Symbol",
+                    _ => unreachable!(),
+                };
+                let proto = self.constructor_prototype_value(proto_name)?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
             // §26.1.4 / §26.2.4 — walk the realm prototype for
             // `WeakRef` / `FinalizationRegistry` instances.
             Value::WeakRef(_) | Value::FinalizationRegistry(_) => {

@@ -728,6 +728,31 @@ impl Interpreter {
                     None => None,
                 }
             }
+            // §7.1.18 ToObject — primitive receivers walk the
+            // constructor's prototype to surface inherited
+            // `Object.prototype.*` methods (e.g.
+            // `true.toLocaleString()`). Method-table lookups above
+            // already resolved Number / Boolean / Symbol /
+            // BigInt-specific intrinsics; reaching this arm means
+            // the call is hitting an inherited Object.prototype
+            // (or user-monkey-patched constructor.prototype) method.
+            Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_) => {
+                let key = VmPropertyKey::String(name);
+                match self.ordinary_get_value(
+                    context,
+                    recv_value.clone(),
+                    recv_value.clone(),
+                    &key,
+                    0,
+                )? {
+                    VmGetOutcome::Value(value) if !matches!(value, Value::Undefined) => Some(value),
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        Some(self.run_callable_sync(context, &getter, recv_value.clone(), args)?)
+                    }
+                    _ => None,
+                }
+            }
             _ => None,
         };
         if let Some(method) = lookup_via_property {

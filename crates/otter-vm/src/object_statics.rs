@@ -954,17 +954,39 @@ fn native_prototype_value_of(
     Ok(ctx.this_value().clone())
 }
 
-/// §20.1.3.5 `Object.prototype.toLocaleString` — foundation form.
+/// §20.1.3.5 `Object.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] )`.
 ///
-/// Spec algorithm: `return ? Invoke(O, "toString")`. We forward to
-/// `Object.prototype.toString` directly so the result matches the
-/// `[object <tag>]` shape the spec mandates. Once user code overrides
-/// `Symbol.toPrimitive` / locale-aware `toString` overloads we'll
-/// route this through the standard `Invoke` ladder.
+/// 1. Let `O` be the this value.
+/// 2. Return `? Invoke(O, "toString")`.
+///
+/// Routes through the `Invoke` ladder so user-installed
+/// `Boolean.prototype.toString` / `Number.prototype.toString` /
+/// other receiver-side overrides are observable. Falls back to
+/// `Object.prototype.toString` when no execution context is wired
+/// (sync-only fast path used by some embedders).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-object.prototype.tolocalestring>
 fn native_prototype_to_locale_string(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    if let Some(context) = ctx.execution_context().cloned() {
+        let callee = ctx
+            .cx
+            .interp
+            .get_property_value_for_call(&context, this_value.clone(), "toString")
+            .map_err(|err| object_native_error("toLocaleString", err))?;
+        if crate::is_callable_value(&callee) {
+            let result = ctx
+                .cx
+                .interp
+                .run_callable_sync(&context, &callee, this_value, smallvec::SmallVec::new())
+                .map_err(|err| object_native_error("toLocaleString", err))?;
+            return Ok(result);
+        }
+    }
     native_prototype_to_string(ctx, args)
 }
 

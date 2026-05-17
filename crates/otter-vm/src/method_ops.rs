@@ -421,7 +421,26 @@ impl Interpreter {
         // properties surface as `NotCallable` so callers see the
         // same error as `obj.notFn()`.
         let lookup_via_property = match &recv_value {
-            Value::Object(_) | Value::Proxy(_) => {
+            // Property-bearing exotic receivers all route through
+            // `ordinary_get_value` so user-installed own properties
+            // (e.g. `arr.getClass = Object.prototype.toString`)
+            // shadow the intrinsic-table miss path and surface a
+            // callable for the dispatch ladder.
+            Value::Object(_)
+            | Value::Proxy(_)
+            | Value::Array(_)
+            | Value::Date(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::Promise(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_) => {
                 let key = VmPropertyKey::String(name);
                 match self.ordinary_get_value(
                     context,

@@ -295,12 +295,12 @@ impl Interpreter {
                         | Value::Symbol(_)
                 );
                 if needs_coercion {
-                    let coerced_key =
-                        self.evaluate_to_property_key(context, &key_arg)?;
+                    let coerced_key = self.evaluate_to_property_key(context, &key_arg)?;
                     let coerced_value = match &coerced_key {
                         crate::VmPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
                         other => Value::String(crate::string::JsString::from_str(
-                            other.string_name()
+                            other
+                                .string_name()
                                 .expect("non-symbol key has string spelling"),
                             &self.string_heap,
                         )?),
@@ -311,33 +311,29 @@ impl Interpreter {
                     } else {
                         rewritten.push(coerced_value);
                     }
-                    let result =
-                        if let Some(result) = self.try_function_object_static_call(
-                            Some(context),
-                            Some(stack),
+                    let result = if let Some(result) = self.try_function_object_static_call(
+                        Some(context),
+                        Some(stack),
+                        method,
+                        &rewritten,
+                    )? {
+                        result
+                    } else if let Some(result) =
+                        self.try_proxy_object_static_call(context, Some(stack), method, &rewritten)?
+                    {
+                        result
+                    } else if let Some(result) =
+                        self.object_static_call_stack_rooted(stack, method, &rewritten)?
+                    {
+                        result
+                    } else {
+                        object_statics::call(
                             method,
                             &rewritten,
-                        )? {
-                            result
-                        } else if let Some(result) = self.try_proxy_object_static_call(
-                            context,
-                            Some(stack),
-                            method,
-                            &rewritten,
-                        )? {
-                            result
-                        } else if let Some(result) = self
-                            .object_static_call_stack_rooted(stack, method, &rewritten)?
-                        {
-                            result
-                        } else {
-                            object_statics::call(
-                                method,
-                                &rewritten,
-                                &self.string_heap,
-                                &mut self.gc_heap,
-                            )?
-                        };
+                            &self.string_heap,
+                            &mut self.gc_heap,
+                        )?
+                    };
                     return finish_static_call(&mut stack[top_idx], dst, result);
                 }
             }
@@ -393,24 +389,84 @@ impl Interpreter {
         if let Some(props_arg) = args.get(1)
             && !matches!(props_arg, Value::Undefined)
         {
-            let props = match props_arg {
-                Value::Object(object) => *object,
+            // §20.1.2.2 step 4 — `properties = ToObject(Properties)`.
+            // Plain `Value::Object` uses `with_properties` directly;
+            // ClassConstructor / Array / Function-like sources route
+            // through their respective enumerable-own-key probes so
+            // user code can pass `Object.create({}, function() { ...
+            // })` with own data properties installed on the
+            // function.
+            let entries: Vec<(String, Value)> = match props_arg {
+                Value::Object(o) => object::with_properties(*o, self.gc_heap(), |p| {
+                    p.enumerable_data_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect()
+                }),
+                Value::ClassConstructor(class) => {
+                    object::with_properties(class.statics(self.gc_heap()), self.gc_heap(), |p| {
+                        p.enumerable_data_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect()
+                    })
+                }
+                Value::Array(arr) => {
+                    let mut out: Vec<(String, Value)> = Vec::new();
+                    let dense: Vec<Value> = array::with_elements(*arr, self.gc_heap(), |els| {
+                        els.iter().cloned().collect()
+                    });
+                    for (idx, v) in dense.into_iter().enumerate() {
+                        out.push((idx.to_string(), v));
+                    }
+                    let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
+                        body.named_properties.as_ref().map_or_else(Vec::new, |m| {
+                            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                        })
+                    });
+                    out.extend(named);
+                    out
+                }
+                Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                    // Function objects carry a user-properties bag —
+                    // an ordinary JsObject — accessed via the
+                    // function-id keyed side table on the runtime.
+                    // Iterate its enumerable own data entries.
+                    let fid = *function_id;
+                    self.function_user_props
+                        .get(&fid)
+                        .copied()
+                        .map_or_else(Vec::new, |bag| {
+                            object::with_properties(bag, self.gc_heap(), |p| {
+                                p.enumerable_data_iter()
+                                    .map(|(k, v)| (k.to_string(), v))
+                                    .collect()
+                            })
+                        })
+                }
+                Value::NativeFunction(native) => native
+                    .enumerable_own_property_keys(self.gc_heap())
+                    .into_iter()
+                    .filter_map(|key| {
+                        match native.own_property_descriptor(
+                            self.gc_heap(),
+                            &self.string_heap,
+                            &key,
+                        ) {
+                            Ok(Some(desc)) => Some((
+                                key,
+                                match &desc.kind {
+                                    object::DescriptorKind::Data { value } => value.clone(),
+                                    _ => Value::Undefined,
+                                },
+                            )),
+                            _ => None,
+                        }
+                    })
+                    .collect(),
                 _ => return Err(VmError::TypeMismatch),
             };
-            let entries: Vec<(String, Value)> =
-                object::with_properties(props, self.gc_heap(), |p| {
-                    p.enumerable_data_iter()
-                        .map(|(key, value)| (key.to_string(), value))
-                        .collect()
-                });
             for (key, desc_value) in entries {
                 let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
-                if !object::define_own_property_partial(
-                    obj,
-                    &mut self.gc_heap,
-                    &key,
-                    descriptor,
-                ) {
+                if !object::define_own_property_partial(obj, &mut self.gc_heap, &key, descriptor) {
                     return Err(VmError::TypeError {
                         message: format!("Cannot define property '{key}'"),
                     });
@@ -478,9 +534,8 @@ impl Interpreter {
                 // §22.1.3.3 EnumerableOwnPropertyNames for Array —
                 // indices in storage order, then any named props.
                 let mut out: Vec<(String, Value)> = Vec::new();
-                let dense: Vec<Value> = array::with_elements(*arr, self.gc_heap(), |els| {
-                    els.iter().cloned().collect()
-                });
+                let dense: Vec<Value> =
+                    array::with_elements(*arr, self.gc_heap(), |els| els.iter().cloned().collect());
                 for (idx, v) in dense.into_iter().enumerate() {
                     out.push((idx.to_string(), v));
                 }
@@ -601,11 +656,9 @@ impl Interpreter {
                     for (idx, ch) in lossy.chars().enumerate() {
                         let mut buf = [0u16; 2];
                         let units = ch.encode_utf16(&mut buf);
-                        let unit_string = crate::string::JsString::from_utf16_units(
-                            units,
-                            &self.string_heap,
-                        )
-                        .map_err(|_| VmError::TypeMismatch)?;
+                        let unit_string =
+                            crate::string::JsString::from_utf16_units(units, &self.string_heap)
+                                .map_err(|_| VmError::TypeMismatch)?;
                         object::set(
                             target,
                             &mut self.gc_heap,
@@ -678,12 +731,11 @@ impl Interpreter {
                             .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
                             .map(|i| i.to_string())
                             .collect();
-                        let named: Vec<String> =
-                            self.gc_heap().read_payload(*arr, |body| {
-                                body.named_properties
-                                    .as_ref()
-                                    .map_or_else(Vec::new, |m| m.keys().cloned().collect())
-                            });
+                        let named: Vec<String> = self.gc_heap().read_payload(*arr, |body| {
+                            body.named_properties
+                                .as_ref()
+                                .map_or_else(Vec::new, |m| m.keys().cloned().collect())
+                        });
                         keys.extend(named);
                         keys
                     }
@@ -708,9 +760,11 @@ impl Interpreter {
             }
             M::Values => {
                 let values: Vec<Value> = match args.first() {
-                    Some(Value::Object(target)) => object::with_properties(*target, self.gc_heap(), |p| {
-                        p.enumerable_data_iter().map(|(_, value)| value).collect()
-                    }),
+                    Some(Value::Object(target)) => {
+                        object::with_properties(*target, self.gc_heap(), |p| {
+                            p.enumerable_data_iter().map(|(_, value)| value).collect()
+                        })
+                    }
                     Some(Value::Boolean(_))
                     | Some(Value::Number(_))
                     | Some(Value::Symbol(_))
@@ -831,57 +885,47 @@ impl Interpreter {
                                 ),
                                 Value::String(s) => {
                                     let units = s.to_utf16_vec();
-                                    let zero = units.first().copied().map_or(
-                                        Value::Undefined,
-                                        |u| {
+                                    let zero =
+                                        units.first().copied().map_or(Value::Undefined, |u| {
                                             crate::string::JsString::from_utf16_units(
                                                 &[u],
                                                 &self.string_heap,
                                             )
                                             .map(Value::String)
                                             .unwrap_or(Value::Undefined)
-                                        },
-                                    );
-                                    let one = units.get(1).copied().map_or(
-                                        Value::Undefined,
-                                        |u| {
-                                            crate::string::JsString::from_utf16_units(
-                                                &[u],
-                                                &self.string_heap,
-                                            )
-                                            .map(Value::String)
-                                            .unwrap_or(Value::Undefined)
-                                        },
-                                    );
+                                        });
+                                    let one = units.get(1).copied().map_or(Value::Undefined, |u| {
+                                        crate::string::JsString::from_utf16_units(
+                                            &[u],
+                                            &self.string_heap,
+                                        )
+                                        .map(Value::String)
+                                        .unwrap_or(Value::Undefined)
+                                    });
                                     (zero, one)
                                 }
                                 Value::Object(obj) => {
-                                    if let Some(s) =
-                                        crate::object::string_data(obj, self.gc_heap())
+                                    if let Some(s) = crate::object::string_data(obj, self.gc_heap())
                                     {
                                         let units = s.to_utf16_vec();
-                                        let zero = units.first().copied().map_or(
-                                            Value::Undefined,
-                                            |u| {
+                                        let zero =
+                                            units.first().copied().map_or(Value::Undefined, |u| {
                                                 crate::string::JsString::from_utf16_units(
                                                     &[u],
                                                     &self.string_heap,
                                                 )
                                                 .map(Value::String)
                                                 .unwrap_or(Value::Undefined)
-                                            },
-                                        );
-                                        let one = units.get(1).copied().map_or(
-                                            Value::Undefined,
-                                            |u| {
+                                            });
+                                        let one =
+                                            units.get(1).copied().map_or(Value::Undefined, |u| {
                                                 crate::string::JsString::from_utf16_units(
                                                     &[u],
                                                     &self.string_heap,
                                                 )
                                                 .map(Value::String)
                                                 .unwrap_or(Value::Undefined)
-                                            },
-                                        );
+                                            });
                                         (zero, one)
                                     } else {
                                         let k = crate::object::get(obj, self.gc_heap(), "0")
@@ -947,9 +991,8 @@ impl Interpreter {
                     | Some(Value::BigInt(_)) => None,
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
-                            message:
-                                "Object.getOwnPropertyDescriptor called on null or undefined"
-                                    .to_string(),
+                            message: "Object.getOwnPropertyDescriptor called on null or undefined"
+                                .to_string(),
                         });
                     }
                     _ => {
@@ -980,9 +1023,8 @@ impl Interpreter {
                 match args.first() {
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
-                            message:
-                                "Object.getOwnPropertyDescriptors called on null or undefined"
-                                    .to_string(),
+                            message: "Object.getOwnPropertyDescriptors called on null or undefined"
+                                .to_string(),
                         });
                     }
                     Some(Value::Boolean(_))
@@ -998,11 +1040,9 @@ impl Interpreter {
                         let result_root = Value::Object(result);
                         for (i, u) in units.iter().enumerate() {
                             let key = i.to_string();
-                            let unit = crate::string::JsString::from_utf16_units(
-                                &[*u],
-                                &self.string_heap,
-                            )
-                            .map_err(|_| VmError::TypeMismatch)?;
+                            let unit =
+                                crate::string::JsString::from_utf16_units(&[*u], &self.string_heap)
+                                    .map_err(|_| VmError::TypeMismatch)?;
                             let desc = crate::object::PropertyDescriptor::data(
                                 Value::String(unit),
                                 false,
@@ -1106,9 +1146,9 @@ impl Interpreter {
                             .into_iter()
                             .collect()
                     }
-                    Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_)) => {
-                        Vec::new()
-                    }
+                    Some(
+                        Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_),
+                    ) => Vec::new(),
                     Some(Value::String(s)) => {
                         let mut keys: Vec<String> =
                             (0..s.len()).map(|idx| idx.to_string()).collect();
@@ -1132,9 +1172,8 @@ impl Interpreter {
                     }
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
-                            message:
-                                "Object.getOwnPropertyNames called on null or undefined"
-                                    .to_string(),
+                            message: "Object.getOwnPropertyNames called on null or undefined"
+                                .to_string(),
                         });
                     }
                     _ => return Err(VmError::TypeMismatch),

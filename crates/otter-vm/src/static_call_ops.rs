@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, IteratorState, Value, VmError, VmPropertyKey,
-    abstract_ops, bigint, binary, collections, constructor_return_is_object, date,
+    abstract_ops, array, bigint, binary, collections, constructor_return_is_object, date,
     global_functions, json, json_to_vm_error, math, math_to_vm_error, native_function, object,
     object_statics,
     operand_decode::{const_operand, register_operand},
@@ -384,21 +384,51 @@ impl Interpreter {
                 message: "Object.defineProperties target must be an object".to_string(),
             });
         }
-        let props_keys_source = match args.get(1) {
-            Some(Value::Object(o)) => *o,
-            Some(Value::ClassConstructor(class)) => class.statics(self.gc_heap()),
+        // §20.1.2.3 step 2 — `props = ToObject(Properties)`; the
+        // resulting object is then enumerated for own enumerable
+        // string-keyed names. We accept any Object-typed source and
+        // route the key probe through the unified
+        // `own_enumerable_string_keyed_property_entries` helper so
+        // arrays / functions / class constructors / native functions
+        // behave like ordinary objects here.
+        let props_value = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let entries: Vec<(String, Value)> = match &props_value {
+            Value::Object(o) => object::with_properties(*o, self.gc_heap(), |p| {
+                p.enumerable_data_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect()
+            }),
+            Value::ClassConstructor(class) => {
+                object::with_properties(class.statics(self.gc_heap()), self.gc_heap(), |p| {
+                    p.enumerable_data_iter()
+                        .map(|(k, v)| (k.to_string(), v))
+                        .collect()
+                })
+            }
+            Value::Array(arr) => {
+                // §22.1.3.3 EnumerableOwnPropertyNames for Array —
+                // indices in storage order, then any named props.
+                let mut out: Vec<(String, Value)> = Vec::new();
+                let dense: Vec<Value> = array::with_elements(*arr, self.gc_heap(), |els| {
+                    els.iter().cloned().collect()
+                });
+                for (idx, v) in dense.into_iter().enumerate() {
+                    out.push((idx.to_string(), v));
+                }
+                let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
+                    body.named_properties.as_ref().map_or_else(Vec::new, |m| {
+                        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    })
+                });
+                out.extend(named);
+                out
+            }
             _ => {
                 return Err(VmError::TypeError {
                     message: "Object.defineProperties properties must be an object".to_string(),
                 });
             }
         };
-        let entries: Vec<(String, Value)> =
-            object::with_properties(props_keys_source, self.gc_heap(), |p| {
-                p.enumerable_data_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect()
-            });
         for (key, desc_value) in entries {
             let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
             let vm_key = crate::VmPropertyKey::OwnedString(key.clone());

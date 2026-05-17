@@ -1926,9 +1926,15 @@ mod tests {
         assert_eq!(telemetry.duplicate_names_found(), 0);
         assert_eq!(telemetry.strings_interned(), 0);
         assert_eq!(telemetry.namespace_objects_installed(), 6);
+        // 103 baseline + Object.is / Object.getPrototypeOf /
+        // Object.setPrototypeOf (3) — all installed through the
+        // `OBJECT_SPEC` namespace spec and therefore counted in
+        // `native_functions_installed`. Date's static / prototype
+        // methods are still installed via `ObjectBuilder::method_from_spec`
+        // and don't bump the namespace counter.
         assert_eq!(
             telemetry.native_functions_installed(),
-            103 + reflect::REFLECT_SPEC.methods.len(),
+            106 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

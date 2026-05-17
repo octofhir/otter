@@ -67,6 +67,9 @@ pub static OBJECT_SPEC: NamespaceSpec = NamespaceSpec {
 };
 
 const OBJECT_STATIC_METHODS: &[MethodSpec] = &[
+    method("is", 2, native_is),
+    method("getPrototypeOf", 1, native_get_prototype_of),
+    method("setPrototypeOf", 2, native_set_prototype_of),
     method("create", 2, native_create),
     method("defineProperty", 3, native_define_property),
     method("defineProperties", 2, native_define_properties),
@@ -707,6 +710,74 @@ native_object_static!(native_from_entries, FromEntries);
 native_object_static!(native_has_own, HasOwn);
 native_object_static!(native_get_own_property_names, GetOwnPropertyNames);
 native_object_static!(native_get_own_property_symbols, GetOwnPropertySymbols);
+
+/// §20.1.2.13 `Object.is(value1, value2)` — direct §7.2.11 SameValue.
+///
+/// Mirrors the compile-time `Op::SameValue` lowering so callers that
+/// read the property as a value (e.g.
+/// `Object.getOwnPropertyDescriptor(Object, "is").value`) and then
+/// invoke it through `.call` / `Reflect.apply` see the spec result.
+fn native_is(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let a = args.first().cloned().unwrap_or(Value::Undefined);
+    let b = args.get(1).cloned().unwrap_or(Value::Undefined);
+    Ok(Value::Boolean(crate::abstract_ops::same_value(&a, &b)))
+}
+
+/// §20.1.2.12 `Object.getPrototypeOf(O)` — `[[Prototype]]` of `O`
+/// after ToObject coercion. Primitive operands resolve to their
+/// respective `%X.prototype%` per §7.1.18.
+fn native_get_prototype_of(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let interp = ctx.interp_mut();
+    interp.get_prototype_for_op(&target).map_err(|err| {
+        object_native_error(otter_bytecode::method_id::ObjectMethod::PreventExtensions.name(), err)
+    })
+}
+
+/// §20.1.2.21 `Object.setPrototypeOf(O, proto)` — assigns the
+/// `[[Prototype]]` of `O` to `proto` (which must be Object or Null)
+/// and returns `O` after ToObject coercion checks.
+fn native_set_prototype_of(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let proto = args.get(1).cloned().unwrap_or(Value::Undefined);
+    match (&target, &proto) {
+        (Value::Null | Value::Undefined, _) => {
+            return Err(NativeError::TypeError {
+                name: "Object.setPrototypeOf",
+                reason: "Object.setPrototypeOf called on null or undefined".to_string(),
+            });
+        }
+        (_, Value::Object(_) | Value::Null) => {}
+        _ => {
+            return Err(NativeError::TypeError {
+                name: "Object.setPrototypeOf",
+                reason: "Object.setPrototypeOf prototype must be an Object or null".to_string(),
+            });
+        }
+    }
+    match &target {
+        Value::Object(obj) => {
+            let proto_obj = if let Value::Object(p) = &proto {
+                Some(*p)
+            } else {
+                None
+            };
+            crate::object::set_prototype(*obj, ctx.heap_mut(), proto_obj);
+            Ok(target)
+        }
+        // Primitive operands: ToObject would wrap but spec §20.1.2.21
+        // step 5 says "Return O" unchanged when ToObject would
+        // produce a transient wrapper. We mirror that and skip the
+        // prototype write — the wrapper would be unreachable anyway.
+        _ => Ok(target),
+    }
+}
 
 fn native_prototype_to_string(
     ctx: &mut NativeCtx<'_>,

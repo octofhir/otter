@@ -37,6 +37,27 @@ use crate::string::Interrupted;
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError};
 
+/// §22.1.3.1 thisStringValue / §7.1.17 ToString glue for
+/// `String.prototype.*` receivers.
+///
+/// Spec algorithm per method:
+/// 1. `RequireObjectCoercible(O)` — `null` / `undefined` reject with
+///    TypeError.
+/// 2. `S = ? ToString(O)` — primitives coerce via §7.1.17, wrapper
+///    objects read `[[StringData]]`, plain objects walk the
+///    `Symbol.toPrimitive` / `toString` / `valueOf` ladder (not yet
+///    wired here — see callers of `receiver_string`).
+///
+/// We accept:
+/// - `Value::String` directly.
+/// - `Value::Object` carrying `[[StringData]]` (String wrapper).
+/// - `Value::Boolean` → `"true"` / `"false"`.
+/// - `Value::Number` → display-string form.
+/// - `Value::BigInt` → its decimal display.
+/// - `Value::Symbol` rejects (§22.1.3.7 — Symbol receivers throw
+///   TypeError in every String.prototype.* method).
+/// - `Value::Null` / `Value::Undefined` reject per
+///   `RequireObjectCoercible`.
 fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError> {
     match args.receiver {
         Value::String(s) => Ok(s.clone()),
@@ -45,6 +66,19 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
             crate::object::string_data(*obj, gc)
                 .ok_or(IntrinsicError::BadReceiver { expected: "string" })
         }
+        Value::Boolean(b) => {
+            let text = if *b { "true" } else { "false" };
+            Ok(JsString::from_str(text, args.string_heap)?)
+        }
+        Value::Number(n) => {
+            let text = n.to_display_string();
+            Ok(JsString::from_str(&text, args.string_heap)?)
+        }
+        Value::BigInt(b) => {
+            let text = b.to_decimal_string();
+            Ok(JsString::from_str(&text, args.string_heap)?)
+        }
+        Value::Null | Value::Undefined => Err(IntrinsicError::BadReceiver { expected: "string" }),
         _ => Err(IntrinsicError::BadReceiver { expected: "string" }),
     }
 }

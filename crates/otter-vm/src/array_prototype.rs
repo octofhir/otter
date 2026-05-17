@@ -332,20 +332,84 @@ fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 }
 
 fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let heap = &mut *args.gc_heap;
-    let existing_len = array::len(arr, heap);
-    let mut values: Vec<Value> = args.args.to_vec();
-    array::with_elements(arr, heap, |elements| {
-        values.extend(elements.iter().cloned())
-    });
-    array::with_elements_mut(arr, heap, |elements| {
-        elements.clear();
-        elements.extend(values);
-    });
-    Ok(Value::Number(NumberValue::from_i32(
-        (existing_len + args.args.len()) as i32,
-    )))
+    // §23.1.3.34 — prepend the argument list; existing indices shift
+    // up by `argCount`, length grows by the same amount. Dense Array
+    // keeps the existing vec-rebuild path. Object receiver walks
+    // pre-present indices in **descending** order so writing to
+    // `i + N` doesn't clobber a not-yet-relocated `i + N`.
+    let arg_count = args.args.len();
+    if let Value::Array(arr) = args.receiver {
+        let heap = &mut *args.gc_heap;
+        let existing_len = array::len(*arr, heap);
+        let mut values: Vec<Value> = args.args.to_vec();
+        array::with_elements(*arr, heap, |elements| {
+            values.extend(elements.iter().cloned())
+        });
+        array::with_elements_mut(*arr, heap, |elements| {
+            elements.clear();
+            elements.extend(values);
+        });
+        return Ok(Value::Number(NumberValue::from_i32(
+            (existing_len + arg_count) as i32,
+        )));
+    }
+    if let Value::Object(obj) = args.receiver {
+        let heap_ref = &*args.gc_heap;
+        let existing_len = read_array_like_length(*obj, heap_ref);
+        if arg_count == 0 {
+            // Spec still requires writing `length` back (no-op if it
+            // already equals `existing_len`).
+            let heap = &mut *args.gc_heap;
+            crate::object::set(
+                *obj,
+                heap,
+                "length",
+                Value::Number(NumberValue::from_f64(existing_len as f64)),
+            );
+            return Ok(Value::Number(NumberValue::from_f64(existing_len as f64)));
+        }
+        let entries = array_like_present_entries(args.receiver, heap_ref)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        let pre_present: std::collections::BTreeSet<usize> =
+            entries.iter().map(|(i, _)| *i).collect();
+        let heap = &mut *args.gc_heap;
+        // Walk descending so destination slot is never live yet.
+        for (i, v) in entries.into_iter().rev() {
+            let new_idx = i + arg_count;
+            crate::object::set(*obj, heap, &new_idx.to_string(), v);
+        }
+        // Positions in `[0, arg_count)` that originally held a
+        // pre-present value but whose post-shift writer doesn't
+        // overwrite them need explicit delete. After the shift, the
+        // new present positions are `{i + arg_count for i in
+        // pre_present}`; positions in pre_present \ post_present
+        // must be cleared.
+        let post_present: std::collections::BTreeSet<usize> =
+            pre_present.iter().map(|&i| i + arg_count).collect();
+        for &i in &pre_present {
+            if !post_present.contains(&i) && i < arg_count {
+                // Will be overwritten by the prepend below, no need
+                // to delete.
+                continue;
+            }
+            if !post_present.contains(&i) {
+                let _ = crate::object::delete(*obj, heap, &i.to_string());
+            }
+        }
+        // Prepend the new items at indices 0..arg_count.
+        for (i, v) in args.args.iter().enumerate() {
+            crate::object::set(*obj, heap, &i.to_string(), v.clone());
+        }
+        let new_len = existing_len + arg_count;
+        crate::object::set(
+            *obj,
+            heap,
+            "length",
+            Value::Number(NumberValue::from_f64(new_len as f64)),
+        );
+        return Ok(Value::Number(NumberValue::from_f64(new_len as f64)));
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

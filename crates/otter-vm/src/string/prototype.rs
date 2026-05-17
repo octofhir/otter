@@ -664,6 +664,50 @@ fn create_html(
     Ok(Value::String(JsString::from_str(&out, args.string_heap)?))
 }
 
+/// §B.2.3.1 `String.prototype.substr(start, length)`.
+///
+/// 1. Let `O` be `? RequireObjectCoercible(this)`.
+/// 2. Let `S` be `? ToString(O)`.
+/// 3. Let `size` be the length of `S`.
+/// 4. Let `intStart` be `? ToIntegerOrInfinity(start)`. If `-∞`,
+///    clamp to 0; if negative, clamp to `max(size + intStart, 0)`;
+///    else clamp to `min(intStart, size)`.
+/// 5. If `length` is undefined → `intLength = size`; else
+///    `intLength = ? ToIntegerOrInfinity(length)` and clamp to
+///    `min(max(intLength, 0), size - intStart)`.
+/// 6. If `intLength <= 0` return the empty string.
+/// 7. Return the substring of `S` from `intStart` of length `intLength`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-string.prototype.substr>
+fn impl_substr(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let recv = receiver_string(args)?;
+    let size = recv.len() as i64;
+    let raw_start = arg_int_or(args, 0, 0)?;
+    let int_start = if raw_start == i64::MIN {
+        0
+    } else if raw_start < 0 {
+        std::cmp::max(size + raw_start, 0)
+    } else {
+        std::cmp::min(raw_start, size)
+    };
+    let int_length = match args.args.get(1) {
+        None | Some(Value::Undefined) => size,
+        Some(_) => {
+            let raw = arg_int_or(args, 1, 0)?;
+            std::cmp::min(std::cmp::max(raw, 0), size - int_start)
+        }
+    };
+    if int_length <= 0 {
+        return Ok(Value::String(JsString::empty(args.string_heap)?));
+    }
+    Ok(Value::String(recv.slice(
+        int_start as u32,
+        int_length as u32,
+        args.string_heap,
+    )?))
+}
+
 fn impl_anchor(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     create_html(args, "a", Some("name"))
 }
@@ -1331,6 +1375,8 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             // route both through the same intrinsic impls.
             "trimLeft"      / 0 => impl_trim_start,
             "trimRight"     / 0 => impl_trim_end,
+            // §B.2.3.1 AnnexB legacy substr(start, length).
+            "substr"        / 2 => impl_substr,
             // §B.2.3 AnnexB HTML wrappers.
             "anchor"        / 1 => impl_anchor,
             "big"           / 0 => impl_big,
@@ -1769,6 +1815,7 @@ string_prototype_methods!(
     bridge_trim_end        => "trimEnd",        0;
     bridge_trim_left       => "trimLeft",       0;
     bridge_trim_right      => "trimRight",      0;
+    bridge_substr          => "substr",         2;
     bridge_anchor          => "anchor",         1;
     bridge_big             => "big",            0;
     bridge_blink           => "blink",          0;

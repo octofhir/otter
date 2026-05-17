@@ -171,18 +171,19 @@ fn arg_to_string(args: &IntrinsicArgs<'_>, index: u16) -> Result<JsString, Intri
     }
 }
 
-/// Pull a u32 index from arg `index`. Accepts `Value::Number`
-/// (clamped to `[0, u32::MAX]`) or, for foundation-era ergonomics,
-/// `Value::String` whose body parses as a non-negative decimal
-/// integer. Missing arguments collapse to `default`.
+/// Pull a u32 index from arg `index`. §7.1.5 ToUint32 coerces every
+/// spec-relevant operand: `Value::Number` clamps to `[0, u32::MAX]`,
+/// `Value::Boolean` (true → 1, false → 0), `Value::Null` → 0,
+/// `Value::String` parses as decimal (NaN-on-failure clamps to 0
+/// per ToUint32 modulo), `Value::Undefined` and missing arguments
+/// collapse to `default`.
 fn arg_u32_or(args: &IntrinsicArgs<'_>, index: u16, default: u32) -> Result<u32, IntrinsicError> {
     match args.args.get(index as usize) {
-        None => Ok(default),
+        None | Some(Value::Undefined) => Ok(default),
         Some(Value::Number(n)) => Ok(number_to_u32(*n)),
-        Some(Value::String(s)) => parse_index(s).ok_or(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a non-negative integer",
-        }),
+        Some(Value::Boolean(true)) => Ok(1),
+        Some(Value::Boolean(false)) | Some(Value::Null) => Ok(0),
+        Some(Value::String(s)) => Ok(parse_index(s).unwrap_or(0)),
         Some(_) => Err(IntrinsicError::BadArgument {
             index,
             reason: "must be a non-negative integer",
@@ -218,9 +219,23 @@ fn parse_index(s: &JsString) -> Option<u32> {
 /// to [`i64::MIN`] / [`i64::MAX`]; finite floats truncate toward
 /// zero.
 fn arg_int_or(args: &IntrinsicArgs<'_>, index: u16, default: i64) -> Result<i64, IntrinsicError> {
+    // §7.1.5 ToIntegerOrInfinity — coerce the spec-relevant operand
+    // set (Number / Boolean / Null / String) before treating
+    // non-finite / NaN as the default.
     match args.args.get(index as usize) {
         None | Some(Value::Undefined) => Ok(default),
         Some(Value::Number(n)) => Ok(number_to_int(*n)),
+        Some(Value::Boolean(true)) => Ok(1),
+        Some(Value::Boolean(false)) | Some(Value::Null) => Ok(0),
+        Some(Value::String(s)) => {
+            let text = s.to_lossy_string();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                Ok(0)
+            } else {
+                Ok(trimmed.parse::<i64>().unwrap_or(0))
+            }
+        }
         Some(_) => Err(IntrinsicError::BadArgument {
             index,
             reason: "must be a number",
@@ -466,20 +481,16 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 }
 
 fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    // §22.1.3.5 — `for each next of arguments: nextString = ?
+    // ToString(next)`. Coerce every operand via the shared
+    // `arg_to_string` helper (primitives + wrapper objects with
+    // `[[StringData]]`); plain objects without an inherited
+    // `toString` still reject.
     let recv = receiver_string(args)?;
     let mut result = recv.clone();
-    for (i, v) in args.args.iter().enumerate() {
-        match v {
-            Value::String(s) => {
-                result = JsString::concat(&result, s, args.string_heap)?;
-            }
-            _ => {
-                return Err(IntrinsicError::BadArgument {
-                    index: i as u16,
-                    reason: "must be a string",
-                });
-            }
-        }
+    for i in 0..args.args.len() {
+        let piece = arg_to_string(args, i as u16)?;
+        result = JsString::concat(&result, &piece, args.string_heap)?;
     }
     Ok(Value::String(result))
 }
@@ -1722,20 +1733,26 @@ mod tests {
     }
 
     #[test]
-    fn concat_rejects_non_string_args() {
+    fn concat_coerces_non_string_args() {
+        // §22.1.3.5 — `for each next of arguments: nextString = ?
+        // ToString(next)`. Numbers, Booleans, etc. coerce instead
+        // of rejecting.
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::String(JsString::from_str("a", &heap).unwrap());
         let entry = lookup("concat").unwrap();
-        let err = (entry.impl_fn)(&mut IntrinsicArgs {
+        let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[Value::Number(NumberValue::from_i32(3))],
             string_heap: &heap,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
-        .unwrap_err();
-        assert!(matches!(err, IntrinsicError::BadArgument { .. }));
+        .unwrap();
+        match result {
+            Value::String(s) => assert_eq!(s.to_lossy_string(), "a3"),
+            other => panic!("expected string result, got {other:?}"),
+        }
     }
 
     #[test]

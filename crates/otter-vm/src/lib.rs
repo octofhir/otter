@@ -2125,7 +2125,23 @@ impl Interpreter {
             | Value::Promise(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
-            | Value::TypedArray(_) => match self.intrinsic_prototype_object_for(value) {
+            | Value::TypedArray(_)
+            | Value::Date(_) => match self.intrinsic_prototype_object_for(value) {
+                Some(o) => Ok(Value::Object(o)),
+                None => Ok(Value::Null),
+            },
+            // §20.1.2.10 Object.getPrototypeOf: when applied to a
+            // primitive value, the spec performs `ToObject(value)`
+            // first (§7.1.18) and then walks the resulting wrapper's
+            // `[[Prototype]]`. The wrapper's prototype is the
+            // constructor's `%X.prototype%`, so we read it directly
+            // via `intrinsic_prototype_object_for` without materialising
+            // a transient wrapper object.
+            Value::Symbol(_)
+            | Value::String(_)
+            | Value::Number(_)
+            | Value::Boolean(_)
+            | Value::BigInt(_) => match self.intrinsic_prototype_object_for(value) {
                 Some(o) => Ok(Value::Object(o)),
                 None => Ok(Value::Null),
             },

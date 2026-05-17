@@ -363,6 +363,18 @@ impl Interpreter {
             }
             Value::DataView(_) => "DataView",
             Value::TypedArray(t) => t.kind().name(),
+            // §10.4 Date is an exotic object; §20.1.2.10
+            // Object.getPrototypeOf also accepts primitives by
+            // routing through ToObject (§7.1.18), so we hand
+            // primitive values their own constructor's
+            // `%X.prototype%` here. Callers that only deal with
+            // exotic-object shapes already filter out primitives.
+            Value::Date(_) => "Date",
+            Value::Symbol(_) => "Symbol",
+            Value::String(_) => "String",
+            Value::Number(_) => "Number",
+            Value::Boolean(_) => "Boolean",
+            Value::BigInt(_) => "BigInt",
             Value::Object(_) | Value::Proxy(_) => return None,
             _ => return None,
         };

@@ -58,6 +58,34 @@ pub static JSON_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::global_binding(),
 };
 
+/// `BuiltinIntrinsic` adapter for the global `JSON` namespace.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = JSON_SPEC.name;
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+
+    fn install(
+        heap: &mut otter_gc::GcHeap,
+        global: crate::object::JsObject,
+    ) -> Result<(), crate::js_surface::JsSurfaceError> {
+        let global_root = crate::Value::Object(global);
+        let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
+            heap,
+            &JSON_SPEC,
+            vec![global_root],
+        )?
+        .build()?;
+        crate::bootstrap::define_global_value(
+            global,
+            heap,
+            <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+            crate::Value::Object(namespace),
+        );
+        Ok(())
+    }
+}
+
 const JSON_METHODS: &[MethodSpec] = &[
     MethodSpec {
         name: "parse",

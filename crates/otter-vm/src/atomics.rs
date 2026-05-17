@@ -55,6 +55,42 @@ pub static ATOMICS_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::global_binding(),
 };
 
+/// `BuiltinIntrinsic` adapter for the global `Atomics` namespace.
+/// Wires the namespace through `NamespaceBuilder` and links its
+/// `[[Prototype]]` to `%Object.prototype%` per §25.4.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = ATOMICS_SPEC.name;
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+
+    fn install(
+        heap: &mut otter_gc::GcHeap,
+        global: crate::object::JsObject,
+    ) -> Result<(), crate::js_surface::JsSurfaceError> {
+        let global_root = Value::Object(global);
+        let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
+            heap,
+            &ATOMICS_SPEC,
+            vec![global_root],
+        )?
+        .build()?;
+        if let Some(Value::Object(object_ctor)) = crate::object::get(global, heap, "Object")
+            && let Some(Value::Object(object_proto)) =
+                crate::object::get(object_ctor, heap, "prototype")
+        {
+            crate::object::set_prototype(namespace, heap, Some(object_proto));
+        }
+        crate::bootstrap::define_global_value(
+            global,
+            heap,
+            <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+            Value::Object(namespace),
+        );
+        Ok(())
+    }
+}
+
 const ATOMICS_METHODS: &[MethodSpec] = &[
     method("add", 3, native_add),
     method("and", 3, native_and),

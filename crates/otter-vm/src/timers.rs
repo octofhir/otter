@@ -209,6 +209,28 @@ pub(crate) fn install_timer_globals(
     Ok(())
 }
 
+/// `BuiltinIntrinsic` adapter for the WHATWG timer globals
+/// (`setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`).
+///
+/// The real scheduling — `tokio::time`, libuv, browser event loop —
+/// is supplied by the embedder through [`TimerScheduler`] and
+/// installed on the runtime before the first script runs. The
+/// intrinsic only attaches the four native function entry points on
+/// `globalThis`; their bodies delegate every queue / cancel call to
+/// the embedder-supplied scheduler.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    /// `setTimeout` is the conventional name used by the bootstrap
+    /// registry to address the whole timer family.
+    const NAME: &'static str = "setTimeout";
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_timer_globals(global, heap)
+    }
+}
+
 fn coerce_delay_ms(value: Option<&Value>) -> u64 {
     let n = match value {
         Some(Value::Number(num)) => num.as_f64(),

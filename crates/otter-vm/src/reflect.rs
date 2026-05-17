@@ -423,6 +423,43 @@ pub static REFLECT_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::global_binding(),
 };
 
+/// `BuiltinIntrinsic` adapter for the global `Reflect` namespace.
+/// Mirrors §28.1: ordinary namespace object with own data
+/// properties for each spec method, `[[Prototype]]` linked to
+/// `%Object.prototype%`.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = REFLECT_SPEC.name;
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+
+    fn install(
+        heap: &mut otter_gc::GcHeap,
+        global: crate::object::JsObject,
+    ) -> Result<(), crate::js_surface::JsSurfaceError> {
+        let global_root = crate::Value::Object(global);
+        let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
+            heap,
+            &REFLECT_SPEC,
+            vec![global_root],
+        )?
+        .build()?;
+        if let Some(crate::Value::Object(object_ctor)) = crate::object::get(global, heap, "Object")
+            && let Some(crate::Value::Object(object_proto)) =
+                crate::object::get(object_ctor, heap, "prototype")
+        {
+            crate::object::set_prototype(namespace, heap, Some(object_proto));
+        }
+        crate::bootstrap::define_global_value(
+            global,
+            heap,
+            <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+            crate::Value::Object(namespace),
+        );
+        Ok(())
+    }
+}
+
 const REFLECT_METHODS: &[MethodSpec] = &[
     method("apply", 3, native_apply),
     method("construct", 2, native_construct),

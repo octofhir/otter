@@ -27,7 +27,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::js_surface::{Attr, JsSurfaceError, NamespaceBuilder, NamespaceSpec, ObjectBuilder};
+use crate::js_surface::{Attr, JsSurfaceError, NamespaceSpec, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
     Value, array_prototype, array_statics, atomics, console, function_prototype, json, math,
@@ -320,11 +320,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_array,
     },
-    BootstrapEntry {
-        name: json::JSON_SPEC.name,
-        feature: BootstrapFeatures::CORE,
-        install: install_json,
-    },
+    crate::bootstrap_entry!(crate::json::Intrinsic),
     crate::bootstrap_entry!(crate::string::intrinsic::Intrinsic),
     BootstrapEntry {
         name: "Number",
@@ -342,11 +338,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_symbol,
     },
-    BootstrapEntry {
-        name: math::MATH_SPEC.name,
-        feature: BootstrapFeatures::CORE,
-        install: install_math,
-    },
+    crate::bootstrap_entry!(crate::math::Intrinsic),
     BootstrapEntry {
         name: "Date",
         feature: BootstrapFeatures::CORE,
@@ -392,11 +384,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_proxy,
     },
-    BootstrapEntry {
-        name: reflect::REFLECT_SPEC.name,
-        feature: BootstrapFeatures::CORE,
-        install: install_reflect,
-    },
+    crate::bootstrap_entry!(crate::reflect::Intrinsic),
     BootstrapEntry {
         name: "Function",
         feature: BootstrapFeatures::CORE,
@@ -428,11 +416,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     typed_array_entry("Float64Array"),
     typed_array_entry("BigInt64Array"),
     typed_array_entry("BigUint64Array"),
-    BootstrapEntry {
-        name: atomics::ATOMICS_SPEC.name,
-        feature: BootstrapFeatures::CORE,
-        install: install_atomics,
-    },
+    crate::bootstrap_entry!(crate::atomics::Intrinsic),
     placeholder("Intl"),
     placeholder("Temporal"),
     placeholder("AggregateError"),
@@ -442,16 +426,8 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         install: crate::bootstrap_weak_refs::install_finalization_registry,
     },
     placeholder("Iterator"),
-    BootstrapEntry {
-        name: console::CONSOLE_SPEC.name,
-        feature: BootstrapFeatures::CONSOLE,
-        install: install_console,
-    },
-    BootstrapEntry {
-        name: "setTimeout",
-        feature: BootstrapFeatures::CORE,
-        install: install_timer_globals,
-    },
+    crate::bootstrap_entry!(crate::console::Intrinsic),
+    crate::bootstrap_entry!(crate::timers::Intrinsic),
 ];
 
 /// Build `globalThis` with all default features.
@@ -1609,35 +1585,8 @@ fn install_function(
     Ok(())
 }
 
-fn install_math(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
-    let namespace = NamespaceBuilder::from_spec_with_value_roots(
-        heap,
-        &math::MATH_SPEC,
-        vec![global_root.clone()],
-    )
-    .map_err(JsSurfaceError::from)?
-    .build()?;
-    define_global(global, heap, entry.name, Value::Object(namespace));
-    Ok(())
-}
-
-fn install_json(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
-    let namespace =
-        NamespaceBuilder::from_spec_with_value_roots(heap, &json::JSON_SPEC, vec![global_root])?
-            .build()?;
-    define_global(global, heap, entry.name, Value::Object(namespace));
-    Ok(())
-}
+// `Math` installer migrated to [`crate::math::Intrinsic`].
+// `JSON` installer migrated to [`crate::json::Intrinsic`].
 
 fn install_object(
     entry: &BootstrapEntry,
@@ -1771,71 +1720,10 @@ fn install_date(
     Ok(())
 }
 
-fn install_atomics(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
-    let namespace = NamespaceBuilder::from_spec_with_value_roots(
-        heap,
-        &atomics::ATOMICS_SPEC,
-        vec![global_root],
-    )?
-    .build()?;
-    // §25.4 — the `Atomics` object's [[Prototype]] is
-    // %Object.prototype%, mirroring the other namespace builtins.
-    // <https://tc39.es/ecma262/#sec-atomics-object>
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
-    {
-        object::set_prototype(namespace, heap, Some(object_proto));
-    }
-    define_global(global, heap, entry.name, Value::Object(namespace));
-    Ok(())
-}
-
-// §28.1 Reflect — ordinary namespace object with own data properties
-// for every spec method. Links the namespace prototype to
-// `%Object.prototype%` so reflective inspection (`Object.getPrototypeOf
-// (Reflect) === Object.prototype`) returns the spec-required value.
-// <https://tc39.es/ecma262/#sec-reflect-object>
-fn install_reflect(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
-    let namespace = NamespaceBuilder::from_spec_with_value_roots(
-        heap,
-        &reflect::REFLECT_SPEC,
-        vec![global_root],
-    )?
-    .build()?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
-    {
-        object::set_prototype(namespace, heap, Some(object_proto));
-    }
-    define_global(global, heap, entry.name, Value::Object(namespace));
-    Ok(())
-}
-
-fn install_console(
-    _entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    console::install(global, heap)
-}
-
-fn install_timer_globals(
-    _entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    crate::timers::install_timer_globals(global, heap)
-}
+// `Atomics` installer migrated to [`crate::atomics::Intrinsic`].
+// `Reflect` installer migrated to [`crate::reflect::Intrinsic`].
+// `console` installer migrated to [`crate::console::Intrinsic`].
+// Timer globals migrated to [`crate::timers::Intrinsic`].
 
 pub(crate) fn define_global_value(
     global: JsObject,

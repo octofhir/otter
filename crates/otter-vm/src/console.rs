@@ -40,6 +40,32 @@ pub static CONSOLE_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::global_binding(),
 };
 
+/// `BuiltinIntrinsic` adapter for the `console` global.
+///
+/// Console method bodies dispatch to the embedder-supplied
+/// [`ConsoleSink`] (default = stdout/stderr through `println!` /
+/// `eprintln!`); the runtime never writes directly. Hosts that wire
+/// `tracing`, structured logging, or a UI sink swap the sink through
+/// [`crate::VmRuntime::set_console_sink`] (or its equivalent on
+/// whichever runtime wrapper is in use) before the first script
+/// runs. The intrinsic only owns the namespace shape — `log`,
+/// `info`, `debug`, `warn`, `error`, `assert`, plus the optional
+/// counters/timers — leaving the actual write path injectable.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = CONSOLE_SPEC.name;
+    const FEATURE: crate::bootstrap::BootstrapFeatures =
+        crate::bootstrap::BootstrapFeatures::CONSOLE;
+
+    fn install(
+        heap: &mut otter_gc::GcHeap,
+        global: object::JsObject,
+    ) -> Result<(), JsSurfaceError> {
+        install(global, heap)
+    }
+}
+
 /// Console output level selected by the invoked console method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]

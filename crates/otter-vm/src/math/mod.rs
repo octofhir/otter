@@ -55,6 +55,38 @@ pub static MATH_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::global_binding(),
 };
 
+/// `BuiltinIntrinsic` adapter that materialises the global `Math`
+/// namespace through [`MATH_SPEC`]. `Math` is a non-constructible
+/// namespace object — no `[[Construct]]` slot, no prototype, just
+/// the spec-listed methods and floating-point constants.
+pub struct Intrinsic;
+
+impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = MATH_SPEC.name;
+    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
+
+    fn install(
+        heap: &mut otter_gc::GcHeap,
+        global: crate::object::JsObject,
+    ) -> Result<(), crate::js_surface::JsSurfaceError> {
+        let global_root = crate::Value::Object(global);
+        let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
+            heap,
+            &MATH_SPEC,
+            vec![global_root],
+        )
+        .map_err(crate::js_surface::JsSurfaceError::from)?
+        .build()?;
+        crate::bootstrap::define_global_value(
+            global,
+            heap,
+            <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
+            crate::Value::Object(namespace),
+        );
+        Ok(())
+    }
+}
+
 const MATH_CONSTANTS: &[ConstSpec] = &[
     ConstSpec {
         name: "E",

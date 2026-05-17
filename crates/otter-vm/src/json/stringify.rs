@@ -41,6 +41,31 @@ pub struct StringifyOptions {
 impl StringifyOptions {
     /// Build a [`StringifyOptions`] from the JS `space` argument.
     pub fn from_space(space: &Value) -> Result<Self, JsonError> {
+        Self::from_space_with_heap(space, None)
+    }
+
+    /// Same as [`from_space`] but with the heap available so Number /
+    /// String wrapper objects can be unwrapped per §25.5.2.4 step 5.
+    pub fn from_space_with_heap(
+        space: &Value,
+        gc_heap: Option<&otter_gc::GcHeap>,
+    ) -> Result<Self, JsonError> {
+        // §25.5.2.4 step 5 — unwrap Number / String wrapper objects.
+        let unwrapped: Value;
+        let space = match (space, gc_heap) {
+            (Value::Object(obj), Some(heap)) => {
+                if let Some(n) = crate::object::number_data(*obj, heap) {
+                    unwrapped = Value::Number(n);
+                    &unwrapped
+                } else if let Some(s) = crate::object::string_data(*obj, heap) {
+                    unwrapped = Value::String(s);
+                    &unwrapped
+                } else {
+                    space
+                }
+            }
+            _ => space,
+        };
         match space {
             Value::Undefined | Value::Null => Ok(Self::default()),
             Value::Number(n) => {
@@ -64,11 +89,10 @@ impl StringifyOptions {
                     indent: bytes[..take].to_vec(),
                 })
             }
-            _ => Err(JsonError::BadArgument {
-                name: "stringify",
-                index: 2,
-                reason: "must be a number or string",
-            }),
+            // §25.5.2.4 step 8: `Else, let gap be the empty
+            // String.` Boolean / Symbol / Object / other primitives
+            // silently degrade to compact output rather than throwing.
+            _ => Ok(Self::default()),
         }
     }
 

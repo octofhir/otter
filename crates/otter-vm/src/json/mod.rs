@@ -265,7 +265,7 @@ fn json_stringify(
 ) -> Result<Value, JsonError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let space = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let opts = StringifyOptions::from_space(&space)?;
+    let opts = StringifyOptions::from_space_with_heap(&space, Some(gc_heap))?;
     match stringify_with_options(&value, &opts, gc_heap)? {
         Some(text) => Ok(Value::String(JsString::from_str(&text, heap)?)),
         None => Ok(Value::Undefined),

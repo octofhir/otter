@@ -128,6 +128,29 @@ fn impl_get_timezone_offset(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intri
     Ok(smi(0))
 }
 
+/// §B.2.4 (Temporal proposal) — `Date.prototype.toTemporalInstant()`.
+/// Returns a `Temporal.Instant` corresponding to this Date's
+/// `[[DateValue]]`. Throws `RangeError` for Invalid Date (NaN).
+fn impl_to_temporal_instant(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let time = receiver_time(args)?;
+    if !time.is_finite() {
+        return Err(IntrinsicError::OutOfRange {
+            index: 0,
+            reason: "Invalid Date",
+        });
+    }
+    let ms = time as i64;
+    let inst = temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|_| {
+        IntrinsicError::OutOfRange {
+            index: 0,
+            reason: "Temporal.Instant out of range",
+        }
+    })?;
+    Ok(crate::temporal::helpers::make_temporal(
+        crate::temporal::payload::TemporalPayload::Instant(inst),
+    ))
+}
+
 /// §21.4.4.36 — `toISOString()`. Throws RangeError on Invalid Date
 /// per spec; the foundation surfaces that via `BadArgument`.
 fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -413,6 +436,7 @@ pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "getTimezoneOffset"   / 0 => impl_get_timezone_offset,
             "toISOString"         / 0 => impl_to_iso_string,
             "toJSON"              / 0 => impl_to_json,
+            "toTemporalInstant"   / 0 => impl_to_temporal_instant,
             "toString"            / 0 => impl_to_string,
             "toUTCString"         / 0 => impl_to_string,
             "toDateString"        / 0 => impl_to_date_string,
@@ -528,6 +552,7 @@ date_prototype_methods!(
     bridge_get_utc_milliseconds  => "getUTCMilliseconds",  0;
     bridge_get_timezone_offset   => "getTimezoneOffset",   0;
     bridge_to_iso_string         => "toISOString",         0;
+    bridge_to_temporal_instant   => "toTemporalInstant",   0;
     bridge_to_string             => "toString",            0;
     bridge_to_utc_string         => "toUTCString",         0;
     bridge_to_date_string        => "toDateString",        0;

@@ -1261,6 +1261,13 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "copyWithin"  / 2 => impl_copy_within,
             "toReversed"  / 0 => impl_to_reversed,
             "with"        / 2 => impl_with,
+            // §23.1.3.32 toLocaleString — foundation form delegates
+            // to the default `join(",")` shape until per-locale
+            // formatting + element `toLocaleString` invocation lands
+            // through the interpreter dispatcher. Matches the
+            // `toString` callable shape so reflective property
+            // reads resolve.
+            "toLocaleString" / 0 => impl_to_string,
         )
     });
 
@@ -1293,6 +1300,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("copyWithin", 2, native_copy_within),
     method("toReversed", 0, native_to_reversed),
     method("with", 2, native_with),
+    method("toLocaleString", 0, native_to_locale_string),
 ];
 
 const fn method(
@@ -1363,6 +1371,7 @@ native_array!(native_to_string, "toString");
 native_array!(native_copy_within, "copyWithin");
 native_array!(native_to_reversed, "toReversed");
 native_array!(native_with, "with");
+native_array!(native_to_locale_string, "toLocaleString");
 
 #[cfg(test)]
 mod tests {

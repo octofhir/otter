@@ -754,7 +754,18 @@ impl Interpreter {
                 | Value::Closure { .. }
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
-                | Value::ClassConstructor(_),
+                | Value::ClassConstructor(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_),
                 Value::Symbol(_),
             ) => {
                 let key = match &idx_value {

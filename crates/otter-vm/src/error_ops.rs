@@ -193,6 +193,19 @@ impl Interpreter {
                     dynamic_message.as_str(),
                 )
             }
+            // §25.5 JSON.parse / JSON.stringify spec-mandated
+            // exception classes:
+            //   parse failures → SyntaxError (§25.5.1.1 step 2),
+            //   cyclic / BigInt / depth / bad-arg → TypeError.
+            VmError::JsonError { code, message } => {
+                dynamic_message = message.clone();
+                let kind = if *code == "JSON_PARSE" {
+                    error_classes::ErrorKind::SyntaxError
+                } else {
+                    error_classes::ErrorKind::TypeError
+                };
+                (kind, dynamic_message.as_str())
+            }
             // Hard / structural errors stay as host failures so the
             // caller surfaces them through `RunError` rather than
             // catching them as `try { ... } catch`.

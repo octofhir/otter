@@ -1229,6 +1229,75 @@ fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
     )?))
 }
 
+/// §20.1.3.2 — `Array.prototype.hasOwnProperty(V)`. Spec: inherited
+/// from `Object.prototype.hasOwnProperty`. Foundation: short-circuit
+/// here so callers don't need the (yet-to-be-real) Array prototype
+/// chain walker. Checks indexed slots, named-properties side table,
+/// and the synthetic `length` slot.
+fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let Value::Array(arr) = args.receiver else {
+        return Err(IntrinsicError::BadReceiver { expected: "array" });
+    };
+    let key_value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let heap = &*args.gc_heap;
+    // Try indexed first.
+    let key_string: String = match &key_value {
+        Value::String(s) => s.to_lossy_string(),
+        Value::Number(n) => n.to_display_string(),
+        Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Undefined => "undefined".to_string(),
+        _ => return Ok(Value::Boolean(false)),
+    };
+    if let Ok(idx) = key_string.parse::<usize>() {
+        return Ok(Value::Boolean(array::has_own_element(*arr, heap, idx)));
+    }
+    if key_string == "length" {
+        return Ok(Value::Boolean(true));
+    }
+    let has_named = heap.read_payload(*arr, |body| {
+        body.named_properties
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&key_string))
+    });
+    Ok(Value::Boolean(has_named))
+}
+
+/// §20.1.3.3 — `Array.prototype.isPrototypeOf(V)`. Foundation: arrays
+/// are not in a real prototype chain target; always returns false.
+fn impl_is_prototype_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    Ok(Value::Boolean(false))
+}
+
+/// §20.1.3.4 — `Array.prototype.propertyIsEnumerable(V)`. Indexed
+/// slots + named props are enumerable; `length` is not.
+fn impl_property_is_enumerable(
+    args: &mut IntrinsicArgs<'_>,
+) -> Result<Value, IntrinsicError> {
+    let Value::Array(arr) = args.receiver else {
+        return Err(IntrinsicError::BadReceiver { expected: "array" });
+    };
+    let key_value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let heap = &*args.gc_heap;
+    let key_string: String = match &key_value {
+        Value::String(s) => s.to_lossy_string(),
+        Value::Number(n) => n.to_display_string(),
+        _ => return Ok(Value::Boolean(false)),
+    };
+    if key_string == "length" {
+        return Ok(Value::Boolean(false));
+    }
+    if let Ok(idx) = key_string.parse::<usize>() {
+        return Ok(Value::Boolean(array::has_own_element(*arr, heap, idx)));
+    }
+    let has_named = heap.read_payload(*arr, |body| {
+        body.named_properties
+            .as_ref()
+            .is_some_and(|m| m.contains_key(&key_string))
+    });
+    Ok(Value::Boolean(has_named))
+}
+
 /// §23.1.3.{18,35,8} — `Array.prototype.keys()` / `.values()` /
 /// `.entries()`. Each constructs an `ArrayIterator` backed by the
 /// receiver: `keys()` yields the numeric indices, `values()` yields
@@ -1403,6 +1472,9 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "keys"        / 0 => impl_keys_iter,
             "values"      / 0 => impl_values_iter,
             "entries"     / 0 => impl_entries_iter,
+            "hasOwnProperty"      / 1 => impl_has_own_property,
+            "isPrototypeOf"       / 1 => impl_is_prototype_of,
+            "propertyIsEnumerable" / 1 => impl_property_is_enumerable,
             // §23.1.3.32 toLocaleString — foundation form delegates
             // to the default `join(",")` shape until per-locale
             // formatting + element `toLocaleString` invocation lands

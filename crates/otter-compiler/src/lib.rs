@@ -8376,6 +8376,111 @@ fn compile_class(
         let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
         emit_make_callable(cx, m_reg, m_const, &m_captures, false, method_span);
+        // §15.7.10 ClassDefinitionEvaluation step 26 / 27 —
+        // accessor method definitions (`get foo()` / `set foo(v)`)
+        // install an `{ get | set, enumerable: false, configurable:
+        // true }` accessor descriptor via `DefinePropertyOrThrow`.
+        // Plain methods stay on the data-property fast path.
+        // <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+        let is_accessor = matches!(
+            m.kind,
+            oxc_ast::ast::MethodDefinitionKind::Get | oxc_ast::ast::MethodDefinitionKind::Set
+        );
+        if is_accessor {
+            // Resolve the property key into a register (literal vs
+            // computed expression — both paths are observed by the
+            // §13.2.5 ComputedPropertyName / IdentifierName rules).
+            let key_reg = match (&static_name, m.computed) {
+                (Some(name), false) => {
+                    let r = cx.alloc_scratch();
+                    let const_idx = cx.intern_string_constant(name);
+                    cx.emit(
+                        Op::LoadString,
+                        [Operand::Register(r), Operand::ConstIndex(const_idx)],
+                        method_span,
+                    );
+                    r
+                }
+                _ => {
+                    let key_expr =
+                        m.key
+                            .as_expression()
+                            .ok_or_else(|| CompileError::Unsupported {
+                                node: "ClassDeclaration: non-expression computed accessor key"
+                                    .to_string(),
+                                span: method_span,
+                            })?;
+                    compile_expr(cx, key_expr, method_span)?
+                }
+            };
+            let desc_reg = cx.alloc_scratch();
+            cx.emit(Op::NewObject, [Operand::Register(desc_reg)], method_span);
+            let accessor_key = match m.kind {
+                oxc_ast::ast::MethodDefinitionKind::Get => "get",
+                oxc_ast::ast::MethodDefinitionKind::Set => "set",
+                _ => unreachable!(),
+            };
+            let accessor_const = cx.intern_string_constant(accessor_key);
+            let store_scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(desc_reg),
+                    Operand::ConstIndex(accessor_const),
+                    Operand::Register(m_reg),
+                    Operand::Register(store_scratch),
+                ],
+                method_span,
+            );
+            // Class accessor descriptors are `enumerable: false,
+            // configurable: true`. Object literals install
+            // `enumerable: true` on the same template — the only
+            // difference between the two surfaces.
+            let true_reg = cx.alloc_scratch();
+            cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], method_span);
+            let false_reg = cx.alloc_scratch();
+            cx.emit(Op::LoadFalse, [Operand::Register(false_reg)], method_span);
+            let enum_const = cx.intern_string_constant("enumerable");
+            let enum_scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(desc_reg),
+                    Operand::ConstIndex(enum_const),
+                    Operand::Register(false_reg),
+                    Operand::Register(enum_scratch),
+                ],
+                method_span,
+            );
+            let cfg_const = cx.intern_string_constant("configurable");
+            let cfg_scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(desc_reg),
+                    Operand::ConstIndex(cfg_const),
+                    Operand::Register(true_reg),
+                    Operand::Register(cfg_scratch),
+                ],
+                method_span,
+            );
+            let define_dst = cx.alloc_scratch();
+            cx.emit(
+                Op::ObjectCall,
+                vec![
+                    Operand::Register(define_dst),
+                    Operand::ConstIndex(
+                        otter_bytecode::method_id::ObjectMethod::DefineProperty.as_u32(),
+                    ),
+                    Operand::ConstIndex(3),
+                    Operand::Register(target_reg),
+                    Operand::Register(key_reg),
+                    Operand::Register(desc_reg),
+                ],
+                method_span,
+            );
+            continue;
+        }
         match (&static_name, m.computed) {
             (Some(name), false) => {
                 let name_const = cx.intern_string_constant(name);

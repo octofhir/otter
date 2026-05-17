@@ -772,8 +772,25 @@ impl Interpreter {
             Value::ClassConstructor(c) => Some(if name == "prototype" {
                 Value::Object(c.prototype(&self.gc_heap))
             } else {
-                crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, &name)
-                    .unwrap_or(Value::Undefined)
+                // Go through the full `[[Get]]` ladder so accessor
+                // descriptors on static members (`static get foo()`
+                // / `static set foo(v)`) invoke their getter rather
+                // than yielding `undefined`.
+                let statics = Value::Object(c.statics(&self.gc_heap));
+                let key = VmPropertyKey::String(&name);
+                match self.ordinary_get_value(
+                    context,
+                    statics.clone(),
+                    statics.clone(),
+                    &key,
+                    0,
+                )? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, statics.clone(), args)?
+                    }
+                }
             }),
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties (e.g. `assert.sameValue = function(){}`)

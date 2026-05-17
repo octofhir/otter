@@ -514,29 +514,56 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 }
 
 fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
+    // §23.1.3.16 — generic via ToObject + LengthOfArrayLike. Holes
+    // and `null` / `undefined` serialise as the empty string. Dense
+    // `Value::Array` keeps the existing tight walk; Object receivers
+    // walk indices `[0, len)` materialising absent slots as empty
+    // strings (matches HasProperty result).
     let heap = &*args.gc_heap;
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => ",".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(),
     };
-    let parts: Vec<String> = array::with_elements(arr, heap, |elements| {
-        elements
-            .iter()
-            .map(|v| match v {
-                // §23.1.3.16: holes serialize the same as `undefined`
-                // / `null` — i.e. an empty string between separators.
+    if let Value::Array(arr) = args.receiver {
+        let parts: Vec<String> = array::with_elements(*arr, heap, |elements| {
+            elements
+                .iter()
+                .map(|v| match v {
+                    Value::Undefined | Value::Null | Value::Hole => String::new(),
+                    other => other.display_string(),
+                })
+                .collect()
+        });
+        let joined = parts.join(&separator);
+        return Ok(Value::String(JsString::from_str(&joined, args.string_heap)?));
+    }
+    if let Value::Object(obj) = args.receiver {
+        let len = read_array_like_length(*obj, heap);
+        if len == 0 {
+            return Ok(Value::String(JsString::from_str("", args.string_heap)?));
+        }
+        // Materialise present indices into a sparse lookup; absent
+        // slots produce empty-string parts so the final `join` keeps
+        // separator placement correct. We bound the `parts` length by
+        // `len` (already clamped to `MAX_ARRAY_LIKE_PROBE_LEN`); no
+        // unbounded probe.
+        let entries = array_like_present_entries(args.receiver, heap)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        let mut parts: Vec<String> = vec![String::new(); len];
+        for (i, v) in entries {
+            if i >= len {
+                continue;
+            }
+            parts[i] = match v {
                 Value::Undefined | Value::Null | Value::Hole => String::new(),
                 other => other.display_string(),
-            })
-            .collect()
-    });
-    let joined = parts.join(&separator);
-    Ok(Value::String(JsString::from_str(
-        &joined,
-        args.string_heap,
-    )?))
+            };
+        }
+        let joined = parts.join(&separator);
+        return Ok(Value::String(JsString::from_str(&joined, args.string_heap)?));
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

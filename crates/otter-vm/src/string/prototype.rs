@@ -83,16 +83,50 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
     }
 }
 
-fn arg_string<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Result<&'a JsString, IntrinsicError> {
+/// §7.1.17 ToString applied to argument `index`.
+///
+/// Returns an owned `JsString`. Primitives coerce directly; wrapper
+/// objects with `[[StringData]]` unwrap; `Symbol` and ordinary
+/// objects bail (the latter needs §7.1.1 OrdinaryToPrimitive routing
+/// through user-defined `toString`, which sits behind an
+/// `ExecutionContext` we don't carry here yet).
+///
+/// Missing arguments coerce to `"undefined"` per §7.1.17 step 1
+/// (`ToString(undefined) = "undefined"`).
+fn arg_to_string(args: &IntrinsicArgs<'_>, index: u16) -> Result<JsString, IntrinsicError> {
     match args.args.get(index as usize) {
-        Some(Value::String(s)) => Ok(s),
+        None | Some(Value::Undefined) => Ok(JsString::from_str("undefined", args.string_heap)?),
+        Some(Value::Null) => Ok(JsString::from_str("null", args.string_heap)?),
+        Some(Value::String(s)) => Ok(s.clone()),
+        Some(Value::Boolean(b)) => {
+            let text = if *b { "true" } else { "false" };
+            Ok(JsString::from_str(text, args.string_heap)?)
+        }
+        Some(Value::Number(n)) => {
+            let text = n.to_display_string();
+            Ok(JsString::from_str(&text, args.string_heap)?)
+        }
+        Some(Value::BigInt(b)) => {
+            let text = b.to_decimal_string();
+            Ok(JsString::from_str(&text, args.string_heap)?)
+        }
+        Some(Value::Object(obj)) => {
+            // Wrapper objects with `[[StringData]]` unwrap directly.
+            // Plain objects routing through §7.1.1 OrdinaryToPrimitive
+            // is not yet wired here; we still reject for those.
+            let gc = &*args.gc_heap;
+            crate::object::string_data(*obj, gc).ok_or(IntrinsicError::BadArgument {
+                index,
+                reason: "must be a string",
+            })
+        }
+        Some(Value::Symbol(_)) => Err(IntrinsicError::BadArgument {
+            index,
+            reason: "Symbol values cannot be converted to a string",
+        }),
         Some(_) => Err(IntrinsicError::BadArgument {
             index,
             reason: "must be a string",
-        }),
-        None => Err(IntrinsicError::BadArgument {
-            index,
-            reason: "is required",
         }),
     }
 }
@@ -349,10 +383,10 @@ fn impl_substring(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 
 fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let needle = arg_string(args, 0)?;
+    let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
     let pos =
-        recv.index_of(needle, from, None)
+        recv.index_of(&needle, from, None)
             .map_err(|Interrupted| IntrinsicError::BadArgument {
                 index: 0,
                 reason: "interrupted",
@@ -366,24 +400,24 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 
 fn impl_starts_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let needle = arg_string(args, 0)?;
+    let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
-    Ok(Value::Boolean(recv.starts_with(needle, from)))
+    Ok(Value::Boolean(recv.starts_with(&needle, from)))
 }
 
 fn impl_ends_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let needle = arg_string(args, 0)?;
+    let needle = arg_to_string(args, 0)?;
     let end_pos = arg_u32_or(args, 1, recv.len())?;
-    Ok(Value::Boolean(recv.ends_with(needle, end_pos)))
+    Ok(Value::Boolean(recv.ends_with(&needle, end_pos)))
 }
 
 fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let needle = arg_string(args, 0)?;
+    let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
     let pos =
-        recv.index_of(needle, from, None)
+        recv.index_of(&needle, from, None)
             .map_err(|Interrupted| IntrinsicError::BadArgument {
                 index: 0,
                 reason: "interrupted",
@@ -623,7 +657,7 @@ fn impl_to_upper_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     if let Some(Value::RegExp(re)) = args.args.first() {
-        let replacement = arg_string(args, 1)?;
+        let replacement = arg_to_string(args, 1)?;
         let heap = &*args.gc_heap;
         return regex_replace(
             &recv,
@@ -633,8 +667,8 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             args.string_heap,
         );
     }
-    let needle = arg_string(args, 0)?;
-    let replacement = arg_string(args, 1)?;
+    let needle = arg_to_string(args, 0)?;
+    let replacement = arg_to_string(args, 1)?;
     let recv_units = recv.to_utf16_vec();
     let needle_units = needle.to_utf16_vec();
     let replacement_units = replacement.to_utf16_vec();
@@ -674,7 +708,7 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
                 reason: "must be a global regular expression",
             });
         }
-        let replacement = arg_string(args, 1)?;
+        let replacement = arg_to_string(args, 1)?;
         return regex_replace(
             &recv,
             re,
@@ -683,8 +717,8 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
             args.string_heap,
         );
     }
-    let needle = arg_string(args, 0)?;
-    let replacement = arg_string(args, 1)?;
+    let needle = arg_to_string(args, 0)?;
+    let replacement = arg_to_string(args, 1)?;
     let recv_units = recv.to_utf16_vec();
     let needle_units = needle.to_utf16_vec();
     let replacement_units = replacement.to_utf16_vec();
@@ -1126,13 +1160,13 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
 /// §22.1.3.10 String.prototype.lastIndexOf(search, fromIndex?).
 fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let needle = arg_string(args, 0)?;
+    let needle = arg_to_string(args, 0)?;
     // ECMA-262 §22.1.3.11: `position` defaults to +∞, then
     // ToInteger, then min(pos, len). NaN clamps to 0. Foundation
     // takes the simpler accessor and clamps to `recv.len()`.
     let position = arg_u32_or(args, 1, recv.len())?.min(recv.len());
     let pos = recv
-        .last_index_of(needle, position, None)
+        .last_index_of(&needle, position, None)
         .map_err(|Interrupted| IntrinsicError::BadArgument {
             index: 0,
             reason: "interrupted",

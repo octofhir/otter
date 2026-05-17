@@ -239,8 +239,64 @@ impl Interpreter {
             && (name == "replace" || name == "replaceAll")
             && arg_values.len() >= 2
             && self.is_callable_runtime(&arg_values[1])
-            && matches!(arg_values.first(), Some(Value::String(_)))
+            && !matches!(arg_values.first(), Some(Value::RegExp(_)))
         {
+            // §22.1.3.18 step 7 — `searchString = ? ToString(searchValue)`.
+            // Coerce non-String searchValues (null, undefined, numbers,
+            // objects with `toString`) before handing the args to the
+            // callable-replace bridge.
+            let mut coerced_args = arg_values.clone();
+            let needs_coerce = !matches!(coerced_args.first(), Some(Value::String(_)));
+            if needs_coerce {
+                let original = coerced_args.first().cloned().unwrap_or(Value::Undefined);
+                let coerced = match &original {
+                    Value::Undefined => "undefined".to_string(),
+                    Value::Null => "null".to_string(),
+                    Value::Boolean(true) => "true".to_string(),
+                    Value::Boolean(false) => "false".to_string(),
+                    Value::Number(n) => n.to_display_string(),
+                    Value::BigInt(b) => b.to_decimal_string(),
+                    Value::Symbol(_) => {
+                        return Err(VmError::TypeError {
+                            message: "Cannot convert a Symbol value to a string".to_string(),
+                        });
+                    }
+                    Value::Object(_)
+                    | Value::Array(_)
+                    | Value::Function { .. }
+                    | Value::Closure { .. }
+                    | Value::NativeFunction(_)
+                    | Value::BoundFunction(_)
+                    | Value::ClassConstructor(_)
+                    | Value::Proxy(_) => {
+                        let primitive = self.evaluate_to_primitive(
+                            context,
+                            &original,
+                            crate::abstract_ops::ToPrimitiveHint::String,
+                        )?;
+                        match primitive {
+                            Value::String(s) => s.to_lossy_string(),
+                            Value::Number(n) => n.to_display_string(),
+                            Value::Boolean(true) => "true".to_string(),
+                            Value::Boolean(false) => "false".to_string(),
+                            Value::Null => "null".to_string(),
+                            Value::Undefined => "undefined".to_string(),
+                            Value::BigInt(b) => b.to_decimal_string(),
+                            Value::Symbol(_) => {
+                                return Err(VmError::TypeError {
+                                    message: "Cannot convert a Symbol value to a string"
+                                        .to_string(),
+                                });
+                            }
+                            _ => return Err(VmError::TypeMismatch),
+                        }
+                    }
+                    _ => return Err(VmError::TypeMismatch),
+                };
+                if let Some(slot) = coerced_args.first_mut() {
+                    *slot = Value::String(JsString::from_str(&coerced, &self.string_heap)?);
+                }
+            }
             stack[top_idx].pc = stack[top_idx]
                 .pc
                 .checked_add(1)
@@ -249,7 +305,7 @@ impl Interpreter {
                 .dispatch_string_callable_replace(
                     context,
                     &recv_value,
-                    &arg_values,
+                    &coerced_args,
                     name == "replaceAll",
                 )
                 .map_err(VmError::from)?;
@@ -397,6 +453,12 @@ impl Interpreter {
                 // §22.1.3.5 concat(...) — every arg ToString. Cover
                 // the first four slots (matches our 4-wide SmallVec).
                 "concat" => (&[], &[0, 1, 2, 3]),
+                // §22.1.3.{13,14,15,16} match / matchAll / search /
+                // normalize — non-RegExp arg passes through
+                // `RegExpCreate` which itself starts with `ToString`.
+                // Pre-coerce so user `@@toPrimitive` / `toString` /
+                // `valueOf` fire when the arg is an Object literal.
+                "match" | "matchAll" | "search" | "normalize" => (&[], &[0]),
                 _ => (&[], &[]),
             };
             // §24.3.1.{1,2} GetViewValue / SetViewValue on
@@ -441,6 +503,12 @@ impl Interpreter {
             if matches!(&recv_value, Value::String(_))
                 && (!string_int_coerce.is_empty() || !string_str_coerce.is_empty())
             {
+                // §22.1.3.{13,14,15} `match` / `matchAll` / `search`
+                // forward a `RegExp` arg unchanged through the
+                // `@@match` / `@@matchAll` / `@@search` ladder, so the
+                // pre-coerce here must not stringify a RegExp.
+                let regexp_pass_through =
+                    matches!(&*name, "match" | "matchAll" | "search" | "normalize");
                 let is_non_primitive = |v: &Value| {
                     matches!(
                         v,
@@ -452,8 +520,7 @@ impl Interpreter {
                             | Value::BoundFunction(_)
                             | Value::ClassConstructor(_)
                             | Value::Proxy(_)
-                            | Value::RegExp(_)
-                    )
+                    ) || (!regexp_pass_through && matches!(v, Value::RegExp(_)))
                 };
                 for &idx in string_int_coerce {
                     let Some(slot) = small_args.get_mut(idx) else {

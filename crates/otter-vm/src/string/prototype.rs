@@ -122,6 +122,20 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
             });
             Ok(JsString::from_str(&items.join(","), args.string_heap)?)
         }
+        Value::RegExp(re) => {
+            // §22.2.6.13 RegExp.prototype.toString — `/source/flags`.
+            let gc = &*args.gc_heap;
+            let pattern = re.source(gc);
+            let flags = re.flags(gc);
+            let pattern_str = if pattern.is_empty() {
+                "(?:)".to_string()
+            } else {
+                pattern
+            };
+            let text = format!("/{}/{}", pattern_str, flags.to_js_string());
+            Ok(JsString::from_str(&text, args.string_heap)?)
+        }
+        Value::Symbol(_) => Err(IntrinsicError::BadReceiver { expected: "string" }),
         Value::Null | Value::Undefined => Err(IntrinsicError::BadReceiver { expected: "string" }),
         _ => Err(IntrinsicError::BadReceiver { expected: "string" }),
     }

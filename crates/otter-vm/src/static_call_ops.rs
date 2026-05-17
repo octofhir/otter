@@ -969,51 +969,124 @@ impl Interpreter {
                 }
             }
             M::GetOwnPropertyDescriptors => {
-                let target = match args.first() {
-                    Some(Value::Object(target)) => *target,
-                    _ => return Err(VmError::TypeMismatch),
-                };
-                let target_root = Value::Object(target);
-                let result =
-                    self.alloc_stack_rooted_object_with_value_roots(stack, &[&target_root], args)?;
-                let result_root = Value::Object(result);
-                let (keys, symbols): (Vec<String>, Vec<crate::symbol::JsSymbol>) =
-                    object::with_properties(target, self.gc_heap(), |p| {
-                        (
-                            p.keys().map(|s| s.to_string()).collect(),
-                            p.symbol_keys().collect(),
-                        )
-                    });
-                for key in keys {
-                    if let Some(desc) = object::get_own_descriptor(target, self.gc_heap(), &key) {
-                        let desc_obj = self.descriptor_to_object_stack_rooted(
-                            stack,
-                            &desc,
-                            &[&target_root, &result_root],
-                            args,
-                        )?;
-                        object::set(result, &mut self.gc_heap, &key, Value::Object(desc_obj));
+                // §20.1.2.10.1 — ToObject(target) then enumerate
+                // every own key. Primitive ToObject:
+                // - Boolean / Number / Symbol / BigInt wrappers
+                //   have no own keys → empty result object.
+                // - String wrapper exposes indexed code-unit slots +
+                //   `length`; emit data descriptors directly.
+                // - Null / Undefined throw TypeError per spec.
+                let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
+                match args.first() {
+                    Some(Value::Null) | Some(Value::Undefined) | None => {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Object.getOwnPropertyDescriptors called on null or undefined"
+                                    .to_string(),
+                        });
                     }
-                }
-                for sym in symbols {
-                    if let Some(desc) =
-                        object::get_own_symbol_descriptor(target, self.gc_heap(), &sym)
-                    {
-                        let desc_obj = self.descriptor_to_object_stack_rooted(
+                    Some(Value::Boolean(_))
+                    | Some(Value::Number(_))
+                    | Some(Value::Symbol(_))
+                    | Some(Value::BigInt(_)) => {
+                        // Empty result; primitive wrapper carries no
+                        // own keys reachable through the foundation
+                        // surface.
+                    }
+                    Some(Value::String(s)) => {
+                        let units = s.to_utf16_vec();
+                        let result_root = Value::Object(result);
+                        for (i, u) in units.iter().enumerate() {
+                            let key = i.to_string();
+                            let unit = crate::string::JsString::from_utf16_units(
+                                &[*u],
+                                &self.string_heap,
+                            )
+                            .map_err(|_| VmError::TypeMismatch)?;
+                            let desc = crate::object::PropertyDescriptor::data(
+                                Value::String(unit),
+                                false,
+                                true,
+                                false,
+                            );
+                            let desc_obj = self.descriptor_to_object_stack_rooted(
+                                stack,
+                                &desc,
+                                &[&result_root],
+                                args,
+                            )?;
+                            object::set(result, &mut self.gc_heap, &key, Value::Object(desc_obj));
+                        }
+                        let length_desc = crate::object::PropertyDescriptor::data(
+                            Value::Number(crate::number::NumberValue::from_f64(units.len() as f64)),
+                            false,
+                            false,
+                            false,
+                        );
+                        let length_obj = self.descriptor_to_object_stack_rooted(
                             stack,
-                            &desc,
-                            &[&target_root, &result_root],
+                            &length_desc,
+                            &[&result_root],
                             args,
                         )?;
-                        if !object::set_symbol(
+                        object::set(
                             result,
                             &mut self.gc_heap,
-                            sym,
-                            Value::Object(desc_obj),
-                        ) {
-                            return Err(VmError::TypeMismatch);
+                            "length",
+                            Value::Object(length_obj),
+                        );
+                    }
+                    Some(Value::Object(target)) => {
+                        let target = *target;
+                        let target_root = Value::Object(target);
+                        let result_root = Value::Object(result);
+                        let (keys, symbols): (Vec<String>, Vec<crate::symbol::JsSymbol>) =
+                            object::with_properties(target, self.gc_heap(), |p| {
+                                (
+                                    p.keys().map(|s| s.to_string()).collect(),
+                                    p.symbol_keys().collect(),
+                                )
+                            });
+                        for key in keys {
+                            if let Some(desc) =
+                                object::get_own_descriptor(target, self.gc_heap(), &key)
+                            {
+                                let desc_obj = self.descriptor_to_object_stack_rooted(
+                                    stack,
+                                    &desc,
+                                    &[&target_root, &result_root],
+                                    args,
+                                )?;
+                                object::set(
+                                    result,
+                                    &mut self.gc_heap,
+                                    &key,
+                                    Value::Object(desc_obj),
+                                );
+                            }
+                        }
+                        for sym in symbols {
+                            if let Some(desc) =
+                                object::get_own_symbol_descriptor(target, self.gc_heap(), &sym)
+                            {
+                                let desc_obj = self.descriptor_to_object_stack_rooted(
+                                    stack,
+                                    &desc,
+                                    &[&target_root, &result_root],
+                                    args,
+                                )?;
+                                if !object::set_symbol(
+                                    result,
+                                    &mut self.gc_heap,
+                                    sym,
+                                    Value::Object(desc_obj),
+                                ) {
+                                    return Err(VmError::TypeMismatch);
+                                }
+                            }
                         }
                     }
+                    _ => return Err(VmError::TypeMismatch),
                 }
                 Ok(Some(Value::Object(result)))
             }
@@ -1033,12 +1106,36 @@ impl Interpreter {
                             .into_iter()
                             .collect()
                     }
-                    Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
+                    Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_)) => {
+                        Vec::new()
+                    }
                     Some(Value::String(s)) => {
                         let mut keys: Vec<String> =
                             (0..s.len()).map(|idx| idx.to_string()).collect();
                         keys.push("length".to_string());
                         keys
+                    }
+                    Some(Value::Array(arr)) => {
+                        let len = crate::array::len(*arr, self.gc_heap());
+                        let mut keys: Vec<String> = (0..len)
+                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
+                            .map(|i| i.to_string())
+                            .collect();
+                        let named: Vec<String> = self.gc_heap().read_payload(*arr, |body| {
+                            body.named_properties
+                                .as_ref()
+                                .map_or_else(Vec::new, |m| m.keys().cloned().collect())
+                        });
+                        keys.extend(named);
+                        keys.push("length".to_string());
+                        keys
+                    }
+                    Some(Value::Null) | Some(Value::Undefined) | None => {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Object.getOwnPropertyNames called on null or undefined"
+                                    .to_string(),
+                        });
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };

@@ -37,6 +37,46 @@ use crate::{
 };
 
 impl Interpreter {
+    /// §7.1.19 `ToPropertyKey(value)` — projection used by the
+    /// computed-key `LoadElement` / `StoreElement` opcode dispatch
+    /// before the per-receiver match runs. Primitive operands round
+    /// through their existing arms unchanged; objects, functions,
+    /// closures, arrays, and other non-primitives surface as a
+    /// `Value::String` (the `ToString` result) or `Value::Symbol`
+    /// (when `[Symbol.toPrimitive]` returns a Symbol). Bypassing
+    /// this step caused `obj[() => {}]` / `class { [() => {}](){} }`
+    /// to raise `TypeMismatch` even though the spec mandates a
+    /// successful ToString coercion of the key.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-topropertykey>
+    /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    fn coerce_property_key_value(
+        &mut self,
+        context: &ExecutionContext,
+        value: Value,
+    ) -> Result<Value, VmError> {
+        if abstract_ops::is_primitive(&value) {
+            return Ok(value);
+        }
+        let key = self.to_property_key_sync(context, value)?;
+        match key {
+            VmPropertyKey::Symbol(sym) => Ok(Value::Symbol(sym)),
+            VmPropertyKey::Atom(atom) => {
+                let s = JsString::from_str(atom.name(), &self.string_heap)?;
+                Ok(Value::String(s))
+            }
+            VmPropertyKey::String(s) => {
+                let s = JsString::from_str(s, &self.string_heap)?;
+                Ok(Value::String(s))
+            }
+            VmPropertyKey::OwnedString(s) => {
+                let s = JsString::from_str(&s, &self.string_heap)?;
+                Ok(Value::String(s))
+            }
+        }
+    }
+
     fn function_user_bag_with_stack_roots(
         &mut self,
         stack: &SmallVec<[Frame; 8]>,
@@ -636,7 +676,8 @@ impl Interpreter {
         idx_reg: u16,
     ) -> Result<(), VmError> {
         let recv = read_register(frame, recv_reg)?.clone();
-        let idx_value = read_register(frame, idx_reg)?.clone();
+        let idx_value_raw = read_register(frame, idx_reg)?.clone();
+        let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         let value = match (&recv, &idx_value) {
             (Value::Object(obj), Value::Symbol(sym)) => {
                 crate::object::get_symbol(*obj, &self.gc_heap, sym).unwrap_or(Value::Undefined)
@@ -860,9 +901,10 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
         let recv = read_register(frame, recv_reg)?.clone();
-        let idx_value = read_register(frame, idx_reg)?.clone();
+        let idx_value_raw = read_register(frame, idx_reg)?.clone();
         let value = read_register(frame, src_reg)?.clone();
         let strict = context.function_is_strict(frame.function_id);
+        let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         match (&recv, &idx_value) {
             // Symbol-keyed write on an object.
             (Value::Object(obj), Value::Symbol(sym)) => {
@@ -1430,7 +1472,8 @@ impl Interpreter {
         let key_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
-        let key_value = read_register(&stack[top_idx], key_reg)?.clone();
+        let key_value_raw = read_register(&stack[top_idx], key_reg)?.clone();
+        let key_value = self.coerce_property_key_value(context, key_value_raw)?;
         let key = match &key_value {
             Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
             Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
@@ -1802,7 +1845,8 @@ impl Interpreter {
         let scratch_reg = register_operand(operands.get(3))?;
         let top_idx = stack.len() - 1;
         let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
-        let key_value = read_register(&stack[top_idx], key_reg)?.clone();
+        let key_value_raw = read_register(&stack[top_idx], key_reg)?.clone();
+        let key_value = self.coerce_property_key_value(context, key_value_raw)?;
         let value = read_register(&stack[top_idx], src_reg)?.clone();
         let strict = Self::current_frame_is_strict(stack, context);
         enum ComputedPropertyKey {

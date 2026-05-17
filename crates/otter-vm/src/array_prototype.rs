@@ -920,7 +920,6 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// reduces to "is `Value::Array`".
 /// <https://tc39.es/ecma262/#sec-array.prototype.flat>
 fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
     let heap = &*args.gc_heap;
     let depth = match args.args.first() {
         None | Some(Value::Undefined) => 1i64,
@@ -934,8 +933,6 @@ fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     fn walk(out: &mut Vec<Value>, heap: &otter_gc::GcHeap, body: &[Value], depth: i64) {
         for v in body {
             match v {
-                // §23.1.3.12 step 4.b — `flat` skips array holes
-                // (`HasProperty(O, P)` is `false`).
                 Value::Hole => {}
                 Value::Array(a) if depth > 0 => {
                     array::with_elements(*a, heap, |inner| walk(out, heap, inner, depth - 1));
@@ -944,8 +941,18 @@ fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
         }
     }
-    let mut out: Vec<Value> = Vec::with_capacity(array::len(arr, heap));
-    array::with_elements(arr, heap, |elements| walk(&mut out, heap, elements, depth));
+    let elements: Vec<Value> = match args.receiver {
+        Value::Array(arr) => array::with_elements(*arr, heap, |els| els.to_vec()),
+        Value::Object(obj) => {
+            let len = read_array_like_length(*obj, heap);
+            (0..len)
+                .map(|i| crate::object::get(*obj, heap, &i.to_string()).unwrap_or(Value::Undefined))
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    walk(&mut out, heap, &elements, depth);
     Ok(Value::Array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
@@ -1685,6 +1692,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("findLastIndex", 1, native_find_last_index),
     method("reduce", 1, native_reduce),
     method("reduceRight", 1, native_reduce_right),
+    method("flatMap", 1, native_flat_map),
 ];
 
 const fn method(
@@ -1936,6 +1944,30 @@ fn array_callback_native_dispatch(
             "reduce" | "reduceRight" => {
                 acc = result;
             }
+            "flatMap" => {
+                // §23.1.3.13 step 5 — FlattenIntoArray with depth=1.
+                // Each callback result, if an Array, has its
+                // elements spliced into the output; otherwise the
+                // raw value is appended.
+                match result {
+                    Value::Array(inner) => {
+                        let inner_vals: Vec<Value> = crate::array::with_elements(
+                            inner,
+                            interp.gc_heap(),
+                            |els| {
+                                els.iter()
+                                    .filter(|v| !matches!(v, Value::Hole))
+                                    .cloned()
+                                    .collect()
+                            },
+                        );
+                        for v in inner_vals {
+                            out.push((out.len(), v));
+                        }
+                    }
+                    other => out.push((out.len(), other)),
+                }
+            }
             _ => {}
         }
     }
@@ -1982,7 +2014,7 @@ fn array_callback_native_dispatch(
             });
             Ok(Value::Array(arr))
         }
-        "filter" => {
+        "filter" | "flatMap" => {
             let buf: Vec<Value> = out.into_iter().map(|(_, v)| v).collect();
             let (interp, _) = ctx.interp_mut_and_context();
             let heap = interp.gc_heap_mut();
@@ -2041,6 +2073,9 @@ fn native_reduce(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 fn native_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     array_callback_native_dispatch("reduceRight", ctx, args)
+}
+fn native_flat_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("flatMap", ctx, args)
 }
 
 #[cfg(test)]

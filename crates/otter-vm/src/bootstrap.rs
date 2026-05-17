@@ -310,36 +310,16 @@ struct AllocationSnapshot {
 /// so subsequent entries can resolve `globalThis.Object.prototype`
 /// without falling through to a null `[[Prototype]]`.
 pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
-    BootstrapEntry {
-        name: object_statics::OBJECT_SPEC.name,
-        feature: BootstrapFeatures::CORE,
-        install: install_object,
-    },
-    BootstrapEntry {
-        name: "Array",
-        feature: BootstrapFeatures::CORE,
-        install: install_array,
-    },
+    crate::bootstrap_entry!(crate::bootstrap::ObjectIntrinsic),
+    crate::bootstrap_entry!(crate::bootstrap::ArrayIntrinsic),
     crate::bootstrap_entry!(crate::json::Intrinsic),
     crate::bootstrap_entry!(crate::string::intrinsic::Intrinsic),
-    BootstrapEntry {
-        name: "Number",
-        feature: BootstrapFeatures::CORE,
-        install: install_number,
-    },
+    crate::bootstrap_entry!(crate::bootstrap::NumberIntrinsic),
     crate::bootstrap_entry!(crate::boolean::intrinsic::Intrinsic),
     crate::bootstrap_entry!(crate::bootstrap_bigint::Intrinsic),
-    BootstrapEntry {
-        name: "Symbol",
-        feature: BootstrapFeatures::CORE,
-        install: install_symbol,
-    },
+    crate::bootstrap_entry!(crate::bootstrap::SymbolIntrinsic),
     crate::bootstrap_entry!(crate::math::Intrinsic),
-    BootstrapEntry {
-        name: "Date",
-        feature: BootstrapFeatures::CORE,
-        install: install_date,
-    },
+    crate::bootstrap_entry!(crate::bootstrap::DateIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_regexp::Intrinsic),
     crate::bootstrap_entry!(crate::bootstrap_collections::MapIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_collections::SetIntrinsic),
@@ -347,17 +327,9 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_collections::WeakSetIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_weak_refs::WeakRefIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_promise::Intrinsic),
-    BootstrapEntry {
-        name: "Proxy",
-        feature: BootstrapFeatures::CORE,
-        install: install_proxy,
-    },
+    crate::bootstrap_entry!(crate::bootstrap::ProxyIntrinsic),
     crate::bootstrap_entry!(crate::reflect::Intrinsic),
-    BootstrapEntry {
-        name: "Function",
-        feature: BootstrapFeatures::CORE,
-        install: install_function,
-    },
+    crate::bootstrap_entry!(crate::bootstrap::FunctionIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::ArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::SharedArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_data_view::Intrinsic),
@@ -486,11 +458,7 @@ fn install_placeholder(
     Ok(())
 }
 
-fn install_proxy(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCtx, NativeError};
 
     fn proxy_target_is_object(value: &Value) -> bool {
@@ -612,7 +580,7 @@ fn install_proxy(
     if !proxy_ctor.define_own_property(heap, &string_heap, "revocable", revocable_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("revocable"));
     }
-    define_global(global, heap, entry.name, Value::NativeFunction(proxy_ctor));
+    define_global(global, heap, "Proxy", Value::NativeFunction(proxy_ctor));
     Ok(())
 }
 
@@ -622,11 +590,7 @@ fn install_proxy(
 // (configurable=false, writable=false, enumerable=false per
 // §20.4.2.*), plus `for` / `keyFor` methods and a `prototype` link.
 // <https://tc39.es/ecma262/#sec-symbol-constructor>
-fn install_symbol(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
     use crate::{NativeCtx, NativeError};
 
@@ -877,7 +841,7 @@ fn install_symbol(
     // the per-realm well-known JsSymbol singleton.
     let _ = WellKnown::Iterator; // silence the unused-import lint
     let _ = symbol_proto_to_primitive;
-    define_global(global, heap, entry.name, Value::NativeFunction(symbol_ctor));
+    define_global(global, heap, "Symbol", Value::NativeFunction(symbol_ctor));
     Ok(())
 }
 
@@ -1072,11 +1036,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     Ok(())
 }
 
-fn install_array(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCtx, NativeError};
 
     let global_root = Value::Object(global);
@@ -1177,15 +1137,11 @@ fn install_array(
     // slot. This must not appear in JS own-property reflection.
     object::set_constructor_native(array, heap, Value::NativeFunction(ctor_native));
 
-    define_global(global, heap, entry.name, Value::Object(array));
+    define_global(global, heap, "Array", Value::Object(array));
     Ok(())
 }
 
-fn install_number(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCall, NativeCtx, NativeError};
 
     let global_root = Value::Object(global);
@@ -1402,7 +1358,7 @@ fn install_number(
     // §21.1.3.1 `Number.prototype.constructor` points back at the
     // Number constructor.
     object::set(prototype, heap, "constructor", number_value.clone());
-    define_global(global, heap, entry.name, number_value);
+    define_global(global, heap, "Number", number_value);
     Ok(())
 }
 
@@ -1413,11 +1369,7 @@ fn install_number(
 // `Boolean` installer migrated to
 // [`crate::boolean::intrinsic::Intrinsic`].
 
-fn install_function(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCtx, NativeError};
 
     fn function_prototype_call(
@@ -1533,18 +1485,14 @@ fn install_function(
     )?;
     let constructor = PropertyDescriptor::data(Value::Object(function), true, false, true);
     let _ = object::define_own_property(prototype, heap, "constructor", constructor);
-    define_global(global, heap, entry.name, Value::Object(function));
+    define_global(global, heap, "Function", Value::Object(function));
     Ok(())
 }
 
 // `Math` installer migrated to [`crate::math::Intrinsic`].
 // `JSON` installer migrated to [`crate::json::Intrinsic`].
 
-fn install_object(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCtx, NativeError};
 
     fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1593,15 +1541,11 @@ fn install_object(
         }
     }
     object::set(prototype, heap, "constructor", Value::Object(object));
-    define_global(global, heap, entry.name, Value::Object(object));
+    define_global(global, heap, "Object", Value::Object(object));
     Ok(())
 }
 
-fn install_date(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
+fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{JsString, NativeCtx, NativeError};
 
     fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1668,7 +1612,7 @@ fn install_date(
 
     let date_value = Value::Object(constructor);
     object::set(prototype, heap, "constructor", date_value.clone());
-    define_global(global, heap, entry.name, date_value);
+    define_global(global, heap, "Date", date_value);
     Ok(())
 }
 
@@ -1684,6 +1628,84 @@ pub(crate) fn define_global_value(
     value: Value,
 ) {
     define_global(global, heap, name, value);
+}
+
+/// `BuiltinIntrinsic` adapters for the remaining built-ins whose
+/// installers still live inside `bootstrap.rs`. Each adapter is a
+/// zero-sized marker type wired through the per-class private
+/// `install_*` body. Migration target: move the bodies into
+/// per-class modules and drop these adapters; for now they cleanly
+/// retire the `install: install_xxx` function-pointer entries from
+/// `BOOTSTRAP_ENTRIES` without disturbing the installer bodies.
+
+/// `BuiltinIntrinsic` adapter for the global `Object` constructor.
+pub struct ObjectIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for ObjectIntrinsic {
+    const NAME: &'static str = "Object";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_object(heap, global)
+    }
+}
+
+/// `BuiltinIntrinsic` adapter for the global `Array` constructor.
+pub struct ArrayIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for ArrayIntrinsic {
+    const NAME: &'static str = "Array";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_array(heap, global)
+    }
+}
+
+/// `BuiltinIntrinsic` adapter for the global `Number` constructor.
+pub struct NumberIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for NumberIntrinsic {
+    const NAME: &'static str = "Number";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_number(heap, global)
+    }
+}
+
+/// `BuiltinIntrinsic` adapter for the global `Symbol` constructor.
+pub struct SymbolIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for SymbolIntrinsic {
+    const NAME: &'static str = "Symbol";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_symbol(heap, global)
+    }
+}
+
+/// `BuiltinIntrinsic` adapter for the global `Date` constructor.
+pub struct DateIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for DateIntrinsic {
+    const NAME: &'static str = "Date";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_date(heap, global)
+    }
+}
+
+/// `BuiltinIntrinsic` adapter for the global `Proxy` constructor.
+pub struct ProxyIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for ProxyIntrinsic {
+    const NAME: &'static str = "Proxy";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_proxy(heap, global)
+    }
+}
+
+/// `BuiltinIntrinsic` adapter for the global `Function` constructor.
+pub struct FunctionIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for FunctionIntrinsic {
+    const NAME: &'static str = "Function";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install_function(heap, global)
+    }
 }
 
 fn define_global(global: JsObject, heap: &mut otter_gc::GcHeap, name: &'static str, value: Value) {

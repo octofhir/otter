@@ -28,10 +28,13 @@
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier, Class,
-    Expression, Function, NumericLiteral, Program, SimpleAssignmentTarget, StringLiteral,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement, Function,
+    IfStatement, LabeledStatement, NumericLiteral, Program, SimpleAssignmentTarget, Statement,
+    StringLiteral, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    WhileStatement,
 };
 use oxc_ast_visit::{Visit, walk};
+use oxc_span::Span;
 use oxc_syntax::scope::ScopeFlags;
 
 use crate::CompileError;
@@ -84,6 +87,50 @@ impl StrictValidator {
     fn is_strict(&self) -> bool {
         self.strict_stack.last().copied().unwrap_or(false)
     }
+
+    /// Flag a `FunctionDeclaration` appearing as the direct body of
+    /// a control-flow statement (if / while / for / labeled / etc.).
+    ///
+    /// ECMA-262 §13.6.1.1 / §13.7.2.1 / §13.7.3.1 / §13.7.4.1 /
+    /// §13.7.5.1 / §14.13.1: it is a Syntax Error if
+    /// `IsLabelledFunction(Statement)` is true. Annex B §B.3.2
+    /// relaxes only the `IfStatement` arm and only for sloppy mode;
+    /// strict mode rejects unconditionally for every controller.
+    /// `context_label` is folded into the diagnostic so the engine
+    /// reports which controller hosted the offender.
+    fn flag_function_declaration_body(&mut self, body: &Statement<'_>, context_label: &str) {
+        if !self.is_strict() {
+            return;
+        }
+        let Some(span) = function_declaration_body_span(body) else {
+            return;
+        };
+        self.diagnostics.push(SyntaxDiagnostic {
+            code: "STRICT_FUNCTION_AS_STATEMENT_BODY".to_string(),
+            message: format!(
+                "SyntaxError: function declarations cannot appear as the direct body of \
+                 `{context_label}` in strict mode (§13.6.1.1 / §13.7.x.1 \
+                 IsLabelledFunction early error)"
+            ),
+            range: Some((span.start, span.end)),
+            help: Some(
+                "wrap the function declaration in a block `{ … }` or convert it to a function \
+                 expression assigned to a binding"
+                    .to_string(),
+            ),
+        });
+    }
+}
+
+/// Return the source span of a `FunctionDeclaration` when `body` is
+/// that exact AST shape (rather than e.g. a `BlockStatement` or a
+/// `LabeledStatement` that wraps one). Used by the strict-mode body
+/// check so the diagnostic points at the offending function header.
+fn function_declaration_body_span(body: &Statement<'_>) -> Option<Span> {
+    match body {
+        Statement::FunctionDeclaration(func) => Some(func.span),
+        _ => None,
+    }
 }
 
 impl<'a> Visit<'a> for StrictValidator {
@@ -132,6 +179,49 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
+    }
+
+    fn visit_if_statement(&mut self, it: &IfStatement<'a>) {
+        self.flag_function_declaration_body(&it.consequent, "if");
+        if let Some(alt) = &it.alternate {
+            self.flag_function_declaration_body(alt, "else");
+        }
+        walk::walk_if_statement(self, it);
+    }
+
+    fn visit_while_statement(&mut self, it: &WhileStatement<'a>) {
+        self.flag_function_declaration_body(&it.body, "while");
+        walk::walk_while_statement(self, it);
+    }
+
+    fn visit_do_while_statement(&mut self, it: &DoWhileStatement<'a>) {
+        self.flag_function_declaration_body(&it.body, "do-while");
+        walk::walk_do_while_statement(self, it);
+    }
+
+    fn visit_for_statement(&mut self, it: &ForStatement<'a>) {
+        self.flag_function_declaration_body(&it.body, "for");
+        walk::walk_for_statement(self, it);
+    }
+
+    fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
+        self.flag_function_declaration_body(&it.body, "for-in");
+        walk::walk_for_in_statement(self, it);
+    }
+
+    fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
+        self.flag_function_declaration_body(&it.body, "for-of");
+        walk::walk_for_of_statement(self, it);
+    }
+
+    fn visit_labeled_statement(&mut self, it: &LabeledStatement<'a>) {
+        // §14.13.1 LabelledStatement Static Semantics: Early Errors —
+        // IsLabelledFunction(Statement) must not be true. Even in
+        // sloppy mode a labelled function declaration as the labelled
+        // body is forbidden; in strict mode all FunctionDeclaration
+        // bodies are too, so we flag uniformly.
+        self.flag_function_declaration_body(&it.body, "labeled");
+        walk::walk_labeled_statement(self, it);
     }
 
     fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {

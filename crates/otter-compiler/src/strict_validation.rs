@@ -31,10 +31,11 @@ use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier,
     BindingPattern, Class, ClassElement, DoWhileStatement, Expression, ForInStatement,
-    ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function, IfStatement,
-    LabeledStatement, MethodDefinitionKind, NumericLiteral, Program, PropertyKey,
-    SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement, UnaryExpression,
-    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind, WhileStatement,
+    ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
+    IdentifierReference, IfStatement, LabeledStatement, MethodDefinitionKind, NumericLiteral,
+    Program, PropertyKey, SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral,
+    SwitchStatement, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
+    VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -89,6 +90,29 @@ struct StrictValidator {
 impl StrictValidator {
     fn is_strict(&self) -> bool {
         self.strict_stack.last().copied().unwrap_or(false)
+    }
+
+    /// Scan a class field / accessor initializer for free
+    /// `arguments` references and emit a diagnostic if any survives
+    /// the same scope rules used by [`ContainsArgumentsScanner`].
+    fn check_initializer_no_arguments(&mut self, init: &Expression<'_>, label: &str) {
+        let mut scanner = ContainsArgumentsScanner { found: None };
+        scanner.visit_expression(init);
+        if let Some(span) = scanner.found {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "CLASS_FIELD_CONTAINS_ARGUMENTS".to_string(),
+                message: format!(
+                    "SyntaxError: class {label} cannot reference `arguments` \
+                     (§15.7.1 ContainsArguments early error)"
+                ),
+                range: Some((span.start, span.end)),
+                help: Some(
+                    "class field initializers run in the class scope, which never binds \
+                     `arguments`; pass the values you need explicitly into a method instead"
+                        .to_string(),
+                ),
+            });
+        }
     }
 
     /// Walk a class body and flag duplicate `PrivateBoundNames` per
@@ -289,6 +313,73 @@ impl StrictValidator {
                     .to_string(),
             ),
         });
+    }
+}
+
+/// Scanner that detects free `arguments` references inside a class
+/// static initialization block per ECMA-262 §15.7.1 ContainsArguments.
+///
+/// "Free" here means *not shadowed by a nested function-like binding
+/// scope*. The walker:
+/// - Records the first `IdentifierReference` named `arguments`.
+/// - Stops descent at `Function`, `ArrowFunctionExpression`, and any
+///   nested `StaticBlock` (each opens its own `arguments` scope or
+///   sits outside the original block).
+/// - Stops descent at class element bodies that have their own
+///   `[[ContainsArguments]]` semantics: method definitions
+///   (`MethodDefinition.value` is a Function), property / accessor
+///   initializers (treated as function-like FieldDefinition records),
+///   and inner `StaticBlock`s — but still walks computed property
+///   keys, which evaluate in the surrounding scope and therefore see
+///   the outer `arguments` ban.
+/// - Walks `Class.super_class` because the heritage expression is
+///   evaluated in the surrounding scope.
+struct ContainsArgumentsScanner {
+    found: Option<oxc_span::Span>,
+}
+
+impl<'a> Visit<'a> for ContainsArgumentsScanner {
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        if self.found.is_none() && it.name.as_str() == "arguments" {
+            self.found = Some(it.span);
+        }
+    }
+
+    // Bail at function / arrow boundaries (own arguments scope).
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    // A nested class static block is its own ContainsArguments scope.
+    fn visit_static_block(&mut self, _: &StaticBlock<'a>) {}
+
+    // Walk class shapes selectively: heritage expression + computed
+    // keys live in surrounding scope; method values, field
+    // initializers, and inner static blocks each open their own
+    // boundary and are skipped by the per-shape visitors above.
+    fn visit_class(&mut self, it: &Class<'a>) {
+        if let Some(super_class) = &it.super_class {
+            self.visit_expression(super_class);
+        }
+        for element in &it.body.body {
+            match element {
+                ClassElement::MethodDefinition(m) => {
+                    if m.computed {
+                        self.visit_property_key(&m.key);
+                    }
+                }
+                ClassElement::PropertyDefinition(p) => {
+                    if p.computed {
+                        self.visit_property_key(&p.key);
+                    }
+                    // p.value is a field initializer with its own scope — skip.
+                }
+                ClassElement::AccessorProperty(a) => {
+                    if a.computed {
+                        self.visit_property_key(&a.key);
+                    }
+                }
+                ClassElement::StaticBlock(_) | ClassElement::TSIndexSignature(_) => {}
+            }
+        }
     }
 }
 
@@ -523,8 +614,63 @@ impl<'a> Visit<'a> for StrictValidator {
         // entries, except when a name is used exactly once as a
         // getter and once as a setter (no other entries).
         self.check_private_bound_names(it);
+        // §15.7.1 FieldDefinition Static Semantics: Early Errors —
+        // It is a Syntax Error if Initializer is present and
+        // ContainsArguments of Initializer is true. Field initializers
+        // (and accessor `value` expressions) execute in the class
+        // scope, which never binds `arguments` even when the class
+        // sits inside a function.
+        for element in &it.body.body {
+            match element {
+                ClassElement::PropertyDefinition(p) => {
+                    if let Some(init) = &p.value {
+                        self.check_initializer_no_arguments(init, "field initializer");
+                    }
+                }
+                ClassElement::AccessorProperty(a) => {
+                    if let Some(init) = &a.value {
+                        self.check_initializer_no_arguments(init, "accessor initializer");
+                    }
+                }
+                _ => {}
+            }
+        }
         walk::walk_class(self, it);
         self.strict_stack.pop();
+    }
+
+    fn visit_static_block(&mut self, it: &StaticBlock<'a>) {
+        // §15.7.1 ClassStaticBlockBody Static Semantics: Early
+        // Errors — `arguments` is not in scope inside a class static
+        // initialization block, so any IdentifierReference resolving
+        // to the name `arguments` is a SyntaxError. We use a custom
+        // scanner that walks the block statements but stops at any
+        // nested scope that binds its own `arguments` (functions,
+        // methods, class static blocks, property / accessor
+        // initializers).
+        let mut scanner = ContainsArgumentsScanner { found: None };
+        for stmt in &it.body {
+            scanner.visit_statement(stmt);
+            if scanner.found.is_some() {
+                break;
+            }
+        }
+        if let Some(span) = scanner.found {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "CLASS_STATIC_BLOCK_CONTAINS_ARGUMENTS".to_string(),
+                message:
+                    "SyntaxError: class static initialization block cannot reference `arguments` \
+                     (§15.7.1 ContainsArguments early error)"
+                        .to_string(),
+                range: Some((span.start, span.end)),
+                help: Some(
+                    "use a class field initializer or move the logic into a method; \
+                     `arguments` has no binding inside a static block"
+                        .to_string(),
+                ),
+            });
+        }
+        walk::walk_static_block(self, it);
     }
 
     fn visit_numeric_literal(&mut self, it: &NumericLiteral<'a>) {

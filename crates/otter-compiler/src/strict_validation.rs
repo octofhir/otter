@@ -581,16 +581,19 @@ impl<'a> Visit<'a> for StrictValidator {
             return;
         }
         let name = it.name.as_str();
-        if is_reserved_strict_assignment_target(name) {
+        if is_reserved_strict_binding_name(name) {
             self.diagnostics.push(SyntaxDiagnostic {
                 code: "STRICT_RESERVED_BINDING".to_string(),
                 message: format!(
-                    "SyntaxError: cannot bind name `{name}` in strict mode code \
-                     (§13.1.1 BindingIdentifier reserves `eval` and `arguments`)"
+                    "SyntaxError: cannot bind name `{name}` in strict mode code (§13.1.1 \
+                     BindingIdentifier reserves `eval`, `arguments`, and the strict-mode \
+                     FutureReservedWords `implements` / `interface` / `let` / `package` / \
+                     `private` / `protected` / `public` / `static` / `yield`)"
                 ),
                 range: Some((it.span.start, it.span.end)),
                 help: Some(
-                    "rename the binding; `eval` and `arguments` cannot be declared in strict code"
+                    "rename the binding; these identifiers are reserved by the strict-mode \
+                     grammar and cannot be declared as bindings"
                         .to_string(),
                 ),
             });
@@ -647,23 +650,45 @@ impl<'a> Visit<'a> for StrictValidator {
     }
 
     fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {
-        if self.is_strict()
-            && matches!(it.operator, UnaryOperator::Delete)
-            && let Some(name) = unwrap_parens_identifier(&it.argument)
-        {
-            self.diagnostics.push(SyntaxDiagnostic {
-                code: "STRICT_DELETE_IDENTIFIER".to_string(),
-                message: format!(
-                    "SyntaxError: `delete {name}` is not allowed in strict mode \
-                     (UnaryExpression :: delete UnaryExpression resolves to an IdentifierReference)"
-                ),
-                range: Some((it.span.start, it.span.end)),
-                help: Some(
-                    "delete a property of an object instead (`delete obj.prop` or \
-                     `delete obj[key]`)"
+        if matches!(it.operator, UnaryOperator::Delete) {
+            // §13.5.1.1: `delete <IdentifierReference>` in strict.
+            if self.is_strict()
+                && let Some(name) = unwrap_parens_identifier(&it.argument)
+            {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "STRICT_DELETE_IDENTIFIER".to_string(),
+                    message: format!(
+                        "SyntaxError: `delete {name}` is not allowed in strict mode \
+                         (UnaryExpression :: delete UnaryExpression resolves to an IdentifierReference)"
+                    ),
+                    range: Some((it.span.start, it.span.end)),
+                    help: Some(
+                        "delete a property of an object instead (`delete obj.prop` or \
+                         `delete obj[key]`)"
+                            .to_string(),
+                    ),
+                });
+            }
+            // §13.5.1.1: `delete MemberExpression.PrivateName` and
+            // `delete CallExpression.PrivateName` are always Syntax
+            // Errors (mode-independent — class bodies are strict
+            // anyway, but the rule also rejects the construct in any
+            // surrounding scope reachable to a `#name`).
+            if let Some(span) = unwrap_parens_private_field_delete_span(&it.argument) {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "DELETE_PRIVATE_FIELD".to_string(),
+                    message: "SyntaxError: cannot `delete` a member of an object's private field \
+                         (`delete obj.#name` / `delete expr().#name` are early errors per \
+                         §13.5.1.1)"
                         .to_string(),
-                ),
-            });
+                    range: Some((span.start, span.end)),
+                    help: Some(
+                        "private fields cannot be removed; use `obj.#name = undefined` to \
+                         clear the slot value if needed"
+                            .to_string(),
+                    ),
+                });
+            }
         }
         walk::walk_unary_expression(self, it);
     }
@@ -709,9 +734,41 @@ fn assignment_target_identifier<'a>(target: &'a AssignmentTarget<'a>) -> Option<
 /// of a destructuring pattern in strict code.
 const STRICT_RESERVED_TARGETS: &[&str] = &["eval", "arguments"];
 
+/// Strict-mode FutureReservedWords flagged by §13.1.1 Static
+/// Semantics: Early Errors for BindingIdentifier. The StringValue of
+/// the IdentifierName cannot be any of these in strict-mode code,
+/// regardless of whether the source uses a Unicode escape sequence
+/// — oxc stores the cooked name, so `class let {}` lands here
+/// with name="let".
+///
+/// `yield` is included because the §13.1.1 rule applies in strict
+/// scopes even outside generators (the contextual keyword status
+/// promotes to a hard reservation under strict-mode semantics).
+/// `eval` and `arguments` are repeated so a single helper covers
+/// both the §12.7.1 simple-assignment-target rule and the §13.1.1
+/// binding rule.
+const STRICT_RESERVED_BINDING_NAMES: &[&str] = &[
+    "eval",
+    "arguments",
+    "implements",
+    "interface",
+    "let",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "static",
+    "yield",
+];
+
 #[inline]
 fn is_reserved_strict_assignment_target(name: &str) -> bool {
     STRICT_RESERVED_TARGETS.contains(&name)
+}
+
+#[inline]
+fn is_reserved_strict_binding_name(name: &str) -> bool {
+    STRICT_RESERVED_BINDING_NAMES.contains(&name)
 }
 
 /// Return the bare identifier name when the update operand is a
@@ -745,6 +802,30 @@ fn unwrap_parens_identifier<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
             Expression::ParenthesizedExpression(inner) => {
                 cursor = &inner.expression;
             }
+            _ => return None,
+        }
+    }
+}
+
+/// Detect `delete <expr>.#<priv>` (parens-tolerant). Returns the
+/// span of the offending `PrivateFieldExpression` so the diagnostic
+/// can point at the private name.
+///
+/// ECMA-262 §13.5.1.1 Static Semantics: Early Errors:
+/// > It is a Syntax Error if the derived UnaryExpression is
+/// > MemberExpression :: MemberExpression `.` PrivateIdentifier or
+/// > CallExpression :: CallExpression `.` PrivateIdentifier.
+///
+/// Both AST shapes serialize to `PrivateFieldExpression` in oxc, so
+/// one branch covers both. The rule is mode-independent — class
+/// bodies are strict by §10.2.10 anyway, but the early error also
+/// applies wherever a private name is reachable.
+fn unwrap_parens_private_field_delete_span<'a>(expr: &'a Expression<'a>) -> Option<oxc_span::Span> {
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            Expression::PrivateFieldExpression(pf) => return Some(pf.span),
+            Expression::ParenthesizedExpression(inner) => cursor = &inner.expression,
             _ => return None,
         }
     }

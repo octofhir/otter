@@ -329,6 +329,56 @@ fn impl_set_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     finish_set(obj, args, c)
 }
 
+/// §B.2.4.1 — `Date.prototype.getYear()`. Returns
+/// `YearFromTime(LocalTime(t)) - 1900`, or `NaN` if the receiver's
+/// `[[DateValue]]` is `NaN`. The foundation treats LocalTime as
+/// UTC, mirroring the rest of the `getUTC*` / `get*` impls.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-date.prototype.getyear>
+fn impl_get_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let time = receiver_time(args)?;
+    Ok(broken_down(time)
+        .map(|bd| smi(bd.year - 1900))
+        .unwrap_or_else(nan))
+}
+
+/// §B.2.4.2 — `Date.prototype.setYear(year)`.
+///
+/// 1. Let `t` be `thisTimeValue(this)`.
+/// 2. If `t` is `NaN`, set `t` to `+0`; otherwise `t = LocalTime(t)`.
+/// 3. Let `y` be `ToNumber(year)`.
+/// 4. If `y` is `NaN`, `[[DateValue]] = NaN`, return `NaN`.
+/// 5. If `y` is finite and `0 ≤ ToInteger(y) ≤ 99`,
+///    `yyyy = ToInteger(y) + 1900`.
+/// 6. Else `yyyy = y`.
+/// 7. `d = MakeDay(yyyy, MonthFromTime(t), DateFromTime(t))`.
+/// 8. `date = UTC(MakeDate(d, TimeWithinDay(t)))`.
+/// 9. `[[DateValue]] = TimeClip(date)`; return `TimeClip(date)`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-date.prototype.setyear>
+fn impl_set_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let (obj, time) = receiver_handle(args)?;
+    let y = read_arg_number(args, 0, f64::NAN);
+    if y.is_nan() {
+        object::set_date_data(obj, args.gc_heap, f64::NAN);
+        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+    }
+    // §B.2.4.2 step 2: t = NaN → +0; else LocalTime(t) (== t under UTC).
+    let base_time = if time.is_nan() { 0.0 } else { time };
+    // §B.2.4.2 step 5–6.
+    let y_int = y.trunc();
+    let yyyy = if (0.0..=99.0).contains(&y_int) {
+        y_int + 1900.0
+    } else {
+        y
+    };
+    let mut c = current_components(base_time);
+    c.0 = yyyy;
+    finish_set(obj, args, c)
+}
+
 /// Declarative `Date.prototype` table. Local-time getters share
 /// the UTC implementations.
 pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
@@ -378,6 +428,8 @@ pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "setUTCSeconds"       / 2 => impl_set_seconds,
             "setMilliseconds"     / 1 => impl_set_milliseconds,
             "setUTCMilliseconds"  / 1 => impl_set_milliseconds,
+            "getYear"             / 0 => impl_get_year,
+            "setYear"             / 1 => impl_set_year,
         )
     });
 
@@ -492,4 +544,6 @@ date_prototype_methods!(
     bridge_set_utc_seconds       => "setUTCSeconds",       2;
     bridge_set_milliseconds      => "setMilliseconds",     1;
     bridge_set_utc_milliseconds  => "setUTCMilliseconds",  1;
+    bridge_get_year              => "getYear",             0;
+    bridge_set_year              => "setYear",             1;
 );

@@ -24,6 +24,8 @@
 //!   negatives) follows the foundation subset; rare edge cases
 //!   are documented inline.
 
+use smallvec::SmallVec;
+
 use crate::Value;
 use crate::array::{self, JsArray};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
@@ -88,7 +90,7 @@ fn read_array_like_length(obj: crate::object::JsObject, heap: &otter_gc::GcHeap)
 ///
 /// Returns `None` when `receiver` is not array-like (caller surfaces
 /// the spec's `RequireObjectCoercible` TypeError).
-fn array_like_present_entries(
+pub(crate) fn array_like_present_entries(
     receiver: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Option<Vec<(usize, Value)>> {
@@ -138,7 +140,7 @@ fn array_like_present_entries(
 /// §7.3.18 reachable length helper for receivers whose `.length`
 /// we trust to be observable but where we only need the upper bound
 /// for `fromIndex` clamping — does not allocate, just reads.
-fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> usize {
+pub(crate) fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> usize {
     match receiver {
         Value::Array(arr) => array::len(*arr, heap),
         Value::Object(obj) => read_array_like_length(*obj, heap),
@@ -1445,6 +1447,17 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("keys", 0, native_keys_iter),
     method("values", 0, native_values_iter),
     method("entries", 0, native_entries_iter),
+    method("forEach", 1, native_for_each),
+    method("map", 1, native_map),
+    method("filter", 1, native_filter),
+    method("some", 1, native_some),
+    method("every", 1, native_every),
+    method("find", 1, native_find),
+    method("findIndex", 1, native_find_index),
+    method("findLast", 1, native_find_last),
+    method("findLastIndex", 1, native_find_last_index),
+    method("reduce", 1, native_reduce),
+    method("reduceRight", 1, native_reduce_right),
 ];
 
 const fn method(
@@ -1520,6 +1533,235 @@ native_array!(native_to_locale_string, "toLocaleString");
 native_array!(native_keys_iter, "keys");
 native_array!(native_values_iter, "values");
 native_array!(native_entries_iter, "entries");
+
+/// Shared driver for the callback-driven `Array.prototype.*` methods
+/// when invoked through `.call` / `.apply` / a reflective property
+/// read. The dense `Value::Array` fast path in
+/// `method_ops::array_callback_dispatch` is still preferred when the
+/// receiver is a real Array — this wrapper covers
+/// `Array.prototype.forEach.call(<array-like-object>, ...)` and
+/// related shapes, which the interpreter dispatcher cannot reach.
+///
+/// Walks **present** indexed own keys via
+/// `array_like_present_entries` so pathological-length receivers
+/// don't trigger an `O(len)` HasProperty scan. The `this_arg`
+/// argument and the callback shape `(value, index, O)` follow the
+/// spec algorithm for each method.
+fn array_callback_native_dispatch(
+    name: &str,
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let receiver = ctx.this_value().clone();
+    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let (interp, ctx_opt) = ctx.interp_mut_and_context();
+    let context = ctx_opt.ok_or(NativeError::TypeError {
+        name: "Array.prototype callback",
+        reason: "missing execution context".to_string(),
+    })?;
+    let entries = {
+        let heap = interp.gc_heap();
+        array_like_present_entries(&receiver, heap).ok_or(NativeError::TypeError {
+            name: "Array.prototype callback",
+            reason: "receiver is not array-like".to_string(),
+        })?
+    };
+    let len = array_like_length(&receiver, interp.gc_heap());
+    let mut acc = Value::Undefined;
+    let mut out: Vec<(usize, Value)> = Vec::new();
+    let mut found_idx: Option<usize> = None;
+    let mut found_val = Value::Undefined;
+    let mut bool_acc: bool = match name {
+        "every" => true,
+        "some" => false,
+        _ => false,
+    };
+    let mut reduce_has_init = args.len() >= 2;
+    if name == "reduce" || name == "reduceRight" {
+        acc = if reduce_has_init {
+            args[1].clone()
+        } else {
+            Value::Undefined
+        };
+    }
+    let iter: Box<dyn Iterator<Item = (usize, Value)>> = if name == "reduceRight"
+        || name == "findLast"
+        || name == "findLastIndex"
+    {
+        Box::new(entries.into_iter().rev())
+    } else {
+        Box::new(entries.into_iter())
+    };
+    for (idx, v) in iter {
+        let cb_args: SmallVec<[Value; 8]> = match name {
+            "reduce" | "reduceRight" => {
+                if !reduce_has_init {
+                    acc = v.clone();
+                    reduce_has_init = true;
+                    continue;
+                }
+                smallvec::smallvec![
+                    acc.clone(),
+                    v.clone(),
+                    Value::Number(NumberValue::from_f64(idx as f64)),
+                    receiver.clone(),
+                ]
+            }
+            _ => smallvec::smallvec![
+                v.clone(),
+                Value::Number(NumberValue::from_f64(idx as f64)),
+                receiver.clone(),
+            ],
+        };
+        let result = interp
+            .run_callable_sync(&context, &callback, this_arg.clone(), cb_args)
+            .map_err(|err| NativeError::TypeError {
+                name: "Array.prototype callback",
+                reason: err.to_string(),
+            })?;
+        match name {
+            "forEach" => {}
+            "map" => out.push((idx, result)),
+            "filter" => {
+                if result.to_boolean() {
+                    out.push((idx, v));
+                }
+            }
+            "find" | "findLast" => {
+                if result.to_boolean() {
+                    found_val = v.clone();
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+            "findIndex" | "findLastIndex" => {
+                if result.to_boolean() {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+            "every" => {
+                if !result.to_boolean() {
+                    bool_acc = false;
+                    break;
+                }
+            }
+            "some" => {
+                if result.to_boolean() {
+                    bool_acc = true;
+                    break;
+                }
+            }
+            "reduce" | "reduceRight" => {
+                acc = result;
+            }
+            _ => {}
+        }
+    }
+    match name {
+        "forEach" => Ok(Value::Undefined),
+        "find" | "findLast" => Ok(found_val),
+        "findIndex" | "findLastIndex" => Ok(Value::Number(NumberValue::from_f64(
+            found_idx.map_or(-1.0, |i| i as f64),
+        ))),
+        "every" | "some" => Ok(Value::Boolean(bool_acc)),
+        "reduce" | "reduceRight" => {
+            if !reduce_has_init {
+                return Err(NativeError::TypeError {
+                    name: "reduce",
+                    reason: "empty array with no initial value".to_string(),
+                });
+            }
+            Ok(acc)
+        }
+        "map" => {
+            // Materialise into a dense array of length `len`. Absent
+            // positions stay `undefined`.
+            let mut buf: Vec<Value> = vec![Value::Undefined; len];
+            for (i, v) in out {
+                if i < len {
+                    buf[i] = v;
+                }
+            }
+            let (interp, _) = ctx.interp_mut_and_context();
+            let heap = interp.gc_heap_mut();
+            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for value in &buf {
+                    value.trace_value_slots(visit);
+                }
+            };
+            let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
+                NativeError::TypeError {
+                    name: "map",
+                    reason: "array allocation failed".to_string(),
+                }
+            })?;
+            crate::array::with_elements_mut(arr, heap, |elements| {
+                elements.extend(buf);
+            });
+            Ok(Value::Array(arr))
+        }
+        "filter" => {
+            let buf: Vec<Value> = out.into_iter().map(|(_, v)| v).collect();
+            let (interp, _) = ctx.interp_mut_and_context();
+            let heap = interp.gc_heap_mut();
+            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for value in &buf {
+                    value.trace_value_slots(visit);
+                }
+            };
+            let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
+                NativeError::TypeError {
+                    name: "filter",
+                    reason: "array allocation failed".to_string(),
+                }
+            })?;
+            crate::array::with_elements_mut(arr, heap, |elements| {
+                elements.extend(buf);
+            });
+            Ok(Value::Array(arr))
+        }
+        _ => Err(NativeError::TypeError {
+            name: "Array.prototype callback",
+            reason: format!("unknown callback method '{name}'"),
+        }),
+    }
+}
+
+fn native_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("forEach", ctx, args)
+}
+fn native_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("map", ctx, args)
+}
+fn native_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("filter", ctx, args)
+}
+fn native_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("some", ctx, args)
+}
+fn native_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("every", ctx, args)
+}
+fn native_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("find", ctx, args)
+}
+fn native_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("findIndex", ctx, args)
+}
+fn native_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("findLast", ctx, args)
+}
+fn native_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("findLastIndex", ctx, args)
+}
+fn native_reduce(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("reduce", ctx, args)
+}
+fn native_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    array_callback_native_dispatch("reduceRight", ctx, args)
+}
 
 #[cfg(test)]
 mod tests {

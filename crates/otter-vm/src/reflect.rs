@@ -393,10 +393,26 @@ fn create_list_from_array_like(
     arg: Option<&Value>,
 ) -> Result<SmallVec<[Value; 8]>, VmError> {
     match arg {
+        // §7.3.18 step 4–5 — when the source is a real Array the
+        // dense fast path bypasses ordinary Get walks, but it must
+        // still substitute holes (the internal `Value::Hole`
+        // sentinel) with the spec-mandated `undefined` from
+        // ArrayPrototype's `[[Get]]` fall-through. Without this,
+        // `Reflect.apply(fn, null, ['a', , null])` leaks `Hole`
+        // through `arguments` and trips later equality / typeof
+        // ladders.
         Some(Value::Array(arr)) => Ok(crate::array::with_elements(
             *arr,
             interp.gc_heap(),
-            |elements| elements.iter().cloned().collect(),
+            |elements| {
+                elements
+                    .iter()
+                    .map(|v| match v {
+                        Value::Hole => Value::Undefined,
+                        other => other.clone(),
+                    })
+                    .collect()
+            },
         )),
         Some(v) if is_type_object(v) => {
             // §7.3.18 CreateListFromArrayLike: probe `length` then

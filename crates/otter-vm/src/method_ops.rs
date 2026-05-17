@@ -430,6 +430,52 @@ impl Interpreter {
             frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(());
         }
+        // §7.1.18 ToObject — `String.prototype.hasOwnProperty(idx)`,
+        // `(0).propertyIsEnumerable("toString")`, etc. inherit
+        // `Object.prototype.{hasOwnProperty, propertyIsEnumerable,
+        // isPrototypeOf}` through the primitive wrapper chain. The
+        // wrapper isn't materialized; we answer directly from the
+        // primitive shape: String exposes integer indices in
+        // `[0, length)` plus `"length"`; every other primitive has
+        // no own properties.
+        if matches!(
+            &*name,
+            "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
+        ) && matches!(
+            &recv_value,
+            Value::String(_)
+                | Value::Number(_)
+                | Value::Boolean(_)
+                | Value::Symbol(_)
+                | Value::BigInt(_)
+        ) {
+            let result = match &*name {
+                "hasOwnProperty" | "propertyIsEnumerable" => {
+                    let key = property_key_from_arg(arg_values.first())?;
+                    match &recv_value {
+                        Value::String(s) => {
+                            if key == "length" {
+                                // propertyIsEnumerable is false for
+                                // String wrapper's `length`; hasOwn
+                                // is true.
+                                name == "hasOwnProperty"
+                            } else if let Ok(idx) = key.parse::<u32>() {
+                                idx < s.len()
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    }
+                }
+                "isPrototypeOf" => false,
+                _ => unreachable!("guarded by method-name match"),
+            };
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, Value::Boolean(result))?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
+        }
 
         // §20.2.3 Function.prototype canonical methods —
         // `call` / `apply` / `bind` / `toString`. They are

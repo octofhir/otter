@@ -629,7 +629,35 @@ impl Interpreter {
         context: &ExecutionContext,
         value: Value,
     ) -> Result<SmallVec<[Value; 8]>, VmError> {
-        if !matches!(value, Value::Object(_) | Value::Array(_) | Value::Proxy(_)) {
+        // §7.3.18 — `Type(obj) must be Object`. Cover every shape
+        // the VM models as a JS Object: ordinary objects, arrays,
+        // proxies, every callable variant (so `Reflect.apply(fn,
+        // null, new Function())` reads `.length` and walks indices
+        // per spec), plus the exotic objects with their own
+        // `[[Get]]` ladder (RegExp, ArrayBuffer, DataView,
+        // TypedArray, collections, etc.).
+        if !matches!(
+            value,
+            Value::Object(_)
+                | Value::Array(_)
+                | Value::Proxy(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+                | Value::Promise(_)
+        ) {
             return Err(VmError::TypeError {
                 message: "Function.prototype.apply argument list must be object-like".to_string(),
             });

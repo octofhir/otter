@@ -30,6 +30,23 @@ use crate::{
     string, symbol, to_length,
 };
 
+/// Convert an already-primitive value to a [`VmPropertyKey`] per
+/// §7.1.19 step 2-3: Symbol values pass through unchanged; every
+/// other primitive coerces to a UTF-16 string spelling.
+fn primitive_to_property_key(value: Value) -> Result<VmPropertyKey<'static>, VmError> {
+    match value {
+        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym)),
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::Number(n) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
+        Value::Boolean(true) => Ok(VmPropertyKey::String("true")),
+        Value::Boolean(false) => Ok(VmPropertyKey::String("false")),
+        Value::Null => Ok(VmPropertyKey::String("null")),
+        Value::Undefined => Ok(VmPropertyKey::String("undefined")),
+        Value::BigInt(b) => Ok(VmPropertyKey::OwnedString(b.to_decimal_string())),
+        _ => Err(VmError::TypeMismatch),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DescriptorAllocationRoots<'a> {
     Runtime {
@@ -2145,7 +2162,7 @@ impl Interpreter {
         target: Value,
         key: Option<&Value>,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
-        let key = Self::coerce_vm_property_key(key)?;
+        let key = self.to_property_key_sync(context, key.cloned().unwrap_or(Value::Undefined))?;
         self.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
             target.clone(),
@@ -2154,6 +2171,88 @@ impl Interpreter {
             &[&target],
             &[],
         )
+    }
+
+    /// §7.1.19 `ToPropertyKey(value)` — synchronous variant for native
+    /// dispatch paths (`hasOwnProperty`, `propertyIsEnumerable`,
+    /// `getOwnPropertyDescriptor`, …) that need to coerce a non-
+    /// primitive `V` to a property key without the call-frame ladder.
+    ///
+    /// 1. `key = ? ToPrimitive(V, hint = string)`.
+    /// 2. If `key` is a Symbol, return `key`.
+    /// 3. Else return `ToString(key)`.
+    ///
+    /// For objects without `[Symbol.toPrimitive]`, falls back to the
+    /// §7.1.1.1 `OrdinaryToPrimitive` `toString`/`valueOf` ladder. The
+    /// `@@toPrimitive` trap is invoked synchronously via
+    /// [`Self::run_callable_sync`] when present.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-topropertykey>
+    /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    pub(crate) fn to_property_key_sync(
+        &mut self,
+        context: &ExecutionContext,
+        value: Value,
+    ) -> Result<VmPropertyKey<'static>, VmError> {
+        if abstract_ops::is_primitive(&value) {
+            return primitive_to_property_key(value);
+        }
+        let primitive =
+            self.to_primitive_sync(context, value, abstract_ops::ToPrimitiveHint::String)?;
+        primitive_to_property_key(primitive)
+    }
+
+    /// §7.1.1 `ToPrimitive(value, hint)` — synchronous variant. See
+    /// [`Self::to_property_key_sync`] for the rationale.
+    pub(crate) fn to_primitive_sync(
+        &mut self,
+        context: &ExecutionContext,
+        value: Value,
+        hint: abstract_ops::ToPrimitiveHint,
+    ) -> Result<Value, VmError> {
+        if abstract_ops::is_primitive(&value) {
+            return Ok(value);
+        }
+        let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
+        let to_prim = match &value {
+            Value::Object(o) => crate::object::get_symbol(*o, &self.gc_heap, &to_prim_sym),
+            _ => None,
+        };
+        if let Some(callee) = to_prim
+            && self.is_callable_runtime(&callee)
+        {
+            let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
+            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+            args.push(Value::String(hint_str));
+            let result = self.run_callable_sync(context, &callee, value.clone(), args)?;
+            if abstract_ops::is_primitive(&result) {
+                return Ok(result);
+            }
+            return Err(VmError::TypeError {
+                message: "Cannot convert object to primitive value".to_string(),
+            });
+        }
+        let order: [&str; 2] = match hint {
+            abstract_ops::ToPrimitiveHint::String => ["toString", "valueOf"],
+            abstract_ops::ToPrimitiveHint::Number | abstract_ops::ToPrimitiveHint::Default => {
+                ["valueOf", "toString"]
+            }
+        };
+        for method in order {
+            let callee = self.get_property_value_for_call(context, value.clone(), method)?;
+            if !self.is_callable_runtime(&callee) {
+                continue;
+            }
+            let result =
+                self.run_callable_sync(context, &callee, value.clone(), SmallVec::new())?;
+            if abstract_ops::is_primitive(&result) {
+                return Ok(result);
+            }
+        }
+        Err(VmError::TypeError {
+            message: "Cannot convert object to primitive value".to_string(),
+        })
     }
 
     pub(crate) fn enumerable_own_string_keys_for_value(

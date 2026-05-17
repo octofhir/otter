@@ -34,7 +34,19 @@
 use std::cell::RefCell;
 
 use otter_gc::raw::{RawGc, SlotVisitor};
-use regress::{Flags, Regex};
+use regress::{ExecConfig, Flags, Regex};
+
+/// ReDoS guard for every `regress` execution. Cuts pathological
+/// backtracking patterns (`(a+)+b` against long inputs, nested
+/// alternation explosions) at a fixed step budget. A budget of
+/// `10_000_000` matches the value documented in `regress` and cuts
+/// runaway inputs within a few milliseconds while leaving realistic
+/// patterns untouched.
+///
+/// # See also
+/// - <https://en.wikipedia.org/wiki/ReDoS>
+/// - [`regress::ExecConfig`]
+pub const REGEX_BACKTRACK_BUDGET: u64 = 10_000_000;
 
 use crate::Value;
 use crate::number::NumberValue;
@@ -252,7 +264,11 @@ impl JsRegExp {
     }
 
     /// Run the compiled engine from a UTF-16 offset and collect
-    /// owned matches.
+    /// owned matches. Bounded by [`REGEX_BACKTRACK_BUDGET`] so
+    /// pathological ReDoS patterns abort with no matches instead of
+    /// stalling the interpreter. Step-limit aborts surface as an
+    /// empty match list — the spec-visible behaviour matches
+    /// "no match at this position" while letting the caller move on.
     #[must_use]
     pub fn find_from_utf16(
         &self,
@@ -260,8 +276,14 @@ impl JsRegExp {
         text_units: &[u16],
         start: usize,
     ) -> Vec<regress::Match> {
+        let config = ExecConfig {
+            backtrack_limit: Some(REGEX_BACKTRACK_BUDGET),
+        };
         heap.read_payload(self.inner, |body| {
-            body.regex.find_from_utf16(text_units, start).collect()
+            body.regex
+                .find_from_utf16_with_config(text_units, start, config)
+                .map_while(Result::ok)
+                .collect()
         })
     }
 

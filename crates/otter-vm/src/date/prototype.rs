@@ -128,6 +128,187 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
 }
 
+/// §21.4.4.27 / §21.4.4.43 / §21.4.4.40 — `toDateString` /
+/// `toTimeString` / `toLocaleString` / `toLocaleDateString` /
+/// `toLocaleTimeString`. Foundation form returns the ISO string
+/// for backward compatibility with `toString`. Locale-aware
+/// rendering ships once Intl lands.
+fn impl_to_date_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    let s = match crate::date::broken_down(date.time()) {
+        Some(bd) => format!("{:04}-{:02}-{:02}", bd.year, bd.month + 1, bd.day),
+        None => "Invalid Date".to_string(),
+    };
+    Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
+}
+
+fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    let s = match crate::date::broken_down(date.time()) {
+        Some(bd) => format!(
+            "{:02}:{:02}:{:02}.{:03}Z",
+            bd.hour, bd.minute, bd.second, bd.millisecond
+        ),
+        None => "Invalid Date".to_string(),
+    };
+    Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
+}
+
+/// Helper for `setX`-family methods. Reads each `args.args[idx]` as
+/// a `f64` via `ToNumber`; missing args fall back to the current
+/// broken-down component supplied by `defaults`. Returns `NaN` if
+/// any provided arg is non-finite.
+fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
+    match args.args.get(idx) {
+        None => fallback,
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::Boolean(true)) => 1.0,
+        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
+        Some(Value::Undefined) => f64::NAN,
+        _ => f64::NAN,
+    }
+}
+
+/// §21.4.4.27 — `setTime(ms)`. Direct write, returns the time value.
+fn impl_set_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    let ms = read_arg_number(args, 0, f64::NAN);
+    date.set_time(ms);
+    Ok(Value::Number(NumberValue::from_f64(date.time())))
+}
+
+/// Common body for the `setX` setter family: read current
+/// broken-down components (or epoch defaults for an Invalid Date),
+/// apply the user-supplied overrides via the closure, run
+/// `MakeDate`, write `set_time`, return the new time value.
+fn write_components<F>(date: &JsDate, _args: &IntrinsicArgs<'_>, update: F) -> f64
+where
+    F: FnOnce(&mut (f64, f64, f64, f64, f64, f64, f64)),
+{
+    let bd = crate::date::broken_down(date.time());
+    let mut components: (f64, f64, f64, f64, f64, f64, f64) = match bd {
+        Some(b) => (
+            b.year as f64,
+            b.month as f64,
+            b.day as f64,
+            b.hour as f64,
+            b.minute as f64,
+            b.second as f64,
+            b.millisecond as f64,
+        ),
+        None => (f64::NAN, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+    };
+    update(&mut components);
+    let (year, month, day, hour, minute, second, ms) = components;
+    let new_ms = crate::date::make_date(year, month, day, hour, minute, second, ms);
+    date.set_time(new_ms);
+    new_ms
+}
+
+fn impl_set_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    let ms = write_components(&date, args, |c| {
+        c.0 = read_arg_number(args, 0, c.0);
+        if args.args.len() >= 2 {
+            c.1 = read_arg_number(args, 1, c.1);
+        }
+        if args.args.len() >= 3 {
+            c.2 = read_arg_number(args, 2, c.2);
+        }
+    });
+    Ok(Value::Number(NumberValue::from_f64(ms)))
+}
+
+fn impl_set_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    // §21.4.4.21 — `setMonth(month [, date])`. Invalid Date passes
+    // through (NaN year → NaN result).
+    let bd = crate::date::broken_down(date.time());
+    if bd.is_none() {
+        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+    }
+    let ms = write_components(&date, args, |c| {
+        c.1 = read_arg_number(args, 0, c.1);
+        if args.args.len() >= 2 {
+            c.2 = read_arg_number(args, 1, c.2);
+        }
+    });
+    Ok(Value::Number(NumberValue::from_f64(ms)))
+}
+
+fn impl_set_date(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    if crate::date::broken_down(date.time()).is_none() {
+        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+    }
+    let ms = write_components(&date, args, |c| {
+        c.2 = read_arg_number(args, 0, c.2);
+    });
+    Ok(Value::Number(NumberValue::from_f64(ms)))
+}
+
+fn impl_set_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    if crate::date::broken_down(date.time()).is_none() {
+        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+    }
+    let ms = write_components(&date, args, |c| {
+        c.3 = read_arg_number(args, 0, c.3);
+        if args.args.len() >= 2 {
+            c.4 = read_arg_number(args, 1, c.4);
+        }
+        if args.args.len() >= 3 {
+            c.5 = read_arg_number(args, 2, c.5);
+        }
+        if args.args.len() >= 4 {
+            c.6 = read_arg_number(args, 3, c.6);
+        }
+    });
+    Ok(Value::Number(NumberValue::from_f64(ms)))
+}
+
+fn impl_set_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    if crate::date::broken_down(date.time()).is_none() {
+        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+    }
+    let ms = write_components(&date, args, |c| {
+        c.4 = read_arg_number(args, 0, c.4);
+        if args.args.len() >= 2 {
+            c.5 = read_arg_number(args, 1, c.5);
+        }
+        if args.args.len() >= 3 {
+            c.6 = read_arg_number(args, 2, c.6);
+        }
+    });
+    Ok(Value::Number(NumberValue::from_f64(ms)))
+}
+
+fn impl_set_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    if crate::date::broken_down(date.time()).is_none() {
+        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+    }
+    let ms = write_components(&date, args, |c| {
+        c.5 = read_arg_number(args, 0, c.5);
+        if args.args.len() >= 2 {
+            c.6 = read_arg_number(args, 1, c.6);
+        }
+    });
+    Ok(Value::Number(NumberValue::from_f64(ms)))
+}
+
+fn impl_set_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let date = receiver(args)?;
+    if crate::date::broken_down(date.time()).is_none() {
+        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+    }
+    let ms = write_components(&date, args, |c| {
+        c.6 = read_arg_number(args, 0, c.6);
+    });
+    Ok(Value::Number(NumberValue::from_f64(ms)))
+}
+
 /// Declarative `Date.prototype` table. Local-time getters share
 /// the UTC implementations.
 pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
@@ -157,6 +338,26 @@ pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "toJSON"              / 0 => impl_to_json,
             "toString"            / 0 => impl_to_string,
             "toUTCString"         / 0 => impl_to_string,
+            "toDateString"        / 0 => impl_to_date_string,
+            "toTimeString"        / 0 => impl_to_time_string,
+            "toLocaleString"      / 0 => impl_to_string,
+            "toLocaleDateString"  / 0 => impl_to_date_string,
+            "toLocaleTimeString"  / 0 => impl_to_time_string,
+            "setTime"             / 1 => impl_set_time,
+            "setFullYear"         / 3 => impl_set_full_year,
+            "setUTCFullYear"      / 3 => impl_set_full_year,
+            "setMonth"            / 2 => impl_set_month,
+            "setUTCMonth"         / 2 => impl_set_month,
+            "setDate"             / 1 => impl_set_date,
+            "setUTCDate"          / 1 => impl_set_date,
+            "setHours"            / 4 => impl_set_hours,
+            "setUTCHours"         / 4 => impl_set_hours,
+            "setMinutes"          / 3 => impl_set_minutes,
+            "setUTCMinutes"       / 3 => impl_set_minutes,
+            "setSeconds"          / 2 => impl_set_seconds,
+            "setUTCSeconds"       / 2 => impl_set_seconds,
+            "setMilliseconds"     / 1 => impl_set_milliseconds,
+            "setUTCMilliseconds"  / 1 => impl_set_milliseconds,
         )
     });
 
@@ -251,4 +452,24 @@ date_prototype_methods!(
     bridge_to_json               => "toJSON",              0;
     bridge_to_string             => "toString",            0;
     bridge_to_utc_string         => "toUTCString",         0;
+    bridge_to_date_string        => "toDateString",        0;
+    bridge_to_time_string        => "toTimeString",        0;
+    bridge_to_locale_string      => "toLocaleString",      0;
+    bridge_to_locale_date_string => "toLocaleDateString",  0;
+    bridge_to_locale_time_string => "toLocaleTimeString",  0;
+    bridge_set_time              => "setTime",             1;
+    bridge_set_full_year         => "setFullYear",         3;
+    bridge_set_utc_full_year     => "setUTCFullYear",      3;
+    bridge_set_month             => "setMonth",            2;
+    bridge_set_utc_month         => "setUTCMonth",         2;
+    bridge_set_date              => "setDate",             1;
+    bridge_set_utc_date          => "setUTCDate",          1;
+    bridge_set_hours             => "setHours",            4;
+    bridge_set_utc_hours         => "setUTCHours",         4;
+    bridge_set_minutes           => "setMinutes",          3;
+    bridge_set_utc_minutes       => "setUTCMinutes",       3;
+    bridge_set_seconds           => "setSeconds",          2;
+    bridge_set_utc_seconds       => "setUTCSeconds",       2;
+    bridge_set_milliseconds      => "setMilliseconds",     1;
+    bridge_set_utc_milliseconds  => "setUTCMilliseconds",  1;
 );

@@ -249,6 +249,18 @@ impl Interpreter {
             | Value::Closure { .. }
             | Value::BoundFunction(_)
             | Value::NativeFunction(_) => {}
+            // §20.1.2.21 step 4 — `Object.setPrototypeOf(primitive,
+            // proto)` returns the primitive unchanged after the
+            // RequireObjectCoercible / proto-typecheck steps (which
+            // already succeeded for `Boolean / Number / String /
+            // Symbol / BigInt` because they are coercible). Mirror
+            // V8 / JSC and skip the prototype write — the wrapper
+            // would be unreachable.
+            Value::Boolean(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Symbol(_)
+            | Value::BigInt(_) => {}
             _ => return Err(VmError::TypeMismatch),
         }
         frame.pc += 1;

@@ -9221,16 +9221,33 @@ fn compile_object_builtin(
             );
             Ok(dst)
         }
-        ("setPrototypeOf", 2) => {
-            let obj_reg = arg_regs[0];
-            let proto_reg = arg_regs[1];
+        // §20.1.2.21 `Object.setPrototypeOf(O, proto)`. Fast-path
+        // lowering on the canonical 2-arg shape; off-arity calls
+        // synthesize `undefined` for the missing operand and reuse
+        // the same `Op::SetPrototype` arm so the runtime can throw
+        // the spec-required `TypeError` (proto must be Object/Null,
+        // O must be coercible) rather than the compiler rejecting
+        // the call shape outright.
+        ("setPrototypeOf", _) => {
+            let obj_reg = if let Some(reg) = arg_regs.first().copied() {
+                reg
+            } else {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                dst
+            };
+            let proto_reg = if let Some(reg) = arg_regs.get(1).copied() {
+                reg
+            } else {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                dst
+            };
             cx.emit(
                 Op::SetPrototype,
                 [Operand::Register(obj_reg), Operand::Register(proto_reg)],
                 span,
             );
-            // Spec says `setPrototypeOf` returns `obj`; foundation
-            // mirrors that.
             Ok(obj_reg)
         }
         // `Object.is(x, y)` — ECMA-262 §20.1.2.13. Lowers to

@@ -325,12 +325,87 @@ fn install_accessor(
     Ok(())
 }
 
+/// §22.2.6.10 `get RegExp.prototype.source`. When `this` is the
+/// realm's `%RegExp.prototype%` (no `[[OriginalSource]]` slot)
+/// returns the sentinel `"(?:)"`; non-RegExp non-prototype
+/// receivers throw `TypeError`. Otherwise emits the spec's
+/// `EscapeRegExpPattern(src, flags)`: empty source → `"(?:)"`,
+/// unescaped `/` / line terminators escaped.
 fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let re = receiver_regexp(ctx, "get RegExp.prototype.source")?;
-    let source = re.source(ctx.heap());
+    let receiver = ctx.this_value().clone();
     let string_heap = ctx.interp_mut().string_heap_clone();
+    let raw = match &receiver {
+        Value::RegExp(re) => re.source(ctx.heap()),
+        Value::Object(obj) => {
+            let is_proto = ctx
+                .interp_mut()
+                .constructor_prototype_value("RegExp")
+                .ok()
+                .and_then(|p| match p {
+                    Value::Object(p) => Some(p),
+                    _ => None,
+                })
+                .is_some_and(|p| p == *obj);
+            if !is_proto {
+                return Err(NativeError::TypeError {
+                    name: "get RegExp.prototype.source",
+                    reason: "this is not a RegExp".to_string(),
+                });
+            }
+            return Ok(Value::String(
+                JsString::from_str("(?:)", &string_heap).map_err(|_| oom("source"))?,
+            ));
+        }
+        _ => {
+            return Err(NativeError::TypeError {
+                name: "get RegExp.prototype.source",
+                reason: "this is not a RegExp".to_string(),
+            });
+        }
+    };
+    // §22.2.3.2.4 `EscapeRegExpPattern(src, flags)` — emit a string
+    // that, when re-parsed as a Pattern, matches the same set of
+    // strings as the original. Empty source maps to `"(?:)"`; bare
+    // `/` and line terminators are escaped; everything else passes
+    // through.
+    let escaped = if raw.is_empty() {
+        "(?:)".to_string()
+    } else {
+        let mut out = String::with_capacity(raw.len());
+        let mut in_class = false;
+        let mut chars = raw.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    out.push('\\');
+                    if let Some(&next) = chars.peek() {
+                        out.push(next);
+                        chars.next();
+                    }
+                }
+                '[' => {
+                    in_class = true;
+                    out.push('[');
+                }
+                ']' => {
+                    in_class = false;
+                    out.push(']');
+                }
+                '/' if !in_class => {
+                    out.push('\\');
+                    out.push('/');
+                }
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\u{2028}' => out.push_str("\\u2028"),
+                '\u{2029}' => out.push_str("\\u2029"),
+                other => out.push(other),
+            }
+        }
+        out
+    };
     Ok(Value::String(
-        JsString::from_str(&source, &string_heap).map_err(|_| oom("source"))?,
+        JsString::from_str(&escaped, &string_heap).map_err(|_| oom("source"))?,
     ))
 }
 

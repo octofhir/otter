@@ -662,12 +662,23 @@ impl NativeFunction {
                 return crate::object::define_own_property(obj, heap, key, descriptor);
             }
         };
+        // Built-in `name` / `length` slots live on the metadata
+        // record so future spec reads see the override without
+        // walking the side-table. Every other key — including
+        // existing builder-installed methods like
+        // `Promise.resolve` — routes through `body.own_properties`
+        // so accessor / data redefinitions on a NativeFunction
+        // ctor work uniformly.
+        if key != "name" && key != "length" {
+            let obj = heap.read_payload(self.inner, |body| body.own_properties);
+            return crate::object::define_own_property(obj, heap, key, descriptor);
+        }
         let barrier_descriptor = descriptor.clone();
         let success = heap.with_payload(self.inner, |body| {
             let slot = match key {
                 "name" => &mut body.name_property,
                 "length" => &mut body.length_property,
-                _ => return false,
+                _ => unreachable!(),
             };
             *slot = NativeOwnProperty::Overridden(descriptor);
             true

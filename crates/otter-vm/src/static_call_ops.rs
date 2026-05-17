@@ -660,6 +660,38 @@ impl Interpreter {
                         .into_iter()
                         .collect()
                     }
+                    // §7.1.18 ToObject — Boolean / Number / Symbol /
+                    // BigInt wrappers expose no own enumerable
+                    // string keys; String wrappers carry indexed
+                    // code-unit slots.
+                    Some(Value::Boolean(_))
+                    | Some(Value::Number(_))
+                    | Some(Value::Symbol(_))
+                    | Some(Value::BigInt(_)) => Vec::new(),
+                    Some(Value::String(s)) => {
+                        let len = s.len() as usize;
+                        (0..len).map(|i| i.to_string()).collect()
+                    }
+                    Some(Value::Array(arr)) => {
+                        let len = crate::array::len(*arr, self.gc_heap());
+                        let mut keys: Vec<String> = (0..len)
+                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
+                            .map(|i| i.to_string())
+                            .collect();
+                        let named: Vec<String> =
+                            self.gc_heap().read_payload(*arr, |body| {
+                                body.named_properties
+                                    .as_ref()
+                                    .map_or_else(Vec::new, |m| m.keys().cloned().collect())
+                            });
+                        keys.extend(named);
+                        keys
+                    }
+                    Some(Value::Null) | Some(Value::Undefined) | None => {
+                        return Err(VmError::TypeError {
+                            message: "Object.keys called on null or undefined".to_string(),
+                        });
+                    }
                     _ => return Err(VmError::TypeMismatch),
                 };
                 let mut names = Vec::with_capacity(owned.len());
@@ -675,41 +707,97 @@ impl Interpreter {
                 Ok(Some(Value::Array(array)))
             }
             M::Values => {
-                let target = match args.first() {
-                    Some(Value::Object(target)) => *target,
+                let values: Vec<Value> = match args.first() {
+                    Some(Value::Object(target)) => object::with_properties(*target, self.gc_heap(), |p| {
+                        p.enumerable_data_iter().map(|(_, value)| value).collect()
+                    }),
+                    Some(Value::Boolean(_))
+                    | Some(Value::Number(_))
+                    | Some(Value::Symbol(_))
+                    | Some(Value::BigInt(_)) => Vec::new(),
+                    Some(Value::String(s)) => {
+                        let units = s.to_utf16_vec();
+                        units
+                            .into_iter()
+                            .map(|u| {
+                                crate::string::JsString::from_utf16_units(&[u], &self.string_heap)
+                                    .map(Value::String)
+                                    .unwrap_or(Value::Undefined)
+                            })
+                            .collect()
+                    }
+                    Some(Value::Array(arr)) => {
+                        let len = crate::array::len(*arr, self.gc_heap());
+                        (0..len)
+                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
+                            .map(|i| crate::array::get(*arr, self.gc_heap(), i))
+                            .collect()
+                    }
+                    Some(Value::Null) | Some(Value::Undefined) | None => {
+                        return Err(VmError::TypeError {
+                            message: "Object.values called on null or undefined".to_string(),
+                        });
+                    }
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let values: Vec<Value> = object::with_properties(target, self.gc_heap(), |p| {
-                    p.enumerable_data_iter().map(|(_, value)| value).collect()
-                });
-                let target_root = Value::Object(target);
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     values,
-                    &[&target_root],
+                    &[],
                     &[args],
                 )?;
                 Ok(Some(Value::Array(array)))
             }
             M::Entries => {
-                let target = match args.first() {
-                    Some(Value::Object(target)) => *target,
+                let raw: Vec<(String, Value)> = match args.first() {
+                    Some(Value::Object(target)) => {
+                        object::with_properties(*target, self.gc_heap(), |p| {
+                            p.enumerable_data_iter()
+                                .map(|(key, value)| (key.to_string(), value))
+                                .collect()
+                        })
+                    }
+                    Some(Value::Boolean(_))
+                    | Some(Value::Number(_))
+                    | Some(Value::Symbol(_))
+                    | Some(Value::BigInt(_)) => Vec::new(),
+                    Some(Value::String(s)) => {
+                        let units = s.to_utf16_vec();
+                        units
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, u)| {
+                                let v = crate::string::JsString::from_utf16_units(
+                                    &[u],
+                                    &self.string_heap,
+                                )
+                                .map(Value::String)
+                                .unwrap_or(Value::Undefined);
+                                (i.to_string(), v)
+                            })
+                            .collect()
+                    }
+                    Some(Value::Array(arr)) => {
+                        let len = crate::array::len(*arr, self.gc_heap());
+                        (0..len)
+                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
+                            .map(|i| (i.to_string(), crate::array::get(*arr, self.gc_heap(), i)))
+                            .collect()
+                    }
+                    Some(Value::Null) | Some(Value::Undefined) | None => {
+                        return Err(VmError::TypeError {
+                            message: "Object.entries called on null or undefined".to_string(),
+                        });
+                    }
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let raw: Vec<(String, Value)> =
-                    object::with_properties(target, self.gc_heap(), |p| {
-                        p.enumerable_data_iter()
-                            .map(|(key, value)| (key.to_string(), value))
-                            .collect()
-                    });
-                let target_root = Value::Object(target);
                 let mut pairs = Vec::with_capacity(raw.len());
                 for (key, value) in raw {
                     let key_value = stack_static_string_value(&key, self)?;
                     let pair = self.alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
                         [key_value, value],
-                        &[&target_root],
+                        &[],
                         &[args, pairs.as_slice()],
                     )?;
                     pairs.push(Value::Array(pair));
@@ -717,7 +805,7 @@ impl Interpreter {
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     pairs,
-                    &[&target_root],
+                    &[],
                     &[args],
                 )?;
                 Ok(Some(Value::Array(array)))

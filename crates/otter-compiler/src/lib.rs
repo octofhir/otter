@@ -3257,6 +3257,51 @@ fn compile_assignment(
         return compile_logical_assignment(cx, a, span);
     }
     if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
+        // §13.3.5.3 MakeSuperPropertyReference + §6.2.4.5 PutValue
+        // step 6.b — `super.X = V` writes through the receiver
+        // (`this`), not the parent prototype, so the foundation
+        // lowers the store as a plain `this.X = V` write. Reads
+        // still walk the parent chain via `compile_super_member_load`.
+        if matches!(member.object, Expression::Super(_)) {
+            let this_reg = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+            let name_idx = cx.intern_string_constant(member.property.name.as_str());
+            let new_value = match compound_op {
+                None => compile_expr(cx, &a.right, span)?,
+                Some(op) => {
+                    let current = compile_super_member_load(
+                        cx,
+                        member.property.name.as_str(),
+                        span,
+                    )?;
+                    let rhs = compile_expr(cx, &a.right, span)?;
+                    let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
+                    let dst = cx.alloc_scratch();
+                    cx.emit(
+                        op,
+                        vec![
+                            Operand::Register(dst),
+                            Operand::Register(cur_p),
+                            Operand::Register(rhs_p),
+                        ],
+                        span,
+                    );
+                    dst
+                }
+            };
+            let store_scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(this_reg),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(new_value),
+                    Operand::Register(store_scratch),
+                ],
+                span,
+            );
+            return Ok(new_value);
+        }
         let obj_reg = compile_expr(cx, &member.object, span)?;
         let name_idx = cx.intern_string_constant(member.property.name.as_str());
         let new_value = match compound_op {
@@ -3351,6 +3396,50 @@ fn compile_assignment(
         return Ok(new_value);
     }
     if let AssignmentTarget::ComputedMemberExpression(member) = &a.left {
+        // `super[idx] = V` shares the receiver-targeted store with
+        // its dotted counterpart per §13.3.5.3 + §6.2.4.5 step 6.b.
+        if matches!(member.object, Expression::Super(_)) {
+            let this_reg = cx.alloc_scratch();
+            cx.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+            let idx_reg = compile_expr(cx, &member.expression, span)?;
+            let new_value = match compound_op {
+                None => compile_expr(cx, &a.right, span)?,
+                Some(op) => {
+                    let current = cx.alloc_scratch();
+                    let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+                    let parent_reg = cx.alloc_scratch();
+                    cx.emit(
+                        Op::GetPrototype,
+                        [Operand::Register(parent_reg), Operand::Register(home_reg)],
+                        span,
+                    );
+                    cx.emit(
+                        Op::LoadElement,
+                        vec![
+                            Operand::Register(current),
+                            Operand::Register(parent_reg),
+                            Operand::Register(idx_reg),
+                        ],
+                        span,
+                    );
+                    let rhs = compile_expr(cx, &a.right, span)?;
+                    let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
+                    let dst = cx.alloc_scratch();
+                    cx.emit(
+                        op,
+                        vec![
+                            Operand::Register(dst),
+                            Operand::Register(cur_p),
+                            Operand::Register(rhs_p),
+                        ],
+                        span,
+                    );
+                    dst
+                }
+            };
+            cx.emit_store_element(this_reg, idx_reg, new_value, span);
+            return Ok(new_value);
+        }
         let arr_reg = compile_expr(cx, &member.object, span)?;
         let idx_reg = compile_expr(cx, &member.expression, span)?;
         let new_value = match compound_op {
@@ -5530,6 +5619,30 @@ fn compile_expr(
         // `s[i]` — runtime checks that `s` is a string.
         Expression::ComputedMemberExpression(m) => {
             let span = (m.span.start, m.span.end);
+            // `super[expr]` — load through `Object.getPrototypeOf(home)`
+            // so the read picks up the parent prototype's slot per
+            // §13.3.5 MakeSuperPropertyReference.
+            if matches!(m.object, Expression::Super(_)) {
+                let home_reg = load_synthetic_capture(cx, SUPER_HOME_NAME, span)?;
+                let parent_reg = cx.alloc_scratch();
+                cx.emit(
+                    Op::GetPrototype,
+                    [Operand::Register(parent_reg), Operand::Register(home_reg)],
+                    span,
+                );
+                let idx = compile_expr(cx, &m.expression, span)?;
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadElement,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(parent_reg),
+                        Operand::Register(idx),
+                    ],
+                    span,
+                );
+                return Ok(dst);
+            }
             let recv = compile_expr(cx, &m.object, span)?;
             let idx = compile_expr(cx, &m.expression, span)?;
             let dst = cx.alloc_scratch();

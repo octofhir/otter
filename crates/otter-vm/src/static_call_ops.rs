@@ -410,7 +410,7 @@ impl Interpreter {
                     {
                         result
                     } else if let Some(result) =
-                        self.object_static_call_stack_rooted(stack, method, &rewritten)?
+                        self.object_static_call_stack_rooted(context, stack, method, &rewritten)?
                     {
                         result
                     } else {
@@ -434,7 +434,7 @@ impl Interpreter {
             self.try_proxy_object_static_call(context, Some(stack), method, &args)?
         {
             result
-        } else if let Some(result) = self.object_static_call_stack_rooted(stack, method, &args)? {
+        } else if let Some(result) = self.object_static_call_stack_rooted(context, stack, method, &args)? {
             result
         } else {
             object_statics::call(method, &args, &self.string_heap, &mut self.gc_heap)?
@@ -815,6 +815,7 @@ impl Interpreter {
 
     fn object_static_call_stack_rooted(
         &mut self,
+        context: &ExecutionContext,
         stack: &SmallVec<[Frame; 8]>,
         method: method_id::ObjectMethod,
         args: &[Value],
@@ -971,6 +972,36 @@ impl Interpreter {
                             .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
                             .map(|i| (i.to_string(), crate::array::get(*arr, self.gc_heap(), i)))
                             .collect()
+                    }
+                    // §20.1.2.5 — `Object.entries` walks enumerable
+                    // own string keys per `EnumerableOwnPropertyNames`
+                    // and reads each value via the spec `[[Get]]`.
+                    // Callable shapes expose `name` / `length` /
+                    // `prototype` plus a user-properties bag —
+                    // enumerable keys come from
+                    // [`Interpreter::enumerable_own_string_keys_for_value`]
+                    // and per-key values from `get_property_value_for_call`.
+                    Some(target @ (Value::Function { .. }
+                    | Value::Closure { .. }
+                    | Value::NativeFunction(_)
+                    | Value::BoundFunction(_)
+                    | Value::ClassConstructor(_))) => {
+                        let target_value = target.clone();
+                        let keys = self.enumerable_own_string_keys_for_value(
+                            context,
+                            target_value.clone(),
+                            0,
+                        )?;
+                        let mut entries = Vec::with_capacity(keys.len());
+                        for key in keys {
+                            let value = self.get_property_value_for_call(
+                                context,
+                                target_value.clone(),
+                                &key,
+                            )?;
+                            entries.push((key, value));
+                        }
+                        entries
                     }
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {

@@ -2233,12 +2233,29 @@ impl Interpreter {
                 Ok(keys)
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                let Some(bag) = self.function_user_props.get(&function_id).copied() else {
-                    return Ok(Vec::new());
-                };
-                Ok(crate::object::with_properties(bag, &self.gc_heap, |p| {
-                    p.enumerable_keys().map(str::to_string).collect()
-                }))
+                // §20.1.2.5 / §10.2.4 — enumerable own string keys in
+                // spec creation order. Intrinsic metadata (`length`,
+                // `name`, non-arrow `prototype`) is older than any
+                // user-installed bag property; route through
+                // `ordinary_function_own_property_keys` for the
+                // canonical order, then filter by enumerability via
+                // the descriptor reader (the default builtin attrs
+                // are non-enumerable; `defineProperty` migrating one
+                // into the user bag with `enumerable: true` lifts
+                // it).
+                let keys = self.ordinary_function_own_property_keys(context, function_id);
+                let mut out = Vec::with_capacity(keys.len());
+                for key in keys {
+                    if let Some(desc) = self.ordinary_function_own_property_descriptor(
+                        Some(context),
+                        function_id,
+                        &key,
+                    )? && desc.enumerable()
+                    {
+                        out.push(key);
+                    }
+                }
+                Ok(out)
             }
             Value::NativeFunction(native) => Ok(native
                 .enumerable_own_property_keys(&self.gc_heap)

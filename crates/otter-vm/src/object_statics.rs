@@ -363,15 +363,9 @@ fn native_from_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result
             let snapshot: Vec<Value> =
                 crate::array::with_elements(arr, ctx.heap(), |elements| elements.to_vec());
             for entry in snapshot {
-                match entry {
-                    Value::Array(pair) => {
-                        let key = crate::array::get(pair, ctx.heap(), 0);
-                        let value = crate::array::get(pair, ctx.heap(), 1);
-                        let key_str = property_key_from_value(&key)?;
-                        crate::object::set(result, ctx.heap_mut(), &key_str, value);
-                    }
-                    _ => return Err(VmError::TypeMismatch),
-                }
+                let (key, value) = read_entry_pair(ctx, &entry)?;
+                let key_str = property_key_from_value(&key)?;
+                crate::object::set(result, ctx.heap_mut(), &key_str, value);
             }
         }
         Value::Map(map) => {
@@ -383,6 +377,116 @@ fn native_from_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result
         _ => return Err(VmError::TypeMismatch),
     }
     Ok(Value::Object(result))
+}
+
+/// §20.1.2.7 step 5.b — read indices `"0"` and `"1"` from an entry
+/// candidate via the spec `[[Get]]`. Heap-only variant for the
+/// context-less `object_statics::call` path. Accepts Array pairs,
+/// ordinary Objects with indexed keys, and String / String-wrapper
+/// entries.
+fn read_entry_pair_heap(
+    entry: &Value,
+    heap: &otter_gc::GcHeap,
+    string_heap: &StringHeap,
+) -> Result<(Value, Value), VmError> {
+    match entry {
+        Value::Array(pair) => Ok((
+            crate::array::get(*pair, heap, 0),
+            crate::array::get(*pair, heap, 1),
+        )),
+        Value::Object(obj) => {
+            if let Some(s) = crate::object::string_data(*obj, heap) {
+                let units = s.to_utf16_vec();
+                let zero = units.first().copied().map_or(Value::Undefined, |u| {
+                    crate::string::JsString::from_utf16_units(&[u], string_heap)
+                        .map(Value::String)
+                        .unwrap_or(Value::Undefined)
+                });
+                let one = units.get(1).copied().map_or(Value::Undefined, |u| {
+                    crate::string::JsString::from_utf16_units(&[u], string_heap)
+                        .map(Value::String)
+                        .unwrap_or(Value::Undefined)
+                });
+                return Ok((zero, one));
+            }
+            let key = crate::object::get(*obj, heap, "0").unwrap_or(Value::Undefined);
+            let value = crate::object::get(*obj, heap, "1").unwrap_or(Value::Undefined);
+            Ok((key, value))
+        }
+        Value::String(s) => {
+            let units = s.to_utf16_vec();
+            let zero = units.first().copied().map_or(Value::Undefined, |u| {
+                crate::string::JsString::from_utf16_units(&[u], string_heap)
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)
+            });
+            let one = units.get(1).copied().map_or(Value::Undefined, |u| {
+                crate::string::JsString::from_utf16_units(&[u], string_heap)
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)
+            });
+            Ok((zero, one))
+        }
+        _ => Err(VmError::TypeMismatch),
+    }
+}
+
+fn read_entry_pair(ctx: &NativeCtx<'_>, entry: &Value) -> Result<(Value, Value), VmError> {
+    match entry {
+        Value::Array(pair) => Ok((
+            crate::array::get(*pair, ctx.heap(), 0),
+            crate::array::get(*pair, ctx.heap(), 1),
+        )),
+        Value::Object(obj) => {
+            // Wrapper String `Object("ab")` carries `[[StringData]]`
+            // — read its code-unit slots directly so `Object.fromEntries
+            // ([Object("ab")])` yields `{a: "b"}`.
+            if let Some(s) = crate::object::string_data(*obj, ctx.heap()) {
+                let units = s.to_utf16_vec();
+                let zero = units.first().copied().map_or(Value::Undefined, |u| {
+                    crate::string::JsString::from_utf16_units(
+                        &[u],
+                        &ctx.cx.interp.string_heap_clone(),
+                    )
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)
+                });
+                let one = units.get(1).copied().map_or(Value::Undefined, |u| {
+                    crate::string::JsString::from_utf16_units(
+                        &[u],
+                        &ctx.cx.interp.string_heap_clone(),
+                    )
+                    .map(Value::String)
+                    .unwrap_or(Value::Undefined)
+                });
+                return Ok((zero, one));
+            }
+            let key = crate::object::get(*obj, ctx.heap(), "0").unwrap_or(Value::Undefined);
+            let value = crate::object::get(*obj, ctx.heap(), "1").unwrap_or(Value::Undefined);
+            Ok((key, value))
+        }
+        Value::String(s) => {
+            let units = s.to_utf16_vec();
+            let zero = units.first().copied().map_or(Value::Undefined, |u| {
+                crate::string::JsString::from_utf16_units(
+                    &[u],
+                    &ctx.cx.interp.string_heap_clone(),
+                )
+                .map(Value::String)
+                .unwrap_or(Value::Undefined)
+            });
+            let one = units.get(1).copied().map_or(Value::Undefined, |u| {
+                crate::string::JsString::from_utf16_units(
+                    &[u],
+                    &ctx.cx.interp.string_heap_clone(),
+                )
+                .map(Value::String)
+                .unwrap_or(Value::Undefined)
+            });
+            Ok((zero, one))
+        }
+        _ => Err(VmError::TypeMismatch),
+    }
 }
 
 fn native_get_own_property_descriptor_rooted(
@@ -1537,15 +1641,9 @@ pub fn call(
                     let snapshot: Vec<Value> =
                         crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
                     for entry in snapshot {
-                        match entry {
-                            Value::Array(pair) => {
-                                let key = crate::array::get(pair, gc_heap, 0);
-                                let value = crate::array::get(pair, gc_heap, 1);
-                                let key_str = property_key_from_value(&key)?;
-                                crate::object::set(result, gc_heap, &key_str, value);
-                            }
-                            _ => return Err(VmError::TypeMismatch),
-                        }
+                        let (key, value) = read_entry_pair_heap(&entry, gc_heap, string_heap)?;
+                        let key_str = property_key_from_value(&key)?;
+                        crate::object::set(result, gc_heap, &key_str, value);
                     }
                 }
                 Value::Map(m) => {

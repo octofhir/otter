@@ -732,15 +732,81 @@ impl Interpreter {
                                 elements.to_vec()
                             });
                         for entry in snapshot {
-                            match entry {
-                                Value::Array(pair) => {
-                                    let key = crate::array::get(pair, self.gc_heap(), 0);
-                                    let value = crate::array::get(pair, self.gc_heap(), 1);
-                                    let key_str = object_static_property_key_from_value(&key)?;
-                                    object::set(result, &mut self.gc_heap, &key_str, value);
+                            // §20.1.2.7 step 5.b — read `[0]` / `[1]`
+                            // via spec `[[Get]]`. Accepts Array,
+                            // wrapper String, ordinary Object with
+                            // indexed keys, and String primitive.
+                            let (key, value) = match entry {
+                                Value::Array(pair) => (
+                                    crate::array::get(pair, self.gc_heap(), 0),
+                                    crate::array::get(pair, self.gc_heap(), 1),
+                                ),
+                                Value::String(s) => {
+                                    let units = s.to_utf16_vec();
+                                    let zero = units.first().copied().map_or(
+                                        Value::Undefined,
+                                        |u| {
+                                            crate::string::JsString::from_utf16_units(
+                                                &[u],
+                                                &self.string_heap,
+                                            )
+                                            .map(Value::String)
+                                            .unwrap_or(Value::Undefined)
+                                        },
+                                    );
+                                    let one = units.get(1).copied().map_or(
+                                        Value::Undefined,
+                                        |u| {
+                                            crate::string::JsString::from_utf16_units(
+                                                &[u],
+                                                &self.string_heap,
+                                            )
+                                            .map(Value::String)
+                                            .unwrap_or(Value::Undefined)
+                                        },
+                                    );
+                                    (zero, one)
+                                }
+                                Value::Object(obj) => {
+                                    if let Some(s) =
+                                        crate::object::string_data(obj, self.gc_heap())
+                                    {
+                                        let units = s.to_utf16_vec();
+                                        let zero = units.first().copied().map_or(
+                                            Value::Undefined,
+                                            |u| {
+                                                crate::string::JsString::from_utf16_units(
+                                                    &[u],
+                                                    &self.string_heap,
+                                                )
+                                                .map(Value::String)
+                                                .unwrap_or(Value::Undefined)
+                                            },
+                                        );
+                                        let one = units.get(1).copied().map_or(
+                                            Value::Undefined,
+                                            |u| {
+                                                crate::string::JsString::from_utf16_units(
+                                                    &[u],
+                                                    &self.string_heap,
+                                                )
+                                                .map(Value::String)
+                                                .unwrap_or(Value::Undefined)
+                                            },
+                                        );
+                                        (zero, one)
+                                    } else {
+                                        let k = crate::object::get(obj, self.gc_heap(), "0")
+                                            .unwrap_or(Value::Undefined);
+                                        let v = crate::object::get(obj, self.gc_heap(), "1")
+                                            .unwrap_or(Value::Undefined);
+                                        (k, v)
+                                    }
                                 }
                                 _ => return Err(VmError::TypeMismatch),
-                            }
+                            };
+                            let key_str = object_static_property_key_from_value(&key)?;
+                            object::set(result, &mut self.gc_heap, &key_str, value);
                         }
                     }
                     Value::Map(map) => {

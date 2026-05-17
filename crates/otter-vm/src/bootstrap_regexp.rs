@@ -126,12 +126,57 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    // `RegExp.prototype` does NOT have `@@toStringTag` per spec —
-    // §22.2.5 does not list it. But §22.2.6.16
-    // `RegExp.prototype[@@matchAll]` etc. are spec methods on the
-    // prototype. They stay foundation-driven for the moment.
-    let _ = well_known.get(WellKnown::Match); // silence the unused-import lint
-    let _ = (heap, string_heap, prototype);
+    // §22.2.6.{8,10} `RegExp.prototype[@@match]` /
+    // `RegExp.prototype[@@search]` — install native functions so user
+    // calls like `re[Symbol.match]("…")` and `re[Symbol.search]("…")`
+    // resolve through the spec-mandated algorithm. The remaining
+    // symbol-keyed methods (`@@matchAll`, `@@replace`, `@@split`)
+    // remain foundation-driven through their `String.prototype.*`
+    // counterparts and will land in follow-up commits.
+    let prototype_root = Value::Object(prototype);
+    let match_sym = well_known.get(WellKnown::Match);
+    let search_sym = well_known.get(WellKnown::Search);
+    let match_fn = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "[Symbol.match]",
+        1,
+        crate::regexp_prototype::native_regexp_symbol_match,
+        &[&prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let search_fn = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "[Symbol.search]",
+        1,
+        crate::regexp_prototype::native_regexp_symbol_search,
+        &[&prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &match_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::NativeFunction(match_fn)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &search_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::NativeFunction(search_fn)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    let _ = string_heap;
     Ok(())
 }
 

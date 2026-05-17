@@ -554,6 +554,177 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     )?))
 }
 
+/// §22.2.6.8 `RegExp.prototype[@@match](string)` — invoked by
+/// `String.prototype.match(re)` when a user installs a custom
+/// matcher, and directly when user code calls
+/// `re[Symbol.match]("…")`.
+///
+/// 1. Let `rx` be the this value; must be Object.
+/// 2. Let `S` be `? ToString(string)`.
+/// 3. Let `flags` be `? ToString(? Get(rx, "flags"))`.
+/// 4. If `flags` contains "g", run the global match loop returning
+///    an array of full matches or `null` when no match exists.
+/// 5. Otherwise return `? RegExpExec(rx, S)`.
+///
+/// The foundation drives the engine directly via
+/// [`JsRegExp::find_from_utf16`] so the spec-mandated `lastIndex`
+/// updates and `AdvanceStringIndex` semantics fire correctly for
+/// both global and non-global receivers. Unicode awareness is keyed
+/// off the `u` and `v` flags per §22.2.5.2 step 18.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@match>
+pub fn native_regexp_symbol_match(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let receiver = ctx.this_value().clone();
+    let Value::RegExp(re) = receiver else {
+        return Err(crate::NativeError::TypeError {
+            name: "RegExp.prototype[@@match]",
+            reason: "called on a non-RegExp receiver".to_string(),
+        });
+    };
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    let text = string_arg_to_jsstring(ctx, args, 0, "RegExp.prototype[@@match]", &string_heap)?;
+    let flags = re.flags(ctx.heap());
+    let units = text.to_utf16_vec();
+    if !flags.global {
+        return exec_once_native(&re, &text, &string_heap, ctx, &[])
+            .map_err(intrinsic_to_native_error("RegExp.prototype[@@match]"));
+    }
+    let full_unicode = flags.unicode || flags.unicode_sets;
+    re.set_last_index(ctx.heap_mut(), 0);
+    let mut cursor: usize = 0;
+    let mut matches_out: Vec<Value> = Vec::new();
+    loop {
+        let mut iter = re.find_from_utf16(ctx.heap(), &units, cursor).into_iter();
+        let m = match iter.next() {
+            Some(m) => m,
+            None => break,
+        };
+        let match_str =
+            JsString::from_utf16_units(&units[m.range.clone()], &string_heap).map_err(|_| {
+                crate::NativeError::TypeError {
+                    name: "RegExp.prototype[@@match]",
+                    reason: "out of memory".to_string(),
+                }
+            })?;
+        matches_out.push(Value::String(match_str.clone()));
+        if m.range.start == m.range.end {
+            cursor = advance_string_index(&units, m.range.end, full_unicode);
+        } else {
+            cursor = m.range.end;
+        }
+        if cursor > units.len() {
+            break;
+        }
+    }
+    re.set_last_index(ctx.heap_mut(), 0);
+    if matches_out.is_empty() {
+        return Ok(Value::Null);
+    }
+    let receiver_value = Value::RegExp(re);
+    let text_value = Value::String(text);
+    let arr = ctx
+        .array_from_elements_with_roots(
+            matches_out.iter().cloned(),
+            &[&receiver_value, &text_value],
+            &[matches_out.as_slice()],
+        )
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "RegExp.prototype[@@match]",
+            reason: "array allocation failed".to_string(),
+        })?;
+    Ok(Value::Array(arr))
+}
+
+/// §22.2.6.10 `RegExp.prototype[@@search](string)` — returns the
+/// 0-based index of the first match or `-1`, preserving the
+/// receiver's pre-call `lastIndex`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@search>
+pub fn native_regexp_symbol_search(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let receiver = ctx.this_value().clone();
+    let Value::RegExp(re) = receiver else {
+        return Err(crate::NativeError::TypeError {
+            name: "RegExp.prototype[@@search]",
+            reason: "called on a non-RegExp receiver".to_string(),
+        });
+    };
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    let text = string_arg_to_jsstring(ctx, args, 0, "RegExp.prototype[@@search]", &string_heap)?;
+    let previous = re.last_index_value(ctx.heap());
+    re.set_last_index(ctx.heap_mut(), 0);
+    let units = text.to_utf16_vec();
+    let result = re.find_from_utf16(ctx.heap(), &units, 0).into_iter().next();
+    re.set_last_index_value(ctx.heap_mut(), previous);
+    Ok(match result {
+        Some(m) => Value::Number(NumberValue::from_i32(m.range.start as i32)),
+        None => Value::Number(NumberValue::from_i32(-1)),
+    })
+}
+
+/// §22.2.7.3 `AdvanceStringIndex(S, index, unicode)`. When `unicode`
+/// is true and the current code unit is a high surrogate followed
+/// by a low surrogate, the index advances by two; otherwise by one.
+fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
+    if !unicode || index + 1 >= units.len() {
+        return index + 1;
+    }
+    let cp = units[index];
+    if (0xD800..=0xDBFF).contains(&cp) {
+        let next = units[index + 1];
+        if (0xDC00..=0xDFFF).contains(&next) {
+            return index + 2;
+        }
+    }
+    index + 1
+}
+
+fn string_arg_to_jsstring(
+    _ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    index: usize,
+    method_name: &'static str,
+    string_heap: &StringHeap,
+) -> Result<JsString, crate::NativeError> {
+    let raw = args.get(index).cloned().unwrap_or(Value::Undefined);
+    let text: String = match &raw {
+        Value::String(s) => return Ok(s.clone()),
+        Value::Undefined => "undefined".to_string(),
+        Value::Null => "null".to_string(),
+        Value::Boolean(true) => "true".to_string(),
+        Value::Boolean(false) => "false".to_string(),
+        Value::Number(n) => n.to_display_string(),
+        Value::BigInt(b) => b.to_decimal_string(),
+        Value::Symbol(_) => {
+            return Err(crate::NativeError::TypeError {
+                name: method_name,
+                reason: "cannot convert a Symbol to a string".to_string(),
+            });
+        }
+        other => other.display_string(),
+    };
+    JsString::from_str(&text, string_heap).map_err(|_| crate::NativeError::TypeError {
+        name: method_name,
+        reason: "out of memory".to_string(),
+    })
+}
+
+fn intrinsic_to_native_error(
+    method_name: &'static str,
+) -> impl Fn(IntrinsicError) -> crate::NativeError {
+    move |err| crate::NativeError::TypeError {
+        name: method_name,
+        reason: err.to_string(),
+    }
+}
+
 /// Declarative `RegExp.prototype` table.
 pub static REGEXP_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
     std::sync::LazyLock::new(|| {

@@ -1018,6 +1018,13 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     )?;
     // §22.1.3.34 — `String.prototype[@@iterator]`.
     crate::install_string_iterator_post_bootstrap(heap, global, well_known)?;
+    // §22.2.6.{8,10} — `RegExp.prototype[@@match]` / `[@@search]`.
+    crate::bootstrap_regexp::install_regexp_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
     // §25.2.5 — `SharedArrayBuffer.prototype[@@toStringTag]`.
     crate::bootstrap_array_buffer::install_shared_array_buffer_well_knowns_post_bootstrap(
         heap,

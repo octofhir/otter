@@ -363,8 +363,9 @@ impl Interpreter {
                 let result = self.do_object_assign(context, stack, &args)?;
                 return finish_static_call(&mut stack[top_idx], dst, result);
             }
-            method_id::ObjectMethod::GetOwnPropertyDescriptor => {
-                // §20.1.2.10 step 2: `key = ? ToPropertyKey(P)`.
+            method_id::ObjectMethod::GetOwnPropertyDescriptor
+            | method_id::ObjectMethod::HasOwn => {
+                // §20.1.2.10 / §20.1.2.13 step 2: `key = ? ToPropertyKey(P)`.
                 // The ToPrimitive ladder may invoke user
                 // `Symbol.toPrimitive` / `toString` / `valueOf`, so
                 // we route through the context-aware path *only*

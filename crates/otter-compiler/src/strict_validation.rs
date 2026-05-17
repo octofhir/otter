@@ -27,8 +27,9 @@
 
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, Class, Expression, Function, NumericLiteral, Program, StringLiteral,
-    UnaryExpression, UnaryOperator,
+    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, Class, Expression, Function,
+    NumericLiteral, Program, SimpleAssignmentTarget, StringLiteral, UnaryExpression, UnaryOperator,
+    UpdateExpression, UpdateOperator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_syntax::scope::ScopeFlags;
@@ -133,6 +134,55 @@ impl<'a> Visit<'a> for StrictValidator {
         }
     }
 
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        if self.is_strict()
+            && let Some(name) = assignment_target_identifier(&it.left)
+            && is_reserved_strict_assignment_target(name)
+        {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_RESERVED_ASSIGNMENT_TARGET".to_string(),
+                message: format!(
+                    "SyntaxError: `{name}` is not a valid assignment target in strict mode \
+                     (§12.7.1 IsValidSimpleAssignmentTarget reserves `eval` and `arguments`)"
+                ),
+                range: Some((it.span.start, it.span.end)),
+                help: Some(
+                    "rename the binding; `eval` and `arguments` cannot be reassigned in strict code"
+                        .to_string(),
+                ),
+            });
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
+    fn visit_update_expression(&mut self, it: &UpdateExpression<'a>) {
+        // §13.4 (Update Expressions): ++/-- on `eval` or `arguments`
+        // in strict mode is also an early error via the same
+        // simple-assignment-target rule.
+        if self.is_strict()
+            && matches!(
+                it.operator,
+                UpdateOperator::Increment | UpdateOperator::Decrement
+            )
+            && let Some(name) = update_target_identifier(&it.argument)
+            && is_reserved_strict_assignment_target(name)
+        {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_RESERVED_UPDATE_TARGET".to_string(),
+                message: format!(
+                    "SyntaxError: `{name}` is not a valid update target in strict mode"
+                ),
+                range: Some((it.span.start, it.span.end)),
+                help: Some(
+                    "rename the binding; `eval` and `arguments` cannot be incremented or \
+                     decremented in strict code"
+                        .to_string(),
+                ),
+            });
+        }
+        walk::walk_update_expression(self, it);
+    }
+
     fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {
         if self.is_strict()
             && matches!(it.operator, UnaryOperator::Delete)
@@ -176,6 +226,42 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
+    }
+}
+
+/// Return the bare identifier name when the assignment target is a
+/// simple identifier — peeling through ParenthesizedExpression isn't
+/// needed at the AssignmentTarget layer because oxc represents
+/// `(eval) = 1` differently from a UnaryExpression argument.
+fn assignment_target_identifier<'a>(target: &'a AssignmentTarget<'a>) -> Option<&'a str> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
+        _ => None,
+    }
+}
+
+/// Strict-mode IdentifierReference targets recognised by
+/// §12.7.1 IsValidSimpleAssignmentTarget. The bindings `eval` and
+/// `arguments` cannot be reassigned, updated, or used as the LHS
+/// of a destructuring pattern in strict code.
+const STRICT_RESERVED_TARGETS: &[&str] = &["eval", "arguments"];
+
+#[inline]
+fn is_reserved_strict_assignment_target(name: &str) -> bool {
+    STRICT_RESERVED_TARGETS.contains(&name)
+}
+
+/// Return the bare identifier name when the update operand is a
+/// simple IdentifierReference (`++x` / `x--`).
+///
+/// `SimpleAssignmentTarget` represents `MemberExpression` variants
+/// through the `inherit_variants!` macro; we only care about the
+/// `AssignmentTargetIdentifier` arm here because the strict-mode
+/// reserved-name rule only applies to bare identifier targets.
+fn update_target_identifier<'a>(target: &'a SimpleAssignmentTarget<'a>) -> Option<&'a str> {
+    match target {
+        SimpleAssignmentTarget::AssignmentTargetIdentifier(id) => Some(id.name.as_str()),
+        _ => None,
     }
 }
 

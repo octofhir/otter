@@ -25,13 +25,15 @@
 //! - ECMA-262 §10.2.10 ClassBody is always strict mode code:
 //!   <https://tc39.es/ecma262/#sec-strict-mode-code>
 
+use std::collections::BTreeMap;
+
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier, Class,
-    DoWhileStatement, Expression, ForInStatement, ForOfStatement, ForStatement, Function,
-    IfStatement, LabeledStatement, NumericLiteral, Program, SimpleAssignmentTarget, Statement,
-    StringLiteral, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
-    WhileStatement,
+    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier,
+    BindingPattern, Class, DoWhileStatement, Expression, ForInStatement, ForOfStatement,
+    ForStatement, Function, IfStatement, LabeledStatement, NumericLiteral, Program,
+    SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement, UnaryExpression,
+    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -122,6 +124,161 @@ impl StrictValidator {
     }
 }
 
+/// Collect names introduced by **lexical** declarations directly
+/// inside `stmts` — `let`, `const`, `class`, and every
+/// `FunctionDeclaration` shape (sync, async, generator, async
+/// generator). These names participate in §13.12.1
+/// `LexicallyDeclaredNames` of a switch CaseBlock.
+///
+/// The walk is **non-recursive** with respect to nested blocks: a
+/// `BlockStatement` introduces its own scope, so its inner lexical
+/// bindings do not bubble up to the switch CaseBlock. The walk does
+/// recurse through `LabeledStatement` because a labelled lexical
+/// declaration still contributes to the surrounding CaseBlock.
+fn collect_lex_decl_names<'a, F>(stmts: &'a [Statement<'a>], emit: &mut F)
+where
+    F: FnMut(&'a str, oxc_span::Span),
+{
+    for stmt in stmts {
+        match stmt {
+            Statement::VariableDeclaration(decl)
+                if matches!(
+                    decl.kind,
+                    VariableDeclarationKind::Let
+                        | VariableDeclarationKind::Const
+                        | VariableDeclarationKind::Using
+                        | VariableDeclarationKind::AwaitUsing
+                ) =>
+            {
+                for declarator in &decl.declarations {
+                    for_each_bound_identifier(&declarator.id, &mut |name, span| {
+                        emit(name, span);
+                    });
+                }
+            }
+            Statement::FunctionDeclaration(func) => {
+                if let Some(id) = &func.id {
+                    emit(id.name.as_str(), id.span);
+                }
+            }
+            Statement::ClassDeclaration(cls) => {
+                if let Some(id) = &cls.id {
+                    emit(id.name.as_str(), id.span);
+                }
+            }
+            Statement::LabeledStatement(labelled) => {
+                if let Some(inner) = std::slice::from_ref(&labelled.body).first() {
+                    collect_lex_decl_names(std::slice::from_ref(inner), emit);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect names introduced by `var` declarations anywhere in
+/// `stmts` (recursing through control-flow constructs and nested
+/// blocks but stopping at function / class boundaries). These names
+/// form `VarDeclaredNames` of the surrounding CaseBlock per
+/// §13.12.1, and they must not clash with `LexicallyDeclaredNames`
+/// inside the same switch.
+fn collect_var_decl_names<'a, F>(stmts: &'a [Statement<'a>], emit: &mut F)
+where
+    F: FnMut(&'a str, oxc_span::Span),
+{
+    for stmt in stmts {
+        collect_var_decl_names_in_stmt(stmt, emit);
+    }
+}
+
+fn collect_var_decl_names_in_stmt<'a, F>(stmt: &'a Statement<'a>, emit: &mut F)
+where
+    F: FnMut(&'a str, oxc_span::Span),
+{
+    match stmt {
+        Statement::VariableDeclaration(decl)
+            if matches!(decl.kind, VariableDeclarationKind::Var) =>
+        {
+            for declarator in &decl.declarations {
+                for_each_bound_identifier(&declarator.id, &mut |name, span| {
+                    emit(name, span);
+                });
+            }
+        }
+        Statement::BlockStatement(block) => collect_var_decl_names(&block.body, emit),
+        Statement::IfStatement(ifs) => {
+            collect_var_decl_names_in_stmt(&ifs.consequent, emit);
+            if let Some(alt) = &ifs.alternate {
+                collect_var_decl_names_in_stmt(alt, emit);
+            }
+        }
+        Statement::DoWhileStatement(s) => collect_var_decl_names_in_stmt(&s.body, emit),
+        Statement::WhileStatement(s) => collect_var_decl_names_in_stmt(&s.body, emit),
+        Statement::ForStatement(s) => {
+            if let Some(init) = &s.init
+                && let oxc_ast::ast::ForStatementInit::VariableDeclaration(decl) = init
+                && matches!(decl.kind, VariableDeclarationKind::Var)
+            {
+                for declarator in &decl.declarations {
+                    for_each_bound_identifier(&declarator.id, &mut |name, span| {
+                        emit(name, span);
+                    });
+                }
+            }
+            collect_var_decl_names_in_stmt(&s.body, emit);
+        }
+        Statement::ForInStatement(s) => collect_var_decl_names_in_stmt(&s.body, emit),
+        Statement::ForOfStatement(s) => collect_var_decl_names_in_stmt(&s.body, emit),
+        Statement::SwitchStatement(s) => {
+            for case in &s.cases {
+                collect_var_decl_names(&case.consequent, emit);
+            }
+        }
+        Statement::LabeledStatement(s) => collect_var_decl_names_in_stmt(&s.body, emit),
+        Statement::TryStatement(s) => {
+            collect_var_decl_names(&s.block.body, emit);
+            if let Some(handler) = &s.handler {
+                collect_var_decl_names(&handler.body.body, emit);
+            }
+            if let Some(finalizer) = &s.finalizer {
+                collect_var_decl_names(&finalizer.body, emit);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk a `BindingPattern` and emit every bound identifier name with
+/// its span. Used to enumerate the `BoundNames` of a `VariableDeclarator`
+/// (§8.2.1) for both lexical and var collection helpers above.
+fn for_each_bound_identifier<'a, F>(pattern: &'a BindingPattern<'a>, emit: &mut F)
+where
+    F: FnMut(&'a str, oxc_span::Span),
+{
+    match pattern {
+        BindingPattern::BindingIdentifier(id) => emit(id.name.as_str(), id.span),
+        BindingPattern::ObjectPattern(obj) => {
+            for prop in &obj.properties {
+                for_each_bound_identifier(&prop.value, emit);
+            }
+            if let Some(rest) = &obj.rest {
+                for_each_bound_identifier(&rest.argument, emit);
+            }
+        }
+        BindingPattern::ArrayPattern(arr) => {
+            for elem in &arr.elements {
+                if let Some(p) = elem {
+                    for_each_bound_identifier(p, emit);
+                }
+            }
+            if let Some(rest) = &arr.rest {
+                for_each_bound_identifier(&rest.argument, emit);
+            }
+        }
+        BindingPattern::AssignmentPattern(asn) => for_each_bound_identifier(&asn.left, emit),
+    }
+}
+
 /// Return the source span of a `FunctionDeclaration` when `body` is
 /// that exact AST shape (rather than e.g. a `BlockStatement` or a
 /// `LabeledStatement` that wraps one). Used by the strict-mode body
@@ -179,6 +336,73 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
+    }
+
+    fn visit_switch_statement(&mut self, it: &SwitchStatement<'a>) {
+        // ECMA-262 §13.12.1 SwitchStatement Static Semantics: Early
+        // Errors:
+        //   - It is a Syntax Error if the LexicallyDeclaredNames of
+        //     CaseBlock contains any duplicate entries.
+        //   - It is a Syntax Error if any element of the
+        //     LexicallyDeclaredNames of CaseBlock also occurs in the
+        //     VarDeclaredNames of CaseBlock.
+        //
+        // Independent of strict mode — these are static errors for
+        // every switch.
+        let mut lex_seen: BTreeMap<&str, ()> = BTreeMap::new();
+        let mut var_seen: BTreeMap<&str, ()> = BTreeMap::new();
+        let mut duplicates: Vec<(String, oxc_span::Span)> = Vec::new();
+        let mut lex_var_clash: Vec<(String, oxc_span::Span)> = Vec::new();
+
+        for case in &it.cases {
+            collect_lex_decl_names(&case.consequent, &mut |name, span| {
+                if lex_seen.insert(name, ()).is_some() {
+                    duplicates.push((name.to_string(), span));
+                }
+            });
+            collect_var_decl_names(&case.consequent, &mut |name, _span| {
+                var_seen.insert(name, ());
+            });
+        }
+        for case in &it.cases {
+            collect_lex_decl_names(&case.consequent, &mut |name, span| {
+                if var_seen.contains_key(name) {
+                    lex_var_clash.push((name.to_string(), span));
+                }
+            });
+        }
+
+        for (name, span) in &duplicates {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "SWITCH_DUPLICATE_LEXICAL_DECL".to_string(),
+                message: format!(
+                    "SyntaxError: `{name}` already lexically declared earlier in this switch \
+                     (§13.12.1 LexicallyDeclaredNames of CaseBlock must be unique)"
+                ),
+                range: Some((span.start, span.end)),
+                help: Some(
+                    "let / const / class / function declarations across all `case` and \
+                     `default` clauses share one lexical scope — rename one binding"
+                        .to_string(),
+                ),
+            });
+        }
+        for (name, span) in &lex_var_clash {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "SWITCH_LEXICAL_VAR_CLASH".to_string(),
+                message: format!(
+                    "SyntaxError: lexical declaration of `{name}` conflicts with a `var` \
+                     declaration in the same switch CaseBlock (§13.12.1)"
+                ),
+                range: Some((span.start, span.end)),
+                help: Some(
+                    "lexical bindings (let / const / class / function) cannot share a name \
+                     with a `var` declaration in the surrounding switch"
+                        .to_string(),
+                ),
+            });
+        }
+        walk::walk_switch_statement(self, it);
     }
 
     fn visit_if_statement(&mut self, it: &IfStatement<'a>) {

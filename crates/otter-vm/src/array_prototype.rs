@@ -142,6 +142,18 @@ pub(crate) fn array_like_present_entries(
         | Value::Number(_)
         | Value::Symbol(_)
         | Value::BigInt(_) => Some(Vec::new()),
+        // Callable receivers (Function / Closure / NativeFunction /
+        // BoundFunction / ClassConstructor) carry a `length` and no
+        // observable own indexed properties unless the user
+        // installs them. Generic Array.prototype callbacks treat
+        // them as empty array-likes with `length = funcLength`,
+        // matching ToObject + LengthOfArrayLike. The callback
+        // observes `undefined` slots if `length > 0`.
+        Value::Function { .. }
+        | Value::Closure { .. }
+        | Value::NativeFunction(_)
+        | Value::BoundFunction(_)
+        | Value::ClassConstructor(_) => Some(Vec::new()),
         // String primitive: walks code-unit slots up to `length`.
         // Each unit materialises as a single-unit `JsString`.
         Value::String(s) => {

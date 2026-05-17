@@ -357,6 +357,12 @@ impl Interpreter {
                     value => value,
                 }
             }
+            // §21.4.4 Date instances expose all their state through
+            // prototype methods (no own data properties); route
+            // string-keyed access straight to `Date.prototype` so
+            // `(new Date()).getTime` etc. resolve to the JS-visible
+            // native installed by `install_date`.
+            v @ Value::Date(_) => self.load_from_constructor_prototype(context, "Date", v, name)?,
             Value::Symbol(s) => symbol_prototype::load_property(s, name),
             Value::Iterator(_) => match name {
                 "next" | "return" | "throw" => {

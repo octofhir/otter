@@ -17,8 +17,11 @@
 use super::{JsDate, broken_down, to_iso_string};
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::js_surface::{Attr, MethodSpec};
+use crate::native_function::NativeCall;
 use crate::number::NumberValue;
 use crate::string::JsString;
+use crate::{NativeCtx, NativeError};
 
 fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsDate, IntrinsicError> {
     match args.receiver {
@@ -162,3 +165,90 @@ pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     DATE_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Date, name)
 }
+
+/// Generic bridge that exposes a `Date.prototype.<name>` intrinsic
+/// as a JS-visible NativeFunction so user code reading the property
+/// directly (`const f = d.getTime; f.call(d)`) resolves to a real
+/// callable. The compiler's `CallDate` fast path keeps using the
+/// table directly.
+fn native_date_method(
+    name: &'static str,
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let receiver = ctx.this_value().clone();
+    let (string_heap, allocation_roots) = {
+        let interp = ctx.interp_mut();
+        (interp.string_heap_clone(), interp.collect_runtime_roots())
+    };
+    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
+        name,
+        reason: "unknown Date.prototype method".to_string(),
+    })?;
+    (entry.impl_fn)(&mut IntrinsicArgs {
+        receiver: &receiver,
+        args,
+        string_heap: &string_heap,
+        gc_heap: ctx.heap_mut(),
+        allocation_roots: allocation_roots.as_slice(),
+    })
+    .map_err(|err| match err {
+        IntrinsicError::OutOfRange { .. } => NativeError::RangeError {
+            name,
+            reason: err.to_string(),
+        },
+        _ => NativeError::TypeError {
+            name,
+            reason: err.to_string(),
+        },
+    })
+}
+
+/// Per-method trampoline + spec-table entry generator. Same shape as
+/// the `string_prototype_methods!` macro in `crate::string::prototype`.
+macro_rules! date_prototype_methods {
+    ($($bridge:ident => $name:literal, $length:literal;)*) => {
+        $(
+            fn $bridge(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+                native_date_method($name, ctx, args)
+            }
+        )*
+
+        /// Declarative `Date.prototype` method specs installed as
+        /// JS-visible own properties during the `Date` bootstrap.
+        pub static DATE_PROTOTYPE_METHODS: &[MethodSpec] = &[
+            $(MethodSpec {
+                name: $name,
+                length: $length,
+                attrs: Attr::builtin_function(),
+                call: NativeCall::Static($bridge),
+            },)*
+        ];
+    };
+}
+
+date_prototype_methods!(
+    bridge_get_time              => "getTime",             0;
+    bridge_value_of              => "valueOf",             0;
+    bridge_get_full_year         => "getFullYear",         0;
+    bridge_get_utc_full_year     => "getUTCFullYear",      0;
+    bridge_get_month             => "getMonth",            0;
+    bridge_get_utc_month         => "getUTCMonth",         0;
+    bridge_get_date              => "getDate",             0;
+    bridge_get_utc_date          => "getUTCDate",          0;
+    bridge_get_day               => "getDay",              0;
+    bridge_get_utc_day           => "getUTCDay",           0;
+    bridge_get_hours             => "getHours",            0;
+    bridge_get_utc_hours         => "getUTCHours",         0;
+    bridge_get_minutes           => "getMinutes",          0;
+    bridge_get_utc_minutes       => "getUTCMinutes",       0;
+    bridge_get_seconds           => "getSeconds",          0;
+    bridge_get_utc_seconds       => "getUTCSeconds",       0;
+    bridge_get_milliseconds      => "getMilliseconds",     0;
+    bridge_get_utc_milliseconds  => "getUTCMilliseconds",  0;
+    bridge_get_timezone_offset   => "getTimezoneOffset",   0;
+    bridge_to_iso_string         => "toISOString",         0;
+    bridge_to_json               => "toJSON",              0;
+    bridge_to_string             => "toString",            0;
+    bridge_to_utc_string         => "toUTCString",         0;
+);

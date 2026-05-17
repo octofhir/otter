@@ -1816,6 +1816,22 @@ fn install_date(
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
     object::set(constructor, heap, "prototype", Value::Object(prototype));
+
+    // §21.4.4 Properties of the Date Prototype Object — install
+    // JS-visible prototype method specs so `(new Date()).getTime`
+    // resolves to a callable. The compile-time `CallDate` opcode
+    // keeps using the prototype intrinsic table directly.
+    {
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            prototype,
+            vec![global_root.clone(), constructor_root.clone()],
+        );
+        for spec in crate::date::prototype::DATE_PROTOTYPE_METHODS {
+            builder.method_from_spec(spec)?;
+        }
+    }
+
     let date_value = Value::Object(constructor);
     object::set(prototype, heap, "constructor", date_value.clone());
     define_global(global, heap, entry.name, date_value);
@@ -2013,8 +2029,8 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 720;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 320 * 1024;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 770;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 340 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

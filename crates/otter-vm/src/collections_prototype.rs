@@ -203,6 +203,211 @@ fn impl_set_keys(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     impl_set_values(args)
 }
 
+/// Extract a snapshot of values from `other` for the ES2025
+/// set-method `other` operand. Per the
+/// [set-methods proposal](https://tc39.es/proposal-set-methods/),
+/// `other` must be a "set-like" — an object exposing `size: Number`,
+/// `has(value): boolean`, and `keys(): Iterator`. Foundation
+/// supports the two most common shapes natively:
+///
+/// - `Value::Set` — direct insertion-order snapshot.
+/// - `Value::Map` — insertion-order keys (matches the
+///   `Map.prototype.keys` iterator).
+///
+/// Arbitrary set-likes that need `.has` / `.keys` invocation go
+/// through the slow path in `set_method_other_snapshot_dynamic` once
+/// it lands; the foundation fall-back rejects with `TypeMismatch`.
+fn set_method_other_snapshot(
+    other: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<Vec<Value>, IntrinsicError> {
+    match other {
+        Value::Set(s) => Ok(collections::set_values(*s, heap)),
+        Value::Map(m) => Ok(collections::map_entries(*m, heap)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()),
+        _ => Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a Set or Map",
+        }),
+    }
+}
+
+/// §24.2.4.7 `Set.prototype.union(other)` — return a new Set with
+/// every value of `this` followed by every value of `other` not
+/// already present (insertion order preserved).
+fn impl_set_union(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let s = receiver_set(args)?;
+    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
+    // Walk `this` first; then merge `other` entries skipping
+    // already-present values via the existing
+    // SameValueZero-aware `set_has` probe.
+    let mut new_set = {
+        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for v in &other_values {
+                v.trace_value_slots(visit);
+            }
+        };
+        collections::alloc_set_with_roots(args.gc_heap, &mut visitor)?
+    };
+    let existing = collections::set_values(s, &*args.gc_heap);
+    for v in existing {
+        args.set_add_rooted(&mut new_set, v)?;
+    }
+    for v in other_values {
+        if collections::set_has(new_set, &*args.gc_heap, &v) {
+            continue;
+        }
+        args.set_add_rooted(&mut new_set, v)?;
+    }
+    Ok(Value::Set(new_set))
+}
+
+/// §24.2.4.5 `Set.prototype.intersection(other)` — values present in
+/// both `this` and `other`. Insertion order follows the smaller set
+/// per spec step 5 (foundation always iterates `this` for
+/// determinism).
+fn impl_set_intersection(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let s = receiver_set(args)?;
+    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
+    let mut new_set = {
+        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for v in &other_values {
+                v.trace_value_slots(visit);
+            }
+        };
+        collections::alloc_set_with_roots(args.gc_heap, &mut visitor)?
+    };
+    // Use `other_values` as the membership probe — saves one
+    // `Vec<Value>` alloc for `this`'s snapshot. For SameValueZero
+    // semantics we still rely on the `set_has` insertion check
+    // against the under-construction `new_set` to deduplicate
+    // (other_values may contain the same value twice if it's a
+    // Map keys iteration).
+    let this_values = collections::set_values(s, &*args.gc_heap);
+    for v in this_values {
+        let in_other = other_values
+            .iter()
+            .any(|o| crate::abstract_ops::same_value_zero(o, &v));
+        if !in_other {
+            continue;
+        }
+        if collections::set_has(new_set, &*args.gc_heap, &v) {
+            continue;
+        }
+        args.set_add_rooted(&mut new_set, v)?;
+    }
+    Ok(Value::Set(new_set))
+}
+
+/// §24.2.4.4 `Set.prototype.difference(other)` — values in `this`
+/// not in `other`.
+fn impl_set_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let s = receiver_set(args)?;
+    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
+    let mut new_set = {
+        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for v in &other_values {
+                v.trace_value_slots(visit);
+            }
+        };
+        collections::alloc_set_with_roots(args.gc_heap, &mut visitor)?
+    };
+    let this_values = collections::set_values(s, &*args.gc_heap);
+    for v in this_values {
+        let in_other = other_values
+            .iter()
+            .any(|o| crate::abstract_ops::same_value_zero(o, &v));
+        if in_other {
+            continue;
+        }
+        args.set_add_rooted(&mut new_set, v)?;
+    }
+    Ok(Value::Set(new_set))
+}
+
+/// §24.2.4.6 `Set.prototype.symmetricDifference(other)` — values in
+/// `this` xor `other`.
+fn impl_set_symmetric_difference(
+    args: &mut IntrinsicArgs<'_>,
+) -> Result<Value, IntrinsicError> {
+    let s = receiver_set(args)?;
+    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
+    let mut new_set = {
+        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for v in &other_values {
+                v.trace_value_slots(visit);
+            }
+        };
+        collections::alloc_set_with_roots(args.gc_heap, &mut visitor)?
+    };
+    let this_values = collections::set_values(s, &*args.gc_heap);
+    for v in &this_values {
+        let in_other = other_values
+            .iter()
+            .any(|o| crate::abstract_ops::same_value_zero(o, v));
+        if !in_other {
+            args.set_add_rooted(&mut new_set, v.clone())?;
+        }
+    }
+    for v in other_values {
+        let in_this = this_values
+            .iter()
+            .any(|t| crate::abstract_ops::same_value_zero(t, &v));
+        if in_this {
+            continue;
+        }
+        if collections::set_has(new_set, &*args.gc_heap, &v) {
+            continue;
+        }
+        args.set_add_rooted(&mut new_set, v)?;
+    }
+    Ok(Value::Set(new_set))
+}
+
+/// §24.2.4.10 `Set.prototype.isSubsetOf(other)` — every value of
+/// `this` is in `other`.
+fn impl_set_is_subset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let s = receiver_set(args)?;
+    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
+    let heap = &*args.gc_heap;
+    let this_values = collections::set_values(s, heap);
+    let all_in_other = this_values.iter().all(|v| {
+        other_values
+            .iter()
+            .any(|o| crate::abstract_ops::same_value_zero(o, v))
+    });
+    Ok(Value::Boolean(all_in_other))
+}
+
+/// §24.2.4.11 `Set.prototype.isSupersetOf(other)` — every value of
+/// `other` is in `this`.
+fn impl_set_is_superset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let s = receiver_set(args)?;
+    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
+    let heap = &*args.gc_heap;
+    let all_in_this = other_values.iter().all(|v| collections::set_has(s, heap, v));
+    Ok(Value::Boolean(all_in_this))
+}
+
+/// §24.2.4.9 `Set.prototype.isDisjointFrom(other)` — no shared
+/// value.
+fn impl_set_is_disjoint_from(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let s = receiver_set(args)?;
+    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
+    let heap = &*args.gc_heap;
+    let any_shared = other_values.iter().any(|v| collections::set_has(s, heap, v));
+    Ok(Value::Boolean(!any_shared))
+}
+
 /// `Set.prototype.entries` — yields `[v, v]` pairs per
 /// §24.2.3.5.
 fn impl_set_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -366,6 +571,17 @@ pub static SET_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "keys"    / 0 => impl_set_keys,
             "values"  / 0 => impl_set_values,
             "entries" / 0 => impl_set_entries,
+            // ES2025 set-methods proposal (
+            // <https://tc39.es/proposal-set-methods/>) — combinators
+            // returning a new Set, and predicate methods returning
+            // Boolean.
+            "union"               / 1 => impl_set_union,
+            "intersection"        / 1 => impl_set_intersection,
+            "difference"          / 1 => impl_set_difference,
+            "symmetricDifference" / 1 => impl_set_symmetric_difference,
+            "isSubsetOf"          / 1 => impl_set_is_subset_of,
+            "isSupersetOf"        / 1 => impl_set_is_superset_of,
+            "isDisjointFrom"      / 1 => impl_set_is_disjoint_from,
         )
     });
 

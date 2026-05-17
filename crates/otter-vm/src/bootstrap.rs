@@ -1315,10 +1315,13 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
 
     {
+        let global_root2 = Value::Object(global);
+        let statics_root = Value::Object(statics);
+        let prototype_root2 = Value::Object(prototype);
         let mut builder = ObjectBuilder::from_object_with_value_roots(
             heap,
             statics,
-            vec![global_root, prototype_root],
+            vec![global_root2.clone(), prototype_root2.clone()],
         );
         let methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
             ("isNaN", 1, number_is_nan_native),
@@ -1330,6 +1333,117 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         ];
         for (name, length, call) in methods {
             builder.method(
+                name,
+                *length,
+                NativeCall::Static(*call),
+                Attr::builtin_function(),
+            )?;
+        }
+        // §19.2 — the global `parseInt` / `parseFloat` / `isNaN` /
+        // `isFinite` properties are spec-defined to be the **same
+        // callable** as their `Number.*` counterparts. Install
+        // global aliases now that the Number statics exist. Note
+        // these are independent property records pointing at fresh
+        // NativeFunction values, not literal slot sharing — the
+        // callables match by behaviour, which is what user code
+        // observes.
+        //
+        // The four URI globals (`encodeURI` / `decodeURI` /
+        // `encodeURIComponent` / `decodeURIComponent`) install
+        // alongside because they share the same prerequisite plumbing
+        // and route through the existing `global_functions::call`
+        // dispatcher when the compiler emits `Op::GlobalCall` — these
+        // natives are only consulted for reflective / `.call` reads.
+        fn global_encode_uri(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let heap = ctx.interp_mut().string_heap_clone();
+            crate::global_functions::call(
+                otter_bytecode::method_id::GlobalMethod::EncodeURI,
+                args,
+                &heap,
+            )
+            .map_err(|err| NativeError::TypeError {
+                name: "encodeURI",
+                reason: err.to_string(),
+            })
+        }
+        fn global_encode_uri_component(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let heap = ctx.interp_mut().string_heap_clone();
+            crate::global_functions::call(
+                otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
+                args,
+                &heap,
+            )
+            .map_err(|err| NativeError::TypeError {
+                name: "encodeURIComponent",
+                reason: err.to_string(),
+            })
+        }
+        fn global_decode_uri(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let heap = ctx.interp_mut().string_heap_clone();
+            crate::global_functions::call(
+                otter_bytecode::method_id::GlobalMethod::DecodeURI,
+                args,
+                &heap,
+            )
+            .map_err(|err| match err {
+                crate::VmError::TypeError { message } => NativeError::TypeError {
+                    name: "decodeURI",
+                    reason: message,
+                },
+                other => NativeError::TypeError {
+                    name: "decodeURI",
+                    reason: other.to_string(),
+                },
+            })
+        }
+        fn global_decode_uri_component(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let heap = ctx.interp_mut().string_heap_clone();
+            crate::global_functions::call(
+                otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
+                args,
+                &heap,
+            )
+            .map_err(|err| match err {
+                crate::VmError::TypeError { message } => NativeError::TypeError {
+                    name: "decodeURIComponent",
+                    reason: message,
+                },
+                other => NativeError::TypeError {
+                    name: "decodeURIComponent",
+                    reason: other.to_string(),
+                },
+            })
+        }
+
+        let global_methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
+            ("parseInt", 2, number_parse_int_native),
+            ("parseFloat", 1, number_parse_float_native),
+            ("isNaN", 1, number_is_nan_native),
+            ("isFinite", 1, number_is_finite_native),
+            ("encodeURI", 1, global_encode_uri),
+            ("encodeURIComponent", 1, global_encode_uri_component),
+            ("decodeURI", 1, global_decode_uri),
+            ("decodeURIComponent", 1, global_decode_uri_component),
+        ];
+        let mut global_builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            global,
+            vec![statics_root, prototype_root2],
+        );
+        for (name, length, call) in global_methods {
+            global_builder.method(
                 name,
                 *length,
                 NativeCall::Static(*call),
@@ -1929,8 +2043,8 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 770;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 340 * 1024;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 800;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 360 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

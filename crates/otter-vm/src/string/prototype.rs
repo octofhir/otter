@@ -1039,10 +1039,33 @@ fn coerce_pattern_to_regexp(
     value: &Value,
     flags: &str,
     gc_heap: &mut otter_gc::GcHeap,
+    string_heap: &crate::string::StringHeap,
 ) -> Result<JsRegExp, IntrinsicError> {
+    // §22.1.3.{13,14,15} step 6 — `pattern = ? ToString(arg)`.
+    // Coerce every spec-relevant operand before compiling.
     let pattern_units: Vec<u16> = match value {
-        Value::String(s) => s.to_utf16_vec(),
         Value::Undefined => Vec::new(),
+        Value::String(s) => s.to_utf16_vec(),
+        Value::Null => "null".encode_utf16().collect(),
+        Value::Boolean(b) => {
+            let text = if *b { "true" } else { "false" };
+            text.encode_utf16().collect()
+        }
+        Value::Number(n) => n.to_display_string().encode_utf16().collect(),
+        Value::BigInt(b) => b.to_decimal_string().encode_utf16().collect(),
+        Value::Object(obj) => {
+            let gc = &*gc_heap;
+            if let Some(s) = crate::object::string_data(*obj, gc) {
+                s.to_utf16_vec()
+            } else if let Some(b) = crate::object::boolean_data(*obj, gc) {
+                let text = if b { "true" } else { "false" };
+                text.encode_utf16().collect()
+            } else if let Some(n) = crate::object::number_data(*obj, gc) {
+                n.to_display_string().encode_utf16().collect()
+            } else {
+                "[object Object]".encode_utf16().collect()
+            }
+        }
         _ => {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
@@ -1050,6 +1073,7 @@ fn coerce_pattern_to_regexp(
             });
         }
     };
+    let _ = string_heap;
     JsRegExp::compile(gc_heap, &pattern_units, flags).map_err(|_| IntrinsicError::BadArgument {
         index: 0,
         reason: "is not a valid regular expression pattern",
@@ -1067,7 +1091,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     } else {
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
         let heap = &mut *args.gc_heap;
-        coerced = coerce_pattern_to_regexp(arg0, "", heap)?;
+        coerced = coerce_pattern_to_regexp(arg0, "", heap, args.string_heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
@@ -1136,7 +1160,7 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         // sweep visits every match.
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
         let heap = &mut *args.gc_heap;
-        coerced = coerce_pattern_to_regexp(arg0, "g", heap)?;
+        coerced = coerce_pattern_to_regexp(arg0, "g", heap, args.string_heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();
@@ -1174,7 +1198,7 @@ fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     } else {
         let arg0 = args.args.first().unwrap_or(&Value::Undefined);
         let heap = &mut *args.gc_heap;
-        coerced = coerce_pattern_to_regexp(arg0, "", heap)?;
+        coerced = coerce_pattern_to_regexp(arg0, "", heap, args.string_heap)?;
         &coerced
     };
     let recv_units = recv.to_utf16_vec();

@@ -2009,11 +2009,12 @@ mod tests {
         // Bumped over time as the bootstrap installer family
         // grows: Map/Set/WeakMap/WeakSet (slice 9), Promise
         // (slice 10), RegExp (slice 11), WeakRef +
-        // FinalizationRegistry (slice 12). Each ctor installs a
-        // `[[Construct]]` slot plus a prototype with several
-        // native methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 640;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 280 * 1024;
+        // FinalizationRegistry (slice 12), `String.prototype`
+        // method spec install pass (Iter 11). Each ctor installs a
+        // `[[Construct]]` slot plus a prototype with several native
+        // methods and (for some) accessors.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 720;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 320 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

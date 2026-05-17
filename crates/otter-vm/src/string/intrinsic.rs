@@ -130,6 +130,22 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         }
     }
 
+    // §22.1.3 Properties of the String Prototype Object — install
+    // JS-visible prototype method specs so `"abc".split` and
+    // `Reflect.get(String.prototype, "trim")` resolve to real
+    // callables. The compile-time `CallString` opcode keeps using
+    // the prototype intrinsic table directly for the hot path.
+    {
+        let mut builder = ObjectBuilder::from_object_with_value_roots(
+            heap,
+            prototype,
+            vec![global_root.clone(), constructor_root.clone()],
+        );
+        for spec in super::prototype::STRING_PROTOTYPE_METHODS {
+            builder.method_from_spec(spec)?;
+        }
+    }
+
     let string_value = Value::Object(constructor);
     object::set(prototype, heap, "constructor", string_value.clone());
     crate::bootstrap::define_global_value(

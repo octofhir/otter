@@ -29,10 +29,13 @@
 
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::js_surface::{Attr, MethodSpec};
+use crate::native_function::NativeCall;
 use crate::number::NumberValue;
 use crate::regexp::JsRegExp;
 use crate::string::Interrupted;
 use crate::string::JsString;
+use crate::{NativeCtx, NativeError};
 
 fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError> {
     match args.receiver {
@@ -1164,6 +1167,111 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     STRING_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::String, name)
 }
+
+/// Generic bridge that exposes a `String.prototype.<name>` intrinsic
+/// as a JS-visible NativeFunction so user code reading the property
+/// directly (`const f = "".split; f.call(s, ",")`) resolves to a
+/// real callable. The compiler keeps its compile-time `CallString`
+/// fast path; this bridge only services indirect access through the
+/// own-property table.
+///
+/// The function captures the method name via a per-method
+/// trampoline (see [`string_prototype_methods!`] below) and then
+/// looks up the implementation in [`STRING_PROTOTYPE_TABLE`].
+fn native_string_method(
+    name: &'static str,
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let receiver = ctx.this_value().clone();
+    let (string_heap, allocation_roots) = {
+        let interp = ctx.interp_mut();
+        (interp.string_heap_clone(), interp.collect_runtime_roots())
+    };
+    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
+        name,
+        reason: "unknown String.prototype method".to_string(),
+    })?;
+    (entry.impl_fn)(&mut IntrinsicArgs {
+        receiver: &receiver,
+        args,
+        string_heap: &string_heap,
+        gc_heap: ctx.heap_mut(),
+        allocation_roots: allocation_roots.as_slice(),
+    })
+    .map_err(|err| match err {
+        IntrinsicError::OutOfRange { .. } => NativeError::RangeError {
+            name,
+            reason: err.to_string(),
+        },
+        _ => NativeError::TypeError {
+            name,
+            reason: err.to_string(),
+        },
+    })
+}
+
+/// Generate a per-method trampoline + spec-table entry. The
+/// trampoline binds the JavaScript method name into a `fn`-pointer
+/// shape that fits `NativeCall::Static` without dynamic dispatch.
+macro_rules! string_prototype_methods {
+    ($($bridge:ident => $name:literal, $length:literal;)*) => {
+        $(
+            fn $bridge(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+                native_string_method($name, ctx, args)
+            }
+        )*
+
+        /// Declarative `String.prototype` method specs installed as
+        /// JS-visible own properties during the `String` bootstrap.
+        ///
+        /// Property-access surfaces (`"".split`, `Reflect.get`,
+        /// `Object.getOwnPropertyNames(String.prototype)`) resolve
+        /// through this table; the compile-time `CallString` fast
+        /// path keeps using [`STRING_PROTOTYPE_TABLE`] directly.
+        pub static STRING_PROTOTYPE_METHODS: &[MethodSpec] = &[
+            $(MethodSpec {
+                name: $name,
+                length: $length,
+                attrs: Attr::builtin_function(),
+                call: NativeCall::Static($bridge),
+            },)*
+        ];
+    };
+}
+
+string_prototype_methods!(
+    bridge_char_at         => "charAt",         1;
+    bridge_char_code_at    => "charCodeAt",     1;
+    bridge_code_point_at   => "codePointAt",    1;
+    bridge_at              => "at",             1;
+    bridge_slice           => "slice",          2;
+    bridge_substring       => "substring",      2;
+    bridge_index_of        => "indexOf",        2;
+    bridge_last_index_of   => "lastIndexOf",    2;
+    bridge_includes        => "includes",       2;
+    bridge_starts_with     => "startsWith",     2;
+    bridge_ends_with       => "endsWith",       2;
+    bridge_concat          => "concat",         1;
+    bridge_repeat          => "repeat",         1;
+    bridge_pad_start       => "padStart",       2;
+    bridge_pad_end         => "padEnd",         2;
+    bridge_trim            => "trim",           0;
+    bridge_trim_start      => "trimStart",      0;
+    bridge_trim_end        => "trimEnd",        0;
+    bridge_to_lower_case   => "toLowerCase",    0;
+    bridge_to_upper_case   => "toUpperCase",    0;
+    bridge_replace         => "replace",        2;
+    bridge_replace_all     => "replaceAll",     2;
+    bridge_split           => "split",          2;
+    bridge_match           => "match",          1;
+    bridge_match_all       => "matchAll",       1;
+    bridge_search          => "search",         1;
+    bridge_locale_compare  => "localeCompare",  1;
+    bridge_normalize       => "normalize",      1;
+    bridge_to_string       => "toString",       0;
+    bridge_value_of        => "valueOf",        0;
+);
 
 #[cfg(test)]
 mod tests {

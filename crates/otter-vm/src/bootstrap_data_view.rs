@@ -262,7 +262,53 @@ fn dispatch_method(
         reason: format!("method {method_name} missing"),
     })?;
     let receiver = ctx.this_value().clone();
-    let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    // §24.3.1.1 GetViewValue / §24.3.1.2 SetViewValue both start with
+    // `ToIndex(byteOffset)`, which runs `ToPrimitive(Number)` →
+    // `ToIntegerOrInfinity` per spec. For setters the third arg
+    // (value) needs ToNumber / ToBigInt before the intrinsic's
+    // strict guard runs. Pre-coerce non-primitive args here so user
+    // `@@toPrimitive` / `valueOf` / `toString` hooks fire.
+    let exec = ctx.execution_context().cloned();
+    let small_args: SmallVec<[Value; 4]> = if let Some(exec) = &exec {
+        let mut out: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+        let coerce_indices: &[usize] = if method_name.starts_with("get") {
+            &[0]
+        } else if method_name.starts_with("set") {
+            &[0, 1]
+        } else {
+            &[]
+        };
+        for &idx in coerce_indices {
+            let Some(slot) = out.get_mut(idx) else {
+                continue;
+            };
+            if !matches!(
+                slot,
+                Value::Object(_)
+                    | Value::Array(_)
+                    | Value::Function { .. }
+                    | Value::Closure { .. }
+                    | Value::NativeFunction(_)
+                    | Value::BoundFunction(_)
+                    | Value::ClassConstructor(_)
+                    | Value::Proxy(_)
+                    | Value::RegExp(_)
+            ) {
+                continue;
+            }
+            let interp = ctx.interp_mut();
+            let primitive = interp
+                .evaluate_to_primitive(exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
+                .map_err(|e| NativeError::TypeError {
+                    name: "DataView.prototype",
+                    reason: e.to_string(),
+                })?;
+            *slot = primitive;
+        }
+        out
+    } else {
+        args.iter().cloned().collect()
+    };
     let (string_heap, allocation_roots) = {
         let interp = ctx.interp_mut();
         (interp.string_heap_clone(), interp.collect_runtime_roots())

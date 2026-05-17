@@ -399,6 +399,45 @@ impl Interpreter {
                 "split" => (&[1], &[0]),
                 _ => (&[], &[]),
             };
+            // §24.3.1.{1,2} GetViewValue / SetViewValue on
+            // `DataView.prototype.*` — pre-coerce `byteOffset` (and
+            // setter `value`) through `ToPrimitive(Number)` so user
+            // `@@toPrimitive` / `valueOf` / `toString` fire before
+            // the intrinsic's strict numeric guard.
+            if matches!(&recv_value, Value::DataView(_)) {
+                let dv_int_coerce: &[usize] = if name.starts_with("get") {
+                    &[0]
+                } else if name.starts_with("set") {
+                    &[0, 1]
+                } else {
+                    &[]
+                };
+                for &idx in dv_int_coerce {
+                    let Some(slot) = small_args.get_mut(idx) else {
+                        continue;
+                    };
+                    if !matches!(
+                        slot,
+                        Value::Object(_)
+                            | Value::Array(_)
+                            | Value::Function { .. }
+                            | Value::Closure { .. }
+                            | Value::NativeFunction(_)
+                            | Value::BoundFunction(_)
+                            | Value::ClassConstructor(_)
+                            | Value::Proxy(_)
+                            | Value::RegExp(_)
+                    ) {
+                        continue;
+                    }
+                    let primitive = self.evaluate_to_primitive(
+                        context,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )?;
+                    *slot = primitive;
+                }
+            }
             if matches!(&recv_value, Value::String(_))
                 && (!string_int_coerce.is_empty() || !string_str_coerce.is_empty())
             {

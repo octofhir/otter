@@ -43,6 +43,12 @@ use crate::number::NumberValue;
 /// [`crate::VmError::TypeMismatch`]).
 #[must_use]
 pub fn to_index(value: &Value) -> Option<u64> {
+    // §7.1.17 ToIndex(value):
+    // 1. If value is undefined → return 0.
+    // 2. Else let integer = ToIntegerOrInfinity(value).
+    // 3. If integer < 0 or integer > 2^53-1 → RangeError (return None).
+    // §7.1.5 ToIntegerOrInfinity: ToNumber(value); NaN → 0;
+    // +∞ / -∞ pass through; else truncate toward 0.
     let n = match value {
         Value::Undefined => return Some(0),
         Value::Number(n) => n.as_f64(),
@@ -51,10 +57,13 @@ pub fn to_index(value: &Value) -> Option<u64> {
         Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string()).as_f64(),
         _ => return None,
     };
-    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > 9_007_199_254_740_991.0 {
+    if n.is_nan() {
+        return Some(0);
+    }
+    if !n.is_finite() || n < 0.0 || n > 9_007_199_254_740_991.0 {
         return None;
     }
-    Some(n as u64)
+    Some(n.trunc() as u64)
 }
 
 /// §7.1.4 `ToNumber` for the `littleEndian` flag — a missing or

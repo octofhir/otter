@@ -549,6 +549,53 @@ impl Interpreter {
                         }
                     })
                     .collect(),
+                // §20.1.2.2 / §20.1.2.3 step 2 — `ToObject(Properties)`
+                // boxes primitives into their wrapper. Wrappers carry
+                // no observable enumerable own keys (String chars +
+                // length are non-enumerable on the wrapper object),
+                // so the spec walk yields an empty descriptor list.
+                // Return `Ok(())` rather than `TypeMismatch` so
+                // `Object.create(proto, 1n)` etc. round-trip per
+                // `properties-arg-to-object*.js`.
+                Value::Boolean(_)
+                | Value::Number(_)
+                | Value::String(_)
+                | Value::Symbol(_)
+                | Value::BigInt(_) => Vec::new(),
+                // §22.2.6 — RegExp instances walk via the generic
+                // enumerable-key probe so user-installed own
+                // properties surface, then each value is read with
+                // observable `[[Get]]` semantics (accessors fire).
+                Value::RegExp(_) => {
+                    let keys = self
+                        .enumerable_own_string_keys_for_value(context, props_arg.clone(), 0)?;
+                    let mut out = Vec::with_capacity(keys.len());
+                    for key in keys {
+                        let value = self.get_property_value_for_call(
+                            context,
+                            props_arg.clone(),
+                            &key,
+                        )?;
+                        out.push((key, value));
+                    }
+                    out
+                }
+                Value::BoundFunction(bound) => {
+                    let names = crate::function_metadata::bound_enumerable_own_property_keys(
+                        bound,
+                        self.gc_heap(),
+                    );
+                    let mut out = Vec::with_capacity(names.len());
+                    for key in names {
+                        let value = self.get_property_value_for_call(
+                            context,
+                            props_arg.clone(),
+                            &key,
+                        )?;
+                        out.push((key, value));
+                    }
+                    out
+                }
                 _ => return Err(VmError::TypeMismatch),
             };
             for (key, desc_value) in entries {

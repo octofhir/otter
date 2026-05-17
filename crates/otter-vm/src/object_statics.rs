@@ -655,6 +655,27 @@ fn native_get_own_property_names_rooted(
                 .into_iter()
                 .collect()
         }
+        Some(Value::Function { function_id }) | Some(Value::Closure { function_id, .. }) => {
+            let Some(context) = context else {
+                return Err(VmError::InvalidOperand);
+            };
+            ctx.cx
+                .interp
+                .ordinary_function_own_property_keys(context, *function_id)
+        }
+        Some(Value::ClassConstructor(class)) => {
+            // §15.7.13 — class constructors expose `prototype` as
+            // an own property in addition to anything installed on
+            // their static-bag object.
+            let mut keys: Vec<String> =
+                crate::object::with_properties(class.statics(ctx.heap()), ctx.heap(), |p| {
+                    p.keys().map(|k| k.to_string()).collect()
+                });
+            if !keys.iter().any(|k| k == "prototype") {
+                keys.push("prototype".to_string());
+            }
+            keys
+        }
         Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
         Some(Value::String(s)) => {
             let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
@@ -1674,6 +1695,31 @@ pub fn call(
                     crate::function_metadata::bound_own_property_keys(bound, gc_heap)
                         .into_iter()
                         .collect()
+                }
+                // Ordinary functions / closures — without an
+                // `ExecutionContext` we cannot honor the arrow-vs-
+                // constructor branch in
+                // [`Interpreter::ordinary_function_own_property_keys`].
+                // The context-aware paths
+                // ([`super::run_object_static_call_operands`] +
+                // [`native_get_own_property_names_rooted`]) reach
+                // this branch only after exhausting their own
+                // handlers, so signal "no context" here and let the
+                // caller fall through to the array shape it expects
+                // (the realistic fast paths already produced a
+                // result before landing here).
+                Some(Value::Function { .. }) | Some(Value::Closure { .. }) => {
+                    return Err(VmError::InvalidOperand);
+                }
+                Some(Value::ClassConstructor(class)) => {
+                    let mut keys: Vec<String> =
+                        crate::object::with_properties(class.statics(gc_heap), gc_heap, |p| {
+                            p.keys().map(|k| k.to_string()).collect()
+                        });
+                    if !keys.iter().any(|k| k == "prototype") {
+                        keys.push("prototype".to_string());
+                    }
+                    keys
                 }
                 Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
                 Some(Value::String(s)) => {

@@ -762,6 +762,59 @@ impl Interpreter {
         }
     }
 
+    /// Own string-keyed property names for an ordinary function
+    /// record, in spec creation order.
+    ///
+    /// Mirrors §10.2.4 OrdinaryFunctionCreate's installed metadata:
+    /// `length`, `name`, and (for non-arrow callable shapes)
+    /// `prototype` — plus any user-installed own properties that
+    /// live in [`Self::function_user_props`]. Each intrinsic key is
+    /// suppressed if [`Self::function_deleted_metadata`] records a
+    /// matching deletion, so the result agrees with
+    /// [`Self::ordinary_function_own_property_descriptor`] and
+    /// `hasOwnProperty`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-object.getownpropertynames>
+    /// - <https://tc39.es/ecma262/#sec-ordinaryfunctioncreate>
+    /// - <https://tc39.es/ecma262/#sec-makeconstructor>
+    pub(crate) fn ordinary_function_own_property_keys(
+        &self,
+        context: &ExecutionContext,
+        function_id: u32,
+    ) -> Vec<String> {
+        let mut keys = Vec::new();
+        let is_arrow = context.function_is_arrow(function_id);
+        let deleted = |key: &'static str| {
+            self.function_deleted_metadata
+                .contains(&(function_id, key))
+        };
+        if !deleted("length") {
+            keys.push("length".to_string());
+        }
+        if !deleted("name") {
+            keys.push("name".to_string());
+        }
+        let mut bag_has_prototype = false;
+        if let Some(bag) = self.function_user_props.get(&function_id).copied() {
+            crate::object::with_properties(bag, &self.gc_heap, |p| {
+                for k in p.keys() {
+                    if k == "length" || k == "name" {
+                        continue;
+                    }
+                    if k == "prototype" {
+                        bag_has_prototype = true;
+                    }
+                    keys.push(k.to_string());
+                }
+            });
+        }
+        if !is_arrow && !bag_has_prototype {
+            keys.push("prototype".to_string());
+        }
+        keys
+    }
+
     pub(crate) fn ordinary_function_own_property_descriptor(
         &self,
         context: Option<&ExecutionContext>,
@@ -929,8 +982,10 @@ impl Interpreter {
                 | Value::Closure { .. }
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
-        ) && matches!(method, M::GetOwnPropertyDescriptor | M::HasOwn | M::Keys)
-        {
+        ) && matches!(
+            method,
+            M::GetOwnPropertyDescriptor | M::HasOwn | M::Keys | M::GetOwnPropertyNames
+        ) {
             let Some(context) = context else {
                 return if matches!(target, Value::Proxy(_)) {
                     Err(VmError::InvalidOperand)
@@ -938,6 +993,72 @@ impl Interpreter {
                     Ok(None)
                 };
             };
+            if matches!(method, M::GetOwnPropertyNames) {
+                // §20.1.2.12 — `getOwnPropertyNames(O)` returns
+                // every own string-keyed property, regardless of
+                // enumerability. Ordinary functions + closures
+                // expose `length` / `name` / (non-arrow) `prototype`
+                // plus user-installed own properties; native and
+                // bound functions and proxies already have
+                // descriptor-table-driven enumerations elsewhere, so
+                // route per-shape here.
+                let names: Vec<String> = match &target {
+                    Value::Function { function_id } | Value::Closure { function_id, .. } => self
+                        .ordinary_function_own_property_keys(context, *function_id),
+                    Value::NativeFunction(native) => {
+                        native.own_property_keys(&self.gc_heap).into_iter().collect()
+                    }
+                    Value::BoundFunction(bound) => {
+                        function_metadata::bound_own_property_keys(bound, &self.gc_heap)
+                            .into_iter()
+                            .collect()
+                    }
+                    Value::Proxy(_) => {
+                        let string_heap = self.string_heap.clone();
+                        let trap_keys =
+                            self.own_property_keys_value(context, &target, &string_heap)?;
+                        let values: Vec<Value> = trap_keys
+                            .into_iter()
+                            .filter(|v| matches!(v, Value::String(_)))
+                            .collect();
+                        return Ok(Some(Value::Array(self.function_static_array_from_values(
+                            stack_roots,
+                            values,
+                            &[&target],
+                            &[args],
+                        )?)));
+                    }
+                    Value::Array(arr) => {
+                        let len = crate::array::len(*arr, &self.gc_heap);
+                        let mut keys: Vec<String> = (0..len)
+                            .filter(|&i| crate::array::has_own_element(*arr, &self.gc_heap, i))
+                            .map(|i| i.to_string())
+                            .collect();
+                        let named: Vec<String> = self.gc_heap.read_payload(*arr, |body| {
+                            body.named_properties
+                                .as_ref()
+                                .map_or_else(Vec::new, |m| m.keys().cloned().collect())
+                        });
+                        keys.extend(named);
+                        keys.push("length".to_string());
+                        keys
+                    }
+                    _ => return Ok(None),
+                };
+                let mut values = Vec::with_capacity(names.len());
+                for key in names {
+                    values.push(Value::String(
+                        JsString::from_str(&key, &self.string_heap)
+                            .map_err(|_| VmError::TypeMismatch)?,
+                    ));
+                }
+                return Ok(Some(Value::Array(self.function_static_array_from_values(
+                    stack_roots,
+                    values,
+                    &[&target],
+                    &[args],
+                )?)));
+            }
             if matches!(method, M::Keys) {
                 // For Proxy targets, route through the full §10.5.11
                 // ownKeys path so trap invariants apply, then filter

@@ -39,7 +39,7 @@ pub mod atomics;
 pub mod atomics_wait;
 pub mod bigint;
 pub mod binary;
-pub mod boolean_prototype;
+pub mod boolean;
 mod call_ops;
 mod collection_ops;
 pub mod collections;

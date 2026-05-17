@@ -1,0 +1,102 @@
+//! `Boolean` built-in installer.
+//!
+//! Owns the full installation of the global `Boolean` constructor:
+//! prototype object with the `[[BooleanData]]` slot, prototype
+//! methods (`toString`, `valueOf`), prototype chain to
+//! `Object.prototype`, and the call/construct bridge for the
+//! `Boolean(...)` / `new Boolean(...)` surface.
+//!
+//! # See also
+//! - <https://tc39.es/ecma262/#sec-boolean-objects>
+//! - <https://tc39.es/ecma262/#sec-boolean-constructor>
+
+use crate::bootstrap::{
+    BootstrapFeatures, alloc_object_with_value_roots, native_static_with_value_roots,
+};
+use crate::intrinsic_install::BuiltinIntrinsic;
+use crate::js_surface::{JsSurfaceError, ObjectBuilder};
+use crate::object::{self, JsObject};
+use crate::{NativeCtx, NativeError, Value};
+
+/// Zero-sized marker used to install the global `Boolean`
+/// constructor through [`BuiltinIntrinsic`].
+pub struct Intrinsic;
+
+impl BuiltinIntrinsic for Intrinsic {
+    const NAME: &'static str = "Boolean";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        install(heap, global)
+    }
+}
+
+fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+    let global_root = Value::Object(global);
+    let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
+    {
+        let mut builder =
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+        for method in super::prototype::BOOLEAN_PROTOTYPE_METHODS {
+            builder.method_from_spec(method)?;
+        }
+    }
+    crate::object::set_boolean_data(prototype, heap, false);
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(prototype, heap, Some(object_proto));
+    }
+
+    let prototype_root = Value::Object(prototype);
+    let ctor_native = native_static_with_value_roots(
+        heap,
+        "Boolean",
+        1,
+        boolean_ctor_call,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_native_root = Value::NativeFunction(ctor_native);
+    let statics =
+        alloc_object_with_value_roots(heap, &[&global_root, &prototype_root, &ctor_native_root])?;
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(statics, heap, Some(object_proto));
+    }
+    object::set_constructor_native(statics, heap, ctor_native_root);
+    object::set(statics, heap, "prototype", Value::Object(prototype));
+    let boolean_value = Value::Object(statics);
+    object::set(prototype, heap, "constructor", boolean_value.clone());
+    crate::bootstrap::define_global_value(
+        global,
+        heap,
+        <Intrinsic as BuiltinIntrinsic>::NAME,
+        boolean_value,
+    );
+    Ok(())
+}
+
+/// `Boolean(value)` / `new Boolean(value)` — §20.3.1.
+///
+/// The call form returns `ToBoolean(value)`. The construct form
+/// wraps the receiver object's `[[BooleanData]]` slot with the
+/// coerced value.
+fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let value = args.first().is_some_and(Value::to_boolean);
+    if ctx.is_construct_call() {
+        let this = ctx.this_value().clone();
+        if let Value::Object(obj) = this {
+            crate::object::set_boolean_data(obj, ctx.heap_mut(), value);
+            Ok(Value::Object(obj))
+        } else {
+            Err(NativeError::TypeError {
+                name: "Boolean",
+                reason: "expected object receiver in `new Boolean(...)`".to_string(),
+            })
+        }
+    } else {
+        Ok(Value::Boolean(value))
+    }
+}

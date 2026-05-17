@@ -331,11 +331,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
         feature: BootstrapFeatures::CORE,
         install: install_number,
     },
-    BootstrapEntry {
-        name: "Boolean",
-        feature: BootstrapFeatures::CORE,
-        install: install_boolean,
-    },
+    crate::bootstrap_entry!(crate::boolean::intrinsic::Intrinsic),
     BootstrapEntry {
         name: "BigInt",
         feature: BootstrapFeatures::CORE,
@@ -1486,71 +1482,8 @@ fn install_number(
 // — see [`crate::intrinsic_install::BuiltinIntrinsic`] for the
 // per-class installation contract.
 
-fn install_boolean(
-    entry: &BootstrapEntry,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    use crate::{NativeCtx, NativeError};
-
-    let global_root = Value::Object(global);
-    let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
-    {
-        let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
-        for method in crate::boolean_prototype::BOOLEAN_PROTOTYPE_METHODS {
-            builder.method_from_spec(method)?;
-        }
-    }
-    crate::object::set_boolean_data(prototype, heap, false);
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
-    {
-        object::set_prototype(prototype, heap, Some(object_proto));
-    }
-
-    fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let value = args.first().is_some_and(Value::to_boolean);
-        if ctx.is_construct_call() {
-            let this = ctx.this_value().clone();
-            if let Value::Object(obj) = this {
-                crate::object::set_boolean_data(obj, ctx.heap_mut(), value);
-                Ok(Value::Object(obj))
-            } else {
-                Err(NativeError::TypeError {
-                    name: "Boolean",
-                    reason: "expected object receiver in `new Boolean(...)`".to_string(),
-                })
-            }
-        } else {
-            Ok(Value::Boolean(value))
-        }
-    }
-
-    let prototype_root = Value::Object(prototype);
-    let ctor_native = native_static_with_value_roots(
-        heap,
-        "Boolean",
-        1,
-        boolean_ctor_call,
-        &[&global_root, &prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_native_root = Value::NativeFunction(ctor_native);
-    let statics =
-        alloc_object_with_value_roots(heap, &[&global_root, &prototype_root, &ctor_native_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
-    {
-        object::set_prototype(statics, heap, Some(object_proto));
-    }
-    object::set_constructor_native(statics, heap, ctor_native_root);
-    object::set(statics, heap, "prototype", Value::Object(prototype));
-    let boolean_value = Value::Object(statics);
-    object::set(prototype, heap, "constructor", boolean_value.clone());
-    define_global(global, heap, entry.name, boolean_value);
-    Ok(())
-}
+// `Boolean` installer migrated to
+// [`crate::boolean::intrinsic::Intrinsic`].
 
 fn install_function(
     entry: &BootstrapEntry,

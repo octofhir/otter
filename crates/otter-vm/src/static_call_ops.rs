@@ -367,16 +367,24 @@ impl Interpreter {
         _stack: &SmallVec<[Frame; 8]>,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let target = match args.first() {
-            Some(Value::Object(target)) => *target,
-            Some(Value::ClassConstructor(class)) => class.statics(self.gc_heap()),
-            _ => {
-                return Err(VmError::TypeError {
-                    message: "Object.defineProperties target must be an object".to_string(),
-                });
-            }
-        };
-        let props = match args.get(1) {
+        let target_value = args.first().cloned().unwrap_or(Value::Undefined);
+        // §20.1.2.3 step 1 — `Type(O)` must be Object.
+        if !matches!(
+            &target_value,
+            Value::Object(_)
+                | Value::Proxy(_)
+                | Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::BoundFunction(_)
+                | Value::NativeFunction(_)
+                | Value::ClassConstructor(_)
+        ) {
+            return Err(VmError::TypeError {
+                message: "Object.defineProperties target must be an object".to_string(),
+            });
+        }
+        let props_keys_source = match args.get(1) {
             Some(Value::Object(o)) => *o,
             Some(Value::ClassConstructor(class)) => class.statics(self.gc_heap()),
             _ => {
@@ -386,20 +394,22 @@ impl Interpreter {
             }
         };
         let entries: Vec<(String, Value)> =
-            object::with_properties(props, self.gc_heap(), |p| {
+            object::with_properties(props_keys_source, self.gc_heap(), |p| {
                 p.enumerable_data_iter()
                     .map(|(k, v)| (k.to_string(), v))
                     .collect()
             });
         for (key, desc_value) in entries {
             let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
-            if !object::define_own_property_partial(target, &mut self.gc_heap, &key, descriptor) {
+            let vm_key = crate::VmPropertyKey::OwnedString(key.clone());
+            let ok = self.define_own_property_value(context, &target_value, &vm_key, descriptor)?;
+            if !ok {
                 return Err(VmError::TypeError {
-                    message: format!("Cannot define property '{key}'"),
+                    message: format!("Object.defineProperties: cannot define '{key}'"),
                 });
             }
         }
-        Ok(Value::Object(target))
+        Ok(target_value)
     }
 
     fn object_static_call_stack_rooted(

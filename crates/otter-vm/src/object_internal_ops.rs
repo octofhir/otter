@@ -772,6 +772,11 @@ impl Interpreter {
             // foundation surface handles indexed writes by routing to
             // dense storage; descriptor attributes are not yet
             // tracked on Array slots, so accessor descriptors reject.
+            // Non-indexed string keys fall through to the array's
+            // named-property side-table so user-defined own props on
+            // arrays (e.g. `arr.foo = 1`) still observe define-success
+            // — descriptor attribute enforcement on those slots is
+            // tracked separately.
             Value::Array(arr) => {
                 let Some(k) = key.string_name() else {
                     return Ok(false);
@@ -794,14 +799,18 @@ impl Interpreter {
                     return Ok(true);
                 }
                 if k == "length" {
+                    // §6.2.5.1 generic descriptor (no fields) — no-op
+                    // for `length`, succeed without writing.
                     if let Some(v) = &descriptor.value {
                         array::set_named_property(*arr, &mut self.gc_heap, k, v.clone())
                             .map_err(|_| VmError::TypeMismatch)?;
-                        return Ok(true);
                     }
-                    return Ok(false);
+                    return Ok(true);
                 }
-                Ok(false)
+                let value = descriptor.value.clone().unwrap_or(Value::Undefined);
+                array::set_named_property(*arr, &mut self.gc_heap, k, value)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                Ok(true)
             }
             _ => Ok(false),
         }

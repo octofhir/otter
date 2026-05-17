@@ -729,6 +729,34 @@ impl Interpreter {
             {
                 collections_prototype::make_set_iterator_factory(*s, &mut self.gc_heap)?
             }
+            // §10.2 — callable + class shapes inherit @@-keyed
+            // properties through `Function.prototype` (or the class
+            // statics for `ClassConstructor`). Without a Symbol-key
+            // arm here, `f[Symbol.hasInstance]` falls through to the
+            // numeric-index default and trips `TypeMismatch`. Route
+            // through `ordinary_get_value` so the per-shape lookup
+            // (function user-props → Function.prototype → walked
+            // accessor outcomes) fires correctly.
+            (
+                Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_),
+                Value::Symbol(_),
+            ) => {
+                let key = match &idx_value {
+                    Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+                    _ => unreachable!(),
+                };
+                match self.ordinary_get_value(context, recv.clone(), recv.clone(), &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv.clone(), args)?
+                    }
+                }
+            }
             // §7.1.18 ToObject — primitive receivers walk their
             // wrapper prototype for both string- and symbol-keyed
             // access. Mirrors V8 / JSC where `Symbol()[

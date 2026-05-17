@@ -63,8 +63,25 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
         Value::String(s) => Ok(s.clone()),
         Value::Object(obj) => {
             let gc = &*args.gc_heap;
-            crate::object::string_data(*obj, gc)
-                .ok_or(IntrinsicError::BadReceiver { expected: "string" })
+            // Wrapper objects expose their primitive via the matching
+            // internal slot; missing-slot ordinary objects fall back
+            // to `Object.prototype.toString`'s "[object Object]"
+            // shape so `String.prototype.*.call({})` doesn't bail.
+            // User-defined `toString` overrides require an
+            // `ExecutionContext` we don't carry into the intrinsic
+            // layer yet — handled in a follow-up.
+            if let Some(s) = crate::object::string_data(*obj, gc) {
+                return Ok(s);
+            }
+            if let Some(b) = crate::object::boolean_data(*obj, gc) {
+                let text = if b { "true" } else { "false" };
+                return Ok(JsString::from_str(text, args.string_heap)?);
+            }
+            if let Some(n) = crate::object::number_data(*obj, gc) {
+                let text = n.to_display_string();
+                return Ok(JsString::from_str(&text, args.string_heap)?);
+            }
+            Ok(JsString::from_str("[object Object]", args.string_heap)?)
         }
         Value::Boolean(b) => {
             let text = if *b { "true" } else { "false" };
@@ -77,6 +94,27 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
         Value::BigInt(b) => {
             let text = b.to_decimal_string();
             Ok(JsString::from_str(&text, args.string_heap)?)
+        }
+        Value::Array(arr) => {
+            // §22.1.3.32 Array.prototype.toString → Array.prototype.join(",").
+            // We mirror the spec result for the common no-override
+            // case: comma-joined dense elements with null/undefined
+            // displayed as "".
+            let gc = &*args.gc_heap;
+            let items: Vec<String> = crate::array::with_elements(*arr, gc, |els| {
+                els.iter()
+                    .map(|v| match v {
+                        Value::Null | Value::Undefined | Value::Hole => String::new(),
+                        Value::String(s) => s.to_lossy_string(),
+                        Value::Number(n) => n.to_display_string(),
+                        Value::Boolean(b) => {
+                            if *b { "true".to_string() } else { "false".to_string() }
+                        }
+                        _ => v.display_string(),
+                    })
+                    .collect()
+            });
+            Ok(JsString::from_str(&items.join(","), args.string_heap)?)
         }
         Value::Null | Value::Undefined => Err(IntrinsicError::BadReceiver { expected: "string" }),
         _ => Err(IntrinsicError::BadReceiver { expected: "string" }),

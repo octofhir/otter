@@ -27,7 +27,8 @@
 
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, Class, Function, NumericLiteral, Program, StringLiteral,
+    ArrowFunctionExpression, Class, Expression, Function, NumericLiteral, Program, StringLiteral,
+    UnaryExpression, UnaryOperator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_syntax::scope::ScopeFlags;
@@ -132,6 +133,28 @@ impl<'a> Visit<'a> for StrictValidator {
         }
     }
 
+    fn visit_unary_expression(&mut self, it: &UnaryExpression<'a>) {
+        if self.is_strict()
+            && matches!(it.operator, UnaryOperator::Delete)
+            && let Some(name) = unwrap_parens_identifier(&it.argument)
+        {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "STRICT_DELETE_IDENTIFIER".to_string(),
+                message: format!(
+                    "SyntaxError: `delete {name}` is not allowed in strict mode \
+                     (UnaryExpression :: delete UnaryExpression resolves to an IdentifierReference)"
+                ),
+                range: Some((it.span.start, it.span.end)),
+                help: Some(
+                    "delete a property of an object instead (`delete obj.prop` or \
+                     `delete obj[key]`)"
+                        .to_string(),
+                ),
+            });
+        }
+        walk::walk_unary_expression(self, it);
+    }
+
     fn visit_string_literal(&mut self, it: &StringLiteral<'a>) {
         if !self.is_strict() {
             return;
@@ -152,6 +175,28 @@ impl<'a> Visit<'a> for StrictValidator {
                     "use the `\\xNN` or `\\uNNNN` escape forms in strict mode code".to_string(),
                 ),
             });
+        }
+    }
+}
+
+/// Unwrap any number of `ParenthesizedExpression` layers and return
+/// the bare identifier name if the resulting expression is an
+/// IdentifierReference.
+///
+/// ECMA-262 §13.5.1.1 Static Semantics: Early Errors flags
+/// `delete UnaryExpression` whenever the UnaryExpression is a
+/// PrimaryExpression :: IdentifierReference, regardless of how many
+/// `(` `)` cover groups wrap it. The check must therefore peel
+/// parens before matching.
+fn unwrap_parens_identifier<'a>(expr: &'a Expression<'a>) -> Option<&'a str> {
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            Expression::Identifier(id) => return Some(id.name.as_str()),
+            Expression::ParenthesizedExpression(inner) => {
+                cursor = &inner.expression;
+            }
+            _ => return None,
         }
     }
 }

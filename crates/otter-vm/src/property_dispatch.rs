@@ -112,6 +112,11 @@ impl Interpreter {
         let receiver = read_register(frame, obj_reg)?.clone();
         let removed = match &receiver {
             Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, name),
+            // §10.4.2 [[Delete]] for Array exotic objects: integer
+            // index keys delete the dense/sparse slot (and the spec
+            // protects `length` from deletion); named keys route
+            // through the array exotic's named-property store.
+            Value::Array(arr) => crate::array::delete_named_property(*arr, &mut self.gc_heap, name),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 self.ordinary_function_delete_own_property(*function_id, name)
             }
@@ -153,6 +158,35 @@ impl Interpreter {
                 Some(v) if v >= 0 => crate::object::delete(*obj, &mut self.gc_heap, &v.to_string()),
                 _ => crate::object::delete(*obj, &mut self.gc_heap, &n.to_display_string()),
             },
+            // §10.4.2 Array exotic [[Delete]]: number / string index
+            // keys both flow through `delete_named_property`, which
+            // handles dense / sparse / named storage and protects
+            // `length`.
+            (Value::Array(arr), Value::Number(n)) => match n.as_smi() {
+                Some(v) if v >= 0 => {
+                    crate::array::delete_named_property(*arr, &mut self.gc_heap, &v.to_string())
+                }
+                _ => crate::array::delete_named_property(
+                    *arr,
+                    &mut self.gc_heap,
+                    &n.to_display_string(),
+                ),
+            },
+            (Value::Array(arr), Value::String(s)) => {
+                crate::array::delete_named_property(*arr, &mut self.gc_heap, &s.to_lossy_string())
+            }
+            // §10.4.3 String exotic objects expose a non-configurable
+            // own property at every valid character index; integer
+            // indices in `[0, length)` therefore reject deletion,
+            // while out-of-range integer indices and non-integer
+            // keys succeed (the wrapper has no such own property and
+            // ordinary [[Delete]] succeeds vacuously).
+            // <https://tc39.es/ecma262/#sec-string-exotic-objects-delete-p>
+            (Value::String(s), Value::Number(n)) => match n.as_smi() {
+                Some(v) if v >= 0 && (v as u32) < s.len() => false,
+                _ => true,
+            },
+            (Value::String(_), _) => true,
             (
                 Value::Function { function_id } | Value::Closure { function_id, .. },
                 Value::String(s),

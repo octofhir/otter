@@ -970,7 +970,16 @@ impl Interpreter {
                 | Value::ClassConstructor(_)
                 | Value::Map(_)
                 | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
                 | Value::RegExp(_)
+                | Value::Date(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
         ) {
             return Err(VmError::TypeError {
                 message: "ToPropertyDescriptor argument must be an Object".to_string(),
@@ -1832,6 +1841,31 @@ impl Interpreter {
                 let proto_name = match base {
                     Value::WeakRef(_) => "WeakRef",
                     Value::FinalizationRegistry(_) => "FinalizationRegistry",
+                    _ => unreachable!(),
+                };
+                let proto = self.constructor_prototype_value(proto_name)?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
+            // §21.4.4 — Date instances have no own string-keyed data
+            // properties; everything routes through `Date.prototype`.
+            Value::Date(_) => {
+                let proto = self.constructor_prototype_value("Date")?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
+            // ArrayBuffer / DataView / TypedArray — walk their realm
+            // prototypes for instance method lookups.
+            Value::ArrayBuffer(_) | Value::DataView(_) | Value::TypedArray(_) => {
+                let proto_name = match base {
+                    Value::ArrayBuffer(buf) if buf.is_shared() => "SharedArrayBuffer",
+                    Value::ArrayBuffer(_) => "ArrayBuffer",
+                    Value::DataView(_) => "DataView",
+                    Value::TypedArray(t) => t.kind().name(),
                     _ => unreachable!(),
                 };
                 let proto = self.constructor_prototype_value(proto_name)?;

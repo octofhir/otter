@@ -281,10 +281,14 @@ pub(super) fn validate_descriptor_update(
 }
 
 fn optional_value_eq(a: &Option<Value>, b: &Option<Value>) -> bool {
+    // §10.1.6.3 — a missing accessor side (`[[Get]]` / `[[Set]]`) is
+    // spec-defined to be `undefined`, so a stored `None` slot
+    // compares SameValue-equal to an incoming explicit
+    // `Value::Undefined`. Anything else falls back to SameValue.
     match (a, b) {
         (None, None) => true,
+        (None, Some(v)) | (Some(v), None) => matches!(v, Value::Undefined),
         (Some(x), Some(y)) => same_value(x, y),
-        _ => false,
     }
 }
 

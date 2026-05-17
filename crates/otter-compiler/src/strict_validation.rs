@@ -30,11 +30,11 @@ use std::collections::BTreeMap;
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier,
-    BindingPattern, Class, DoWhileStatement, Expression, ForInStatement, ForOfStatement,
-    ForStatement, ForStatementLeft, FormalParameters, Function, IfStatement, LabeledStatement,
-    NumericLiteral, Program, SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement,
-    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind,
-    WhileStatement,
+    BindingPattern, Class, ClassElement, DoWhileStatement, Expression, ForInStatement,
+    ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function, IfStatement,
+    LabeledStatement, MethodDefinitionKind, NumericLiteral, Program, PropertyKey,
+    SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement, UnaryExpression,
+    UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -89,6 +89,102 @@ struct StrictValidator {
 impl StrictValidator {
     fn is_strict(&self) -> bool {
         self.strict_stack.last().copied().unwrap_or(false)
+    }
+
+    /// Walk a class body and flag duplicate `PrivateBoundNames` per
+    /// ECMA-262 §15.7.1.
+    ///
+    /// Allowed shapes for the same name within one class:
+    ///   - exactly one getter + one setter with matching staticness
+    ///     (instance accessor pair OR static accessor pair).
+    ///
+    /// Anything else — two methods, method + field, two fields,
+    /// async generator + field, static + instance with the same name,
+    /// getter without setter twice, etc. — is a Syntax Error.
+    fn check_private_bound_names(&mut self, class: &Class<'_>) {
+        // Bucket entries by private name. Each entry records its kind
+        // (the spec-relevant role) and staticness so the getter/setter
+        // exception can match precisely.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum PrivKind {
+            Method,
+            Get,
+            Set,
+            Field,
+        }
+        let mut buckets: BTreeMap<&str, Vec<(PrivKind, bool, oxc_span::Span)>> = BTreeMap::new();
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(m) => {
+                    if let PropertyKey::PrivateIdentifier(id) = &m.key {
+                        let kind = match m.kind {
+                            MethodDefinitionKind::Get => PrivKind::Get,
+                            MethodDefinitionKind::Set => PrivKind::Set,
+                            MethodDefinitionKind::Method => PrivKind::Method,
+                            MethodDefinitionKind::Constructor => PrivKind::Method,
+                        };
+                        buckets
+                            .entry(id.name.as_str())
+                            .or_default()
+                            .push((kind, m.r#static, id.span));
+                    }
+                }
+                ClassElement::PropertyDefinition(p) => {
+                    if let PropertyKey::PrivateIdentifier(id) = &p.key {
+                        buckets.entry(id.name.as_str()).or_default().push((
+                            PrivKind::Field,
+                            p.r#static,
+                            id.span,
+                        ));
+                    }
+                }
+                ClassElement::AccessorProperty(a) => {
+                    if let PropertyKey::PrivateIdentifier(id) = &a.key {
+                        buckets.entry(id.name.as_str()).or_default().push((
+                            PrivKind::Field,
+                            a.r#static,
+                            id.span,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (name, entries) in &buckets {
+            if entries.len() < 2 {
+                continue;
+            }
+            // §15.7.1 exception: exactly one getter and one setter
+            // sharing staticness. Anything else is a SyntaxError.
+            let allowed = entries.len() == 2 && {
+                let (k0, s0, _) = entries[0];
+                let (k1, s1, _) = entries[1];
+                s0 == s1
+                    && ((k0 == PrivKind::Get && k1 == PrivKind::Set)
+                        || (k0 == PrivKind::Set && k1 == PrivKind::Get))
+            };
+            if allowed {
+                continue;
+            }
+            // Flag every entry past the first so each duplicate gets
+            // a diagnostic anchored at its own site.
+            for (_, _, span) in entries.iter().skip(1) {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "CLASS_DUPLICATE_PRIVATE_NAME".to_string(),
+                    message: format!(
+                        "SyntaxError: duplicate private name `{name}` in class body (§15.7.1; \
+                         the only allowed dup is one getter + one setter pair with matching \
+                         static-ness)"
+                    ),
+                    range: Some((span.start, span.end)),
+                    help: Some(
+                        "rename one of the private members, or merge them into a single \
+                         getter/setter pair"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
     }
 
     /// Flag a function with a `"use strict"` directive in its body
@@ -422,6 +518,11 @@ impl<'a> Visit<'a> for StrictValidator {
     fn visit_class(&mut self, it: &Class<'a>) {
         // ECMA-262 §10.2.10 — class bodies are always strict mode code.
         self.strict_stack.push(true);
+        // §15.7.1 ClassBody Static Semantics: Early Errors —
+        // PrivateBoundNames of ClassBody contains no duplicate
+        // entries, except when a name is used exactly once as a
+        // getter and once as a setter (no other entries).
+        self.check_private_bound_names(it);
         walk::walk_class(self, it);
         self.strict_stack.pop();
     }

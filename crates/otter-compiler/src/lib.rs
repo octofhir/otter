@@ -5577,21 +5577,21 @@ fn compile_expr(
                     new_span,
                 );
             }
-            // §20.1.1 `new Object()` / `new Object(value)` — bare-
-            // call form lowered to a fresh object via `Op::NewObject`
-            // when no args, or pass-through for object-typed args.
+            // §20.1.1 `new Object()` — empty-args shortcut to
+            // `Op::NewObject`. One-arg / multi-arg forms fall through
+            // to the general construct path so the runtime
+            // `OrdinaryCreateFromConstructor` + `ToObject` (§20.1.1.1)
+            // logic in `object_ctor_call` runs, including the
+            // null/undefined → fresh-object coercion.
             if let Expression::Identifier(id) = callee
                 && id.name.as_str() == "Object"
                 && cx.lookup_binding("Object").is_none()
                 && find_module_import_binding(cx, "Object").is_none()
+                && new_expr.arguments.is_empty()
             {
-                let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-                if arg_regs.is_empty() {
-                    let dst = cx.alloc_scratch();
-                    cx.emit(Op::NewObject, [Operand::Register(dst)], new_span);
-                    return Ok(dst);
-                }
-                return Ok(arg_regs[0]);
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::NewObject, [Operand::Register(dst)], new_span);
+                return Ok(dst);
             }
             // §23.1.1.1 `new Array(...)` — typed
             // [`Op::ArrayConstruct`]. Single-numeric form reserves
@@ -7639,26 +7639,18 @@ fn compile_method_call(
         cx.emit(Op::ArrayConstruct, operands, span);
         return Ok(dst);
     }
-    // §20.1.1 `Object(value)` — bare-call form. Foundation routes
-    // through `Op::ObjectCall("from", ...)` (a helper that wraps
-    // the value via the existing object-coercion path). For
-    // `undefined` / `null` / no-args, the runtime returns a fresh
-    // empty object.
+    // §20.1.1 `Object()` — empty-args shortcut to `Op::NewObject`.
+    // One-arg form falls through to the general call path so the
+    // runtime `object_ctor_call` (§20.1.1.1) handles null/undefined
+    // → fresh-object coercion and primitive → wrapper coercion.
     if let Expression::Identifier(id) = callee
         && id.name.as_str() == "Object"
         && cx.lookup_binding("Object").is_none()
         && find_module_import_binding(cx, "Object").is_none()
+        && call.arguments.is_empty()
     {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        // Foundation: when no args, return a fresh object via NewObject.
-        if arg_regs.is_empty() {
-            let dst = cx.alloc_scratch();
-            cx.emit(Op::NewObject, [Operand::Register(dst)], span);
-            return Ok(dst);
-        }
-        // With one arg, return the arg unchanged when it's an
-        // object (foundation simplification of §20.1.1.1 OrdinaryToPrimitive).
-        let dst = arg_regs[0];
+        let dst = cx.alloc_scratch();
+        cx.emit(Op::NewObject, [Operand::Register(dst)], span);
         return Ok(dst);
     }
     // §21.4.3 Date statics — typed dispatch via [`DateMethod`].

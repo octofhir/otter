@@ -438,6 +438,25 @@ fn native_get_own_property_descriptor_rooted(
             };
             native.own_property_descriptor(ctx.heap(), &ctx.cx.interp.string_heap_clone(), key)?
         }
+        // §20.1.2.7 — primitive operands are coerced via ToObject;
+        // the wrapper carries no own data property for arbitrary
+        // keys (except String which exposes indexed characters and
+        // `length`, handled in the dedicated arms above). Returning
+        // `Undefined` matches the spec's "no such own property"
+        // path without materialising a transient wrapper.
+        Some(
+            Value::Boolean(_)
+            | Value::Number(_)
+            | Value::String(_)
+            | Value::Symbol(_)
+            | Value::BigInt(_),
+        ) => None,
+        Some(Value::Null) | Some(Value::Undefined) | None => {
+            return Err(VmError::TypeError {
+                message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
+                    .to_string(),
+            });
+        }
         _ => {
             return Err(VmError::TypeError {
                 message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
@@ -1179,6 +1198,27 @@ pub fn call(
                         )?)),
                         None => Ok(Value::Undefined),
                     }
+                }
+                // §20.1.2.7 Object.getOwnPropertyDescriptor performs
+                // `obj = ? ToObject(O)` first. Primitive Boolean /
+                // Number / String / Symbol / BigInt coerce to their
+                // wrapper, which carries no own data properties
+                // matching arbitrary keys (other than indexed chars
+                // and `length` on String). Returning `Undefined` for
+                // the common "no such own property" case matches
+                // spec without materialising a transient wrapper.
+                Some(
+                    Value::Boolean(_)
+                    | Value::Number(_)
+                    | Value::String(_)
+                    | Value::Symbol(_)
+                    | Value::BigInt(_),
+                ) => Ok(Value::Undefined),
+                Some(Value::Null) | Some(Value::Undefined) | None => {
+                    Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
+                            .to_string(),
+                    })
                 }
                 _ => Err(VmError::TypeError {
                     message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),

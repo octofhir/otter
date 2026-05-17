@@ -466,6 +466,18 @@ impl Interpreter {
                         };
                         native.own_property_descriptor(self.gc_heap(), &self.string_heap, key)?
                     }
+                    Some(Value::Boolean(_))
+                    | Some(Value::Number(_))
+                    | Some(Value::String(_))
+                    | Some(Value::Symbol(_))
+                    | Some(Value::BigInt(_)) => None,
+                    Some(Value::Null) | Some(Value::Undefined) | None => {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Object.getOwnPropertyDescriptor called on null or undefined"
+                                    .to_string(),
+                        });
+                    }
                     _ => {
                         return Err(VmError::TypeError {
                             message: "Object.getOwnPropertyDescriptor target must be an object"

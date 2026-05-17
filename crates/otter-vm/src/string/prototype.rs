@@ -1144,6 +1144,16 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "trimEnd"       / 0 => impl_trim_end,
             "toLowerCase"   / 0 => impl_to_lower_case,
             "toUpperCase"   / 0 => impl_to_upper_case,
+            // §22.1.3.21 / §22.1.3.23 — `toLocaleLowerCase` /
+            // `toLocaleUpperCase` accept an optional `locales`
+            // argument but their default behaviour matches their
+            // locale-insensitive counterparts in the absence of an
+            // Intl Locale impl. Until Intl lands, alias to the
+            // generic case folders so the property exists and the
+            // spec result-shape (a string of the same length plus
+            // case mapping) holds for the ASCII fast path.
+            "toLocaleLowerCase" / 0 => impl_to_lower_case,
+            "toLocaleUpperCase" / 0 => impl_to_upper_case,
             "replace"       / 2 => impl_replace,
             "replaceAll"    / 2 => impl_replace_all,
             "split"         / 2 => impl_split,
@@ -1329,6 +1339,8 @@ string_prototype_methods!(
     bridge_trim_end        => "trimEnd",        0;
     bridge_to_lower_case   => "toLowerCase",    0;
     bridge_to_upper_case   => "toUpperCase",    0;
+    bridge_to_locale_lower => "toLocaleLowerCase", 0;
+    bridge_to_locale_upper => "toLocaleUpperCase", 0;
     bridge_replace         => "replace",        2;
     bridge_replace_all     => "replaceAll",     2;
     bridge_split           => "split",          2;

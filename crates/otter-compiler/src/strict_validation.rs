@@ -31,8 +31,8 @@ use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier,
     BindingPattern, Class, DoWhileStatement, Expression, ForInStatement, ForOfStatement,
-    ForStatement, Function, IfStatement, LabeledStatement, NumericLiteral, Program,
-    SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement, UnaryExpression,
+    ForStatement, ForStatementLeft, Function, IfStatement, LabeledStatement, NumericLiteral,
+    Program, SimpleAssignmentTarget, Statement, StringLiteral, SwitchStatement, UnaryExpression,
     UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind, WhileStatement,
 };
 use oxc_ast_visit::{Visit, walk};
@@ -88,6 +88,55 @@ struct StrictValidator {
 impl StrictValidator {
     fn is_strict(&self) -> bool {
         self.strict_stack.last().copied().unwrap_or(false)
+    }
+
+    /// Flag a `for-in` / `for-of` head whose ForBinding declarator
+    /// carries an Initializer.
+    ///
+    /// - `for-in`: ECMA-262 §13.7.5.1 forbids the Initializer for
+    ///   `let` / `const` / `using` / destructuring bindings
+    ///   unconditionally, and Annex B §B.3.5 grants `var x = init`
+    ///   only in sloppy mode. Strict-mode `var` with an Initializer
+    ///   is also a SyntaxError.
+    /// - `for-of`: Initializer is never legal regardless of mode.
+    ///
+    /// `kind_label` is `"for-in"` or `"for-of"`; the helper picks
+    /// the right relaxation through the `is_for_of` flag derived
+    /// from the label.
+    fn flag_for_head_initializer(&mut self, left: &ForStatementLeft<'_>, kind_label: &'static str) {
+        let ForStatementLeft::VariableDeclaration(decl) = left else {
+            return;
+        };
+        let is_for_of = kind_label == "for-of";
+        let allow_var_init_in_sloppy =
+            !self.is_strict() && matches!(decl.kind, VariableDeclarationKind::Var) && !is_for_of;
+        for declarator in &decl.declarations {
+            let Some(init) = &declarator.init else {
+                continue;
+            };
+            // Destructuring patterns (object / array) never tolerate
+            // an Initializer in for-in / for-of heads, even in
+            // sloppy mode (Annex B §B.3.5 only relaxes simple `var`).
+            let destructuring = !matches!(declarator.id, BindingPattern::BindingIdentifier(_));
+            if allow_var_init_in_sloppy && !destructuring {
+                continue;
+            }
+            let init_span = oxc_span::GetSpan::span(init);
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "FOR_HEAD_INITIALIZER".to_string(),
+                message: format!(
+                    "SyntaxError: `{kind_label}` head declarator cannot carry an initializer \
+                     (§13.7.5.1; Annex B §B.3.5 grants only sloppy `for (var x = ... in ...)`, \
+                     which never extends to `for-of` or destructuring patterns)"
+                ),
+                range: Some((init_span.start, init_span.end)),
+                help: Some(
+                    "drop the `= …` initializer from the `for` head; assign the value inside \
+                     the loop body instead"
+                        .to_string(),
+                ),
+            });
+        }
     }
 
     /// Flag a `FunctionDeclaration` appearing as the direct body of
@@ -430,11 +479,21 @@ impl<'a> Visit<'a> for StrictValidator {
 
     fn visit_for_in_statement(&mut self, it: &ForInStatement<'a>) {
         self.flag_function_declaration_body(&it.body, "for-in");
+        // §13.7.5.1 ForIn/OfHeadEvaluation early error: ForBinding
+        // declarators in a `for-in` head must not carry an
+        // Initializer. Annex B §B.3.5 relaxes this for `for (var x =
+        // init in obj)` in sloppy mode only; let / const / using and
+        // destructuring patterns are always rejected, and `var` with
+        // an Initializer is rejected in strict code.
+        self.flag_for_head_initializer(&it.left, "for-in");
         walk::walk_for_in_statement(self, it);
     }
 
     fn visit_for_of_statement(&mut self, it: &ForOfStatement<'a>) {
         self.flag_function_declaration_body(&it.body, "for-of");
+        // §13.7.5.1 — `for-of` heads never permit Initializer on
+        // any variant of ForBinding, regardless of strict mode.
+        self.flag_for_head_initializer(&it.left, "for-of");
         walk::walk_for_of_statement(self, it);
     }
 

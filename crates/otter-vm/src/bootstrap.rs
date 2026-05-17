@@ -1009,6 +1009,13 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         global,
         well_known,
     )?;
+    // §21.4.4.45 — `Date.prototype[@@toPrimitive]`.
+    crate::date::well_known::install_date_well_knowns_post_bootstrap(
+        heap,
+        string_heap,
+        global,
+        well_known,
+    )?;
     // §25.2.5 — `SharedArrayBuffer.prototype[@@toStringTag]`.
     crate::bootstrap_array_buffer::install_shared_array_buffer_well_knowns_post_bootstrap(
         heap,

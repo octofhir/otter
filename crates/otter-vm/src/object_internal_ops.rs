@@ -907,8 +907,24 @@ impl Interpreter {
                 message: "Symbol.toPrimitive returned a non-primitive".to_string(),
             });
         }
-        // OrdinaryToPrimitive — try `valueOf` / `toString` in
-        // hint-dependent order.
+        self.evaluate_ordinary_to_primitive(context, input, hint)
+    }
+
+    /// §7.1.1.1 `OrdinaryToPrimitive` synchronous helper. Walks the
+    /// hint-dependent `valueOf` / `toString` ladder via `ordinary_get_value`
+    /// and `run_callable_sync` without first probing `@@toPrimitive` — this
+    /// is the entry point used by `Date.prototype[@@toPrimitive]`
+    /// (§21.4.4.45 step 6) to avoid the infinite recursion that would
+    /// otherwise occur when `[Symbol.toPrimitive]` resolves to itself.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
+    pub(crate) fn evaluate_ordinary_to_primitive(
+        &mut self,
+        context: &ExecutionContext,
+        input: &Value,
+        hint: abstract_ops::ToPrimitiveHint,
+    ) -> Result<Value, VmError> {
         let names: [&str; 2] = match hint {
             abstract_ops::ToPrimitiveHint::String => ["toString", "valueOf"],
             _ => ["valueOf", "toString"],

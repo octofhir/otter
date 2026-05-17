@@ -26,6 +26,7 @@
 
 pub mod dispatch;
 pub mod prototype;
+pub mod well_known;
 
 /// Host wall-clock epoch milliseconds. Used by `Date.now` and the
 /// 0-argument `new Date()` form. Falls back to `NaN` if the host

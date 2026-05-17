@@ -397,6 +397,9 @@ impl Interpreter {
                 // path RegExp on String yet so coercing through ladder
                 // is fine), limit [1] ToInteger.
                 "split" => (&[1], &[0]),
+                // §22.1.3.5 concat(...) — every arg ToString. Cover
+                // the first four slots (matches our 4-wide SmallVec).
+                "concat" => (&[], &[0, 1, 2, 3]),
                 _ => (&[], &[]),
             };
             // §24.3.1.{1,2} GetViewValue / SetViewValue on

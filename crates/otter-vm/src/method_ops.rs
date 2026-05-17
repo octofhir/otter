@@ -324,6 +324,36 @@ impl Interpreter {
                     }
                 }
             }
+            // §23.1.3.14 / .17 — `Array.prototype.indexOf` /
+            // `lastIndexOf` run `ToIntegerOrInfinity(fromIndex)`,
+            // which itself starts with `ToNumber` →
+            // `ToPrimitive(arg, "number")`. Non-primitive fromIndex
+            // must observe `@@toPrimitive` / `valueOf` / `toString`
+            // per spec — pre-coerce here so user `valueOf` side
+            // effects fire before the intrinsic walks elements.
+            if matches!(&recv_value, Value::Array(_) | Value::Object(_))
+                && matches!(&*name, "indexOf" | "lastIndexOf" | "includes")
+                && let Some(slot) = small_args.get_mut(1)
+                && matches!(
+                    slot,
+                    Value::Object(_)
+                        | Value::Array(_)
+                        | Value::Function { .. }
+                        | Value::Closure { .. }
+                        | Value::NativeFunction(_)
+                        | Value::BoundFunction(_)
+                        | Value::ClassConstructor(_)
+                        | Value::Proxy(_)
+                        | Value::RegExp(_)
+                )
+            {
+                let primitive = self.evaluate_to_primitive(
+                    context,
+                    slot,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )?;
+                *slot = primitive;
+            }
             let result = {
                 let string_heap = self.string_heap.clone();
                 let allocation_roots = self.collect_allocation_roots(stack);

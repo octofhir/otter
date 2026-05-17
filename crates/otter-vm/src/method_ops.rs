@@ -392,6 +392,11 @@ impl Interpreter {
                 "repeat" => (&[0], &[]),
                 "padStart" | "padEnd" => (&[0], &[1]),
                 "replace" | "replaceAll" => (&[], &[0]),
+                // §22.1.3.21 split(separator, limit) — separator [0]
+                // ToString (unless RegExp, but our impl doesn't fast-
+                // path RegExp on String yet so coercing through ladder
+                // is fine), limit [1] ToInteger.
+                "split" => (&[1], &[0]),
                 _ => (&[], &[]),
             };
             if matches!(&recv_value, Value::String(_))

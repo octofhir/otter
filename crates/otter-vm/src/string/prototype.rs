@@ -1537,6 +1537,7 @@ fn native_string_method(
         "repeat" => (&[0], &[]),
         "padStart" | "padEnd" => (&[0], &[1]),
         "replace" | "replaceAll" => (&[], &[0]),
+        "split" => (&[1], &[0]),
         _ => (&[], &[]),
     };
     let coerced_args: smallvec::SmallVec<[Value; 4]> = if string_int_coerce.is_empty()

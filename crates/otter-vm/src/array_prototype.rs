@@ -543,15 +543,29 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 /// §23.1.3.1 `Array.prototype.at(index)` — clamp negative indexing.
 /// <https://tc39.es/ecma262/#sec-array.prototype.at>
 fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let len = array::len(arr, &*args.gc_heap) as i64;
-    let raw = arg_signed_index(args, 0, 0)?;
-    let idx = if raw < 0 { len + raw } else { raw };
-    if idx < 0 || idx >= len {
-        return Ok(Value::Undefined);
-    }
+    // §23.1.3.1 — generic via ToObject(this) + LengthOfArrayLike,
+    // then a single indexed Get. Constant-time regardless of `len`.
     let heap = &*args.gc_heap;
-    Ok(array::get(arr, heap, idx as usize))
+    if let Value::Array(arr) = args.receiver {
+        let len = array::len(*arr, heap) as i64;
+        let raw = arg_signed_index(args, 0, 0)?;
+        let idx = if raw < 0 { len + raw } else { raw };
+        if idx < 0 || idx >= len {
+            return Ok(Value::Undefined);
+        }
+        return Ok(array::get(*arr, heap, idx as usize));
+    }
+    if let Value::Object(obj) = args.receiver {
+        let len = read_array_like_length(*obj, heap) as i64;
+        let raw = arg_signed_index(args, 0, 0)?;
+        let idx = if raw < 0 { len + raw } else { raw };
+        if idx < 0 || idx >= len {
+            return Ok(Value::Undefined);
+        }
+        let key = (idx as usize).to_string();
+        return Ok(crate::object::get(*obj, heap, &key).unwrap_or(Value::Undefined));
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 /// §23.1.3.18 `Array.prototype.lastIndexOf(value, fromIndex?)`.
@@ -624,31 +638,108 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 }
 
 /// §23.1.3.27 `Array.prototype.reverse()` — in-place.
+/// Generic over array-likes; sparse Object receivers swap only the
+/// pairs `(i, len-1-i)` where at least one side is present (matching
+/// the spec's `HasProperty` short-circuit).
 /// <https://tc39.es/ecma262/#sec-array.prototype.reverse>
 fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let heap = &mut *args.gc_heap;
-    array::with_elements_mut(arr, heap, |elements| elements.reverse());
-    Ok(Value::Array(arr))
+    if let Value::Array(arr) = args.receiver {
+        let heap = &mut *args.gc_heap;
+        array::with_elements_mut(*arr, heap, |elements| elements.reverse());
+        return Ok(Value::Array(*arr));
+    }
+    if let Value::Object(obj) = args.receiver {
+        let heap_ref = &*args.gc_heap;
+        let len = read_array_like_length(*obj, heap_ref);
+        if len < 2 {
+            return Ok(args.receiver.clone());
+        }
+        let entries = array_like_present_entries(args.receiver, heap_ref)
+            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+        let pre_present: std::collections::BTreeSet<usize> =
+            entries.iter().map(|(i, _)| *i).collect();
+        let heap = &mut *args.gc_heap;
+        // Walk only present indices ≤ middle; pair each with its
+        // mirror `len-1-i`. Spec §23.1.3.27 step 5: if one side is
+        // present and the other isn't, the present side migrates
+        // (Set + Delete); both-present → swap; both-absent → skip.
+        for &i in pre_present.iter().filter(|&&i| i < len) {
+            let mirror = len - 1 - i;
+            if mirror <= i {
+                break;
+            }
+            let key_i = i.to_string();
+            let key_m = mirror.to_string();
+            let v_i = crate::object::get(*obj, heap, &key_i).unwrap_or(Value::Undefined);
+            let mirror_present = pre_present.contains(&mirror);
+            if mirror_present {
+                let v_m = crate::object::get(*obj, heap, &key_m).unwrap_or(Value::Undefined);
+                crate::object::set(*obj, heap, &key_i, v_m);
+                crate::object::set(*obj, heap, &key_m, v_i);
+            } else {
+                // Mirror absent — migrate i → mirror, delete i.
+                crate::object::set(*obj, heap, &key_m, v_i);
+                let _ = crate::object::delete(*obj, heap, &key_i);
+            }
+        }
+        // Also walk present indices > middle whose mirror was absent
+        // (the mirror walk above misses them since we iterated i <
+        // mirror only).
+        for &i in pre_present.iter().filter(|&&i| i < len) {
+            let mirror = len - 1 - i;
+            if mirror >= i {
+                continue;
+            }
+            if pre_present.contains(&mirror) {
+                // Already handled when we processed `mirror` from the
+                // lower half.
+                continue;
+            }
+            // Mirror absent → i migrates down to mirror; delete i.
+            let key_i = i.to_string();
+            let key_m = mirror.to_string();
+            let v_i = crate::object::get(*obj, heap, &key_i).unwrap_or(Value::Undefined);
+            crate::object::set(*obj, heap, &key_m, v_i);
+            let _ = crate::object::delete(*obj, heap, &key_i);
+        }
+        return Ok(args.receiver.clone());
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 /// §23.1.3.7 `Array.prototype.fill(value, start?, end?)` — in-place.
+/// Generic over array-likes via ToObject(this) + LengthOfArrayLike.
 /// <https://tc39.es/ecma262/#sec-array.prototype.fill>
 fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let len = array::len(arr, &*args.gc_heap);
     let value = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
-    let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
-    if start < end {
-        let heap = &mut *args.gc_heap;
-        array::with_elements_mut(arr, heap, |elements| {
-            for slot in elements.iter_mut().take(end).skip(start) {
-                *slot = value.clone();
-            }
-        });
+    if let Value::Array(arr) = args.receiver {
+        let len = array::len(*arr, &*args.gc_heap);
+        let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
+        let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
+        if start < end {
+            let heap = &mut *args.gc_heap;
+            array::with_elements_mut(*arr, heap, |elements| {
+                for slot in elements.iter_mut().take(end).skip(start) {
+                    *slot = value.clone();
+                }
+            });
+        }
+        return Ok(Value::Array(*arr));
     }
-    Ok(Value::Array(arr))
+    if let Value::Object(obj) = args.receiver {
+        let len = read_array_like_length(*obj, &*args.gc_heap);
+        let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
+        let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
+        // Cap defensively — `MAX_ARRAY_LIKE_PROBE_LEN` is already
+        // applied to `len` via `read_array_like_length`, so the
+        // bounded `start..end` walk is safe.
+        let heap = &mut *args.gc_heap;
+        for k in start..end {
+            crate::object::set(*obj, heap, &k.to_string(), value.clone());
+        }
+        return Ok(args.receiver.clone());
+    }
+    Err(IntrinsicError::BadReceiver { expected: "array" })
 }
 
 /// §23.1.3.11 `Array.prototype.flat(depth?)` — flattens at most

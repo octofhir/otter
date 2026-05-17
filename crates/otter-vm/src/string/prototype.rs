@@ -810,6 +810,9 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
 
     // Resolve separator: missing or `undefined` → caller-as-only-element.
+    // §7.1.17 ToString coerces every other operand (Boolean / Number /
+    // BigInt / Null / wrapper objects) before the search.
+    let separator_owned: JsString;
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => {
             let singleton = [Value::String(recv.clone())];
@@ -821,10 +824,8 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         Some(Value::String(s)) => s,
         Some(_) => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a string",
-            });
+            separator_owned = arg_to_string(args, 0)?;
+            &separator_owned
         }
     };
 
@@ -882,6 +883,11 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// Common limit-arg parser shared by string-separator and
 /// regex-separator `split` paths.
 fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
+    // §22.1.3.23 step 6: `limit` defaults to 2^32 - 1 and is
+    // ToUint32-coerced. Foundation accepts the spec set
+    // (`Number` / `Boolean` / `null` / `String` — strings parsed as
+    // decimal integers). Non-integer / negative coerce to 0 per
+    // ToUint32 modulo.
     Ok(match args.args.get(1) {
         None | Some(Value::Undefined) => u32::MAX,
         Some(Value::Number(n)) => {
@@ -892,6 +898,25 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
                 u32::MAX
             } else {
                 v as u32
+            }
+        }
+        Some(Value::Boolean(true)) => 1,
+        Some(Value::Boolean(false) | Value::Null) => 0,
+        Some(Value::String(s)) => {
+            let text = s.to_lossy_string();
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                0
+            } else {
+                trimmed.parse::<i64>().map_or(0, |v| {
+                    if v < 0 {
+                        0
+                    } else if v > u32::MAX as i64 {
+                        u32::MAX
+                    } else {
+                        v as u32
+                    }
+                })
             }
         }
         Some(_) => {

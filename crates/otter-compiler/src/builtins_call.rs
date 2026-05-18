@@ -143,39 +143,63 @@ pub(crate) fn compile_object_builtin(
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
     match (method, arg_regs.len()) {
-        ("create", 1) => {
-            let proto_reg = arg_regs[0];
-            let dst = cx.alloc_scratch();
-            cx.emit(Op::NewObject, [Operand::Register(dst)], span);
-            cx.emit(
-                Op::SetPrototype,
-                [Operand::Register(dst), Operand::Register(proto_reg)],
-                span,
-            );
-            Ok(dst)
-        }
-        // §20.1.2.2 `Object.create(O, Properties)` — proto + initial
-        // descriptor object form. Routes through the runtime's
-        // `Object.create` handler so descriptor coercion stays
-        // alongside `defineProperties`.
+        // §20.1.2.2 `Object.create(O [, Properties])` — synthesise
+        // `undefined` for missing arguments so the runtime can throw
+        // the spec `TypeError("Object.create: O must be Object or
+        // Null")` rather than the compiler rejecting the call shape.
+        // 1-arg shape uses the fast-path `NewObject` + `SetPrototype`;
+        // 2-arg shape routes through the runtime so descriptor
+        // coercion stays alongside `defineProperties`. Extra
+        // arguments fall through to the 2-arg path (the runtime
+        // ignores trailing args).
         // <https://tc39.es/ecma262/#sec-object.create>
-        ("create", 2) => {
-            let dst = cx.alloc_scratch();
-            cx.emit(
-                Op::ObjectCall,
-                vec![
-                    Operand::Register(dst),
-                    Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Create.as_u32()),
-                    Operand::ConstIndex(2),
-                    Operand::Register(arg_regs[0]),
-                    Operand::Register(arg_regs[1]),
-                ],
-                span,
-            );
-            Ok(dst)
+        ("create", n) => {
+            let proto_reg = if let Some(reg) = arg_regs.first().copied() {
+                reg
+            } else {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                dst
+            };
+            if n <= 1 {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::NewObject, [Operand::Register(dst)], span);
+                cx.emit(
+                    Op::SetPrototype,
+                    [Operand::Register(dst), Operand::Register(proto_reg)],
+                    span,
+                );
+                Ok(dst)
+            } else {
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::ObjectCall,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::ConstIndex(
+                            otter_bytecode::method_id::ObjectMethod::Create.as_u32(),
+                        ),
+                        Operand::ConstIndex(2),
+                        Operand::Register(proto_reg),
+                        Operand::Register(arg_regs[1]),
+                    ],
+                    span,
+                );
+                Ok(dst)
+            }
         }
-        ("getPrototypeOf", 1) => {
-            let obj_reg = arg_regs[0];
+        // §20.1.2.12 `Object.getPrototypeOf(O)` — accept any arity so
+        // the runtime can surface the spec `TypeError` when `O` is
+        // missing / `undefined` / `null`.
+        // <https://tc39.es/ecma262/#sec-object.getprototypeof>
+        ("getPrototypeOf", _) => {
+            let obj_reg = if let Some(reg) = arg_regs.first().copied() {
+                reg
+            } else {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                dst
+            };
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::GetPrototype,
@@ -213,17 +237,33 @@ pub(crate) fn compile_object_builtin(
             );
             Ok(obj_reg)
         }
-        // `Object.is(x, y)` — ECMA-262 §20.1.2.13. Lowers to
+        // §20.1.2.13 `Object.is(value1, value2)` — lowers to
         // [`Op::SameValue`], which dispatches §7.2.11 SameValue.
+        // Missing arguments default to `undefined`; extra arguments
+        // are ignored per §10.4.4 (built-in call surface).
         // <https://tc39.es/ecma262/#sec-object.is>
-        ("is", 2) => {
+        ("is", _) => {
+            let x_reg = if let Some(reg) = arg_regs.first().copied() {
+                reg
+            } else {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                dst
+            };
+            let y_reg = if let Some(reg) = arg_regs.get(1).copied() {
+                reg
+            } else {
+                let dst = cx.alloc_scratch();
+                cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+                dst
+            };
             let dst = cx.alloc_scratch();
             cx.emit(
                 Op::SameValue,
                 vec![
                     Operand::Register(dst),
-                    Operand::Register(arg_regs[0]),
-                    Operand::Register(arg_regs[1]),
+                    Operand::Register(x_reg),
+                    Operand::Register(y_reg),
                 ],
                 span,
             );

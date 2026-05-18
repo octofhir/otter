@@ -2082,11 +2082,104 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
 }
 
 fn iterator_receiver(
-    ctx: &crate::NativeCtx<'_>,
+    ctx: &mut crate::NativeCtx<'_>,
     name: &'static str,
 ) -> Result<crate::IteratorHandle, crate::NativeError> {
-    match ctx.this_value() {
-        Value::Iterator(h) => Ok(*h),
+    let this_value = ctx.this_value().clone();
+    match this_value {
+        Value::Iterator(h) => Ok(h),
+        // §27.1.2 step 1 — `Iterator.prototype.X.call(generator, ...)`
+        // accepts a Generator receiver by wrapping it into
+        // `IteratorState::Generator` so the lazy combinators and
+        // eager terminals share the iterator dispatch path.
+        Value::Generator(g) => {
+            let gen_value = Value::Generator(g);
+            let state = crate::IteratorState::Generator { handle: g };
+            ctx.alloc_iterator_state(state, &[&gen_value], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name,
+                    reason: "iterator allocation failed".to_string(),
+                })
+        }
+        // §27.1.2 step 1 fallback — Object receivers with
+        // `[Symbol.iterator]` (e.g. Array iterators backed by a
+        // user iterator object). Look up `@@iterator` and call it
+        // to obtain the inner iterator, then wrap in
+        // `IteratorState::User`.
+        Value::Object(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::Array(_)
+        | Value::String(_) => {
+            let iterator_sym = ctx
+                .cx
+                .interp
+                .well_known_symbols()
+                .get(crate::symbol::WellKnown::Iterator);
+            let (interp, exec_ctx) = ctx.interp_mut_and_context();
+            let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+            let key = crate::VmPropertyKey::Symbol(iterator_sym);
+            let outcome = interp
+                .ordinary_get_value(&exec_ctx, this_value.clone(), this_value.clone(), &key, 0)
+                .map_err(|e| crate::NativeError::TypeError {
+                    name,
+                    reason: e.to_string(),
+                })?;
+            let iter_method = match outcome {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                    interp
+                        .run_callable_sync(&exec_ctx, &getter, this_value.clone(), args)
+                        .map_err(|e| crate::NativeError::TypeError {
+                            name,
+                            reason: e.to_string(),
+                        })?
+                }
+            };
+            let iter_value = if !matches!(iter_method, Value::Undefined | Value::Null)
+                && interp.is_callable_runtime(&iter_method)
+            {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp
+                    .run_callable_sync(&exec_ctx, &iter_method, this_value.clone(), args)
+                    .map_err(|e| crate::NativeError::TypeError {
+                        name,
+                        reason: e.to_string(),
+                    })?
+            } else {
+                return Err(crate::NativeError::TypeError {
+                    name,
+                    reason: "this is not an iterator".to_string(),
+                });
+            };
+            match iter_value {
+                Value::Iterator(h) => Ok(h),
+                Value::Generator(g) => {
+                    let gen_value = Value::Generator(g);
+                    let state = crate::IteratorState::Generator { handle: g };
+                    ctx.alloc_iterator_state(state, &[&gen_value], &[]).map_err(|_| {
+                        crate::NativeError::TypeError {
+                            name,
+                            reason: "iterator allocation failed".to_string(),
+                        }
+                    })
+                }
+                other => {
+                    let other_root = other.clone();
+                    let state = crate::IteratorState::User { iterator: other };
+                    ctx.alloc_iterator_state(state, &[&other_root], &[]).map_err(|_| {
+                        crate::NativeError::TypeError {
+                            name,
+                            reason: "iterator allocation failed".to_string(),
+                        }
+                    })
+                }
+            }
+        }
         _ => Err(crate::NativeError::TypeError {
             name,
             reason: "this is not an iterator".to_string(),

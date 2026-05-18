@@ -753,7 +753,8 @@ impl Interpreter {
             | Value::Promise(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
-            | Value::TypedArray(_) => {
+            | Value::TypedArray(_)
+            | Value::Iterator(_) => {
                 let key = VmPropertyKey::String(name);
                 match self.ordinary_get_value(
                     context,

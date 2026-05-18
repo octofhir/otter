@@ -314,12 +314,23 @@ impl Interpreter {
         // table can't run callbacks (it lacks an
         // `ExecutionContext`), so intercept here before the table
         // lookup and route through the dedicated bridge.
-        if matches!(&recv_value, Value::String(_))
+        //
+        // Wrapper objects (`new String("…")`) also reach this arm —
+        // unwrap their `[[StringData]]` so the receiver flows in as
+        // a primitive string for the callable-replace bridge.
+        let string_recv: Option<Value> = match &recv_value {
+            Value::String(_) => Some(recv_value.clone()),
+            Value::Object(obj) => crate::object::string_data(*obj, &self.gc_heap)
+                .map(Value::String),
+            _ => None,
+        };
+        if let Some(string_recv) = string_recv
             && (name == "replace" || name == "replaceAll")
             && arg_values.len() >= 2
             && self.is_callable_runtime(&arg_values[1])
             && !matches!(arg_values.first(), Some(Value::RegExp(_)))
         {
+            let recv_value = string_recv;
             // §22.1.3.18 step 7 — `searchString = ? ToString(searchValue)`.
             // Coerce non-String searchValues (null, undefined, numbers,
             // objects with `toString`) before handing the args to the

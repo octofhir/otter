@@ -401,6 +401,38 @@ fn build_global_this_impl(
 
     let global = alloc_object_with_value_roots(heap, &[])?;
     object::set(global, heap, "globalThis", Value::Object(global));
+    // §19.1 — `NaN`, `Infinity`, `undefined` are own properties of
+    // the global object with writable / enumerable / configurable
+    // all false. Reflective lookups (`Object.getOwnPropertyDescriptor(
+    // globalThis, "NaN")`) observe the exact attributes.
+    object::define_own_property(
+        global,
+        heap,
+        "NaN",
+        crate::object::PropertyDescriptor::data(
+            Value::Number(crate::number::NumberValue::from_f64(f64::NAN)),
+            false,
+            false,
+            false,
+        ),
+    );
+    object::define_own_property(
+        global,
+        heap,
+        "Infinity",
+        crate::object::PropertyDescriptor::data(
+            Value::Number(crate::number::NumberValue::from_f64(f64::INFINITY)),
+            false,
+            false,
+            false,
+        ),
+    );
+    object::define_own_property(
+        global,
+        heap,
+        "undefined",
+        crate::object::PropertyDescriptor::data(Value::Undefined, false, false, false),
+    );
     if let Some(t) = telemetry.as_deref_mut() {
         t.record_global_this();
     }
@@ -1138,6 +1170,15 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     // Wire the callable+constructable bridge as an internal object
     // slot. This must not appear in JS own-property reflection.
     object::set_constructor_native(array, heap, Value::NativeFunction(ctor_native));
+
+    // §23.1.3.1 — `Array.prototype.constructor = Array`, writable,
+    // non-enumerable, configurable.
+    object::define_own_property(
+        prototype,
+        heap,
+        "constructor",
+        crate::object::PropertyDescriptor::data(Value::Object(array), true, false, true),
+    );
 
     define_global(global, heap, "Array", Value::Object(array));
     Ok(())

@@ -596,16 +596,25 @@ impl Interpreter {
                     .unwrap_or(Value::Undefined),
             },
             v @ Value::RegExp(_) => {
-                let direct = if let Value::RegExp(r) = v {
-                    regexp_prototype::load_property(r, &self.gc_heap, name, &self.string_heap)
+                let r = if let Value::RegExp(r) = v { *r } else { unreachable!() };
+                // Expando bag wins over the spec-mandated direct
+                // load so user-installed members
+                // (`re.exec = fn`, `re.global = false`) shadow the
+                // built-in accessors during test262 observability
+                // checks.
+                if let Some(bag) = r.expando(&self.gc_heap)
+                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+                {
+                    value
                 } else {
-                    Value::Undefined
-                };
-                match direct {
-                    Value::Undefined => {
-                        self.load_from_constructor_prototype(context, "RegExp", v, name)?
+                    let direct =
+                        regexp_prototype::load_property(&r, &self.gc_heap, name, &self.string_heap);
+                    match direct {
+                        Value::Undefined => {
+                            self.load_from_constructor_prototype(context, "RegExp", v, name)?
+                        }
+                        value => value,
                     }
-                    value => value,
                 }
             }
             Value::Symbol(s) => symbol_prototype::load_property(s, name),
@@ -747,7 +756,16 @@ impl Interpreter {
             Value::Object(o) => Some(*o),
             Value::ClassConstructor(c) => Some(c.statics(&self.gc_heap)),
             Value::RegExp(r) => {
-                regexp_prototype::store_property(r, &mut self.gc_heap, name, value.clone());
+                // `lastIndex` lives in the body slot; every other
+                // named write lands in the lazy expando bag so
+                // `re.global = false` / `re.exec = fn` survive
+                // observability checks.
+                if name == "lastIndex" {
+                    regexp_prototype::store_property(r, &mut self.gc_heap, name, value.clone());
+                } else {
+                    let bag = regexp_ensure_expando(self, r, &receiver)?;
+                    crate::object::set(bag, &mut self.gc_heap, name, value.clone());
+                }
                 None
             }
             Value::Array(a) => {
@@ -1056,13 +1074,19 @@ impl Interpreter {
             // as proper own/prototype properties).
             (Value::RegExp(r), Value::String(key)) => {
                 let name = key.to_lossy_string();
-                let direct =
-                    regexp_prototype::load_property(r, &self.gc_heap, &name, &self.string_heap);
-                match direct {
-                    Value::Undefined => {
-                        self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
+                if let Some(bag) = r.expando(&self.gc_heap)
+                    && let Some(value) = crate::object::get(bag, &self.gc_heap, &name)
+                {
+                    value
+                } else {
+                    let direct =
+                        regexp_prototype::load_property(r, &self.gc_heap, &name, &self.string_heap);
+                    match direct {
+                        Value::Undefined => {
+                            self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
+                        }
+                        value => value,
                     }
-                    value => value,
                 }
             }
             (Value::Map(m), Value::Symbol(sym))
@@ -3139,4 +3163,48 @@ fn typed_array_set_expando(
     let bag = typed_array_ensure_expando(interp, t)?;
     crate::object::set(bag, &mut interp.gc_heap, name, value);
     Ok(())
+}
+
+/// Lazy-allocate (and cache) the RegExp expando JsObject used
+/// to back non-spec own properties like `re.exec = fn`.
+fn regexp_ensure_expando(
+    interp: &mut Interpreter,
+    r: &crate::regexp::JsRegExp,
+    _receiver: &Value,
+) -> Result<JsObject, VmError> {
+    regexp_ensure_expando_pub(&mut interp.gc_heap, r)
+}
+
+/// Public-crate variant for `Object.defineProperty` callers.
+pub(crate) fn regexp_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    r: &crate::regexp::JsRegExp,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = r.expando(heap) {
+        return Ok(existing);
+    }
+    let recv = Value::RegExp(*r);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    r.set_expando(heap, bag);
+    Ok(bag)
+}
+
+/// Public-crate variant of the Promise expando lazy allocator.
+pub(crate) fn promise_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    p: &crate::promise::JsPromiseHandle,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = p.expando(heap) {
+        return Ok(existing);
+    }
+    let recv = Value::Promise(*p);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        recv.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
+    p.set_expando(heap, bag);
+    Ok(bag)
 }

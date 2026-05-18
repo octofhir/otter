@@ -1766,6 +1766,56 @@ pub fn call(
                     }
                     Ok(Value::NativeFunction(*native))
                 }
+                // RegExp instances expose `lastIndex` and the
+                // expando bag for ordinary defineProperty.
+                Some(Value::RegExp(r)) => {
+                    let r = *r;
+                    let bag = crate::property_dispatch::regexp_ensure_expando_pub(
+                        gc_heap,
+                        &r,
+                    )?;
+                    let ok = match &key {
+                        PropertyKey::String(k) => crate::object::define_own_property_partial(
+                            bag, gc_heap, k, descriptor,
+                        ),
+                        PropertyKey::Symbol(sym) => {
+                            crate::object::define_own_symbol_property_partial(
+                                bag, gc_heap, sym, descriptor,
+                            )
+                        }
+                    };
+                    if !ok {
+                        return Err(VmError::TypeError {
+                            message: format!("Cannot define property '{}'", key.label()),
+                        });
+                    }
+                    Ok(Value::RegExp(r))
+                }
+                // Promise instances also expose the lazy expando
+                // bag through Object.defineProperty.
+                Some(Value::Promise(p)) => {
+                    let p = *p;
+                    let bag = crate::property_dispatch::promise_ensure_expando_pub(
+                        gc_heap,
+                        &p,
+                    )?;
+                    let ok = match &key {
+                        PropertyKey::String(k) => crate::object::define_own_property_partial(
+                            bag, gc_heap, k, descriptor,
+                        ),
+                        PropertyKey::Symbol(sym) => {
+                            crate::object::define_own_symbol_property_partial(
+                                bag, gc_heap, sym, descriptor,
+                            )
+                        }
+                    };
+                    if !ok {
+                        return Err(VmError::TypeError {
+                            message: format!("Cannot define property '{}'", key.label()),
+                        });
+                    }
+                    Ok(Value::Promise(p))
+                }
                 // §10.4.5.3 IntegerIndexedExoticObject
                 // [[DefineOwnProperty]] — canonical-numeric-index
                 // keys verify the index against the live element

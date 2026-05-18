@@ -202,6 +202,12 @@ pub struct JsRegExpBody {
     /// RegExp execution coerces it numerically, but ordinary JS
     /// reads/writes observe the exact stored value.
     pub last_index: RefCell<Value>,
+    /// Lazy expando bag for non-spec own properties — user
+    /// installations such as `re.global = false` /
+    /// `re.exec = fn` per the §22.2.6 spec-observable hook tests.
+    /// Mutated through `heap.with_payload` like every other GC
+    /// body field; never wrap in `Cell`.
+    pub expando: Option<crate::object::JsObject>,
 }
 
 impl otter_gc::SafeTraceable for JsRegExpBody {
@@ -209,6 +215,9 @@ impl otter_gc::SafeTraceable for JsRegExpBody {
 
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         self.last_index.borrow().trace_value_slots(visitor);
+        if let Some(expando) = &self.expando {
+            Value::Object(*expando).trace_value_slots(visitor);
+        }
     }
 }
 
@@ -253,6 +262,7 @@ impl JsRegExp {
                 source,
                 flags,
                 last_index: RefCell::new(Value::Number(NumberValue::from_i32(0))),
+                expando: None,
             })?,
         })
     }
@@ -321,6 +331,24 @@ impl JsRegExp {
                 .map_while(Result::ok)
                 .collect()
         })
+    }
+
+    /// Parsed flag bits.
+    #[must_use]
+    /// Read the lazy expando bag, if any user installations
+    /// (`re.global = false`, `re.exec = fn`) created one.
+    #[must_use]
+    pub fn expando(&self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.inner, |body| body.expando)
+    }
+
+    /// Install / replace the lazy expando bag.
+    pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
+        let barrier = Value::Object(expando);
+        let _ = heap.with_payload(self.inner, |body| {
+            body.expando = Some(expando);
+        });
+        heap.record_write(self.inner, &barrier);
     }
 
     /// Parsed flag bits.

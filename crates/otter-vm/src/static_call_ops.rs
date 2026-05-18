@@ -69,7 +69,35 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
                     method_id::BigIntMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result = bigint::dispatch::call(method, &args)?;
+                // §7.1.13 ToBigInt step 4 — Array operands flow
+                // through `ToPrimitive(hint: number)`, which routes
+                // through `Array.prototype.toString` = `.join(",")`.
+                // The free dispatcher can't reach the heap, so we
+                // pre-coerce Array args to their joined-string form
+                // here. Empty arrays surface as `""` (→ 0n).
+                let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+                for slot in coerced.iter_mut() {
+                    if let Value::Array(arr) = slot {
+                        let parts: Vec<String> =
+                            crate::array::with_elements(*arr, &self.gc_heap, |elements| {
+                                elements
+                                    .iter()
+                                    .map(|v| match v {
+                                        Value::Undefined | Value::Null | Value::Hole => {
+                                            String::new()
+                                        }
+                                        other => other.display_string(),
+                                    })
+                                    .collect()
+                            });
+                        let joined = parts.join(",");
+                        *slot = Value::String(crate::string::JsString::from_str(
+                            &joined,
+                            &self.string_heap,
+                        )?);
+                    }
+                }
+                let result = bigint::dispatch::call(method, &coerced)?;
                 finish_static_call(frame, dst, result)
             }
             Op::ArrayBufferCall => unreachable!("ArrayBufferCall requires stack-rooted dispatch"),

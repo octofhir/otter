@@ -162,14 +162,84 @@ fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 }
 
 fn bigint_static_as_int_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let _ = ctx;
-    bigint::dispatch::call(BigIntMethod::AsIntN, args).map_err(|e| vm_to_native(e, "BigInt.asIntN"))
+    let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asIntN")?;
+    bigint::dispatch::call(BigIntMethod::AsIntN, &coerced)
+        .map_err(|e| vm_to_native(e, "BigInt.asIntN"))
 }
 
 fn bigint_static_as_uint_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let _ = ctx;
-    bigint::dispatch::call(BigIntMethod::AsUintN, args)
+    let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asUintN")?;
+    bigint::dispatch::call(BigIntMethod::AsUintN, &coerced)
         .map_err(|e| vm_to_native(e, "BigInt.asUintN"))
+}
+
+/// §7.1.13 ToBigInt step 4 — Array operands flow through
+/// `ToPrimitive(hint: number)` which routes through
+/// `Array.prototype.toString` = `.join(",")`. The free
+/// `bigint::dispatch::call` has no GC access, so we pre-coerce
+/// Array arguments to their joined-string form before dispatch.
+fn coerce_bigint_call_args(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
+    let string_heap = ctx.interp_mut().string_heap_clone();
+    let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    for slot in out.iter_mut() {
+        match slot {
+            Value::Array(arr) => {
+                let parts: Vec<String> =
+                    crate::array::with_elements(*arr, ctx.heap(), |elements| {
+                        elements
+                            .iter()
+                            .map(|v| match v {
+                                Value::Undefined | Value::Null | Value::Hole => String::new(),
+                                other => other.display_string(),
+                            })
+                            .collect()
+                    });
+                let joined = parts.join(",");
+                *slot = Value::String(
+                    crate::string::JsString::from_str(&joined, &string_heap).map_err(|_| {
+                        NativeError::TypeError {
+                            name,
+                            reason: "out of memory".to_string(),
+                        }
+                    })?,
+                );
+            }
+            // §7.1.1 ToPrimitive — object / function / proxy operands
+            // run through the spec ladder so user `Symbol.toPrimitive` /
+            // `valueOf` / `toString` is observable. The result is then
+            // re-coerced by the BigInt dispatcher.
+            Value::Object(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::Proxy(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_) => {
+                let (interp, exec) = ctx.interp_mut_and_context();
+                let exec = exec.ok_or_else(|| NativeError::TypeError {
+                    name,
+                    reason: "missing execution context".to_string(),
+                })?;
+                let primitive = interp
+                    .evaluate_to_primitive(
+                        &exec,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                    .map_err(|e| vm_to_native(e, name))?;
+                *slot = primitive;
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------

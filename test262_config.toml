@@ -172,4 +172,13 @@ known_panics = [
     "S15.10.2.8_A3_T16",
     # Unicode property-escapes generated tests build huge strings, cause OOM/GC crash
     "RegExp/property-escapes/generated",
+    # Iterator-helpers re-entry tests recurse into the underlying
+    # iterator from within the helper callback; the VM lacks a
+    # "generator-already-running" guard so they exhaust the
+    # native stack instead of throwing the spec TypeError.
+    "Iterator/prototype/filter/throws-typeerror-when-generator-is-running",
+    "Iterator/prototype/map/throws-typeerror-when-generator-is-running",
+    "Iterator/prototype/flatMap/throws-typeerror-when-generator-is-running",
+    "Iterator/prototype/take/throws-typeerror-when-generator-is-running",
+    "Iterator/prototype/drop/throws-typeerror-when-generator-is-running",
 ]

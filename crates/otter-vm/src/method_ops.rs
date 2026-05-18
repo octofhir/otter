@@ -204,6 +204,35 @@ impl Interpreter {
             }
         }
 
+        // §27.1.2 — Generator receivers walk through
+        // `Iterator.prototype` for the iterator-helpers proposal
+        // surface (`map` / `filter` / `take` / `drop` / `flatMap` /
+        // `toArray` / `forEach` / `reduce` / `some` / `every` /
+        // `find`). The direct Generator-method branch above only
+        // handles `next` / `return` / `throw`; everything else
+        // resolves through the global Iterator constructor's
+        // prototype slot. Found methods invoke with the Generator
+        // as the receiver so the foundation's
+        // `iterator_receiver` wraps it on entry.
+        if matches!(&recv_value, Value::Generator(_)) {
+            let iterator_proto = match crate::object::get(self.global_this, &self.gc_heap, "Iterator")
+            {
+                Some(Value::Object(ctor)) => {
+                    crate::object::get(ctor, &self.gc_heap, "prototype")
+                }
+                _ => None,
+            };
+            if let Some(Value::Object(proto)) = iterator_proto
+                && let Some(method) = crate::object::get(proto, &self.gc_heap, &name)
+                && self.is_callable_runtime(&method)
+            {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                self.invoke(stack, context, &method, recv_value.clone(), arg_values, dst)?;
+                return Ok(());
+            }
+        }
+
         // §23.1.3 callback-driven Array.prototype methods. The
         // intrinsic table can't drive callbacks, so the foundation
         // dispatches them here via `run_callable_sync`. Each method

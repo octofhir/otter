@@ -545,6 +545,56 @@ fn ta_ctor_dispatch(
             reason: "constructor requires 'new'".to_string(),
         });
     }
+    // §22.2.4.5 `TypedArray(buffer [, byteOffset [, length]])` —
+    // ToIndex(byteOffset) / ToIndex(length) per spec invoke
+    // ToPrimitive(Number) → ToIntegerOrInfinity. The dispatch
+    // helper only handles primitive operands; pre-coerce non-
+    // primitive Object args here so user `@@toPrimitive` /
+    // `valueOf` / `toString` hooks fire.
+    // <https://tc39.es/ecma262/#sec-typedarray-buffer-byteoffset-length>
+    let exec = ctx.execution_context().cloned();
+    let coerced: SmallVec<[Value; 4]> = if matches!(args.first(), Some(Value::ArrayBuffer(_))) {
+        if let Some(exec) = &exec {
+            let mut out: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+            for idx in 1..=2 {
+                let Some(slot) = out.get_mut(idx) else {
+                    continue;
+                };
+                if !matches!(
+                    slot,
+                    Value::Object(_)
+                        | Value::Array(_)
+                        | Value::Function { .. }
+                        | Value::Closure { .. }
+                        | Value::NativeFunction(_)
+                        | Value::BoundFunction(_)
+                        | Value::ClassConstructor(_)
+                        | Value::Proxy(_)
+                        | Value::RegExp(_)
+                ) {
+                    continue;
+                }
+                let interp = ctx.interp_mut();
+                let primitive = interp
+                    .evaluate_to_primitive(
+                        exec,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                    .map_err(|e| NativeError::TypeError {
+                        name: typed_array_name(kind),
+                        reason: e.to_string(),
+                    })?;
+                *slot = primitive;
+            }
+            out
+        } else {
+            args.iter().cloned().collect()
+        }
+    } else {
+        args.iter().cloned().collect()
+    };
+    let coerced_slice: &[Value] = coerced.as_slice();
     let roots = ctx.collect_native_roots();
     let this_value = ctx.this_value().clone();
     let new_target = ctx.new_target().cloned();
@@ -555,13 +605,13 @@ fn ta_ctor_dispatch(
             &this_value,
             new_target.as_ref(),
             &[],
-            &[args],
+            &[coerced_slice],
         );
     };
     dispatch::typed_array_call_with_roots(
         kind,
         TypedArrayMethod::Construct,
-        args,
+        coerced_slice,
         ctx.heap_mut(),
         &mut external_visit,
     )

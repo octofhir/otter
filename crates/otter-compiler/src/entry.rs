@@ -253,6 +253,13 @@ pub fn compile_module_program(
     // §12.9.3.1 + §15.7 strict-mode early errors. Module bodies are
     // always strict mode code (§10.2.10).
     strict_validation::validate_strict_mode_early_errors(program, true)?;
+    // §16.2.1 Static Semantics: Early Errors — `ImportDeclaration`
+    // and `ExportDeclaration` are `ModuleItem` productions, not
+    // statements; they may appear only directly under `ModuleBody`.
+    // Nested occurrences (inside a `Block`, `IfStatement`, loop
+    // body, etc.) are early `SyntaxError`s.
+    // <https://tc39.es/ecma262/#sec-module-semantics-static-semantics-early-errors>
+    validate_module_item_positions(program)?;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     let init_is_async = module_body_uses_top_level_await(&program.body);
     module.borrow_mut().functions.push(Function {
@@ -542,6 +549,77 @@ pub fn compile_module_program(
         module_resolutions,
         module_inits: Vec::new(),
     })
+}
+
+/// §16.2.1 — reject `ImportDeclaration` / `ExportDeclaration` in any
+/// position other than directly under `ModuleBody`. Top-level
+/// occurrences are kept; nested ones (inside a `Block`, `IfStatement`,
+/// loop body, switch case, labeled statement, try/catch/finally,
+/// function or class body, …) produce a `SyntaxError`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#prod-ModuleItem>
+/// - <https://tc39.es/ecma262/#sec-module-semantics-static-semantics-early-errors>
+fn validate_module_item_positions(program: &Program<'_>) -> Result<(), CompileError> {
+    use oxc_ast_visit::Visit;
+
+    struct ModuleItemFinder {
+        found: Option<(u32, u32, &'static str)>,
+    }
+    impl<'a> Visit<'a> for ModuleItemFinder {
+        fn visit_import_declaration(&mut self, it: &oxc_ast::ast::ImportDeclaration<'a>) {
+            if self.found.is_none() {
+                self.found = Some((it.span.start, it.span.end, "import"));
+            }
+        }
+        fn visit_export_named_declaration(
+            &mut self,
+            it: &oxc_ast::ast::ExportNamedDeclaration<'a>,
+        ) {
+            if self.found.is_none() {
+                self.found = Some((it.span.start, it.span.end, "export"));
+            }
+        }
+        fn visit_export_default_declaration(
+            &mut self,
+            it: &oxc_ast::ast::ExportDefaultDeclaration<'a>,
+        ) {
+            if self.found.is_none() {
+                self.found = Some((it.span.start, it.span.end, "export"));
+            }
+        }
+        fn visit_export_all_declaration(
+            &mut self,
+            it: &oxc_ast::ast::ExportAllDeclaration<'a>,
+        ) {
+            if self.found.is_none() {
+                self.found = Some((it.span.start, it.span.end, "export"));
+            }
+        }
+    }
+
+    for stmt in &program.body {
+        if matches!(
+            stmt,
+            Statement::ImportDeclaration(_)
+                | Statement::ExportNamedDeclaration(_)
+                | Statement::ExportDefaultDeclaration(_)
+                | Statement::ExportAllDeclaration(_)
+        ) {
+            continue;
+        }
+        let mut finder = ModuleItemFinder { found: None };
+        finder.visit_statement(stmt);
+        if let Some((_, _, kind)) = finder.found {
+            return Err(CompileError::Syntax {
+                messages: vec![format!(
+                    "SyntaxError: `{kind}` declarations may only appear at the top level of a module"
+                )],
+                diagnostics: Vec::new(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Compile a parsed ES module into the frozen runtime boundary product.

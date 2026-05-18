@@ -863,6 +863,34 @@ impl Interpreter {
                     None => self.load_from_constructor_prototype(context, "Array", &recv, &name)?,
                 }
             }
+            // §10.4.5.4 IntegerIndexedExoticObject [[Get]]:
+            // canonical numeric index strings short-circuit to the
+            // element / undefined path; non-numeric keys walk the
+            // ordinary prototype chain.
+            // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-get-p-receiver>
+            (Value::TypedArray(t), Value::String(key)) => {
+                let name = key.to_lossy_string();
+                if let Some(n) = canonical_numeric_index_string(&name) {
+                    if n.is_finite()
+                        && n.fract() == 0.0
+                        && n >= 0.0
+                        && (n as usize) < t.length()
+                    {
+                        t.get(n as usize)
+                    } else {
+                        Value::Undefined
+                    }
+                } else {
+                    let direct = binary::typed_array_prototype::load_property(t, &name);
+                    match direct {
+                        Value::Undefined => {
+                            let kind_name = t.kind().name();
+                            self.load_from_constructor_prototype(context, kind_name, &recv, &name)?
+                        }
+                        value => value,
+                    }
+                }
+            }
             // Computed string-key access on RegExp must observe the
             // same own/prototype lookup as `re.lastIndex` (member
             // access). Without this arm, `re["lastIndex"]` falls
@@ -2865,5 +2893,23 @@ fn has_class_static_property(
             object::PropertyLookup::Absent
         ),
         _ => false,
+    }
+}
+
+/// §7.1.16 CanonicalNumericIndexString — `"-0"` maps to `-0`, any
+/// string whose ToNumber round-trips back to the same string maps to
+/// that number, otherwise undefined. Used by TypedArray and TypedArray
+/// prototype walks to recognise integer-indexed exotic keys.
+/// <https://tc39.es/ecma262/#sec-canonicalnumericindexstring>
+fn canonical_numeric_index_string(s: &str) -> Option<f64> {
+    if s == "-0" {
+        return Some(-0.0);
+    }
+    let n: f64 = s.parse().ok()?;
+    let formatted = crate::number::NumberValue::from_f64(n).to_display_string();
+    if formatted == s {
+        Some(n)
+    } else {
+        None
     }
 }

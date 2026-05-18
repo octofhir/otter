@@ -4602,7 +4602,7 @@ impl Interpreter {
                         .exec_register3(instr)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_has_property_regs(frame, dst, lhs, rhs)?;
+                    self.run_has_property_regs(frame, context, dst, lhs, rhs)?;
                     continue;
                 }
                 _ => {}

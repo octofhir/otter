@@ -147,16 +147,93 @@ impl Interpreter {
     pub(crate) fn run_has_property_regs(
         &self,
         frame: &mut Frame,
+        context: &crate::execution_context::ExecutionContext,
         dst: u16,
         lhs: u16,
         rhs: u16,
     ) -> Result<(), VmError> {
         let lhs = read_register(frame, lhs)?.clone();
         let rhs = read_register(frame, rhs)?.clone();
+        let key_name = match &lhs {
+            Value::String(s) => Some(s.to_lossy_string()),
+            Value::Number(n) => Some(n.to_display_string()),
+            Value::Boolean(b) => Some(if *b { "true" } else { "false" }.to_string()),
+            Value::Null => Some("null".to_string()),
+            Value::Undefined => Some("undefined".to_string()),
+            Value::BigInt(b) => Some(b.to_decimal_string()),
+            Value::Symbol(_) => None,
+            _ => None,
+        };
         let present = match &rhs {
             Value::Object(obj) => has_object_property(self, *obj, &lhs),
             Value::Array(arr) => has_array_property(self, *arr, &lhs),
             Value::ClassConstructor(c) => has_class_static_property(self, c, &lhs),
+            // §10.2.1 Function exotic — own descriptor table covers
+            // `length` / `name` / `prototype` (the latter is absent on
+            // methods / arrows); Function.prototype hosts the
+            // canonical `call` / `apply` / `bind` / `toString` shims.
+            // Lookups for symbol keys fall through to `false` because
+            // the foundation Function layout has no symbol slot.
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                if let Some(name) = key_name.as_deref() {
+                    let bag_has = self
+                        .function_user_props
+                        .get(function_id)
+                        .copied()
+                        .is_some_and(|bag| {
+                            crate::object::with_properties(bag, &self.gc_heap, |p| {
+                                p.keys().any(|k| k == name)
+                            })
+                        });
+                    let metadata_has = self
+                        .ordinary_function_own_property_descriptor(None, *function_id, name)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                    // §10.2.4 ordinary functions expose `prototype` as
+                    // an own data property unless arrow / method /
+                    // explicit deletion.
+                    let prototype_implicit = name == "prototype"
+                        && !context.function_is_arrow(*function_id)
+                        && !self
+                            .function_deleted_metadata
+                            .contains(&(*function_id, "prototype"));
+                    bag_has
+                        || metadata_has
+                        || prototype_implicit
+                        || matches!(name, "call" | "apply" | "bind" | "toString")
+                } else {
+                    false
+                }
+            }
+            Value::NativeFunction(native) => {
+                if let Some(name) = key_name.as_deref() {
+                    native
+                        .own_property_descriptor(&self.gc_heap, &self.string_heap, name)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                        || matches!(name, "call" | "apply" | "bind" | "toString")
+                } else {
+                    false
+                }
+            }
+            Value::BoundFunction(bound) => {
+                if let Some(name) = key_name.as_deref() {
+                    function_metadata::bound_own_property_descriptor(
+                        bound,
+                        &self.gc_heap,
+                        &self.string_heap,
+                        name,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some()
+                        || matches!(name, "call" | "apply" | "bind" | "toString")
+                } else {
+                    false
+                }
+            }
             _ => return Err(VmError::TypeMismatch),
         };
         write_register(frame, dst, Value::Boolean(present))?;

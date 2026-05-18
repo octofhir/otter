@@ -8727,18 +8727,17 @@ fn compile_class(
             oxc_ast::ast::ClassElement::StaticBlock(s) => {
                 // §15.7.4 StaticBlock — a synthesised function with
                 // no params; `this` bound to the statics object.
-                // Compile a closure-less function from the block
-                // body, then invoke it with the statics object as
-                // the receiver via `Op::CallWithThis`.
+                // Compile through the standard MakeClosure path so
+                // identifier references to outer locals capture as
+                // upvalues (the previous `MakeFunction`-only emit
+                // dropped captures and left `Op::LoadUpvalue` /
+                // `Op::StoreUpvalue` indices dangling).
                 let bspan = (s.span.start, s.span.end);
-                let function_id = compile_static_block(cx, &display_name, &s.body, bspan)?;
+                let (function_id, captures) =
+                    compile_static_block(cx, &display_name, &s.body, bspan)?;
                 let const_idx = cx.intern_function_id(function_id);
                 let fn_reg = cx.alloc_scratch();
-                cx.emit(
-                    Op::MakeFunction,
-                    [Operand::Register(fn_reg), Operand::ConstIndex(const_idx)],
-                    bspan,
-                );
+                emit_make_callable(cx, fn_reg, const_idx, &captures, false, bspan);
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::CallWithThis,
@@ -9066,9 +9065,14 @@ fn compile_static_block(
     class_name: &str,
     body: &oxc_allocator::Vec<'_, Statement<'_>>,
     span: (u32, u32),
-) -> Result<u32, CompileError> {
+) -> Result<(u32, Vec<u32>), CompileError> {
     let module = Rc::clone(&parent.top_mut().module);
-    let child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
+    let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(true);
+    // §15.7.4 — `var` / `let` / `function` declarations inside a
+    // static block live in the block's own scope. Compute the
+    // capture-name set so identifier references to outer locals
+    // can promote to upvalues just like any nested function body.
+    child.captured_names = capture::analyze_module(body);
     parent.push(child);
     parent.enter_scope();
 
@@ -9081,9 +9085,6 @@ fn compile_static_block(
         ..Default::default()
     });
 
-    // Same pre-passes as a regular function body — top-level
-    // `var` / `let` / `function` statements inside a static block
-    // hoist to the block's scope, not the surrounding class.
     let mut var_names: Vec<String> = Vec::new();
     hoist_var_names(body, &mut var_names);
     pre_declare_var_bindings(parent, &var_names, span)?;
@@ -9098,6 +9099,7 @@ fn compile_static_block(
     parent.emit(Op::ReturnUndefined, vec![], span);
 
     let child = parent.pop();
+    let captures = child.parent_captures.clone();
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions
@@ -9109,7 +9111,7 @@ fn compile_static_block(
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;
-    Ok(function_id)
+    Ok((function_id, captures))
 }
 
 /// Synthetic name for the per-method "home object" upvalue that

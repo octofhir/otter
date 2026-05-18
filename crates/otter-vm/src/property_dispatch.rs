@@ -56,8 +56,31 @@ impl Interpreter {
         context: &ExecutionContext,
         value: Value,
     ) -> Result<Value, VmError> {
-        if abstract_ops::is_primitive(&value) {
-            return Ok(value);
+        // §7.1.19 ToPropertyKey — `String` / `Number` / `Symbol`
+        // operands pass through to their existing per-receiver
+        // arms unchanged; `Boolean` / `Null` / `Undefined` /
+        // `BigInt` flatten to their display-string form so the
+        // downstream match treats them as string keys.
+        match &value {
+            Value::String(_) | Value::Symbol(_) | Value::Number(_) => return Ok(value),
+            Value::Boolean(b) => {
+                let s = if *b { "true" } else { "false" };
+                let js = JsString::from_str(s, &self.string_heap)?;
+                return Ok(Value::String(js));
+            }
+            Value::Null => {
+                let js = JsString::from_str("null", &self.string_heap)?;
+                return Ok(Value::String(js));
+            }
+            Value::Undefined | Value::Hole => {
+                let js = JsString::from_str("undefined", &self.string_heap)?;
+                return Ok(Value::String(js));
+            }
+            Value::BigInt(b) => {
+                let js = JsString::from_str(&b.to_decimal_string(), &self.string_heap)?;
+                return Ok(Value::String(js));
+            }
+            _ => {}
         }
         let key = self.to_property_key_sync(context, value)?;
         match key {
@@ -1029,6 +1052,38 @@ impl Interpreter {
                             )?;
                         }
                     }
+                }
+            }
+            // §22.1 Array exotic — string-keyed write of an
+            // integer-string lands as a dense element; everything
+            // else stores on the named-properties side table so
+            // `arr["i"] = 10` round-trips.
+            (Value::Array(arr), Value::String(key)) => {
+                let name = key.to_lossy_string();
+                if let Ok(idx) = name.parse::<u32>()
+                    && name == idx.to_string()
+                {
+                    let roots = self.collect_allocation_roots(stack);
+                    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                        for &slot in &roots {
+                            visitor(slot);
+                        }
+                    };
+                    crate::array::set_with_roots(
+                        *arr,
+                        &mut self.gc_heap,
+                        idx as usize,
+                        value,
+                        &mut external_visit,
+                    )?;
+                } else {
+                    crate::array::set_named_property(
+                        *arr,
+                        &mut self.gc_heap,
+                        &name,
+                        value,
+                    )
+                    .map_err(|_| VmError::TypeMismatch)?;
                 }
             }
             // Numeric-indexed array write.

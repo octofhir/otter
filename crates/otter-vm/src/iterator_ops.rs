@@ -373,6 +373,12 @@ impl Interpreter {
                     Value::Undefined,
                     smallvec::smallvec![v],
                 )?;
+                // §27.5.1.10 step 7.b.iv — `GetIteratorFlattenable(mapped)`
+                // accepts any iterable (Array / Set / Map / String /
+                // Generator / Object with `@@iterator`) and any
+                // existing iterator. Non-iterable primitives throw
+                // TypeError. The Iterator-helpers spec rejects raw
+                // values that aren't iterables.
                 let inner_state = match mapped {
                     Value::Array(arr) => IteratorState::Array {
                         array: arr,
@@ -388,7 +394,78 @@ impl Interpreter {
                         inner = Some(new_inner);
                         continue;
                     }
-                    other => return Ok((other, false)),
+                    Value::Generator(g) => IteratorState::Generator { handle: g },
+                    Value::String(s) => IteratorState::String { string: s, index: 0 },
+                    Value::Set(_) | Value::Map(_) | Value::Object(_) => {
+                        // §7.4.2 GetIteratorFlattenable — look up
+                        // `@@iterator`. If present, call it to obtain
+                        // the real iterator. If missing / null, the
+                        // value is already an iterator (has `.next`
+                        // directly) and routes through
+                        // `IteratorState::User` unchanged.
+                        let iterator_sym = self
+                            .well_known_symbols
+                            .get(crate::symbol::WellKnown::Iterator);
+                        let key = crate::VmPropertyKey::Symbol(iterator_sym);
+                        let outcome = self.ordinary_get_value(
+                            context,
+                            mapped.clone(),
+                            mapped.clone(),
+                            &key,
+                            0,
+                        )?;
+                        let iter_method = match outcome {
+                            crate::VmGetOutcome::Value(v) => v,
+                            crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                                context,
+                                &getter,
+                                mapped.clone(),
+                                SmallVec::new(),
+                            )?,
+                        };
+                        let iter_value = if matches!(iter_method, Value::Undefined | Value::Null) {
+                            // Iterator-without-`@@iterator` shape —
+                            // wrap the mapped object directly so
+                            // subsequent `IteratorNext` calls invoke
+                            // its own `.next`.
+                            mapped.clone()
+                        } else if self.is_callable_runtime(&iter_method) {
+                            self.run_callable_sync(
+                                context,
+                                &iter_method,
+                                mapped.clone(),
+                                SmallVec::new(),
+                            )?
+                        } else {
+                            return Err(VmError::TypeError {
+                                message: "Iterator.prototype.flatMap mapper return must be iterable"
+                                    .to_string(),
+                            });
+                        };
+                        if let Value::Iterator(rc) = iter_value {
+                            let new_inner = rc;
+                            self.gc_heap.with_payload(*iter, |state| {
+                                if let IteratorState::FlatMap { inner: slot, .. } = state {
+                                    *slot = Some(new_inner);
+                                }
+                            });
+                            inner = Some(new_inner);
+                            continue;
+                        }
+                        if let Value::Generator(g) = iter_value {
+                            IteratorState::Generator { handle: g }
+                        } else {
+                            IteratorState::User {
+                                iterator: iter_value,
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(VmError::TypeError {
+                            message: "Iterator.prototype.flatMap mapper return must be iterable"
+                                .to_string(),
+                        });
+                    }
                 };
                 let iter_root = Value::Iterator(*iter);
                 let source_root = Value::Iterator(source);

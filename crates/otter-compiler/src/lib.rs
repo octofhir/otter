@@ -8264,6 +8264,127 @@ fn try_compile_function_method(
 /// `__class_home` (the prototype object methods belong to) and
 /// `__class_super` (the parent class value, only present when the
 /// class has an `extends` clause).
+/// §15.7.1 Class Definitions: Static Semantics: HasDirectSuper /
+/// Early Errors. Walks each `ClassElement` in `body` and raises
+/// `CompileError::Syntax` if any non-constructor method definition
+/// or field initializer contains a direct `super(...)` call.
+///
+/// "Direct" matches the spec definition: only `SuperCall` nodes
+/// reachable through arrow functions stay in scope; entering a
+/// non-arrow function or a nested method definition resets the
+/// super binding and is therefore transparent for this check.
+fn validate_no_direct_super_in_methods(
+    body: &oxc_ast::ast::ClassBody<'_>,
+) -> Result<(), CompileError> {
+    use oxc_ast_visit::Visit;
+    struct SuperFinder {
+        nested_function_depth: u32,
+        found: Option<(u32, u32)>,
+    }
+    impl<'a> Visit<'a> for SuperFinder {
+        fn visit_function(
+            &mut self,
+            it: &oxc_ast::ast::Function<'a>,
+            flags: oxc_syntax::scope::ScopeFlags,
+        ) {
+            // Non-arrow function — new HomeObject scope; spec resets
+            // HasDirectSuper across the boundary.
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_function(self, it, flags);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_method_definition(&mut self, it: &oxc_ast::ast::MethodDefinition<'a>) {
+            // Inner-class methods carry their own HomeObject.
+            self.nested_function_depth += 1;
+            oxc_ast_visit::walk::walk_method_definition(self, it);
+            self.nested_function_depth -= 1;
+        }
+        fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
+            if self.nested_function_depth == 0
+                && matches!(it.callee, oxc_ast::ast::Expression::Super(_))
+                && self.found.is_none()
+            {
+                self.found = Some((it.span.start, it.span.end));
+            }
+            oxc_ast_visit::walk::walk_call_expression(self, it);
+        }
+    }
+    for element in &body.body {
+        match element {
+            oxc_ast::ast::ClassElement::MethodDefinition(m)
+                if !matches!(m.kind, oxc_ast::ast::MethodDefinitionKind::Constructor) =>
+            {
+                let mut finder = SuperFinder {
+                    nested_function_depth: 0,
+                    found: None,
+                };
+                // Walk the method body + parameter defaults directly
+                // so the outermost function-scope is treated as the
+                // method itself (depth 0) — nested non-arrow
+                // functions / inner methods still bump depth via the
+                // overrides on `Visit`.
+                if let Some(body) = m.value.body.as_deref() {
+                    for stmt in &body.statements {
+                        finder.visit_statement(stmt);
+                    }
+                }
+                for param in &m.value.params.items {
+                    if let Some(init) = param.initializer.as_deref() {
+                        finder.visit_expression(init);
+                    }
+                }
+                if finder.found.is_some() {
+                    return Err(CompileError::Syntax {
+                        messages: vec![
+                            "SyntaxError: 'super' call is only allowed in a derived-class constructor"
+                                .to_string(),
+                        ],
+                        diagnostics: Vec::new(),
+                    });
+                }
+            }
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
+                if let Some(init) = p.value.as_ref() {
+                    let mut finder = SuperFinder {
+                        nested_function_depth: 0,
+                        found: None,
+                    };
+                    finder.visit_expression(init);
+                    if let Some(_span) = finder.found {
+                        return Err(CompileError::Syntax {
+                            messages: vec![
+                                "SyntaxError: 'super' call is only allowed in a derived-class constructor"
+                                    .to_string(),
+                            ],
+                            diagnostics: Vec::new(),
+                        });
+                    }
+                }
+            }
+            oxc_ast::ast::ClassElement::StaticBlock(b) => {
+                let mut finder = SuperFinder {
+                    nested_function_depth: 0,
+                    found: None,
+                };
+                for stmt in &b.body {
+                    finder.visit_statement(stmt);
+                }
+                if let Some(_span) = finder.found {
+                    return Err(CompileError::Syntax {
+                        messages: vec![
+                            "SyntaxError: 'super' call is only allowed in a derived-class constructor"
+                                .to_string(),
+                        ],
+                        diagnostics: Vec::new(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn compile_class(
     cx: &mut Compiler,
     class: &oxc_ast::ast::Class<'_>,
@@ -8293,6 +8414,16 @@ fn compile_class(
         cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
         return Ok(dst);
     }
+
+    // §15.7.1 Class Definitions: Static Semantics: Early Errors —
+    // `ClassElement : MethodDefinition` (incl. `static`) is a Syntax
+    // Error when `HasDirectSuper(MethodDefinition)` is true and the
+    // method's PropName is not "constructor". A FieldDefinition is
+    // likewise a Syntax Error if its initializer Contains SuperCall.
+    // Arrow functions and class static blocks are transparent for
+    // HasDirectSuper; nested non-arrow function bodies break the
+    // chain (they have their own [[HomeObject]] = undefined).
+    validate_no_direct_super_in_methods(&class.body)?;
 
     cx.enter_scope();
 

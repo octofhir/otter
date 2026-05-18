@@ -294,6 +294,97 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     Ok(())
 }
 
+/// Drain a JS iterable into a `Vec<Value>` by calling its
+/// `[Symbol.iterator]` method and pumping the resulting iterator
+/// until completion. Used by the §22.2.4.4 `new TA(iterable)`
+/// constructor path.
+fn drain_iterable_into_values(
+    ctx: &mut NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+    src: &Value,
+) -> Result<Vec<Value>, NativeError> {
+    let iterator_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Iterator);
+    let src_value = src.clone();
+    let key = crate::VmPropertyKey::Symbol(iterator_sym);
+    let outcome = ctx
+        .cx
+        .interp
+        .ordinary_get_value(exec_ctx, src_value.clone(), src_value.clone(), &key, 0)
+        .map_err(|e| NativeError::TypeError {
+            name: "TypedArray",
+            reason: e.to_string(),
+        })?;
+    let iter_method = match outcome {
+        crate::VmGetOutcome::Value(v) => v,
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+            ctx.cx
+                .interp
+                .run_callable_sync(exec_ctx, &getter, src_value.clone(), args)
+                .map_err(|e| NativeError::TypeError {
+                    name: "TypedArray",
+                    reason: e.to_string(),
+                })?
+        }
+    };
+    if !ctx.cx.interp.is_callable_runtime(&iter_method) {
+        return Err(NativeError::TypeError {
+            name: "TypedArray",
+            reason: "source object is not iterable".to_string(),
+        });
+    }
+    let no_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+    let iter_obj = ctx
+        .cx
+        .interp
+        .run_callable_sync(exec_ctx, &iter_method, src_value, no_args)
+        .map_err(|e| NativeError::TypeError {
+            name: "TypedArray",
+            reason: e.to_string(),
+        })?;
+    let handle = match iter_obj {
+        Value::Iterator(h) => h,
+        Value::Generator(g) => {
+            let gen_value = Value::Generator(g);
+            let state = crate::IteratorState::Generator { handle: g };
+            ctx.alloc_iterator_state(state, &[&gen_value], &[])
+                .map_err(|_| NativeError::TypeError {
+                    name: "TypedArray",
+                    reason: "iterator allocation failed".to_string(),
+                })?
+        }
+        other => {
+            let other_root = other.clone();
+            let state = crate::IteratorState::User { iterator: other };
+            ctx.alloc_iterator_state(state, &[&other_root], &[])
+                .map_err(|_| NativeError::TypeError {
+                    name: "TypedArray",
+                    reason: "iterator allocation failed".to_string(),
+                })?
+        }
+    };
+    let mut collected: Vec<Value> = Vec::new();
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(exec_ctx, &handle)
+            .map_err(|e| NativeError::TypeError {
+                name: "TypedArray",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        collected.push(v);
+    }
+    Ok(collected)
+}
+
 /// §22.2.6.15 `get %TypedArray%.prototype [ @@toStringTag ]` — return
 /// the receiver's element-kind name (`"Int8Array"`, …), or undefined
 /// if the receiver is not a TypedArray.
@@ -588,7 +679,43 @@ fn ta_ctor_dispatch(
     // `valueOf` / `toString` hooks fire.
     // <https://tc39.es/ecma262/#sec-typedarray-buffer-byteoffset-length>
     let exec = ctx.execution_context().cloned();
-    let coerced: SmallVec<[Value; 4]> = if matches!(args.first(), Some(Value::ArrayBuffer(_))) {
+    // §22.2.4.4 — when the source argument is an Object with
+    // `@@iterator`, drain that iterator into an Array up-front so
+    // the per-kind dispatcher's array-like path collects the
+    // yielded values rather than reading the (probably-undefined)
+    // `length` own slot.
+    let iter_pre: Option<SmallVec<[Value; 4]>> =
+        if let (Some(Value::Object(src_obj)), Some(exec)) = (args.first(), exec.as_ref()) {
+            let iter_sym = ctx
+                .cx
+                .interp
+                .well_known_symbols()
+                .get(crate::symbol::WellKnown::Iterator);
+            let has_iter = crate::object::get_symbol(*src_obj, ctx.heap(), &iter_sym).is_some();
+            if has_iter {
+                let src_value = Value::Object(*src_obj);
+                let drained = drain_iterable_into_values(ctx, exec, &src_value)?;
+                let arr = ctx
+                    .array_from_elements(drained.into_iter())
+                    .map_err(|_| NativeError::TypeError {
+                        name: typed_array_name(kind),
+                        reason: "out of memory while allocating array".to_string(),
+                    })?;
+                let mut out: SmallVec<[Value; 4]> = SmallVec::new();
+                out.push(Value::Array(arr));
+                for v in args.iter().skip(1) {
+                    out.push(v.clone());
+                }
+                Some(out)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let coerced: SmallVec<[Value; 4]> = if let Some(pre) = iter_pre {
+        pre
+    } else if matches!(args.first(), Some(Value::ArrayBuffer(_))) {
         if let Some(exec) = &exec {
             let mut out: SmallVec<[Value; 4]> = args.iter().cloned().collect();
             for idx in 1..=2 {

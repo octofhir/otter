@@ -2104,30 +2104,118 @@ impl crate::intrinsic_install::BuiltinIntrinsic for AggregateErrorIntrinsic {
     }
 }
 
-/// Placeholder `BuiltinIntrinsic` for `Iterator` (the ES2025
-/// constructor; iterator-helpers proposal not yet implemented).
+/// §27.1.1.1 `Iterator()` constructor — abstract base for the
+/// ES2025 iterator-helpers protocol. Direct calls / direct `new`
+/// throw `TypeError`; subclass `super()` calls allocate an
+/// ordinary object inheriting from the new-target's `.prototype`.
+fn iterator_ctor_call(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let new_target = ctx.new_target().cloned();
+    let Some(new_target) = new_target else {
+        return Err(crate::NativeError::TypeError {
+            name: "Iterator",
+            reason: "constructor Iterator requires 'new'".to_string(),
+        });
+    };
+    // §27.1.1.1 step 2 — OrdinaryCreateFromConstructor(new.target,
+    // "%Iterator.prototype%"). Resolve the prototype off the
+    // new-target so subclass `class T extends Iterator { … }` /
+    // `new T()` inherits from `T.prototype`.
+    let new_target_root = new_target.clone();
+    let obj = ctx
+        .alloc_object_with_roots(&[&new_target_root], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator",
+            reason: "out of memory".to_string(),
+        })?;
+    let proto = match &new_target {
+        Value::NativeFunction(nf) => {
+            let heap = ctx.heap();
+            let string_heap = ctx.cx.interp.string_heap_clone();
+            nf.own_property_descriptor(heap, &string_heap, "prototype")
+                .ok()
+                .flatten()
+                .and_then(|d| match d.kind {
+                    crate::object::DescriptorKind::Data { value } => Some(value),
+                    _ => None,
+                })
+        }
+        Value::Object(target_obj) => crate::object::get(*target_obj, ctx.heap(), "prototype"),
+        Value::ClassConstructor(c) => {
+            crate::object::get(c.statics(ctx.heap()), ctx.heap(), "prototype")
+        }
+        _ => None,
+    };
+    if let Some(Value::Object(proto_obj)) = proto {
+        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto_obj));
+    }
+    Ok(Value::Object(obj))
+}
+
+/// `BuiltinIntrinsic` for the ES2025 `Iterator` constructor — the
+/// abstract base of the iterator-helpers protocol.
 pub struct IteratorIntrinsic;
 impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
     const NAME: &'static str = "Iterator";
     const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_placeholder(Self::NAME, heap, global)?;
-        // §27.1.4.1 `Iterator.from(iterable)` — wraps an iterable
-        // (or already-iterator) into a foundation `Value::Iterator`
-        // handle so the `.next()` / iterator-helper dispatch fires
-        // through the normal interpreter path.
-        let Some(Value::Object(iterator_ctor)) = object::get(global, heap, "Iterator") else {
-            return Ok(());
-        };
-        let ctor_root = Value::Object(iterator_ctor);
-        let from_fn =
-            native_static_with_value_roots(heap, "from", 1, iterator_from_native, &[&ctor_root])
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        object::set(iterator_ctor, heap, "from", Value::NativeFunction(from_fn));
-        let prototype = match object::get(iterator_ctor, heap, "prototype") {
-            Some(Value::Object(p)) => p,
-            _ => return Ok(()),
-        };
+        let global_root = Value::Object(global);
+        // Build the spec-compliant Iterator constructor (callable as
+        // `new Iterator()` via subclass `super()`, throws when
+        // invoked directly).
+        let ctor = native_constructor_static_with_value_roots(
+            heap,
+            "Iterator",
+            0,
+            iterator_ctor_call,
+            &[&global_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        // Wire %Iterator.prototype% — a fresh object chained later
+        // to %Object.prototype% and decorated with the iterator
+        // helpers below.
+        let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
+        let proto_value = Value::Object(proto);
+        let string_heap = crate::string::StringHeap::default();
+        let prototype_desc =
+            crate::object::PropertyDescriptor::data(proto_value.clone(), false, false, false);
+        if !ctor.define_own_property(heap, &string_heap, "prototype", prototype_desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+        }
+        // §27.1.2 — `Iterator.prototype.constructor = %Iterator%`,
+        // writable / non-enumerable / configurable.
+        crate::object::define_own_property(
+            proto,
+            heap,
+            "constructor",
+            crate::object::PropertyDescriptor::data(
+                Value::NativeFunction(ctor),
+                true,
+                false,
+                true,
+            ),
+        );
+        define_global_value(global, heap, Self::NAME, Value::NativeFunction(ctor));
+        let iterator_ctor = ctor;
+        let ctor_root = Value::NativeFunction(iterator_ctor);
+        let from_fn = native_static_with_value_roots(
+            heap,
+            "from",
+            1,
+            iterator_from_native,
+            &[&ctor_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let from_desc = crate::object::PropertyDescriptor::data(
+            Value::NativeFunction(from_fn),
+            true,
+            false,
+            true,
+        );
+        let _ = iterator_ctor.define_own_property(heap, &string_heap, "from", from_desc);
+        let prototype = proto;
         // §27.1.2 %IteratorPrototype% — install the iterator-helpers
         // proposal methods on the prototype carried by the
         // `Iterator` constructor. The handlers re-enter the
@@ -2997,7 +3085,7 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1047;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1050;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 464 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

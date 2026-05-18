@@ -624,7 +624,18 @@ impl Interpreter {
                 self.load_from_constructor_prototype(context, proto_name, v, name)?
             }
             v @ Value::Promise(_) => {
-                self.load_from_constructor_prototype(context, "Promise", v, name)?
+                // §27.2.5 — user-installed own properties
+                // (`promise.then = fn`) live in a lazy expando bag;
+                // honour them before the realm `Promise.prototype`
+                // walk.
+                let p = if let Value::Promise(p) = v { *p } else { unreachable!() };
+                if let Some(bag) = p.expando(&self.gc_heap)
+                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+                {
+                    value
+                } else {
+                    self.load_from_constructor_prototype(context, "Promise", v, name)?
+                }
             }
             v @ (Value::Map(_) | Value::Set(_) | Value::WeakMap(_) | Value::WeakSet(_)) => {
                 match collections_prototype::load_property_with_heap(v, name, &self.gc_heap) {
@@ -857,6 +868,23 @@ impl Interpreter {
                     None
                 }
             },
+            Value::Promise(p) => {
+                let bag = if let Some(bag) = p.expando(&self.gc_heap) {
+                    bag
+                } else {
+                    let p_value = receiver.clone();
+                    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                        p_value.trace_value_slots(visitor);
+                    };
+                    let bag = crate::object::alloc_object_with_roots(
+                        &mut self.gc_heap,
+                        &mut external_visit,
+                    )?;
+                    p.set_expando(&mut self.gc_heap, bag);
+                    bag
+                };
+                Some(bag)
+            }
             Value::Undefined | Value::Null | Value::Hole => {
                 return Err(VmError::TypeError {
                     message: format!(

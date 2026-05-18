@@ -277,6 +277,10 @@ pub struct PurePromiseBody {
     fulfill_reactions: Vec<PromiseReaction>,
     reject_reactions: Vec<PromiseReaction>,
     is_handled: bool,
+    /// Lazy expando bag for non-spec own properties such as
+    /// user-installed `then` / `constructor` overrides per the
+    /// Promise resolution-callback observation tests.
+    expando: Option<crate::object::JsObject>,
 }
 
 impl otter_gc::SafeTraceable for PurePromiseBody {
@@ -291,6 +295,9 @@ impl otter_gc::SafeTraceable for PurePromiseBody {
         {
             reaction.trace_value_slots(visitor);
         }
+        if let Some(expando) = &self.expando {
+            Value::Object(*expando).trace_value_slots(visitor);
+        }
     }
 }
 
@@ -303,6 +310,7 @@ impl PurePromise {
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
                 is_handled: false,
+                expando: None,
             })?,
         })
     }
@@ -319,6 +327,7 @@ impl PurePromise {
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
                     is_handled: false,
+                expando: None,
                 },
                 external_visit,
             )?,
@@ -336,6 +345,7 @@ impl PurePromise {
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
                 is_handled: false,
+                expando: None,
             })?,
         })
     }
@@ -353,6 +363,7 @@ impl PurePromise {
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
                     is_handled: false,
+                expando: None,
                 },
                 external_visit,
             )?,
@@ -370,6 +381,7 @@ impl PurePromise {
                 fulfill_reactions: Vec::new(),
                 reject_reactions: Vec::new(),
                 is_handled: false,
+                expando: None,
             })?,
         })
     }
@@ -387,6 +399,7 @@ impl PurePromise {
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
                     is_handled: false,
+                expando: None,
                 },
                 external_visit,
             )?,
@@ -403,6 +416,21 @@ impl PurePromise {
     #[must_use]
     pub fn identity_addr(&self) -> *const () {
         self.inner.as_header_ptr() as *const ()
+    }
+
+    /// Read the lazy expando bag, if one was created.
+    #[must_use]
+    pub fn expando(&self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.inner, |body| body.expando)
+    }
+
+    /// Install (or replace) the lazy expando bag.
+    pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
+        let barrier = Value::Object(expando);
+        let _ = heap.with_payload(self.inner, |body| {
+            body.expando = Some(expando);
+        });
+        heap.record_write(self.inner, &barrier);
     }
 
     #[cfg(test)]
@@ -621,6 +649,22 @@ impl JsPromiseHandle {
     pub fn from_pure(p: PurePromise) -> Self {
         Self {
             inner: PromiseRepr::Pure(p),
+        }
+    }
+
+    /// Read the lazy expando bag — only populated by user
+    /// installations such as `promise.then = fn`.
+    #[must_use]
+    pub fn expando(&self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        match &self.inner {
+            PromiseRepr::Pure(p) => p.expando(heap),
+        }
+    }
+
+    /// Install / replace the lazy expando bag.
+    pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
+        match &self.inner {
+            PromiseRepr::Pure(p) => p.set_expando(heap, expando),
         }
     }
 

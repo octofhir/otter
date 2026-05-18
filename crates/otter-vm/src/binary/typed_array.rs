@@ -379,6 +379,11 @@ pub struct TypedArrayBody {
     /// fixed-length: even if the backing buffer is resizable the
     /// view's element count is captured here.
     length: usize,
+    /// Lazy expando bag for non-canonical-numeric own properties
+    /// — created on first non-element write (e.g.
+    /// `typedArr.constructor = X`, `typedArr.foo = 1`). Element
+    /// indices stay routed through the buffer storage.
+    expando: std::cell::Cell<Option<crate::object::JsObject>>,
 }
 
 impl JsTypedArray {
@@ -397,8 +402,20 @@ impl JsTypedArray {
                 kind,
                 byte_offset,
                 length,
+                expando: std::cell::Cell::new(None),
             }),
         }
+    }
+
+    /// Read the lazy expando bag, if one has been created.
+    #[must_use]
+    pub fn expando(&self) -> Option<crate::object::JsObject> {
+        self.inner.expando.get()
+    }
+
+    /// Install / replace the lazy expando bag.
+    pub fn set_expando(&self, expando: crate::object::JsObject) {
+        self.inner.expando.set(Some(expando));
     }
 
     /// Backing buffer.

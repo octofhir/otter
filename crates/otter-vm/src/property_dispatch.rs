@@ -368,7 +368,13 @@ impl Interpreter {
                             true
                         }
                     }
-                    None => true,
+                    None => {
+                        if let Some(bag) = t.expando() {
+                            crate::object::delete(bag, &mut self.gc_heap, &name)
+                        } else {
+                            true
+                        }
+                    }
                 }
             }
             (Value::TypedArray(t), Value::Number(n)) => {
@@ -381,7 +387,13 @@ impl Interpreter {
                     }
                 }
             }
-            (Value::TypedArray(_), Value::Symbol(_)) => true,
+            (Value::TypedArray(t), Value::Symbol(sym)) => {
+                if let Some(bag) = t.expando() {
+                    crate::object::delete_symbol(bag, &mut self.gc_heap, &sym)
+                } else {
+                    true
+                }
+            }
             _ => return Err(VmError::TypeMismatch),
         };
         write_register(frame, dst, Value::Boolean(removed))?;
@@ -643,21 +655,29 @@ impl Interpreter {
                 }
             }
             v @ Value::TypedArray(_) => {
-                let direct = if let Value::TypedArray(t) = v {
-                    binary::typed_array_prototype::load_property(t, name)
+                let t = if let Value::TypedArray(t) = v {
+                    t
                 } else {
-                    Value::Undefined
+                    unreachable!()
                 };
-                match direct {
-                    Value::Undefined => {
-                        let kind_name = if let Value::TypedArray(t) = v {
-                            t.kind().name()
-                        } else {
-                            unreachable!()
-                        };
-                        self.load_from_constructor_prototype(context, kind_name, v, name)?
+                // §10.4.5.4 [[Get]] — check the expando bag before
+                // the per-kind built-ins so user-installed
+                // properties (`typedArr.foo = 1`,
+                // `typedArr.constructor = X`) win over inherited
+                // defaults.
+                if let Some(bag) = t.expando()
+                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+                {
+                    value
+                } else {
+                    let direct = binary::typed_array_prototype::load_property(t, name);
+                    match direct {
+                        Value::Undefined => {
+                            let kind_name = t.kind().name();
+                            self.load_from_constructor_prototype(context, kind_name, v, name)?
+                        }
+                        value => value,
                     }
-                    value => value,
                 }
             }
             v @ Value::BigInt(_) => {
@@ -699,6 +719,24 @@ impl Interpreter {
             }
             Value::Array(a) => {
                 crate::array::set_named_property(*a, &mut self.gc_heap, name, value.clone())?;
+                None
+            }
+            Value::TypedArray(t) => {
+                if let Some(n) = canonical_numeric_index_string(name) {
+                    if !t.buffer().is_detached()
+                        && n.is_finite()
+                        && n.fract() == 0.0
+                        && n >= 0.0
+                        && (n as usize) < t.length()
+                    {
+                        let coerced =
+                            binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
+                        t.set(n as usize, &coerced);
+                    }
+                } else {
+                    let t_clone = t.clone();
+                    typed_array_set_expando(self, &t_clone, name, value.clone())?;
+                }
                 None
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
@@ -933,14 +971,30 @@ impl Interpreter {
                         Value::Undefined
                     }
                 } else {
-                    let direct = binary::typed_array_prototype::load_property(t, &name);
-                    match direct {
-                        Value::Undefined => {
-                            let kind_name = t.kind().name();
-                            self.load_from_constructor_prototype(context, kind_name, &recv, &name)?
-                        }
-                        value => value,
+                    // §10.4.5.4 step 3 — non-canonical-numeric keys
+                    // fall through to OrdinaryGet. Honour the lazy
+                    // expando bag first, then the prototype chain.
+                    let mut value = Value::Undefined;
+                    let mut found = false;
+                    if let Some(bag) = t.expando()
+                        && let Some(v) = crate::object::get(bag, &self.gc_heap, &name)
+                    {
+                        value = v;
+                        found = true;
                     }
+                    if !found {
+                        let direct = binary::typed_array_prototype::load_property(t, &name);
+                        value = match direct {
+                            Value::Undefined => {
+                                let kind_name = t.kind().name();
+                                self.load_from_constructor_prototype(
+                                    context, kind_name, &recv, &name,
+                                )?
+                            }
+                            v => v,
+                        };
+                    }
+                    value
                 }
             }
             // Computed string-key access on RegExp must observe the
@@ -1287,6 +1341,37 @@ impl Interpreter {
                 }
                 _ => return Err(VmError::TypeMismatch),
             },
+            // §10.4.5.6 IntegerIndexedExoticObject [[Set]]:
+            // canonical-numeric-index strings funnel into element
+            // storage (or no-op on out-of-range); non-canonical
+            // string / symbol keys store into the lazy expando bag.
+            (Value::TypedArray(t), Value::String(key)) => {
+                let name = key.to_lossy_string();
+                if let Some(n) = canonical_numeric_index_string(&name) {
+                    if t.buffer().is_detached()
+                        || !n.is_finite()
+                        || n.fract() != 0.0
+                        || n < 0.0
+                        || (n as usize) >= t.length()
+                    {
+                        // out-of-range / non-integer — silent no-op
+                    } else {
+                        let coerced =
+                            binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
+                        t.set(n as usize, &coerced);
+                    }
+                } else {
+                    typed_array_set_expando(self, t, &name, value.clone())?;
+                }
+            }
+            (Value::TypedArray(t), Value::Symbol(sym)) => {
+                let bag = typed_array_ensure_expando(self, t)?;
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot store symbol property on TypedArray".to_string(),
+                    });
+                }
+            }
             (Value::Undefined | Value::Null | Value::Hole, _) => {
                 return Err(VmError::TypeError {
                     message: format!("Cannot set property on {}", value_kind_name(&recv)),
@@ -2964,4 +3049,34 @@ pub(crate) fn canonical_numeric_index_string(s: &str) -> Option<f64> {
     } else {
         None
     }
+}
+
+/// Lazy-allocate (and cache) the TypedArray expando JsObject used
+/// to back non-canonical-numeric own properties such as
+/// `typedArr.constructor = X`.
+fn typed_array_ensure_expando(
+    interp: &mut Interpreter,
+    t: &crate::binary::typed_array::JsTypedArray,
+) -> Result<JsObject, VmError> {
+    if let Some(existing) = t.expando() {
+        return Ok(existing);
+    }
+    let ta_root = Value::TypedArray(t.clone());
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        ta_root.trace_value_slots(visitor);
+    };
+    let bag = crate::object::alloc_object_with_roots(&mut interp.gc_heap, &mut external_visit)?;
+    t.set_expando(bag);
+    Ok(bag)
+}
+
+fn typed_array_set_expando(
+    interp: &mut Interpreter,
+    t: &crate::binary::typed_array::JsTypedArray,
+    name: &str,
+    value: Value,
+) -> Result<(), VmError> {
+    let bag = typed_array_ensure_expando(interp, t)?;
+    crate::object::set(bag, &mut interp.gc_heap, name, value);
+    Ok(())
 }

@@ -78,7 +78,11 @@ impl Interpreter {
     /// # Errors
     /// - [`VmError::SyntaxError`] when no eval hook is installed or
     ///   parsing / compilation fail.
-    fn run_eval(&mut self, value: &Value, force_strict: bool) -> Result<Value, VmError> {
+    pub(crate) fn run_eval(
+        &mut self,
+        value: &Value,
+        force_strict: bool,
+    ) -> Result<Value, VmError> {
         let source = match value {
             Value::String(s) => s.to_lossy_string(),
             // Per §19.4.1.1 step 4, eval'd non-strings are returned

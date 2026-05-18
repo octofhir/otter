@@ -1488,6 +1488,24 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             })
         }
 
+        // §19.4.1 global `eval` — when invoked indirectly (e.g.
+        // `(0, eval)(src)` / `var f = eval; f(src)`), the spec runs
+        // §19.4.1.1 PerformEval with `direct = false`, which drops
+        // the caller's lexical scope and never inherits strictness.
+        // The runtime `Op::Eval` opcode already implements this for
+        // the direct-call shape; the global binding reuses the same
+        // entry point so reflective access works.
+        // <https://tc39.es/ecma262/#sec-eval-x>
+        fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            ctx.interp_mut()
+                .run_eval(&arg, false)
+                .map_err(|err| NativeError::TypeError {
+                    name: "eval",
+                    reason: err.to_string(),
+                })
+        }
+
         let global_methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
             ("parseInt", 2, number_parse_int_native),
             ("parseFloat", 1, number_parse_float_native),
@@ -1499,6 +1517,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             ("decodeURIComponent", 1, global_decode_uri_component),
             ("escape", 1, global_escape),
             ("unescape", 1, global_unescape),
+            ("eval", 1, global_eval),
         ];
         let mut global_builder = ObjectBuilder::from_object_with_value_roots(
             heap,

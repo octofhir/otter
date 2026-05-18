@@ -1576,7 +1576,11 @@ fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         Value::Intl(_) => "Intl",
         Value::ArrayBuffer(_) => "ArrayBuffer",
         Value::DataView(_) => "DataView",
-        Value::TypedArray(_) => "TypedArray",
+        // §22.2.6.15: `%TypedArray%.prototype[@@toStringTag]`
+        // is an accessor that yields the receiver's
+        // [[TypedArrayName]] — the kind-specific name string —
+        // not the generic `"TypedArray"` family tag.
+        Value::TypedArray(t) => t.kind().name(),
         Value::Object(obj) if crate::object::call_native(*obj, ctx.heap()).is_some() => "Function",
         Value::Object(_) | Value::Proxy(_) => "Object",
     }

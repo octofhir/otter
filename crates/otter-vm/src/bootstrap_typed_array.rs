@@ -243,19 +243,29 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     use crate::symbol::WellKnown;
 
     let tag_sym = well_known.get(WellKnown::ToStringTag);
-    for (ctor_name, _kind, _call) in TYPED_ARRAY_CTORS {
-        let Some(prototype) = ctor_prototype(global, heap, string_heap, ctor_name) else {
-            continue;
-        };
-        let tag = crate::string::JsString::from_str(ctor_name, string_heap)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+
+    // §22.2.6 — `%TypedArray%.prototype[@@toStringTag]` is an
+    // accessor on the abstract prototype. The getter returns the
+    // receiver's [[TypedArrayName]] (the kind name string) or
+    // `undefined` for non-TypedArray receivers. Per-kind
+    // prototypes inherit the accessor; per-instance access walks
+    // up to %TypedArray%.prototype and triggers the getter.
+    if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
+        let abstract_proto_root = Value::Object(abstract_proto);
+        let getter = crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "[Symbol.toStringTag]",
+            0,
+            tostring_tag_getter,
+            &[&abstract_proto_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
         object::define_own_symbol_property_partial(
-            prototype,
+            abstract_proto,
             heap,
             &tag_sym,
             PartialPropertyDescriptor {
-                value: Some(Value::String(tag)),
-                writable: Some(false),
+                get: Some(Value::NativeFunction(getter)),
                 enumerable: Some(false),
                 configurable: Some(true),
                 ..Default::default()
@@ -282,6 +292,31 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         );
     }
     Ok(())
+}
+
+/// §22.2.6.15 `get %TypedArray%.prototype [ @@toStringTag ]` — return
+/// the receiver's element-kind name (`"Int8Array"`, …), or undefined
+/// if the receiver is not a TypedArray.
+///
+/// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype-%symbol.tostringtag%>
+fn tostring_tag_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let kind_name = match this_value {
+        Value::TypedArray(t) => t.kind().name(),
+        _ => return Ok(Value::Undefined),
+    };
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    Ok(Value::String(
+        crate::string::JsString::from_str(kind_name, &string_heap).map_err(|_| {
+            NativeError::TypeError {
+                name: "TypedArray.prototype[@@toStringTag]",
+                reason: "out of memory".to_string(),
+            }
+        })?,
+    ))
 }
 
 // ---------------------------------------------------------------

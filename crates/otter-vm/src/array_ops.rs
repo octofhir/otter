@@ -145,6 +145,7 @@ impl Interpreter {
                 | Value::Set(_)
                 | Value::Map(_)
                 | Value::Generator(_)
+                | Value::Iterator(_)
         );
         let iterator_method = if matches!(items, Value::Undefined | Value::Null) {
             Value::Undefined

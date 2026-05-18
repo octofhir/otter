@@ -937,6 +937,22 @@ impl Interpreter {
                     out.push(value);
                 }
             }
+            // §27.5 IteratorRecord drain — `Value::Iterator` wraps a
+            // foundation `IteratorState`. Drive it through
+            // `iterator_next_full` so lazy combinators (Map / Filter
+            // / Take / Drop / FlatMap) and user iterators all share
+            // the same termination contract.
+            Value::Iterator(handle) => {
+                let handle = *handle;
+                let mut out: Vec<Value> = Vec::new();
+                loop {
+                    let (v, done) = self.iterator_next_full(context, &handle)?;
+                    if done {
+                        return Ok(out);
+                    }
+                    out.push(v);
+                }
+            }
             _ => {}
         }
 

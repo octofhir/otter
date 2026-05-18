@@ -1457,10 +1457,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
 
         // §B.2.1.1 / §B.2.1.2 — AnnexB legacy `escape` / `unescape`
         // globals. Same dispatcher path as the URI quartet above.
-        fn global_escape(
-            ctx: &mut NativeCtx<'_>,
-            args: &[Value],
-        ) -> Result<Value, NativeError> {
+        fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
             let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::Escape,
@@ -1472,10 +1469,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 reason: err.to_string(),
             })
         }
-        fn global_unescape(
-            ctx: &mut NativeCtx<'_>,
-            args: &[Value],
-        ) -> Result<Value, NativeError> {
+        fn global_unescape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
             let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::Unescape,
@@ -1721,12 +1715,13 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     Value::Boolean(b) => {
                         let b = *b;
                         let interp = ctx.interp_mut();
-                        let proto = interp
-                            .primitive_wrapper_prototype("Boolean")
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
+                        let proto =
+                            interp
+                                .primitive_wrapper_prototype("Boolean")
+                                .map_err(|err| NativeError::TypeError {
+                                    name: "Object",
+                                    reason: err.to_string(),
+                                })?;
                         let obj = interp
                             .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
                             .map_err(|err| NativeError::TypeError {
@@ -1739,12 +1734,13 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     Value::Number(n) => {
                         let n = *n;
                         let interp = ctx.interp_mut();
-                        let proto = interp
-                            .primitive_wrapper_prototype("Number")
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
+                        let proto =
+                            interp
+                                .primitive_wrapper_prototype("Number")
+                                .map_err(|err| NativeError::TypeError {
+                                    name: "Object",
+                                    reason: err.to_string(),
+                                })?;
                         let obj = interp
                             .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
                             .map_err(|err| NativeError::TypeError {
@@ -1757,12 +1753,13 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     Value::String(s) => {
                         let s = s.clone();
                         let interp = ctx.interp_mut();
-                        let proto = interp
-                            .primitive_wrapper_prototype("String")
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
+                        let proto =
+                            interp
+                                .primitive_wrapper_prototype("String")
+                                .map_err(|err| NativeError::TypeError {
+                                    name: "Object",
+                                    reason: err.to_string(),
+                                })?;
                         let obj = interp
                             .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
                             .map_err(|err| NativeError::TypeError {
@@ -2120,20 +2117,10 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
             return Ok(());
         };
         let ctor_root = Value::Object(iterator_ctor);
-        let from_fn = native_static_with_value_roots(
-            heap,
-            "from",
-            1,
-            iterator_from_native,
-            &[&ctor_root],
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        object::set(
-            iterator_ctor,
-            heap,
-            "from",
-            Value::NativeFunction(from_fn),
-        );
+        let from_fn =
+            native_static_with_value_roots(heap, "from", 1, iterator_from_native, &[&ctor_root])
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        object::set(iterator_ctor, heap, "from", Value::NativeFunction(from_fn));
         let prototype = match object::get(iterator_ctor, heap, "prototype") {
             Some(Value::Object(p)) => p,
             _ => return Ok(()),
@@ -2145,17 +2132,16 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         // call-method fast path and reflective property access
         // share behaviour.
         let proto_root = Value::Object(prototype);
-        let install_proto =
-            |heap: &mut otter_gc::GcHeap,
-             name: &'static str,
-             length: u8,
-             call: crate::native_function::NativeFastFn|
-             -> Result<(), JsSurfaceError> {
-                let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
-                    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-                object::set(prototype, heap, name, Value::NativeFunction(f));
-                Ok(())
-            };
+        let install_proto = |heap: &mut otter_gc::GcHeap,
+                             name: &'static str,
+                             length: u8,
+                             call: crate::native_function::NativeFastFn|
+         -> Result<(), JsSurfaceError> {
+            let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+            object::set(prototype, heap, name, Value::NativeFunction(f));
+            Ok(())
+        };
         install_proto(heap, "map", 1, iterator_proto_map)?;
         install_proto(heap, "filter", 1, iterator_proto_filter)?;
         install_proto(heap, "take", 1, iterator_proto_take)?;
@@ -2196,11 +2182,7 @@ fn iterator_receiver(
         // user iterator object). Look up `@@iterator` and call it
         // to obtain the inner iterator, then wrap in
         // `IteratorState::User`.
-        Value::Object(_)
-        | Value::Map(_)
-        | Value::Set(_)
-        | Value::Array(_)
-        | Value::String(_) => {
+        Value::Object(_) | Value::Map(_) | Value::Set(_) | Value::Array(_) | Value::String(_) => {
             let iterator_sym = ctx
                 .cx
                 .interp
@@ -2251,22 +2233,20 @@ fn iterator_receiver(
                 Value::Generator(g) => {
                     let gen_value = Value::Generator(g);
                     let state = crate::IteratorState::Generator { handle: g };
-                    ctx.alloc_iterator_state(state, &[&gen_value], &[]).map_err(|_| {
-                        crate::NativeError::TypeError {
+                    ctx.alloc_iterator_state(state, &[&gen_value], &[])
+                        .map_err(|_| crate::NativeError::TypeError {
                             name,
                             reason: "iterator allocation failed".to_string(),
-                        }
-                    })
+                        })
                 }
                 other => {
                     let other_root = other.clone();
                     let state = crate::IteratorState::User { iterator: other };
-                    ctx.alloc_iterator_state(state, &[&other_root], &[]).map_err(|_| {
-                        crate::NativeError::TypeError {
+                    ctx.alloc_iterator_state(state, &[&other_root], &[])
+                        .map_err(|_| crate::NativeError::TypeError {
                             name,
                             reason: "iterator allocation failed".to_string(),
-                        }
-                    })
+                        })
                 }
             }
         }
@@ -2361,10 +2341,7 @@ fn iterator_proto_drop(
     let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
     let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.drop")?;
     let source_value = Value::Iterator(source);
-    let state = crate::IteratorState::Drop {
-        source,
-        to_drop: n,
-    };
+    let state = crate::IteratorState::Drop { source, to_drop: n };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value], &[])
         .map_err(|_| crate::NativeError::TypeError {
@@ -2444,12 +2421,13 @@ fn iterator_proto_to_array(
     _args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver(ctx, "Iterator.prototype.toArray")?;
-    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
-        crate::NativeError::TypeError {
-            name: "Iterator.prototype.toArray",
-            reason: "missing execution context".to_string(),
-        }
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.toArray",
+                reason: "missing execution context".to_string(),
+            })?;
     let mut collected: Vec<Value> = Vec::new();
     loop {
         let (v, done) = ctx
@@ -2485,12 +2463,13 @@ fn iterator_proto_for_each(
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver(ctx, "Iterator.prototype.forEach")?;
     let callback = require_callable_arg(ctx, args, "Iterator.prototype.forEach", 0)?;
-    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
-        crate::NativeError::TypeError {
-            name: "Iterator.prototype.forEach",
-            reason: "missing execution context".to_string(),
-        }
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.forEach",
+                reason: "missing execution context".to_string(),
+            })?;
     let mut idx: f64 = 0.0;
     loop {
         let (v, done) = ctx
@@ -2525,12 +2504,13 @@ fn iterator_proto_reduce(
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver(ctx, "Iterator.prototype.reduce")?;
     let reducer = require_callable_arg(ctx, args, "Iterator.prototype.reduce", 0)?;
-    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
-        crate::NativeError::TypeError {
-            name: "Iterator.prototype.reduce",
-            reason: "missing execution context".to_string(),
-        }
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.reduce",
+                reason: "missing execution context".to_string(),
+            })?;
     let has_initial = args.len() >= 2;
     let mut acc = if has_initial {
         args[1].clone()
@@ -2600,12 +2580,13 @@ fn iterator_proto_find(
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver(ctx, "Iterator.prototype.find")?;
     let predicate = require_callable_arg(ctx, args, "Iterator.prototype.find", 0)?;
-    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
-        crate::NativeError::TypeError {
-            name: "Iterator.prototype.find",
-            reason: "missing execution context".to_string(),
-        }
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.find",
+                reason: "missing execution context".to_string(),
+            })?;
     let mut idx: f64 = 0.0;
     loop {
         let (v, done) = ctx
@@ -2647,12 +2628,13 @@ fn iterator_predicate_drain(
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver(ctx, name)?;
     let predicate = require_callable_arg(ctx, args, name, 0)?;
-    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
-        crate::NativeError::TypeError {
-            name,
-            reason: "missing execution context".to_string(),
-        }
-    })?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
     let mut idx: f64 = 0.0;
     loop {
         let (v, done) = ctx
@@ -2934,7 +2916,7 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 943;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 957;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 400 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

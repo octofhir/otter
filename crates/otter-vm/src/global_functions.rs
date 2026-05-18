@@ -142,8 +142,7 @@ fn legacy_escape(units: &[u16]) -> String {
     fn is_unescaped(c: u16) -> bool {
         if c < 128 {
             let b = c as u8;
-            b.is_ascii_alphanumeric()
-                || matches!(b, b'@' | b'*' | b'_' | b'+' | b'-' | b'.' | b'/')
+            b.is_ascii_alphanumeric() || matches!(b, b'@' | b'*' | b'_' | b'+' | b'-' | b'.' | b'/')
         } else {
             false
         }

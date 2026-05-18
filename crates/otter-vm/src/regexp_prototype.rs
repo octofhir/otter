@@ -1128,13 +1128,13 @@ pub fn native_regexp_symbol_replace(
             if let Some(nc) = &named_captures_obj {
                 replacer_args.push(nc.clone());
             }
-            let exec_ctx = ctx
-                .execution_context()
-                .cloned()
-                .ok_or_else(|| crate::NativeError::TypeError {
-                    name,
-                    reason: "missing execution context".to_string(),
-                })?;
+            let exec_ctx =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| crate::NativeError::TypeError {
+                        name,
+                        reason: "missing execution context".to_string(),
+                    })?;
             let raw = {
                 let (interp, _) = ctx.interp_mut_and_context();
                 interp
@@ -1380,7 +1380,10 @@ pub fn native_regexp_symbol_match_all(
             name,
             reason: "array allocation failed".to_string(),
         })?;
-    let iter_state = crate::IteratorState::Array { array: arr, index: 0 };
+    let iter_state = crate::IteratorState::Array {
+        array: arr,
+        index: 0,
+    };
     let arr_value = Value::Array(arr);
     let handle = ctx
         .alloc_iterator_state(iter_state, &[&arr_value], &[])
@@ -1485,7 +1488,11 @@ pub fn native_regexp_symbol_split(
                 reason: "missing execution context".to_string(),
             })?;
             interp
-                .evaluate_to_primitive(&exec, &limit_arg, crate::abstract_ops::ToPrimitiveHint::Number)
+                .evaluate_to_primitive(
+                    &exec,
+                    &limit_arg,
+                    crate::abstract_ops::ToPrimitiveHint::Number,
+                )
                 .map_err(vm_err_to_native(name))?
         };
         let n = crate::number::to_number_value(&primitive);
@@ -1564,9 +1571,9 @@ pub fn native_regexp_symbol_split(
         }
         let part = JsString::from_utf16_units(&s_units[p..q], &ctx.cx.interp.string_heap_clone())
             .map_err(|_| crate::NativeError::TypeError {
-                name,
-                reason: "out of memory".to_string(),
-            })?;
+            name,
+            reason: "out of memory".to_string(),
+        })?;
         out_elements.push(Value::String(part));
         if out_elements.len() as u32 == lim {
             let arr = ctx

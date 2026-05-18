@@ -222,11 +222,9 @@ fn native_group_by_rooted(
             message: "Object.groupBy: callback must be a function".to_string(),
         });
     }
-    let exec_ctx = context
-        .cloned()
-        .ok_or_else(|| VmError::TypeError {
-            message: "Object.groupBy: missing execution context".to_string(),
-        })?;
+    let exec_ctx = context.cloned().ok_or_else(|| VmError::TypeError {
+        message: "Object.groupBy: missing execution context".to_string(),
+    })?;
     let result = ctx.alloc_object_with_roots(&[&items, &callback], &[args])?;
     crate::object::set_prototype(result, ctx.heap_mut(), None);
 
@@ -263,11 +261,13 @@ fn native_group_by_rooted(
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(item.clone());
-        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx as f64)));
-        let key = ctx
-            .cx
-            .interp
-            .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)?;
+        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
+            idx as f64,
+        )));
+        let key =
+            ctx.cx
+                .interp
+                .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)?;
         let key_pk = ctx.cx.interp.to_property_key_sync(&exec_ctx, key)?;
         let key_str = match key_pk {
             crate::VmPropertyKey::Symbol(_) => {
@@ -283,8 +283,11 @@ fn native_group_by_rooted(
         let group = match existing {
             Some(Value::Array(arr)) => arr,
             _ => {
-                let arr = ctx
-                    .array_from_elements_with_roots(std::iter::empty(), &[&Value::Object(result), item], &[args])?;
+                let arr = ctx.array_from_elements_with_roots(
+                    std::iter::empty(),
+                    &[&Value::Object(result), item],
+                    &[args],
+                )?;
                 crate::object::set(result, ctx.heap_mut(), &key_str, Value::Array(arr));
                 arr
             }

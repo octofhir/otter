@@ -1219,6 +1219,20 @@ impl Interpreter {
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
         Self::bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
+        // §27.5.1 GeneratorFunction call evaluation returns a
+        // generator object without executing the body. `invoke`
+        // handles this for opcode calls; the synchronous re-entry
+        // helper must mirror it for builtins that call user
+        // functions, such as `GetSetRecord(...).[[Keys]]`.
+        // <https://tc39.es/ecma262/#sec-generatorfunction-objects>
+        if function.is_generator {
+            new_frame.return_register = None;
+            let async_gen = function.is_async_generator;
+            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, new_frame)?;
+            gen_handle.set_async(&mut self.gc_heap, async_gen);
+            gen_handle.install_owner_on_frame(&mut self.gc_heap);
+            return Ok(Value::Generator(gen_handle));
+        }
         inner.push(new_frame);
         self.dispatch_loop(context, &mut inner)
     }

@@ -588,10 +588,7 @@ fn validate_module_item_positions(program: &Program<'_>) -> Result<(), CompileEr
                 self.found = Some((it.span.start, it.span.end, "export"));
             }
         }
-        fn visit_export_all_declaration(
-            &mut self,
-            it: &oxc_ast::ast::ExportAllDeclaration<'a>,
-        ) {
+        fn visit_export_all_declaration(&mut self, it: &oxc_ast::ast::ExportAllDeclaration<'a>) {
             if self.found.is_none() {
                 self.found = Some((it.span.start, it.span.end, "export"));
             }

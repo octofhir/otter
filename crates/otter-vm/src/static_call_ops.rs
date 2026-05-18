@@ -256,8 +256,7 @@ impl Interpreter {
                     Value::String(s) => s,
                     Value::Symbol(_) => {
                         return Err(VmError::TypeError {
-                            message: "JSON.parse: cannot convert a Symbol to a string"
-                                .to_string(),
+                            message: "JSON.parse: cannot convert a Symbol to a string".to_string(),
                         });
                     }
                     other => crate::string::JsString::from_str(
@@ -1614,7 +1613,8 @@ impl Interpreter {
                 message: "Object.groupBy: callback must be a function".to_string(),
             });
         }
-        let result = self.alloc_stack_rooted_object_with_extra_roots(stack, &[&items, &callback])?;
+        let result =
+            self.alloc_stack_rooted_object_with_extra_roots(stack, &[&items, &callback])?;
         object::set_prototype(result, &mut self.gc_heap, None);
 
         let items_snapshot: Vec<Value> = match &items {
@@ -1622,8 +1622,8 @@ impl Interpreter {
                 crate::array::with_elements(*arr, &self.gc_heap, |elements| elements.to_vec())
             }
             Value::Object(obj) => {
-                let length = crate::object::get(*obj, &self.gc_heap, "length")
-                    .unwrap_or(Value::Undefined);
+                let length =
+                    crate::object::get(*obj, &self.gc_heap, "length").unwrap_or(Value::Undefined);
                 let length_n = crate::number::to_number_value(&length);
                 let length_usize = if length_n.is_nan() || length_n <= 0.0 {
                     0
@@ -1659,9 +1659,10 @@ impl Interpreter {
         for (idx, item) in items_snapshot.iter().enumerate() {
             let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
             cb_args.push(item.clone());
-            cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx as f64)));
-            let key =
-                self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
+            cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
+                idx as f64,
+            )));
+            let key = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
             let key_pk = self.to_property_key_sync(context, key)?;
             let key_str = match key_pk {
                 crate::VmPropertyKey::Symbol(sym) => {

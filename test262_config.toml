@@ -82,13 +82,7 @@ skip_features = [
 # Test flags to skip. Strictness is controlled by each test's
 # frontmatter (`onlyStrict`, `noStrict`, `module`, `raw`) rather than
 # by a global runner prelude.
-#
-# `noStrict` filters out tests that opt out of strict mode (legacy
-# sloppy / Annex B web-compat coverage). The conformance grind
-# focuses on strict + default-both variants so this keeps the
-# reported numbers honest and stops pathological sloppy-only fails
-# from dominating per-category buckets.
-skip_flags = ["noStrict"]
+skip_flags = []
 
 # Test path patterns to ignore (tests matching these patterns will be skipped)
 ignored_tests = [

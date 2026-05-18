@@ -121,8 +121,7 @@ pub(crate) fn compile_object_literal(
     let needs_home = object_literal_uses_super_in_methods(obj);
     if needs_home {
         cx.enter_scope();
-        let storage =
-            cx.declare_captured_binding(crate::class::SUPER_HOME_NAME, true, span)?;
+        let storage = cx.declare_captured_binding(crate::class::SUPER_HOME_NAME, true, span)?;
         cx.emit_store_storage(dst, storage, span);
         cx.mark_initialized(crate::class::SUPER_HOME_NAME);
     }

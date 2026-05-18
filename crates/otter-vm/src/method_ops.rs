@@ -25,12 +25,12 @@ use smallvec::SmallVec;
 
 use crate::{
     BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IntrinsicArgs,
-    JsArray, JsString, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, array_prototype,
-    bigint, binary,
+    JsArray, JsString, NativeCallInfo, NativeCtx, NumberValue, Value, VmError, VmGetOutcome,
+    VmPropertyKey, array_prototype, bigint, binary,
     boolean::prototype as boolean_prototype,
-    bound_function_object_prototype_intercept, build_array_cb_args, collections_prototype, date,
-    descriptor_value, function_metadata, intl, intrinsic_to_vm_error, is_callable,
-    native_function_object_prototype_intercept, native_to_vm_error, number,
+    bootstrap_collections, bound_function_object_prototype_intercept, build_array_cb_args,
+    collections_prototype, date, descriptor_value, function_metadata, intl, intrinsic_to_vm_error,
+    is_callable, native_function_object_prototype_intercept, native_to_vm_error, number,
     object_prototype_intercept,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
@@ -98,6 +98,27 @@ impl Interpreter {
         // table so it can drive `self.invoke`.
         if name == "forEach" && matches!(&recv_value, Value::Map(_) | Value::Set(_)) {
             return self.do_collection_for_each(stack, context, &recv_value, &arg_values, dst);
+        }
+
+        // §24.2.4 Set methods use `GetSetRecord(other)`, so they
+        // may call user-visible `other.has` / `other.keys`. Route
+        // through the native context path instead of the synchronous
+        // intrinsic table, which has no interpreter re-entry handle.
+        // <https://tc39.es/ecma262/#sec-getsetrecord>
+        if matches!(&recv_value, Value::Set(_)) && bootstrap_collections::is_set_method_name(name) {
+            let result = {
+                let mut ctx = NativeCtx::new_with_call_info_and_context(
+                    self,
+                    NativeCallInfo::call(recv_value.clone()),
+                    Some(context.clone()),
+                );
+                bootstrap_collections::set_method_call(&mut ctx, name, &arg_values)
+                    .map_err(native_to_vm_error)?
+            };
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
         }
 
         // Iterator-helpers proposal — when receiver is an iterator
@@ -215,13 +236,13 @@ impl Interpreter {
         // as the receiver so the foundation's
         // `iterator_receiver` wraps it on entry.
         if matches!(&recv_value, Value::Generator(_)) {
-            let iterator_proto = match crate::object::get(self.global_this, &self.gc_heap, "Iterator")
-            {
-                Some(Value::Object(ctor)) => {
-                    crate::object::get(ctor, &self.gc_heap, "prototype")
-                }
-                _ => None,
-            };
+            let iterator_proto =
+                match crate::object::get(self.global_this, &self.gc_heap, "Iterator") {
+                    Some(Value::Object(ctor)) => {
+                        crate::object::get(ctor, &self.gc_heap, "prototype")
+                    }
+                    _ => None,
+                };
             if let Some(Value::Object(proto)) = iterator_proto
                 && let Some(method) = crate::object::get(proto, &self.gc_heap, &name)
                 && self.is_callable_runtime(&method)
@@ -808,13 +829,7 @@ impl Interpreter {
                 // than yielding `undefined`.
                 let statics = Value::Object(c.statics(&self.gc_heap));
                 let key = VmPropertyKey::String(&name);
-                match self.ordinary_get_value(
-                    context,
-                    statics.clone(),
-                    statics.clone(),
-                    &key,
-                    0,
-                )? {
+                match self.ordinary_get_value(context, statics.clone(), statics.clone(), &key, 0)? {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();

@@ -1379,13 +1379,17 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     // each `next()` step yields one match in iteration order.
     let arr = args.array_from_elements_rooted(out.iter().cloned(), &[], &[out.as_slice()])?;
     let arr_value = Value::Array(arr);
-    let state = crate::IteratorState::Array { array: arr, index: 0 };
-    let handle = args.gc_heap.alloc_old(state).map_err(|_| {
-        IntrinsicError::OutOfRange {
+    let state = crate::IteratorState::Array {
+        array: arr,
+        index: 0,
+    };
+    let handle = args
+        .gc_heap
+        .alloc_old(state)
+        .map_err(|_| IntrinsicError::OutOfRange {
             index: 0,
             reason: "iterator allocation failed",
-        }
-    })?;
+        })?;
     let _ = arr_value;
     Ok(Value::Iterator(handle))
 }

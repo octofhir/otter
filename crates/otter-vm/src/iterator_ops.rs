@@ -395,7 +395,10 @@ impl Interpreter {
                         continue;
                     }
                     Value::Generator(g) => IteratorState::Generator { handle: g },
-                    Value::String(s) => IteratorState::String { string: s, index: 0 },
+                    Value::String(s) => IteratorState::String {
+                        string: s,
+                        index: 0,
+                    },
                     Value::Set(_) | Value::Map(_) | Value::Object(_) => {
                         // §7.4.2 GetIteratorFlattenable — look up
                         // `@@iterator`. If present, call it to obtain
@@ -416,12 +419,13 @@ impl Interpreter {
                         )?;
                         let iter_method = match outcome {
                             crate::VmGetOutcome::Value(v) => v,
-                            crate::VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                                context,
-                                &getter,
-                                mapped.clone(),
-                                SmallVec::new(),
-                            )?,
+                            crate::VmGetOutcome::InvokeGetter { getter } => self
+                                .run_callable_sync(
+                                    context,
+                                    &getter,
+                                    mapped.clone(),
+                                    SmallVec::new(),
+                                )?,
                         };
                         let iter_value = if matches!(iter_method, Value::Undefined | Value::Null) {
                             // Iterator-without-`@@iterator` shape —
@@ -438,8 +442,9 @@ impl Interpreter {
                             )?
                         } else {
                             return Err(VmError::TypeError {
-                                message: "Iterator.prototype.flatMap mapper return must be iterable"
-                                    .to_string(),
+                                message:
+                                    "Iterator.prototype.flatMap mapper return must be iterable"
+                                        .to_string(),
                             });
                         };
                         if let Value::Iterator(rc) = iter_value {

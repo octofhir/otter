@@ -42,34 +42,36 @@ pub(crate) fn compile_synthetic_constructor(
     });
 
     if is_derived {
-        // Default derived ctor is `constructor(...args) { super(...args); }`.
-        // We have no user-visible `args` parameter (the body uses
-        // the receiver's already-allocated `this`), so simulate by
-        // pulling the captured `__class_super` directly and
-        // forwarding zero args. A faithful spec-default would
-        // forward `arguments`, but the foundation has no
-        // `arguments` object yet — `super()` with no args is
-        // sufficient for the common chained-base-init case.
+        // Default derived ctor is `constructor(...args) {
+        // super(...args); }`: materialise the incoming argument
+        // list and construct the captured superclass.
+        //
+        // # See also
+        // - <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
         let super_ctor = load_synthetic_capture(parent, SUPER_CTOR_NAME, span)?;
-        let this_reg = parent.alloc_scratch();
-        parent.emit(Op::LoadThis, [Operand::Register(this_reg)], span);
+        let args_reg = parent.alloc_scratch();
+        parent.emit(Op::CollectRest, [Operand::Register(args_reg)], span);
         let dst = parent.alloc_scratch();
         parent.emit(
-            Op::CallWithThis,
+            Op::NewSpread,
             vec![
                 Operand::Register(dst),
                 Operand::Register(super_ctor),
-                Operand::Register(this_reg),
-                Operand::ConstIndex(0),
+                Operand::Register(args_reg),
             ],
             span,
         );
+        if instance_fields.is_empty() {
+            parent.emit(Op::Return, [Operand::Register(dst)], span);
+        }
     }
     // §15.7.10 InitializeInstanceElements — run instance-field
     // initialisers with `this` bound to the new instance, after the
     // super() call has run.
     emit_instance_field_inits(parent, instance_fields)?;
-    parent.emit(Op::ReturnUndefined, vec![], span);
+    if !is_derived || !instance_fields.is_empty() {
+        parent.emit(Op::ReturnUndefined, vec![], span);
+    }
 
     parent.exit_scope();
     let child = parent.pop();
@@ -82,6 +84,7 @@ pub(crate) fn compile_synthetic_constructor(
     slot.locals = 0;
     slot.scratch = child.scratch;
     slot.param_count = 0;
+    slot.has_rest = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
     slot.spans = child.spans;

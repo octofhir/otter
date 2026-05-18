@@ -382,6 +382,48 @@ fn install_prototype_methods(
                 NativeCall::Static(set_proto_for_each),
                 Attr::builtin_function(),
             )?;
+            builder.method(
+                "union",
+                1,
+                NativeCall::Static(set_proto_union),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "intersection",
+                1,
+                NativeCall::Static(set_proto_intersection),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "difference",
+                1,
+                NativeCall::Static(set_proto_difference),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "symmetricDifference",
+                1,
+                NativeCall::Static(set_proto_symmetric_difference),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "isSubsetOf",
+                1,
+                NativeCall::Static(set_proto_is_subset_of),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "isSupersetOf",
+                1,
+                NativeCall::Static(set_proto_is_superset_of),
+                Attr::builtin_function(),
+            )?;
+            builder.method(
+                "isDisjointFrom",
+                1,
+                NativeCall::Static(set_proto_is_disjoint_from),
+                Attr::builtin_function(),
+            )?;
         }
         CollectionKind::WeakMap => {
             builder.method(
@@ -942,6 +984,288 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     Ok(Value::Undefined)
 }
 
+/// Whether `name` belongs to the ES set-methods surface that needs
+/// `GetSetRecord` and may call user-provided `has` / `keys`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-getsetrecord>
+/// - <https://tc39.es/ecma262/#sec-set.prototype.union>
+#[must_use]
+pub(crate) fn is_set_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "union"
+            | "intersection"
+            | "difference"
+            | "symmetricDifference"
+            | "isSubsetOf"
+            | "isSupersetOf"
+            | "isDisjointFrom"
+    )
+}
+
+/// Native dispatch entry used by `Op::CallMethodValue` for direct
+/// `set.method(...)` calls. The intrinsic table cannot re-enter JS,
+/// while these algorithms must execute `GetSetRecord`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-getsetrecord>
+/// - <https://tc39.es/ecma262/#sec-properties-of-the-set-prototype-object>
+pub(crate) fn set_method_call(
+    ctx: &mut NativeCtx<'_>,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    match name {
+        "union" => set_proto_union(ctx, args),
+        "intersection" => set_proto_intersection(ctx, args),
+        "difference" => set_proto_difference(ctx, args),
+        "symmetricDifference" => set_proto_symmetric_difference(ctx, args),
+        "isSubsetOf" => set_proto_is_subset_of(ctx, args),
+        "isSupersetOf" => set_proto_is_superset_of(ctx, args),
+        "isDisjointFrom" => set_proto_is_disjoint_from(ctx, args),
+        _ => Err(NativeError::TypeError {
+            name: "Set.prototype",
+            reason: format!("unknown Set method {name}"),
+        }),
+    }
+}
+
+/// §24.2.4.7 `Set.prototype.union`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set.prototype.union>
+fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let this = receiver_set(ctx, "Set.prototype.union")?;
+    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other_rec = get_set_record(ctx, other, "Set.prototype.union")?;
+    let mut result = ctx.alloc_set().map_err(|_| oom("Set.prototype.union"))?;
+    for value in collections::set_values(this, ctx.heap()) {
+        ctx.set_add(&mut result, value)
+            .map_err(|_| oom("Set.prototype.union"))?;
+    }
+    let context = execution_context(ctx, "Set.prototype.union")?;
+    let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.union")?;
+    while let Some(value) = set_record_next_key(ctx, &context, &mut keys, "Set.prototype.union")? {
+        ctx.set_add(&mut result, normalize_set_key(value))
+            .map_err(|_| oom("Set.prototype.union"))?;
+    }
+    Ok(Value::Set(result))
+}
+
+/// §24.2.4.5 `Set.prototype.intersection`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set.prototype.intersection>
+fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let this = receiver_set(ctx, "Set.prototype.intersection")?;
+    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other_rec = get_set_record(ctx, other, "Set.prototype.intersection")?;
+    let mut result = ctx
+        .alloc_set()
+        .map_err(|_| oom("Set.prototype.intersection"))?;
+    let context = execution_context(ctx, "Set.prototype.intersection")?;
+    let this_size = collections::set_len(this, ctx.heap()) as f64;
+    if this_size <= other_rec.size() {
+        for value in collections::set_values(this, ctx.heap()) {
+            if set_record_has(
+                ctx,
+                &context,
+                &other_rec,
+                &value,
+                "Set.prototype.intersection",
+            )? {
+                ctx.set_add(&mut result, value)
+                    .map_err(|_| oom("Set.prototype.intersection"))?;
+            }
+        }
+    } else {
+        let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.intersection")?;
+        while let Some(value) =
+            set_record_next_key(ctx, &context, &mut keys, "Set.prototype.intersection")?
+        {
+            let value = normalize_set_key(value);
+            if collections::set_has(this, ctx.heap(), &value) {
+                ctx.set_add(&mut result, value)
+                    .map_err(|_| oom("Set.prototype.intersection"))?;
+            }
+        }
+    }
+    Ok(Value::Set(result))
+}
+
+/// §24.2.4.4 `Set.prototype.difference`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set.prototype.difference>
+fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let this = receiver_set(ctx, "Set.prototype.difference")?;
+    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other_rec = get_set_record(ctx, other, "Set.prototype.difference")?;
+    let mut result = ctx
+        .alloc_set()
+        .map_err(|_| oom("Set.prototype.difference"))?;
+    let this_values = collections::set_values(this, ctx.heap());
+    for value in &this_values {
+        ctx.set_add(&mut result, value.clone())
+            .map_err(|_| oom("Set.prototype.difference"))?;
+    }
+    let context = execution_context(ctx, "Set.prototype.difference")?;
+    if (this_values.len() as f64) <= other_rec.size() {
+        for value in this_values {
+            if set_record_has(
+                ctx,
+                &context,
+                &other_rec,
+                &value,
+                "Set.prototype.difference",
+            )? {
+                collections::set_delete(result, ctx.heap_mut(), &value);
+            }
+        }
+    } else {
+        let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.difference")?;
+        while let Some(value) =
+            set_record_next_key(ctx, &context, &mut keys, "Set.prototype.difference")?
+        {
+            collections::set_delete(result, ctx.heap_mut(), &normalize_set_key(value));
+        }
+    }
+    Ok(Value::Set(result))
+}
+
+/// §24.2.4.6 `Set.prototype.symmetricDifference`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set.prototype.symmetricdifference>
+fn set_proto_symmetric_difference(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let this = receiver_set(ctx, "Set.prototype.symmetricDifference")?;
+    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other_rec = get_set_record(ctx, other, "Set.prototype.symmetricDifference")?;
+    let mut result = ctx
+        .alloc_set()
+        .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
+    for value in collections::set_values(this, ctx.heap()) {
+        ctx.set_add(&mut result, value)
+            .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
+    }
+    let context = execution_context(ctx, "Set.prototype.symmetricDifference")?;
+    let mut keys = set_record_keys(
+        ctx,
+        &context,
+        &other_rec,
+        "Set.prototype.symmetricDifference",
+    )?;
+    while let Some(value) = set_record_next_key(
+        ctx,
+        &context,
+        &mut keys,
+        "Set.prototype.symmetricDifference",
+    )? {
+        let value = normalize_set_key(value);
+        if collections::set_has(result, ctx.heap(), &value) {
+            collections::set_delete(result, ctx.heap_mut(), &value);
+        } else {
+            ctx.set_add(&mut result, value)
+                .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
+        }
+    }
+    Ok(Value::Set(result))
+}
+
+/// §24.2.4.10 `Set.prototype.isSubsetOf`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set.prototype.issubsetof>
+fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let this = receiver_set(ctx, "Set.prototype.isSubsetOf")?;
+    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other_rec = get_set_record(ctx, other, "Set.prototype.isSubsetOf")?;
+    if (collections::set_len(this, ctx.heap()) as f64) > other_rec.size() {
+        return Ok(Value::Boolean(false));
+    }
+    let context = execution_context(ctx, "Set.prototype.isSubsetOf")?;
+    for value in collections::set_values(this, ctx.heap()) {
+        if !set_record_has(
+            ctx,
+            &context,
+            &other_rec,
+            &value,
+            "Set.prototype.isSubsetOf",
+        )? {
+            return Ok(Value::Boolean(false));
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
+/// §24.2.4.11 `Set.prototype.isSupersetOf`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set.prototype.issupersetof>
+fn set_proto_is_superset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let this = receiver_set(ctx, "Set.prototype.isSupersetOf")?;
+    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other_rec = get_set_record(ctx, other, "Set.prototype.isSupersetOf")?;
+    if (collections::set_len(this, ctx.heap()) as f64) < other_rec.size() {
+        return Ok(Value::Boolean(false));
+    }
+    let context = execution_context(ctx, "Set.prototype.isSupersetOf")?;
+    let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.isSupersetOf")?;
+    while let Some(value) =
+        set_record_next_key(ctx, &context, &mut keys, "Set.prototype.isSupersetOf")?
+    {
+        let value = normalize_set_key(value);
+        if !collections::set_has(this, ctx.heap(), &value) {
+            set_record_close(ctx, &context, &mut keys, "Set.prototype.isSupersetOf")?;
+            return Ok(Value::Boolean(false));
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
+/// §24.2.4.9 `Set.prototype.isDisjointFrom`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-set.prototype.isdisjointfrom>
+fn set_proto_is_disjoint_from(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let this = receiver_set(ctx, "Set.prototype.isDisjointFrom")?;
+    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other_rec = get_set_record(ctx, other, "Set.prototype.isDisjointFrom")?;
+    let context = execution_context(ctx, "Set.prototype.isDisjointFrom")?;
+    if (collections::set_len(this, ctx.heap()) as f64) <= other_rec.size() {
+        for value in collections::set_values(this, ctx.heap()) {
+            if set_record_has(
+                ctx,
+                &context,
+                &other_rec,
+                &value,
+                "Set.prototype.isDisjointFrom",
+            )? {
+                return Ok(Value::Boolean(false));
+            }
+        }
+    } else {
+        let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.isDisjointFrom")?;
+        while let Some(value) =
+            set_record_next_key(ctx, &context, &mut keys, "Set.prototype.isDisjointFrom")?
+        {
+            let value = normalize_set_key(value);
+            if collections::set_has(this, ctx.heap(), &value) {
+                set_record_close(ctx, &context, &mut keys, "Set.prototype.isDisjointFrom")?;
+                return Ok(Value::Boolean(false));
+            }
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
 fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "get Set.prototype.size")?;
     Ok(Value::Number(crate::number::NumberValue::from_i32(
@@ -1076,6 +1400,46 @@ enum MapIterKind {
     Entries,
 }
 
+#[derive(Clone)]
+enum SetRecord {
+    Set {
+        set: crate::JsSet,
+        size: f64,
+    },
+    Map {
+        map: crate::JsMap,
+        size: f64,
+    },
+    Dynamic {
+        set: Value,
+        size: f64,
+        has: Value,
+        keys: Value,
+    },
+}
+
+impl SetRecord {
+    fn size(&self) -> f64 {
+        match self {
+            Self::Set { size, .. } | Self::Map { size, .. } | Self::Dynamic { size, .. } => *size,
+        }
+    }
+}
+
+enum SetRecordKeys {
+    Snapshot {
+        values: Vec<Value>,
+        index: usize,
+    },
+    Generator {
+        handle: crate::generator::JsGenerator,
+    },
+    Dynamic {
+        iterator: Value,
+        next_method: Value,
+    },
+}
+
 fn make_map_iterator(
     ctx: &mut NativeCtx<'_>,
     m: crate::JsMap,
@@ -1108,6 +1472,311 @@ fn make_map_iterator(
         )
         .map_err(|_| oom("Map iterator"))?;
     Ok(Value::Iterator(iter))
+}
+
+/// ECMA-262 `GetSetRecord` for the Set methods.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-getsetrecord>
+fn get_set_record(
+    ctx: &mut NativeCtx<'_>,
+    other: Value,
+    name: &'static str,
+) -> Result<SetRecord, NativeError> {
+    match other {
+        Value::Set(set) => Ok(SetRecord::Set {
+            set,
+            size: collections::set_len(set, ctx.heap()) as f64,
+        }),
+        Value::Map(map) => Ok(SetRecord::Map {
+            map,
+            size: collections::map_len(map, ctx.heap()) as f64,
+        }),
+        value => {
+            if !value_is_object_like(&value) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "other is not an object".to_string(),
+                });
+            }
+            let context = execution_context(ctx, name)?;
+            let raw_size = read_property(ctx, &context, &value, "size", name)?;
+            let size = to_number_runtime(ctx, &context, &raw_size, name)?;
+            if size.is_nan() {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "set-like size is NaN".to_string(),
+                });
+            }
+            let has = read_property(ctx, &context, &value, "has", name)?;
+            if !ctx.interp_mut().is_callable_runtime(&has) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "set-like has is not callable".to_string(),
+                });
+            }
+            let keys = read_property(ctx, &context, &value, "keys", name)?;
+            if !ctx.interp_mut().is_callable_runtime(&keys) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "set-like keys is not callable".to_string(),
+                });
+            }
+            Ok(SetRecord::Dynamic {
+                set: value,
+                size,
+                has,
+                keys,
+            })
+        }
+    }
+}
+
+fn set_record_has(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    record: &SetRecord,
+    value: &Value,
+    name: &'static str,
+) -> Result<bool, NativeError> {
+    match record {
+        SetRecord::Set { set, .. } => Ok(collections::set_has(*set, ctx.heap(), value)),
+        SetRecord::Map { map, .. } => Ok(collections::map_has(*map, ctx.heap(), value)),
+        SetRecord::Dynamic { set, has, .. } => {
+            let result = ctx
+                .interp_mut()
+                .run_callable_sync(
+                    context,
+                    has,
+                    set.clone(),
+                    smallvec::smallvec![value.clone()],
+                )
+                .map_err(|err| vm_to_native(err, name))?;
+            Ok(result.to_boolean())
+        }
+    }
+}
+
+fn set_record_keys(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    record: &SetRecord,
+    name: &'static str,
+) -> Result<SetRecordKeys, NativeError> {
+    match record {
+        SetRecord::Set { set, .. } => Ok(SetRecordKeys::Snapshot {
+            values: collections::set_values(*set, ctx.heap()),
+            index: 0,
+        }),
+        SetRecord::Map { map, .. } => Ok(SetRecordKeys::Snapshot {
+            values: collections::map_entries(*map, ctx.heap())
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect(),
+            index: 0,
+        }),
+        SetRecord::Dynamic { set, keys, .. } => {
+            let iterator = ctx
+                .interp_mut()
+                .run_callable_sync(context, keys, set.clone(), SmallVec::new())
+                .map_err(|err| vm_to_native(err, name))?;
+            if let Value::Generator(handle) = iterator {
+                return Ok(SetRecordKeys::Generator { handle });
+            }
+            if matches!(iterator, Value::Iterator(_)) {
+                let values = ctx
+                    .interp_mut()
+                    .iterator_to_list_sync(context, &iterator)
+                    .map_err(|err| vm_to_native(err, name))?;
+                return Ok(SetRecordKeys::Snapshot { values, index: 0 });
+            }
+            if iterator_has_callable_iterator(ctx, context, &iterator, name)? {
+                let values = ctx
+                    .interp_mut()
+                    .iterator_to_list_sync(context, &iterator)
+                    .map_err(|err| vm_to_native(err, name))?;
+                return Ok(SetRecordKeys::Snapshot { values, index: 0 });
+            }
+            if !value_is_object_like(&iterator) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "set-like keys did not return an object".to_string(),
+                });
+            }
+            let next_method = read_property(ctx, context, &iterator, "next", name)?;
+            if !ctx.interp_mut().is_callable_runtime(&next_method) {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "set-like keys iterator next is not callable".to_string(),
+                });
+            }
+            Ok(SetRecordKeys::Dynamic {
+                iterator,
+                next_method,
+            })
+        }
+    }
+}
+
+fn set_record_next_key(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    keys: &mut SetRecordKeys,
+    name: &'static str,
+) -> Result<Option<Value>, NativeError> {
+    match keys {
+        SetRecordKeys::Snapshot { values, index } => {
+            let Some(value) = values.get(*index).cloned() else {
+                return Ok(None);
+            };
+            *index += 1;
+            Ok(Some(value))
+        }
+        SetRecordKeys::Generator { handle } => {
+            let result = ctx
+                .interp_mut()
+                .resume_generator(
+                    context,
+                    handle,
+                    crate::GeneratorResumeKind::Next(Value::Undefined),
+                )
+                .map_err(|err| vm_to_native(err, name))?;
+            let Value::Object(record) = result else {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "generator next did not return an object".to_string(),
+                });
+            };
+            let done = crate::object::get(record, ctx.heap(), "done")
+                .unwrap_or(Value::Undefined)
+                .to_boolean();
+            if done {
+                return Ok(None);
+            }
+            Ok(Some(
+                crate::object::get(record, ctx.heap(), "value").unwrap_or(Value::Undefined),
+            ))
+        }
+        SetRecordKeys::Dynamic {
+            iterator,
+            next_method,
+        } => ctx
+            .interp_mut()
+            .iterator_step_sync(context, iterator, next_method)
+            .map_err(|err| vm_to_native(err, name)),
+    }
+}
+
+fn set_record_close(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    keys: &mut SetRecordKeys,
+    name: &'static str,
+) -> Result<(), NativeError> {
+    if let SetRecordKeys::Dynamic { iterator, .. } = keys {
+        ctx.interp_mut()
+            .iterator_close_sync(context, iterator)
+            .map_err(|err| vm_to_native(err, name))?;
+    }
+    Ok(())
+}
+
+fn execution_context(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<crate::ExecutionContext, NativeError> {
+    ctx.execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name,
+            reason: "no active execution context".to_string(),
+        })
+}
+
+fn read_property(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    target: &Value,
+    property: &'static str,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let interp = ctx.interp_mut();
+    let outcome = interp
+        .ordinary_get_value(
+            context,
+            target.clone(),
+            target.clone(),
+            &VmPropertyKey::String(property),
+            0,
+        )
+        .map_err(|err| vm_to_native(err, name))?;
+    match outcome {
+        VmGetOutcome::Value(value) => Ok(value),
+        VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(context, &getter, target.clone(), SmallVec::new())
+            .map_err(|err| vm_to_native(err, name)),
+    }
+}
+
+fn iterator_has_callable_iterator(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    target: &Value,
+    name: &'static str,
+) -> Result<bool, NativeError> {
+    let iterator_sym = ctx
+        .interp_mut()
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Iterator);
+    let interp = ctx.interp_mut();
+    let outcome = interp
+        .ordinary_get_value(
+            context,
+            target.clone(),
+            target.clone(),
+            &VmPropertyKey::Symbol(iterator_sym),
+            0,
+        )
+        .map_err(|err| vm_to_native(err, name))?;
+    let method = match outcome {
+        VmGetOutcome::Value(value) => value,
+        VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(context, &getter, target.clone(), SmallVec::new())
+            .map_err(|err| vm_to_native(err, name))?,
+    };
+    Ok(!matches!(method, Value::Undefined | Value::Null)
+        && ctx.interp_mut().is_callable_runtime(&method))
+}
+
+fn to_number_runtime(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    value: &Value,
+    name: &'static str,
+) -> Result<f64, NativeError> {
+    let primitive = if crate::abstract_ops::is_primitive(value) {
+        value.clone()
+    } else {
+        ctx.interp_mut()
+            .evaluate_to_primitive(context, value, crate::abstract_ops::ToPrimitiveHint::Number)
+            .map_err(|err| vm_to_native(err, name))?
+    };
+    match primitive {
+        Value::Symbol(_) | Value::BigInt(_) => Err(NativeError::TypeError {
+            name,
+            reason: "cannot convert value to number".to_string(),
+        }),
+        value => Ok(crate::number::to_number_value(&value)),
+    }
+}
+
+fn normalize_set_key(value: Value) -> Value {
+    match value {
+        Value::Number(crate::NumberValue::Double(n)) if n == 0.0 && n.is_sign_negative() => {
+            Value::Number(crate::NumberValue::from_i32(0))
+        }
+        value => value,
+    }
 }
 
 fn value_is_object_like(v: &Value) -> bool {

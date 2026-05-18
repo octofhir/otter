@@ -376,6 +376,16 @@ impl Interpreter {
                 read_register(frame, proto_reg)?.clone()
             }
             Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
+            Value::NativeFunction(_) => {
+                // §15.7.14 ClassDefinitionEvaluation links the
+                // constructor's static side to the superclass value.
+                // Native constructors store statics directly on the
+                // callable rather than in a JsObject-shaped statics
+                // bag, so there is no object prototype to mutate.
+                // <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
+                frame.pc += 1;
+                return Ok(());
+            }
             _ => return Err(VmError::TypeMismatch),
         };
         let receiver = read_register(frame, obj_reg)?.clone();
@@ -1165,13 +1175,8 @@ impl Interpreter {
                         &mut external_visit,
                     )?;
                 } else {
-                    crate::array::set_named_property(
-                        *arr,
-                        &mut self.gc_heap,
-                        &name,
-                        value,
-                    )
-                    .map_err(|_| VmError::TypeMismatch)?;
+                    crate::array::set_named_property(*arr, &mut self.gc_heap, &name, value)
+                        .map_err(|_| VmError::TypeMismatch)?;
                 }
             }
             // Numeric-indexed array write.

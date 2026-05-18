@@ -279,6 +279,30 @@ impl Interpreter {
         {
             return Ok(());
         }
+        // §23.2.3.{8,11,12,13,14,15,17,18,21,22,28} — TypedArray
+        // prototype callback methods. Same shape as the Array set
+        // but routed through a TypedArray-specific dispatcher so
+        // map / filter / etc. allocate a new TypedArray of the
+        // receiver's kind instead of a plain Array.
+        if let Value::TypedArray(t) = &recv_value
+            && matches!(
+                name,
+                "forEach"
+                    | "map"
+                    | "filter"
+                    | "find"
+                    | "findIndex"
+                    | "findLast"
+                    | "findLastIndex"
+                    | "every"
+                    | "some"
+                    | "reduce"
+                    | "reduceRight"
+            )
+            && self.typed_array_callback_dispatch(stack, context, t, &name, &arg_values, dst)?
+        {
+            return Ok(());
+        }
         // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
         // `replaceAll` with a callable replaceValue dispatch through
         // the interpreter to invoke the callback. The intrinsic
@@ -1421,6 +1445,241 @@ impl Interpreter {
         write_register(frame_top, dst, result)?;
         Ok(true)
     }
+
+    /// §23.2.3 TypedArray prototype callback methods —
+    /// `forEach` / `map` / `filter` / `find` / `findIndex` /
+    /// `findLast` / `findLastIndex` / `every` / `some` / `reduce` /
+    /// `reduceRight`. Same shape as the Array prototype family but
+    /// element snapshots come from the TypedArray's backing buffer
+    /// and `map` / `filter` allocate a fresh TypedArray of the
+    /// receiver's kind.
+    ///
+    /// <https://tc39.es/ecma262/#sec-typedarray.prototype-objects>
+    #[allow(clippy::too_many_arguments)]
+    fn typed_array_callback_dispatch(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        t: &crate::binary::typed_array::JsTypedArray,
+        name: &str,
+        args: &SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<bool, VmError> {
+        let ta_value = Value::TypedArray(t.clone());
+        let kind = t.kind();
+        let len = t.length();
+        let elements: Vec<Value> = (0..len).map(|i| t.get(i)).collect();
+
+        let top_idx = stack.len() - 1;
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+
+        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+
+        let result = match name {
+            "forEach" => {
+                let callee = require_callable(args.first())?;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                }
+                Value::Undefined
+            }
+            "map" => {
+                let callee = require_callable(args.first())?;
+                let mut out: Vec<Value> = Vec::with_capacity(len);
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let mapped =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let coerced = crate::binary::dispatch::coerce_element_for_store(kind, &mapped)?;
+                    out.push(coerced);
+                }
+                self.typed_array_from_values_stack_rooted(stack, kind, &out, &[&ta_value, &callee])?
+            }
+            "filter" => {
+                let callee = require_callable(args.first())?;
+                let mut out: Vec<Value> = Vec::new();
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let kept =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    if kept.to_boolean() {
+                        out.push(t.get(i));
+                    }
+                }
+                self.typed_array_from_values_stack_rooted(stack, kind, &out, &[&ta_value, &callee])?
+            }
+            "find" => {
+                let callee = require_callable(args.first())?;
+                let mut found = Value::Undefined;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let hit =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    if hit.to_boolean() {
+                        found = value;
+                        break;
+                    }
+                }
+                found
+            }
+            "findIndex" => {
+                let callee = require_callable(args.first())?;
+                let mut idx: i32 = -1;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let hit =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    if hit.to_boolean() {
+                        idx = i as i32;
+                        break;
+                    }
+                }
+                Value::Number(NumberValue::from_i32(idx))
+            }
+            "findLast" => {
+                let callee = require_callable(args.first())?;
+                let mut found = Value::Undefined;
+                for i in (0..len).rev() {
+                    let value = elements[i].clone();
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let hit =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    if hit.to_boolean() {
+                        found = value;
+                        break;
+                    }
+                }
+                found
+            }
+            "findLastIndex" => {
+                let callee = require_callable(args.first())?;
+                let mut idx: i32 = -1;
+                for i in (0..len).rev() {
+                    let value = elements[i].clone();
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let hit =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    if hit.to_boolean() {
+                        idx = i as i32;
+                        break;
+                    }
+                }
+                Value::Number(NumberValue::from_i32(idx))
+            }
+            "every" => {
+                let callee = require_callable(args.first())?;
+                let mut all = true;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let hit =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    if !hit.to_boolean() {
+                        all = false;
+                        break;
+                    }
+                }
+                Value::Boolean(all)
+            }
+            "some" => {
+                let callee = require_callable(args.first())?;
+                let mut any = false;
+                for (i, value) in elements.into_iter().enumerate() {
+                    let cb_args = build_array_cb_args(&value, i, &ta_value);
+                    let hit =
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    if hit.to_boolean() {
+                        any = true;
+                        break;
+                    }
+                }
+                Value::Boolean(any)
+            }
+            "reduce" | "reduceRight" => {
+                let callee = require_callable(args.first())?;
+                let has_init = args.len() >= 2;
+                let reverse = name == "reduceRight";
+                if len == 0 && !has_init {
+                    return Err(VmError::TypeMismatch);
+                }
+                let step: i64 = if reverse { -1 } else { 1 };
+                let (mut acc, start_idx) = if has_init {
+                    (
+                        args[1].clone(),
+                        if reverse { len as i64 - 1 } else { 0 },
+                    )
+                } else {
+                    let seed = if reverse { len - 1 } else { 0 };
+                    (elements[seed].clone(), seed as i64 + step)
+                };
+                let mut i = start_idx;
+                while i >= 0 && (i as usize) < len {
+                    let value = elements[i as usize].clone();
+                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                    cb_args.push(acc.clone());
+                    cb_args.push(value);
+                    cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
+                    cb_args.push(ta_value.clone());
+                    acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                    i += step;
+                }
+                acc
+            }
+            _ => return Ok(false),
+        };
+
+        let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        write_register(frame_top, dst, result)?;
+        Ok(true)
+    }
+
+    fn typed_array_from_values_stack_rooted(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        kind: crate::binary::typed_array::TypedArrayKind,
+        values: &[Value],
+        value_roots: &[&Value],
+    ) -> Result<Value, VmError> {
+        let stack_roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &stack_roots {
+                visitor(slot);
+            }
+            for v in value_roots {
+                v.trace_value_slots(visitor);
+            }
+            for v in values {
+                v.trace_value_slots(visitor);
+            }
+        };
+        let bpe = kind.bytes_per_element();
+        let byte_len = values.len().checked_mul(bpe).ok_or(VmError::RangeError {
+            message: "TypedArray byte length overflow".to_string(),
+        })?;
+        let new_buf = crate::binary::array_buffer::JsArrayBuffer::try_new_with_roots(
+            byte_len,
+            &mut self.gc_heap,
+            &mut external_visit,
+        )
+        .map_err(|err| VmError::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
+        })?
+        .ok_or_else(|| VmError::RangeError {
+            message: format!(
+                "TypedArray allocation of {byte_len} bytes exceeds the available heap"
+            ),
+        })?;
+        let view = crate::binary::typed_array::JsTypedArray::new(new_buf, kind, 0, values.len());
+        for (i, value) in values.iter().enumerate() {
+            view.set(i, value);
+        }
+        Ok(Value::TypedArray(view))
+    }
+
     fn dispatch_function_method(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,

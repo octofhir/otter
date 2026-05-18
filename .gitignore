@@ -36,3 +36,4 @@ scratch/
 *.trace.json
 *.folded
 timeout-dump*.txt
+.claude/scheduled_tasks.lock

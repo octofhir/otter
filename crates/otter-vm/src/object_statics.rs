@@ -715,11 +715,15 @@ fn native_get_own_property_descriptor_rooted(
                             true,
                         ))
                     }
+                } else if let Some(bag) = target.expando() {
+                    crate::object::get_own_descriptor(bag, ctx.heap(), k)
                 } else {
                     None
                 }
             }
-            PropertyKey::Symbol(_) => None,
+            PropertyKey::Symbol(sym) => target
+                .expando()
+                .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, ctx.heap(), sym)),
         },
         // §20.1.2.7 — primitive operands are coerced via ToObject;
         // the wrapper carries no own data property for arbitrary
@@ -1761,6 +1765,78 @@ pub fn call(
                         });
                     }
                     Ok(Value::NativeFunction(*native))
+                }
+                // §10.4.5.3 IntegerIndexedExoticObject
+                // [[DefineOwnProperty]] — canonical-numeric-index
+                // keys verify the index against the live element
+                // (writable / enumerable / configurable / value);
+                // everything else falls through to OrdinaryDefine
+                // against the lazy expando bag.
+                Some(Value::TypedArray(t)) => {
+                    let t = t.clone();
+                    match &key {
+                        PropertyKey::String(k) => {
+                            if let Some(n) =
+                                crate::property_dispatch::canonical_numeric_index_string(k)
+                            {
+                                if t.buffer().is_detached()
+                                    || !n.is_finite()
+                                    || n.fract() != 0.0
+                                    || n < 0.0
+                                    || (n as usize) >= t.length()
+                                    || descriptor.configurable == Some(false)
+                                    || descriptor.enumerable == Some(false)
+                                    || descriptor.writable == Some(false)
+                                    || descriptor.is_accessor()
+                                {
+                                    return Err(VmError::TypeError {
+                                        message: format!(
+                                            "Cannot define property '{}'",
+                                            key.label()
+                                        ),
+                                    });
+                                }
+                                if let Some(value) = descriptor.value.clone() {
+                                    let coerced =
+                                        crate::binary::dispatch::coerce_element_for_store(
+                                            t.kind(),
+                                            &value,
+                                        )?;
+                                    t.set(n as usize, &coerced);
+                                }
+                            } else {
+                                let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
+                                    gc_heap, &t,
+                                )?;
+                                if !crate::object::define_own_property_partial(
+                                    bag, gc_heap, k, descriptor,
+                                ) {
+                                    return Err(VmError::TypeError {
+                                        message: format!(
+                                            "Cannot define property '{}'",
+                                            key.label()
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        PropertyKey::Symbol(sym) => {
+                            let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
+                                gc_heap, &t,
+                            )?;
+                            if !crate::object::define_own_symbol_property_partial(
+                                bag, gc_heap, sym, descriptor,
+                            ) {
+                                return Err(VmError::TypeError {
+                                    message: format!(
+                                        "Cannot define property '{}'",
+                                        key.label()
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Ok(Value::TypedArray(t))
                 }
                 _ => Err(VmError::TypeError {
                     message: "Object.defineProperty target must be an object".to_string(),

@@ -264,6 +264,28 @@ impl Interpreter {
             Value::BoundFunction(bound) => {
                 function_metadata::bound_delete_own_property(bound, &mut self.gc_heap, name)
             }
+            // §10.4.5.5 [[Delete]] — canonical-numeric-index keys
+            // reject in-range elements; other keys probe the lazy
+            // expando bag.
+            Value::TypedArray(t) => {
+                if let Some(n) = canonical_numeric_index_string(name) {
+                    if t.buffer().is_detached() {
+                        true
+                    } else if n.is_finite()
+                        && n.fract() == 0.0
+                        && n >= 0.0
+                        && (n as usize) < t.length()
+                    {
+                        false
+                    } else {
+                        true
+                    }
+                } else if let Some(bag) = t.expando() {
+                    crate::object::delete(bag, &mut self.gc_heap, name)
+                } else {
+                    true
+                }
+            }
             other => {
                 return Err(VmError::TypeError {
                     message: format!(
@@ -3058,6 +3080,16 @@ fn typed_array_ensure_expando(
     interp: &mut Interpreter,
     t: &crate::binary::typed_array::JsTypedArray,
 ) -> Result<JsObject, VmError> {
+    typed_array_ensure_expando_pub(&mut interp.gc_heap, t)
+}
+
+/// Public-crate variant of `typed_array_ensure_expando` so static
+/// callers (e.g. `Object.defineProperty`) can lazily materialise
+/// the bag without going through `Interpreter`.
+pub(crate) fn typed_array_ensure_expando_pub(
+    heap: &mut otter_gc::GcHeap,
+    t: &crate::binary::typed_array::JsTypedArray,
+) -> Result<JsObject, VmError> {
     if let Some(existing) = t.expando() {
         return Ok(existing);
     }
@@ -3065,7 +3097,7 @@ fn typed_array_ensure_expando(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         ta_root.trace_value_slots(visitor);
     };
-    let bag = crate::object::alloc_object_with_roots(&mut interp.gc_heap, &mut external_visit)?;
+    let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
     t.set_expando(bag);
     Ok(bag)
 }

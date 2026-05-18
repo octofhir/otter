@@ -1304,7 +1304,11 @@ impl Interpreter {
                     // strings produce a data descriptor for in-range
                     // elements; everything else returns no descriptor.
                     Some(Value::TypedArray(t)) => match &key {
-                        VmPropertyKey::Symbol(_) => None,
+                        VmPropertyKey::Symbol(sym) => t
+                            .expando()
+                            .and_then(|bag| {
+                                crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), sym)
+                            }),
                         _ => {
                             let k = key
                                 .string_name()
@@ -1327,6 +1331,8 @@ impl Interpreter {
                                         true,
                                     ))
                                 }
+                            } else if let Some(bag) = t.expando() {
+                                crate::object::get_own_descriptor(bag, self.gc_heap(), k)
                             } else {
                                 None
                             }

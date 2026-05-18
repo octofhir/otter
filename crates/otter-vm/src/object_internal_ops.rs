@@ -1963,17 +1963,52 @@ impl Interpreter {
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
-            // ArrayBuffer / DataView / TypedArray — walk their realm
-            // prototypes for instance method lookups.
-            Value::ArrayBuffer(_) | Value::DataView(_) | Value::TypedArray(_) => {
+            // ArrayBuffer / DataView — walk realm prototypes for
+            // instance method lookups.
+            Value::ArrayBuffer(_) | Value::DataView(_) => {
                 let proto_name = match base {
                     Value::ArrayBuffer(buf) if buf.is_shared() => "SharedArrayBuffer",
                     Value::ArrayBuffer(_) => "ArrayBuffer",
                     Value::DataView(_) => "DataView",
-                    Value::TypedArray(t) => t.kind().name(),
                     _ => unreachable!(),
                 };
                 let proto = self.constructor_prototype_value(proto_name)?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
+            // §10.4.5.4 IntegerIndexedExoticObject [[Get]] —
+            // canonical-numeric-index short-circuit, then the lazy
+            // expando bag, then the per-kind prototype chain.
+            Value::TypedArray(t) => {
+                if let Some(name) = key.string_name() {
+                    if let Some(n) =
+                        crate::property_dispatch::canonical_numeric_index_string(name)
+                    {
+                        if t.buffer().is_detached()
+                            || !n.is_finite()
+                            || n.fract() != 0.0
+                            || n < 0.0
+                            || (n as usize) >= t.length()
+                        {
+                            return Ok(VmGetOutcome::Value(Value::Undefined));
+                        }
+                        return Ok(VmGetOutcome::Value(t.get(n as usize)));
+                    }
+                    if let Some(bag) = t.expando()
+                        && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
+                    {
+                        return Ok(VmGetOutcome::Value(v));
+                    }
+                }
+                if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(bag) = t.expando()
+                    && let Some(v) = crate::object::get_symbol(bag, &self.gc_heap, sym)
+                {
+                    return Ok(VmGetOutcome::Value(v));
+                }
+                let proto = self.constructor_prototype_value(t.kind().name())?;
                 if matches!(proto, Value::Null | Value::Undefined) {
                     return Ok(VmGetOutcome::Value(Value::Undefined));
                 }

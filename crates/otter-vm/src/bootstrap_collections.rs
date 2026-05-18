@@ -262,8 +262,154 @@ fn install_collection(
         PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
     );
 
+    // §24.1.2.1 `Map.groupBy(items, callback)` static.
+    // §24.2.2.1 `Set.groupBy` was rejected by TC39; only Map has
+    // it. Object.groupBy already handled elsewhere.
+    if matches!(kind, CollectionKind::Map) {
+        let ctor_root = Value::NativeFunction(ctor);
+        let group_by_fn = crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "groupBy",
+            2,
+            map_group_by_native,
+            &[&global_root, &ctor_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let desc = PropertyDescriptor::data(
+            Value::NativeFunction(group_by_fn),
+            true,
+            false,
+            true,
+        );
+        if !ctor.define_own_property(heap, &string_heap, "groupBy", desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed("groupBy"));
+        }
+    }
+
     crate::bootstrap::define_global_value(global, heap, name, Value::NativeFunction(ctor));
     Ok(())
+}
+
+/// §24.1.2.1 `Map.groupBy(items, callbackfn)` — drain `items`
+/// into groups keyed by callback return value, store result in
+/// a new Map.
+fn map_group_by_native(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let items = args.first().cloned().unwrap_or(Value::Undefined);
+    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if matches!(items, Value::Undefined | Value::Null) {
+        return Err(NativeError::TypeError {
+            name: "Map.groupBy",
+            reason: "items must be iterable".to_string(),
+        });
+    }
+    if !ctx.cx.interp.is_callable_runtime(&callback) {
+        return Err(NativeError::TypeError {
+            name: "Map.groupBy",
+            reason: "callback must be a function".to_string(),
+        });
+    }
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Map.groupBy",
+            reason: "missing execution context".to_string(),
+        })?;
+    let result = ctx.alloc_map().map_err(|_| NativeError::TypeError {
+        name: "Map.groupBy",
+        reason: "out of memory".to_string(),
+    })?;
+    let result_value = Value::Map(result);
+    let items_snapshot: Vec<Value> = match &items {
+        Value::Array(arr) => {
+            crate::array::with_elements(*arr, ctx.heap(), |elements| elements.to_vec())
+        }
+        Value::Object(obj) => {
+            let length =
+                crate::object::get(*obj, ctx.heap(), "length").unwrap_or(Value::Undefined);
+            let len = crate::number::to_number_value(&length);
+            let n = if len.is_nan() || len <= 0.0 {
+                0
+            } else {
+                len.min(9_007_199_254_740_991.0) as usize
+            };
+            let mut out: Vec<Value> = Vec::with_capacity(n);
+            for i in 0..n {
+                let key = i.to_string();
+                out.push(crate::object::get(*obj, ctx.heap(), &key).unwrap_or(Value::Undefined));
+            }
+            out
+        }
+        _ => {
+            return Err(NativeError::TypeError {
+                name: "Map.groupBy",
+                reason: "items is not iterable".to_string(),
+            });
+        }
+    };
+    for (idx, item) in items_snapshot.iter().enumerate() {
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(item.clone());
+        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
+            idx as f64,
+        )));
+        let key = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)
+            .map_err(|e| NativeError::TypeError {
+                name: "Map.groupBy",
+                reason: e.to_string(),
+            })?;
+        let existing = crate::collections::map_get(result, ctx.heap(), &key);
+        let group_arr = match existing {
+            Some(Value::Array(arr)) => arr,
+            _ => {
+                let arr = ctx
+                    .array_from_elements_with_roots(
+                        std::iter::empty(),
+                        &[&result_value, &key, item],
+                        &[items_snapshot.as_slice()],
+                    )
+                    .map_err(|_| NativeError::TypeError {
+                        name: "Map.groupBy",
+                        reason: "out of memory".to_string(),
+                    })?;
+                crate::collections::map_set(result, ctx.heap_mut(), key.clone(), Value::Array(arr))
+                    .map_err(|_| NativeError::TypeError {
+                        name: "Map.groupBy",
+                        reason: "out of memory".to_string(),
+                    })?;
+                arr
+            }
+        };
+        let arr_value = Value::Array(group_arr);
+        let len = crate::array::len(group_arr, ctx.heap());
+        let roots = ctx.collect_native_roots();
+        let item_clone = item.clone();
+        let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            arr_value.trace_value_slots(visitor);
+            item_clone.trace_value_slots(visitor);
+        };
+        crate::array::set_with_roots(
+            group_arr,
+            ctx.heap_mut(),
+            len,
+            item.clone(),
+            &mut visit,
+        )
+        .map_err(|_| NativeError::TypeError {
+            name: "Map.groupBy",
+            reason: "out of memory".to_string(),
+        })?;
+    }
+    Ok(result_value)
 }
 
 fn install_prototype_methods(

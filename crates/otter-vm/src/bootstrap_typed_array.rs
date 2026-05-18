@@ -71,6 +71,29 @@ const TYPED_ARRAY_METHODS: &[(&str, u8, crate::native_function::NativeFastFn)] =
     ("entries", 0, ta_entries),
 ];
 
+/// Per-kind `<TA>.from` / `<TA>.of` static-method routing table.
+/// Installed on each concrete TypedArray constructor after its
+/// prototype is wired so the §23.2.6 inherited statics resolve via
+/// ordinary property lookup (and not only the call-method
+/// intrinsic dispatch path).
+const TYPED_ARRAY_STATICS: &[(
+    &str,
+    crate::native_function::NativeFastFn,
+    crate::native_function::NativeFastFn,
+)] = &[
+    ("Int8Array", from_int8, of_int8),
+    ("Uint8Array", from_uint8, of_uint8),
+    ("Uint8ClampedArray", from_uint8_clamped, of_uint8_clamped),
+    ("Int16Array", from_int16, of_int16),
+    ("Uint16Array", from_uint16, of_uint16),
+    ("Int32Array", from_int32, of_int32),
+    ("Uint32Array", from_uint32, of_uint32),
+    ("Float32Array", from_float32, of_float32),
+    ("Float64Array", from_float64, of_float64),
+    ("BigInt64Array", from_bigint64, of_bigint64),
+    ("BigUint64Array", from_biguint64, of_biguint64),
+];
+
 /// 11 concrete kinds × (name, length, ctor fn pointer).
 const TYPED_ARRAY_CTORS: &[(&str, TypedArrayKind, crate::native_function::NativeFastFn)] = &[
     ("Int8Array", TypedArrayKind::Int8, ctor_int8),
@@ -157,6 +180,45 @@ pub(crate) fn install_typed_array_entry(
         false,
     );
     let _ = ctor.define_own_property(heap, &string_heap, "BYTES_PER_ELEMENT", bpe_desc);
+
+    // §23.2.2.1 / §23.2.2.2 — per-kind `from` / `of` static methods.
+    // Installed as own properties so reflective access
+    // (`Int8Array.from`, `Int8Array.of`) returns a callable.
+    if let Some((_, from_fn, of_fn)) = TYPED_ARRAY_STATICS
+        .iter()
+        .copied()
+        .find(|(n, _, _)| *n == name)
+    {
+        let abstract_ctor_value = Value::NativeFunction(abstract_ctor);
+        let from_native = crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "from",
+            1,
+            from_fn,
+            &[&ctor_root, &abstract_ctor_value],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let _ = ctor.define_own_property(
+            heap,
+            &string_heap,
+            "from",
+            PropertyDescriptor::data(Value::NativeFunction(from_native), true, false, true),
+        );
+        let of_native = crate::bootstrap::native_static_with_value_roots(
+            heap,
+            "of",
+            0,
+            of_fn,
+            &[&ctor_root, &abstract_ctor_value],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let _ = ctor.define_own_property(
+            heap,
+            &string_heap,
+            "of",
+            PropertyDescriptor::data(Value::NativeFunction(of_native), true, false, true),
+        );
+    }
 
     object::define_own_property(
         prototype,
@@ -371,6 +433,93 @@ macro_rules! ta_ctor {
             ta_ctor_dispatch(ctx, args, $kind)
         }
     };
+}
+
+/// Build a per-kind `from` static for the concrete TypedArray
+/// constructor. Mirrors §23.2.2.1 `%TypedArray%.from(source [,
+/// mapfn [, thisArg]])` for the common cases (no `mapfn` and the
+/// receiver is a known concrete constructor). The basic shape
+/// (`Int8Array.from([1,2,3])`, `Int8Array.from(otherTA)`,
+/// `Int8Array.from(arrayLike)`) routes through the existing
+/// `typed_array_call_with_roots` dispatch under `M::From`.
+macro_rules! ta_static_from {
+    ($name:ident, $kind:expr) => {
+        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            ta_from_dispatch(ctx, args, $kind)
+        }
+    };
+}
+
+macro_rules! ta_static_of {
+    ($name:ident, $kind:expr) => {
+        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            ta_of_dispatch(ctx, args, $kind)
+        }
+    };
+}
+
+ta_static_from!(from_int8, TypedArrayKind::Int8);
+ta_static_from!(from_uint8, TypedArrayKind::Uint8);
+ta_static_from!(from_uint8_clamped, TypedArrayKind::Uint8Clamped);
+ta_static_from!(from_int16, TypedArrayKind::Int16);
+ta_static_from!(from_uint16, TypedArrayKind::Uint16);
+ta_static_from!(from_int32, TypedArrayKind::Int32);
+ta_static_from!(from_uint32, TypedArrayKind::Uint32);
+ta_static_from!(from_float32, TypedArrayKind::Float32);
+ta_static_from!(from_float64, TypedArrayKind::Float64);
+ta_static_from!(from_bigint64, TypedArrayKind::BigInt64);
+ta_static_from!(from_biguint64, TypedArrayKind::BigUint64);
+
+ta_static_of!(of_int8, TypedArrayKind::Int8);
+ta_static_of!(of_uint8, TypedArrayKind::Uint8);
+ta_static_of!(of_uint8_clamped, TypedArrayKind::Uint8Clamped);
+ta_static_of!(of_int16, TypedArrayKind::Int16);
+ta_static_of!(of_uint16, TypedArrayKind::Uint16);
+ta_static_of!(of_int32, TypedArrayKind::Int32);
+ta_static_of!(of_uint32, TypedArrayKind::Uint32);
+ta_static_of!(of_float32, TypedArrayKind::Float32);
+ta_static_of!(of_float64, TypedArrayKind::Float64);
+ta_static_of!(of_bigint64, TypedArrayKind::BigInt64);
+ta_static_of!(of_biguint64, TypedArrayKind::BigUint64);
+
+fn ta_from_dispatch(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    kind: TypedArrayKind,
+) -> Result<Value, NativeError> {
+    let roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        crate::runtime_cx::visit_native_roots(visitor, &roots, &this_value, None, &[], &[args]);
+    };
+    dispatch::typed_array_call_with_roots(
+        kind,
+        TypedArrayMethod::From,
+        args,
+        ctx.heap_mut(),
+        &mut external_visit,
+    )
+    .map_err(|e| vm_to_native(e, typed_array_name(kind)))
+}
+
+fn ta_of_dispatch(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    kind: TypedArrayKind,
+) -> Result<Value, NativeError> {
+    let roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        crate::runtime_cx::visit_native_roots(visitor, &roots, &this_value, None, &[], &[args]);
+    };
+    dispatch::typed_array_call_with_roots(
+        kind,
+        TypedArrayMethod::Of,
+        args,
+        ctx.heap_mut(),
+        &mut external_visit,
+    )
+    .map_err(|e| vm_to_native(e, typed_array_name(kind)))
 }
 
 ta_ctor!(ctor_int8, TypedArrayKind::Int8);

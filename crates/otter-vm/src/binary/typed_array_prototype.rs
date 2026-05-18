@@ -385,6 +385,14 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
     let off = offset as usize;
     let source = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let kind = t.kind();
+    let coerce = |v: &Value| -> Result<Value, IntrinsicError> {
+        crate::binary::dispatch::coerce_element_for_store(kind, v)
+            .map_err(|_| IntrinsicError::BadArgument {
+                index: 0,
+                reason: "element type mismatch",
+            })
+    };
     match source {
         Value::TypedArray(src) => {
             let src_len = src.length();
@@ -397,7 +405,8 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             // Snapshot first to handle aliasing of the same buffer.
             let snapshot: Vec<Value> = (0..src_len).map(|i| src.get(i)).collect();
             for (i, v) in snapshot.iter().enumerate() {
-                t.set(off + i, v);
+                let coerced = coerce(v)?;
+                t.set(off + i, &coerced);
             }
         }
         Value::Array(arr) => {
@@ -410,7 +419,34 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
             for i in 0..src_len {
-                t.set(off + i, &crate::array::get(arr, heap, i));
+                let v = crate::array::get(arr, heap, i);
+                let coerced = coerce(&v)?;
+                t.set(off + i, &coerced);
+            }
+        }
+        Value::Object(obj) => {
+            // §22.2.3.23.1 step 14 — array-like Object source: read
+            // `length` then `[0..len)` indexed values, coerced to
+            // the destination kind.
+            let heap = &*args.gc_heap;
+            let len_value = crate::object::get(obj, heap, "length").unwrap_or(Value::Undefined);
+            let len_n = crate::number::to_number_value(&len_value);
+            let src_len = if len_n.is_nan() || len_n <= 0.0 {
+                0
+            } else {
+                len_n.min(9_007_199_254_740_991.0) as usize
+            };
+            if off + src_len > t.length() {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "source overruns destination",
+                });
+            }
+            for i in 0..src_len {
+                let key = i.to_string();
+                let v = crate::object::get(obj, heap, &key).unwrap_or(Value::Undefined);
+                let coerced = coerce(&v)?;
+                t.set(off + i, &coerced);
             }
         }
         _ => {

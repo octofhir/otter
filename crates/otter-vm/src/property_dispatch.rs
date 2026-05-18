@@ -1054,6 +1054,14 @@ impl Interpreter {
                     }
                 }
             }
+            // §22.1 Array exotic — Symbol-keyed writes are
+            // accepted but the foundation Array layout has no
+            // symbol-slot storage, so the property is dropped on
+            // the floor. Callers that read it back see
+            // `undefined`, which matches the spec default for the
+            // `Symbol.isConcatSpreadable` / `Symbol.iterator`
+            // queries the runtime fast-paths handle separately.
+            (Value::Array(_), Value::Symbol(_)) => {}
             // §22.1 Array exotic — string-keyed write of an
             // integer-string lands as a dense element; everything
             // else stores on the named-properties side table so

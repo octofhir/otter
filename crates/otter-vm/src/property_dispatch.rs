@@ -344,6 +344,44 @@ impl Interpreter {
                     &s.to_lossy_string(),
                 )
             }
+            // §10.4.5.5 IntegerIndexedExoticObject [[Delete]]:
+            // canonical-numeric-index strings reject deletion only
+            // when the index resolves to a valid in-range element
+            // (and the buffer is attached). Out-of-range indices,
+            // non-integer canonical numerics, and arbitrary
+            // non-canonical keys all succeed vacuously — the
+            // TypedArray exotic has no expando own properties.
+            // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-delete-p>
+            (Value::TypedArray(t), Value::String(s)) => {
+                let name = s.to_lossy_string();
+                match canonical_numeric_index_string(&name) {
+                    Some(n) => {
+                        if t.buffer().is_detached() {
+                            true
+                        } else if n.is_finite()
+                            && n.fract() == 0.0
+                            && n >= 0.0
+                            && (n as usize) < t.length()
+                        {
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    None => true,
+                }
+            }
+            (Value::TypedArray(t), Value::Number(n)) => {
+                if t.buffer().is_detached() {
+                    true
+                } else {
+                    match n.as_smi() {
+                        Some(v) if v >= 0 && (v as usize) < t.length() => false,
+                        _ => true,
+                    }
+                }
+            }
+            (Value::TypedArray(_), Value::Symbol(_)) => true,
             _ => return Err(VmError::TypeMismatch),
         };
         write_register(frame, dst, Value::Boolean(removed))?;
@@ -2901,7 +2939,7 @@ fn has_class_static_property(
 /// that number, otherwise undefined. Used by TypedArray and TypedArray
 /// prototype walks to recognise integer-indexed exotic keys.
 /// <https://tc39.es/ecma262/#sec-canonicalnumericindexstring>
-fn canonical_numeric_index_string(s: &str) -> Option<f64> {
+pub(crate) fn canonical_numeric_index_string(s: &str) -> Option<f64> {
     if s == "-0" {
         return Some(-0.0);
     }

@@ -1299,6 +1299,39 @@ impl Interpreter {
                             )?
                         }
                     },
+                    // §10.4.5.1 IntegerIndexedExoticObject
+                    // [[GetOwnProperty]] — canonical-numeric-index
+                    // strings produce a data descriptor for in-range
+                    // elements; everything else returns no descriptor.
+                    Some(Value::TypedArray(t)) => match &key {
+                        VmPropertyKey::Symbol(_) => None,
+                        _ => {
+                            let k = key
+                                .string_name()
+                                .expect("non-symbol property key has string spelling");
+                            if let Some(n) =
+                                crate::property_dispatch::canonical_numeric_index_string(k)
+                            {
+                                if t.buffer().is_detached()
+                                    || !n.is_finite()
+                                    || n.fract() != 0.0
+                                    || n < 0.0
+                                    || (n as usize) >= t.length()
+                                {
+                                    None
+                                } else {
+                                    Some(crate::object::PropertyDescriptor::data(
+                                        t.get(n as usize),
+                                        true,
+                                        true,
+                                        true,
+                                    ))
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                    },
                     Some(Value::Boolean(_))
                     | Some(Value::Number(_))
                     | Some(Value::String(_))

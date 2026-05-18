@@ -691,6 +691,36 @@ fn native_get_own_property_descriptor_rooted(
             )?,
             PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
         },
+        // §10.4.5.1 IntegerIndexedExoticObject [[GetOwnProperty]] —
+        // canonical-numeric-index string keys produce a data
+        // descriptor for the live element when in range, otherwise
+        // undefined. Symbol / non-numeric keys have no own
+        // descriptor on the bare TypedArray exotic.
+        // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-getownproperty-p>
+        Some(Value::TypedArray(target)) => match &key {
+            PropertyKey::String(k) => {
+                if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(k) {
+                    if target.buffer().is_detached()
+                        || !n.is_finite()
+                        || n.fract() != 0.0
+                        || n < 0.0
+                        || (n as usize) >= target.length()
+                    {
+                        None
+                    } else {
+                        Some(crate::object::PropertyDescriptor::data(
+                            target.get(n as usize),
+                            true,
+                            true,
+                            true,
+                        ))
+                    }
+                } else {
+                    None
+                }
+            }
+            PropertyKey::Symbol(_) => None,
+        },
         // §20.1.2.7 — primitive operands are coerced via ToObject;
         // the wrapper carries no own data property for arbitrary
         // keys (except String which exposes indexed characters and

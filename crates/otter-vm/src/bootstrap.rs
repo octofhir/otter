@@ -2021,7 +2021,164 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
     const NAME: &'static str = "Iterator";
     const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_placeholder(Self::NAME, heap, global)
+        install_placeholder(Self::NAME, heap, global)?;
+        // §27.1.4.1 `Iterator.from(iterable)` — wraps an iterable
+        // (or already-iterator) into a foundation `Value::Iterator`
+        // handle so the `.next()` / iterator-helper dispatch fires
+        // through the normal interpreter path.
+        let Some(Value::Object(iterator_ctor)) = object::get(global, heap, "Iterator") else {
+            return Ok(());
+        };
+        let ctor_root = Value::Object(iterator_ctor);
+        let from_fn = native_static_with_value_roots(
+            heap,
+            "from",
+            1,
+            iterator_from_native,
+            &[&ctor_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        object::set(
+            iterator_ctor,
+            heap,
+            "from",
+            Value::NativeFunction(from_fn),
+        );
+        Ok(())
+    }
+}
+
+/// §27.1.4.1 `Iterator.from(iterable)` — wraps the operand into a
+/// foundation iterator. Already-iterator inputs pass through;
+/// iterable objects route through `GetIterator` so `[Symbol.iterator]()`
+/// fires and the resulting user iterator is wrapped in
+/// `IteratorState::User`. Plain Array / Set / Map / String operands
+/// route through their respective `IteratorState` shapes via the
+/// existing `make_*_iterator_factory` helpers. Primitive inputs that
+/// aren't iterable raise TypeError per spec step 4.
+fn iterator_from_native(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let input = args.first().cloned().unwrap_or(Value::Undefined);
+    match &input {
+        Value::Iterator(_) => Ok(input),
+        Value::Array(arr) => {
+            let arr_value = Value::Array(*arr);
+            let state = crate::IteratorState::Array {
+                array: *arr,
+                index: 0,
+            };
+            let handle = ctx
+                .alloc_iterator_state(state, &[&arr_value], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name: "Iterator.from",
+                    reason: "iterator allocation failed".to_string(),
+                })?;
+            Ok(Value::Iterator(handle))
+        }
+        Value::Generator(g) => {
+            let state = crate::IteratorState::Generator { handle: *g };
+            let handle = ctx
+                .alloc_iterator_state(state, &[&input], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name: "Iterator.from",
+                    reason: "iterator allocation failed".to_string(),
+                })?;
+            Ok(Value::Iterator(handle))
+        }
+        // §27.1.4.1 step 1 — `iterable` may also be an Object with
+        // `@@iterator`; look up the method, call it, and wrap the
+        // resulting iterator object in `IteratorState::User`. When
+        // the receiver already exposes `.next` directly (the
+        // already-iterator path) we wrap it as-is so subsequent
+        // `IteratorNext` invocations drive it through the user
+        // dispatcher.
+        Value::Object(_)
+        | Value::Set(_)
+        | Value::Map(_)
+        | Value::Function { .. }
+        | Value::Closure { .. }
+        | Value::NativeFunction(_)
+        | Value::BoundFunction(_)
+        | Value::ClassConstructor(_)
+        | Value::Proxy(_) => {
+            let iterator_sym = ctx
+                .cx
+                .interp
+                .well_known_symbols()
+                .get(crate::symbol::WellKnown::Iterator);
+            let (interp, exec_ctx) = ctx.interp_mut_and_context();
+            let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "missing execution context".to_string(),
+            })?;
+            let key = crate::VmPropertyKey::Symbol(iterator_sym);
+            let outcome = interp
+                .ordinary_get_value(&exec_ctx, input.clone(), input.clone(), &key, 0)
+                .map_err(|e| crate::NativeError::TypeError {
+                    name: "Iterator.from",
+                    reason: e.to_string(),
+                })?;
+            let iter_method = match outcome {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                    interp
+                        .run_callable_sync(&exec_ctx, &getter, input.clone(), args)
+                        .map_err(|e| crate::NativeError::TypeError {
+                            name: "Iterator.from",
+                            reason: e.to_string(),
+                        })?
+                }
+            };
+            let iter_value = if matches!(iter_method, Value::Undefined | Value::Null) {
+                input.clone()
+            } else if interp.is_callable_runtime(&iter_method) {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp
+                    .run_callable_sync(&exec_ctx, &iter_method, input.clone(), args)
+                    .map_err(|e| crate::NativeError::TypeError {
+                        name: "Iterator.from",
+                        reason: e.to_string(),
+                    })?
+            } else {
+                return Err(crate::NativeError::TypeError {
+                    name: "Iterator.from",
+                    reason: "argument is not iterable".to_string(),
+                });
+            };
+            if let Value::Iterator(_) = &iter_value {
+                return Ok(iter_value);
+            }
+            let state = crate::IteratorState::User {
+                iterator: iter_value.clone(),
+            };
+            let handle = ctx
+                .alloc_iterator_state(state, &[&iter_value], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name: "Iterator.from",
+                    reason: "iterator allocation failed".to_string(),
+                })?;
+            Ok(Value::Iterator(handle))
+        }
+        Value::String(s) => {
+            let state = crate::IteratorState::String {
+                string: s.clone(),
+                index: 0,
+            };
+            let handle = ctx
+                .alloc_iterator_state(state, &[&input], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name: "Iterator.from",
+                    reason: "iterator allocation failed".to_string(),
+                })?;
+            Ok(Value::Iterator(handle))
+        }
+        _ => Err(crate::NativeError::TypeError {
+            name: "Iterator.from",
+            reason: "argument is not iterable".to_string(),
+        }),
     }
 }
 
@@ -2141,7 +2298,7 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 917;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 919;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 400 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

@@ -144,6 +144,11 @@ pub(crate) fn install_typed_array_entry(
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
+    // §23.2.6.1: each concrete TypedArray constructor inherits from
+    // %TypedArray%. The override is consulted by
+    // `Object.getPrototypeOf` / `__proto__` walks.
+    let abstract_ctor = ensure_abstract_typed_array_constructor(heap, global)?;
+    ctor.set_prototype_override(heap, Some(Value::NativeFunction(abstract_ctor)));
     // Also expose BYTES_PER_ELEMENT on the constructor (§23.2.6.1).
     let bpe_desc = PropertyDescriptor::data(
         Value::Number(NumberValue::from_i32(bpe)),
@@ -225,6 +230,68 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
 /// `%TypedArray%.prototype`. Hidden by a leading symbol-style
 /// `@@` prefix to avoid colliding with any user-visible global.
 const ABSTRACT_PROTO_SLOT: &str = "@@%TypedArrayPrototype%";
+
+/// Sentinel slot that holds the abstract `%TypedArray%` constructor
+/// function. Spec §23.2.1: this constructor is the [[Prototype]] of
+/// every concrete TypedArray constructor (Int8Array, Uint8Array …).
+const ABSTRACT_CTOR_SLOT: &str = "@@%TypedArray%";
+
+/// §23.2.1.1 — calling `%TypedArray%` directly always throws a
+/// `TypeError`. The abstract constructor is never observably
+/// instantiated.
+fn abstract_typed_array_call(
+    _ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    Err(NativeError::TypeError {
+        name: "TypedArray",
+        reason: "Abstract class TypedArray not directly constructable".to_string(),
+    })
+}
+
+fn ensure_abstract_typed_array_constructor(
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+) -> Result<crate::native_function::NativeFunction, JsSurfaceError> {
+    if let Some(Value::NativeFunction(nf)) = object::get(global, heap, ABSTRACT_CTOR_SLOT) {
+        return Ok(nf);
+    }
+    let abstract_proto = ensure_abstract_typed_array_prototype(heap, global)?;
+    let global_root = Value::Object(global);
+    let abstract_proto_root = Value::Object(abstract_proto);
+    let ctor = native_constructor_static_with_value_roots(
+        heap,
+        "TypedArray",
+        0,
+        abstract_typed_array_call,
+        &[&global_root, &abstract_proto_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let string_heap = crate::string::StringHeap::default();
+    // §23.2.2.3 %TypedArray%.prototype is non-writable,
+    // non-enumerable, non-configurable.
+    let proto_desc =
+        PropertyDescriptor::data(Value::Object(abstract_proto), false, false, false);
+    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+    }
+    // §23.2.3.2 %TypedArray%.prototype.constructor — writable,
+    // non-enumerable, configurable.
+    object::define_own_property(
+        abstract_proto,
+        heap,
+        "constructor",
+        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+    );
+    // Hide the abstract ctor under a non-enumerable global slot.
+    object::define_own_property(
+        global,
+        heap,
+        ABSTRACT_CTOR_SLOT,
+        PropertyDescriptor::data(Value::NativeFunction(ctor), false, false, false),
+    );
+    Ok(ctor)
+}
 
 fn ensure_abstract_typed_array_prototype(
     heap: &mut otter_gc::GcHeap,

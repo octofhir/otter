@@ -2129,8 +2129,13 @@ impl Interpreter {
                 }
                 Ok(stored.unwrap_or(Value::Null))
             }
-            Value::NativeFunction(_)
-            | Value::Function { .. }
+            Value::NativeFunction(nf) => {
+                if let Some(over) = nf.prototype_override(&self.gc_heap) {
+                    return Ok(over);
+                }
+                Ok(Value::Object(self.function_prototype_object()?))
+            }
+            Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_) => Ok(Value::Object(self.function_prototype_object()?)),

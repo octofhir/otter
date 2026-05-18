@@ -206,6 +206,13 @@ pub struct NativeFunctionBody {
     /// Ordinary own properties installed on native callables, such
     /// as `%Proxy%.revocable`.
     own_properties: JsObject,
+    /// Override for `[[Prototype]]`. Defaults to `None` so
+    /// `Object.getPrototypeOf` falls back to `%Function.prototype%`.
+    /// Spec-mandated overrides (e.g. each concrete TypedArray ctor
+    /// must inherit from `%TypedArray%`, §23.2.6) populate this slot
+    /// at bootstrap. Stored as a [`Value`] so the override can itself
+    /// be a callable (a NativeFunction such as `%TypedArray%`).
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for NativeFunctionBody {
@@ -222,6 +229,9 @@ impl otter_gc::SafeTraceable for NativeFunctionBody {
         trace_native_own_property(&self.length_property, visitor);
         let p = &self.own_properties as *const JsObject as *mut RawGc;
         visitor(p);
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
+        }
     }
 }
 
@@ -313,10 +323,35 @@ impl NativeFunction {
                     length_property: default_length_property(),
                     metadata,
                     own_properties,
+                    prototype_override: None,
                 },
                 &mut visit,
             )?,
         })
+    }
+
+    /// Spec-driven `[[Prototype]]` override. Concrete TypedArray
+    /// constructors point at `%TypedArray%` per §23.2.6.1.
+    /// <https://tc39.es/ecma262/#sec-properties-of-the-typedarray-constructors>
+    pub fn set_prototype_override(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        proto: Option<Value>,
+    ) {
+        let proto_clone = proto.clone();
+        let success = heap.with_payload(self.inner, |body| {
+            body.prototype_override = proto;
+            true
+        });
+        if success && let Some(p) = proto_clone {
+            heap.record_write(self.inner, &p);
+        }
+    }
+
+    /// Current `[[Prototype]]` override, if set.
+    #[must_use]
+    pub fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
+        heap.read_payload(self.inner, |body| body.prototype_override.clone())
     }
 
     /// Build a native function with a static name and an `Fn`

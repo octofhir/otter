@@ -472,47 +472,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
             });
         }
     };
-    // §22.2.3.2.4 `EscapeRegExpPattern(src, flags)` — emit a string
-    // that, when re-parsed as a Pattern, matches the same set of
-    // strings as the original. Empty source maps to `"(?:)"`; bare
-    // `/` and line terminators are escaped; everything else passes
-    // through.
-    let escaped = if raw.is_empty() {
-        "(?:)".to_string()
-    } else {
-        let mut out = String::with_capacity(raw.len());
-        let mut in_class = false;
-        let mut chars = raw.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    out.push('\\');
-                    if let Some(&next) = chars.peek() {
-                        out.push(next);
-                        chars.next();
-                    }
-                }
-                '[' => {
-                    in_class = true;
-                    out.push('[');
-                }
-                ']' => {
-                    in_class = false;
-                    out.push(']');
-                }
-                '/' if !in_class => {
-                    out.push('\\');
-                    out.push('/');
-                }
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\u{2028}' => out.push_str("\\u2028"),
-                '\u{2029}' => out.push_str("\\u2029"),
-                other => out.push(other),
-            }
-        }
-        out
-    };
+    let escaped = crate::regexp_prototype::escape_regexp_pattern(&raw);
     Ok(Value::String(
         JsString::from_str(&escaped, &string_heap).map_err(|_| oom("source"))?,
     ))

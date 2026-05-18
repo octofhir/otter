@@ -1794,10 +1794,14 @@ pub fn load_property(
     string_heap: &crate::string::StringHeap,
 ) -> Value {
     match name {
-        "source" => match JsString::from_str(&re.source(gc_heap), string_heap) {
-            Ok(s) => Value::String(s),
-            Err(_) => Value::Undefined,
-        },
+        "source" => {
+            let raw = re.source(gc_heap);
+            let escaped = escape_regexp_pattern(&raw);
+            match JsString::from_str(&escaped, string_heap) {
+                Ok(s) => Value::String(s),
+                Err(_) => Value::Undefined,
+            }
+        }
         "flags" => match JsString::from_str(&re.flags(gc_heap).to_js_string(), string_heap) {
             Ok(s) => Value::String(s),
             Err(_) => Value::Undefined,
@@ -1823,6 +1827,52 @@ pub fn store_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str,
     if name == "lastIndex" {
         re.set_last_index_value(gc_heap, value);
     }
+}
+
+/// §22.2.3.2.4 `EscapeRegExpPattern(src, flags)` — emit a string
+/// that, when re-parsed as a Pattern, matches the same set of
+/// strings as the original. Empty source maps to `"(?:)"`; bare
+/// `/` and line terminators are escaped; everything else passes
+/// through. Shared by `RegExp.prototype.source` /
+/// `RegExp.prototype.toString` / direct property loads.
+///
+/// <https://tc39.es/ecma262/#sec-escaperegexppattern>
+pub fn escape_regexp_pattern(raw: &str) -> String {
+    if raw.is_empty() {
+        return "(?:)".to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut in_class = false;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                out.push('\\');
+                if let Some(&next) = chars.peek() {
+                    out.push(next);
+                    chars.next();
+                }
+            }
+            '[' => {
+                in_class = true;
+                out.push('[');
+            }
+            ']' => {
+                in_class = false;
+                out.push(']');
+            }
+            '/' if !in_class => {
+                out.push('\\');
+                out.push('/');
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

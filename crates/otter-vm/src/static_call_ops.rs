@@ -1470,8 +1470,160 @@ impl Interpreter {
                 )?;
                 Ok(Some(Value::Array(array)))
             }
+            // §20.1.2.7 `Object.groupBy(items, callbackfn)` — groups
+            // an iterable into a null-prototype object keyed by the
+            // callback's return value. The foundation drives Array
+            // / array-like items directly; the spec's full
+            // `GetIterator` ladder is reachable but not exercised by
+            // the test262 buckets covered today.
+            //
+            // <https://tc39.es/ecma262/#sec-object.groupby>
+            M::GroupBy => Ok(Some(self.do_object_group_by(context, stack, args)?)),
             _ => Ok(None),
         }
+    }
+
+    fn do_object_group_by(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &SmallVec<[Frame; 8]>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        let items = args.first().cloned().unwrap_or(Value::Undefined);
+        let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+        if matches!(items, Value::Undefined | Value::Null) {
+            return Err(VmError::TypeError {
+                message: "Object.groupBy: items must be iterable".to_string(),
+            });
+        }
+        if !self.is_callable_runtime(&callback) {
+            return Err(VmError::TypeError {
+                message: "Object.groupBy: callback must be a function".to_string(),
+            });
+        }
+        let result = self.alloc_stack_rooted_object_with_extra_roots(stack, &[&items, &callback])?;
+        object::set_prototype(result, &mut self.gc_heap, None);
+
+        let items_snapshot: Vec<Value> = match &items {
+            Value::Array(arr) => {
+                crate::array::with_elements(*arr, &self.gc_heap, |elements| elements.to_vec())
+            }
+            Value::Object(obj) => {
+                let length = crate::object::get(*obj, &self.gc_heap, "length")
+                    .unwrap_or(Value::Undefined);
+                let length_n = crate::number::to_number_value(&length);
+                let length_usize = if length_n.is_nan() || length_n <= 0.0 {
+                    0
+                } else {
+                    length_n.min(9_007_199_254_740_991.0) as usize
+                };
+                let mut out: Vec<Value> = Vec::with_capacity(length_usize);
+                for i in 0..length_usize {
+                    let key = i.to_string();
+                    out.push(
+                        crate::object::get(*obj, &self.gc_heap, &key).unwrap_or(Value::Undefined),
+                    );
+                }
+                out
+            }
+            Value::String(s) => {
+                let mut out: Vec<Value> = Vec::new();
+                let units = s.to_utf16_vec();
+                for &u in &units {
+                    let unit_str = crate::JsString::from_utf16_units(&[u], &self.string_heap)
+                        .map_err(|_| VmError::TypeMismatch)?;
+                    out.push(Value::String(unit_str));
+                }
+                out
+            }
+            _ => {
+                return Err(VmError::TypeError {
+                    message: "Object.groupBy: items is not iterable".to_string(),
+                });
+            }
+        };
+
+        for (idx, item) in items_snapshot.iter().enumerate() {
+            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+            cb_args.push(item.clone());
+            cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx as f64)));
+            let key =
+                self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
+            let key_pk = self.to_property_key_sync(context, key)?;
+            let key_str = match key_pk {
+                crate::VmPropertyKey::Symbol(sym) => {
+                    let existing = crate::object::get_symbol(result, &self.gc_heap, &sym);
+                    let group = match existing {
+                        Some(Value::Array(arr)) => arr,
+                        _ => {
+                            let arr = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                                stack,
+                                Vec::new(),
+                                &[&Value::Object(result), item],
+                                &[args],
+                            )?;
+                            crate::object::set_symbol(
+                                result,
+                                &mut self.gc_heap,
+                                sym.clone(),
+                                Value::Array(arr),
+                            );
+                            arr
+                        }
+                    };
+                    let value_root = item.clone();
+                    let arr_value = Value::Array(group);
+                    let res_root = Value::Object(result);
+                    let roots = [&value_root, &arr_value, &res_root];
+                    let mut external_visit =
+                        |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                            for v in &roots {
+                                v.trace_value_slots(visitor);
+                            }
+                        };
+                    crate::array::push_with_roots(
+                        group,
+                        &mut self.gc_heap,
+                        item.clone(),
+                        &mut external_visit,
+                    )?;
+                    continue;
+                }
+                crate::VmPropertyKey::Atom(a) => a.name().to_string(),
+                crate::VmPropertyKey::String(s) => s.to_string(),
+                crate::VmPropertyKey::OwnedString(s) => s,
+            };
+            let existing = crate::object::get(result, &self.gc_heap, &key_str);
+            let group = match existing {
+                Some(Value::Array(arr)) => arr,
+                _ => {
+                    let arr = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        Vec::new(),
+                        &[&Value::Object(result), item],
+                        &[args],
+                    )?;
+                    crate::object::set(result, &mut self.gc_heap, &key_str, Value::Array(arr));
+                    arr
+                }
+            };
+            let value_root = item.clone();
+            let arr_value = Value::Array(group);
+            let res_root = Value::Object(result);
+            let roots = [&value_root, &arr_value, &res_root];
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for v in &roots {
+                    v.trace_value_slots(visitor);
+                }
+            };
+            crate::array::push_with_roots(
+                group,
+                &mut self.gc_heap,
+                item.clone(),
+                &mut external_visit,
+            )?;
+        }
+        Ok(Value::Object(result))
     }
 
     fn descriptor_to_object_stack_rooted(

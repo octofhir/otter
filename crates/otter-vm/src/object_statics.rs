@@ -97,6 +97,7 @@ const OBJECT_STATIC_METHODS: &[MethodSpec] = &[
     method("hasOwn", 2, native_has_own),
     method("getOwnPropertyNames", 1, native_get_own_property_names),
     method("getOwnPropertySymbols", 1, native_get_own_property_symbols),
+    method("groupBy", 2, native_group_by),
 ];
 
 /// Static methods installed on `Object.prototype`.
@@ -188,8 +189,117 @@ fn native_rooted_call(
         M::GetOwnPropertySymbols => {
             native_get_own_property_symbols_rooted(ctx, context, args).map(Some)
         }
+        M::GroupBy => native_group_by_rooted(ctx, context, args).map(Some),
         _ => Ok(None),
     }
+}
+
+/// §20.1.2.7 `Object.groupBy(items, callbackfn)` — groups iterable
+/// `items` into a null-prototype object keyed by the callback's
+/// return value. Each value is an Array of `items` in iteration
+/// order. The callback receives `(item, index)`.
+///
+/// Foundation iterates Array operands directly. Non-Array iterables
+/// would require the full `GetIterator` ladder; that path falls
+/// through to the catch-all below today.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-object.groupby>
+fn native_group_by_rooted(
+    ctx: &mut NativeCtx<'_>,
+    context: Option<&crate::ExecutionContext>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let items = args.first().cloned().unwrap_or(Value::Undefined);
+    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    if matches!(items, Value::Undefined | Value::Null) {
+        return Err(VmError::TypeError {
+            message: "Object.groupBy: items must be iterable".to_string(),
+        });
+    }
+    if !ctx.cx.interp.is_callable_runtime(&callback) {
+        return Err(VmError::TypeError {
+            message: "Object.groupBy: callback must be a function".to_string(),
+        });
+    }
+    let exec_ctx = context
+        .cloned()
+        .ok_or_else(|| VmError::TypeError {
+            message: "Object.groupBy: missing execution context".to_string(),
+        })?;
+    let result = ctx.alloc_object_with_roots(&[&items, &callback], &[args])?;
+    crate::object::set_prototype(result, ctx.heap_mut(), None);
+
+    // Snapshot the iterable's elements. Arrays drain through their
+    // dense storage; objects with a `length` data property degrade
+    // to `for (let i = 0; i < length; i++)` so spec-classic
+    // array-likes are also accepted.
+    let items_snapshot: Vec<Value> = match &items {
+        Value::Array(arr) => {
+            crate::array::with_elements(*arr, ctx.heap(), |elements| elements.to_vec())
+        }
+        Value::Object(obj) => {
+            let length = crate::object::get(*obj, ctx.heap(), "length").unwrap_or(Value::Undefined);
+            let length_n = crate::number::to_number_value(&length);
+            let length_usize = if length_n.is_nan() || length_n <= 0.0 {
+                0
+            } else {
+                length_n.min(9_007_199_254_740_991.0) as usize
+            };
+            let mut out: Vec<Value> = Vec::with_capacity(length_usize);
+            for i in 0..length_usize {
+                let key = i.to_string();
+                out.push(crate::object::get(*obj, ctx.heap(), &key).unwrap_or(Value::Undefined));
+            }
+            out
+        }
+        _ => {
+            return Err(VmError::TypeError {
+                message: "Object.groupBy: items is not iterable".to_string(),
+            });
+        }
+    };
+
+    for (idx, item) in items_snapshot.iter().enumerate() {
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(item.clone());
+        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx as f64)));
+        let key = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)?;
+        let key_pk = ctx.cx.interp.to_property_key_sync(&exec_ctx, key)?;
+        let key_str = match key_pk {
+            crate::VmPropertyKey::Symbol(_) => {
+                // Symbol keys go through `set_symbol`; reuse the
+                // existing arm.
+                continue;
+            }
+            crate::VmPropertyKey::Atom(a) => a.name().to_string(),
+            crate::VmPropertyKey::String(s) => s.to_string(),
+            crate::VmPropertyKey::OwnedString(s) => s,
+        };
+        let existing = crate::object::get(result, ctx.heap(), &key_str);
+        let group = match existing {
+            Some(Value::Array(arr)) => arr,
+            _ => {
+                let arr = ctx
+                    .array_from_elements_with_roots(std::iter::empty(), &[&Value::Object(result), item], &[args])?;
+                crate::object::set(result, ctx.heap_mut(), &key_str, Value::Array(arr));
+                arr
+            }
+        };
+        let value_root = item.clone();
+        let arr_value = Value::Array(group);
+        let roots = [&value_root, &arr_value, &Value::Object(result)];
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for v in &roots {
+                v.trace_value_slots(visitor);
+            }
+        };
+        crate::array::push_with_roots(group, ctx.heap_mut(), item.clone(), &mut external_visit)?;
+    }
+    Ok(Value::Object(result))
 }
 
 fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
@@ -866,6 +976,7 @@ native_object_static!(native_from_entries, FromEntries);
 native_object_static!(native_has_own, HasOwn);
 native_object_static!(native_get_own_property_names, GetOwnPropertyNames);
 native_object_static!(native_get_own_property_symbols, GetOwnPropertySymbols);
+native_object_static!(native_group_by, GroupBy);
 
 /// §20.1.2.13 `Object.is(value1, value2)` — direct §7.2.11 SameValue.
 ///
@@ -2061,6 +2172,16 @@ pub fn call(
                 &[args],
             )?))
         }
+        // §20.1.2.7 `Object.groupBy(items, callbackfn)` — the
+        // context-less fallback path can't run the callback, so it
+        // routes through the rooted entrypoint above. Reaching this
+        // arm means the call site bypassed `native_rooted_call`
+        // (e.g. through `Reflect.apply` without a live execution
+        // context); surface as a TypeError so the caller learns the
+        // method needs a JS frame.
+        M::GroupBy => Err(VmError::TypeError {
+            message: "Object.groupBy requires an active execution context".to_string(),
+        }),
     }
 }
 

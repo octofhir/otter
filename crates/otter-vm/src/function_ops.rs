@@ -1331,7 +1331,8 @@ impl Interpreter {
             | M::Keys
             | M::PreventExtensions
             | M::Seal
-            | M::Values => Ok(None),
+            | M::Values
+            | M::GroupBy => Ok(None),
         }
     }
 

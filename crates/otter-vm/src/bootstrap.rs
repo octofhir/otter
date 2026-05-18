@@ -2141,7 +2141,7 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 915;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 917;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 400 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
@@ -2170,7 +2170,7 @@ mod tests {
         // `copyWithin` / `toReversed` / `with` additions.
         assert_eq!(
             telemetry.native_functions_installed(),
-            127 + reflect::REFLECT_SPEC.methods.len(),
+            128 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

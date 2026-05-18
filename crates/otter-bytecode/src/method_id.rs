@@ -146,6 +146,7 @@ method_id_enum! {
         PreventExtensions = 16 => "preventExtensions",
         Seal = 17 => "seal",
         Values = 18 => "values",
+        GroupBy = 19 => "groupBy",
     }
 }
 

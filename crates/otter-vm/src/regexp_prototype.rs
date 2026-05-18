@@ -554,6 +554,80 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     )?))
 }
 
+/// §B.2.4.1 `RegExp.prototype.compile(pattern, flags)`. Re-initialises
+/// the receiver's pattern + flags in place per Annex B legacy
+/// requirement.
+///
+/// 1. Let `O` be the this value; reject non-RegExp.
+/// 2. If `pattern` is itself a RegExp: reject if `flags` is not
+///    `undefined`, then copy that RegExp's `[[OriginalSource]]` /
+///    `[[OriginalFlags]]`. Otherwise `P = pattern` (ToString) and
+///    `F = flags` (ToString).
+/// 3. Run `RegExpInitialize(O, P, F)` (§22.2.3.2) — invoked via
+///    [`JsRegExp::reinitialize`] which also resets `lastIndex`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-regexp.prototype.compile>
+fn impl_compile(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let re = *receiver_regexp(args)?;
+    let pattern_raw = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let flags_raw = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let (pattern_units, flags_str) = match pattern_raw {
+        Value::RegExp(other) => {
+            if !matches!(flags_raw, Value::Undefined) {
+                return Err(IntrinsicError::BadArgument {
+                    index: 1,
+                    reason: "Cannot supply flags when constructing one RegExp from another",
+                });
+            }
+            let heap = &*args.gc_heap;
+            (other.pattern_utf16(heap), other.flags(heap).to_js_string())
+        }
+        Value::Undefined => {
+            let flags_text = value_to_text(&flags_raw)?;
+            (Vec::<u16>::new(), flags_text)
+        }
+        other => {
+            let pattern_str = value_to_text(&other)?;
+            let pattern_units: Vec<u16> = pattern_str.encode_utf16().collect();
+            let flags_text = value_to_text(&flags_raw)?;
+            (pattern_units, flags_text)
+        }
+    };
+    re.reinitialize(args.gc_heap, &pattern_units, &flags_str)
+        .map_err(|err| IntrinsicError::BadArgument {
+            index: 0,
+            reason: match err {
+                crate::regexp::RegExpError::InvalidPattern { .. } => "invalid regular expression",
+                _ => "invalid regular expression flag",
+            },
+        })?;
+    Ok(args.receiver.clone())
+}
+
+/// Best-effort `ToString` for the inline coercion in
+/// `RegExp.prototype.compile`. Mirrors the primitive branch of
+/// §7.1.17 ToString — anything non-primitive returns
+/// `[object Object]` via `display_string`.
+fn value_to_text(value: &Value) -> Result<String, IntrinsicError> {
+    Ok(match value {
+        Value::String(s) => s.to_lossy_string(),
+        Value::Undefined => "undefined".to_string(),
+        Value::Null => "null".to_string(),
+        Value::Boolean(true) => "true".to_string(),
+        Value::Boolean(false) => "false".to_string(),
+        Value::Number(n) => n.to_display_string(),
+        Value::BigInt(b) => b.to_decimal_string(),
+        Value::Symbol(_) => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "cannot convert a Symbol to a string",
+            });
+        }
+        other => other.display_string(),
+    })
+}
+
 /// §22.2.6.8 `RegExp.prototype[@@match](string)` — invoked by
 /// `String.prototype.match(re)` when a user installs a custom
 /// matcher, and directly when user code calls
@@ -1780,6 +1854,7 @@ pub static REGEXP_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "exec"     / 1 => impl_exec,
             "test"     / 1 => impl_test,
             "toString" / 0 => impl_to_string,
+            "compile"  / 2 => impl_compile,
         )
     });
 

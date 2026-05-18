@@ -339,6 +339,12 @@ fn install_prototype_methods(
         NativeCall::Static(proto_to_string),
         Attr::builtin_function(),
     )?;
+    builder.method(
+        "compile",
+        2,
+        NativeCall::Static(proto_compile),
+        Attr::builtin_function(),
+    )?;
     Ok(())
 }
 
@@ -354,6 +360,65 @@ fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let result = proto_exec(ctx, args)?;
     Ok(Value::Boolean(!matches!(result, Value::Null)))
+}
+
+/// §B.2.4.1 `RegExp.prototype.compile(pattern, flags)` — native
+/// surface that mirrors the intrinsic-table dispatch path for users
+/// who call through `Function.prototype.call` / property reads.
+fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let re = receiver_regexp(ctx, "RegExp.prototype.compile")?;
+    let pattern_raw = args.first().cloned().unwrap_or(Value::Undefined);
+    let flags_raw = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let (pattern_units, flags_str) = match pattern_raw {
+        Value::RegExp(other) => {
+            if !matches!(flags_raw, Value::Undefined) {
+                return Err(NativeError::TypeError {
+                    name: "RegExp.prototype.compile",
+                    reason: "Cannot supply flags when constructing one RegExp from another"
+                        .to_string(),
+                });
+            }
+            let heap = ctx.heap();
+            (other.pattern_utf16(heap), other.flags(heap).to_js_string())
+        }
+        Value::Undefined => (Vec::<u16>::new(), value_to_text(&flags_raw, "RegExp.prototype.compile")?),
+        ref other => {
+            let pattern_str = value_to_text(other, "RegExp.prototype.compile")?;
+            let pattern_units: Vec<u16> = pattern_str.encode_utf16().collect();
+            let flags_text = value_to_text(&flags_raw, "RegExp.prototype.compile")?;
+            (pattern_units, flags_text)
+        }
+    };
+    re.reinitialize(ctx.heap_mut(), &pattern_units, &flags_str)
+        .map_err(|err| NativeError::TypeError {
+            name: "RegExp.prototype.compile",
+            reason: match err {
+                crate::regexp::RegExpError::InvalidPattern { message } => {
+                    format!("invalid regular expression: {message}")
+                }
+                _ => "invalid regular expression flag".to_string(),
+            },
+        })?;
+    Ok(Value::RegExp(re))
+}
+
+fn value_to_text(value: &Value, name: &'static str) -> Result<String, NativeError> {
+    Ok(match value {
+        Value::String(s) => s.to_lossy_string(),
+        Value::Undefined => "undefined".to_string(),
+        Value::Null => "null".to_string(),
+        Value::Boolean(true) => "true".to_string(),
+        Value::Boolean(false) => "false".to_string(),
+        Value::Number(n) => n.to_display_string(),
+        Value::BigInt(b) => b.to_decimal_string(),
+        Value::Symbol(_) => {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "cannot convert a Symbol to a string".to_string(),
+            });
+        }
+        other => other.display_string(),
+    })
 }
 
 fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

@@ -257,6 +257,42 @@ impl JsRegExp {
         })
     }
 
+    /// Re-initialize this regex with a new pattern and flags in
+    /// place. Mirrors the `RegExpInitialize` abstract operation that
+    /// `RegExp.prototype.compile` (§B.2.4.1) routes through. Resets
+    /// `lastIndex` to 0 per step 12 of `RegExpInitialize` (§22.2.3.2).
+    /// <https://tc39.es/ecma262/#sec-regexpinitialize>
+    pub fn reinitialize(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        pattern_utf16: &[u16],
+        flag_str: &str,
+    ) -> Result<(), RegExpError> {
+        let flags = RegExpFlags::parse(flag_str)?;
+        let source = String::from_utf16_lossy(pattern_utf16);
+        let engine_flags = Flags {
+            icase: flags.ignore_case,
+            multiline: flags.multiline,
+            dot_all: flags.dot_all,
+            unicode: flags.unicode,
+            unicode_sets: flags.unicode_sets,
+            ..Default::default()
+        };
+        let regex =
+            Regex::with_flags(&source, engine_flags).map_err(|e| RegExpError::InvalidPattern {
+                message: format!("{e}"),
+            })?;
+        let pattern_units = pattern_utf16.to_vec();
+        heap.with_payload(self.inner, |body| {
+            body.regex = regex;
+            body.pattern_utf16 = pattern_units;
+            body.source = source;
+            body.flags = flags;
+            *body.last_index.borrow_mut() = Value::Number(NumberValue::from_i32(0));
+        });
+        Ok(())
+    }
+
     /// Raw handle used by root tracing and write barriers.
     #[must_use]
     pub(crate) fn raw(&self) -> RawGc {

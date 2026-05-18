@@ -2044,16 +2044,16 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
             "from",
             Value::NativeFunction(from_fn),
         );
-        // §27.1.2 %IteratorPrototype% — install the iterator-helpers
-        // proposal methods on the prototype carried by the
-        // `Iterator` constructor placeholder. The handlers re-enter
-        // the runtime via existing `IteratorState` wrappers so the
-        // call-method fast path and reflective property access
-        // share behaviour.
         let prototype = match object::get(iterator_ctor, heap, "prototype") {
             Some(Value::Object(p)) => p,
             _ => return Ok(()),
         };
+        // §27.1.2 %IteratorPrototype% — install the iterator-helpers
+        // proposal methods on the prototype carried by the
+        // `Iterator` constructor. The handlers re-enter the
+        // runtime via existing `IteratorState` wrappers so the
+        // call-method fast path and reflective property access
+        // share behaviour.
         let proto_root = Value::Object(prototype);
         let install_proto =
             |heap: &mut otter_gc::GcHeap,
@@ -2249,7 +2249,7 @@ fn iterator_proto_take(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let source = iterator_receiver(ctx, "Iterator.prototype.take")?;
-    let n = iterator_arg_count(args, "Iterator.prototype.take")?;
+    let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.take")?;
     let source_value = Value::Iterator(source);
     let state = crate::IteratorState::Take {
         source,
@@ -2269,7 +2269,7 @@ fn iterator_proto_drop(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
-    let n = iterator_arg_count(args, "Iterator.prototype.drop")?;
+    let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.drop")?;
     let source_value = Value::Iterator(source);
     let state = crate::IteratorState::Drop {
         source,
@@ -2305,10 +2305,39 @@ fn iterator_proto_flat_map(
     Ok(Value::Iterator(handle))
 }
 
-fn iterator_arg_count(args: &[Value], name: &'static str) -> Result<u64, crate::NativeError> {
+fn iterator_arg_count_native(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<u64, crate::NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let n = crate::number::to_number_value(&arg);
-    if n.is_nan() || n < 0.0 {
+    // §27.5.1.2 step 3 — `numLimit = ? ToNumber(limit)`. Non-
+    // primitive operands route through `ToPrimitive(hint: number)`
+    // so `valueOf` / `toString` / `Symbol.toPrimitive` hooks fire.
+    let primitive = if crate::abstract_ops::is_primitive(&arg) {
+        arg
+    } else {
+        let (interp, exec) = ctx.interp_mut_and_context();
+        let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        interp
+            .evaluate_to_primitive(&exec, &arg, crate::abstract_ops::ToPrimitiveHint::Number)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?
+    };
+    let n = crate::number::to_number_value(&primitive);
+    if n.is_nan() {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "argument must be a non-negative integer".to_string(),
+        });
+    }
+    let trunc = n.trunc();
+    if trunc < 0.0 {
         return Err(crate::NativeError::RangeError {
             name,
             reason: "argument must be a non-negative integer".to_string(),
@@ -2317,7 +2346,7 @@ fn iterator_arg_count(args: &[Value], name: &'static str) -> Result<u64, crate::
     if n.is_infinite() {
         return Ok(u64::MAX);
     }
-    Ok(n.trunc() as u64)
+    Ok(trunc as u64)
 }
 
 fn iterator_proto_to_array(

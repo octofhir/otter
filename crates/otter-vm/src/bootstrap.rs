@@ -1658,19 +1658,20 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
 
     /// §20.1.1.1 Object ( [ value ] ).
     ///
-    /// - With no args / null / undefined: `OrdinaryObjectCreate(%Object.prototype%)`.
-    ///   The new object's `[[Prototype]]` is wired to the realm's
-    ///   `Object.prototype` so the inherited `toString` / `valueOf` /
-    ///   `hasOwnProperty` etc. resolve.
-    /// - With an object-typed arg: ToObject is the identity, so we
-    ///   return the value untouched.
-    /// - With a primitive arg (Boolean / Number / String / Symbol /
-    ///   BigInt): the spec calls ToObject which produces a fresh
-    ///   wrapper. We currently return the primitive unchanged here —
-    ///   wrappers are produced by the dedicated constructors
-    ///   (`new Number(x)` etc.). Primitive operands are uncommon for
-    ///   the bare-call form and don't crash; `valueOf()` / equality
-    ///   continue to work on the primitive.
+    /// 1. If `NewTarget` is neither `undefined` nor the active
+    ///    `Object` function, return `OrdinaryCreateFromConstructor(NewTarget,
+    ///    %Object.prototype%)`. (Subclass path — `class C extends Object {}`.)
+    /// 2. If `value` is `undefined` or `null`, return
+    ///    `OrdinaryObjectCreate(%Object.prototype%)`.
+    /// 3. Return `! ToObject(value)`.
+    ///
+    /// `ToObject(value)` wraps a primitive with the appropriate
+    /// `[[BooleanData]]` / `[[NumberData]]` / `[[StringData]]` /
+    /// `[[SymbolData]]` / `[[BigIntData]]` slot so the wrapper's
+    /// inherited `toString` / `valueOf` observe the original value.
+    /// Object-typed operands return as-is.
+    ///
+    /// <https://tc39.es/ecma262/#sec-object-value>
     fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         match args.first() {
             None | Some(Value::Undefined | Value::Null) => {
@@ -1684,7 +1685,77 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 }
                 Ok(Value::Object(obj))
             }
-            Some(value) => Ok(value.clone()),
+            Some(value) => {
+                // §7.1.18 ToObject — wrap a primitive with its
+                // %X.prototype% and the matching internal data slot
+                // (so the wrapper's inherited `toString` / `valueOf`
+                // unbox correctly). Object-typed operands fall through
+                // and return unchanged. BigInt and Symbol carry their
+                // primitive identity here because their wrapper data
+                // slots aren't materialised on this engine yet —
+                // returning the primitive preserves the existing
+                // `Object(bigint).toString()` / `Object(symbol)`
+                // behaviour rather than producing a wrapper whose
+                // prototype methods would `TypeError`.
+                let v = value.clone();
+                match &v {
+                    Value::Boolean(b) => {
+                        let b = *b;
+                        let interp = ctx.interp_mut();
+                        let proto = interp
+                            .primitive_wrapper_prototype("Boolean")
+                            .map_err(|err| NativeError::TypeError {
+                                name: "Object",
+                                reason: err.to_string(),
+                            })?;
+                        let obj = interp
+                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                            .map_err(|err| NativeError::TypeError {
+                                name: "Object",
+                                reason: err.to_string(),
+                            })?;
+                        crate::object::set_boolean_data(obj, &mut interp.gc_heap, b);
+                        Ok(Value::Object(obj))
+                    }
+                    Value::Number(n) => {
+                        let n = *n;
+                        let interp = ctx.interp_mut();
+                        let proto = interp
+                            .primitive_wrapper_prototype("Number")
+                            .map_err(|err| NativeError::TypeError {
+                                name: "Object",
+                                reason: err.to_string(),
+                            })?;
+                        let obj = interp
+                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                            .map_err(|err| NativeError::TypeError {
+                                name: "Object",
+                                reason: err.to_string(),
+                            })?;
+                        crate::object::set_number_data(obj, &mut interp.gc_heap, n);
+                        Ok(Value::Object(obj))
+                    }
+                    Value::String(s) => {
+                        let s = s.clone();
+                        let interp = ctx.interp_mut();
+                        let proto = interp
+                            .primitive_wrapper_prototype("String")
+                            .map_err(|err| NativeError::TypeError {
+                                name: "Object",
+                                reason: err.to_string(),
+                            })?;
+                        let obj = interp
+                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                            .map_err(|err| NativeError::TypeError {
+                                name: "Object",
+                                reason: err.to_string(),
+                            })?;
+                        crate::object::set_string_data(obj, &mut interp.gc_heap, s);
+                        Ok(Value::Object(obj))
+                    }
+                    _ => Ok(v),
+                }
+            }
         }
     }
 

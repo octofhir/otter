@@ -310,7 +310,18 @@ pub(crate) fn compile_statement(
                 f.generator,
                 false,
             )?;
-            let storage = cx.declare_binding(&name, false, span)?;
+            // §B.3.2 / §B.3.3 web-compat — in sloppy mode a nested
+            // function declaration whose name collides with an
+            // existing `var` (or pre-hoisted) binding in the same
+            // scope reuses that binding rather than redeclaring.
+            // The `var f = 123; if (true) function f(){}` shape at
+            // global scope is the canonical case.
+            //
+            // <https://tc39.es/ecma262/#sec-block-level-function-declarations-web-legacy-compatibility-semantics>
+            let storage = match cx.lookup_in_current_scope(&name) {
+                Some(info) => info.storage,
+                None => cx.declare_binding(&name, false, span)?,
+            };
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
             emit_make_callable(cx, tmp, const_idx, &captures, false, span);

@@ -244,6 +244,46 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
 
     let tag_sym = well_known.get(WellKnown::ToStringTag);
 
+    // §22.2.6.{1-4} — instance accessor getters live on
+    // `%TypedArray%.prototype` (not the per-kind prototypes).
+    // Each getter validates the receiver carries a TypedArray
+    // internal slot and reads the corresponding field. The
+    // setter side is undefined per spec.
+    if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
+        let abstract_proto_root = Value::Object(abstract_proto);
+        let install_accessor =
+            |heap: &mut otter_gc::GcHeap,
+             name: &'static str,
+             getter_name: &'static str,
+             getter: crate::native_function::NativeFastFn|
+             -> Result<(), JsSurfaceError> {
+                let f = crate::bootstrap::native_static_with_value_roots(
+                    heap,
+                    getter_name,
+                    0,
+                    getter,
+                    &[&abstract_proto_root],
+                )
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+                object::define_own_property(
+                    abstract_proto,
+                    heap,
+                    name,
+                    PropertyDescriptor::accessor(
+                        Some(Value::NativeFunction(f)),
+                        None,
+                        false,
+                        true,
+                    ),
+                );
+                Ok(())
+            };
+        install_accessor(heap, "buffer", "get buffer", ta_buffer_getter)?;
+        install_accessor(heap, "byteLength", "get byteLength", ta_byte_length_getter)?;
+        install_accessor(heap, "byteOffset", "get byteOffset", ta_byte_offset_getter)?;
+        install_accessor(heap, "length", "get length", ta_length_getter)?;
+    }
+
     // §22.2.6 — `%TypedArray%.prototype[@@toStringTag]` is an
     // accessor on the abstract prototype. The getter returns the
     // receiver's [[TypedArrayName]] (the kind name string) or
@@ -383,6 +423,61 @@ fn drain_iterable_into_values(
         collected.push(v);
     }
     Ok(collected)
+}
+
+/// §22.2.6.1 `get %TypedArray%.prototype.buffer` — return the
+/// receiver's [[ViewedArrayBuffer]] or raise TypeError on
+/// non-TypedArray receivers.
+fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    match ctx.this_value() {
+        Value::TypedArray(t) => Ok(Value::ArrayBuffer(t.buffer().clone())),
+        _ => Err(NativeError::TypeError {
+            name: "TypedArray.prototype.buffer",
+            reason: "this is not a TypedArray".to_string(),
+        }),
+    }
+}
+
+/// §22.2.6.2 `get %TypedArray%.prototype.byteLength`.
+fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    match ctx.this_value() {
+        Value::TypedArray(t) => {
+            let n = t.byte_length();
+            Ok(Value::Number(crate::number::NumberValue::from_f64(n as f64)))
+        }
+        _ => Err(NativeError::TypeError {
+            name: "TypedArray.prototype.byteLength",
+            reason: "this is not a TypedArray".to_string(),
+        }),
+    }
+}
+
+/// §22.2.6.3 `get %TypedArray%.prototype.byteOffset`.
+fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    match ctx.this_value() {
+        Value::TypedArray(t) => {
+            let n = t.byte_offset();
+            Ok(Value::Number(crate::number::NumberValue::from_f64(n as f64)))
+        }
+        _ => Err(NativeError::TypeError {
+            name: "TypedArray.prototype.byteOffset",
+            reason: "this is not a TypedArray".to_string(),
+        }),
+    }
+}
+
+/// §22.2.6.18 `get %TypedArray%.prototype.length`.
+fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    match ctx.this_value() {
+        Value::TypedArray(t) => {
+            let n = t.length();
+            Ok(Value::Number(crate::number::NumberValue::from_f64(n as f64)))
+        }
+        _ => Err(NativeError::TypeError {
+            name: "TypedArray.prototype.length",
+            reason: "this is not a TypedArray".to_string(),
+        }),
+    }
 }
 
 /// §22.2.6.15 `get %TypedArray%.prototype [ @@toStringTag ]` — return

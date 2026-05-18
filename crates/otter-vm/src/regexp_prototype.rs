@@ -1267,6 +1267,130 @@ fn species_constructor_runtime(
     })
 }
 
+/// §22.2.6.9 `RegExp.prototype[@@matchAll](string)`. Resolves
+/// `SpeciesConstructor(rx, %RegExp%)` (§7.3.21), builds the matcher
+/// with the receiver's flags, snapshots the receiver's `lastIndex`
+/// into the matcher, and pre-computes every match via
+/// `RegExpExec(matcher, S)`. The match arrays are wrapped in a
+/// `Value::Iterator` so each `next()` yields one entry — the
+/// foundation's iterator-protocol surface drives the
+/// `{ value, done }` shape directly.
+///
+/// `lastIndex` is cached at call time per §22.2.6.9 step 2.f — the
+/// matcher's `lastIndex` is read from the receiver before iteration
+/// starts, so mutating `rx.lastIndex` between the @@matchAll call
+/// and the iterator drain is observably ignored.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@matchall>
+/// - <https://tc39.es/ecma262/#sec-createregexpstringiterator>
+pub fn native_regexp_symbol_match_all(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let name = "RegExp.prototype[@@matchAll]";
+    let receiver = ctx.this_value().clone();
+    if !is_object_kind(&receiver) {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "called on a non-object receiver".to_string(),
+        });
+    }
+    let string_arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
+
+    let default_ctor = {
+        let interp = &ctx.cx.interp;
+        crate::object::get(interp.global_this, &interp.gc_heap, "RegExp").ok_or_else(|| {
+            crate::NativeError::TypeError {
+                name,
+                reason: "%RegExp% intrinsic missing".to_string(),
+            }
+        })?
+    };
+    let c = species_constructor_runtime(ctx, &receiver, &default_ctor, name)?;
+
+    let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
+    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string();
+    let global = flags_str.contains('g');
+    let full_unicode = flags_str.contains('u') || flags_str.contains('v');
+
+    let flags_js = {
+        let string_heap = ctx.cx.interp.string_heap_clone();
+        JsString::from_str(&flags_str, &string_heap).map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "out of memory".to_string(),
+        })?
+    };
+    let matcher = {
+        let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        ctor_args.push(receiver.clone());
+        ctor_args.push(Value::String(flags_js));
+        let (interp, exec_ctx) = ctx.interp_mut_and_context();
+        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        interp
+            .run_construct_sync(&exec_ctx, &c, c.clone(), ctor_args)
+            .map_err(vm_err_to_native(name))?
+    };
+
+    // Step 2.f — snapshot rx.lastIndex into matcher.
+    let last_index_val = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
+    let last_index = to_length_runtime(ctx, &last_index_val, name)? as f64;
+    set_property_runtime(
+        ctx,
+        &matcher,
+        "lastIndex",
+        Value::Number(NumberValue::from_f64(last_index)),
+        name,
+    )?;
+
+    let s_units = s.to_utf16_vec();
+    let mut out: Vec<Value> = Vec::new();
+    loop {
+        let result = regexp_exec_runtime(ctx, &matcher, &s, name)?;
+        if matches!(result, Value::Null) {
+            break;
+        }
+        out.push(result.clone());
+        if !global {
+            break;
+        }
+        let matched_val = get_property_runtime(ctx, &result, "0", name)?;
+        let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
+        if matched_str.len() == 0 {
+            let li_val = get_property_runtime(ctx, &matcher, "lastIndex", name)?;
+            let this_index = to_length_runtime(ctx, &li_val, name)? as usize;
+            let next_index = advance_string_index(&s_units, this_index, full_unicode);
+            set_property_runtime(
+                ctx,
+                &matcher,
+                "lastIndex",
+                Value::Number(NumberValue::from_f64(next_index as f64)),
+                name,
+            )?;
+        }
+    }
+
+    let arr = ctx
+        .array_from_elements_with_roots(out.iter().cloned(), &[&matcher], &[out.as_slice()])
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "array allocation failed".to_string(),
+        })?;
+    let iter_state = crate::IteratorState::Array { array: arr, index: 0 };
+    let arr_value = Value::Array(arr);
+    let handle = ctx
+        .alloc_iterator_state(iter_state, &[&arr_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::Iterator(handle))
+}
+
 /// §22.2.6.14 `RegExp.prototype[@@split](string, limit)`.
 ///
 /// Walks the spec-mandated `SpeciesConstructor` → `Construct(C, [rx,

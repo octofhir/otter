@@ -3239,6 +3239,109 @@ fn compile_function_full(
 /// assignments (`||=`, `&&=`, `??=`) are deferred (they need
 /// short-circuit lowering) and short-circuit out with a clear
 /// `Unsupported` diagnostic.
+/// `true` when `name` is forbidden as an `IdentifierReference` in
+/// strict mode per §13.1.1 (FutureReservedWord) plus the `eval` /
+/// `arguments` early errors. Escaped reserved words are caught by
+/// the same check because oxc reports the decoded `StringValue` in
+/// `IdentifierReference.name`.
+fn is_strict_reserved_binding_name(name: &str) -> bool {
+    matches!(
+        name,
+        "eval"
+            | "arguments"
+            | "implements"
+            | "interface"
+            | "let"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "yield"
+    )
+}
+
+/// Walk an `AssignmentTarget` AST (destructuring patterns recurse
+/// through nested array / object targets) and raise
+/// `CompileError::Syntax` on any strict-reserved identifier used as
+/// an `AssignmentTargetIdentifier`. Caller decides when strict-mode
+/// applies.
+fn validate_strict_assignment_target(
+    target: &oxc_ast::ast::AssignmentTarget<'_>,
+) -> Result<(), CompileError> {
+    use oxc_ast::ast::{
+        AssignmentTarget, AssignmentTargetProperty, AssignmentTargetRest,
+    };
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => {
+            let name = id.name.as_str();
+            if is_strict_reserved_binding_name(name) {
+                return Err(CompileError::Syntax {
+                    messages: vec![format!(
+                        "SyntaxError: '{name}' is not a valid assignment target in strict mode"
+                    )],
+                    diagnostics: Vec::new(),
+                });
+            }
+        }
+        AssignmentTarget::ArrayAssignmentTarget(arr) => {
+            for elem in &arr.elements {
+                if let Some(t) = elem {
+                    validate_strict_assignment_target_maybe_default(t)?;
+                }
+            }
+            if let Some(rest) = &arr.rest {
+                let AssignmentTargetRest { target, .. } = rest.as_ref();
+                validate_strict_assignment_target(target)?;
+            }
+        }
+        AssignmentTarget::ObjectAssignmentTarget(obj) => {
+            for prop in &obj.properties {
+                match prop {
+                    AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(p) => {
+                        let name = p.binding.name.as_str();
+                        if is_strict_reserved_binding_name(name) {
+                            return Err(CompileError::Syntax {
+                                messages: vec![format!(
+                                    "SyntaxError: '{name}' is not a valid assignment target in strict mode"
+                                )],
+                                diagnostics: Vec::new(),
+                            });
+                        }
+                    }
+                    AssignmentTargetProperty::AssignmentTargetPropertyProperty(p) => {
+                        validate_strict_assignment_target_maybe_default(&p.binding)?;
+                    }
+                }
+            }
+            if let Some(rest) = &obj.rest {
+                let AssignmentTargetRest { target, .. } = rest.as_ref();
+                validate_strict_assignment_target(target)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_strict_assignment_target_maybe_default(
+    target: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
+) -> Result<(), CompileError> {
+    use oxc_ast::ast::AssignmentTargetMaybeDefault;
+    match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+            validate_strict_assignment_target(&d.binding)
+        }
+        other => {
+            if let Some(t) = other.as_assignment_target() {
+                validate_strict_assignment_target(t)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 fn compile_assignment(
     cx: &mut Compiler,
     a: &oxc_ast::ast::AssignmentExpression<'_>,
@@ -3472,6 +3575,21 @@ fn compile_assignment(
         };
         cx.emit_store_element(arr_reg, idx_reg, new_value, span);
         return Ok(new_value);
+    }
+    // §13.15.1 Static Semantics: Early Errors — destructuring
+    // AssignmentTarget identifiers cannot bind `eval` / `arguments`
+    // or any strict-mode-reserved word (the `IdentifierReference`
+    // grammar excludes them, and §13.1.1 makes the early error
+    // explicit). Walk the LHS before lowering so the runner sees a
+    // parse-phase SyntaxError instead of running the destructuring.
+    if cx.is_strict
+        && matches!(
+            &a.left,
+            AssignmentTarget::ArrayAssignmentTarget(_)
+                | AssignmentTarget::ObjectAssignmentTarget(_)
+        )
+    {
+        validate_strict_assignment_target(&a.left)?;
     }
     // §13.15.5 DestructuringAssignmentEvaluation — array / object
     // destructuring assignment targets recurse through the helper.

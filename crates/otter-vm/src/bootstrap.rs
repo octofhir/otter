@@ -2321,10 +2321,24 @@ pub fn install_iterator_well_knowns_post_bootstrap(
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
-    let Some(Value::Object(iterator_ctor)) = object::get(global, heap, "Iterator") else {
-        return Ok(());
+    let prototype = match object::get(global, heap, "Iterator") {
+        Some(Value::NativeFunction(ctor)) => ctor
+            .own_property_descriptor(heap, string_heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|d| match d.kind {
+                crate::object::DescriptorKind::Data {
+                    value: Value::Object(p),
+                } => Some(p),
+                _ => None,
+            }),
+        Some(Value::Object(iterator_ctor)) => match object::get(iterator_ctor, heap, "prototype") {
+            Some(Value::Object(p)) => Some(p),
+            _ => None,
+        },
+        _ => None,
     };
-    let Some(Value::Object(prototype)) = object::get(iterator_ctor, heap, "prototype") else {
+    let Some(prototype) = prototype else {
         return Ok(());
     };
     let proto_root = Value::Object(prototype);
@@ -2727,7 +2741,10 @@ fn iterator_proto_reduce(
     } else {
         Value::Undefined
     };
-    let mut consumed_initial = !has_initial;
+    // `has_acc` flips to true once `acc` holds a real value — either
+    // the caller-supplied initial value or the first yielded element
+    // when no initial was passed.
+    let mut has_acc = has_initial;
     let mut idx: f64 = 0.0;
     loop {
         let (v, done) = ctx
@@ -2741,9 +2758,9 @@ fn iterator_proto_reduce(
         if done {
             break;
         }
-        if !consumed_initial {
+        if !has_acc {
             acc = v;
-            consumed_initial = true;
+            has_acc = true;
             idx += 1.0;
             continue;
         }
@@ -2761,7 +2778,7 @@ fn iterator_proto_reduce(
             })?;
         idx += 1.0;
     }
-    if !consumed_initial {
+    if !has_acc {
         return Err(crate::NativeError::TypeError {
             name: "Iterator.prototype.reduce",
             reason: "reduce of empty iterator with no initial value".to_string(),

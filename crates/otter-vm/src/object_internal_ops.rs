@@ -530,12 +530,17 @@ impl Interpreter {
                     key,
                 )
             }
-            Value::NativeFunction(native) => {
-                let Some(key) = key.string_name() else {
-                    return Ok(None);
-                };
-                Ok(native.own_property_descriptor(&self.gc_heap, &self.string_heap, key)?)
-            }
+            Value::NativeFunction(native) => Ok(match key {
+                VmPropertyKey::Symbol(sym) => {
+                    native.own_symbol_property_descriptor(&self.gc_heap, sym)
+                }
+                _ => {
+                    let key = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    native.own_property_descriptor(&self.gc_heap, &self.string_heap, key)?
+                }
+            }),
             _ => Ok(None),
         }
     }
@@ -783,6 +788,22 @@ impl Interpreter {
                         .string_name()
                         .expect("non-symbol key has string spelling");
                     object::define_own_property_partial(*obj, &mut self.gc_heap, k, descriptor)
+                }
+            }),
+            Value::NativeFunction(native) => Ok(match key {
+                VmPropertyKey::Symbol(sym) => {
+                    native.define_own_symbol_property(&mut self.gc_heap, sym, descriptor)
+                }
+                _ => {
+                    let k = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    native.define_own_property(
+                        &mut self.gc_heap,
+                        &self.string_heap,
+                        k,
+                        descriptor.complete_for_new_property(),
+                    )
                 }
             }),
             // §10.4.2 ArrayExoticObject [[DefineOwnProperty]] —
@@ -1731,11 +1752,30 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => {
                 let value = match key {
-                    VmPropertyKey::Symbol(sym) => self
-                        .function_prototype_object()
-                        .ok()
-                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                        .unwrap_or(Value::Undefined),
+                    VmPropertyKey::Symbol(sym) => {
+                        match native.own_symbol_property_descriptor(&self.gc_heap, sym) {
+                            Some(object::PropertyDescriptor {
+                                kind: object::DescriptorKind::Data { value },
+                                ..
+                            }) => value,
+                            Some(object::PropertyDescriptor {
+                                kind: object::DescriptorKind::Accessor { getter, .. },
+                                ..
+                            }) => {
+                                return Ok(match getter {
+                                    Some(getter) if abstract_ops::is_callable(&getter) => {
+                                        VmGetOutcome::InvokeGetter { getter }
+                                    }
+                                    _ => VmGetOutcome::Value(Value::Undefined),
+                                });
+                            }
+                            None => self
+                                .function_prototype_object()
+                                .ok()
+                                .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                                .unwrap_or(Value::Undefined),
+                        }
+                    }
                     _ if key
                         .string_name()
                         .is_some_and(|key| key == "name" || key == "length") =>
@@ -2504,6 +2544,9 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => Ok(match key.string_name() {
                 Some(key) => native.delete_own_property(&mut self.gc_heap, key),
+                None if let VmPropertyKey::Symbol(sym) = key => {
+                    native.delete_own_symbol_property(&mut self.gc_heap, sym)
+                }
                 None => true,
             }),
             Value::BoundFunction(bound) => Ok(match key.string_name() {

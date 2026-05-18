@@ -331,6 +331,9 @@ impl Interpreter {
                 Value::Function { function_id } | Value::Closure { function_id, .. },
                 Value::String(s),
             ) => self.ordinary_function_delete_own_property(*function_id, &s.to_lossy_string()),
+            (Value::NativeFunction(native), Value::Symbol(sym)) => {
+                native.delete_own_symbol_property(&mut self.gc_heap, &sym)
+            }
             (Value::NativeFunction(native), Value::String(s)) => {
                 native.delete_own_property(&mut self.gc_heap, &s.to_lossy_string())
             }

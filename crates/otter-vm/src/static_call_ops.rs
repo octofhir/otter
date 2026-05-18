@@ -1285,12 +1285,21 @@ impl Interpreter {
                                 .expect("non-symbol property key has string spelling"),
                         ),
                     },
-                    Some(Value::NativeFunction(native)) => {
-                        let Some(key) = key.string_name() else {
-                            return Ok(Some(Value::Undefined));
-                        };
-                        native.own_property_descriptor(self.gc_heap(), &self.string_heap, key)?
-                    }
+                    Some(Value::NativeFunction(native)) => match &key {
+                        VmPropertyKey::Symbol(sym) => {
+                            native.own_symbol_property_descriptor(self.gc_heap(), sym)
+                        }
+                        _ => {
+                            let key = key
+                                .string_name()
+                                .expect("non-symbol property key has string spelling");
+                            native.own_property_descriptor(
+                                self.gc_heap(),
+                                &self.string_heap,
+                                key,
+                            )?
+                        }
+                    },
                     Some(Value::Boolean(_))
                     | Some(Value::Number(_))
                     | Some(Value::String(_))

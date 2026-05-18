@@ -680,12 +680,14 @@ fn native_get_own_property_descriptor_rooted(
                 crate::object::get_own_symbol_descriptor(class.statics(ctx.heap()), ctx.heap(), sym)
             }
         },
-        Some(Value::NativeFunction(native)) => {
-            let PropertyKey::String(key) = &key else {
-                return Ok(Value::Undefined);
-            };
-            native.own_property_descriptor(ctx.heap(), &ctx.cx.interp.string_heap_clone(), key)?
-        }
+        Some(Value::NativeFunction(native)) => match &key {
+            PropertyKey::String(key) => native.own_property_descriptor(
+                ctx.heap(),
+                &ctx.cx.interp.string_heap_clone(),
+                key,
+            )?,
+            PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
+        },
         // §20.1.2.7 — primitive operands are coerced via ToObject;
         // the wrapper carries no own data property for arbitrary
         // keys (except String which exposes indexed characters and
@@ -1176,8 +1178,15 @@ fn native_prototype_property_is_enumerable(
             }
         }
         Value::NativeFunction(native) => {
-            let _ = native;
-            false
+            let key = expect_property_key(args.first())
+                .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+            let desc = match key {
+                PropertyKey::String(key) => native
+                    .own_property_descriptor(ctx.heap(), &ctx.cx.interp.string_heap_clone(), &key)
+                    .map_err(|err| object_native_error("propertyIsEnumerable", err.into()))?,
+                PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), &sym),
+            };
+            desc.as_ref().is_some_and(PropertyDescriptor::enumerable)
         }
         Value::BoundFunction(bound) => {
             let key = expect_property_key(args.first())
@@ -1568,7 +1577,10 @@ fn native_function_has_own(
             .ok()
             .flatten()
             .is_some(),
-        Ok(PropertyKey::Symbol(_)) | Err(_) => false,
+        Ok(PropertyKey::Symbol(sym)) => native
+            .own_symbol_property_descriptor(gc_heap, &sym)
+            .is_some(),
+        Err(_) => false,
     }
 }
 
@@ -1691,20 +1703,22 @@ pub fn call(
                     Ok(Value::ClassConstructor(*class))
                 }
                 Some(Value::NativeFunction(native)) => {
-                    let PropertyKey::String(key) = &key else {
+                    let ok = match &key {
+                        PropertyKey::String(key) => native.define_own_property(
+                            gc_heap,
+                            string_heap,
+                            key,
+                            descriptor.complete_for_new_property(),
+                        ),
+                        PropertyKey::Symbol(sym) => {
+                            native.define_own_symbol_property(gc_heap, sym, descriptor)
+                        }
+                    };
+                    if !ok {
                         return Err(VmError::TypeError {
                             message: format!(
                                 "Cannot define property '{}' on function {}",
                                 key.label(),
-                                native.name(gc_heap)
-                            ),
-                        });
-                    };
-                    let completed = descriptor.complete_for_new_property();
-                    if !native.define_own_property(gc_heap, string_heap, key, completed) {
-                        return Err(VmError::TypeError {
-                            message: format!(
-                                "Cannot define property '{key}' on function {}",
                                 native.name(gc_heap)
                             ),
                         });

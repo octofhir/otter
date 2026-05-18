@@ -153,10 +153,11 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     Ok(())
 }
 
-/// Install `@@toStringTag = "Promise"` on `Promise.prototype`.
+/// Install Promise well-known symbol properties.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.prototype-@@tostringtag>
+/// - <https://tc39.es/ecma262/#sec-get-promise-@@species>
 pub fn install_promise_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
     string_heap: &crate::string::StringHeap,
@@ -168,6 +169,31 @@ pub fn install_promise_well_knowns_post_bootstrap(
     let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "Promise") else {
         return Ok(());
     };
+    let global_root = Value::Object(global);
+    let ctor_root = Value::NativeFunction(ctor);
+    let species_getter = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "get [Symbol.species]",
+        0,
+        promise_species_get,
+        &[&global_root, &ctor_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    if !ctor.define_own_symbol_property(
+        heap,
+        &well_known.get(WellKnown::Species),
+        PartialPropertyDescriptor {
+            get: Some(Value::NativeFunction(species_getter)),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    ) {
+        return Err(JsSurfaceError::DefinePropertyFailed(
+            "Promise[Symbol.species]",
+        ));
+    }
+
     let descriptor = ctor
         .own_property_descriptor(heap, string_heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
@@ -195,6 +221,14 @@ pub fn install_promise_well_knowns_post_bootstrap(
         },
     );
     Ok(())
+}
+
+/// §27.2.4.10 `get Promise[@@species]`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-get-promise-@@species>
+fn promise_species_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(ctx.this_value().clone())
 }
 
 // ---------------------------------------------------------------

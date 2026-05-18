@@ -590,6 +590,18 @@ impl NativeFunction {
         })
     }
 
+    /// Return an own symbol-keyed property descriptor stored on the
+    /// native function object's ordinary property bag.
+    pub(crate) fn own_symbol_property_descriptor(
+        &self,
+        heap: &otter_gc::GcHeap,
+        key: &crate::symbol::JsSymbol,
+    ) -> Option<PropertyDescriptor> {
+        heap.read_payload(self.inner, |body| {
+            crate::object::get_own_symbol_descriptor(body.own_properties, heap, key)
+        })
+    }
+
     /// Return enumerable own string keys for the function object's
     /// metadata properties. Built-in `name` / `length` are not
     /// enumerable; overridden descriptors participate according to
@@ -689,6 +701,18 @@ impl NativeFunction {
         success
     }
 
+    /// Define or redefine a symbol-keyed own property on the native
+    /// function object's ordinary property bag.
+    pub(crate) fn define_own_symbol_property(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        key: &crate::symbol::JsSymbol,
+        descriptor: crate::object::PartialPropertyDescriptor,
+    ) -> bool {
+        let obj = heap.read_payload(self.inner, |body| body.own_properties);
+        crate::object::define_own_symbol_property_partial(obj, heap, key, descriptor)
+    }
+
     /// Delete a configurable own metadata property.
     pub(crate) fn delete_own_property(&self, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
         if key != "name" && key != "length" {
@@ -716,6 +740,17 @@ impl NativeFunction {
             *slot = NativeOwnProperty::Deleted;
             true
         })
+    }
+
+    /// Delete a configurable symbol-keyed own property from the
+    /// native function object's ordinary property bag.
+    pub(crate) fn delete_own_symbol_property(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        key: &crate::symbol::JsSymbol,
+    ) -> bool {
+        let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
+        crate::object::delete_symbol(own_properties, heap, key)
     }
 
     /// Clone the call target and captures so the caller can invoke

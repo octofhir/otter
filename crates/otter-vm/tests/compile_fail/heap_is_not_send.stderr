@@ -22,7 +22,7 @@ note: required because it appears within the type `VecDeque<*mut GcHeader>`
   |
   | pub struct VecDeque<
   |            ^^^^^^^^
-note: required because it appears within the type `MarkingState`
+note: required because it appears within the type `otter_gc::marking::MarkingState`
  --> $WORKSPACE/crates/otter-gc/src/marking.rs
   |
   | pub struct MarkingState {

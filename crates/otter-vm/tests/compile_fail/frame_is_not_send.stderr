@@ -8,7 +8,7 @@ error[E0277]: `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>` cannot be sent b
    |
    = help: within `Frame`, the trait `Send` is not implemented for `Rc<[otter_gc::compressed::Gc<UpvalueCellBody>]>`
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -28,7 +28,7 @@ error[E0277]: `Rc<str>` cannot be sent between threads safely
    |
    = help: within `Frame`, the trait `Send` is not implemented for `Rc<str>`
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -58,7 +58,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -88,7 +88,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -118,37 +118,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
-   |
-   | pub struct Frame {
-   |            ^^^^^
-note: required by a bound in `assert_send`
-  --> tests/compile_fail/frame_is_not_send.rs:6:19
-   |
- 6 | fn assert_send<T: Send>(_t: T) {}
-   |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<Cell<f64>>` cannot be sent between threads safely
-  --> tests/compile_fail/frame_is_not_send.rs:11:17
-   |
-11 |     assert_send(frame);
-   |     ----------- ^^^^^ `Rc<Cell<f64>>` cannot be sent between threads safely
-   |     |
-   |     required by a bound introduced by this call
-   |
-   = help: within `Frame`, the trait `Send` is not implemented for `Rc<Cell<f64>>`
-note: required because it appears within the type `JsDate`
-  --> src/date/mod.rs
-   |
-   | pub struct JsDate {
-   |            ^^^^^^
-note: required because it appears within the type `otter_vm::Value`
-  --> src/lib.rs
-   |
-   | pub enum Value {
-   |          ^^^^^
-note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -178,37 +148,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
-   |
-   | pub struct Frame {
-   |            ^^^^^
-note: required by a bound in `assert_send`
-  --> tests/compile_fail/frame_is_not_send.rs:6:19
-   |
- 6 | fn assert_send<T: Send>(_t: T) {}
-   |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `Rc<ArrayBufferBody>` cannot be sent between threads safely
-  --> tests/compile_fail/frame_is_not_send.rs:11:17
-   |
-11 |     assert_send(frame);
-   |     ----------- ^^^^^ `Rc<ArrayBufferBody>` cannot be sent between threads safely
-   |     |
-   |     required by a bound introduced by this call
-   |
-   = help: within `Frame`, the trait `Send` is not implemented for `Rc<ArrayBufferBody>`
-note: required because it appears within the type `JsArrayBuffer`
-  --> src/binary/array_buffer.rs
-   |
-   | pub struct JsArrayBuffer {
-   |            ^^^^^^^^^^^^^
-note: required because it appears within the type `otter_vm::Value`
-  --> src/lib.rs
-   |
-   | pub enum Value {
-   |          ^^^^^
-note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -238,7 +178,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -268,7 +208,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -298,7 +238,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -333,7 +273,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -368,7 +308,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -403,7 +343,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -438,7 +378,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -473,7 +413,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -508,7 +448,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -543,7 +483,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -578,7 +518,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -613,7 +553,42 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
+  --> src/frame_state.rs
+   |
+   | pub struct Frame {
+   |            ^^^^^
+note: required by a bound in `assert_send`
+  --> tests/compile_fail/frame_is_not_send.rs:6:19
+   |
+ 6 | fn assert_send<T: Send>(_t: T) {}
+   |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `Rc<LocalBody>` cannot be sent between threads safely
+  --> tests/compile_fail/frame_is_not_send.rs:11:17
+   |
+11 |     assert_send(frame);
+   |     ----------- ^^^^^ `Rc<LocalBody>` cannot be sent between threads safely
+   |     |
+   |     required by a bound introduced by this call
+   |
+   = help: within `Frame`, the trait `Send` is not implemented for `Rc<LocalBody>`
+note: required because it appears within the type `BufferStorage`
+  --> src/binary/array_buffer.rs
+   |
+   | pub enum BufferStorage {
+   |          ^^^^^^^^^^^^^
+note: required because it appears within the type `JsArrayBuffer`
+  --> src/binary/array_buffer.rs
+   |
+   | pub struct JsArrayBuffer {
+   |            ^^^^^^^^^^^^^
+note: required because it appears within the type `otter_vm::Value`
   --> src/lib.rs
+   |
+   | pub enum Value {
+   |          ^^^^^
+note: required because it appears within the type `Frame`
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -653,7 +628,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -693,7 +668,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -733,7 +708,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -773,7 +748,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -813,7 +788,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^
@@ -863,7 +838,7 @@ note: required because it appears within the type `otter_vm::Value`
    | pub enum Value {
    |          ^^^^^
 note: required because it appears within the type `Frame`
-  --> src/lib.rs
+  --> src/frame_state.rs
    |
    | pub struct Frame {
    |            ^^^^^

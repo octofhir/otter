@@ -2,9 +2,15 @@ error[E0425]: cannot find type `TraceTable` in crate `otter_gc`
  --> tests/compile_fail/root_trace_table_import_rejected.rs:2:34
   |
 2 |     let _table: Option<otter_gc::TraceTable> = None;
-  |                                  ^^^^^^^^^^ help: a trait with a similar name exists: `Traceable`
+  |                                  ^^^^^^^^^^
   |
  ::: $WORKSPACE/crates/otter-gc/src/trace.rs
   |
   | pub trait Traceable: 'static {
   | ---------------------------- similarly named trait `Traceable` defined here
+  |
+help: a trait with a similar name exists
+  |
+2 -     let _table: Option<otter_gc::TraceTable> = None;
+2 +     let _table: Option<otter_gc::Traceable> = None;
+  |

@@ -60,7 +60,41 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
                     method_id::JsonMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result = json::call(method, &args, &self.string_heap, &mut self.gc_heap)
+                // §25.5.1 step 1 — `JText = ? ToString(text)`. Run
+                // the ToPrimitive(hint: string) ladder on a
+                // non-string parse operand so user
+                // `Symbol.toPrimitive` / `toString` / `valueOf`
+                // hooks fire before the SyntaxError check.
+                let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+                if matches!(method, method_id::JsonMethod::Parse)
+                    && let Some(slot) = coerced.first_mut()
+                    && !matches!(slot, Value::String(_))
+                {
+                    let primitive = if crate::abstract_ops::is_primitive(slot) {
+                        slot.clone()
+                    } else {
+                        self.evaluate_to_primitive(
+                            context,
+                            slot,
+                            crate::abstract_ops::ToPrimitiveHint::String,
+                        )?
+                    };
+                    let s = match primitive {
+                        Value::String(s) => s,
+                        Value::Symbol(_) => {
+                            return Err(VmError::TypeError {
+                                message: "JSON.parse: cannot convert a Symbol to a string"
+                                    .to_string(),
+                            });
+                        }
+                        other => crate::string::JsString::from_str(
+                            &other.display_string(),
+                            &self.string_heap,
+                        )?,
+                    };
+                    *slot = Value::String(s);
+                }
+                let result = json::call(method, &coerced, &self.string_heap, &mut self.gc_heap)
                     .map_err(json_to_vm_error)?;
                 finish_static_call(frame, dst, result)
             }
@@ -186,6 +220,7 @@ impl Interpreter {
 
     pub(crate) fn run_json_static_call_operands(
         &mut self,
+        context: Option<&ExecutionContext>,
         stack: &mut SmallVec<[Frame; 8]>,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -195,6 +230,47 @@ impl Interpreter {
             decode_static_call(frame, operands, 1, 2, 3)?
         };
         let method = method_id::JsonMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
+        // §25.5.1 step 1 — `JText = ? ToString(text)`. Run the
+        // ToPrimitive(hint: string) ladder on a non-string parse
+        // operand so user `Symbol.toPrimitive` / `toString` /
+        // `valueOf` hooks fire before the SyntaxError check.
+        let args: SmallVec<[Value; 4]> = if matches!(method, method_id::JsonMethod::Parse) {
+            let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+            if let Some(slot) = coerced.first_mut()
+                && !matches!(slot, Value::String(_))
+            {
+                let primitive = if crate::abstract_ops::is_primitive(slot) {
+                    slot.clone()
+                } else if let Some(context) = context {
+                    self.evaluate_to_primitive(
+                        context,
+                        slot,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )?
+                } else {
+                    return Err(VmError::TypeError {
+                        message: "JSON.parse argument 0 must be a string".to_string(),
+                    });
+                };
+                let s = match primitive {
+                    Value::String(s) => s,
+                    Value::Symbol(_) => {
+                        return Err(VmError::TypeError {
+                            message: "JSON.parse: cannot convert a Symbol to a string"
+                                .to_string(),
+                        });
+                    }
+                    other => crate::string::JsString::from_str(
+                        &other.display_string(),
+                        &self.string_heap,
+                    )?,
+                };
+                *slot = Value::String(s);
+            }
+            coerced
+        } else {
+            args.iter().cloned().collect()
+        };
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {

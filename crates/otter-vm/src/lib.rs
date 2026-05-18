@@ -4726,7 +4726,7 @@ impl Interpreter {
                     unreachable!("register binary ops handled earlier in this loop")
                 }
                 Op::JsonCall => {
-                    self.run_json_static_call_operands(stack, operands)?;
+                    self.run_json_static_call_operands(Some(context), stack, operands)?;
                     continue;
                 }
                 Op::ArrayBufferCall => {
@@ -6939,7 +6939,7 @@ mod tests {
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
         interp
-            .run_json_static_call_operands(&mut stack, operands.as_slice())
+            .run_json_static_call_operands(None, &mut stack, operands.as_slice())
             .expect("JSON.parse");
 
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;

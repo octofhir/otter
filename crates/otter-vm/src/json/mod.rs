@@ -219,7 +219,75 @@ pub(crate) fn call_with_roots(
 }
 
 fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Parse, args)
+    let coerced = coerce_json_parse_args(ctx, args)?;
+    native_json_call(ctx, otter_bytecode::method_id::JsonMethod::Parse, &coerced)
+}
+
+/// §25.5.1 step 1 — `JText = ? ToString(text)`. Non-string `text`
+/// arguments coerce through the spec ToPrimitive (hint:string) +
+/// ToString ladder so a `JSON.parse({ toString(){ return '...' } })`
+/// observes the user hook.
+fn coerce_json_parse_args(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
+    let string_heap = ctx.interp_mut().string_heap_clone();
+    let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    if let Some(slot) = out.first_mut() {
+        let s = match slot {
+            Value::String(s) => s.clone(),
+            Value::Symbol(_) => {
+                return Err(NativeError::TypeError {
+                    name: "parse",
+                    reason: "cannot convert a Symbol to a string".to_string(),
+                });
+            }
+            ref primitive if crate::abstract_ops::is_primitive(primitive) => {
+                let text = primitive.display_string();
+                JsString::from_str(&text, &string_heap).map_err(|_| NativeError::TypeError {
+                    name: "parse",
+                    reason: "out of memory".to_string(),
+                })?
+            }
+            ref non_primitive => {
+                let (interp, exec) = ctx.interp_mut_and_context();
+                let exec = exec.ok_or_else(|| NativeError::TypeError {
+                    name: "parse",
+                    reason: "missing execution context".to_string(),
+                })?;
+                let primitive = interp
+                    .evaluate_to_primitive(
+                        &exec,
+                        non_primitive,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )
+                    .map_err(|e| NativeError::TypeError {
+                        name: "parse",
+                        reason: e.to_string(),
+                    })?;
+                match primitive {
+                    Value::String(s) => s,
+                    Value::Symbol(_) => {
+                        return Err(NativeError::TypeError {
+                            name: "parse",
+                            reason: "cannot convert a Symbol to a string".to_string(),
+                        });
+                    }
+                    other => {
+                        let text = other.display_string();
+                        JsString::from_str(&text, &string_heap).map_err(|_| {
+                            NativeError::TypeError {
+                                name: "parse",
+                                reason: "out of memory".to_string(),
+                            }
+                        })?
+                    }
+                }
+            }
+        };
+        *slot = Value::String(s);
+    }
+    Ok(out)
 }
 
 fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

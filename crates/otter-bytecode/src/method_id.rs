@@ -166,6 +166,8 @@ method_id_enum! {
         NumberIsFinite = 9 => "Number.isFinite",
         NumberIsInteger = 10 => "Number.isInteger",
         NumberIsSafeInteger = 11 => "Number.isSafeInteger",
+        Escape = 12 => "escape",
+        Unescape = 13 => "unescape",
     }
 }
 

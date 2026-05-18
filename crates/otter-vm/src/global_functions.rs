@@ -105,7 +105,110 @@ pub fn call(
             let out = uri_decode(&coerce_to_string(args.first()), true)?;
             js_string(&out, heap)
         }
+        // §B.2.1.1 `escape(string)` — legacy AnnexB encoder. Walks
+        // the UTF-16 code units; preserves the spec's "static
+        // unencoded" set, emits `%XX` for code points below 256,
+        // and `%uXXXX` for the rest.
+        M::Escape => js_string(&legacy_escape(&coerce_to_utf16(args.first())), heap),
+        // §B.2.1.2 `unescape(string)` — legacy AnnexB decoder.
+        // Recognises `%XX` and `%uXXXX` sequences, copies other
+        // code units unchanged.
+        M::Unescape => {
+            let units = coerce_to_utf16(args.first());
+            let decoded = legacy_unescape(&units);
+            Ok(Value::String(
+                JsString::from_utf16_units(&decoded, heap).map_err(|_| VmError::TypeMismatch)?,
+            ))
+        }
     }
+}
+
+/// Coerce an argument to a UTF-16 buffer. Mirrors `coerce_to_string`
+/// but preserves the spec's "string of code units" view that
+/// `escape` / `unescape` walk.
+fn coerce_to_utf16(arg: Option<&Value>) -> Vec<u16> {
+    match arg {
+        None | Some(Value::Undefined) => "undefined".encode_utf16().collect(),
+        Some(Value::String(s)) => s.to_utf16_vec(),
+        Some(other) => other.display_string().encode_utf16().collect(),
+    }
+}
+
+/// §B.2.1.1 `escape(string)` — emit ASCII alphanumerics plus the
+/// static "unencoded" set verbatim. Anything else turns into
+/// `%XX` (single-byte code points) or `%uXXXX` (everything else).
+fn legacy_escape(units: &[u16]) -> String {
+    const HEX: &[u8] = b"0123456789ABCDEF";
+    fn is_unescaped(c: u16) -> bool {
+        if c < 128 {
+            let b = c as u8;
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'@' | b'*' | b'_' | b'+' | b'-' | b'.' | b'/')
+        } else {
+            false
+        }
+    }
+    let mut out = String::with_capacity(units.len());
+    for &c in units {
+        if is_unescaped(c) {
+            out.push(c as u8 as char);
+        } else if c < 256 {
+            out.push('%');
+            out.push(HEX[(c >> 4) as usize] as char);
+            out.push(HEX[(c & 0x0F) as usize] as char);
+        } else {
+            out.push('%');
+            out.push('u');
+            out.push(HEX[((c >> 12) & 0x0F) as usize] as char);
+            out.push(HEX[((c >> 8) & 0x0F) as usize] as char);
+            out.push(HEX[((c >> 4) & 0x0F) as usize] as char);
+            out.push(HEX[(c & 0x0F) as usize] as char);
+        }
+    }
+    out
+}
+
+/// §B.2.1.2 `unescape(string)` — invert `legacy_escape`. Walks
+/// the code-unit buffer once; copies any code unit that isn't part
+/// of a well-formed `%XX` or `%uXXXX` escape verbatim. Malformed
+/// escapes are preserved literally (spec quirk — `%G` stays `%G`).
+fn legacy_unescape(units: &[u16]) -> Vec<u16> {
+    fn hex_u16(c: u16) -> Option<u16> {
+        match c as u32 {
+            v @ (0x30..=0x39) => Some(v as u16 - 0x30),
+            v @ (0x41..=0x46) => Some(v as u16 - 0x41 + 10),
+            v @ (0x61..=0x66) => Some(v as u16 - 0x61 + 10),
+            _ => None,
+        }
+    }
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        if units[i] == b'%' as u16 {
+            if i + 5 < units.len() && units[i + 1] == b'u' as u16 {
+                if let (Some(a), Some(b), Some(c), Some(d)) = (
+                    hex_u16(units[i + 2]),
+                    hex_u16(units[i + 3]),
+                    hex_u16(units[i + 4]),
+                    hex_u16(units[i + 5]),
+                ) {
+                    out.push((a << 12) | (b << 8) | (c << 4) | d);
+                    i += 6;
+                    continue;
+                }
+            }
+            if i + 2 < units.len() {
+                if let (Some(hi), Some(lo)) = (hex_u16(units[i + 1]), hex_u16(units[i + 2])) {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(units[i]);
+        i += 1;
+    }
+    out
 }
 
 fn coerce_to_string(arg: Option<&Value>) -> String {

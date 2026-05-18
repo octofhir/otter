@@ -1455,6 +1455,39 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             })
         }
 
+        // §B.2.1.1 / §B.2.1.2 — AnnexB legacy `escape` / `unescape`
+        // globals. Same dispatcher path as the URI quartet above.
+        fn global_escape(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let heap = ctx.interp_mut().string_heap_clone();
+            crate::global_functions::call(
+                otter_bytecode::method_id::GlobalMethod::Escape,
+                args,
+                &heap,
+            )
+            .map_err(|err| NativeError::TypeError {
+                name: "escape",
+                reason: err.to_string(),
+            })
+        }
+        fn global_unescape(
+            ctx: &mut NativeCtx<'_>,
+            args: &[Value],
+        ) -> Result<Value, NativeError> {
+            let heap = ctx.interp_mut().string_heap_clone();
+            crate::global_functions::call(
+                otter_bytecode::method_id::GlobalMethod::Unescape,
+                args,
+                &heap,
+            )
+            .map_err(|err| NativeError::TypeError {
+                name: "unescape",
+                reason: err.to_string(),
+            })
+        }
+
         let global_methods: &[(&'static str, u8, crate::native_function::NativeFastFn)] = &[
             ("parseInt", 2, number_parse_int_native),
             ("parseFloat", 1, number_parse_float_native),
@@ -1464,6 +1497,8 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             ("encodeURIComponent", 1, global_encode_uri_component),
             ("decodeURI", 1, global_decode_uri),
             ("decodeURIComponent", 1, global_decode_uri_component),
+            ("escape", 1, global_escape),
+            ("unescape", 1, global_unescape),
         ];
         let mut global_builder = ObjectBuilder::from_object_with_value_roots(
             heap,

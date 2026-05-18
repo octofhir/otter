@@ -45,6 +45,39 @@ pub(crate) fn hoist_var_names_in_stmt<'a>(stmt: &Statement<'a>, out: &mut Vec<St
                 collect_pattern_var_names(&declarator.id, out);
             }
         }
+        // §B.3.3 (web-compat) — in sloppy mode, a block-nested
+        // FunctionDeclaration must also surface as a `var` binding
+        // in the containing function / script / eval scope so the
+        // canonical shape
+        // `{ function f(){} } f()` resolves `f` after the block
+        // exits. The block-level lex binding is separately created
+        // by the inner BlockStatement scope.
+        // <https://tc39.es/ecma262/#sec-block-level-function-declarations-web-legacy-compatibility-semantics>
+        Statement::FunctionDeclaration(f) if !f.declare => {
+            if let Some(id) = &f.id {
+                out.push(id.name.as_str().to_string());
+            }
+        }
+        Statement::IfStatement(s)
+            if matches!(s.consequent, Statement::FunctionDeclaration(_))
+                || s.alternate
+                    .as_ref()
+                    .is_some_and(|a| matches!(a, Statement::FunctionDeclaration(_))) =>
+        {
+            if let Statement::FunctionDeclaration(f) = &s.consequent
+                && !f.declare
+                && let Some(id) = &f.id
+            {
+                out.push(id.name.as_str().to_string());
+            }
+            if let Some(alt) = &s.alternate
+                && let Statement::FunctionDeclaration(f) = alt
+                && !f.declare
+                && let Some(id) = &f.id
+            {
+                out.push(id.name.as_str().to_string());
+            }
+        }
         // §16.2.3.7 ExportEntry — `export var x` shares the
         // module's `var`-hoisted scope: the name must be
         // pre-declared at the module-init top, exactly as for a

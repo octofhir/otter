@@ -677,11 +677,27 @@ impl Interpreter {
                 out.extend(named);
                 out
             }
-            _ => {
+            // §7.1.18 ToObject — `null` / `undefined` throw a
+            // TypeError. Other primitives wrap into their boxed
+            // form which has no own enumerable string-keyed
+            // properties (except `String`, where the code units
+            // surface as indexed slots).
+            Value::Null | Value::Undefined => {
                 return Err(VmError::TypeError {
                     message: "Object.defineProperties properties must be an object".to_string(),
                 });
             }
+            Value::String(s) => {
+                let mut out: Vec<(String, Value)> = Vec::new();
+                let units = s.to_utf16_vec();
+                for (i, &u) in units.iter().enumerate() {
+                    let unit_str = crate::JsString::from_utf16_units(&[u], &self.string_heap)
+                        .map_err(|_| VmError::TypeMismatch)?;
+                    out.push((i.to_string(), Value::String(unit_str)));
+                }
+                out
+            }
+            _ => Vec::new(),
         };
         for (key, desc_value) in entries {
             let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;

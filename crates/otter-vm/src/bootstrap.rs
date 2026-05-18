@@ -1002,6 +1002,9 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         global,
         well_known,
     )?;
+    // §27.1.2 — `Iterator.prototype[@@iterator]` (returns this) and
+    // `[@@toStringTag] = "Iterator"`.
+    install_iterator_well_knowns_post_bootstrap(heap, string_heap, global, well_known)?;
     // §25.1.5 — `ArrayBuffer.prototype[@@toStringTag]`.
     crate::bootstrap_array_buffer::install_array_buffer_well_knowns_post_bootstrap(
         heap,
@@ -2132,6 +2135,15 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         // call-method fast path and reflective property access
         // share behaviour.
         let proto_root = Value::Object(prototype);
+        // §27.1.2: `%IteratorPrototype%.[[Prototype]]` is
+        // `%Object.prototype%` so reflective walks
+        // (`Object.getPrototypeOf(Iterator.prototype) === Object.prototype`)
+        // terminate at the realm-wide Object root.
+        if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+            && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+        {
+            object::set_prototype(prototype, heap, Some(object_proto));
+        }
         let install_proto = |heap: &mut otter_gc::GcHeap,
                              name: &'static str,
                              length: u8,
@@ -2155,6 +2167,75 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         install_proto(heap, "find", 1, iterator_proto_find)?;
         Ok(())
     }
+}
+
+/// §27.1.2.1 `Iterator.prototype[@@iterator]` — returns the
+/// receiver unchanged so any iterator value is itself iterable.
+///
+/// <https://tc39.es/ecma262/#sec-iteratorprototype-%symbol.iterator%>
+fn iterator_proto_symbol_iterator(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    Ok(ctx.this_value().clone())
+}
+
+/// Post-bootstrap pass that installs the symbol-keyed members of
+/// `%Iterator.prototype%`: `@@iterator` (returns `this`) and
+/// `@@toStringTag = "Iterator"`. Runs after the well-known symbol
+/// table is materialised in the same phase that installs
+/// `@@toStringTag` on TypedArray prototypes.
+pub fn install_iterator_well_knowns_post_bootstrap(
+    heap: &mut otter_gc::GcHeap,
+    string_heap: &crate::string::StringHeap,
+    global: JsObject,
+    well_known: &crate::symbol::WellKnownSymbols,
+) -> Result<(), JsSurfaceError> {
+    use crate::symbol::WellKnown;
+    let Some(Value::Object(iterator_ctor)) = object::get(global, heap, "Iterator") else {
+        return Ok(());
+    };
+    let Some(Value::Object(prototype)) = object::get(iterator_ctor, heap, "prototype") else {
+        return Ok(());
+    };
+    let proto_root = Value::Object(prototype);
+    let symbol_iter_fn = native_static_with_value_roots(
+        heap,
+        "[Symbol.iterator]",
+        0,
+        iterator_proto_symbol_iterator,
+        &[&proto_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let iter_sym = well_known.get(WellKnown::Iterator);
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &iter_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::NativeFunction(symbol_iter_fn)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    let tag_sym = well_known.get(WellKnown::ToStringTag);
+    let tag = crate::string::JsString::from_str("Iterator", string_heap)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        &tag_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::String(tag)),
+            writable: Some(false),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    Ok(())
 }
 
 fn iterator_receiver(

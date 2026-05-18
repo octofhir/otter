@@ -362,6 +362,13 @@ impl Interpreter {
             }
             Value::DataView(_) => "DataView",
             Value::TypedArray(t) => t.kind().name(),
+            // §27.1.2 / §27.5: synthesized Iterator and Generator
+            // values inherit from `Iterator.prototype` for the
+            // iterator-helpers surface (`map` / `filter` / `take` /
+            // `drop` / `flatMap` / `toArray` / `forEach` / `reduce` /
+            // `some` / `every` / `find`).
+            // <https://tc39.es/ecma262/#sec-properties-of-the-iterator-prototype-object>
+            Value::Iterator(_) | Value::Generator(_) => "Iterator",
             // §20.1.2.10 Object.getPrototypeOf accepts primitives
             // by routing through ToObject (§7.1.18), so we hand
             // primitive values their own constructor's

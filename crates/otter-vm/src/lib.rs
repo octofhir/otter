@@ -2161,7 +2161,9 @@ impl Interpreter {
             | Value::Promise(_)
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
-            | Value::TypedArray(_) => match self.intrinsic_prototype_object_for(value) {
+            | Value::TypedArray(_)
+            | Value::Iterator(_)
+            | Value::Generator(_) => match self.intrinsic_prototype_object_for(value) {
                 Some(o) => Ok(Value::Object(o)),
                 None => Ok(Value::Null),
             },

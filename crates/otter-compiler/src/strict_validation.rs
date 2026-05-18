@@ -547,10 +547,8 @@ where
             }
         }
         BindingPattern::ArrayPattern(arr) => {
-            for elem in &arr.elements {
-                if let Some(p) = elem {
-                    for_each_bound_identifier(p, emit);
-                }
+            for p in arr.elements.iter().flatten() {
+                for_each_bound_identifier(p, emit);
             }
             if let Some(rest) = &arr.rest {
                 for_each_bound_identifier(&rest.argument, emit);

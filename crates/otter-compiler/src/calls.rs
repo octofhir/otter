@@ -1,0 +1,1073 @@
+//! Call-expression and spread-call lowering helpers.
+//!
+//! # Contents
+//! - method calls
+//! - spread calls
+//! - Function method fast paths
+//! - argument list compilation
+//! - array spreading
+//!
+//! # Invariants
+//! - Argument registers are emitted in source order.
+//!
+//! # See also
+//! - `builtins_call` and `chain`
+
+use crate::*;
+
+/// Lower a call expression. Three forms are supported:
+///
+/// - `receiver.method(args...)` — emits [`Op::CallMethodValue`].
+///   The runtime branches by receiver kind (string / array
+///   intrinsics, plain object property dispatch, or
+///   `Function.prototype.{call, apply, bind}` for callables).
+/// - `callee.{call, apply, bind}(...)` with a syntactically obvious
+///   call shape — lowered directly to [`Op::CallWithThis`] /
+///   [`Op::BindFunction`] when the argument list can be flattened at
+///   compile time. Dynamic `apply` argument lists stay on
+///   [`Op::CallMethodValue`] so the VM performs the spec
+///   `CreateListFromArrayLike` coercion.
+/// - `callee(args...)` (free call) — emits [`Op::Call`]; the callee
+///   receives `this = undefined`.
+///
+/// Computed-method access, `new`, and spread arguments are
+/// deferred to later tasks.
+pub(crate) fn compile_method_call(
+    cx: &mut Compiler,
+    call: &oxc_ast::ast::CallExpression<'_>,
+) -> Result<u16, CompileError> {
+    let span = (call.span.start, call.span.end);
+    let callee = unwrap_ts_expr(&call.callee);
+    // `super(args...)` — direct super-constructor call. Only valid
+    // inside a derived-class constructor; the upvalue lookup will
+    // surface a clear diagnostic when used elsewhere.
+    if let Expression::Super(_) = callee {
+        return compile_super_call(cx, &call.arguments, span);
+    }
+    // `super.foo(args...)` — invoke a parent prototype method with
+    // `this` bound to the current receiver.
+    if let Expression::StaticMemberExpression(member) = callee
+        && matches!(member.object, Expression::Super(_))
+    {
+        return compile_super_method_call(cx, member.property.name.as_str(), &call.arguments, span);
+    }
+    // `import.meta.resolve(specifier)` — sync URL join against the
+    // active module's URL. HTML spec returns a string; foundation
+    // matches that shape via `Op::ImportMetaResolve`.
+    // <https://html.spec.whatwg.org/multipage/webappapis.html#hostmetagetimportmetaproperties>
+    if let Expression::StaticMemberExpression(member) = callee
+        && let Expression::MetaProperty(meta) = &member.object
+        && meta.meta.name.as_str() == "import"
+        && meta.property.name.as_str() == "meta"
+        && member.property.name.as_str() == "resolve"
+    {
+        if call.arguments.len() != 1 {
+            return Err(CompileError::Unsupported {
+                node: format!("import.meta.resolve/{}", call.arguments.len()),
+                span,
+            });
+        }
+        let arg = call.arguments[0]
+            .as_expression()
+            .ok_or(CompileError::Unsupported {
+                node: "import.meta.resolve: spread argument".to_string(),
+                span,
+            })?;
+        let spec_reg = compile_expr(cx, arg, span)?;
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::ImportMetaResolve,
+            [Operand::Register(dst), Operand::Register(spec_reg)],
+            span,
+        );
+        return Ok(dst);
+    }
+    // Bare `Error("msg")` / `TypeError("msg")` / etc. without
+    // `new` is treated like the matching `new <Kind>("msg")` per
+    // ES spec §20.5.1.1 — same lowering.
+    if let Expression::Identifier(id) = callee
+        && cx.lookup_binding(id.name.as_str()).is_none()
+        && find_module_import_binding(cx, id.name.as_str()).is_none()
+        && is_builtin_error_class_name(id.name.as_str())
+        && builtin_error_construct_fast_path_applies(id.name.as_str(), &call.arguments)
+    {
+        return compile_builtin_error_construct(cx, id.name.as_str(), &call.arguments, span);
+    }
+    let has_spread = call
+        .arguments
+        .iter()
+        .any(|arg| matches!(arg, oxc_ast::ast::Argument::SpreadElement(_)));
+    if has_spread {
+        return compile_spread_call(cx, callee, &call.arguments, span);
+    }
+    if let Expression::StaticMemberExpression(member) = callee {
+        // `ArrayBuffer.isView(arg)` routes through the real
+        // `NativeFunction` installed by `bootstrap_array_buffer` —
+        // `Op::ArrayBufferCall` for the static-method shape is no
+        // longer emitted from the compiler.
+        // §28.2.2 `Proxy.<method>(target, handler)` — typed dispatch
+        // via [`ProxyMethod`].
+        // <https://tc39.es/ecma262/#sec-proxy.revocable>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Proxy"
+            && cx.lookup_binding("Proxy").is_none()
+            && find_module_import_binding(cx, "Proxy").is_none()
+        {
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::ProxyMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Proxy.{method_name}"),
+                    span,
+                });
+            };
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::ProxyCall, operands, span);
+            return Ok(dst);
+        }
+        // §25.4 `Atomics.<method>(args)` — routed through the
+        // namespace native function table installed by
+        // `bootstrap::install_atomics`. The dedicated
+        // `Op::AtomicsCall` shortcut was retired because it
+        // bypassed the spec-required ToIndex coercion and
+        // arraytype-before-value-coercion ordering. The opcode
+        // handler in `crates/otter-vm/src/lib.rs` remains for
+        // backwards-compatibility with older bytecode.
+        // <https://tc39.es/ecma262/#sec-atomics-object>
+        //
+        // §28.1 `Reflect.<method>(args)` — typed dispatch via
+        // [`ReflectMethod`].
+        // <https://tc39.es/ecma262/#sec-reflect-object>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Reflect"
+            && cx.lookup_binding("Reflect").is_none()
+            && find_module_import_binding(cx, "Reflect").is_none()
+        {
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::ReflectMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Reflect.{method_name}"),
+                    span,
+                });
+            };
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::ReflectCall, operands, span);
+            return Ok(dst);
+        }
+        // Iterator-helpers proposal — `Iterator.from(iter)` and
+        // future statics. Typed dispatch via [`IteratorMethod`].
+        // <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Iterator"
+            && cx.lookup_binding("Iterator").is_none()
+            && find_module_import_binding(cx, "Iterator").is_none()
+        {
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::IteratorMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Iterator.{method_name}"),
+                    span,
+                });
+            };
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::IteratorCall, operands, span);
+            return Ok(dst);
+        }
+        // §23.2.2 TypedArray statics — `<T>.from(...)` / `<T>.of(...)`.
+        // Encodes the kind discriminant plus the typed
+        // [`TypedArrayMethod`].
+        // <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarray%25-intrinsic-object>
+        if let Expression::Identifier(id) = &member.object
+            && let Some(kind) =
+                otter_bytecode::method_id::TypedArrayKindId::from_str(id.name.as_str())
+            && cx.lookup_binding(id.name.as_str()).is_none()
+            && find_module_import_binding(cx, id.name.as_str()).is_none()
+        {
+            let method_name = member.property.name.as_str();
+            let Some(method_id) =
+                otter_bytecode::method_id::TypedArrayMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("{}.{method_name}", kind.name()),
+                    span,
+                });
+            };
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(kind.as_u32()));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::TypedArrayCall, operands, span);
+            return Ok(dst);
+        }
+        // Foundation built-ins on the global `Object`: lower a few
+        // canonical forms directly to dedicated opcodes so the
+        // runtime does not need a host-callable bridge yet.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Object"
+        {
+            let method = member.property.name.as_str();
+            if is_compiler_lowered_object_static(method) {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                return compile_object_builtin(cx, method, &arg_regs, span);
+            }
+        }
+        // §23.1.2 Array static surface. `Array.isArray` keeps a
+        // dedicated [`Op::IsArray`] for the §7.2.2 fast path;
+        // `Array.from` / `Array.of` lower to dedicated
+        // [`Op::ArrayFrom`] / [`Op::ArrayOf`] opcodes.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-array-constructor>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Array"
+        {
+            let method = member.property.name.as_str();
+            if method == "isArray" {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                if arg_regs.len() != 1 {
+                    return Err(CompileError::Unsupported {
+                        node: format!("Array.isArray/{}", arg_regs.len()),
+                        span,
+                    });
+                }
+                let dst = cx.alloc_scratch();
+                cx.emit(
+                    Op::IsArray,
+                    [Operand::Register(dst), Operand::Register(arg_regs[0])],
+                    span,
+                );
+                return Ok(dst);
+            }
+            if matches!(method, "from" | "of") {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.iter().copied().map(Operand::Register));
+                let opcode = if method == "from" {
+                    Op::ArrayFrom
+                } else {
+                    Op::ArrayOf
+                };
+                cx.emit(opcode, operands, span);
+                return Ok(dst);
+            }
+        }
+        // `Math.<name>(args)` — typed dispatch via [`MathMethod`].
+        // Constant-style names (`PI`, `E`, …) load through the
+        // separate [`Op::MathLoad`] path, so an unknown method here
+        // surfaces as a compile error.
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Math"
+        {
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::MathMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Math.{method_name}"),
+                    span,
+                });
+            };
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::MathCall, operands, span);
+            return Ok(dst);
+        }
+        // `JSON.<name>(args)` — typed dispatch via [`JsonMethod`].
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "JSON"
+        {
+            let method_name = member.property.name.as_str();
+            if let Some(method_id) = otter_bytecode::method_id::JsonMethod::from_str(method_name) {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(method_id.as_u32()));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::JsonCall, operands, span);
+                return Ok(dst);
+            };
+        }
+        // `Promise.<name>(args)` previously routed through
+        // `Op::PromiseCall` for the typed dispatcher. With the
+        // bootstrap installer placing real statics on the
+        // `NativeFunction` constructor, the call flows through
+        // ordinary method dispatch so user-installed shadows on
+        // `Promise.<name>` are observable.
+        // `Temporal.<Class>.<method>(args)` — typed dispatch via
+        // [`TemporalClassId`] + [`TemporalMethod`]. The callee is a
+        // nested static-member expression (`Temporal.<Class>` then
+        // `.<method>`), detected directly so the runtime needs no
+        // real `Temporal` global.
+        if let Expression::StaticMemberExpression(outer) = &member.object
+            && let Expression::Identifier(id) = &outer.object
+            && id.name.as_str() == "Temporal"
+        {
+            let class_name = outer.property.name.as_str();
+            let method_name = member.property.name.as_str();
+            let Some(class_id) = otter_bytecode::method_id::TemporalClassId::from_str(class_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Temporal.{class_name}"),
+                    span,
+                });
+            };
+            let Some(method_id) = otter_bytecode::method_id::TemporalMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Temporal.{class_name}.{method_name}"),
+                    span,
+                });
+            };
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(class_id.as_u32()));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::TemporalCall, operands, span);
+            return Ok(dst);
+        }
+        // `Symbol.<method>(args)` — typed dispatch via [`SymbolMethod`].
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Symbol"
+        {
+            let method_name = member.property.name.as_str();
+            let Some(method_id) = otter_bytecode::method_id::SymbolMethod::from_str(method_name)
+            else {
+                return Err(CompileError::Unsupported {
+                    node: format!("Symbol.{method_name}"),
+                    span,
+                });
+            };
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::SymbolCall, operands, span);
+            return Ok(dst);
+        }
+        // §21.1.2 Number static surface — `Number.parseInt` /
+        // `Number.parseFloat` are aliases of the global functions
+        // (§21.1.2.13 / §21.1.2.12); `Number.isNaN` /
+        // `Number.isFinite` / `Number.isInteger` /
+        // `Number.isSafeInteger` are the strict variants. All four
+        // shapes route through the same `Op::GlobalCall` entry —
+        // strict variants pass a distinguishing key so
+        // `global_functions::call` can branch.
+        // <https://tc39.es/ecma262/#sec-properties-of-the-number-constructor>
+        if let Expression::Identifier(id) = &member.object
+            && id.name.as_str() == "Number"
+            && cx.lookup_binding("Number").is_none()
+            && find_module_import_binding(cx, "Number").is_none()
+        {
+            use otter_bytecode::method_id::GlobalMethod;
+            let method = member.property.name.as_str();
+            let method_id = match method {
+                "parseInt" => Some(GlobalMethod::ParseInt),
+                "parseFloat" => Some(GlobalMethod::ParseFloat),
+                "isNaN" => Some(GlobalMethod::NumberIsNaN),
+                "isFinite" => Some(GlobalMethod::NumberIsFinite),
+                "isInteger" => Some(GlobalMethod::NumberIsInteger),
+                "isSafeInteger" => Some(GlobalMethod::NumberIsSafeInteger),
+                _ => None,
+            };
+            if let Some(method_id) = method_id {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(method_id.as_u32()));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::GlobalCall, operands, span);
+                return Ok(dst);
+            }
+        }
+    }
+    // Bare `Symbol(desc)` — fresh primitive symbol per call.
+    // Lowers through `Op::SymbolCall` with [`SymbolMethod::Construct`].
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Symbol"
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(
+            otter_bytecode::method_id::SymbolMethod::Construct.as_u32(),
+        ));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::SymbolCall, operands, span);
+        return Ok(dst);
+    }
+    // §20.3.1 `Boolean(value)` — coerces to boolean. The foundation
+    // ships primitive-only Booleans (no wrapper object), so the
+    // bare-call form is identical to `!!value`.
+    // <https://tc39.es/ecma262/#sec-boolean-constructor>
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Boolean"
+        && cx.lookup_binding("Boolean").is_none()
+        && find_module_import_binding(cx, "Boolean").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        match arg_regs.first().copied() {
+            Some(src) => {
+                cx.emit(
+                    Op::ToBoolean,
+                    [Operand::Register(dst), Operand::Register(src)],
+                    span,
+                );
+            }
+            None => {
+                cx.emit(Op::LoadFalse, [Operand::Register(dst)], span);
+            }
+        }
+        return Ok(dst);
+    }
+    // §22.1.1 / §22.1.2 — bare-call `String(value)` and the
+    // `String.<method>(args)` statics route through the
+    // `Value::NativeFunction` table installed at bootstrap. The
+    // dedicated `Op::StringCall` shortcut was retired because it
+    // bypassed §7.1.17 ToString's ToPrimitive step (user classes
+    // with an overridden `toString` / `Symbol.toPrimitive` did
+    // not fire), and because spec-shaped dispatch through
+    // ordinary property lookup is the simpler invariant to keep.
+    // The opcode handler in `crates/otter-vm/src/lib.rs` remains
+    // for backwards-compatibility with older bytecode.
+    // <https://tc39.es/ecma262/#sec-string-constructor>
+    // §21.1.1 `Number(value)` fast path — folds to `Op::LoadInt32 0`
+    // for the bare zero-arg form, or to `Op::ToNumber` for a single
+    // primitive arg. The BigInt arm of §21.1.1.1 step 5 takes a
+    // different shape than generic §7.1.4 ToNumber (which throws on
+    // BigInt — see `language/expressions/unary-plus/bigint-throws.js`).
+    // BigInt arity can't be observed at compile time, so callers with
+    // any argument fall through to the ordinary call dispatch which
+    // routes to `number_ctor_call` and the spec-correct BigInt arm.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Number"
+        && cx.lookup_binding("Number").is_none()
+        && find_module_import_binding(cx, "Number").is_none()
+        && call.arguments.is_empty()
+    {
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadInt32,
+            [Operand::Register(dst), Operand::Imm32(0)],
+            span,
+        );
+        return Ok(dst);
+    }
+    // §20.3.1 `Boolean(value)` — primitive ToBoolean.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Boolean"
+        && cx.lookup_binding("Boolean").is_none()
+        && find_module_import_binding(cx, "Boolean").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        match arg_regs.first().copied() {
+            Some(src) => cx.emit(
+                Op::ToBoolean,
+                [Operand::Register(dst), Operand::Register(src)],
+                span,
+            ),
+            None => cx.emit(Op::LoadFalse, [Operand::Register(dst)], span),
+        }
+        return Ok(dst);
+    }
+    // §23.1.1.1 `Array(...)` — bare-call form has the same spec
+    // body as `new Array(...)`. Both lower to [`Op::ArrayConstruct`]
+    // so the single-numeric-length form produces a sparse array.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Array"
+        && cx.lookup_binding("Array").is_none()
+        && find_module_import_binding(cx, "Array").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::ArrayConstruct, operands, span);
+        return Ok(dst);
+    }
+    // §20.1.1 `Object()` — empty-args shortcut to `Op::NewObject`.
+    // One-arg form falls through to the general call path so the
+    // runtime `object_ctor_call` (§20.1.1.1) handles null/undefined
+    // → fresh-object coercion and primitive → wrapper coercion.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Object"
+        && cx.lookup_binding("Object").is_none()
+        && find_module_import_binding(cx, "Object").is_none()
+        && call.arguments.is_empty()
+    {
+        let dst = cx.alloc_scratch();
+        cx.emit(Op::NewObject, [Operand::Register(dst)], span);
+        return Ok(dst);
+    }
+    // §21.4.3 Date statics — typed dispatch via [`DateMethod`].
+    // <https://tc39.es/ecma262/#sec-properties-of-the-date-constructor>
+    if let Expression::StaticMemberExpression(member) = callee
+        && let Expression::Identifier(id) = &member.object
+        && id.name.as_str() == "Date"
+        && cx.lookup_binding("Date").is_none()
+        && find_module_import_binding(cx, "Date").is_none()
+    {
+        let method_name = member.property.name.as_str();
+        if let Some(method_id) = otter_bytecode::method_id::DateMethod::from_str(method_name) {
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::DateCall, operands, span);
+            return Ok(dst);
+        };
+    }
+    // `BigInt(value)` and `BigInt.asIntN/asUintN(args)` route
+    // through the real `NativeFunction` installed by
+    // `bootstrap_bigint` — the dedicated `Op::BigIntCall` shortcut
+    // is no longer emitted.
+    // §20.2.1.1 — bare `Function(arg0, …, body)` is the same as
+    // `new Function(...)` per spec; lower both shapes through one
+    // path.
+    // <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "Function"
+        && cx.lookup_binding("Function").is_none()
+        && find_module_import_binding(cx, "Function").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(2 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::NewFunction, operands, span);
+        return Ok(dst);
+    }
+    // §19.4.1 `eval(source)` — bare-identifier interception.
+    // Foundation ships indirect-eval semantics (fresh global
+    // scope) which keeps the implementation tractable while
+    // covering the common use case of running source-string
+    // payloads at runtime.
+    // <https://tc39.es/ecma262/#sec-eval-x>
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "eval"
+        && cx.lookup_binding("eval").is_none()
+        && find_module_import_binding(cx, "eval").is_none()
+    {
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        if arg_regs.is_empty() {
+            let dst = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+            return Ok(dst);
+        }
+        let src_reg = arg_regs[0];
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::Eval,
+            [Operand::Register(dst), Operand::Register(src_reg)],
+            span,
+        );
+        return Ok(dst);
+    }
+    // §19.2 global-function interceptions: route bare-identifier
+    // calls like `parseInt(...)` / `isNaN(x)` /
+    // `encodeURIComponent(s)` through a single `Op::GlobalCall`
+    // dispatcher. The user can shadow these names with a local
+    // binding; `lookup_binding` is consulted first so the shadow
+    // wins.
+    // <https://tc39.es/ecma262/#sec-function-properties-of-the-global-object>
+    if let Expression::Identifier(id) = callee {
+        let name = id.name.as_str();
+        if let Some(method_id) = otter_bytecode::method_id::GlobalMethod::from_str(name)
+            && !matches!(method_id.name(), n if n.starts_with("Number."))
+            && cx.lookup_binding(name).is_none()
+            && find_module_import_binding(cx, name).is_none()
+        {
+            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::ConstIndex(method_id.as_u32()));
+            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+            operands.extend(arg_regs.into_iter().map(Operand::Register));
+            cx.emit(Op::GlobalCall, operands, span);
+            return Ok(dst);
+        }
+    }
+    // Bare-identifier interceptions — `queueMicrotask(fn, ...args)`
+    // is the only one today. Lives at the call-site layer (not
+    // inside the StaticMember branch) because the syntax is a
+    // direct call, not a method call.
+    if let Expression::Identifier(id) = callee
+        && id.name.as_str() == "queueMicrotask"
+    {
+        // Compile arguments first so any side effects in the args
+        // run before the enqueue, matching JS evaluation order.
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        if arg_regs.is_empty() {
+            return Err(CompileError::Unsupported {
+                node: "queueMicrotask requires a callback argument".to_string(),
+                span,
+            });
+        }
+        let mut iter = arg_regs.into_iter();
+        let callee_reg = iter.next().expect("checked non-empty");
+        let trailing: Vec<u16> = iter.collect();
+        let mut operands: Vec<Operand> = Vec::with_capacity(2 + trailing.len());
+        operands.push(Operand::Register(callee_reg));
+        operands.push(Operand::ConstIndex(trailing.len() as u32));
+        operands.extend(trailing.into_iter().map(Operand::Register));
+        cx.emit(Op::QueueMicrotask, operands, span);
+        // queueMicrotask returns `undefined` synchronously.
+        let dst = cx.alloc_scratch();
+        cx.emit(Op::LoadUndefined, [Operand::Register(dst)], span);
+        return Ok(dst);
+    }
+    if let Expression::StaticMemberExpression(member) = callee {
+        let method_name = member.property.name.as_str();
+        if let Some(dst) =
+            try_compile_function_method(cx, &member.object, method_name, &call.arguments, span)?
+        {
+            return Ok(dst);
+        }
+        let receiver_reg = compile_expr(cx, &member.object, span)?;
+        let name_idx = cx.intern_string_constant(method_name);
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(receiver_reg));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallMethodValue, operands, span);
+        return Ok(dst);
+    }
+    if let Expression::PrivateFieldExpression(member) = callee {
+        let mangled =
+            cx.mangle_private(member.field.name.as_str())
+                .ok_or(CompileError::Unsupported {
+                    node: "PrivateFieldExpression call outside any class body".to_string(),
+                    span,
+                })?;
+        let receiver_reg = compile_expr(cx, &member.object, span)?;
+        let name_idx = cx.intern_string_constant(&mangled);
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(receiver_reg));
+        operands.push(Operand::ConstIndex(name_idx));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallMethodValue, operands, span);
+        return Ok(dst);
+    }
+    // `obj[expr](args...)` — computed-member call. Lower as
+    // `LoadElement` + `CallWithThis` so the callee receives the
+    // receiver as its `this` value, matching ECMA-262 §13.3.6.1
+    // EvaluateCall step 5.b.
+    if let Expression::ComputedMemberExpression(member) = callee {
+        let receiver_reg = compile_expr(cx, &member.object, span)?;
+        let idx_reg = compile_expr(cx, &member.expression, span)?;
+        let callee_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadElement,
+            vec![
+                Operand::Register(callee_reg),
+                Operand::Register(receiver_reg),
+                Operand::Register(idx_reg),
+            ],
+            span,
+        );
+        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        let dst = cx.alloc_scratch();
+        let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(callee_reg));
+        operands.push(Operand::Register(receiver_reg));
+        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::CallWithThis, operands, span);
+        return Ok(dst);
+    }
+    // Free call: `callee(args...)`.
+    let callee_reg = compile_expr(cx, callee, span)?;
+    let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+    let dst = cx.alloc_scratch();
+    let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+    operands.push(Operand::Register(dst));
+    operands.push(Operand::Register(callee_reg));
+    operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+    operands.extend(arg_regs.into_iter().map(Operand::Register));
+    cx.emit(Op::Call, operands, span);
+    Ok(dst)
+}
+
+/// Lower a call expression whose argument list contains at least
+/// one `...spread` element to [`Op::CallSpread`]. Two callee
+/// shapes are handled:
+///
+/// - `obj.method(...args)` — receiver is evaluated once, the spread
+///   args become an array, dispatched with `this = obj`.
+/// - `callee(...args)` — free call, dispatched with
+///   `this = undefined`.
+///
+/// Mixed spread / non-spread arguments are folded into the same
+/// args array so `f(a, ...arr, b)` calls `f(a, ...arr items..., b)`.
+pub(crate) fn compile_spread_call(
+    cx: &mut Compiler,
+    callee: &Expression<'_>,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let (callee_reg, this_reg) = match callee {
+        Expression::StaticMemberExpression(member) => {
+            let recv = compile_expr(cx, &member.object, span)?;
+            let name_idx = cx.intern_string_constant(member.property.name.as_str());
+            let method_dst = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(method_dst),
+                    Operand::Register(recv),
+                    Operand::ConstIndex(name_idx),
+                ],
+                span,
+            );
+            (method_dst, recv)
+        }
+        other => {
+            let r = compile_expr(cx, other, span)?;
+            let this_dst = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, [Operand::Register(this_dst)], span);
+            (r, this_dst)
+        }
+    };
+    let args_reg = compile_spread_call_args(cx, arguments, span)?;
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::CallSpread,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(callee_reg),
+            Operand::Register(this_reg),
+            Operand::Register(args_reg),
+        ],
+        span,
+    );
+    Ok(dst)
+}
+
+/// Lower the syntactic shapes `<expr>.call(...)`, `<expr>.apply(...)`,
+/// and `<expr>.bind(...)` directly to dedicated opcodes. Returns
+/// `None` when `method_name` is not one of the recognised triple,
+/// so the caller can fall through to the universal
+/// [`Op::CallMethodValue`] path.
+///
+/// The shape detection is **syntactic**: the receiver expression is
+/// evaluated only once, so `getFn().call(t, 1)` invokes `getFn()`
+/// exactly once. `apply` uses the fixed-arity [`Op::CallWithThis`]
+/// path for array literals and falls back to [`Op::CallSpread`] for
+/// dynamic argument arrays so the runtime performs the observable
+/// argument-list check.
+pub(crate) fn try_compile_function_method(
+    cx: &mut Compiler,
+    receiver: &Expression<'_>,
+    method_name: &str,
+    arguments: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<Option<u16>, CompileError> {
+    match method_name {
+        "call" => {
+            let callee_reg = compile_expr(cx, receiver, span)?;
+            let arg_regs = compile_call_args(cx, arguments, span)?;
+            let mut iter = arg_regs.into_iter();
+            let this_reg = match iter.next() {
+                Some(r) => r,
+                None => {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+                    r
+                }
+            };
+            let forwarded: Vec<u16> = iter.collect();
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::Register(this_reg));
+            operands.push(Operand::ConstIndex(forwarded.len() as u32));
+            operands.extend(forwarded.into_iter().map(Operand::Register));
+            cx.emit(Op::CallWithThis, operands, span);
+            Ok(Some(dst))
+        }
+        "bind" => {
+            let callee_reg = compile_expr(cx, receiver, span)?;
+            let arg_regs = compile_call_args(cx, arguments, span)?;
+            let mut iter = arg_regs.into_iter();
+            let this_reg = match iter.next() {
+                Some(r) => r,
+                None => {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+                    r
+                }
+            };
+            let bound: Vec<u16> = iter.collect();
+            let dst = cx.alloc_scratch();
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + bound.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::Register(this_reg));
+            operands.push(Operand::ConstIndex(bound.len() as u32));
+            operands.extend(bound.into_iter().map(Operand::Register));
+            cx.emit(Op::BindFunction, operands, span);
+            Ok(Some(dst))
+        }
+        "apply" => {
+            // `apply(thisArg, argsArray)` — second argument must
+            // be statically an array literal for foundation
+            // lowering. The receiver is still evaluated even when
+            // we fall back to the universal dispatch path so that
+            // observable side-effects keep their position.
+            let callee_reg = compile_expr(cx, receiver, span)?;
+            let mut args_iter = arguments.iter();
+            let this_reg = match args_iter.next() {
+                Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
+                    return Err(CompileError::Unsupported {
+                        node: "Function.prototype.apply: spread thisArg".to_string(),
+                        span: (s.span.start, s.span.end),
+                    });
+                }
+                Some(other) => compile_expr(cx, other.to_expression(), span)?,
+                None => {
+                    let r = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+                    r
+                }
+            };
+            let mut forwarded: Vec<u16> = Vec::new();
+            let mut dynamic_args: Option<u16> = None;
+            match args_iter.next() {
+                None => {}
+                Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
+                    return Err(CompileError::Unsupported {
+                        node: "Function.prototype.apply: spread arg list".to_string(),
+                        span: (s.span.start, s.span.end),
+                    });
+                }
+                Some(other) => {
+                    let expr = unwrap_ts_expr(other.to_expression());
+                    match expr {
+                        Expression::ArrayExpression(arr) => {
+                            for el in &arr.elements {
+                                match el {
+                                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(s) => {
+                                        return Err(CompileError::Unsupported {
+                                            node: "Function.prototype.apply: spread element"
+                                                .to_string(),
+                                            span: (s.span.start, s.span.end),
+                                        });
+                                    }
+                                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                                        let r = cx.alloc_scratch();
+                                        cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+                                        forwarded.push(r);
+                                    }
+                                    el_expr => {
+                                        forwarded.push(compile_expr(
+                                            cx,
+                                            el_expr.to_expression(),
+                                            span,
+                                        )?);
+                                    }
+                                }
+                            }
+                        }
+                        Expression::NullLiteral(_) => {}
+                        Expression::Identifier(id) if id.name.as_str() == "undefined" => {}
+                        _ => {
+                            dynamic_args = Some(compile_expr(cx, expr, span)?);
+                        }
+                    }
+                }
+            }
+            if args_iter.next().is_some() {
+                return Err(CompileError::Unsupported {
+                    node: "Function.prototype.apply: extra arguments".to_string(),
+                    span,
+                });
+            }
+            let dst = cx.alloc_scratch();
+            if let Some(args_reg) = dynamic_args {
+                let name_idx = cx.intern_string_constant("apply");
+                cx.emit(
+                    Op::CallMethodValue,
+                    vec![
+                        Operand::Register(dst),
+                        Operand::Register(callee_reg),
+                        Operand::ConstIndex(name_idx),
+                        Operand::ConstIndex(2),
+                        Operand::Register(this_reg),
+                        Operand::Register(args_reg),
+                    ],
+                    span,
+                );
+                return Ok(Some(dst));
+            }
+            let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
+            operands.push(Operand::Register(dst));
+            operands.push(Operand::Register(callee_reg));
+            operands.push(Operand::Register(this_reg));
+            operands.push(Operand::ConstIndex(forwarded.len() as u32));
+            operands.extend(forwarded.into_iter().map(Operand::Register));
+            cx.emit(Op::CallWithThis, operands, span);
+            Ok(Some(dst))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub(crate) fn compile_call_args(
+    cx: &mut Compiler,
+    args: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<Vec<u16>, CompileError> {
+    let mut regs: Vec<u16> = Vec::with_capacity(args.len());
+    for arg in args {
+        match arg {
+            oxc_ast::ast::Argument::SpreadElement(s) => {
+                return Err(CompileError::Unsupported {
+                    node: "Argument::SpreadElement".to_string(),
+                    span: (s.span.start, s.span.end),
+                });
+            }
+            other => {
+                let expr = other.to_expression();
+                regs.push(compile_expr(cx, expr, span)?);
+            }
+        }
+    }
+    Ok(regs)
+}
+
+/// Emit the bytecode that builds a fresh `Array` register holding
+/// the call arguments fanned out from spreads. Returns the
+/// register that holds the resulting array. Used by the spread-in-
+/// call path; pure regular argument lists keep the dedicated
+/// fast path in [`compile_call_args`] / [`Op::Call`].
+pub(crate) fn compile_spread_call_args(
+    cx: &mut Compiler,
+    args: &oxc_allocator::Vec<'_, oxc_ast::ast::Argument<'_>>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::NewArray,
+        [Operand::Register(dst), Operand::ConstIndex(0)],
+        span,
+    );
+    for arg in args {
+        match arg {
+            oxc_ast::ast::Argument::SpreadElement(s) => {
+                let inner_span = (s.span.start, s.span.end);
+                emit_spread_into_array(cx, dst, &s.argument, inner_span)?;
+            }
+            other => {
+                let r = compile_expr(cx, other.to_expression(), span)?;
+                cx.emit(
+                    Op::ArrayPush,
+                    [Operand::Register(dst), Operand::Register(r)],
+                    span,
+                );
+            }
+        }
+    }
+    Ok(dst)
+}
+
+/// Append every element of `iterable` (already materialised as an
+/// expression) into the array in `dst_reg`. Lowered as a tight
+/// `IteratorNext` loop over a fresh iterator. Shared between the
+/// array-literal spread path and the call-argument spread path.
+pub(crate) fn emit_spread_into_array(
+    cx: &mut Compiler,
+    dst_reg: u16,
+    iterable: &Expression<'_>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let iterable_reg = compile_expr(cx, iterable, span)?;
+    let iter_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::GetIterator,
+        [Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+        span,
+    );
+    let value_reg = cx.alloc_scratch();
+    let done_reg = cx.alloc_scratch();
+    let loop_top = cx.next_pc;
+    cx.emit(
+        Op::IteratorNext,
+        vec![
+            Operand::Register(value_reg),
+            Operand::Register(done_reg),
+            Operand::Register(iter_reg),
+        ],
+        span,
+    );
+    let exit = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+    cx.emit(
+        Op::ArrayPush,
+        [Operand::Register(dst_reg), Operand::Register(value_reg)],
+        span,
+    );
+    let back = cx.emit_branch_placeholder(Op::Jump, None, span);
+    cx.patch_branch(back, loop_top);
+    cx.patch_branch_to_here(exit);
+    Ok(())
+}

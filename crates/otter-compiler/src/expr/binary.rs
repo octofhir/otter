@@ -1,0 +1,220 @@
+//! Binary-family expression lowering.
+//!
+//! # Contents
+//! - [`compile_binary`] — lowers ordinary binary expressions.
+//! - [`compile_logical`] — lowers logical short-circuit expressions.
+//! - [`compile_private_in`] — lowers private-name membership probes.
+//!
+//! # See also
+//! - [`super`] — expression dispatch and shared helpers.
+
+use crate::*;
+use oxc_ast::ast::{BinaryExpression, LogicalExpression, PrivateInExpression};
+
+pub(crate) fn compile_logical(
+    cx: &mut Compiler,
+    l: &LogicalExpression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let _ = span;
+    let span = (l.span.start, l.span.end);
+    // Lower `a && b`, `a || b`, `a ?? b` with short-circuit
+    // semantics. The result lands in a fresh register and
+    // both branches store into the same slot.
+    let left = compile_expr(cx, &l.left, span)?;
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::StoreLocal,
+        [Operand::Register(left), Operand::Imm32(dst as i32)],
+        span,
+    );
+    // Note: locals and scratch share the same register
+    // window. We use STORE_LOCAL into the freshly-allocated
+    // scratch index so the JUMP target reads back through
+    // LOAD_LOCAL — preserves register liveness across the
+    // branch without a phi.
+    let short_circuit = match l.operator {
+        LogicalOperator::And => cx.emit_branch_placeholder(Op::JumpIfFalse, Some(left), span),
+        LogicalOperator::Or => cx.emit_branch_placeholder(Op::JumpIfTrue, Some(left), span),
+        LogicalOperator::Coalesce => {
+            // `a ?? b`: if `a` is **not** nullish, short-
+            // circuit. JumpIfNullish jumps when nullish, so
+            // we want the **inverse**: emit a normal branch
+            // into "evaluate b" path when nullish, and let
+            // fall-through skip past `b`. Implement via two
+            // jumps for clarity.
+            let to_b = cx.emit_branch_placeholder(Op::JumpIfNullish, Some(left), span);
+            let skip = cx.emit_branch_placeholder(Op::Jump, None, span);
+            cx.patch_branch_to_here(to_b);
+            let right = compile_expr(cx, &l.right, span)?;
+            cx.emit(
+                Op::StoreLocal,
+                [Operand::Register(right), Operand::Imm32(dst as i32)],
+                span,
+            );
+            cx.patch_branch_to_here(skip);
+            return Ok({
+                let out = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadLocal,
+                    [Operand::Register(out), Operand::Imm32(dst as i32)],
+                    span,
+                );
+                out
+            });
+        }
+    };
+    // Falling here for `&&` / `||`: evaluate `right` and
+    // store; patch short-circuit at end.
+    let right = compile_expr(cx, &l.right, span)?;
+    cx.emit(
+        Op::StoreLocal,
+        [Operand::Register(right), Operand::Imm32(dst as i32)],
+        span,
+    );
+    cx.patch_branch_to_here(short_circuit);
+    let out = cx.alloc_scratch();
+    cx.emit(
+        Op::LoadLocal,
+        [Operand::Register(out), Operand::Imm32(dst as i32)],
+        span,
+    );
+    Ok(out)
+}
+
+pub(crate) fn compile_private_in(
+    cx: &mut Compiler,
+    p: &PrivateInExpression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let _ = span;
+    let pspan = (p.span.start, p.span.end);
+    let mangled = cx
+        .mangle_private(p.left.name.as_str())
+        .ok_or(CompileError::Unsupported {
+            node: "PrivateInExpression outside any class body".to_string(),
+            span: pspan,
+        })?;
+    let key_reg = cx.alloc_scratch();
+    let key_idx = cx.intern_string_constant(&mangled);
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
+        pspan,
+    );
+    let obj_reg = compile_expr(cx, &p.right, pspan)?;
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        Op::HasProperty,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(key_reg),
+            Operand::Register(obj_reg),
+        ],
+        pspan,
+    );
+    Ok(dst)
+}
+
+pub(crate) fn compile_binary(
+    cx: &mut Compiler,
+    b: &BinaryExpression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let _ = span;
+    let span = (b.span.start, b.span.end);
+    let lhs = compile_expr(cx, &b.left, span)?;
+    let rhs = compile_expr(cx, &b.right, span)?;
+    let op = match b.operator {
+        BinaryOperator::Addition => Op::Add,
+        BinaryOperator::Subtraction => Op::Sub,
+        BinaryOperator::Multiplication => Op::Mul,
+        BinaryOperator::Division => Op::Div,
+        BinaryOperator::Remainder => Op::Rem,
+        BinaryOperator::Exponential => Op::Pow,
+        BinaryOperator::BitwiseAnd => Op::BitwiseAnd,
+        BinaryOperator::BitwiseOR => Op::BitwiseOr,
+        BinaryOperator::BitwiseXOR => Op::BitwiseXor,
+        BinaryOperator::ShiftLeft => Op::Shl,
+        BinaryOperator::ShiftRight => Op::Shr,
+        BinaryOperator::ShiftRightZeroFill => Op::Ushr,
+        BinaryOperator::StrictEquality => Op::Equal,
+        BinaryOperator::StrictInequality => Op::NotEqual,
+        // §7.2.13 IsLooselyEqual — operands flow through
+        // `Op::ToPrimitive(default)` below before the
+        // runtime applies the type-coercion table.
+        BinaryOperator::Equality => Op::LooseEqual,
+        BinaryOperator::Inequality => Op::LooseNotEqual,
+        BinaryOperator::LessThan => Op::LessThan,
+        BinaryOperator::LessEqualThan => Op::LessEq,
+        BinaryOperator::GreaterThan => Op::GreaterThan,
+        BinaryOperator::GreaterEqualThan => Op::GreaterEq,
+        BinaryOperator::Instanceof => Op::Instanceof,
+        // §13.10.1 `RelationalExpression in ShiftExpression`.
+        // <https://tc39.es/ecma262/#sec-relational-operators-runtime-semantics-evaluation>
+        BinaryOperator::In => Op::HasProperty,
+    };
+    // §13.15.4 ApplyStringOrNumericBinaryOperator step 1
+    // requires both operands of `+` to pass through
+    // `ToPrimitive(default)` before the runtime decides
+    // between string concat and numeric add. Emit that
+    // coercion at compile time so the runtime never sees
+    // a non-primitive operand on the `Op::Add` fast path.
+    //
+    // §7.2.13 `IsLooselyEqual` (`==` / `!=`) consults
+    // `[Symbol.toPrimitive]` on object operands too. Same
+    // shape — emit `ToPrimitive(default)` and let the
+    // runtime work over primitives.
+    //
+    // §7.2.14 `AbstractRelationalComparison` (`<`, `<=`,
+    // `>`, `>=`) consults `ToPrimitive(number)` on each
+    // operand per step 1.
+    //
+    // <https://tc39.es/ecma262/#sec-applystringornumericbinaryoperator>
+    // <https://tc39.es/ecma262/#sec-islooselyequal>
+    // <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
+    let (lhs_in, rhs_in) = match op {
+        Op::Add | Op::LooseEqual | Op::LooseNotEqual => {
+            let l = emit_to_primitive(cx, lhs, "default", span);
+            let r = emit_to_primitive(cx, rhs, "default", span);
+            (l, r)
+        }
+        Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
+            let l = emit_to_primitive(cx, lhs, "number", span);
+            let r = emit_to_primitive(cx, rhs, "number", span);
+            (l, r)
+        }
+        // §13.15.3 ApplyStringOrNumericBinaryOperator —
+        // non-additive numeric and bitwise/shift ops apply
+        // ToPrimitive(number) to each operand before
+        // ToNumeric. Pre-coerce here so the runtime never
+        // sees a non-primitive operand.
+        Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Rem
+        | Op::Pow
+        | Op::BitwiseAnd
+        | Op::BitwiseOr
+        | Op::BitwiseXor
+        | Op::Shl
+        | Op::Shr
+        | Op::Ushr => {
+            let l = emit_to_primitive(cx, lhs, "number", span);
+            let r = emit_to_primitive(cx, rhs, "number", span);
+            (l, r)
+        }
+        _ => (lhs, rhs),
+    };
+    let dst = cx.alloc_scratch();
+    cx.emit(
+        op,
+        vec![
+            Operand::Register(dst),
+            Operand::Register(lhs_in),
+            Operand::Register(rhs_in),
+        ],
+        span,
+    );
+    Ok(dst)
+}

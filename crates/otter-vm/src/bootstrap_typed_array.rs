@@ -244,6 +244,52 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
 
     let tag_sym = well_known.get(WellKnown::ToStringTag);
 
+    // §22.2.3.{6-11,13,14,15,17,18,21,22} callback prototype
+    // methods — install NativeFunction wrappers so reflective
+    // access (`TypedArray.prototype.every.length`,
+    // `TypedArray.prototype.map.name`) sees the spec property
+    // descriptor. The actual dispatch fires via
+    // `Interpreter::typed_array_callback_dispatch` on the
+    // method-call fast path. The wrappers below cover the
+    // `Function.prototype.call` / explicit-invoke fallback by
+    // re-entering the same callback loop in the wrapper body.
+    if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
+        let abstract_proto_root = Value::Object(abstract_proto);
+        let install_method =
+            |heap: &mut otter_gc::GcHeap,
+             name: &'static str,
+             length: u8,
+             call: crate::native_function::NativeFastFn|
+             -> Result<(), JsSurfaceError> {
+                let f = crate::bootstrap::native_static_with_value_roots(
+                    heap,
+                    name,
+                    length,
+                    call,
+                    &[&abstract_proto_root],
+                )
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+                object::define_own_property(
+                    abstract_proto,
+                    heap,
+                    name,
+                    PropertyDescriptor::data(Value::NativeFunction(f), true, false, true),
+                );
+                Ok(())
+            };
+        install_method(heap, "forEach", 1, ta_proto_for_each)?;
+        install_method(heap, "map", 1, ta_proto_map)?;
+        install_method(heap, "filter", 1, ta_proto_filter)?;
+        install_method(heap, "find", 1, ta_proto_find)?;
+        install_method(heap, "findIndex", 1, ta_proto_find_index)?;
+        install_method(heap, "findLast", 1, ta_proto_find_last)?;
+        install_method(heap, "findLastIndex", 1, ta_proto_find_last_index)?;
+        install_method(heap, "every", 1, ta_proto_every)?;
+        install_method(heap, "some", 1, ta_proto_some)?;
+        install_method(heap, "reduce", 1, ta_proto_reduce)?;
+        install_method(heap, "reduceRight", 1, ta_proto_reduce_right)?;
+    }
+
     // §22.2.6.{1-4} — instance accessor getters live on
     // `%TypedArray%.prototype` (not the per-kind prototypes).
     // Each getter validates the receiver carries a TypedArray
@@ -423,6 +469,319 @@ fn drain_iterable_into_values(
         collected.push(v);
     }
     Ok(collected)
+}
+
+/// §22.2.3 TypedArray callback prototype method wrappers — used
+/// for reflective access and `Function.prototype.call` style
+/// re-entries; the method-call fast path bypasses these into
+/// `Interpreter::typed_array_callback_dispatch` directly.
+
+fn ta_callback_receiver(
+    ctx: &NativeCtx<'_>,
+    method: &'static str,
+) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
+    match ctx.this_value() {
+        Value::TypedArray(t) => Ok(t.clone()),
+        _ => Err(NativeError::TypeError {
+            name: method,
+            reason: "this is not a TypedArray".to_string(),
+        }),
+    }
+}
+
+fn ta_callback_snapshot(t: &crate::binary::typed_array::JsTypedArray) -> Vec<Value> {
+    (0..t.length()).map(|i| t.get(i)).collect()
+}
+
+fn ta_require_callable(args: &[Value], method: &'static str) -> Result<Value, NativeError> {
+    let cb = args.first().cloned().unwrap_or(Value::Undefined);
+    if !crate::abstract_ops::is_callable(&cb) {
+        return Err(NativeError::TypeError {
+            name: method,
+            reason: "callback is not callable".to_string(),
+        });
+    }
+    Ok(cb)
+}
+
+fn ta_invoke_callback(
+    ctx: &mut NativeCtx<'_>,
+    callee: &Value,
+    this_arg: &Value,
+    value: &Value,
+    index: usize,
+    ta: &Value,
+) -> Result<Value, NativeError> {
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "TypedArray callback",
+            reason: "missing execution context".to_string(),
+        })?;
+    let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+    cb_args.push(value.clone());
+    cb_args.push(Value::Number(crate::number::NumberValue::from_i32(
+        index as i32,
+    )));
+    cb_args.push(ta.clone());
+    ctx.cx
+        .interp
+        .run_callable_sync(&exec_ctx, callee, this_arg.clone(), cb_args)
+        .map_err(|e| NativeError::TypeError {
+            name: "TypedArray callback",
+            reason: e.to_string(),
+        })
+}
+
+fn ta_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.forEach")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.forEach")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    for (i, v) in elements.into_iter().enumerate() {
+        ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+    }
+    Ok(Value::Undefined)
+}
+
+fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.map")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.map")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    let kind = t.kind();
+    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
+    for (i, v) in elements.into_iter().enumerate() {
+        let mapped = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+        let coerced = crate::binary::dispatch::coerce_element_for_store(kind, &mapped)
+            .map_err(|e| vm_to_native(e, "TypedArray.prototype.map"))?;
+        out.push(coerced);
+    }
+    ta_build_result(ctx, kind, &out, "TypedArray.prototype.map")
+}
+
+fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.filter")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.filter")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    let mut out: Vec<Value> = Vec::new();
+    for (i, v) in elements.iter().enumerate() {
+        let kept = ta_invoke_callback(ctx, &callee, &this_arg, v, i, &ta_value)?;
+        if kept.to_boolean() {
+            out.push(v.clone());
+        }
+    }
+    ta_build_result(ctx, t.kind(), &out, "TypedArray.prototype.filter")
+}
+
+fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.find")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.find")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    for (i, v) in elements.into_iter().enumerate() {
+        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+        if hit.to_boolean() {
+            return Ok(v);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.findIndex")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.findIndex")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    for (i, v) in elements.into_iter().enumerate() {
+        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+        if hit.to_boolean() {
+            return Ok(Value::Number(crate::number::NumberValue::from_i32(i as i32)));
+        }
+    }
+    Ok(Value::Number(crate::number::NumberValue::from_i32(-1)))
+}
+
+fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLast")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.findLast")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    for i in (0..elements.len()).rev() {
+        let v = elements[i].clone();
+        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+        if hit.to_boolean() {
+            return Ok(v);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLastIndex")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.findLastIndex")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    for i in (0..elements.len()).rev() {
+        let v = elements[i].clone();
+        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+        if hit.to_boolean() {
+            return Ok(Value::Number(crate::number::NumberValue::from_i32(i as i32)));
+        }
+    }
+    Ok(Value::Number(crate::number::NumberValue::from_i32(-1)))
+}
+
+fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.every")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.every")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    for (i, v) in elements.into_iter().enumerate() {
+        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+        if !hit.to_boolean() {
+            return Ok(Value::Boolean(false));
+        }
+    }
+    Ok(Value::Boolean(true))
+}
+
+fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let t = ta_callback_receiver(ctx, "TypedArray.prototype.some")?;
+    let callee = ta_require_callable(args, "TypedArray.prototype.some")?;
+    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let ta_value = Value::TypedArray(t.clone());
+    let elements = ta_callback_snapshot(&t);
+    for (i, v) in elements.into_iter().enumerate() {
+        let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+        if hit.to_boolean() {
+            return Ok(Value::Boolean(true));
+        }
+    }
+    Ok(Value::Boolean(false))
+}
+
+fn ta_proto_reduce(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    ta_proto_reduce_dir(ctx, args, false)
+}
+
+fn ta_proto_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    ta_proto_reduce_dir(ctx, args, true)
+}
+
+fn ta_proto_reduce_dir(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    reverse: bool,
+) -> Result<Value, NativeError> {
+    let method = if reverse {
+        "TypedArray.prototype.reduceRight"
+    } else {
+        "TypedArray.prototype.reduce"
+    };
+    let t = ta_callback_receiver(ctx, method)?;
+    let callee = ta_require_callable(args, method)?;
+    let elements = ta_callback_snapshot(&t);
+    let len = elements.len();
+    let has_init = args.len() >= 2;
+    if len == 0 && !has_init {
+        return Err(NativeError::TypeError {
+            name: method,
+            reason: "reduce of empty array with no initial value".to_string(),
+        });
+    }
+    let ta_value = Value::TypedArray(t.clone());
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: method,
+            reason: "missing execution context".to_string(),
+        })?;
+    let step: i64 = if reverse { -1 } else { 1 };
+    let (mut acc, start_idx) = if has_init {
+        (args[1].clone(), if reverse { len as i64 - 1 } else { 0 })
+    } else {
+        let seed = if reverse { len - 1 } else { 0 };
+        (elements[seed].clone(), seed as i64 + step)
+    };
+    let mut i = start_idx;
+    while i >= 0 && (i as usize) < len {
+        let value = elements[i as usize].clone();
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(acc.clone());
+        cb_args.push(value);
+        cb_args.push(Value::Number(crate::number::NumberValue::from_i32(i as i32)));
+        cb_args.push(ta_value.clone());
+        acc = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &callee, Value::Undefined, cb_args)
+            .map_err(|e| NativeError::TypeError {
+                name: method,
+                reason: e.to_string(),
+            })?;
+        i += step;
+    }
+    Ok(acc)
+}
+
+fn ta_build_result(
+    ctx: &mut NativeCtx<'_>,
+    kind: crate::binary::typed_array::TypedArrayKind,
+    values: &[Value],
+    method: &'static str,
+) -> Result<Value, NativeError> {
+    let bpe = kind.bytes_per_element();
+    let byte_len = values.len().checked_mul(bpe).ok_or(NativeError::RangeError {
+        name: method,
+        reason: "TypedArray byte length overflow".to_string(),
+    })?;
+    let roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let new_target = ctx.new_target().cloned();
+    let value_slice: &[Value] = values;
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        crate::runtime_cx::visit_native_roots(
+            visitor,
+            &roots,
+            &this_value,
+            new_target.as_ref(),
+            &[],
+            &[value_slice],
+        );
+    };
+    let new_buf = crate::binary::array_buffer::JsArrayBuffer::try_new_with_roots(
+        byte_len,
+        ctx.heap_mut(),
+        &mut external_visit,
+    )
+    .map_err(|err| NativeError::RangeError {
+        name: method,
+        reason: format!(
+            "TypedArray allocation of {byte_len} bytes exceeds the available heap (limit {})",
+            err.heap_limit_bytes()
+        ),
+    })?
+    .ok_or_else(|| NativeError::RangeError {
+        name: method,
+        reason: format!("TypedArray allocation of {byte_len} bytes exceeds the available heap"),
+    })?;
+    let view = crate::binary::typed_array::JsTypedArray::new(new_buf, kind, 0, values.len());
+    for (i, v) in values.iter().enumerate() {
+        view.set(i, v);
+    }
+    Ok(Value::TypedArray(view))
 }
 
 /// §22.2.6.1 `get %TypedArray%.prototype.buffer` — return the

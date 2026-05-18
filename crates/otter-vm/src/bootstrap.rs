@@ -2044,7 +2044,431 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
             "from",
             Value::NativeFunction(from_fn),
         );
+        // §27.1.2 %IteratorPrototype% — install the iterator-helpers
+        // proposal methods on the prototype carried by the
+        // `Iterator` constructor placeholder. The handlers re-enter
+        // the runtime via existing `IteratorState` wrappers so the
+        // call-method fast path and reflective property access
+        // share behaviour.
+        let prototype = match object::get(iterator_ctor, heap, "prototype") {
+            Some(Value::Object(p)) => p,
+            _ => return Ok(()),
+        };
+        let proto_root = Value::Object(prototype);
+        let install_proto =
+            |heap: &mut otter_gc::GcHeap,
+             name: &'static str,
+             length: u8,
+             call: crate::native_function::NativeFastFn|
+             -> Result<(), JsSurfaceError> {
+                let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
+                    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+                object::set(prototype, heap, name, Value::NativeFunction(f));
+                Ok(())
+            };
+        install_proto(heap, "map", 1, iterator_proto_map)?;
+        install_proto(heap, "filter", 1, iterator_proto_filter)?;
+        install_proto(heap, "take", 1, iterator_proto_take)?;
+        install_proto(heap, "drop", 1, iterator_proto_drop)?;
+        install_proto(heap, "flatMap", 1, iterator_proto_flat_map)?;
+        install_proto(heap, "toArray", 0, iterator_proto_to_array)?;
+        install_proto(heap, "forEach", 1, iterator_proto_for_each)?;
+        install_proto(heap, "reduce", 1, iterator_proto_reduce)?;
+        install_proto(heap, "some", 1, iterator_proto_some)?;
+        install_proto(heap, "every", 1, iterator_proto_every)?;
+        install_proto(heap, "find", 1, iterator_proto_find)?;
         Ok(())
+    }
+}
+
+fn iterator_receiver(
+    ctx: &crate::NativeCtx<'_>,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    match ctx.this_value() {
+        Value::Iterator(h) => Ok(*h),
+        _ => Err(crate::NativeError::TypeError {
+            name,
+            reason: "this is not an iterator".to_string(),
+        }),
+    }
+}
+
+fn require_callable_arg(
+    ctx: &crate::NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+    index: usize,
+) -> Result<Value, crate::NativeError> {
+    let v = args.get(index).cloned().unwrap_or(Value::Undefined);
+    if ctx.cx.interp.is_callable_runtime(&v) {
+        Ok(v)
+    } else {
+        Err(crate::NativeError::TypeError {
+            name,
+            reason: "argument must be callable".to_string(),
+        })
+    }
+}
+
+fn iterator_proto_map(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.map")?;
+    let mapper = require_callable_arg(ctx, args, "Iterator.prototype.map", 0)?;
+    let source_value = Value::Iterator(source);
+    let state = crate::IteratorState::Map {
+        source,
+        mapper: mapper.clone(),
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &mapper], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.map",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::Iterator(handle))
+}
+
+fn iterator_proto_filter(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.filter")?;
+    let predicate = require_callable_arg(ctx, args, "Iterator.prototype.filter", 0)?;
+    let source_value = Value::Iterator(source);
+    let state = crate::IteratorState::Filter {
+        source,
+        predicate: predicate.clone(),
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &predicate], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.filter",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::Iterator(handle))
+}
+
+fn iterator_proto_take(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.take")?;
+    let n = iterator_arg_count(args, "Iterator.prototype.take")?;
+    let source_value = Value::Iterator(source);
+    let state = crate::IteratorState::Take {
+        source,
+        remaining: n,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.take",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::Iterator(handle))
+}
+
+fn iterator_proto_drop(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
+    let n = iterator_arg_count(args, "Iterator.prototype.drop")?;
+    let source_value = Value::Iterator(source);
+    let state = crate::IteratorState::Drop {
+        source,
+        to_drop: n,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.drop",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::Iterator(handle))
+}
+
+fn iterator_proto_flat_map(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.flatMap")?;
+    let mapper = require_callable_arg(ctx, args, "Iterator.prototype.flatMap", 0)?;
+    let source_value = Value::Iterator(source);
+    let state = crate::IteratorState::FlatMap {
+        source,
+        mapper: mapper.clone(),
+        inner: None,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &mapper], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.flatMap",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::Iterator(handle))
+}
+
+fn iterator_arg_count(args: &[Value], name: &'static str) -> Result<u64, crate::NativeError> {
+    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let n = crate::number::to_number_value(&arg);
+    if n.is_nan() || n < 0.0 {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "argument must be a non-negative integer".to_string(),
+        });
+    }
+    if n.is_infinite() {
+        return Ok(u64::MAX);
+    }
+    Ok(n.trunc() as u64)
+}
+
+fn iterator_proto_to_array(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.toArray")?;
+    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
+        crate::NativeError::TypeError {
+            name: "Iterator.prototype.toArray",
+            reason: "missing execution context".to_string(),
+        }
+    })?;
+    let mut collected: Vec<Value> = Vec::new();
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.toArray",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        collected.push(v);
+    }
+    let iter_value = Value::Iterator(handle);
+    let arr = ctx
+        .array_from_elements_with_roots(
+            collected.iter().cloned(),
+            &[&iter_value],
+            &[collected.as_slice()],
+        )
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.toArray",
+            reason: "array allocation failed".to_string(),
+        })?;
+    Ok(Value::Array(arr))
+}
+
+fn iterator_proto_for_each(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.forEach")?;
+    let callback = require_callable_arg(ctx, args, "Iterator.prototype.forEach", 0)?;
+    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
+        crate::NativeError::TypeError {
+            name: "Iterator.prototype.forEach",
+            reason: "missing execution context".to_string(),
+        }
+    })?;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.forEach",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(v);
+        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        ctx.cx
+            .interp
+            .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.forEach",
+                reason: e.to_string(),
+            })?;
+        idx += 1.0;
+    }
+    Ok(Value::Undefined)
+}
+
+fn iterator_proto_reduce(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.reduce")?;
+    let reducer = require_callable_arg(ctx, args, "Iterator.prototype.reduce", 0)?;
+    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
+        crate::NativeError::TypeError {
+            name: "Iterator.prototype.reduce",
+            reason: "missing execution context".to_string(),
+        }
+    })?;
+    let has_initial = args.len() >= 2;
+    let mut acc = if has_initial {
+        args[1].clone()
+    } else {
+        Value::Undefined
+    };
+    let mut consumed_initial = !has_initial;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.reduce",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        if !consumed_initial {
+            acc = v;
+            consumed_initial = true;
+            idx += 1.0;
+            continue;
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(acc.clone());
+        cb_args.push(v);
+        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        acc = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &reducer, Value::Undefined, cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.reduce",
+                reason: e.to_string(),
+            })?;
+        idx += 1.0;
+    }
+    if !consumed_initial {
+        return Err(crate::NativeError::TypeError {
+            name: "Iterator.prototype.reduce",
+            reason: "reduce of empty iterator with no initial value".to_string(),
+        });
+    }
+    Ok(acc)
+}
+
+fn iterator_proto_some(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    iterator_predicate_drain(ctx, args, "Iterator.prototype.some", true, false)
+}
+
+fn iterator_proto_every(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    iterator_predicate_drain(ctx, args, "Iterator.prototype.every", false, true)
+}
+
+fn iterator_proto_find(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.find")?;
+    let predicate = require_callable_arg(ctx, args, "Iterator.prototype.find", 0)?;
+    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
+        crate::NativeError::TypeError {
+            name: "Iterator.prototype.find",
+            reason: "missing execution context".to_string(),
+        }
+    })?;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.find",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(v.clone());
+        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        let kept = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &predicate, Value::Undefined, cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.find",
+                reason: e.to_string(),
+            })?;
+        if kept.to_boolean() {
+            return Ok(v);
+        }
+        idx += 1.0;
+    }
+    Ok(Value::Undefined)
+}
+
+fn iterator_predicate_drain(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+    short_on_truthy: bool,
+    initial: bool,
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, name)?;
+    let predicate = require_callable_arg(ctx, args, name, 0)?;
+    let exec_ctx = ctx.execution_context().cloned().ok_or_else(|| {
+        crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        }
+    })?;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?;
+        if done {
+            return Ok(Value::Boolean(initial));
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(v);
+        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        let kept = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &predicate, Value::Undefined, cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?;
+        if kept.to_boolean() == short_on_truthy {
+            return Ok(Value::Boolean(short_on_truthy));
+        }
+        idx += 1.0;
     }
 }
 
@@ -2298,7 +2722,7 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 919;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 941;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 400 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

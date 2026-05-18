@@ -813,6 +813,47 @@ impl<'a> Visit<'a> for StrictValidator {
         walk::walk_labeled_statement(self, it);
     }
 
+    fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        // ECMA-262 §13.1 Identifiers Static Semantics: Early Errors —
+        // in strict-mode code an `IdentifierReference` must not be one
+        // of the strict-mode FutureReservedWords or `yield`. The
+        // parser already rejects `yield` inside generator bodies as a
+        // YieldExpression rather than an `IdentifierReference`, so any
+        // surviving `IdentifierReference` named `yield` reaches this
+        // pass and is a syntax error in strict code (e.g.
+        // `[ x = yield ] = []` in a strict script).
+        // <https://tc39.es/ecma262/#sec-identifiers-static-semantics-early-errors>
+        if self.is_strict() {
+            let name = it.name.as_str();
+            if matches!(
+                name,
+                "yield"
+                    | "implements"
+                    | "interface"
+                    | "let"
+                    | "package"
+                    | "private"
+                    | "protected"
+                    | "public"
+                    | "static"
+            ) {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "STRICT_RESERVED_IDENTIFIER_REFERENCE".to_string(),
+                    message: format!(
+                        "SyntaxError: `{name}` is a reserved word in strict mode and \
+                         cannot appear as an IdentifierReference (§13.1)"
+                    ),
+                    range: Some((it.span.start, it.span.end)),
+                    help: Some(
+                        "rename the reference; strict-mode reserved words may not be \
+                         used as identifier references"
+                            .to_string(),
+                    ),
+                });
+            }
+        }
+    }
+
     fn visit_binding_identifier(&mut self, it: &BindingIdentifier<'a>) {
         // ECMA-262 §13.1.1 Static Semantics: Early Errors for
         // BindingIdentifier — in strict mode code, the binding name

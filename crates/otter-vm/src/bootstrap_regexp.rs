@@ -87,6 +87,8 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
     );
 
+    install_regexp_legacy_accessors(heap, ctor)?;
+
     crate::bootstrap::define_global_value(
         global,
         heap,
@@ -94,6 +96,173 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         Value::NativeFunction(ctor),
     );
     Ok(())
+}
+
+/// §B.2.4 RegExp legacy static accessors — `RegExp.input`, `$_`,
+/// `lastMatch`, `$&`, `lastParen`, `$+`, `leftContext`, `` $` ``,
+/// `rightContext`, `$'`, plus `$1`..`$9`. Each is an accessor
+/// pair installed on the `%RegExp%` constructor with `[[Enumerable]]
+/// = false`, `[[Configurable]] = true`. The getters / setters
+/// validate that `this` is `%RegExp%` per `GetLegacyRegExpStaticProperty`
+/// / `SetLegacyRegExpStaticProperty` and otherwise return empty
+/// strings (we don't yet track per-realm last-match state).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-additional-properties-of-the-regexp.prototype-object>
+fn install_regexp_legacy_accessors(
+    heap: &mut otter_gc::GcHeap,
+    ctor: crate::native_function::NativeFunction,
+) -> Result<(), JsSurfaceError> {
+    use crate::native_function::NativeFunction;
+    let string_heap = crate::string::StringHeap::default();
+    let ctor_value = Value::NativeFunction(ctor);
+
+    fn install_get_only(
+        heap: &mut otter_gc::GcHeap,
+        ctor: NativeFunction,
+        name: &'static str,
+        getter_name: &'static str,
+    ) -> Result<(), JsSurfaceError> {
+        let ctor_value = Value::NativeFunction(ctor);
+        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value.clone()];
+        let getter = NativeFunction::with_length_and_captures(
+            heap,
+            getter_name,
+            0,
+            legacy_accessor_getter,
+            captures,
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let desc = PropertyDescriptor::accessor(
+            Some(Value::NativeFunction(getter)),
+            None,
+            false,
+            true,
+        );
+        let string_heap = crate::string::StringHeap::default();
+        if !ctor.define_own_property(heap, &string_heap, name, desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed(name));
+        }
+        Ok(())
+    }
+
+    fn install_get_set(
+        heap: &mut otter_gc::GcHeap,
+        ctor: NativeFunction,
+        name: &'static str,
+        getter_name: &'static str,
+        setter_name: &'static str,
+    ) -> Result<(), JsSurfaceError> {
+        let ctor_value = Value::NativeFunction(ctor);
+        let g_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value.clone()];
+        let s_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value.clone()];
+        let getter = NativeFunction::with_length_and_captures(
+            heap,
+            getter_name,
+            0,
+            legacy_accessor_getter,
+            g_captures,
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let setter = NativeFunction::with_length_and_captures(
+            heap,
+            setter_name,
+            1,
+            legacy_accessor_setter,
+            s_captures,
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let desc = PropertyDescriptor::accessor(
+            Some(Value::NativeFunction(getter)),
+            Some(Value::NativeFunction(setter)),
+            false,
+            true,
+        );
+        let string_heap = crate::string::StringHeap::default();
+        if !ctor.define_own_property(heap, &string_heap, name, desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed(name));
+        }
+        Ok(())
+    }
+    let _ = (string_heap, ctor_value);
+
+    // input / $_ — only get/set pair per §B.2.4.1.
+    install_get_set(heap, ctor, "input", "get input", "set input")?;
+    install_get_set(heap, ctor, "$_", "get $_", "set $_")?;
+    // Get-only legacy accessors.
+    install_get_only(heap, ctor, "lastMatch", "get lastMatch")?;
+    install_get_only(heap, ctor, "$&", "get $&")?;
+    install_get_only(heap, ctor, "lastParen", "get lastParen")?;
+    install_get_only(heap, ctor, "$+", "get $+")?;
+    install_get_only(heap, ctor, "leftContext", "get leftContext")?;
+    install_get_only(heap, ctor, "$`", "get $`")?;
+    install_get_only(heap, ctor, "rightContext", "get rightContext")?;
+    install_get_only(heap, ctor, "$'", "get $'")?;
+    // `$1`..`$9` — get-only legacy capture-group accessors.
+    install_get_only(heap, ctor, "$1", "get $1")?;
+    install_get_only(heap, ctor, "$2", "get $2")?;
+    install_get_only(heap, ctor, "$3", "get $3")?;
+    install_get_only(heap, ctor, "$4", "get $4")?;
+    install_get_only(heap, ctor, "$5", "get $5")?;
+    install_get_only(heap, ctor, "$6", "get $6")?;
+    install_get_only(heap, ctor, "$7", "get $7")?;
+    install_get_only(heap, ctor, "$8", "get $8")?;
+    install_get_only(heap, ctor, "$9", "get $9")?;
+    Ok(())
+}
+
+/// §B.2.4.1 `GetLegacyRegExpStaticProperty` — verify `this` is the
+/// `%RegExp%` constructor, otherwise raise `TypeError`. We don't yet
+/// maintain per-realm last-match state, so the getter returns the
+/// empty string (spec-permitted "no prior match" sentinel).
+fn legacy_accessor_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    captures: &[Value],
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let ctor = captures.first().cloned().unwrap_or(Value::Undefined);
+    if !values_strict_equal(&this_value, &ctor) {
+        return Err(NativeError::TypeError {
+            name: "RegExp legacy accessor",
+            reason: "Method called on incompatible receiver".to_string(),
+        });
+    }
+    let heap = ctx.interp_mut().string_heap_clone();
+    Ok(Value::String(
+        JsString::from_str("", &heap).map_err(|_| NativeError::TypeError {
+            name: "RegExp legacy accessor",
+            reason: "out of memory".to_string(),
+        })?,
+    ))
+}
+
+/// §B.2.4.2 `SetLegacyRegExpStaticProperty` — accepts the assignment
+/// only when `this` is `%RegExp%`, otherwise raises `TypeError`. We
+/// drop the value because per-realm last-match storage isn't yet
+/// implemented; this satisfies the spec-mandated receiver check and
+/// the prop-desc tests that observe the setter shape.
+fn legacy_accessor_setter(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    captures: &[Value],
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let ctor = captures.first().cloned().unwrap_or(Value::Undefined);
+    if !values_strict_equal(&this_value, &ctor) {
+        return Err(NativeError::TypeError {
+            name: "RegExp legacy accessor",
+            reason: "Method called on incompatible receiver".to_string(),
+        });
+    }
+    Ok(Value::Undefined)
+}
+
+fn values_strict_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::NativeFunction(x), Value::NativeFunction(y)) => x.ptr_eq(y),
+        _ => false,
+    }
 }
 
 /// Install `@@toStringTag` (no longer set on every RegExp — it

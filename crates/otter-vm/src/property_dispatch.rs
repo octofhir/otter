@@ -528,7 +528,21 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => {
                 match native.own_property_descriptor(&self.gc_heap, &self.string_heap, name)? {
-                    Some(desc) => descriptor_value(&desc),
+                    Some(desc) => match &desc.kind {
+                        object::DescriptorKind::Data { value } => value.clone(),
+                        // §10.1.8.1 OrdinaryGet step 7 — accessor
+                        // descriptors invoke `[[Get]]` with the
+                        // receiver. RegExp's `%RegExp%.input` /
+                        // `lastMatch` / etc. legacy accessors land
+                        // here.
+                        object::DescriptorKind::Accessor { getter, .. } => match getter {
+                            Some(g) => {
+                                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                                self.run_callable_sync(context, g, receiver.clone(), args)?
+                            }
+                            None => Value::Undefined,
+                        },
+                    },
                     None => self
                         .load_function_prototype_method(name)
                         .or_else(|| self.load_object_prototype_method(name))

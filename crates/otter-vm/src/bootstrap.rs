@@ -2997,8 +2997,8 @@ mod tests {
         // method spec install pass (Iter 11). Each ctor installs a
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1005;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 440 * 1024;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1047;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 464 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

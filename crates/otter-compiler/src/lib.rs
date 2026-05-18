@@ -8385,6 +8385,317 @@ fn validate_no_direct_super_in_methods(
     Ok(())
 }
 
+/// §15.7.1 / §8.2.4 Static Semantics: AllPrivateNamesValid —
+/// every `#name` reference inside a class body must resolve to a
+/// `PrivateBoundIdentifier` of an enclosing class. The heritage
+/// expression is evaluated against the **outer** private
+/// environment (it cannot see the class's own private names).
+///
+/// Walks the class subtree, maintaining a stack of declared
+/// `#name` sets. Raises `CompileError::Syntax` on the first
+/// unresolved reference.
+/// Returns the computed-key `Expression` view of a `PropertyKey`,
+/// or `None` when the key is a static identifier or a private name
+/// (which don't carry expressions to validate).
+fn property_key_as_expression<'a, 'b>(
+    key: &'b oxc_ast::ast::PropertyKey<'a>,
+) -> Option<&'b oxc_ast::ast::Expression<'a>> {
+    match key {
+        oxc_ast::ast::PropertyKey::StaticIdentifier(_)
+        | oxc_ast::ast::PropertyKey::PrivateIdentifier(_) => None,
+        other => other.as_expression(),
+    }
+}
+
+fn validate_class_private_names(class: &oxc_ast::ast::Class<'_>) -> Result<(), CompileError> {
+    let mut scopes: Vec<std::collections::HashSet<String>> = Vec::new();
+    validate_class_private_names_inner(class, &mut scopes)
+}
+
+fn collect_class_private_bound(
+    body: &oxc_ast::ast::ClassBody<'_>,
+) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for element in &body.body {
+        match element {
+            oxc_ast::ast::ClassElement::MethodDefinition(m) => {
+                if let oxc_ast::ast::PropertyKey::PrivateIdentifier(p) = &m.key {
+                    names.insert(p.name.to_string());
+                }
+            }
+            oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
+                if let oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) = &p.key {
+                    names.insert(pid.name.to_string());
+                }
+            }
+            oxc_ast::ast::ClassElement::AccessorProperty(a) => {
+                if let oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) = &a.key {
+                    names.insert(pid.name.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn private_name_in_scope(
+    scopes: &[std::collections::HashSet<String>],
+    name: &str,
+) -> bool {
+    scopes.iter().rev().any(|s| s.contains(name))
+}
+
+fn validate_private_refs_in_expression(
+    expr: &oxc_ast::ast::Expression<'_>,
+    scopes: &mut Vec<std::collections::HashSet<String>>,
+) -> Result<(), CompileError> {
+    use oxc_ast_visit::Visit;
+    // Custom visitor so we can re-enter nested classes (which mutate
+    // the scope stack) without losing the validator's invariants.
+    struct PrivateRefFinder<'s> {
+        scopes: &'s mut Vec<std::collections::HashSet<String>>,
+        err: Option<CompileError>,
+    }
+    impl<'a, 's> Visit<'a> for PrivateRefFinder<'s> {
+        fn visit_private_field_expression(
+            &mut self,
+            it: &oxc_ast::ast::PrivateFieldExpression<'a>,
+        ) {
+            if self.err.is_some() {
+                return;
+            }
+            let name = it.field.name.as_str();
+            if !private_name_in_scope(self.scopes, name) {
+                self.err = Some(CompileError::Syntax {
+                    messages: vec![format!(
+                        "SyntaxError: undeclared private name '#{name}'"
+                    )],
+                    diagnostics: Vec::new(),
+                });
+                return;
+            }
+            oxc_ast_visit::walk::walk_private_field_expression(self, it);
+        }
+        fn visit_private_in_expression(
+            &mut self,
+            it: &oxc_ast::ast::PrivateInExpression<'a>,
+        ) {
+            if self.err.is_some() {
+                return;
+            }
+            let name = it.left.name.as_str();
+            if !private_name_in_scope(self.scopes, name) {
+                self.err = Some(CompileError::Syntax {
+                    messages: vec![format!(
+                        "SyntaxError: undeclared private name '#{name}'"
+                    )],
+                    diagnostics: Vec::new(),
+                });
+                return;
+            }
+            oxc_ast_visit::walk::walk_private_in_expression(self, it);
+        }
+        fn visit_class(&mut self, it: &oxc_ast::ast::Class<'a>) {
+            if self.err.is_some() {
+                return;
+            }
+            if let Err(e) = validate_class_private_names_inner(it, self.scopes) {
+                self.err = Some(e);
+            }
+        }
+    }
+    let mut finder = PrivateRefFinder { scopes, err: None };
+    finder.visit_expression(expr);
+    match finder.err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn validate_private_refs_in_function_body(
+    func: &oxc_ast::ast::Function<'_>,
+    scopes: &mut Vec<std::collections::HashSet<String>>,
+) -> Result<(), CompileError> {
+    use oxc_ast_visit::Visit;
+    struct PrivateRefFinder<'s> {
+        scopes: &'s mut Vec<std::collections::HashSet<String>>,
+        err: Option<CompileError>,
+    }
+    impl<'a, 's> Visit<'a> for PrivateRefFinder<'s> {
+        fn visit_private_field_expression(
+            &mut self,
+            it: &oxc_ast::ast::PrivateFieldExpression<'a>,
+        ) {
+            if self.err.is_some() {
+                return;
+            }
+            let name = it.field.name.as_str();
+            if !private_name_in_scope(self.scopes, name) {
+                self.err = Some(CompileError::Syntax {
+                    messages: vec![format!(
+                        "SyntaxError: undeclared private name '#{name}'"
+                    )],
+                    diagnostics: Vec::new(),
+                });
+                return;
+            }
+            oxc_ast_visit::walk::walk_private_field_expression(self, it);
+        }
+        fn visit_private_in_expression(
+            &mut self,
+            it: &oxc_ast::ast::PrivateInExpression<'a>,
+        ) {
+            if self.err.is_some() {
+                return;
+            }
+            let name = it.left.name.as_str();
+            if !private_name_in_scope(self.scopes, name) {
+                self.err = Some(CompileError::Syntax {
+                    messages: vec![format!(
+                        "SyntaxError: undeclared private name '#{name}'"
+                    )],
+                    diagnostics: Vec::new(),
+                });
+                return;
+            }
+            oxc_ast_visit::walk::walk_private_in_expression(self, it);
+        }
+        fn visit_class(&mut self, it: &oxc_ast::ast::Class<'a>) {
+            if self.err.is_some() {
+                return;
+            }
+            if let Err(e) = validate_class_private_names_inner(it, self.scopes) {
+                self.err = Some(e);
+            }
+        }
+    }
+    let mut finder = PrivateRefFinder { scopes, err: None };
+    for param in &func.params.items {
+        if let Some(init) = param.initializer.as_deref() {
+            finder.visit_expression(init);
+        }
+    }
+    if let Some(body) = func.body.as_deref() {
+        for stmt in &body.statements {
+            finder.visit_statement(stmt);
+        }
+    }
+    match finder.err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn validate_class_private_names_inner(
+    class: &oxc_ast::ast::Class<'_>,
+    scopes: &mut Vec<std::collections::HashSet<String>>,
+) -> Result<(), CompileError> {
+    // Heritage is evaluated under the outer private environment per
+    // §15.7.14 step 10.b — push happens after the heritage walk.
+    if let Some(parent) = &class.super_class {
+        validate_private_refs_in_expression(parent, scopes)?;
+    }
+    let own = collect_class_private_bound(&class.body);
+    scopes.push(own);
+    let res = (|| -> Result<(), CompileError> {
+        for element in &class.body.body {
+            match element {
+                oxc_ast::ast::ClassElement::MethodDefinition(m) => {
+                    // Computed key expressions are evaluated in the
+                    // class's private scope.
+                    if let Some(e) = property_key_as_expression(&m.key) {
+                        validate_private_refs_in_expression(e, scopes)?;
+                    }
+                    validate_private_refs_in_function_body(&m.value, scopes)?;
+                }
+                oxc_ast::ast::ClassElement::PropertyDefinition(p) => {
+                    if let Some(e) = property_key_as_expression(&p.key) {
+                        validate_private_refs_in_expression(e, scopes)?;
+                    }
+                    if let Some(init) = p.value.as_ref() {
+                        validate_private_refs_in_expression(init, scopes)?;
+                    }
+                }
+                oxc_ast::ast::ClassElement::AccessorProperty(a) => {
+                    if let Some(e) = property_key_as_expression(&a.key) {
+                        validate_private_refs_in_expression(e, scopes)?;
+                    }
+                    if let Some(init) = a.value.as_ref() {
+                        validate_private_refs_in_expression(init, scopes)?;
+                    }
+                }
+                oxc_ast::ast::ClassElement::StaticBlock(b) => {
+                    use oxc_ast_visit::Visit;
+                    struct PrivateRefFinder<'s> {
+                        scopes: &'s mut Vec<std::collections::HashSet<String>>,
+                        err: Option<CompileError>,
+                    }
+                    impl<'a, 's> Visit<'a> for PrivateRefFinder<'s> {
+                        fn visit_private_field_expression(
+                            &mut self,
+                            it: &oxc_ast::ast::PrivateFieldExpression<'a>,
+                        ) {
+                            if self.err.is_some() {
+                                return;
+                            }
+                            let name = it.field.name.as_str();
+                            if !private_name_in_scope(self.scopes, name) {
+                                self.err = Some(CompileError::Syntax {
+                                    messages: vec![format!(
+                                        "SyntaxError: undeclared private name '#{name}'"
+                                    )],
+                                    diagnostics: Vec::new(),
+                                });
+                                return;
+                            }
+                            oxc_ast_visit::walk::walk_private_field_expression(self, it);
+                        }
+                        fn visit_private_in_expression(
+                            &mut self,
+                            it: &oxc_ast::ast::PrivateInExpression<'a>,
+                        ) {
+                            if self.err.is_some() {
+                                return;
+                            }
+                            let name = it.left.name.as_str();
+                            if !private_name_in_scope(self.scopes, name) {
+                                self.err = Some(CompileError::Syntax {
+                                    messages: vec![format!(
+                                        "SyntaxError: undeclared private name '#{name}'"
+                                    )],
+                                    diagnostics: Vec::new(),
+                                });
+                                return;
+                            }
+                            oxc_ast_visit::walk::walk_private_in_expression(self, it);
+                        }
+                        fn visit_class(&mut self, it: &oxc_ast::ast::Class<'a>) {
+                            if self.err.is_some() {
+                                return;
+                            }
+                            if let Err(e) = validate_class_private_names_inner(it, self.scopes) {
+                                self.err = Some(e);
+                            }
+                        }
+                    }
+                    let mut finder = PrivateRefFinder { scopes, err: None };
+                    for stmt in &b.body {
+                        finder.visit_statement(stmt);
+                    }
+                    if let Some(e) = finder.err {
+                        return Err(e);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })();
+    scopes.pop();
+    res
+}
+
 fn compile_class(
     cx: &mut Compiler,
     class: &oxc_ast::ast::Class<'_>,
@@ -8424,6 +8735,10 @@ fn compile_class(
     // HasDirectSuper; nested non-arrow function bodies break the
     // chain (they have their own [[HomeObject]] = undefined).
     validate_no_direct_super_in_methods(&class.body)?;
+    // §15.7.1 / §8.2.4 AllPrivateNamesValid — every `#name` must be
+    // declared in an enclosing class. The heritage expression is
+    // evaluated in the outer private scope.
+    validate_class_private_names(class)?;
 
     cx.enter_scope();
 

@@ -38,17 +38,18 @@ use crate::Value;
 use crate::number::NumberValue;
 
 /// §7.1.22 `ToIndex(value)` — coerce to a non-negative integer in
-/// `[0, 2^53 - 1]`. Returns `None` for non-finite, negative, or
-/// non-integer inputs (the dispatcher surfaces a
-/// [`crate::VmError::TypeMismatch`]).
+/// `[0, 2^53 - 1]`. Returns `None` for non-integer inputs after
+/// `ToIntegerOrInfinity` (`±∞`, BigInt / Symbol, or out-of-range)
+/// so the dispatcher can surface a [`crate::VmError::TypeMismatch`]
+/// / `RangeError`. The truncation step in
+/// [`ToIntegerOrInfinity`](https://tc39.es/ecma262/#sec-tointegerorinfinity)
+/// runs *before* the negative / range check, so callers like
+/// `sample.getUint8(-0.9)` and `sample.getBigInt64("-0.4")` resolve
+/// to index `0` rather than throwing.
+///
+/// <https://tc39.es/ecma262/#sec-toindex>
 #[must_use]
 pub fn to_index(value: &Value) -> Option<u64> {
-    // §7.1.17 ToIndex(value):
-    // 1. If value is undefined → return 0.
-    // 2. Else let integer = ToIntegerOrInfinity(value).
-    // 3. If integer < 0 or integer > 2^53-1 → RangeError (return None).
-    // §7.1.5 ToIntegerOrInfinity: ToNumber(value); NaN → 0;
-    // +∞ / -∞ pass through; else truncate toward 0.
     let n = match value {
         Value::Undefined => return Some(0),
         Value::Number(n) => n.as_f64(),
@@ -60,10 +61,18 @@ pub fn to_index(value: &Value) -> Option<u64> {
     if n.is_nan() {
         return Some(0);
     }
-    if !n.is_finite() || n < 0.0 || n > 9_007_199_254_740_991.0 {
+    if !n.is_finite() {
         return None;
     }
-    Some(n.trunc() as u64)
+    // §7.1.5 ToIntegerOrInfinity truncates toward 0 *first*; the
+    // §7.1.22 ToIndex range check then runs on the truncated value
+    // so `-0.9` (which truncates to `-0`) is a valid index, not a
+    // `RangeError`.
+    let truncated = n.trunc();
+    if truncated < 0.0 || truncated > 9_007_199_254_740_991.0 {
+        return None;
+    }
+    Some(truncated as u64)
 }
 
 /// §7.1.4 `ToNumber` for the `littleEndian` flag — a missing or

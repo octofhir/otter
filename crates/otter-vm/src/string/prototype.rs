@@ -557,15 +557,14 @@ fn pad_impl(args: &IntrinsicArgs<'_>, side: PadSide) -> Result<Value, IntrinsicE
     if target <= recv_len {
         return Ok(Value::String(recv.clone()));
     }
+    // §22.1.3.16 step 11 / §22.1.3.17 step 11 — `fillString` is
+    // either `undefined` (single-space default) or the result of
+    // `ToString(fillString)`. Coerce every spec-relevant operand
+    // shape through `arg_to_string` so primitive fill strings
+    // round-trip without bailing.
     let pad_units: Vec<u16> = match args.args.get(1) {
         None | Some(Value::Undefined) => vec![0x0020],
-        Some(Value::String(s)) => s.to_utf16_vec(),
-        Some(_) => {
-            return Err(IntrinsicError::BadArgument {
-                index: 1,
-                reason: "must be a string",
-            });
-        }
+        _ => arg_to_string(args, 1)?.to_utf16_vec(),
     };
     if pad_units.is_empty() {
         return Ok(Value::String(recv.clone()));
@@ -1374,11 +1373,21 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         )?;
         out.push(Value::Array(arr));
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
-    )?))
+    // §22.1.3.14 step 7 — `Invoke(rx, @@matchAll, « S »)` returns a
+    // `RegExp String Iterator`. The foundation lowers it to a
+    // pre-computed Array wrapped in an `IteratorState::Array` so
+    // each `next()` step yields one match in iteration order.
+    let arr = args.array_from_elements_rooted(out.iter().cloned(), &[], &[out.as_slice()])?;
+    let arr_value = Value::Array(arr);
+    let state = crate::IteratorState::Array { array: arr, index: 0 };
+    let handle = args.gc_heap.alloc_old(state).map_err(|_| {
+        IntrinsicError::OutOfRange {
+            index: 0,
+            reason: "iterator allocation failed",
+        }
+    })?;
+    let _ = arr_value;
+    Ok(Value::Iterator(handle))
 }
 
 fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

@@ -831,7 +831,12 @@ fn native_get_own_property_descriptors_rooted(
 ) -> Result<Value, VmError> {
     let target = expect_object(args.first())?;
     let target_root = Value::Object(target);
+    // §20.1.2.9 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
+    let object_proto = ctx.cx.interp.constructor_prototype_value("Object").ok();
     let result = ctx.alloc_object_with_roots(&[&target_root], &[args])?;
+    if let Some(Value::Object(proto_obj)) = object_proto {
+        crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
+    }
     let result_root = Value::Object(result);
     let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
         crate::object::with_properties(target, ctx.heap(), |p| {
@@ -1001,7 +1006,15 @@ fn native_descriptor_to_object_rooted(
             }
         }
     }
+    // §6.2.5.4 FromPropertyDescriptor step 2 — descriptor objects
+    // inherit `%Object.prototype%`. Without setting the prototype,
+    // reflective tests (`desc instanceof Object`,
+    // `Object.getPrototypeOf(desc)`) observe a null-proto object.
+    let object_proto = ctx.cx.interp.constructor_prototype_value("Object").ok();
     let result = ctx.alloc_object_with_roots(roots.as_slice(), &[args])?;
+    if let Some(Value::Object(proto_obj)) = object_proto {
+        crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
+    }
     match &desc.kind {
         DescriptorKind::Data { value } => {
             ctx.set_property(result, "value", value.clone())?;

@@ -1307,7 +1307,13 @@ impl Interpreter {
                 // - String wrapper exposes indexed code-unit slots +
                 //   `length`; emit data descriptors directly.
                 // - Null / Undefined throw TypeError per spec.
+                // The result inherits from `%Object.prototype%` per
+                // step 2 (`OrdinaryObjectCreate(%Object.prototype%)`).
+                let object_proto = self.constructor_prototype_value("Object").ok();
                 let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
+                if let Some(Value::Object(proto_obj)) = object_proto {
+                    object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
+                }
                 match args.first() {
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
@@ -1722,8 +1728,14 @@ impl Interpreter {
                 }
             }
         }
+        // §6.2.5.4 FromPropertyDescriptor step 2 — descriptor objects
+        // inherit `%Object.prototype%`.
+        let object_proto = self.constructor_prototype_value("Object").ok();
         let result =
             self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
+        if let Some(Value::Object(proto_obj)) = object_proto {
+            object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
+        }
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
                 self.set_property(result, "value", value.clone())?;

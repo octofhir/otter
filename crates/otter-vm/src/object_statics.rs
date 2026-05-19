@@ -2379,9 +2379,34 @@ pub fn call(
         // §20.1.2.15 Object.isFrozen(O)
         M::IsFrozen => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
-            // Per spec, `Object.isFrozen(non_object) === true`.
+            // Per spec, `Object.isFrozen(non_object) === true`. Heap
+            // exotics default to extensible+configurable so they are
+            // not frozen unless the foundation explicitly toggles
+            // their `[[Extensible]]` slot.
             let result = match arg {
                 Value::Object(o) => crate::object::is_frozen(o, gc_heap),
+                Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::BoundFunction(_)
+                | Value::NativeFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+                | Value::Iterator(_)
+                | Value::Generator(_)
+                | Value::Temporal(_)
+                | Value::Intl(_)
+                | Value::Proxy(_) => false,
                 _ => true,
             };
             Ok(Value::Boolean(result))
@@ -2389,8 +2414,39 @@ pub fn call(
         // §20.1.2.16 Object.isSealed(O)
         M::IsSealed => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            // §20.1.2.16 — `Object.isSealed(non_object) === true`. For
+            // ordinary objects, `is_sealed` walks the property table
+            // checking that nothing is configurable and that the
+            // object is non-extensible. Heap-allocated exotics that
+            // do not yet carry per-instance attribute tracking
+            // (Array indexed slots, RegExp expando, …) default to
+            // `false` because their elements / lazy expando bags
+            // remain configurable until `preventExtensions` is
+            // applied through the foundation surface.
             let result = match arg {
                 Value::Object(o) => crate::object::is_sealed(o, gc_heap),
+                Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::BoundFunction(_)
+                | Value::NativeFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+                | Value::Iterator(_)
+                | Value::Generator(_)
+                | Value::Temporal(_)
+                | Value::Intl(_)
+                | Value::Proxy(_) => false,
                 _ => true,
             };
             Ok(Value::Boolean(result))
@@ -2398,14 +2454,35 @@ pub fn call(
         // §20.1.2.14 Object.isExtensible(O)
         M::IsExtensible => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
-            // Spec: `Object.isExtensible(non_object) === false`.
+            // §20.1.2.14 — `Object.isExtensible(non_object) === false`.
+            // Every heap-allocated value kind is an Object, so they
+            // all default to extensible until a `preventExtensions`
+            // / `seal` / `freeze` toggle landed. Primitives and the
+            // null / undefined sentinels return false.
             let result = match arg {
                 Value::Object(o) => crate::object::is_extensible(o, gc_heap),
                 Value::Function { .. }
                 | Value::Closure { .. }
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
-                | Value::ClassConstructor(_) => true,
+                | Value::ClassConstructor(_)
+                | Value::Array(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+                | Value::Iterator(_)
+                | Value::Generator(_)
+                | Value::Temporal(_)
+                | Value::Intl(_)
+                | Value::Proxy(_) => true,
                 _ => false,
             };
             Ok(Value::Boolean(result))

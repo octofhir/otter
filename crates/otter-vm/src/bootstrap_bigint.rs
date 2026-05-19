@@ -158,7 +158,9 @@ fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             reason: "BigInt is not a constructor".to_string(),
         });
     }
-    bigint::dispatch::call(BigIntMethod::Construct, args).map_err(|e| vm_to_native(e, "BigInt"))
+    let coerced = coerce_bigint_call_args(ctx, args, "BigInt")?;
+    bigint::dispatch::call(BigIntMethod::Construct, &coerced)
+        .map_err(|e| vm_to_native(e, "BigInt"))
 }
 
 fn bigint_static_as_int_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

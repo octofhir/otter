@@ -431,6 +431,49 @@ pub(crate) fn push_with_roots(
     Ok(new_len)
 }
 
+/// Spec §10.4.2.4 step 17 truncation / step 9 growth of the dense
+/// element storage backing `Array.prototype.length`. Shrinks below
+/// the current length by dropping dense and sparse slots whose index
+/// is ≥ `new_len`; grows above the current length by extending the
+/// dense vector with [`Value::Hole`] so absent indices remain
+/// distinguishable from explicit `undefined`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-arraysetlength>
+pub fn set_length(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    new_len: usize,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let cur = len(arr, heap);
+    if cur == new_len {
+        return Ok(());
+    }
+    if new_len < cur {
+        heap.with_payload(arr, |body| {
+            body.elements.truncate(new_len);
+            if let Some(sparse) = body.sparse_elements.as_mut() {
+                sparse.retain(|k, _| *k < new_len);
+                if sparse.is_empty() {
+                    body.sparse_elements = None;
+                }
+            }
+            body.dirty = true;
+        });
+        return Ok(());
+    }
+    reserve_for_target_len(arr, heap, new_len)?;
+    heap.with_payload(arr, |body| {
+        body.elements
+            .reserve_exact(new_len.saturating_sub(body.elements.len()));
+        while body.elements.len() < new_len {
+            body.elements.push(Value::Hole);
+        }
+        body.dirty = true;
+    });
+    Ok(())
+}
+
 /// Pop from the tail. Returns `Value::Undefined` for an empty array
 /// and for slots that hold the internal [`Value::Hole`] sentinel.
 #[must_use]

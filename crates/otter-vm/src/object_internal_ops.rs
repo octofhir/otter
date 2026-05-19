@@ -478,21 +478,41 @@ impl Interpreter {
                         .as_ref()
                         .and_then(|m| m.get(key).cloned())
                 }) {
-                    return Ok(Some(object::PropertyDescriptor::data(value, true, true, true)));
+                    return Ok(Some(object::PropertyDescriptor::data(
+                        value, true, true, true,
+                    )));
                 }
                 Ok(None)
             }
             Value::RegExp(re) => {
                 if key.string_name().is_some_and(|key| key == "lastIndex") {
-                    Ok(Some(object::PropertyDescriptor::data(
+                    return Ok(Some(object::PropertyDescriptor::data(
                         re.last_index_value(&self.gc_heap),
                         true,
                         false,
                         false,
-                    )))
-                } else {
-                    Ok(None)
+                    )));
                 }
+                // §22.2.6 — user-installed own properties
+                // (`re.foo = 1`) live in the lazy expando bag. Surface
+                // their full descriptor so reflective probes
+                // (`getOwnPropertyDescriptor`, `hasOwnProperty`,
+                // `ToPropertyDescriptor`) see the same shape ordinary
+                // objects expose.
+                if let Some(bag) = re.expando(&self.gc_heap) {
+                    if let Some(key) = key.string_name() {
+                        if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, key) {
+                            return Ok(Some(desc));
+                        }
+                    } else if let VmPropertyKey::Symbol(sym) = key {
+                        if let Some(desc) =
+                            object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
+                        {
+                            return Ok(Some(desc));
+                        }
+                    }
+                }
+                Ok(None)
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
                 VmPropertyKey::Symbol(sym) => {
@@ -874,10 +894,21 @@ impl Interpreter {
                     return Ok(true);
                 }
                 if k == "length" {
-                    // §6.2.5.1 generic descriptor (no fields) — no-op
-                    // for `length`, succeed without writing.
-                    if let Some(v) = &descriptor.value {
-                        array::set_named_property(*arr, &mut self.gc_heap, k, v.clone())
+                    // §10.4.2.4 ArraySetLength — when [[Value]] is
+                    // present, coerce it through ToUint32 / ToNumber
+                    // and resize the dense storage; mismatches surface
+                    // as RangeError per step 5. Missing [[Value]] is
+                    // currently a no-op since Array length is not yet
+                    // configurable / non-writable.
+                    if let Some(v) = descriptor.value.clone() {
+                        let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
+                        let new_len = crate::number::bitwise::to_uint32(number_len);
+                        if (new_len as f64) != number_len.as_f64() {
+                            return Err(VmError::RangeError {
+                                message: "Invalid array length".to_string(),
+                            });
+                        }
+                        array::set_length(*arr, &mut self.gc_heap, new_len as usize)
                             .map_err(|_| VmError::TypeMismatch)?;
                     }
                     return Ok(true);
@@ -1952,6 +1983,41 @@ impl Interpreter {
                 Ok(VmGetOutcome::Value(value))
             }
             Value::RegExp(re) => {
+                // §22.2.6 — user-installed own properties on a
+                // `RegExp` instance live in the lazy expando bag and
+                // shadow the spec-mandated accessors. Mirror the same
+                // precedence the bytecode property-dispatch path uses
+                // (property_dispatch::load_property RegExp arm) so
+                // reflective entry points
+                // (`ToPropertyDescriptor`, accessor-aware `[[Get]]`)
+                // observe the same value the VM hands out.
+                if let Some(bag) = re.expando(&self.gc_heap) {
+                    let lookup = match key {
+                        VmPropertyKey::Symbol(sym) => {
+                            object::lookup_own_symbol(bag, &self.gc_heap, sym)
+                        }
+                        _ => {
+                            let key = key
+                                .string_name()
+                                .expect("non-symbol key has string spelling");
+                            object::lookup_own(bag, &self.gc_heap, key)
+                        }
+                    };
+                    match lookup {
+                        object::PropertyLookup::Data { value, .. } => {
+                            return Ok(VmGetOutcome::Value(value));
+                        }
+                        object::PropertyLookup::Accessor { getter, .. } => {
+                            return Ok(match getter {
+                                Some(getter) if abstract_ops::is_callable(&getter) => {
+                                    VmGetOutcome::InvokeGetter { getter }
+                                }
+                                _ => VmGetOutcome::Value(Value::Undefined),
+                            });
+                        }
+                        object::PropertyLookup::Absent => {}
+                    }
+                }
                 let direct = match key {
                     VmPropertyKey::Symbol(_) => Value::Undefined,
                     _ => {

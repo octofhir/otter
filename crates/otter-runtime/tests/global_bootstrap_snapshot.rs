@@ -59,6 +59,7 @@ fn global_this_default_snapshot() {
     //   surface report `typeof === "function"`; namespace objects
     //   and internal prototype markers remain object-typed.
     let expected = "\
+@@%TypedArray% ... function
 @@%TypedArrayPrototype% ... object
 AggregateError w.c function
 Array w.c function
@@ -76,14 +77,16 @@ FinalizationRegistry w.c function
 Float32Array w.c function
 Float64Array w.c function
 Function w.c function
+Infinity ... number
 Int16Array w.c function
 Int32Array w.c function
 Int8Array w.c function
 Intl w.c object
-Iterator w.c object
+Iterator w.c function
 JSON w.c object
 Map w.c function
 Math w.c object
+NaN ... number
 Number w.c function
 Object w.c function
 Promise w.c function
@@ -110,10 +113,22 @@ WeakSet w.c function
 clearInterval w.c function
 clearTimeout w.c function
 console w.c object
+decodeURI w.c function
+decodeURIComponent w.c function
+encodeURI w.c function
+encodeURIComponent w.c function
+escape w.c function
+eval w.c function
 globalThis wec object
+isFinite w.c function
+isNaN w.c function
+parseFloat w.c function
+parseInt w.c function
 process w.c object
 setInterval w.c function
-setTimeout w.c function";
+setTimeout w.c function
+undefined ... undefined
+unescape w.c function";
     assert_eq!(dump, expected, "default globalThis own properties drifted");
 }
 

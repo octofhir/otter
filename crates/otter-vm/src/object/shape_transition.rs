@@ -26,18 +26,17 @@
 //!   fallback paths.
 //!
 //! # See also
-//! - [`super::Shape`]
 //! - [`crate::property_ic`]
 //! - [`crate::property_dispatch`]
 
-use std::rc::Rc;
-
 use super::{
-    AtomOwnPropertyHit, JsObject, ObjectBody, ObjectPrototype, PropertyLookup, PropertySlot, Shape,
-    ShapeId, has_writable_own_data_slot_atom, lookup_own_atom, prototype_value, shape_id,
+    AtomOwnPropertyHit, JsObject, ObjectBody, ObjectPrototype, PropertyLookup, PropertySlot,
+    ShapeHandle, ShapeId, has_writable_own_data_slot_atom, lookup_own_atom, prototype_value,
+    shape_id,
 };
 use crate::Value;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
+use otter_gc::raw::{RawGc, SlotVisitor};
 
 /// Atom-aware hidden-class transition for adding one ordinary own data slot.
 #[derive(Debug, Clone)]
@@ -46,12 +45,23 @@ pub(crate) struct StorePropertyTransition {
     pub(crate) from_shape_id: ShapeId,
     /// Atomized named-property key from the executable context.
     pub(crate) atom_id: AtomId,
-    /// Shared child shape reached by adding the property.
-    pub(crate) to_shape: Rc<Shape>,
+    /// Child shape id reached by adding the property.
+    pub(crate) to_shape_id: ShapeId,
+    /// GC-managed child shape reached by adding the property.
+    pub(crate) to_shape: ShapeHandle,
     /// Transition category and replay guard.
     pub(crate) kind: StorePropertyTransitionKind,
     /// Slot offset added by this transition.
     pub(crate) slot: u16,
+}
+
+impl StorePropertyTransition {
+    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
+        if !self.to_shape.is_null() {
+            let p = &self.to_shape as *const ShapeHandle as *mut RawGc;
+            visitor(p);
+        }
+    }
 }
 
 /// Explicit StoreProperty transition categories.
@@ -78,6 +88,7 @@ pub(crate) enum StorePropertyTransitionKind {
 /// Callers must only use this after ordinary `[[Set]]` selected
 /// [`PropertyLookup`]-compatible data assignment. The helper deliberately
 /// refuses unsupported object/prototype shapes instead of approximating.
+#[cfg(test)]
 pub(crate) fn capture_store_property_transition(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
@@ -85,6 +96,9 @@ pub(crate) fn capture_store_property_transition(
     value: &Value,
 ) -> Option<StorePropertyTransition> {
     let kind = transition_kind(obj, heap, key)?;
+    let from_shape_id = super::shape_id(obj, heap);
+    let existing_offset =
+        heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible
@@ -92,23 +106,64 @@ pub(crate) fn capture_store_property_transition(
         {
             return None;
         }
-        if body.shape.offset_of(key.name()).is_some() {
+        if existing_offset.is_some() {
             return None;
         }
         let slot = u16::try_from(body.slots.len()).ok()?;
-        let from_shape_id = body.shape.id();
-        let to_shape = Shape::add_property(&body.shape, key.name());
-        body.shape = Rc::clone(&to_shape);
+        let to_shape_id = super::next_shape_id();
+        body.dictionary_shape_id = to_shape_id;
+        body.dictionary_keys.push(key.name().to_owned());
+        body.shape = super::ShapeHandle::null();
         body.slots.push(PropertySlot::data_default(value.clone()));
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
-            to_shape,
+            to_shape_id,
+            to_shape: ShapeHandle::null(),
             kind,
             slot,
         })
     })?;
     heap.record_write(obj, value);
+    Some(transition)
+}
+
+pub(crate) fn capture_store_property_transition_with_shape(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    value: &Value,
+    next_shape: ShapeHandle,
+) -> Option<StorePropertyTransition> {
+    let kind = transition_kind(obj, heap, key)?;
+    let from_shape_id = super::shape_id(obj, heap);
+    let to_shape_id = heap.read_payload(next_shape, super::shape_body::ShapeBody::id);
+    let existing_offset =
+        heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
+    let transition = heap.with_payload(obj, |body| {
+        if !is_fast_shape_body(body)
+            || !body.extensible
+            || !transition_kind_matches_receiver_body(body, &kind)
+        {
+            return None;
+        }
+        if existing_offset.is_some() {
+            return None;
+        }
+        let slot = u16::try_from(body.slots.len()).ok()?;
+        body.shape = next_shape;
+        body.slots.push(PropertySlot::data_default(value.clone()));
+        Some(StorePropertyTransition {
+            from_shape_id,
+            atom_id: key.atom().id(),
+            to_shape_id,
+            to_shape: next_shape,
+            kind,
+            slot,
+        })
+    })?;
+    heap.record_write(obj, value);
+    heap.record_write(obj, &next_shape);
     Some(transition)
 }
 
@@ -127,9 +182,17 @@ pub(crate) fn replay_store_property_transition(
     if !transition_kind_matches(obj, heap, transition) {
         return None;
     }
+    let current_shape_id = super::shape_id(obj, heap);
+    let to_shape_id = if transition.to_shape.is_null() {
+        None
+    } else {
+        Some(heap.read_payload(transition.to_shape, super::shape_body::ShapeBody::id))
+    };
+    let existing_offset =
+        heap.read_payload(obj, |body| super::body_offset_of(heap, body, key.name()));
     let success = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
-            || body.shape.id() != transition.from_shape_id
+            || current_shape_id != transition.from_shape_id
             || key.atom().id() != transition.atom_id
             || !transition_kind_matches_receiver_body(body, &transition.kind)
             || !body.extensible
@@ -137,15 +200,18 @@ pub(crate) fn replay_store_property_transition(
             return false;
         }
         let offset = usize::from(transition.slot);
-        debug_assert_eq!(body.shape.offset_of(key.name()), None);
-        debug_assert_eq!(
-            transition.to_shape.offset_of(key.name()),
-            Some(transition.slot)
-        );
+        debug_assert_eq!(existing_offset, None);
         if body.slots.len() != offset {
             return false;
         }
-        body.shape = Rc::clone(&transition.to_shape);
+        if transition.to_shape.is_null() {
+            body.dictionary_shape_id = transition.to_shape_id;
+            body.dictionary_keys.push(key.name().to_owned());
+            body.shape = super::ShapeHandle::null();
+        } else {
+            debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
+            body.shape = transition.to_shape;
+        }
         body.slots.push(PropertySlot::data_default(value.clone()));
         true
     });
@@ -153,6 +219,9 @@ pub(crate) fn replay_store_property_transition(
         return None;
     }
     heap.record_write(obj, value);
+    if !transition.to_shape.is_null() {
+        heap.record_write(obj, &transition.to_shape);
+    }
     Some(())
 }
 

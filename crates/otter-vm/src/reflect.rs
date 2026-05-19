@@ -143,29 +143,59 @@ pub fn call(
                     };
                     let obj =
                         interp.alloc_runtime_rooted_object_with_roots(&[], &[&descriptor_roots])?;
-                    let heap = interp.gc_heap_mut();
                     match &desc.kind {
                         crate::object::DescriptorKind::Data { .. } => {
-                            crate::object::set(obj, heap, "value", descriptor_roots[0].clone());
-                            crate::object::set(
+                            let mut external_visit =
+                                |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                                    for value in &descriptor_roots {
+                                        value.trace_value_slots(visitor);
+                                    }
+                                };
+                            interp.set_property_with_extra_roots(
                                 obj,
-                                heap,
+                                "value",
+                                descriptor_roots[0].clone(),
+                                &mut external_visit,
+                            )?;
+                            interp.set_property(
+                                obj,
                                 "writable",
                                 Value::Boolean(flags.writable()),
-                            );
+                            )?;
                         }
                         crate::object::DescriptorKind::Accessor { .. } => {
-                            crate::object::set(obj, heap, "get", descriptor_roots[0].clone());
-                            crate::object::set(obj, heap, "set", descriptor_roots[1].clone());
+                            let mut external_visit =
+                                |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                                    for value in &descriptor_roots {
+                                        value.trace_value_slots(visitor);
+                                    }
+                                };
+                            interp.set_property_with_extra_roots(
+                                obj,
+                                "get",
+                                descriptor_roots[0].clone(),
+                                &mut external_visit,
+                            )?;
+                            let mut external_visit =
+                                |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                                    for value in &descriptor_roots {
+                                        value.trace_value_slots(visitor);
+                                    }
+                                };
+                            interp.set_property_with_extra_roots(
+                                obj,
+                                "set",
+                                descriptor_roots[1].clone(),
+                                &mut external_visit,
+                            )?;
                         }
                     }
-                    crate::object::set(obj, heap, "enumerable", Value::Boolean(flags.enumerable()));
-                    crate::object::set(
+                    interp.set_property(obj, "enumerable", Value::Boolean(flags.enumerable()))?;
+                    interp.set_property(
                         obj,
-                        heap,
                         "configurable",
                         Value::Boolean(flags.configurable()),
-                    );
+                    )?;
                     Ok(Value::Object(obj))
                 }
             }

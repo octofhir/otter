@@ -327,7 +327,7 @@ impl PurePromise {
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
                     is_handled: false,
-                expando: None,
+                    expando: None,
                 },
                 external_visit,
             )?,
@@ -363,7 +363,7 @@ impl PurePromise {
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
                     is_handled: false,
-                expando: None,
+                    expando: None,
                 },
                 external_visit,
             )?,
@@ -399,7 +399,7 @@ impl PurePromise {
                     fulfill_reactions: Vec::new(),
                     reject_reactions: Vec::new(),
                     is_handled: false,
-                expando: None,
+                    expando: None,
                 },
                 external_visit,
             )?,
@@ -759,8 +759,12 @@ impl JsPromiseHandle {
 
     /// Trace this handle as a root slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        let p = self as *const JsPromiseHandle as *mut RawGc;
-        visitor(p);
+        match &self.inner {
+            PromiseRepr::Pure(promise) => {
+                let p = &promise.inner as *const otter_gc::Gc<PurePromiseBody> as *mut RawGc;
+                visitor(p);
+            }
+        }
     }
 
     /// Attach explicit parked-frame reactions for `await`.

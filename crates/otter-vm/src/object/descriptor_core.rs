@@ -7,6 +7,8 @@
 //! # Contents
 //! - [`ordinary_set_data_property`] — the string-keyed data-write half of
 //!   ordinary `[[Set]]`.
+//! - [`ordinary_set_data_property_with_shape`] — the same write core when
+//!   the caller has already allocated the next GC-managed shape.
 //! - [`ordinary_set_symbol_data_property`] — the symbol-keyed data-write half.
 //! - [`validate_and_apply`] — `ValidateAndApplyPropertyDescriptor` for an
 //!   existing ordinary string-keyed slot.
@@ -27,7 +29,7 @@ use crate::Value;
 
 use super::{
     DescriptorKind, JsObject, JsSymbol, PartialPropertyDescriptor, PropertyDescriptor,
-    PropertyFlags, PropertySlot, Shape, SlotBody,
+    PropertyFlags, PropertySlot, ShapeHandle, SlotBody, next_shape_id,
 };
 
 pub(super) fn ordinary_set_data_property(
@@ -37,8 +39,9 @@ pub(super) fn ordinary_set_data_property(
     value: Value,
 ) -> bool {
     let barrier_value = value.clone();
+    let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let success = heap.with_payload(obj, |body| {
-        if let Some(offset) = body.shape.offset_of(key) {
+        if let Some(offset) = existing_offset {
             let slot = &mut body.slots[offset as usize];
             if !slot.flags.writable() {
                 return false;
@@ -53,13 +56,50 @@ pub(super) fn ordinary_set_data_property(
         if !body.extensible {
             return false;
         }
-        let new_shape = Shape::add_property(&body.shape, key);
-        body.shape = new_shape;
+        body.dictionary_shape_id = next_shape_id();
+        body.dictionary_keys.push(key.to_owned());
+        body.shape = ShapeHandle::null();
         body.slots.push(PropertySlot::data_default(value));
         true
     });
     if success {
         heap.record_write(obj, &barrier_value);
+    }
+    success
+}
+
+pub(super) fn ordinary_set_data_property_with_shape(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    value: Value,
+    next_shape: ShapeHandle,
+) -> bool {
+    let barrier_value = value.clone();
+    let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
+    let success = heap.with_payload(obj, |body| {
+        if let Some(offset) = existing_offset {
+            let slot = &mut body.slots[offset as usize];
+            if !slot.flags.writable() {
+                return false;
+            }
+            let SlotBody::Data { value: stored } = &mut slot.body else {
+                return false;
+            };
+            *stored = value;
+            return true;
+        }
+
+        if !body.extensible {
+            return false;
+        }
+        body.shape = next_shape;
+        body.slots.push(PropertySlot::data_default(value));
+        true
+    });
+    if success {
+        heap.record_write(obj, &barrier_value);
+        heap.record_write(obj, &next_shape);
     }
     success
 }

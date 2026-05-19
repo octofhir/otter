@@ -24,6 +24,7 @@
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 
 use crate::Value;
+use crate::VmError;
 use crate::array::JsArray;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
@@ -35,6 +36,22 @@ fn receiver_regexp<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsRegExp, Intr
     match args.receiver {
         Value::RegExp(r) => Ok(r),
         _ => Err(IntrinsicError::BadReceiver { expected: "regexp" }),
+    }
+}
+
+fn vm_shape_error_to_intrinsic(err: VmError) -> IntrinsicError {
+    match err {
+        VmError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        } => IntrinsicError::OutOfMemory {
+            requested_bytes,
+            heap_limit_bytes,
+        },
+        _ => IntrinsicError::BadArgument {
+            index: 0,
+            reason: "property shape update failed",
+        },
     }
 }
 
@@ -355,13 +372,15 @@ pub(crate) fn build_match_result_native(
             Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
             None => Value::Undefined,
         };
-        crate::object::set(groups_obj, ctx.heap_mut(), name, value);
+        ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
+            .map_err(vm_shape_error_to_intrinsic)?;
         for (name, range) in named_iter {
             let value = match range {
                 Some(r) => Value::String(JsString::from_utf16_units(&units[r], string_heap)?),
                 None => Value::Undefined,
             };
-            crate::object::set(groups_obj, ctx.heap_mut(), name, value);
+            ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
+                .map_err(vm_shape_error_to_intrinsic)?;
         }
         crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::Object(groups_obj))?;
     } else {
@@ -424,7 +443,8 @@ pub(crate) fn build_match_result_native(
                 )?,
                 None => Value::Undefined,
             };
-            crate::object::set(g_obj, ctx.heap_mut(), name, v);
+            ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
+                .map_err(vm_shape_error_to_intrinsic)?;
             for (name, range) in named_iter {
                 let v = match range {
                     Some(r) => pair_array_native(
@@ -436,7 +456,8 @@ pub(crate) fn build_match_result_native(
                     )?,
                     None => Value::Undefined,
                 };
-                crate::object::set(g_obj, ctx.heap_mut(), name, v);
+                ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
+                    .map_err(vm_shape_error_to_intrinsic)?;
             }
             crate::array::set_named_property(
                 indices_arr,

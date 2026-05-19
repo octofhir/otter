@@ -387,11 +387,12 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let source = args.args.first().cloned().unwrap_or(Value::Undefined);
     let kind = t.kind();
     let coerce = |v: &Value| -> Result<Value, IntrinsicError> {
-        crate::binary::dispatch::coerce_element_for_store(kind, v)
-            .map_err(|_| IntrinsicError::BadArgument {
+        crate::binary::dispatch::coerce_element_for_store(kind, v).map_err(|_| {
+            IntrinsicError::BadArgument {
                 index: 0,
                 reason: "element type mismatch",
-            })
+            }
+        })
     };
     match source {
         Value::TypedArray(src) => {

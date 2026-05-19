@@ -330,7 +330,10 @@ pub enum StructuredCloneTransferListError {
 /// This stays crate-visible until the worker API lands; exposing it
 /// publicly would leak the internal VM `Value` type through the
 /// runtime boundary.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "worker postMessage plumbing will call this VM-to-owned-payload boundary"
+)]
 pub(crate) fn clone_vm_value(
     value: &Value,
     heap: &GcHeap,
@@ -338,7 +341,10 @@ pub(crate) fn clone_vm_value(
     clone_vm_value_with_options(value, heap, StructuredCloneOptions::default())
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "worker postMessage plumbing will call this VM-to-owned-payload boundary"
+)]
 pub(crate) fn clone_vm_value_with_options(
     value: &Value,
     heap: &GcHeap,

@@ -4,10 +4,9 @@
 //! Each property carries the canonical attribute triple
 //! `(writable, enumerable, configurable)` plus a body that is either
 //! a `[[Value]]` (data property) or a `([[Get]], [[Set]])` accessor
-//! pair. The `Shape`-based hidden-class model stays — keys are still
-//! shared across literals — but as of task 77 the per-object body
-//! (slots, prototype, symbol props, extensibility) lives on the tracing GC
-//! heap as a [`Gc<ObjectBody>`] payload.
+//! pair. Ordinary fast objects use collector-owned [`shape_body::ShapeBody`]
+//! hidden classes; raw heap fixtures and delete-shaped objects fall back to a
+//! per-object dictionary key list.
 //!
 //! # Storage
 //!
@@ -34,16 +33,13 @@
 //!   transition records used by StoreProperty IC replay.
 //! - [`ShapeCacheMode`] — fast-shape eligibility marker for current and future
 //!   dictionary-compatible object storage.
-//! - `ShapeBuilder -> Shape` — transient shape construction followed by frozen
-//!   hidden-class metadata.
-//! - [`JsObject`] / [`Shape`] / [`ObjectBody`] / [`Properties`] — the public
-//!   object handle, its hidden class, the GC-allocated storage, and the
-//!   read-only view used by JSON serialisation and `Object.keys` enumeration.
+//! - [`JsObject`] / [`ObjectBody`] / [`Properties`] — the public object handle,
+//!   the GC-allocated storage, and the read-only view used by JSON
+//!   serialisation and `Object.keys` enumeration.
 //!
 //! # Invariants
-//! - Insertion order is encoded by the shape's key vector and shared
-//!   between `Shape` and the slot table (slot at offset `i` describes
-//!   the key at `keys[i]`).
+//! - Insertion order is encoded by the GC shape chain, or by
+//!   `dictionary_keys` when an object has left fast-shape mode.
 //! - A frozen object's slots all carry `writable = false` (data) and
 //!   `configurable = false`; in addition the object is non-extensible.
 //! - A sealed object's slots all carry `configurable = false` and the
@@ -51,10 +47,9 @@
 //! - Accessor descriptors never carry a `writable` bit — its slot is
 //!   reused as a discriminator (always `false`).
 //! - Hidden-class ICs may cache only [`ShapeCacheMode::Fast`] objects;
-//!   string-keyed delete moves an object to dictionary-compatible mode even
-//!   though the current backing store still uses a fresh shape.
-//! - Shapes are immutable after `ShapeBuilder::freeze`; transition tables and
-//!   offset maps are caches around frozen key metadata, not builder state.
+//!   string-keyed delete moves an object to dictionary-compatible mode.
+//! - GC shape bodies are immutable after allocation; transition tables and
+//!   offset maps live in interpreter-owned side caches.
 //! - Every store of a `Gc<…>`-bearing `Value` into a slot, every
 //!   prototype assignment, and every symbol-property write records
 //!   the store through [`otter_gc::GcHeap::record_write`] so the
@@ -69,9 +64,6 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
 use std::any::Any;
-use std::cell::{Cell, OnceCell};
-use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use smallvec::SmallVec;
@@ -79,7 +71,7 @@ use smallvec::SmallVec;
 use crate::number::NumberValue;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use crate::proxy::JsProxy;
-use crate::string::JsString;
+use crate::string::{JsString, to_utf16_vec};
 use crate::symbol::JsSymbol;
 use crate::{UpvalueCell, Value, read_upvalue, store_upvalue};
 use otter_gc::GcHeap;
@@ -90,17 +82,23 @@ mod descriptor;
 mod descriptor_core;
 mod key_order;
 mod lookup;
+mod shape_body;
 mod shape_cache;
+mod shape_runtime;
 mod shape_transition;
 
 pub use descriptor::{
     DescriptorKind, PartialPropertyDescriptor, PropertyDescriptor, PropertyFlags,
 };
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
+pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};
+pub(crate) use shape_runtime::ShapeRuntime;
+#[cfg(test)]
+pub(crate) use shape_transition::capture_store_property_transition;
 pub(crate) use shape_transition::{
-    StorePropertyTransition, StorePropertyTransitionKind, capture_store_property_transition,
-    replay_store_property_transition,
+    StorePropertyTransition, StorePropertyTransitionKind,
+    capture_store_property_transition_with_shape, replay_store_property_transition,
 };
 
 static NEXT_SHAPE_ID: AtomicU64 = AtomicU64::new(1);
@@ -309,166 +307,9 @@ pub(crate) struct OwnPropertySlotHit {
 pub(crate) struct AtomPropertyLookup {
     /// Metadata for the slot that produced [`Self::lookup`], if the hit was a
     /// string-keyed ordinary object property.
-    #[allow(dead_code)]
     pub(crate) hit: Option<AtomOwnPropertyHit>,
     /// Descriptor-shaped lookup result used by today's interpreter semantics.
     pub(crate) lookup: PropertyLookup,
-}
-
-/// A hidden-class node. Shapes form a tree rooted at the empty
-/// shape; each non-root shape records the parent plus the single
-/// key added to reach it.
-///
-/// Shapes are immutable after construction. Two cache fields use
-/// interior mutability:
-/// - `offsets` — a write-once [`OnceCell`] populated lazily by
-///   [`Self::offset_of`].
-/// - `transitions` — a [`Cell`]-wrapped `HashMap` that records
-///   shared child shapes by added key. Mutations swap the map out,
-///   modify, and swap it back — there is no `RefCell`-style
-///   borrow checker here because nothing observes a partial write
-///   (the call is single-threaded and re-entrancy is impossible:
-///   neither path calls back into shape mutation).
-///
-/// Per the GC architecture plan §4.1 shapes are NOT GC-managed —
-/// they are `Rc`-shared leaf metadata and the [`ObjectBody`] tracer
-/// deliberately does not walk into them.
-pub struct Shape {
-    id: ShapeId,
-    #[allow(dead_code)]
-    parent: Option<Rc<Shape>>,
-    #[allow(dead_code)]
-    key: Option<String>,
-    keys: Vec<String>,
-    offsets: OnceCell<HashMap<String, u16>>,
-    transitions: Cell<HashMap<String, Rc<Shape>>>,
-}
-
-impl std::fmt::Debug for Shape {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Shape")
-            .field("len", &self.keys.len())
-            .finish()
-    }
-}
-
-/// Transient hidden-class builder.
-///
-/// Construction may clone/extend key vectors while a new shape is being
-/// created. Once frozen, the resulting [`Shape`] exposes immutable key metadata
-/// to object storage and inline-cache guards.
-#[derive(Debug)]
-struct ShapeBuilder {
-    id: ShapeId,
-    parent: Option<Rc<Shape>>,
-    key: Option<String>,
-    keys: Vec<String>,
-}
-
-impl ShapeBuilder {
-    fn root() -> Self {
-        Self {
-            id: next_shape_id(),
-            parent: None,
-            key: None,
-            keys: Vec::new(),
-        }
-    }
-
-    fn child(parent: &Rc<Shape>, key: &str) -> Self {
-        let key = key.to_string();
-        let mut keys = parent.keys.clone();
-        keys.push(key.clone());
-        Self {
-            id: next_shape_id(),
-            parent: Some(Rc::clone(parent)),
-            key: Some(key),
-            keys,
-        }
-    }
-
-    fn freeze(self) -> Rc<Shape> {
-        Rc::new(Shape {
-            id: self.id,
-            parent: self.parent,
-            key: self.key,
-            keys: self.keys,
-            offsets: OnceCell::new(),
-            transitions: Cell::new(HashMap::new()),
-        })
-    }
-}
-
-impl Shape {
-    /// Construct the root (empty) shape.
-    #[must_use]
-    pub fn root() -> Rc<Shape> {
-        ShapeBuilder::root().freeze()
-    }
-
-    /// Number of properties carried by this shape.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.keys.len()
-    }
-
-    /// Stable identity for this hidden-class node.
-    #[must_use]
-    pub(crate) const fn id(&self) -> ShapeId {
-        self.id
-    }
-
-    /// `true` for the empty (root) shape.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
-    }
-
-    /// Look up a property's slot offset. Lazily builds the
-    /// keys → offset cache on first call.
-    #[must_use]
-    pub fn offset_of(&self, key: &str) -> Option<u16> {
-        let cache = self.offsets.get_or_init(|| {
-            self.keys
-                .iter()
-                .enumerate()
-                .map(|(i, k)| (k.clone(), i as u16))
-                .collect()
-        });
-        cache.get(key).copied()
-    }
-
-    /// Iterate keys in insertion order.
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.keys.iter()
-    }
-
-    /// Append `key` and return the resulting child shape, sharing
-    /// it with prior callers when possible.
-    ///
-    /// Mutates the parent's transition table by swapping the
-    /// `Cell`-stored map out, inserting, and swapping it back —
-    /// safe because nothing observes the swap window (single
-    /// mutator, no re-entrancy from the called code).
-    #[must_use]
-    pub fn add_property(self_rc: &Rc<Shape>, key: &str) -> Rc<Shape> {
-        // Probe for an existing transition.
-        let mut transitions = self_rc.transitions.take();
-        if let Some(existing) = transitions.get(key) {
-            let hit = Rc::clone(existing);
-            self_rc.transitions.set(transitions);
-            return hit;
-        }
-        let child = ShapeBuilder::child(self_rc, key).freeze();
-        transitions.insert(key.to_string(), Rc::clone(&child));
-        self_rc.transitions.set(transitions);
-        child
-    }
-}
-
-thread_local! {
-    /// Cheap shared root for empty objects.
-    static ROOT_SHAPE: Rc<Shape> = Shape::root();
 }
 
 // ---------- JsObject ------------------------------------------------------
@@ -495,10 +336,13 @@ pub const OBJECT_BODY_TYPE_TAG: u8 = 0x11;
 /// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
 /// - <https://tc39.es/ecma262/#sec-ordinarypreventextensions>
 pub struct ObjectBody {
-    /// Hidden class. `Rc`-shared because shapes are immutable
-    /// post-transition; per architecture plan §4.1 shapes are NOT
-    /// GC-managed.
-    shape: Rc<Shape>,
+    /// GC-managed hidden class for fast ordinary objects.
+    shape: ShapeHandle,
+    /// Fallback/dictionary identity used only when [`Self::shape`] is null.
+    dictionary_shape_id: ShapeId,
+    /// Fallback/dictionary string-key order used only when [`Self::shape`]
+    /// is null, for raw heap fixtures and delete-shaped objects.
+    dictionary_keys: Vec<String>,
     /// Whether string-keyed shape assumptions are IC-compatible.
     ///
     /// Ordinary shape transitions stay in [`ShapeCacheMode::Fast`].
@@ -506,7 +350,7 @@ pub struct ObjectBody {
     /// [`ShapeCacheMode::DictionaryCompatible`] so future dictionary storage
     /// can keep the same invalidation contract without installing stale ICs.
     shape_cache_mode: ShapeCacheMode,
-    /// Slot table aligned with [`Shape::keys`].
+    /// Slot table aligned with the GC shape chain or `dictionary_keys`.
     slots: SmallVec<[PropertySlot; 4]>,
     /// `[[Prototype]]` — [`otter_gc::Gc::null()`] encodes JS
     /// `null` (no prototype). Stored as a bare `JsObject` rather
@@ -549,7 +393,8 @@ pub struct ObjectBody {
 impl std::fmt::Debug for ObjectBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ObjectBody")
-            .field("shape_len", &self.shape.len())
+            .field("has_shape", &!self.shape.is_null())
+            .field("dictionary_len", &self.dictionary_keys.len())
             .field("shape_cache_mode", &self.shape_cache_mode)
             .field("slot_count", &self.slots.len())
             .field(
@@ -585,10 +430,13 @@ impl otter_gc::SafeTraceable for ObjectBody {
     /// - every `Value` inside a data slot or accessor pair;
     /// - every `Value` inside symbol-keyed own properties.
     ///
-    /// Shape keys are interned `String` leaves and their containing
-    /// [`Shape`] is `Rc`-shared, not GC-managed, so they are not
-    /// traced — see the type doc on [`ObjectBody`].
+    /// The GC-managed shape handle is traced directly; dictionary keys are
+    /// owned Rust strings and need no GC tracing.
     fn trace_slots_safe(&self, v: &mut SlotVisitor<'_>) {
+        if !self.shape.is_null() {
+            let p = &self.shape as *const ShapeHandle as *mut RawGc;
+            v(p);
+        }
         match &self.prototype {
             ObjectPrototype::Null => {}
             ObjectPrototype::Object(proto) => {
@@ -666,9 +514,10 @@ pub type JsObject = otter_gc::Gc<ObjectBody>;
 pub const PROTO_CHAIN_HARD_CAP: usize = 1024;
 
 fn empty_object_body() -> ObjectBody {
-    let shape = ROOT_SHAPE.with(Rc::clone);
     ObjectBody {
-        shape,
+        shape: ShapeHandle::null(),
+        dictionary_shape_id: next_shape_id(),
+        dictionary_keys: Vec::new(),
         shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
@@ -682,6 +531,12 @@ fn empty_object_body() -> ObjectBody {
         date_data: None,
         extensible: true,
     }
+}
+
+fn empty_object_body_with_shape(shape: ShapeHandle) -> ObjectBody {
+    let mut body = empty_object_body();
+    body.shape = shape;
+    body
 }
 
 /// Allocate an old-space object for raw GC fixtures.
@@ -705,6 +560,15 @@ pub(crate) fn alloc_object_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     heap.alloc_with_roots(empty_object_body(), external_visit)
+}
+
+/// Allocate a fresh empty object with the root hidden class installed.
+pub(crate) fn alloc_object_with_shape_roots(
+    heap: &mut GcHeap,
+    shape: ShapeHandle,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    heap.alloc_with_roots(empty_object_body_with_shape(shape), external_visit)
 }
 
 /// Allocate a fresh empty object for diagnostic delivery after the
@@ -735,15 +599,46 @@ pub(crate) fn alloc_diagnostic_object(
 /// [`with_host_data`] / [`with_host_data_mut`] using the receiver from
 /// [`crate::NativeCtx::this_value`].
 /// Allocate a fresh host-data object while exposing caller-owned roots.
+#[cfg(test)]
 pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
     heap: &mut otter_gc::GcHeap,
     data: T,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
-    let shape = ROOT_SHAPE.with(Rc::clone);
+    heap.alloc_with_roots(
+        ObjectBody {
+            shape: ShapeHandle::null(),
+            dictionary_shape_id: next_shape_id(),
+            dictionary_keys: Vec::new(),
+            shape_cache_mode: ShapeCacheMode::Fast,
+            slots: SmallVec::new(),
+            prototype: ObjectPrototype::Null,
+            symbol_props: Vec::new(),
+            host_data: Some(Box::new(data)),
+            call_native: None,
+            constructor_native: None,
+            boolean_data: None,
+            number_data: None,
+            string_data: None,
+            date_data: None,
+            extensible: true,
+        },
+        external_visit,
+    )
+}
+
+/// Allocate a fresh host-data object with the root hidden class installed.
+pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
+    heap: &mut otter_gc::GcHeap,
+    shape: ShapeHandle,
+    data: T,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsObject, otter_gc::OutOfMemory> {
     heap.alloc_with_roots(
         ObjectBody {
             shape,
+            dictionary_shape_id: next_shape_id(),
+            dictionary_keys: Vec::new(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
@@ -818,7 +713,7 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
 /// - <https://tc39.es/ecma262/#sec-ordinaryownpropertykeys>
 #[must_use]
 pub fn len(obj: JsObject, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(obj, |body| body.shape.len())
+    heap.read_payload(obj, |body| body_property_count(heap, body))
 }
 
 /// `true` when the object has no string-keyed own properties.
@@ -829,9 +724,52 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 
 /// Return the object's current hidden-class id.
 #[must_use]
-#[allow(dead_code)]
 pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
-    heap.read_payload(obj, |body| body.shape.id())
+    heap.read_payload(obj, |body| body_shape_id(heap, body))
+}
+
+fn body_shape_id(heap: &otter_gc::GcHeap, body: &ObjectBody) -> ShapeId {
+    if !body.shape.is_null() {
+        return heap.read_payload(body.shape, shape_body::ShapeBody::id);
+    }
+    body.dictionary_shape_id
+}
+
+fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
+    if !body.shape.is_null() {
+        return shape_body::shape_property_count(heap, body.shape) as usize;
+    }
+    body.dictionary_keys.len()
+}
+
+pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u16> {
+    if !body.shape.is_null() {
+        return shape_body::shape_offset_of_str(heap, body.shape, key)
+            .and_then(|offset| u16::try_from(offset).ok());
+    }
+    body.dictionary_keys
+        .iter()
+        .position(|candidate| candidate == key)
+        .and_then(|offset| u16::try_from(offset).ok())
+}
+
+fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) -> bool {
+    if !body.shape.is_null() {
+        return u32::try_from(offset)
+            .ok()
+            .and_then(|offset| shape_body::shape_key_at_offset(heap, body.shape, offset))
+            .is_some();
+    }
+    body.dictionary_keys.get(offset).is_some()
+}
+
+fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, key: &str) -> bool {
+    if !body.shape.is_null() {
+        return u32::try_from(offset).ok().is_some_and(|offset| {
+            shape_body::shape_key_matches_str(heap, body.shape, offset, key)
+        });
+    }
+    matches!(body.dictionary_keys.get(offset), Some(name) if name == key)
 }
 
 /// `true` when hidden-class ICs may cache this object's string-keyed slots.
@@ -853,12 +791,10 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
         if let Some(cell) = mapped_argument_cell(body, key) {
             return Some(read_upvalue(heap, cell));
         }
-        body.shape
-            .offset_of(key)
-            .map(|offset| match &body.slots[offset as usize].body {
-                SlotBody::Data { value } => value.clone(),
-                SlotBody::Accessor { .. } => Value::Undefined,
-            })
+        body_offset_of(heap, body, key).map(|offset| match &body.slots[offset as usize].body {
+            SlotBody::Data { value } => value.clone(),
+            SlotBody::Accessor { .. } => Value::Undefined,
+        })
     })
 }
 
@@ -888,7 +824,7 @@ pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
 /// - <https://tc39.es/ecma262/#sec-ordinarygetownproperty>
 #[must_use]
 pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
-    heap.read_payload(obj, |body| match body.shape.offset_of(key) {
+    heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
         Some(offset) => {
             let mut lookup = body.slots[offset as usize].to_lookup();
             if let Some(cell) = mapped_argument_cell(body, key)
@@ -909,7 +845,7 @@ pub(crate) fn lookup_own_slot(
     heap: &otter_gc::GcHeap,
     key: &str,
 ) -> (Option<OwnPropertySlotHit>, PropertyLookup) {
-    heap.read_payload(obj, |body| match body.shape.offset_of(key) {
+    heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
         Some(offset) => {
             let mut lookup = body.slots[offset as usize].to_lookup();
             if let Some(cell) = mapped_argument_cell(body, key)
@@ -919,7 +855,7 @@ pub(crate) fn lookup_own_slot(
             }
             (
                 Some(OwnPropertySlotHit {
-                    shape_id: body.shape.id(),
+                    shape_id: body_shape_id(heap, body),
                     slot: offset,
                 }),
                 lookup,
@@ -936,7 +872,7 @@ pub(crate) fn lookup_own_atom(
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> AtomPropertyLookup {
-    heap.read_payload(obj, |body| match body.shape.offset_of(key.name()) {
+    heap.read_payload(obj, |body| match body_offset_of(heap, body, key.name()) {
         Some(offset) => {
             let mut lookup = body.slots[offset as usize].to_lookup();
             if let Some(cell) = mapped_argument_cell(body, key.name())
@@ -946,7 +882,7 @@ pub(crate) fn lookup_own_atom(
             }
             AtomPropertyLookup {
                 hit: Some(AtomOwnPropertyHit {
-                    shape_id: body.shape.id(),
+                    shape_id: body_shape_id(heap, body),
                     atom_id: key.atom().id(),
                     slot: offset,
                 }),
@@ -968,11 +904,11 @@ pub(crate) fn has_own_slot(
     hit: OwnPropertySlotHit,
 ) -> bool {
     heap.read_payload(obj, |body| {
-        if body.shape.id() != hit.shape_id {
+        if body_shape_id(heap, body) != hit.shape_id {
             return false;
         }
         let offset = hit.slot as usize;
-        body.shape.keys.get(offset).is_some() && body.slots.get(offset).is_some()
+        body_has_key_at(heap, body, offset) && body.slots.get(offset).is_some()
     })
 }
 
@@ -985,11 +921,11 @@ pub(crate) fn load_own_data_slot_atom(
     hit: AtomOwnPropertyHit,
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
-        if body.shape.id() != hit.shape_id || key.atom().id() != hit.atom_id {
+        if body_shape_id(heap, body) != hit.shape_id || key.atom().id() != hit.atom_id {
             return None;
         }
         let offset = hit.slot as usize;
-        if !matches!(body.shape.keys.get(offset), Some(name) if name == key.name()) {
+        if !body_key_matches(heap, body, offset, key.name()) {
             return None;
         }
         if let Some(cell) = mapped_argument_cell(body, key.name()) {
@@ -1014,12 +950,13 @@ pub(crate) fn store_own_data_slot_atom(
     value: &Value,
 ) -> Option<()> {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
+    let current_shape_id = shape_id(obj, heap);
+    let key_matches = heap.read_payload(obj, |body| {
+        body_key_matches(heap, body, hit.slot as usize, key.name())
+    });
     let success = heap.with_payload(obj, |body| {
-        if body.shape.id() != hit.shape_id || key.atom().id() != hit.atom_id {
-            return false;
-        }
         let offset = hit.slot as usize;
-        if !matches!(body.shape.keys.get(offset), Some(name) if name == key.name()) {
+        if current_shape_id != hit.shape_id || key.atom().id() != hit.atom_id || !key_matches {
             return false;
         }
         let Some(slot) = body.slots.get_mut(offset) else {
@@ -1051,10 +988,13 @@ fn has_writable_own_data_slot_atom(
     hit: AtomOwnPropertyHit,
 ) -> bool {
     heap.read_payload(obj, |body| {
-        if body.shape.id() != hit.shape_id || atom_id != hit.atom_id {
+        if body_shape_id(heap, body) != hit.shape_id || atom_id != hit.atom_id {
             return false;
         }
         let offset = hit.slot as usize;
+        if !body_has_key_at(heap, body, offset) {
+            return false;
+        }
         let Some(slot) = body.slots.get(offset) else {
             return false;
         };
@@ -1092,40 +1032,6 @@ pub fn lookup(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLook
     PropertyLookup::Absent
 }
 
-/// Atom-aware property probe with a prototype-chain walk.
-#[must_use]
-#[allow(dead_code)]
-pub(crate) fn lookup_atom(
-    obj: JsObject,
-    heap: &otter_gc::GcHeap,
-    key: AtomizedPropertyKey<'_>,
-) -> AtomPropertyLookup {
-    let own = lookup_own_atom(obj, heap, key);
-    if !matches!(own.lookup, PropertyLookup::Absent) {
-        return own;
-    }
-    let mut current = prototype(obj, heap);
-    let mut hops = 0;
-    while let Some(proto) = current {
-        if hops >= PROTO_CHAIN_HARD_CAP {
-            return AtomPropertyLookup {
-                hit: None,
-                lookup: PropertyLookup::Absent,
-            };
-        }
-        hops += 1;
-        let hit = lookup_own_atom(proto, heap, key);
-        if !matches!(hit.lookup, PropertyLookup::Absent) {
-            return hit;
-        }
-        current = prototype(proto, heap);
-    }
-    AtomPropertyLookup {
-        hit: None,
-        lookup: PropertyLookup::Absent,
-    }
-}
-
 /// Read the descriptor for an own property.
 ///
 /// # Spec
@@ -1138,7 +1044,7 @@ pub fn get_own_descriptor(
     key: &str,
 ) -> Option<PropertyDescriptor> {
     heap.read_payload(obj, |body| {
-        body.shape.offset_of(key).map(|offset| {
+        body_offset_of(heap, body, key).map(|offset| {
             let mut descriptor = body.slots[offset as usize].to_descriptor();
             if let Some(cell) = mapped_argument_cell(body, key)
                 && let DescriptorKind::Data { value } = &mut descriptor.kind
@@ -1441,10 +1347,10 @@ where
     })
 }
 
-/// Borrow the current hidden class.
+/// Borrow the GC-managed hidden class, if installed.
 #[must_use]
-pub fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> Rc<Shape> {
-    heap.read_payload(obj, |body| Rc::clone(&body.shape))
+pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
+    heap.read_payload(obj, |body| body.shape)
 }
 
 /// `[[IsExtensible]]` — `false` after [`prevent_extensions`] /
@@ -1523,17 +1429,43 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// marker / scavenger see the new edge.
 pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
     let barrier_value = value.clone();
+    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     heap.with_payload(obj, |body| {
-        if let Some(offset) = body.shape.offset_of(key) {
+        if let Some(offset) = existing_offset {
             let slot = &mut body.slots[offset as usize];
             slot.body = SlotBody::Data { value };
             return;
         }
-        let new_shape = Shape::add_property(&body.shape, key);
-        body.shape = new_shape;
+        body.dictionary_shape_id = next_shape_id();
+        body.dictionary_keys.push(key.to_owned());
+        body.shape = ShapeHandle::null();
         body.slots.push(PropertySlot::data_default(value));
     });
     heap.record_write(obj, &barrier_value);
+}
+
+/// Construction-time data store for callers that already allocated the next
+/// GC-managed hidden class.
+pub(crate) fn set_with_shape(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    value: Value,
+    next_shape: ShapeHandle,
+) {
+    let barrier_value = value.clone();
+    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    heap.with_payload(obj, |body| {
+        if let Some(offset) = existing_offset {
+            let slot = &mut body.slots[offset as usize];
+            slot.body = SlotBody::Data { value };
+            return;
+        }
+        body.shape = next_shape;
+        body.slots.push(PropertySlot::data_default(value));
+    });
+    heap.record_write(obj, &barrier_value);
+    heap.record_write(obj, &next_shape);
 }
 
 /// Apply the data-write half of ordinary `[[Set]]` after
@@ -1560,6 +1492,27 @@ pub fn ordinary_set_data_property(
 ) -> bool {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
     let success = descriptor_core::ordinary_set_data_property(obj, heap, key, value.clone());
+    if success && let Some(cell) = mapped_cell {
+        store_upvalue(heap, cell, value);
+    }
+    success
+}
+
+pub(crate) fn ordinary_set_data_property_with_shape(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    value: Value,
+    next_shape: ShapeHandle,
+) -> bool {
+    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
+    let success = descriptor_core::ordinary_set_data_property_with_shape(
+        obj,
+        heap,
+        key,
+        value.clone(),
+        next_shape,
+    );
     if success && let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, value);
     }
@@ -1612,25 +1565,29 @@ pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<J
 ///
 /// - <https://tc39.es/ecma262/#sec-ordinarydelete>
 pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
+    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    let replacement_keys = heap.read_payload(obj, |body| {
+        let mut keys = string_keys_in_shape_order(heap, body);
+        if let Some(offset) = existing_offset {
+            let offset = offset as usize;
+            if offset < keys.len() {
+                keys.remove(offset);
+            }
+        }
+        keys
+    });
     heap.with_payload(obj, |body| {
-        let Some(offset) = body.shape.offset_of(key) else {
+        let Some(offset) = existing_offset else {
             // Spec step 2: missing → true.
             return true;
         };
         if !body.slots[offset as usize].flags.configurable() {
             return false;
         }
-        let mut new_keys = body.shape.keys.clone();
-        new_keys.remove(offset as usize);
         body.slots.remove(offset as usize);
-        body.shape = Rc::new(Shape {
-            id: next_shape_id(),
-            parent: None,
-            key: None,
-            keys: new_keys,
-            offsets: OnceCell::new(),
-            transitions: Cell::new(HashMap::new()),
-        });
+        body.dictionary_shape_id = next_shape_id();
+        body.dictionary_keys = replacement_keys;
+        body.shape = ShapeHandle::null();
         shape_cache::invalidate_fast_shape_assumptions(
             body,
             ShapeCacheInvalidation::DeleteOwnProperty,
@@ -1705,8 +1662,9 @@ pub fn define_own_property_partial(
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
     let map_descriptor = completed.clone();
+    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let success = heap.with_payload(obj, |body| {
-        if let Some(offset) = body.shape.offset_of(key) {
+        if let Some(offset) = existing_offset {
             let existing = body.slots[offset as usize].clone();
             match descriptor_core::validate_and_apply_partial(&existing, &descriptor) {
                 Some(merged) => {
@@ -1719,8 +1677,9 @@ pub fn define_own_property_partial(
             if !body.extensible {
                 return false;
             }
-            let new_shape = Shape::add_property(&body.shape, key);
-            body.shape = new_shape;
+            body.dictionary_shape_id = next_shape_id();
+            body.dictionary_keys.push(key.to_owned());
+            body.shape = ShapeHandle::null();
             body.slots
                 .push(PropertySlot::from_descriptor(completed.clone()));
             true
@@ -1742,6 +1701,58 @@ pub fn define_own_property_partial(
             }
         }
         heap.record_write(obj, &barrier_descriptor);
+    }
+    success
+}
+
+pub(crate) fn define_own_property_partial_with_shape(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    descriptor: PartialPropertyDescriptor,
+    next_shape: ShapeHandle,
+) -> bool {
+    let completed = descriptor.complete_for_new_property();
+    let barrier_descriptor = completed.clone();
+    let map_descriptor = completed.clone();
+    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    let success = heap.with_payload(obj, |body| {
+        if let Some(offset) = existing_offset {
+            let existing = body.slots[offset as usize].clone();
+            match descriptor_core::validate_and_apply_partial(&existing, &descriptor) {
+                Some(merged) => {
+                    body.slots[offset as usize] = merged;
+                    true
+                }
+                None => false,
+            }
+        } else {
+            if !body.extensible {
+                return false;
+            }
+            body.shape = next_shape;
+            body.slots
+                .push(PropertySlot::from_descriptor(completed.clone()));
+            true
+        }
+    });
+    if success {
+        let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
+        if let Some(cell) = mapped_cell {
+            match &map_descriptor.kind {
+                DescriptorKind::Data { value } => {
+                    store_upvalue(heap, cell, value.clone());
+                    if !map_descriptor.writable() {
+                        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+                    }
+                }
+                DescriptorKind::Accessor { .. } => {
+                    heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+                }
+            }
+        }
+        heap.record_write(obj, &barrier_descriptor);
+        heap.record_write(obj, &next_shape);
     }
     success
 }
@@ -1794,8 +1805,9 @@ pub fn define_own_property(
 ) -> bool {
     let barrier_descriptor = descriptor.clone();
     let map_descriptor = descriptor.clone();
+    let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let success = heap.with_payload(obj, |body| {
-        if let Some(offset) = body.shape.offset_of(key) {
+        if let Some(offset) = existing_offset {
             let existing = body.slots[offset as usize].clone();
             match descriptor_core::validate_and_apply(&existing, &descriptor) {
                 Some(merged) => {
@@ -1808,8 +1820,9 @@ pub fn define_own_property(
             if !body.extensible {
                 return false;
             }
-            let new_shape = Shape::add_property(&body.shape, key);
-            body.shape = new_shape;
+            body.dictionary_shape_id = next_shape_id();
+            body.dictionary_keys.push(key.to_owned());
+            body.shape = ShapeHandle::null();
             body.slots.push(PropertySlot::from_descriptor(descriptor));
             true
         }
@@ -2093,6 +2106,7 @@ pub fn freeze(obj: JsObject, heap: &mut otter_gc::GcHeap) {
 /// outlive the closure scope.
 pub struct Properties<'a> {
     body: &'a ObjectBody,
+    string_keys: Vec<(String, usize)>,
 }
 
 impl<'a> Properties<'a> {
@@ -2102,24 +2116,19 @@ impl<'a> Properties<'a> {
     /// need accessor fidelity must consult [`get_own_descriptor`]
     /// directly.
     pub fn iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        key_order::ordinary_own_string_key_indices(self.body)
-            .into_iter()
-            .map(|idx| {
-                let k = self.body.shape.keys[idx].as_str();
-                let slot = &self.body.slots[idx];
-                let value = match &slot.body {
-                    SlotBody::Data { value } => value.clone(),
-                    SlotBody::Accessor { .. } => Value::Undefined,
-                };
-                (k, value)
-            })
+        self.string_keys.iter().map(|(key, idx)| {
+            let slot = &self.body.slots[*idx];
+            let value = match &slot.body {
+                SlotBody::Data { value } => value.clone(),
+                SlotBody::Accessor { .. } => Value::Undefined,
+            };
+            (key.as_str(), value)
+        })
     }
 
     /// Iterate string keys in ordinary own-key order.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
-        key_order::ordinary_own_string_key_indices(self.body)
-            .into_iter()
-            .map(|idx| self.body.shape.keys[idx].as_str())
+        self.string_keys.iter().map(|(key, _)| key.as_str())
     }
 
     /// Iterate symbol-keyed own properties in insertion order.
@@ -2133,33 +2142,84 @@ impl<'a> Properties<'a> {
     /// skipping accessor and non-enumerable slots. Used by
     /// JSON.stringify and `for…in` once it lands.
     pub fn enumerable_data_iter(&self) -> impl Iterator<Item = (&str, Value)> {
-        key_order::ordinary_own_string_key_indices(self.body)
-            .into_iter()
-            .filter_map(|idx| {
-                let k = self.body.shape.keys[idx].as_str();
-                let slot = &self.body.slots[idx];
-                if !slot.flags.enumerable() {
-                    return None;
-                }
-                match &slot.body {
-                    SlotBody::Data { value } => Some((k, value.clone())),
-                    SlotBody::Accessor { .. } => None,
-                }
-            })
+        self.string_keys.iter().filter_map(|(key, idx)| {
+            let slot = &self.body.slots[*idx];
+            if !slot.flags.enumerable() {
+                return None;
+            }
+            match &slot.body {
+                SlotBody::Data { value } => Some((key.as_str(), value.clone())),
+                SlotBody::Accessor { .. } => None,
+            }
+        })
     }
 
     /// Iterate enumerable own-key names (string-keyed only) in
     /// ordinary own-key order.
     pub fn enumerable_keys(&self) -> impl Iterator<Item = &str> {
-        key_order::ordinary_own_string_key_indices(self.body)
-            .into_iter()
-            .filter_map(|idx| {
-                self.body.slots[idx]
-                    .flags
-                    .enumerable()
-                    .then_some(self.body.shape.keys[idx].as_str())
-            })
+        self.string_keys.iter().filter_map(|(key, idx)| {
+            self.body.slots[*idx]
+                .flags
+                .enumerable()
+                .then_some(key.as_str())
+        })
     }
+}
+
+fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<(String, usize)> {
+    let insertion_order = if !body.shape.is_null() {
+        shape_body::shape_keys_ordered(heap, body.shape)
+            .into_iter()
+            .map(|(key, offset)| {
+                (
+                    String::from_utf16_lossy(&to_utf16_vec(heap, key)),
+                    offset as usize,
+                )
+            })
+            .collect()
+    } else {
+        body.dictionary_keys
+            .iter()
+            .enumerate()
+            .map(|(slot, key)| (key.to_string(), slot))
+            .collect()
+    };
+
+    order_string_key_entries(insertion_order)
+}
+
+fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<String> {
+    if !body.shape.is_null() {
+        return shape_body::shape_keys_ordered(heap, body.shape)
+            .into_iter()
+            .map(|(key, _)| String::from_utf16_lossy(&to_utf16_vec(heap, key)))
+            .collect();
+    }
+    body.dictionary_keys.clone()
+}
+
+fn order_string_key_entries(entries: Vec<(String, usize)>) -> Vec<(String, usize)> {
+    let mut integer_indices = Vec::new();
+    let mut string_keys = Vec::new();
+
+    for (key, slot) in entries {
+        if let Some(array_index) = key_order::array_index_property_name(&key) {
+            integer_indices.push((array_index, key, slot));
+        } else {
+            string_keys.push((key, slot));
+        }
+    }
+
+    integer_indices.sort_by_key(|(array_index, _, _)| *array_index);
+
+    let mut ordered = Vec::with_capacity(integer_indices.len() + string_keys.len());
+    ordered.extend(
+        integer_indices
+            .into_iter()
+            .map(|(_, key, slot)| (key, slot)),
+    );
+    ordered.extend(string_keys);
+    ordered
 }
 
 /// Run `f` with a [`Properties`] snapshot of `obj`'s string-keyed
@@ -2170,7 +2230,10 @@ pub fn with_properties<R>(
     heap: &otter_gc::GcHeap,
     f: impl FnOnce(Properties<'_>) -> R,
 ) -> R {
-    heap.read_payload(obj, |body| f(Properties { body }))
+    heap.read_payload(obj, |body| {
+        let string_keys = ordinary_string_key_entries(heap, body);
+        f(Properties { body, string_keys })
+    })
 }
 
 #[cfg(test)]
@@ -2188,6 +2251,319 @@ mod tests {
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         assert!(is_empty(o, &heap));
         assert_eq!(len(o, &heap), 0);
+        assert!(shape(o, &heap).is_null());
+    }
+
+    #[test]
+    fn runtime_object_allocation_installs_shape_root() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+
+        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+    }
+
+    #[test]
+    fn runtime_data_assignment_advances_shape() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+
+        assert!(
+            interp
+                .ordinary_set_data_property(o, "x", Value::Boolean(true))
+                .expect("set")
+        );
+
+        let shape_handle = shape(o, interp.gc_heap());
+        assert_eq!(interp.shape_offset_of(shape_handle, "x"), Some(0));
+        assert_eq!(
+            interp
+                .gc_heap()
+                .read_payload(o, |body| body.dictionary_keys.len()),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_construction_set_advances_shape() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+
+        interp
+            .set_property(o, "value", Value::Number(NumberValue::from_i32(1)))
+            .expect("set value");
+        interp
+            .set_property(o, "done", Value::Boolean(false))
+            .expect("set done");
+
+        let shape_handle = shape(o, interp.gc_heap());
+        assert_eq!(interp.shape_offset_of(shape_handle, "value"), Some(0));
+        assert_eq!(interp.shape_offset_of(shape_handle, "done"), Some(1));
+        assert_eq!(
+            interp
+                .gc_heap()
+                .read_payload(o, |body| body.dictionary_keys.len()),
+            0
+        );
+    }
+
+    #[test]
+    fn shape_id_prefers_installed_shape() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+
+        interp
+            .set_property(o, "x", Value::Boolean(true))
+            .expect("set x");
+
+        let shape_handle = shape(o, interp.gc_heap());
+        let installed_shape_id = interp
+            .gc_heap()
+            .read_payload(shape_handle, shape_body::ShapeBody::id);
+        assert_eq!(shape_id(o, interp.gc_heap()), installed_shape_id);
+        assert_ne!(
+            shape_id(o, interp.gc_heap()),
+            interp
+                .gc_heap()
+                .read_payload(o, |body| body.dictionary_shape_id)
+        );
+    }
+
+    #[test]
+    fn own_property_reads_prefer_installed_shape_offsets() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+
+        interp
+            .set_property(o, "x", Value::Boolean(true))
+            .expect("set x");
+        interp.gc_heap_mut().with_payload(o, |body| {
+            body.dictionary_keys.clear();
+            body.dictionary_shape_id = next_shape_id();
+        });
+
+        assert_eq!(len(o, interp.gc_heap()), 1);
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "x"),
+            Some(Value::Boolean(true))
+        );
+        assert!(matches!(
+            lookup_own(o, interp.gc_heap(), "x"),
+            PropertyLookup::Data {
+                value: Value::Boolean(true),
+                ..
+            }
+        ));
+        assert!(get_own_descriptor(o, interp.gc_heap(), "x").is_some());
+        let keys: Vec<String> = with_properties(o, interp.gc_heap(), |p| {
+            p.keys().map(str::to_string).collect()
+        });
+        assert_eq!(keys, vec!["x"]);
+
+        set(o, interp.gc_heap_mut(), "x", Value::Boolean(false));
+
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "x"),
+            Some(Value::Boolean(false))
+        );
+        assert_eq!(interp.gc_heap().read_payload(o, |body| body.slots.len()), 1);
+    }
+
+    #[test]
+    fn runtime_define_property_advances_shape() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+        let descriptor = PartialPropertyDescriptor {
+            value: Some(Value::Number(NumberValue::from_i32(42))),
+            writable: Some(true),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..PartialPropertyDescriptor::default()
+        };
+
+        assert!(
+            interp
+                .define_own_property_partial(o, "answer", descriptor)
+                .expect("define")
+        );
+
+        let shape_handle = shape(o, interp.gc_heap());
+        assert_eq!(interp.shape_offset_of(shape_handle, "answer"), Some(0));
+        assert_eq!(
+            interp
+                .gc_heap()
+                .read_payload(o, |body| body.dictionary_keys.len()),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_delete_invalidates_shape() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+
+        interp
+            .set_property(o, "a", Value::Boolean(true))
+            .expect("set a");
+        interp.set_property(o, "b", Value::Null).expect("set b");
+
+        let before = shape(o, interp.gc_heap());
+        assert!(!before.is_null());
+        assert_eq!(interp.shape_offset_of(before, "b"), Some(1));
+
+        assert!(delete(o, interp.gc_heap_mut(), "a"));
+
+        assert!(shape(o, interp.gc_heap()).is_null());
+        assert!(get(o, interp.gc_heap(), "a").is_none());
+        assert!(matches!(get(o, interp.gc_heap(), "b"), Some(Value::Null)));
+    }
+
+    #[test]
+    fn runtime_store_transition_invalidates_shape() {
+        let mut interp = crate::Interpreter::new();
+        let key = AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
+            "x",
+        );
+        let first = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("first object");
+
+        let transition = capture_store_property_transition(
+            first,
+            interp.gc_heap_mut(),
+            key,
+            &Value::Boolean(true),
+        )
+        .expect("transition install");
+
+        assert!(shape(first, interp.gc_heap()).is_null());
+        assert_eq!(
+            get_own(first, interp.gc_heap(), "x"),
+            Some(Value::Boolean(true))
+        );
+
+        let second = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("second object");
+        assert_eq!(shape(second, interp.gc_heap()), interp.shape_root());
+
+        assert_eq!(
+            replay_store_property_transition(
+                second,
+                interp.gc_heap_mut(),
+                key,
+                &transition,
+                &Value::Null,
+            ),
+            Some(())
+        );
+
+        assert!(shape(second, interp.gc_heap()).is_null());
+        assert_eq!(get_own(second, interp.gc_heap(), "x"), Some(Value::Null));
+    }
+
+    #[test]
+    fn raw_set_invalidates_shape_for_new_property() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+
+        set(o, interp.gc_heap_mut(), "x", Value::Boolean(true));
+
+        assert!(shape(o, interp.gc_heap()).is_null());
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "x"),
+            Some(Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn raw_ordinary_set_invalidates_shape_for_new_property() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+
+        assert!(ordinary_set_data_property(
+            o,
+            interp.gc_heap_mut(),
+            "x",
+            Value::Boolean(true)
+        ));
+
+        assert!(shape(o, interp.gc_heap()).is_null());
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "x"),
+            Some(Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn raw_define_property_invalidates_shape_for_new_property() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+
+        assert!(define_own_property(
+            o,
+            interp.gc_heap_mut(),
+            "x",
+            PropertyDescriptor::data(Value::Boolean(true), true, true, true),
+        ));
+
+        assert!(shape(o, interp.gc_heap()).is_null());
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "x"),
+            Some(Value::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn raw_define_property_partial_invalidates_shape_for_new_property() {
+        let mut interp = crate::Interpreter::new();
+        let o = interp
+            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .expect("object");
+        assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
+        let descriptor = PartialPropertyDescriptor {
+            value: Some(Value::Boolean(true)),
+            writable: Some(true),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..PartialPropertyDescriptor::default()
+        };
+
+        assert!(define_own_property_partial(
+            o,
+            interp.gc_heap_mut(),
+            "x",
+            descriptor,
+        ));
+
+        assert!(shape(o, interp.gc_heap()).is_null());
+        assert_eq!(
+            get_own(o, interp.gc_heap(), "x"),
+            Some(Value::Boolean(true))
+        );
     }
 
     #[test]
@@ -2277,7 +2653,7 @@ mod tests {
     }
 
     #[test]
-    fn atom_add_transition_replays_on_matching_direct_prototype_shape() {
+    fn raw_atom_add_transition_rejects_unshared_dictionary_shape() {
         let mut heap = fresh_heap();
         let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
@@ -2305,9 +2681,9 @@ mod tests {
                 &transition,
                 &Value::Boolean(false),
             ),
-            Some(())
+            None
         );
-        assert_eq!(get_own(second, &heap, "x"), Some(Value::Boolean(false)));
+        assert_eq!(get_own(second, &heap, "x"), None);
     }
 
     #[test]
@@ -2372,7 +2748,7 @@ mod tests {
     }
 
     #[test]
-    fn atom_add_transition_replays_inherited_writable_data_store() {
+    fn raw_atom_add_transition_rejects_unshared_inherited_dictionary_shape() {
         let mut heap = fresh_heap();
         let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(proto, &mut heap, "x", Value::Boolean(true));
@@ -2395,9 +2771,9 @@ mod tests {
 
         assert_eq!(
             replay_store_property_transition(second, &mut heap, key, &transition, &Value::Null,),
-            Some(())
+            None
         );
-        assert_eq!(get_own(second, &heap, "x"), Some(Value::Null));
+        assert_eq!(get_own(second, &heap, "x"), None);
         assert_eq!(get_own(proto, &heap, "x"), Some(Value::Boolean(true)));
     }
 
@@ -2452,35 +2828,6 @@ mod tests {
             capture_store_property_transition(receiver, &mut heap, key, &Value::Null).is_none()
         );
         assert!(get_own(receiver, &heap, "x").is_none());
-    }
-
-    #[test]
-    fn shape_builder_freezes_root_and_child_metadata() {
-        let root = ShapeBuilder::root().freeze();
-        assert!(root.is_empty());
-        assert_eq!(root.len(), 0);
-        assert_eq!(root.offset_of("x"), None);
-
-        let child = ShapeBuilder::child(&root, "x").freeze();
-        let keys: Vec<&str> = child.keys().map(String::as_str).collect();
-
-        assert_eq!(child.len(), 1);
-        assert_eq!(keys, vec!["x"]);
-        assert_eq!(child.offset_of("x"), Some(0));
-        assert_eq!(child.offset_of("missing"), None);
-        assert!(root.is_empty());
-        assert_eq!(root.offset_of("x"), None);
-    }
-
-    #[test]
-    fn shape_add_property_reuses_frozen_transition_child() {
-        let root = Shape::root();
-        let first = Shape::add_property(&root, "x");
-        let second = Shape::add_property(&root, "x");
-
-        assert!(Rc::ptr_eq(&first, &second));
-        assert_eq!(first.offset_of("x"), Some(0));
-        assert!(root.is_empty());
     }
 
     #[test]
@@ -2598,30 +2945,14 @@ mod tests {
     }
 
     #[test]
-    fn two_literals_share_shape() {
-        let mut heap = fresh_heap();
-        let a = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(a, &mut heap, "x", Value::Boolean(true));
-        set(a, &mut heap, "y", Value::Null);
-        let b = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(b, &mut heap, "x", Value::Boolean(false));
-        set(b, &mut heap, "y", Value::Undefined);
-        assert!(Rc::ptr_eq(&shape(a, &heap), &shape(b, &heap)));
-        let c = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(c, &mut heap, "y", Value::Null);
-        set(c, &mut heap, "x", Value::Boolean(true));
-        assert!(!Rc::ptr_eq(&shape(a, &heap), &shape(c, &heap)));
-    }
-
-    #[test]
     fn overwrite_does_not_grow_shape() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "x", Value::Boolean(true));
-        let s1 = shape(o, &heap);
+        let s1 = shape_id(o, &heap);
         set(o, &mut heap, "x", Value::Null);
-        let s2 = shape(o, &heap);
-        assert!(Rc::ptr_eq(&s1, &s2));
+        let s2 = shape_id(o, &heap);
+        assert_eq!(s1, s2);
         assert_eq!(len(o, &heap), 1);
     }
 
@@ -2631,11 +2962,11 @@ mod tests {
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         set(o, &mut heap, "a", Value::Boolean(true));
         set(o, &mut heap, "b", Value::Null);
-        let before = shape(o, &heap);
+        let before = shape_id(o, &heap);
         assert!(supports_fast_property_ic(o, &heap));
         delete(o, &mut heap, "a");
-        let after = shape(o, &heap);
-        assert!(!Rc::ptr_eq(&before, &after));
+        let after = shape_id(o, &heap);
+        assert_ne!(before, after);
         assert!(!supports_fast_property_ic(o, &heap));
         assert_eq!(len(o, &heap), 1);
         assert!(get(o, &heap, "a").is_none());

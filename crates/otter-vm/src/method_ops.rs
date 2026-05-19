@@ -248,18 +248,21 @@ impl Interpreter {
         // as the receiver so the foundation's
         // `iterator_receiver` wraps it on entry.
         if matches!(&recv_value, Value::Generator(_)) {
-            let iterator_proto = match crate::object::get(self.global_this, &self.gc_heap, "Iterator") {
-                Some(Value::Object(ctor)) => crate::object::get(ctor, &self.gc_heap, "prototype"),
-                Some(Value::NativeFunction(ctor)) => ctor
-                    .own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype")
-                    .ok()
-                    .flatten()
-                    .and_then(|d| match d.kind {
-                        crate::object::DescriptorKind::Data { value } => Some(value),
-                        _ => None,
-                    }),
-                _ => None,
-            };
+            let iterator_proto =
+                match crate::object::get(self.global_this, &self.gc_heap, "Iterator") {
+                    Some(Value::Object(ctor)) => {
+                        crate::object::get(ctor, &self.gc_heap, "prototype")
+                    }
+                    Some(Value::NativeFunction(ctor)) => ctor
+                        .own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype")
+                        .ok()
+                        .flatten()
+                        .and_then(|d| match d.kind {
+                            crate::object::DescriptorKind::Data { value } => Some(value),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
             if let Some(Value::Object(proto)) = iterator_proto
                 && let Some(method) = crate::object::get(proto, &self.gc_heap, &name)
                 && self.is_callable_runtime(&method)
@@ -332,8 +335,9 @@ impl Interpreter {
         // a primitive string for the callable-replace bridge.
         let string_recv: Option<Value> = match &recv_value {
             Value::String(_) => Some(recv_value.clone()),
-            Value::Object(obj) => crate::object::string_data(*obj, &self.gc_heap)
-                .map(Value::String),
+            Value::Object(obj) => {
+                crate::object::string_data(*obj, &self.gc_heap).map(Value::String)
+            }
             _ => None,
         };
         if let Some(string_recv) = string_recv
@@ -1635,10 +1639,7 @@ impl Interpreter {
                 }
                 let step: i64 = if reverse { -1 } else { 1 };
                 let (mut acc, start_idx) = if has_init {
-                    (
-                        args[1].clone(),
-                        if reverse { len as i64 - 1 } else { 0 },
-                    )
+                    (args[1].clone(), if reverse { len as i64 - 1 } else { 0 })
                 } else {
                     let seed = if reverse { len - 1 } else { 0 };
                     (elements[seed].clone(), seed as i64 + step)

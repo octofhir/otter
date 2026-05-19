@@ -288,7 +288,7 @@ fn native_group_by_rooted(
                     &[&Value::Object(result), item],
                     &[args],
                 )?;
-                crate::object::set(result, ctx.heap_mut(), &key_str, Value::Array(arr));
+                ctx.set_property(result, &key_str, Value::Array(arr))?;
                 arr
             }
         };
@@ -504,7 +504,16 @@ fn set_from_entries_key(
     value: Value,
     ctx: &mut NativeCtx<'_>,
 ) -> Result<(), VmError> {
-    set_from_entries_key_heap(target, key, value, ctx.heap_mut())
+    match key {
+        Value::Symbol(sym) => {
+            crate::object::set_symbol(target, ctx.heap_mut(), sym.clone(), value);
+            Ok(())
+        }
+        _ => {
+            let key_str = property_key_from_value(key)?;
+            ctx.set_property(target, &key_str, value)
+        }
+    }
 }
 
 /// Heap-only variant of [`set_from_entries_key`] used by the
@@ -784,7 +793,7 @@ fn native_get_own_property_descriptors_rooted(
                 &[&target_root, &result_root],
                 args,
             )?;
-            crate::object::set(result, ctx.heap_mut(), &key, Value::Object(desc_obj));
+            ctx.set_property(result, &key, Value::Object(desc_obj))?;
         }
     }
     for sym in symbols {
@@ -940,41 +949,16 @@ fn native_descriptor_to_object_rooted(
     let result = ctx.alloc_object_with_roots(roots.as_slice(), &[args])?;
     match &desc.kind {
         DescriptorKind::Data { value } => {
-            crate::object::set(result, ctx.heap_mut(), "value", value.clone());
-            crate::object::set(
-                result,
-                ctx.heap_mut(),
-                "writable",
-                Value::Boolean(desc.writable()),
-            );
+            ctx.set_property(result, "value", value.clone())?;
+            ctx.set_property(result, "writable", Value::Boolean(desc.writable()))?;
         }
         DescriptorKind::Accessor { getter, setter } => {
-            crate::object::set(
-                result,
-                ctx.heap_mut(),
-                "get",
-                getter.clone().unwrap_or(Value::Undefined),
-            );
-            crate::object::set(
-                result,
-                ctx.heap_mut(),
-                "set",
-                setter.clone().unwrap_or(Value::Undefined),
-            );
+            ctx.set_property(result, "get", getter.clone().unwrap_or(Value::Undefined))?;
+            ctx.set_property(result, "set", setter.clone().unwrap_or(Value::Undefined))?;
         }
     }
-    crate::object::set(
-        result,
-        ctx.heap_mut(),
-        "enumerable",
-        Value::Boolean(desc.enumerable()),
-    );
-    crate::object::set(
-        result,
-        ctx.heap_mut(),
-        "configurable",
-        Value::Boolean(desc.configurable()),
-    );
+    ctx.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
+    ctx.set_property(result, "configurable", Value::Boolean(desc.configurable()))?;
     Ok(result)
 }
 
@@ -1585,6 +1569,7 @@ fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         // [[TypedArrayName]] — the kind-specific name string —
         // not the generic `"TypedArray"` family tag.
         Value::TypedArray(t) => t.kind().name(),
+        Value::Object(obj) if crate::object::date_data(*obj, ctx.heap()).is_some() => "Date",
         Value::Object(obj) if crate::object::call_native(*obj, ctx.heap()).is_some() => "Function",
         Value::Object(_) | Value::Proxy(_) => "Object",
     }
@@ -1770,14 +1755,11 @@ pub fn call(
                 // expando bag for ordinary defineProperty.
                 Some(Value::RegExp(r)) => {
                     let r = *r;
-                    let bag = crate::property_dispatch::regexp_ensure_expando_pub(
-                        gc_heap,
-                        &r,
-                    )?;
+                    let bag = crate::property_dispatch::regexp_ensure_expando_pub(gc_heap, &r)?;
                     let ok = match &key {
-                        PropertyKey::String(k) => crate::object::define_own_property_partial(
-                            bag, gc_heap, k, descriptor,
-                        ),
+                        PropertyKey::String(k) => {
+                            crate::object::define_own_property_partial(bag, gc_heap, k, descriptor)
+                        }
                         PropertyKey::Symbol(sym) => {
                             crate::object::define_own_symbol_property_partial(
                                 bag, gc_heap, sym, descriptor,
@@ -1795,14 +1777,11 @@ pub fn call(
                 // bag through Object.defineProperty.
                 Some(Value::Promise(p)) => {
                     let p = *p;
-                    let bag = crate::property_dispatch::promise_ensure_expando_pub(
-                        gc_heap,
-                        &p,
-                    )?;
+                    let bag = crate::property_dispatch::promise_ensure_expando_pub(gc_heap, &p)?;
                     let ok = match &key {
-                        PropertyKey::String(k) => crate::object::define_own_property_partial(
-                            bag, gc_heap, k, descriptor,
-                        ),
+                        PropertyKey::String(k) => {
+                            crate::object::define_own_property_partial(bag, gc_heap, k, descriptor)
+                        }
                         PropertyKey::Symbol(sym) => {
                             crate::object::define_own_symbol_property_partial(
                                 bag, gc_heap, sym, descriptor,
@@ -1878,10 +1857,7 @@ pub fn call(
                                 bag, gc_heap, sym, descriptor,
                             ) {
                                 return Err(VmError::TypeError {
-                                    message: format!(
-                                        "Cannot define property '{}'",
-                                        key.label()
-                                    ),
+                                    message: format!("Cannot define property '{}'", key.label()),
                                 });
                             }
                         }

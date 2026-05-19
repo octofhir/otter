@@ -9,7 +9,6 @@
 //! - <https://tc39.es/ecma262/#sec-string.fromcharcode>
 //! - <https://tc39.es/ecma262/#sec-string.fromcodepoint>
 
-use crate::number::NumberValue;
 use crate::string::{JsString, StringHeap};
 use crate::{Value, VmError};
 
@@ -77,14 +76,4 @@ pub fn call(
             ))
         }
     }
-}
-
-/// `Number(value)` is wired alongside the global functions table
-/// today — kept here for symmetry with the rest of the
-/// constructor surface so a future `NumberCall` opcode has a
-/// home. Currently unreferenced; the compiler still routes
-/// `Number(x)` through `Op::ToNumber`.
-#[allow(dead_code)]
-pub fn _placeholder() -> NumberValue {
-    NumberValue::from_i32(0)
 }

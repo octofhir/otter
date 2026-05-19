@@ -133,12 +133,8 @@ fn install_regexp_legacy_accessors(
             captures,
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc = PropertyDescriptor::accessor(
-            Some(Value::NativeFunction(getter)),
-            None,
-            false,
-            true,
-        );
+        let desc =
+            PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
         let string_heap = crate::string::StringHeap::default();
         if !ctor.define_own_property(heap, &string_heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
@@ -229,12 +225,12 @@ fn legacy_accessor_getter(
         });
     }
     let heap = ctx.interp_mut().string_heap_clone();
-    Ok(Value::String(
-        JsString::from_str("", &heap).map_err(|_| NativeError::TypeError {
+    Ok(Value::String(JsString::from_str("", &heap).map_err(
+        |_| NativeError::TypeError {
             name: "RegExp legacy accessor",
             reason: "out of memory".to_string(),
-        })?,
-    ))
+        },
+    )?))
 }
 
 /// §B.2.4.2 `SetLegacyRegExpStaticProperty` — accepts the assignment
@@ -550,7 +546,10 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             let heap = ctx.heap();
             (other.pattern_utf16(heap), other.flags(heap).to_js_string())
         }
-        Value::Undefined => (Vec::<u16>::new(), value_to_text(&flags_raw, "RegExp.prototype.compile")?),
+        Value::Undefined => (
+            Vec::<u16>::new(),
+            value_to_text(&flags_raw, "RegExp.prototype.compile")?,
+        ),
         ref other => {
             let pattern_str = value_to_text(other, "RegExp.prototype.compile")?;
             let pattern_units: Vec<u16> = pattern_str.encode_utf16().collect();

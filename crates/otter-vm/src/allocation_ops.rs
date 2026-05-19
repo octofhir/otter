@@ -54,6 +54,7 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let roots = self.collect_runtime_roots();
+        let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -67,8 +68,12 @@ impl Interpreter {
                 }
             }
         };
-        crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
-            .map_err(VmError::from)
+        crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)
     }
 
     /// Allocate a host-created object while exposing runtime roots and
@@ -82,6 +87,7 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
         let roots = self.collect_runtime_roots();
+        let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -95,7 +101,11 @@ impl Interpreter {
                 }
             }
         };
-        crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
+        crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            &mut external_visit,
+        )
     }
 
     pub(crate) fn alloc_runtime_rooted_object_with_proto(
@@ -106,6 +116,7 @@ impl Interpreter {
     ) -> Result<crate::object::JsObject, VmError> {
         let proto_value = Value::Object(proto);
         let roots = self.collect_runtime_roots();
+        let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -120,8 +131,12 @@ impl Interpreter {
                 }
             }
         };
-        let object = crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
-            .map_err(VmError::from)?;
+        let object = crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)?;
         crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
         Ok(object)
     }
@@ -370,8 +385,8 @@ impl Interpreter {
         roots.push(&value);
         roots.extend_from_slice(value_roots);
         let obj = self.alloc_runtime_rooted_object_with_roots(&roots, slice_roots)?;
-        crate::object::set(obj, &mut self.gc_heap, "value", value);
-        crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(done));
+        self.set_property(obj, "value", value)?;
+        self.set_property(obj, "done", Value::Boolean(done))?;
         Ok(Value::Object(obj))
     }
 
@@ -397,6 +412,7 @@ impl Interpreter {
         slice_roots: &[Value],
     ) -> Result<crate::object::JsObject, VmError> {
         let roots = self.collect_allocation_roots(stack);
+        let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -408,8 +424,12 @@ impl Interpreter {
                 value.trace_value_slots(visitor);
             }
         };
-        crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
-            .map_err(VmError::from)
+        crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)
     }
 
     pub(crate) fn alloc_stack_rooted_object_with_proto(
@@ -421,6 +441,7 @@ impl Interpreter {
     ) -> Result<crate::object::JsObject, VmError> {
         let proto_value = Value::Object(proto);
         let roots = self.collect_allocation_roots(stack);
+        let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -435,8 +456,12 @@ impl Interpreter {
                 }
             }
         };
-        let object = crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)
-            .map_err(VmError::from)?;
+        let object = crate::object::alloc_object_with_shape_roots(
+            &mut self.gc_heap,
+            shape_root,
+            &mut external_visit,
+        )
+        .map_err(VmError::from)?;
         crate::object::set_prototype(object, &mut self.gc_heap, Some(proto));
         Ok(object)
     }

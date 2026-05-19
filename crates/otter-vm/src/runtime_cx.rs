@@ -39,8 +39,8 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, array,
-    collections, native_function, object, promise::JsPromiseHandle, weak_refs,
+    ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, VmError,
+    array, collections, native_function, object, promise::JsPromiseHandle, weak_refs,
 };
 
 /// Internal VM context. Carried explicitly through the dispatch
@@ -81,7 +81,6 @@ impl<'rt> RuntimeCx<'rt> {
     /// `pub(crate)` — only the dispatch loop / internal helpers
     /// build a [`RuntimeCx`].
     #[must_use]
-    #[allow(dead_code)] // wired in by tasks 77-83 caller migration
     pub(crate) fn new(interp: &'rt mut Interpreter) -> Self {
         Self {
             interp,
@@ -160,13 +159,14 @@ pub struct NativeCtx<'rt> {
 impl<'rt> NativeCtx<'rt> {
     /// Build a native context from an interpreter borrow.
     #[must_use]
-    #[allow(dead_code)] // wired in by tasks 82-83 native-binding migration
+    #[cfg(test)]
     pub(crate) fn new(interp: &'rt mut Interpreter) -> Self {
         Self::new_with_call_info(interp, NativeCallInfo::default_call())
     }
 
     /// Build a native context with explicit call-site metadata.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn new_with_call_info(
         interp: &'rt mut Interpreter,
         call_info: NativeCallInfo,
@@ -307,6 +307,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value.clone();
         let new_target = self.call_info.new_target.clone();
+        let shape_root = self.cx.interp.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -317,7 +318,50 @@ impl<'rt> NativeCtx<'rt> {
                 slice_roots,
             );
         };
-        object::alloc_object_with_roots(self.heap_mut(), &mut external_visit)
+        object::alloc_object_with_shape_roots(self.heap_mut(), shape_root, &mut external_visit)
+    }
+
+    /// Set an ordinary string-keyed property while keeping the native-call
+    /// root set alive during any ShapeBody allocation.
+    pub(crate) fn set_property(
+        &mut self,
+        obj: object::JsObject,
+        key: &str,
+        value: Value,
+    ) -> Result<(), VmError> {
+        self.set_property_with_roots(obj, key, value, &[], &[])
+    }
+
+    /// Set an ordinary string-keyed property while keeping additional native
+    /// local values alive during any ShapeBody allocation.
+    pub(crate) fn set_property_with_roots(
+        &mut self,
+        obj: object::JsObject,
+        key: &str,
+        value: Value,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<(), VmError> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value.clone();
+        let new_target = self.call_info.new_target.clone();
+        let value_root = value.clone();
+        let mut combined_roots = Vec::with_capacity(value_roots.len() + 1);
+        combined_roots.push(&value_root);
+        combined_roots.extend_from_slice(value_roots);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                combined_roots.as_slice(),
+                slice_roots,
+            );
+        };
+        self.cx
+            .interp
+            .set_property_with_extra_roots(obj, key, value, &mut external_visit)
     }
 
     /// Allocate a host-data object through the native root contract.
@@ -338,6 +382,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value.clone();
         let new_target = self.call_info.new_target.clone();
+        let shape_root = self.cx.interp.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -348,7 +393,12 @@ impl<'rt> NativeCtx<'rt> {
                 slice_roots,
             );
         };
-        object::alloc_host_object_with_roots(self.heap_mut(), data, &mut external_visit)
+        object::alloc_host_object_with_shape_roots(
+            self.heap_mut(),
+            shape_root,
+            data,
+            &mut external_visit,
+        )
     }
 
     /// Allocate a captured native function through the native root contract.

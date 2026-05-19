@@ -65,7 +65,6 @@ The runner should support deterministic drive modes:
 - `run_until_idle`: run referenced work until the runtime is idle;
 - `run_until_promise`: drive until a target promise settles or the loop
   becomes idle with that promise still pending;
-- `run_until_command`: drive until a command completion is delivered;
 - `shutdown`: cancel or drain, then report leaks.
 
 Budgeted execution adds a resumable yielded state. A yielded turn remains

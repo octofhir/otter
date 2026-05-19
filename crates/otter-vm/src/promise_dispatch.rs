@@ -845,12 +845,7 @@ fn static_all_settled(
                 &[args, entries.as_slice()],
                 move |ctx, args, _captures| {
                     let v = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(true, v, &heap, ctx).map_err(|e| {
-                        NativeError::TypeError {
-                            name: "Promise",
-                            reason: format!("string allocation failed: {e}"),
-                        }
-                    })?;
+                    let record = build_settled_record(true, v, &heap, ctx)?;
                     finalize_settled(&slots, &result, i, record, ctx)?;
                     Ok(Value::Undefined)
                 },
@@ -872,12 +867,7 @@ fn static_all_settled(
                 &[args, entries.as_slice()],
                 move |ctx, args, _captures| {
                     let r = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(false, r, &heap, ctx).map_err(|e| {
-                        NativeError::TypeError {
-                            name: "Promise",
-                            reason: format!("string allocation failed: {e}"),
-                        }
-                    })?;
+                    let record = build_settled_record(false, r, &heap, ctx)?;
                     finalize_settled(&slots, &result, i, record, ctx)?;
                     Ok(Value::Undefined)
                 },
@@ -899,19 +889,28 @@ fn build_settled_record(
     payload: Value,
     heap: &std::sync::Arc<crate::string::StringHeap>,
     ctx: &mut NativeCtx<'_>,
-) -> Result<Value, crate::string::StringError> {
+) -> Result<Value, NativeError> {
     let status_text = if fulfilled { "fulfilled" } else { "rejected" };
-    let status = crate::JsString::from_str(status_text, heap)?;
-    let key = if fulfilled { "value" } else { "reason" };
-    let obj = ctx
-        .alloc_object()
-        .map_err(|_| crate::string::StringError::OutOfMemory {
-            requested_bytes: 0,
-            heap_limit_bytes: 0,
+    let status =
+        crate::JsString::from_str(status_text, heap).map_err(|e| NativeError::TypeError {
+            name: "Promise",
+            reason: format!("string allocation failed: {e}"),
         })?;
-    let gc_heap = ctx.heap_mut();
-    crate::object::set(obj, gc_heap, "status", Value::String(status));
-    crate::object::set(obj, gc_heap, key, payload);
+    let key = if fulfilled { "value" } else { "reason" };
+    let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
+        name: "Promise",
+        reason: "out of memory".to_string(),
+    })?;
+    ctx.set_property_with_roots(obj, "status", Value::String(status), &[&payload], &[])
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise",
+            reason: err.to_string(),
+        })?;
+    ctx.set_property(obj, key, payload)
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise",
+            reason: err.to_string(),
+        })?;
     Ok(Value::Object(obj))
 }
 
@@ -951,18 +950,28 @@ fn make_aggregate_error_runtime_rooted(
             gc_heap,
             Some(registry.prototype(ErrorKind::AggregateError)),
         );
-        crate::object::set(obj, gc_heap, "message", message);
     }
+    let mut errors_root = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for value in &errors {
+            value.trace_value_slots(visitor);
+        }
+    };
+    interp
+        .set_property_with_extra_roots(obj, "message", message, &mut errors_root)
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise",
+            reason: err.to_string(),
+        })?;
     let obj_value = Value::Object(obj);
     let arr = interp
         .alloc_runtime_rooted_array_from_values(errors, &[&obj_value], &[])
         .map_err(|_| oom_native("Promise.any"))?;
-    crate::object::set(
-        obj,
-        interp.gc_heap_for_cx_mut(),
-        "errors",
-        Value::Array(arr),
-    );
+    interp
+        .set_property(obj, "errors", Value::Array(arr))
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise",
+            reason: err.to_string(),
+        })?;
     Ok(Value::Object(obj))
 }
 
@@ -983,13 +992,21 @@ fn make_aggregate_error_native_rooted(
             gc_heap,
             Some(registry.prototype(ErrorKind::AggregateError)),
         );
-        crate::object::set(obj, gc_heap, "message", message);
     }
+    ctx.set_property_with_roots(obj, "message", message, &[], &[&errors])
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise",
+            reason: err.to_string(),
+        })?;
     let obj_value = Value::Object(obj);
     let arr = ctx
         .array_from_elements_with_roots(errors, &[&obj_value], &[])
         .map_err(|_| oom_native("Promise.any"))?;
-    crate::object::set(obj, ctx.heap_mut(), "errors", Value::Array(arr));
+    ctx.set_property(obj, "errors", Value::Array(arr))
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise",
+            reason: err.to_string(),
+        })?;
     Ok(Value::Object(obj))
 }
 
@@ -1146,10 +1163,39 @@ fn static_with_resolvers(
         Ok(o) => o,
         Err(_) => return Ok(Value::Undefined),
     };
-    let gc_heap = interp.gc_heap_for_cx_mut();
-    crate::object::set(obj, gc_heap, "promise", cap.promise);
-    crate::object::set(obj, gc_heap, "resolve", cap.resolve);
-    crate::object::set(obj, gc_heap, "reject", cap.reject);
+    let mut cap_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        cap.promise.trace_value_slots(visitor);
+        cap.resolve.trace_value_slots(visitor);
+        cap.reject.trace_value_slots(visitor);
+    };
+    interp
+        .set_property_with_extra_roots(obj, "promise", cap.promise.clone(), &mut cap_roots)
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise.withResolvers",
+            reason: err.to_string(),
+        })?;
+    let mut cap_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        cap.promise.trace_value_slots(visitor);
+        cap.resolve.trace_value_slots(visitor);
+        cap.reject.trace_value_slots(visitor);
+    };
+    interp
+        .set_property_with_extra_roots(obj, "resolve", cap.resolve.clone(), &mut cap_roots)
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise.withResolvers",
+            reason: err.to_string(),
+        })?;
+    let mut cap_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        cap.promise.trace_value_slots(visitor);
+        cap.resolve.trace_value_slots(visitor);
+        cap.reject.trace_value_slots(visitor);
+    };
+    interp
+        .set_property_with_extra_roots(obj, "reject", cap.reject.clone(), &mut cap_roots)
+        .map_err(|err| NativeError::TypeError {
+            name: "Promise.withResolvers",
+            reason: err.to_string(),
+        })?;
     Ok(Value::Object(obj))
 }
 

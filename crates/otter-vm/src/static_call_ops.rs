@@ -699,7 +699,7 @@ impl Interpreter {
             };
             for (key, desc_value) in entries {
                 let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
-                if !object::define_own_property_partial(obj, &mut self.gc_heap, &key, descriptor) {
+                if !self.define_own_property_partial(obj, &key, descriptor)? {
                     return Err(VmError::TypeError {
                         message: format!("Cannot define property '{key}'"),
                     });
@@ -875,7 +875,7 @@ impl Interpreter {
                                 .collect()
                         });
                     for (k, v) in entries {
-                        object::set(target, &mut self.gc_heap, &k, v);
+                        self.set_property(target, &k, v)?;
                     }
                 }
                 Value::Array(arr) => {
@@ -885,7 +885,7 @@ impl Interpreter {
                         els.iter().cloned().collect()
                     });
                     for (idx, v) in dense.into_iter().enumerate() {
-                        object::set(target, &mut self.gc_heap, &idx.to_string(), v);
+                        self.set_property(target, &idx.to_string(), v)?;
                     }
                     let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
                         body.named_properties.as_ref().map_or_else(Vec::new, |m| {
@@ -893,7 +893,7 @@ impl Interpreter {
                         })
                     });
                     for (k, v) in named {
-                        object::set(target, &mut self.gc_heap, &k, v);
+                        self.set_property(target, &k, v)?;
                     }
                 }
                 Value::String(s) => {
@@ -908,12 +908,7 @@ impl Interpreter {
                         let unit_string =
                             crate::string::JsString::from_utf16_units(units, &self.string_heap)
                                 .map_err(|_| VmError::TypeMismatch)?;
-                        object::set(
-                            target,
-                            &mut self.gc_heap,
-                            &idx.to_string(),
-                            Value::String(unit_string),
-                        );
+                        self.set_property(target, &idx.to_string(), Value::String(unit_string))?;
                     }
                 }
                 _ => {
@@ -1230,7 +1225,7 @@ impl Interpreter {
                                 }
                                 _ => {
                                     let key_str = object_static_property_key_from_value(&key)?;
-                                    object::set(result, &mut self.gc_heap, &key_str, value);
+                                    self.set_property(result, &key_str, value)?;
                                 }
                             }
                         }
@@ -1248,7 +1243,7 @@ impl Interpreter {
                                 }
                                 _ => {
                                     let key_str = object_static_property_key_from_value(&key)?;
-                                    object::set(result, &mut self.gc_heap, &key_str, value);
+                                    self.set_property(result, &key_str, value)?;
                                 }
                             }
                         }
@@ -1304,11 +1299,9 @@ impl Interpreter {
                     // strings produce a data descriptor for in-range
                     // elements; everything else returns no descriptor.
                     Some(Value::TypedArray(t)) => match &key {
-                        VmPropertyKey::Symbol(sym) => t
-                            .expando()
-                            .and_then(|bag| {
-                                crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), sym)
-                            }),
+                        VmPropertyKey::Symbol(sym) => t.expando().and_then(|bag| {
+                            crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), sym)
+                        }),
                         _ => {
                             let k = key
                                 .string_name()
@@ -1409,7 +1402,7 @@ impl Interpreter {
                                 &[&result_root],
                                 args,
                             )?;
-                            object::set(result, &mut self.gc_heap, &key, Value::Object(desc_obj));
+                            self.set_property(result, &key, Value::Object(desc_obj))?;
                         }
                         let length_desc = crate::object::PropertyDescriptor::data(
                             Value::Number(crate::number::NumberValue::from_f64(units.len() as f64)),
@@ -1423,12 +1416,7 @@ impl Interpreter {
                             &[&result_root],
                             args,
                         )?;
-                        object::set(
-                            result,
-                            &mut self.gc_heap,
-                            "length",
-                            Value::Object(length_obj),
-                        );
+                        self.set_property(result, "length", Value::Object(length_obj))?;
                     }
                     Some(Value::Proxy(proxy)) => {
                         // §20.1.2.10.1 step 3 — drive the spec
@@ -1469,12 +1457,11 @@ impl Interpreter {
                             )?;
                             match &key {
                                 Value::String(s) => {
-                                    object::set(
+                                    self.set_property(
                                         result,
-                                        &mut self.gc_heap,
                                         &s.to_lossy_string(),
                                         Value::Object(desc_obj),
-                                    );
+                                    )?;
                                 }
                                 Value::Symbol(sym) => {
                                     if !object::set_symbol(
@@ -1511,12 +1498,7 @@ impl Interpreter {
                                     &[&target_root, &result_root],
                                     args,
                                 )?;
-                                object::set(
-                                    result,
-                                    &mut self.gc_heap,
-                                    &key,
-                                    Value::Object(desc_obj),
-                                );
+                                self.set_property(result, &key, Value::Object(desc_obj))?;
                             }
                         }
                         for sym in symbols {
@@ -1756,7 +1738,7 @@ impl Interpreter {
                         &[&Value::Object(result), item],
                         &[args],
                     )?;
-                    crate::object::set(result, &mut self.gc_heap, &key_str, Value::Array(arr));
+                    self.set_property(result, &key_str, Value::Array(arr))?;
                     arr
                 }
             };
@@ -1803,41 +1785,16 @@ impl Interpreter {
             self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
-                object::set(result, &mut self.gc_heap, "value", value.clone());
-                object::set(
-                    result,
-                    &mut self.gc_heap,
-                    "writable",
-                    Value::Boolean(desc.writable()),
-                );
+                self.set_property(result, "value", value.clone())?;
+                self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
-                object::set(
-                    result,
-                    &mut self.gc_heap,
-                    "get",
-                    getter.clone().unwrap_or(Value::Undefined),
-                );
-                object::set(
-                    result,
-                    &mut self.gc_heap,
-                    "set",
-                    setter.clone().unwrap_or(Value::Undefined),
-                );
+                self.set_property(result, "get", getter.clone().unwrap_or(Value::Undefined))?;
+                self.set_property(result, "set", setter.clone().unwrap_or(Value::Undefined))?;
             }
         }
-        object::set(
-            result,
-            &mut self.gc_heap,
-            "enumerable",
-            Value::Boolean(desc.enumerable()),
-        );
-        object::set(
-            result,
-            &mut self.gc_heap,
-            "configurable",
-            Value::Boolean(desc.configurable()),
-        );
+        self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
+        self.set_property(result, "configurable", Value::Boolean(desc.configurable()))?;
         Ok(result)
     }
 
@@ -1921,9 +1878,13 @@ impl Interpreter {
                         Ok(Value::Undefined)
                     },
                 )?;
-                let obj = object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
-                object::set(obj, &mut self.gc_heap, "proxy", Value::Proxy(proxy));
-                object::set(obj, &mut self.gc_heap, "revoke", revoke);
+                let obj = self.alloc_stack_rooted_object_with_value_roots(
+                    stack,
+                    &[&proxy_value, &revoke],
+                    args,
+                )?;
+                self.set_property(obj, "proxy", Value::Proxy(proxy))?;
+                self.set_property(obj, "revoke", revoke)?;
                 Ok(Value::Object(obj))
             }
         }

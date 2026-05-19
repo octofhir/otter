@@ -85,7 +85,13 @@ impl Interpreter {
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         if let Some(text) = message {
             let s = JsString::from_str(&text, &self.string_heap)?;
-            object::set(obj, &mut self.gc_heap, "message", Value::String(s));
+            self.set_property_with_stack_roots(
+                stack,
+                obj,
+                "message",
+                Value::String(s),
+                &[message_value, &proto_value],
+            )?;
         }
         Ok(obj)
     }
@@ -223,7 +229,14 @@ impl Interpreter {
             .ok()?
         };
         if is_oom {
-            let proto = self.error_classes.prototype(kind);
+            let proto = match crate::object::get(
+                self.error_classes.constructor(kind),
+                &self.gc_heap,
+                "prototype",
+            ) {
+                Some(Value::Object(proto)) => proto,
+                _ => self.error_classes.prototype(kind),
+            };
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }
         if is_oom && let Ok(message_str) = JsString::from_str(message, &self.string_heap) {

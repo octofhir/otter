@@ -333,11 +333,7 @@ impl NativeFunction {
     /// Spec-driven `[[Prototype]]` override. Concrete TypedArray
     /// constructors point at `%TypedArray%` per §23.2.6.1.
     /// <https://tc39.es/ecma262/#sec-properties-of-the-typedarray-constructors>
-    pub fn set_prototype_override(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-        proto: Option<Value>,
-    ) {
+    pub fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
         let proto_clone = proto.clone();
         let success = heap.with_payload(self.inner, |body| {
             body.prototype_override = proto;

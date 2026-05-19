@@ -480,19 +480,10 @@ impl Cage {
     }
 
     /// Return the cage's free-page count for diagnostics.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn free_page_count() -> usize {
         let guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
         guard.as_ref().map(|c| c.free_pages.len()).unwrap_or(0)
-    }
-
-    /// Number of pages the cage carries in total (size / PAGE_SIZE).
-    /// Kept `pub(crate)` for diagnostics — used by integration
-    /// tests that assert on cage occupancy.
-    #[allow(dead_code)]
-    pub(crate) fn total_page_count() -> u32 {
-        let guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
-        guard.as_ref().map(|c| c.page_count).unwrap_or(0)
     }
 
     pub(crate) fn stats() -> Option<CageStats> {

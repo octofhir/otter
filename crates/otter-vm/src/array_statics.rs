@@ -114,9 +114,11 @@ fn construct_and_fill(
     let len = args.len();
     let mut ctor_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(1);
     ctor_args.push(Value::Number(NumberValue::from_i32(len as i32)));
-    let (interp, exec) = ctx.interp_mut_and_context();
-    let exec = exec.ok_or(VmError::InvalidOperand)?;
-    let receiver = interp.run_construct_sync(&exec, target, target.clone(), ctor_args)?;
+    let receiver = {
+        let (interp, exec) = ctx.interp_mut_and_context();
+        let exec = exec.ok_or(VmError::InvalidOperand)?;
+        interp.run_construct_sync(&exec, target, target.clone(), ctor_args)?
+    };
     let receiver_obj = match &receiver {
         Value::Object(obj) => *obj,
         Value::Array(_) => return Ok(receiver),
@@ -128,14 +130,13 @@ fn construct_and_fill(
     };
     for (idx, value) in args.iter().enumerate() {
         let key = idx.to_string();
-        crate::object::set(receiver_obj, interp.gc_heap_mut(), &key, value.clone());
+        ctx.set_property(receiver_obj, &key, value.clone())?;
     }
-    crate::object::set(
+    ctx.set_property(
         receiver_obj,
-        interp.gc_heap_mut(),
         "length",
         Value::Number(NumberValue::from_i32(len as i32)),
-    );
+    )?;
     Ok(receiver)
 }
 

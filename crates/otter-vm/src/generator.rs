@@ -134,7 +134,7 @@ impl JsGenerator {
 
     /// Trace this handle as a root slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        let p = self as *const JsGenerator as *mut RawGc;
+        let p = &self.inner as *const otter_gc::Gc<GeneratorBody> as *mut RawGc;
         visitor(p);
     }
 

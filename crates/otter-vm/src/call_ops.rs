@@ -105,6 +105,7 @@ impl Interpreter {
         receiver: JsObject,
         new_target: Value,
         args: SmallVec<[Value; 8]>,
+        return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
         let (function_id, parent_upvalues) = Self::bytecode_construct_target_parts(current)?;
         let function = context
@@ -114,7 +115,7 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
-            None,
+            return_register,
             upvalues,
             Value::Object(receiver),
         );
@@ -131,6 +132,7 @@ impl Interpreter {
         receiver: JsObject,
         new_target: Value,
         args: &BytecodeArgumentWindow<'_>,
+        return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
         let (function_id, parent_upvalues) = Self::bytecode_construct_target_parts(current)?;
         let function = context
@@ -140,7 +142,7 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
-            None,
+            return_register,
             upvalues,
             Value::Object(receiver),
         );
@@ -682,7 +684,7 @@ impl Interpreter {
         operands: &[Operand],
         first_arg_operand: usize,
         argc: usize,
-        _dst: u16,
+        dst: u16,
     ) -> Result<bool, VmError> {
         let mut current = callee;
         let effective_new_target = current.clone();
@@ -718,6 +720,7 @@ impl Interpreter {
                 receiver,
                 effective_new_target,
                 &args,
+                Some(dst),
             )?
         };
         stack.push(frame);
@@ -907,6 +910,7 @@ impl Interpreter {
                 receiver,
                 new_target,
                 args,
+                Some(dst),
             )?;
             stack.push(frame);
             return Ok(());
@@ -1395,6 +1399,7 @@ impl Interpreter {
             receiver,
             effective_new_target,
             effective_args,
+            None,
         )?;
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         inner.push(new_frame);

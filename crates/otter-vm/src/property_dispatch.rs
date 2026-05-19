@@ -37,6 +37,39 @@ use crate::{
 };
 
 impl Interpreter {
+    fn capture_store_property_transition_with_stack_roots(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        mut obj: JsObject,
+        key: AtomizedPropertyKey<'_>,
+        value: &Value,
+    ) -> Result<Option<object::StorePropertyTransition>, VmError> {
+        let parent = object::shape(obj, &self.gc_heap);
+        if parent.is_null() || self.shape_offset_of(parent, key.name()).is_some() {
+            return Ok(None);
+        }
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            let p = &mut obj as *mut JsObject as *mut RawGc;
+            visitor(p);
+            value.trace_value_slots(visitor);
+        };
+        let next_shape = self
+            .shape_runtime
+            .child_with_roots(&mut self.gc_heap, parent, key.name(), &mut external_visit)
+            .map_err(VmError::from)?;
+        Ok(object::capture_store_property_transition_with_shape(
+            obj,
+            &mut self.gc_heap,
+            key,
+            value,
+            next_shape,
+        ))
+    }
+
     /// §7.1.19 `ToPropertyKey(value)` — projection used by the
     /// computed-key `LoadElement` / `StoreElement` opcode dispatch
     /// before the per-receiver match runs. Primitive operands round
@@ -97,6 +130,28 @@ impl Interpreter {
                 let s = JsString::from_str(&s, &self.string_heap)?;
                 Ok(Value::String(s))
             }
+        }
+    }
+
+    fn load_string_primitive_property(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: &Value,
+        string: &JsString,
+        name: &str,
+    ) -> Result<Value, VmError> {
+        match string_index_property_name(name) {
+            Some(index) => match string.char_code_at(index) {
+                Some(unit) => Ok(Value::String(JsString::from_utf16_units(
+                    &[unit],
+                    &self.string_heap,
+                )?)),
+                None => Ok(Value::Undefined),
+            },
+            None if name == "length" => {
+                Ok(Value::Number(NumberValue::from_i32(string.len() as i32)))
+            }
+            None => self.load_from_constructor_prototype(context, "String", receiver, name),
         }
     }
 
@@ -538,9 +593,7 @@ impl Interpreter {
                     }
                 }
             }
-            Value::String(s) if name == "length" => {
-                Value::Number(NumberValue::from_i32(s.len() as i32))
-            }
+            Value::String(s) => self.load_string_primitive_property(context, &receiver, s, name)?,
             v @ Value::Array(_) => {
                 let direct = if let Value::Array(a) = v {
                     crate::array::get_named_property(*a, &self.gc_heap, name)
@@ -596,7 +649,11 @@ impl Interpreter {
                     .unwrap_or(Value::Undefined),
             },
             v @ Value::RegExp(_) => {
-                let r = if let Value::RegExp(r) = v { *r } else { unreachable!() };
+                let r = if let Value::RegExp(r) = v {
+                    *r
+                } else {
+                    unreachable!()
+                };
                 // Expando bag wins over the spec-mandated direct
                 // load so user-installed members
                 // (`re.exec = fn`, `re.global = false`) shadow the
@@ -637,7 +694,11 @@ impl Interpreter {
                 // (`promise.then = fn`) live in a lazy expando bag;
                 // honour them before the realm `Promise.prototype`
                 // walk.
-                let p = if let Value::Promise(p) = v { *p } else { unreachable!() };
+                let p = if let Value::Promise(p) = v {
+                    *p
+                } else {
+                    unreachable!()
+                };
                 if let Some(bag) = p.expando(&self.gc_heap)
                     && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
                 {
@@ -764,7 +825,7 @@ impl Interpreter {
                     regexp_prototype::store_property(r, &mut self.gc_heap, name, value.clone());
                 } else {
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
-                    crate::object::set(bag, &mut self.gc_heap, name, value.clone());
+                    self.set_property(bag, name, value.clone())?;
                 }
                 None
             }
@@ -780,8 +841,7 @@ impl Interpreter {
                         && n >= 0.0
                         && (n as usize) < t.length()
                     {
-                        let coerced =
-                            binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
+                        let coerced = binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
                         t.set(n as usize, &coerced);
                     }
                 } else {
@@ -932,7 +992,7 @@ impl Interpreter {
             }
         };
         if let Some(target) = target {
-            crate::object::set(target, &mut self.gc_heap, name, value);
+            self.set_property(target, name, value)?;
         }
         stack[top_idx].pc += 1;
         Ok(())
@@ -1029,11 +1089,7 @@ impl Interpreter {
             (Value::TypedArray(t), Value::String(key)) => {
                 let name = key.to_lossy_string();
                 if let Some(n) = canonical_numeric_index_string(&name) {
-                    if n.is_finite()
-                        && n.fract() == 0.0
-                        && n >= 0.0
-                        && (n as usize) < t.length()
-                    {
+                    if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && (n as usize) < t.length() {
                         t.get(n as usize)
                     } else {
                         Value::Undefined
@@ -1064,6 +1120,20 @@ impl Interpreter {
                     }
                     value
                 }
+            }
+            // §10.4.3 String exotic [[GetOwnProperty]] exposes each
+            // UTF-16 code unit as an own, read-only indexed property.
+            // Computed access reaches this arm after ToPropertyKey,
+            // so both `"abc"[0]` and `"abc"["0"]` must resolve here
+            // before falling back to String.prototype.
+            // <https://tc39.es/ecma262/#sec-string-exotic-objects-getownproperty-p>
+            (Value::String(s), Value::String(key)) => {
+                let name = key.to_lossy_string();
+                self.load_string_primitive_property(context, &recv, s, &name)?
+            }
+            (Value::String(s), Value::Number(key)) => {
+                let name = key.to_display_string();
+                self.load_string_primitive_property(context, &recv, s, &name)?
             }
             // Computed string-key access on RegExp must observe the
             // same own/prototype lookup as `re.lastIndex` (member
@@ -1266,7 +1336,7 @@ impl Interpreter {
                             *function_id,
                             &[&recv, &idx_value, &value],
                         )?;
-                        crate::object::set(bag, &mut self.gc_heap, &key, value);
+                        self.set_property(bag, &key, value)?;
                         if let Some(metadata_key) =
                             function_metadata::ordinary_function_metadata_key(&key)
                         {
@@ -1430,8 +1500,7 @@ impl Interpreter {
                     {
                         // out-of-range / non-integer — silent no-op
                     } else {
-                        let coerced =
-                            binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
+                        let coerced = binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
                         t.set(n as usize, &coerced);
                     }
                 } else {
@@ -1482,7 +1551,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         match crate::object::resolve_set(obj, &self.gc_heap, key) {
             object::SetOutcome::AssignData => {
-                if object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value) {
+                if self.ordinary_set_data_property(obj, key, value)? {
                     Ok(())
                 } else {
                     Self::failed_set_result(
@@ -2297,12 +2366,7 @@ impl Interpreter {
                         object::SetOutcome::AssignData => {
                             let ok = match &key {
                                 ComputedPropertyKey::String(key) => {
-                                    object::ordinary_set_data_property(
-                                        target,
-                                        &mut self.gc_heap,
-                                        key,
-                                        value,
-                                    )
+                                    self.ordinary_set_data_property(target, key, value)?
                                 }
                                 ComputedPropertyKey::Symbol(sym) => object::set_symbol(
                                     target,
@@ -2444,7 +2508,7 @@ impl Interpreter {
             object::SetOutcome::AssignData => {
                 let ok = match &key {
                     ComputedPropertyKey::String(key) => {
-                        object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value)
+                        self.ordinary_set_data_property(obj, key, value)?
                     }
                     ComputedPropertyKey::Symbol(sym) => {
                         object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value)
@@ -2628,12 +2692,7 @@ impl Interpreter {
                     };
                     match object::resolve_set(target, &self.gc_heap, &name) {
                         object::SetOutcome::AssignData => {
-                            if !object::ordinary_set_data_property(
-                                target,
-                                &mut self.gc_heap,
-                                &name,
-                                value,
-                            ) {
+                            if !self.ordinary_set_data_property(target, &name, value)? {
                                 Self::failed_set_result(
                                     strict,
                                     format!("Cannot assign to property '{name}'"),
@@ -2775,18 +2834,16 @@ impl Interpreter {
                 let transition = if matches!(receiver, Value::Object(_))
                     && object::supports_fast_property_ic(obj, &self.gc_heap)
                 {
-                    object::capture_store_property_transition(
+                    self.capture_store_property_transition_with_stack_roots(
+                        stack,
                         obj,
-                        &mut self.gc_heap,
                         atomized_key,
                         &value,
-                    )
+                    )?
                 } else {
                     None
                 };
-                if transition.is_none()
-                    && !object::ordinary_set_data_property(obj, &mut self.gc_heap, &name, value)
-                {
+                if transition.is_none() && !self.ordinary_set_data_property(obj, &name, value)? {
                     return Self::finish_failed_set(
                         stack,
                         context,
@@ -3039,6 +3096,20 @@ impl Interpreter {
     }
 }
 
+fn string_index_property_name(key: &str) -> Option<u32> {
+    if key.is_empty() {
+        return None;
+    }
+    if key.len() > 1 && key.as_bytes().first() == Some(&b'0') {
+        return None;
+    }
+    let value = key.parse::<u32>().ok()?;
+    if value == u32::MAX {
+        return None;
+    }
+    Some(value)
+}
+
 fn has_object_property(interpreter: &Interpreter, obj: JsObject, key: &Value) -> bool {
     match key {
         Value::Symbol(s) => crate::object::get_symbol(obj, &interpreter.gc_heap, s).is_some(),
@@ -3118,11 +3189,7 @@ pub(crate) fn canonical_numeric_index_string(s: &str) -> Option<f64> {
     }
     let n: f64 = s.parse().ok()?;
     let formatted = crate::number::NumberValue::from_f64(n).to_display_string();
-    if formatted == s {
-        Some(n)
-    } else {
-        None
-    }
+    if formatted == s { Some(n) } else { None }
 }
 
 /// Lazy-allocate (and cache) the TypedArray expando JsObject used
@@ -3161,7 +3228,7 @@ fn typed_array_set_expando(
     value: Value,
 ) -> Result<(), VmError> {
     let bag = typed_array_ensure_expando(interp, t)?;
-    crate::object::set(bag, &mut interp.gc_heap, name, value);
+    interp.set_property(bag, name, value)?;
     Ok(())
 }
 

@@ -31,6 +31,7 @@ use crate::object::{
 };
 use crate::property_atom::AtomizedPropertyKey;
 use crate::{JsObject, JsString, Value};
+use otter_gc::raw::SlotVisitor;
 
 const MONOMORPHIC_MISS_DISABLE_THRESHOLD: u8 = 4;
 
@@ -137,7 +138,7 @@ impl<T> Default for PropertyIcEntry<T> {
 impl<T> PropertyIcEntry<T> {
     /// `true` when this site currently has a monomorphic cache.
     #[must_use]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) const fn is_monomorphic(&self) -> bool {
         matches!(self, Self::Monomorphic { .. })
     }
@@ -236,6 +237,14 @@ impl<T> PropertyIcEntry<T> {
         match self {
             Self::Monomorphic { ic, .. } => Some(ic),
             Self::Empty | Self::Disabled => None,
+        }
+    }
+}
+
+impl PropertyIcEntry<StorePropertyIc> {
+    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
+        if let Self::Monomorphic { ic, .. } = self {
+            ic.trace_roots(visitor);
         }
     }
 }
@@ -534,6 +543,17 @@ impl StorePropertyIc {
             }
             StorePropertyTransitionKind::DirectPrototypeWritableData { .. } => {
                 Self::DirectPrototypeWritableDataTransition { transition }
+            }
+        }
+    }
+
+    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
+        match self {
+            Self::ExistingOwnDataStore { .. } => {}
+            Self::OwnAddTransition { transition }
+            | Self::DirectPrototypeMissingTransition { transition }
+            | Self::DirectPrototypeWritableDataTransition { transition } => {
+                transition.trace_roots(visitor);
             }
         }
     }

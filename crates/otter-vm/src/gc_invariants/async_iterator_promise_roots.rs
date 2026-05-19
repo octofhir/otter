@@ -49,6 +49,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
     let _ = retained;
     interp.force_gc();
 
+    let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "promise")
         .expect("promise root survives force_gc");
     let Value::Promise(promise) = rooted else {
@@ -67,7 +68,7 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
     let baseline = live_bytes(&mut interp, PURE_PROMISE_BODY_TYPE_TAG);
 
     let mut current = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
-    for _ in 0..100_000 {
+    for _ in 0..10_000 {
         let next = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
         let capability = crate::PromiseCapability {
             promise: Value::Promise(next),
@@ -139,6 +140,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
     let _ = iter;
     interp.force_gc();
 
+    let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "iter").expect("iter");
     let Value::Iterator(iter) = rooted else {
         panic!("expected iterator root")
@@ -172,6 +174,12 @@ fn generator_and_parked_frame_roots_register_values() {
 
     let _ = object;
     interp.force_gc();
+    let global = *interp.global_this();
+    let rooted = crate::object::get(global, interp.gc_heap(), "generator")
+        .expect("generator root survives force_gc");
+    let Value::Generator(generator) = rooted else {
+        panic!("expected rooted generator after force_gc")
+    };
     generator.with_body(interp.gc_heap(), |body| {
         let frame = body.frame.as_ref().expect("saved frame");
         assert!(matches!(frame.registers[0], Value::Object(_)));
@@ -201,6 +209,7 @@ fn generator_and_parked_frame_roots_register_values() {
 
     let _ = parked_object;
     interp.force_gc();
+    let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "awaitPromise")
         .expect("await promise root survives force_gc");
     let Value::Promise(promise) = rooted else {

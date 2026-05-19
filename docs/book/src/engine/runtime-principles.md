@@ -157,7 +157,6 @@ Runtime drive modes should remain deterministic:
 - one tick;
 - run until idle;
 - run until promise;
-- run until command;
 - shutdown.
 
 Budgeted execution adds another observable state: yielded but resumable.

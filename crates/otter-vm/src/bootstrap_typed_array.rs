@@ -236,7 +236,6 @@ pub(crate) fn install_typed_array_entry(
 /// values` on the abstract `%TypedArray%.prototype`.
 pub fn install_typed_array_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -255,28 +254,27 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // re-entering the same callback loop in the wrapper body.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
         let abstract_proto_root = Value::Object(abstract_proto);
-        let install_method =
-            |heap: &mut otter_gc::GcHeap,
-             name: &'static str,
-             length: u8,
-             call: crate::native_function::NativeFastFn|
-             -> Result<(), JsSurfaceError> {
-                let f = crate::bootstrap::native_static_with_value_roots(
-                    heap,
-                    name,
-                    length,
-                    call,
-                    &[&abstract_proto_root],
-                )
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
-                object::define_own_property(
-                    abstract_proto,
-                    heap,
-                    name,
-                    PropertyDescriptor::data(Value::NativeFunction(f), true, false, true),
-                );
-                Ok(())
-            };
+        let install_method = |heap: &mut otter_gc::GcHeap,
+                              name: &'static str,
+                              length: u8,
+                              call: crate::native_function::NativeFastFn|
+         -> Result<(), JsSurfaceError> {
+            let f = crate::bootstrap::native_static_with_value_roots(
+                heap,
+                name,
+                length,
+                call,
+                &[&abstract_proto_root],
+            )
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+            object::define_own_property(
+                abstract_proto,
+                heap,
+                name,
+                PropertyDescriptor::data(Value::NativeFunction(f), true, false, true),
+            );
+            Ok(())
+        };
         install_method(heap, "forEach", 1, ta_proto_for_each)?;
         install_method(heap, "map", 1, ta_proto_map)?;
         install_method(heap, "filter", 1, ta_proto_filter)?;
@@ -297,33 +295,27 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // setter side is undefined per spec.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
         let abstract_proto_root = Value::Object(abstract_proto);
-        let install_accessor =
-            |heap: &mut otter_gc::GcHeap,
-             name: &'static str,
-             getter_name: &'static str,
-             getter: crate::native_function::NativeFastFn|
-             -> Result<(), JsSurfaceError> {
-                let f = crate::bootstrap::native_static_with_value_roots(
-                    heap,
-                    getter_name,
-                    0,
-                    getter,
-                    &[&abstract_proto_root],
-                )
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
-                object::define_own_property(
-                    abstract_proto,
-                    heap,
-                    name,
-                    PropertyDescriptor::accessor(
-                        Some(Value::NativeFunction(f)),
-                        None,
-                        false,
-                        true,
-                    ),
-                );
-                Ok(())
-            };
+        let install_accessor = |heap: &mut otter_gc::GcHeap,
+                                name: &'static str,
+                                getter_name: &'static str,
+                                getter: crate::native_function::NativeFastFn|
+         -> Result<(), JsSurfaceError> {
+            let f = crate::bootstrap::native_static_with_value_roots(
+                heap,
+                getter_name,
+                0,
+                getter,
+                &[&abstract_proto_root],
+            )
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+            object::define_own_property(
+                abstract_proto,
+                heap,
+                name,
+                PropertyDescriptor::accessor(Some(Value::NativeFunction(f)), None, false, true),
+            );
+            Ok(())
+        };
         install_accessor(heap, "buffer", "get buffer", ta_buffer_getter)?;
         install_accessor(heap, "byteLength", "get byteLength", ta_byte_length_getter)?;
         install_accessor(heap, "byteOffset", "get byteOffset", ta_byte_offset_getter)?;
@@ -603,7 +595,9 @@ fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     for (i, v) in elements.into_iter().enumerate() {
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if hit.to_boolean() {
-            return Ok(Value::Number(crate::number::NumberValue::from_i32(i as i32)));
+            return Ok(Value::Number(crate::number::NumberValue::from_i32(
+                i as i32,
+            )));
         }
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(-1)))
@@ -635,7 +629,9 @@ fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
         let v = elements[i].clone();
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if hit.to_boolean() {
-            return Ok(Value::Number(crate::number::NumberValue::from_i32(i as i32)));
+            return Ok(Value::Number(crate::number::NumberValue::from_i32(
+                i as i32,
+            )));
         }
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(-1)))
@@ -721,7 +717,9 @@ fn ta_proto_reduce_dir(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(acc.clone());
         cb_args.push(value);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_i32(i as i32)));
+        cb_args.push(Value::Number(crate::number::NumberValue::from_i32(
+            i as i32,
+        )));
         cb_args.push(ta_value.clone());
         acc = ctx
             .cx
@@ -743,10 +741,13 @@ fn ta_build_result(
     method: &'static str,
 ) -> Result<Value, NativeError> {
     let bpe = kind.bytes_per_element();
-    let byte_len = values.len().checked_mul(bpe).ok_or(NativeError::RangeError {
-        name: method,
-        reason: "TypedArray byte length overflow".to_string(),
-    })?;
+    let byte_len = values
+        .len()
+        .checked_mul(bpe)
+        .ok_or(NativeError::RangeError {
+            name: method,
+            reason: "TypedArray byte length overflow".to_string(),
+        })?;
     let roots = ctx.collect_native_roots();
     let this_value = ctx.this_value().clone();
     let new_target = ctx.new_target().cloned();
@@ -802,7 +803,9 @@ fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
     match ctx.this_value() {
         Value::TypedArray(t) => {
             let n = t.byte_length();
-            Ok(Value::Number(crate::number::NumberValue::from_f64(n as f64)))
+            Ok(Value::Number(crate::number::NumberValue::from_f64(
+                n as f64,
+            )))
         }
         _ => Err(NativeError::TypeError {
             name: "TypedArray.prototype.byteLength",
@@ -816,7 +819,9 @@ fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
     match ctx.this_value() {
         Value::TypedArray(t) => {
             let n = t.byte_offset();
-            Ok(Value::Number(crate::number::NumberValue::from_f64(n as f64)))
+            Ok(Value::Number(crate::number::NumberValue::from_f64(
+                n as f64,
+            )))
         }
         _ => Err(NativeError::TypeError {
             name: "TypedArray.prototype.byteOffset",
@@ -830,7 +835,9 @@ fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     match ctx.this_value() {
         Value::TypedArray(t) => {
             let n = t.length();
-            Ok(Value::Number(crate::number::NumberValue::from_f64(n as f64)))
+            Ok(Value::Number(crate::number::NumberValue::from_f64(
+                n as f64,
+            )))
         }
         _ => Err(NativeError::TypeError {
             name: "TypedArray.prototype.length",
@@ -844,10 +851,7 @@ fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 /// if the receiver is not a TypedArray.
 ///
 /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype-%symbol.tostringtag%>
-fn tostring_tag_getter(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
+fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
     let kind_name = match this_value {
         Value::TypedArray(t) => t.kind().name(),
@@ -912,8 +916,7 @@ fn ensure_abstract_typed_array_constructor(
     let string_heap = crate::string::StringHeap::default();
     // §23.2.2.3 %TypedArray%.prototype is non-writable,
     // non-enumerable, non-configurable.
-    let proto_desc =
-        PropertyDescriptor::data(Value::Object(abstract_proto), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::Object(abstract_proto), false, false, false);
     if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -978,27 +981,6 @@ fn get_abstract_typed_array_prototype(
 ) -> Option<JsObject> {
     match object::get(global, heap, ABSTRACT_PROTO_SLOT) {
         Some(Value::Object(obj)) => Some(obj),
-        _ => None,
-    }
-}
-
-fn ctor_prototype(
-    global: JsObject,
-    heap: &otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
-    ctor_name: &str,
-) -> Option<JsObject> {
-    let Some(Value::NativeFunction(f)) = object::get(global, heap, ctor_name) else {
-        return None;
-    };
-    let descriptor = f
-        .own_property_descriptor(heap, string_heap, "prototype")
-        .ok()
-        .flatten()?;
-    match descriptor.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
         _ => None,
     }
 }
@@ -1149,12 +1131,12 @@ fn ta_ctor_dispatch(
             if has_iter {
                 let src_value = Value::Object(*src_obj);
                 let drained = drain_iterable_into_values(ctx, exec, &src_value)?;
-                let arr = ctx
-                    .array_from_elements(drained.into_iter())
-                    .map_err(|_| NativeError::TypeError {
+                let arr = ctx.array_from_elements(drained.into_iter()).map_err(|_| {
+                    NativeError::TypeError {
                         name: typed_array_name(kind),
                         reason: "out of memory while allocating array".to_string(),
-                    })?;
+                    }
+                })?;
                 let mut out: SmallVec<[Value; 4]> = SmallVec::new();
                 out.push(Value::Array(arr));
                 for v in args.iter().skip(1) {
@@ -1192,11 +1174,7 @@ fn ta_ctor_dispatch(
                 }
                 let interp = ctx.interp_mut();
                 let primitive = interp
-                    .evaluate_to_primitive(
-                        exec,
-                        slot,
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    )
+                    .evaluate_to_primitive(exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
                     .map_err(|e| NativeError::TypeError {
                         name: typed_array_name(kind),
                         reason: e.to_string(),

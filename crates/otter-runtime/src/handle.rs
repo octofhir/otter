@@ -1113,24 +1113,6 @@ impl IsolateRunner {
         }
     }
 
-    #[allow(dead_code)]
-    fn run_until_command(&mut self, id: CommandId) {
-        while !self.shutdown {
-            match self.rx.recv() {
-                Ok(msg) => {
-                    let command_done = matches!(
-                        &msg,
-                        RuntimeMessage::Command(command) if command.id() == id
-                    );
-                    if matches!(self.process_message(msg), TickOutcome::Shutdown) || command_done {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    }
-
     fn shutdown(&mut self) {
         self.shutdown = true;
         self.counters.shutdown.store(true, Ordering::Relaxed);

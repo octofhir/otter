@@ -787,7 +787,7 @@ impl Interpreter {
                     let k = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    object::define_own_property_partial(*obj, &mut self.gc_heap, k, descriptor)
+                    self.define_own_property_partial(*obj, k, descriptor)?
                 }
             }),
             Value::NativeFunction(native) => Ok(match key {
@@ -887,22 +887,22 @@ impl Interpreter {
         }
         let obj = self.alloc_runtime_rooted_object_with_roots(roots.as_slice(), &[])?;
         if let Some(v) = &descriptor.value {
-            object::set(obj, &mut self.gc_heap, "value", v.clone());
+            self.set_property(obj, "value", v.clone())?;
         }
         if let Some(w) = descriptor.writable {
-            object::set(obj, &mut self.gc_heap, "writable", Value::Boolean(w));
+            self.set_property(obj, "writable", Value::Boolean(w))?;
         }
         if let Some(g) = &descriptor.get {
-            object::set(obj, &mut self.gc_heap, "get", g.clone());
+            self.set_property(obj, "get", g.clone())?;
         }
         if let Some(s) = &descriptor.set {
-            object::set(obj, &mut self.gc_heap, "set", s.clone());
+            self.set_property(obj, "set", s.clone())?;
         }
         if let Some(e) = descriptor.enumerable {
-            object::set(obj, &mut self.gc_heap, "enumerable", Value::Boolean(e));
+            self.set_property(obj, "enumerable", Value::Boolean(e))?;
         }
         if let Some(c) = descriptor.configurable {
-            object::set(obj, &mut self.gc_heap, "configurable", Value::Boolean(c));
+            self.set_property(obj, "configurable", Value::Boolean(c))?;
         }
         Ok(obj)
     }
@@ -1983,8 +1983,7 @@ impl Interpreter {
             // expando bag, then the per-kind prototype chain.
             Value::TypedArray(t) => {
                 if let Some(name) = key.string_name() {
-                    if let Some(n) =
-                        crate::property_dispatch::canonical_numeric_index_string(name)
+                    if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
                     {
                         if t.buffer().is_detached()
                             || !n.is_finite()
@@ -2695,13 +2694,12 @@ impl Interpreter {
                     VmPropertyKey::Symbol(sym) => {
                         object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value)
                     }
-                    _ => object::ordinary_set_data_property(
+                    _ => self.ordinary_set_data_property(
                         obj,
-                        &mut self.gc_heap,
                         key.string_name()
                             .expect("non-symbol key has string spelling"),
                         value,
-                    ),
+                    )?,
                 })
             }
             Value::RegExp(re) => match key {

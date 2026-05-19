@@ -89,7 +89,7 @@ pub use compressed::{CageStats, Gc, cage_base, cage_size, cage_stats, init_cage_
 pub use external::{ExternalMemory, SharedExternalMemory};
 pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
-pub use heap::{EmptyRoots, GcHeap, HeapStats, Roots};
+pub use heap::{EmptyRoots, GcHeap, HeapStats};
 pub use oom::OutOfMemory;
 pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use snapshot::{HeapSnapshot, SnapshotObject};

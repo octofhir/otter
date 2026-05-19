@@ -48,6 +48,7 @@
 //!   `String` constructor object (`fromCharCode`, `fromCodePoint`).
 
 pub mod dispatch;
+pub mod gc_body;
 pub mod intrinsic;
 pub mod ops;
 pub mod prototype;
@@ -57,6 +58,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+pub use gc_body::{
+    JS_STRING_BODY_TYPE_TAG, JS_STRING_CHUNK_BODY_TYPE_TAG, JsStringBody, JsStringChunkBody,
+    JsStringHandle, JsStringId, alloc_flat_string_body_with_roots, to_utf16_vec,
+};
 
 /// Per-variant header overhead used by the heap accountant. The
 /// numbers are conservative estimates; real Rust layout may be

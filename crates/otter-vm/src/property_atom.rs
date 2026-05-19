@@ -33,13 +33,6 @@ impl AtomId {
     pub(crate) const fn from_constant_index(index: u32) -> Self {
         Self(index)
     }
-
-    /// Raw numeric id used by future executable inline caches.
-    #[must_use]
-    #[allow(dead_code)]
-    pub(crate) const fn get(self) -> u32 {
-        self.0
-    }
 }
 
 /// Compact identity for one string constant used as a property key.
@@ -57,7 +50,6 @@ impl PropertyAtom {
 
     /// Stable VM-local id.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) const fn id(self) -> AtomId {
         self.id
     }
@@ -79,7 +71,6 @@ impl<'a> AtomizedPropertyKey<'a> {
 
     /// Stable VM-local atom identity.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) const fn atom(self) -> PropertyAtom {
         self.atom
     }
@@ -206,7 +197,7 @@ mod tests {
 
         let key = table.property_atom(1).expect("string atom");
         assert_eq!(key.name(), "name");
-        assert_eq!(key.atom().id().get(), 1);
+        assert_eq!(key.atom().id(), AtomId::from_constant_index(1));
         assert!(table.property_atom(0).is_none());
     }
 
@@ -218,10 +209,10 @@ mod tests {
         ];
         let table = AtomTable::from_constants(&constants);
 
-        let first = table.property_atom(0).unwrap().atom().id().get();
-        let second = table.property_atom(1).unwrap().atom().id().get();
+        let first = table.property_atom(0).unwrap().atom().id();
+        let second = table.property_atom(1).unwrap().atom().id();
 
-        assert_eq!(first, 0);
-        assert_eq!(second, 1);
+        assert_eq!(first, AtomId::from_constant_index(0));
+        assert_eq!(second, AtomId::from_constant_index(1));
     }
 }

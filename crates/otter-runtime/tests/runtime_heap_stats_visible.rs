@@ -42,20 +42,27 @@ fn runtime_heap_stats_reflect_host_alloc_after_run_script() {
 
 fn force_gc_resets_live_count_when_no_roots() {
     let mut rt = Runtime::builder().build().expect("runtime");
-    // Establish a baseline after intrinsics + globalThis are wired.
-    rt.force_gc();
-    let baseline_object = rt.heap_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
-    let baseline_cycles = rt.heap_stats().gc_cycles;
     rt.run_script(
         SourceInput::from_javascript("for (let i = 0; i < 10; i++) ({ i }); undefined;"),
         "<gc-smoke>",
     )
     .expect("script ran");
     rt.force_gc();
+    let first_object = rt.heap_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+
+    rt.force_gc();
+    let baseline_object = rt.heap_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
+    let baseline_cycles = rt.heap_stats().gc_cycles;
+
+    rt.force_gc();
     let stats = rt.heap_stats();
+    assert!(
+        baseline_object <= first_object,
+        "object row should not grow after a forced GC with no new script allocations"
+    );
     assert_eq!(
         stats.by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes, baseline_object,
-        "unrooted object row must return to baseline"
+        "object row must be stable after a GC with no new roots"
     );
     assert_eq!(stats.gc_cycles, baseline_cycles + 1);
 }

@@ -333,8 +333,6 @@ impl JsRegExp {
         })
     }
 
-    /// Parsed flag bits.
-    #[must_use]
     /// Read the lazy expando bag, if any user installations
     /// (`re.global = false`, `re.exec = fn`) created one.
     #[must_use]

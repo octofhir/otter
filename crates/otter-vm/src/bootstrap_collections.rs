@@ -275,12 +275,7 @@ fn install_collection(
             &[&global_root, &ctor_root],
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc = PropertyDescriptor::data(
-            Value::NativeFunction(group_by_fn),
-            true,
-            false,
-            true,
-        );
+        let desc = PropertyDescriptor::data(Value::NativeFunction(group_by_fn), true, false, true);
         if !ctor.define_own_property(heap, &string_heap, "groupBy", desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("groupBy"));
         }
@@ -293,10 +288,7 @@ fn install_collection(
 /// §24.1.2.1 `Map.groupBy(items, callbackfn)` — drain `items`
 /// into groups keyed by callback return value, store result in
 /// a new Map.
-fn map_group_by_native(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
+fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let items = args.first().cloned().unwrap_or(Value::Undefined);
     let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
     if matches!(items, Value::Undefined | Value::Null) {
@@ -328,8 +320,7 @@ fn map_group_by_native(
             crate::array::with_elements(*arr, ctx.heap(), |elements| elements.to_vec())
         }
         Value::Object(obj) => {
-            let length =
-                crate::object::get(*obj, ctx.heap(), "length").unwrap_or(Value::Undefined);
+            let length = crate::object::get(*obj, ctx.heap(), "length").unwrap_or(Value::Undefined);
             let len = crate::number::to_number_value(&length);
             let n = if len.is_nan() || len <= 0.0 {
                 0
@@ -397,17 +388,11 @@ fn map_group_by_native(
             arr_value.trace_value_slots(visitor);
             item_clone.trace_value_slots(visitor);
         };
-        crate::array::set_with_roots(
-            group_arr,
-            ctx.heap_mut(),
-            len,
-            item.clone(),
-            &mut visit,
-        )
-        .map_err(|_| NativeError::TypeError {
-            name: "Map.groupBy",
-            reason: "out of memory".to_string(),
-        })?;
+        crate::array::set_with_roots(group_arr, ctx.heap_mut(), len, item.clone(), &mut visit)
+            .map_err(|_| NativeError::TypeError {
+                name: "Map.groupBy",
+                reason: "out of memory".to_string(),
+            })?;
     }
     Ok(result_value)
 }

@@ -1386,41 +1386,16 @@ impl Interpreter {
         };
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
-                object::set(result, &mut self.gc_heap, "value", value.clone());
-                object::set(
-                    result,
-                    &mut self.gc_heap,
-                    "writable",
-                    Value::Boolean(desc.writable()),
-                );
+                self.set_property(result, "value", value.clone())?;
+                self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
-                object::set(
-                    result,
-                    &mut self.gc_heap,
-                    "get",
-                    getter.clone().unwrap_or(Value::Undefined),
-                );
-                object::set(
-                    result,
-                    &mut self.gc_heap,
-                    "set",
-                    setter.clone().unwrap_or(Value::Undefined),
-                );
+                self.set_property(result, "get", getter.clone().unwrap_or(Value::Undefined))?;
+                self.set_property(result, "set", setter.clone().unwrap_or(Value::Undefined))?;
             }
         }
-        object::set(
-            result,
-            &mut self.gc_heap,
-            "enumerable",
-            Value::Boolean(desc.enumerable()),
-        );
-        object::set(
-            result,
-            &mut self.gc_heap,
-            "configurable",
-            Value::Boolean(desc.configurable()),
-        );
+        self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
+        self.set_property(result, "configurable", Value::Boolean(desc.configurable()))?;
         Ok(result)
     }
 

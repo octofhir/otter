@@ -545,8 +545,18 @@ impl Interpreter {
                                 name: method_name,
                                 reason: e.to_string(),
                             })?;
-                        crate::object::set(obj, &mut interp.gc_heap, "value", v);
-                        crate::object::set(obj, &mut interp.gc_heap, "done", Value::Boolean(done));
+                        interp.set_property(obj, "value", v).map_err(|e| {
+                            NativeError::TypeError {
+                                name: method_name,
+                                reason: e.to_string(),
+                            }
+                        })?;
+                        interp
+                            .set_property(obj, "done", Value::Boolean(done))
+                            .map_err(|e| NativeError::TypeError {
+                                name: method_name,
+                                reason: e.to_string(),
+                            })?;
                         Ok(Value::Object(obj))
                     }
                     "return" => {
@@ -560,8 +570,18 @@ impl Interpreter {
                                 name: method_name,
                                 reason: e.to_string(),
                             })?;
-                        crate::object::set(obj, &mut interp.gc_heap, "value", arg);
-                        crate::object::set(obj, &mut interp.gc_heap, "done", Value::Boolean(true));
+                        interp.set_property(obj, "value", arg).map_err(|e| {
+                            NativeError::TypeError {
+                                name: method_name,
+                                reason: e.to_string(),
+                            }
+                        })?;
+                        interp
+                            .set_property(obj, "done", Value::Boolean(true))
+                            .map_err(|e| NativeError::TypeError {
+                                name: method_name,
+                                reason: e.to_string(),
+                            })?;
                         Ok(Value::Object(obj))
                     }
                     _ => Err(NativeError::Thrown {
@@ -726,8 +746,8 @@ impl Interpreter {
                 let (v, done) = self.iterator_next_full(context, iter_rc)?;
                 let obj =
                     self.alloc_stack_rooted_object_with_extra_roots(stack, &[&iter_value, &v])?;
-                crate::object::set(obj, &mut self.gc_heap, "value", v);
-                crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(done));
+                self.set_property(obj, "value", v)?;
+                self.set_property(obj, "done", Value::Boolean(done))?;
                 Value::Object(obj)
             }
             // §27.1.3 / §27.1.4 — `return` / `throw` on plain
@@ -739,8 +759,8 @@ impl Interpreter {
                 let arg = args.first().cloned().unwrap_or(Value::Undefined);
                 let obj =
                     self.alloc_stack_rooted_object_with_extra_roots(stack, &[&iter_value, &arg])?;
-                crate::object::set(obj, &mut self.gc_heap, "value", arg);
-                crate::object::set(obj, &mut self.gc_heap, "done", Value::Boolean(true));
+                self.set_property(obj, "value", arg)?;
+                self.set_property(obj, "done", Value::Boolean(true))?;
                 Value::Object(obj)
             }
             "throw" => {

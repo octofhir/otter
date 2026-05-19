@@ -1083,6 +1083,7 @@ impl Value {
             Value::BoundFunction(b) => Some(b.raw()),
             Value::NativeFunction(n) => Some(n.raw()),
             Value::RegExp(r) => Some(r.raw()),
+            Value::ClassConstructor(c) => Some(c.raw()),
             // Phase-1 stub for the rest. Subsequent migrations
             // (78+) add variant arms here as their handle types
             // move to `Gc<…>`.
@@ -1170,6 +1171,11 @@ impl Value {
             }
             Value::RegExp(regexp) => {
                 regexp.trace_value_slots(visitor);
+            }
+            Value::ClassConstructor(class_constructor) => {
+                let p = &class_constructor.inner as *const otter_gc::Gc<ClassConstructorBody>
+                    as *mut RawGc;
+                visitor(p);
             }
             Value::Proxy(proxy) => {
                 proxy.trace_value_slots(visitor);
@@ -1505,6 +1511,10 @@ pub struct Interpreter {
     /// layer delegates `gc_heap` / `heap_stats` /
     /// `heap_snapshot` / `force_gc` accessors here.
     gc_heap: otter_gc::GcHeap,
+    /// Interpreter-owned hidden-class side tables for GC-managed shapes.
+    /// Runtime object storage uses the root, interned shape keys, and
+    /// transition/cache tables here.
+    shape_runtime: object::ShapeRuntime,
     max_stack_depth: u32,
     /// Per-interpreter microtask queue. Plain field — accessed
     /// only through `&mut self`. The dispatch loop threads
@@ -1660,6 +1670,15 @@ impl std::fmt::Debug for Interpreter {
     }
 }
 
+impl Drop for Interpreter {
+    fn drop(&mut self) {
+        // Shape side tables store raw compressed GC handles outside the heap.
+        // Clear them before `gc_heap` drops so stale offsets cannot outlive the
+        // collector they came from.
+        self.shape_runtime.clear();
+    }
+}
+
 /// Compile-time options for dynamic source text.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EvalCompileOptions {
@@ -1778,10 +1797,14 @@ impl Interpreter {
                 global_this,
             );
         }
+        let shape_runtime = object::ShapeRuntime::new(&mut gc_heap)
+            .expect("shape root fits within any positive cap");
+        startup_timer.mark("vm_shape_runtime");
         Self {
             interrupt: InterruptFlag::new(),
             string_heap,
             gc_heap,
+            shape_runtime,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
@@ -2670,6 +2693,269 @@ impl Interpreter {
         self.function_user_props.values()
     }
 
+    /// Borrow the GC-managed shape side tables for root tracing.
+    #[must_use]
+    pub(crate) fn shape_runtime_for_trace(&self) -> &object::ShapeRuntime {
+        &self.shape_runtime
+    }
+
+    /// Borrow store-property ICs for root tracing of cached GC shape handles.
+    pub(crate) fn store_property_ics_for_trace(
+        &self,
+    ) -> &[property_ic::PropertyIcEntry<property_ic::StorePropertyIc>] {
+        &self.store_property_ics
+    }
+
+    /// Empty GC-managed hidden-class root.
+    #[must_use]
+    pub(crate) fn shape_root(&self) -> object::ShapeHandle {
+        self.shape_runtime.root()
+    }
+
+    /// Return the GC-managed child shape for appending `key` to `parent`.
+    #[cfg(test)]
+    pub(crate) fn shape_child(
+        &mut self,
+        parent: object::ShapeHandle,
+        key: &str,
+    ) -> Result<object::ShapeHandle, VmError> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        self.shape_runtime
+            .child_with_roots(&mut self.gc_heap, parent, key, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
+    fn shape_child_rooting_object_value(
+        &mut self,
+        parent: object::ShapeHandle,
+        key: &str,
+        obj: &mut object::JsObject,
+        value: &Value,
+    ) -> Result<object::ShapeHandle, VmError> {
+        let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        self.shape_child_rooting_object_value_with_extra_roots(
+            parent,
+            key,
+            obj,
+            value,
+            &mut no_extra_roots,
+        )
+    }
+
+    fn shape_child_rooting_object_value_with_extra_roots(
+        &mut self,
+        parent: object::ShapeHandle,
+        key: &str,
+        obj: &mut object::JsObject,
+        value: &Value,
+        extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<object::ShapeHandle, VmError> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            extra_visit(visitor);
+            for &slot in &roots {
+                visitor(slot);
+            }
+            let p = obj as *mut object::JsObject as *mut RawGc;
+            visitor(p);
+            value.trace_value_slots(visitor);
+        };
+        self.shape_runtime
+            .child_with_roots(&mut self.gc_heap, parent, key, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
+    fn shape_child_rooting_object_descriptor(
+        &mut self,
+        parent: object::ShapeHandle,
+        key: &str,
+        obj: &mut object::JsObject,
+        descriptor: &object::PropertyDescriptor,
+    ) -> Result<object::ShapeHandle, VmError> {
+        let roots = self.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            let p = obj as *mut object::JsObject as *mut RawGc;
+            visitor(p);
+            match &descriptor.kind {
+                object::DescriptorKind::Data { value } => value.trace_value_slots(visitor),
+                object::DescriptorKind::Accessor { getter, setter } => {
+                    if let Some(getter) = getter {
+                        getter.trace_value_slots(visitor);
+                    }
+                    if let Some(setter) = setter {
+                        setter.trace_value_slots(visitor);
+                    }
+                }
+            }
+        };
+        self.shape_runtime
+            .child_with_roots(&mut self.gc_heap, parent, key, &mut external_visit)
+            .map_err(VmError::from)
+    }
+
+    fn should_add_property(&mut self, obj: object::JsObject, key: &str) -> bool {
+        let shape = object::shape(obj, &self.gc_heap);
+        !shape.is_null()
+            && object::is_extensible(obj, &self.gc_heap)
+            && matches!(
+                object::lookup_own(obj, &self.gc_heap, key),
+                object::PropertyLookup::Absent
+            )
+            && self.shape_offset_of(shape, key).is_none()
+    }
+
+    /// Descriptor-aware data assignment that advances the object's GC-managed
+    /// hidden class when a new own data property is created.
+    pub(crate) fn ordinary_set_data_property(
+        &mut self,
+        mut obj: object::JsObject,
+        key: &str,
+        value: Value,
+    ) -> Result<bool, VmError> {
+        let shape = object::shape(obj, &self.gc_heap);
+        let should_add_shape = self.should_add_property(obj, key);
+        let next_shape = if should_add_shape {
+            Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &value)?)
+        } else {
+            None
+        };
+
+        let ok = if let Some(next_shape) = next_shape {
+            object::ordinary_set_data_property_with_shape(
+                obj,
+                &mut self.gc_heap,
+                key,
+                value,
+                next_shape,
+            )
+        } else {
+            object::ordinary_set_data_property(obj, &mut self.gc_heap, key, value)
+        };
+        Ok(ok)
+    }
+
+    /// Construction-time data store that advances the object's GC-managed
+    /// hidden class when a new own data property is created.
+    pub(crate) fn set_property(
+        &mut self,
+        mut obj: object::JsObject,
+        key: &str,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let shape = object::shape(obj, &self.gc_heap);
+        let should_add_shape = self.should_add_property(obj, key);
+        let next_shape = if should_add_shape {
+            Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &value)?)
+        } else {
+            None
+        };
+
+        if let Some(next_shape) = next_shape {
+            object::set_with_shape(obj, &mut self.gc_heap, key, value, next_shape);
+        } else {
+            object::set(obj, &mut self.gc_heap, key, value);
+        }
+        Ok(())
+    }
+
+    /// Construction-time data store with caller-supplied roots for native
+    /// binding contexts that hold live values outside VM frames.
+    pub(crate) fn set_property_with_extra_roots(
+        &mut self,
+        mut obj: object::JsObject,
+        key: &str,
+        value: Value,
+        extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<(), VmError> {
+        let shape = object::shape(obj, &self.gc_heap);
+        let should_add_shape = self.should_add_property(obj, key);
+        let next_shape = if should_add_shape {
+            Some(self.shape_child_rooting_object_value_with_extra_roots(
+                shape,
+                key,
+                &mut obj,
+                &value,
+                extra_visit,
+            )?)
+        } else {
+            None
+        };
+
+        if let Some(next_shape) = next_shape {
+            object::set_with_shape(obj, &mut self.gc_heap, key, value, next_shape);
+        } else {
+            object::set(obj, &mut self.gc_heap, key, value);
+        }
+        Ok(())
+    }
+
+    /// Construction-time data store while keeping the active VM frame stack and
+    /// caller-supplied local values alive during any ShapeBody allocation.
+    pub(crate) fn set_property_with_stack_roots(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        obj: object::JsObject,
+        key: &str,
+        value: Value,
+        value_roots: &[&Value],
+    ) -> Result<(), VmError> {
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            for value in value_roots {
+                value.trace_value_slots(visitor);
+            }
+        };
+        self.set_property_with_extra_roots(obj, key, value, &mut external_visit)
+    }
+
+    /// Field-presence-aware defineProperty path that advances the object's
+    /// GC-managed hidden class when a new own property is created.
+    pub(crate) fn define_own_property_partial(
+        &mut self,
+        mut obj: object::JsObject,
+        key: &str,
+        descriptor: object::PartialPropertyDescriptor,
+    ) -> Result<bool, VmError> {
+        let completed = descriptor.complete_for_new_property();
+        let shape = object::shape(obj, &self.gc_heap);
+        let should_add_shape = self.should_add_property(obj, key);
+        let next_shape = if should_add_shape {
+            Some(self.shape_child_rooting_object_descriptor(shape, key, &mut obj, &completed)?)
+        } else {
+            None
+        };
+
+        let ok = if let Some(next_shape) = next_shape {
+            object::define_own_property_partial_with_shape(
+                obj,
+                &mut self.gc_heap,
+                key,
+                descriptor,
+                next_shape,
+            )
+        } else {
+            object::define_own_property_partial(obj, &mut self.gc_heap, key, descriptor)
+        };
+        Ok(ok)
+    }
+
+    /// Look up a property slot in a GC-managed hidden-class shape.
+    #[must_use]
+    pub(crate) fn shape_offset_of(&mut self, shape: object::ShapeHandle, key: &str) -> Option<u32> {
+        self.shape_runtime.offset_of(&self.gc_heap, shape, key)
+    }
+
     /// Borrow the pending-generator-throw side-channel slot.
     /// Used by the GC root walker (task 75); the body of the
     /// trace stays empty until task 76 (when `Value` carries
@@ -3234,7 +3520,10 @@ impl Interpreter {
                         continue;
                     }
                     if let Some(thrown) = self.vm_error_to_throwable_with_stack_roots(stack, &err) {
-                        let uncaught = if matches!(err, VmError::OutOfMemory { .. }) {
+                        let uncaught = if matches!(
+                            err,
+                            VmError::OutOfMemory { .. } | VmError::JsonError { .. }
+                        ) {
                             Some(err.clone())
                         } else {
                             None
@@ -6893,6 +7182,30 @@ mod tests {
             Some(Value::String(message)) if message
                 .to_lossy_string()
                 .contains("type mismatch")
+        ));
+    }
+
+    #[test]
+    fn oom_throwable_uses_range_error_prototype() {
+        let module = module_with(Vec::new(), 1);
+        let mut interp = Interpreter::new();
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        stack.push(Frame::for_function(&module.functions[0]));
+
+        let Some(Value::Object(error)) = interp.vm_error_to_throwable_with_stack_roots(
+            &stack,
+            &VmError::OutOfMemory {
+                requested_bytes: 160,
+                heap_limit_bytes: 2 * 1024 * 1024,
+            },
+        ) else {
+            panic!("OutOfMemory should convert to a throwable object");
+        };
+
+        assert!(object::has_in_proto_chain(
+            error,
+            interp.gc_heap(),
+            interp.error_classes.prototype(ErrorKind::RangeError)
         ));
     }
 

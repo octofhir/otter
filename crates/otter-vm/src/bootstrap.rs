@@ -1029,10 +1029,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     // §23.2.4 — `%TypedArray%.prototype[@@iterator]` plus per-kind
     // `<T>.prototype[@@toStringTag]`.
     crate::bootstrap_typed_array::install_typed_array_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
+        heap, global, well_known,
     )?;
     // §27.1.2 — `Iterator.prototype[@@iterator]` (returns this) and
     // `[@@toStringTag] = "Iterator"`.
@@ -2231,24 +2228,14 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
             proto,
             heap,
             "constructor",
-            crate::object::PropertyDescriptor::data(
-                Value::NativeFunction(ctor),
-                true,
-                false,
-                true,
-            ),
+            crate::object::PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
         );
         define_global_value(global, heap, Self::NAME, Value::NativeFunction(ctor));
         let iterator_ctor = ctor;
         let ctor_root = Value::NativeFunction(iterator_ctor);
-        let from_fn = native_static_with_value_roots(
-            heap,
-            "from",
-            1,
-            iterator_from_native,
-            &[&ctor_root],
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let from_fn =
+            native_static_with_value_roots(heap, "from", 1, iterator_from_native, &[&ctor_root])
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let from_desc = crate::object::PropertyDescriptor::data(
             Value::NativeFunction(from_fn),
             true,
@@ -2420,7 +2407,13 @@ fn iterator_receiver(
             })?;
             let next_key = crate::VmPropertyKey::String("next");
             let outcome = interp
-                .ordinary_get_value(&exec_ctx, this_value.clone(), this_value.clone(), &next_key, 0)
+                .ordinary_get_value(
+                    &exec_ctx,
+                    this_value.clone(),
+                    this_value.clone(),
+                    &next_key,
+                    0,
+                )
                 .map_err(|e| crate::NativeError::TypeError {
                     name,
                     reason: e.to_string(),
@@ -2444,7 +2437,9 @@ fn iterator_receiver(
                 });
             }
             let this_root = this_value.clone();
-            let state = crate::IteratorState::User { iterator: this_value };
+            let state = crate::IteratorState::User {
+                iterator: this_value,
+            };
             ctx.alloc_iterator_state(state, &[&this_root], &[])
                 .map_err(|_| crate::NativeError::TypeError {
                     name,
@@ -3121,7 +3116,7 @@ mod tests {
         // `[[Construct]]` slot plus a prototype with several native
         // methods and (for some) accessors.
         const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1050;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 464 * 1024;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 468 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

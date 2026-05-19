@@ -99,7 +99,13 @@ impl<'a> RuntimeState<'a> {
         for obj in interp.function_user_props_for_trace() {
             obj.trace_gc_roots(visitor);
         }
-        // 7) Pending throw side-channels. Phase 1 holds them as
+        // 7) GC-managed hidden-class root/key/transition side tables.
+        interp.shape_runtime_for_trace().trace_roots(visitor);
+        // 7b) Store-property ICs can retain cached GC shape transitions.
+        for ic in interp.store_property_ics_for_trace() {
+            ic.trace_roots(visitor);
+        }
+        // 8) Pending throw side-channels. Phase 1 holds them as
         //    `Value` (Rc-shared); the trace body in
         //    `Value::trace_gc_roots` lands with task 76 alongside
         //    the first real `Gc<…>`-bearing variant.
@@ -109,7 +115,7 @@ impl<'a> RuntimeState<'a> {
         if interp.pending_uncaught_throw_for_trace().is_some() {
             // No-op stub.
         }
-        // 8) Active call frames are NOT enumerated here. The
+        // 9) Active call frames are NOT enumerated here. The
         //    frame stack lives on the call stack of
         //    `Interpreter::run_inner` (`SmallVec<[Frame; 8]>`),
         //    not on the [`Interpreter`] struct itself, so an

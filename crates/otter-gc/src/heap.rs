@@ -4,7 +4,7 @@
 //! # Contents
 //!
 //! - [`GcHeap`] — the orchestrator the rest of the runtime sees.
-//! - [`Roots`] — caller-supplied root sources for full GC.
+//! - [`RootSlotVisitor`] — caller-supplied root source closure for full GC.
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
 //! - Ephemeron registry and split mark/sweep hooks used by weak
 //!   collections in the VM.
@@ -45,7 +45,7 @@ use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
 use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, align_up};
-use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, Page, page_base_from_offset};
+use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, page_base_from_offset};
 use crate::scavenger::ScavengeStats;
 use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
 use crate::stats::{GcStats, TYPE_TAG_COUNT};
@@ -59,27 +59,10 @@ use crate::trace::{TraceTable, Traceable};
 /// `type_complexity` lint quiet.
 pub type RootSlotVisitor<'a> = dyn FnMut(&mut dyn FnMut(*mut RawGc)) + 'a;
 
-/// Caller-supplied root source for full GC.
-///
-/// Wraps a slot-visit closure; the visitor argument it hands the
-/// GC receives `*mut RawGc` slot pointers — the scavenger may
-/// rewrite each in place when an object moves.
-pub struct Roots<'a> {
-    #[allow(dead_code)]
-    pub(crate) slot_visit: &'a mut RootSlotVisitor<'a>,
-}
-
-impl<'a> Roots<'a> {
-    /// Build a Roots from a slot-visit closure.
-    pub fn new(slot_visit: &'a mut RootSlotVisitor<'a>) -> Self {
-        Self { slot_visit }
-    }
-
-    /// Empty root set — every reachable object must come from a
-    /// handle scope or a global handle.
-    pub fn empty() -> EmptyRoots {
-        EmptyRoots
-    }
+/// Empty root set — every reachable object must come from a
+/// handle scope or a global handle.
+pub fn empty() -> EmptyRoots {
+    EmptyRoots
 }
 
 /// Trivial empty-roots implementation; useful in tests where all
@@ -1415,9 +1398,3 @@ impl std::fmt::Debug for GcHeap {
 
 // Drop: pages are owned by the spaces; their Drop returns them
 // to the cage automatically.
-
-// Re-export the page-base helper.
-#[allow(dead_code)]
-fn _page_base_check(p: &Page) -> *mut u8 {
-    p.base_ptr()
-}

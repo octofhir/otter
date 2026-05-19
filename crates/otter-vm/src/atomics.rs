@@ -689,9 +689,10 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
         let result = ctx
             .alloc_object_with_roots(&[&label_value, &promise_value], &[args])
             .map_err(|e| type_err(method_name, format!("object allocation failed: {e}")))?;
-        let heap = ctx.heap_mut();
-        crate::object::set(result, heap, "async", Value::Boolean(false));
-        crate::object::set(result, heap, "value", promise_value);
+        ctx.set_property(result, "async", Value::Boolean(false))
+            .map_err(|e| type_err(method_name, e.to_string()))?;
+        ctx.set_property(result, "value", promise_value)
+            .map_err(|e| type_err(method_name, e.to_string()))?;
         Ok(Value::Object(result))
     } else {
         Ok(Value::String(label_str))

@@ -13,7 +13,6 @@ use otter_gc::trace::{SlotVisitor, Traceable};
 use otter_gc::{GcHeap, cage_size};
 
 struct Bytes32 {
-    #[allow(dead_code)]
     data: [u8; 32],
 }
 
@@ -39,6 +38,7 @@ fn alloc_offsets_round_trip_inside_cage() {
             })
             .expect("alloc");
         let off = g.offset();
+        assert_eq!(heap.read_payload(g, |bytes| bytes.data[0]), i as u8);
         let cage_lo = cage_base_addr();
         let cage_hi = cage_lo + cage_size();
         let addr = g.as_header_ptr() as usize;

@@ -14,7 +14,7 @@
 
 use super::BigIntValue;
 use crate::{Value, VmError};
-use num_bigint::{BigInt, Sign};
+use num_bigint::BigInt;
 use num_traits::Signed;
 
 /// Dispatch `BigInt(...)` ([`BigIntMethod::Construct`]) /
@@ -171,8 +171,3 @@ fn as_uint_n(bits: u32, value: &BigInt) -> BigInt {
     }
     wrapped
 }
-
-// Avoid unused-import warning when num_bigint::Sign isn't directly
-// referenced — it is used implicitly through `BigInt`'s arithmetic.
-#[allow(dead_code)]
-const _: Sign = Sign::NoSign;

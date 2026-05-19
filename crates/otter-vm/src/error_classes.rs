@@ -41,12 +41,13 @@
 //! - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 
 use crate::Value;
-use crate::gc_trace::{GcRootVisitor, GcTrace};
+use crate::gc_trace::GcRootVisitor;
 use crate::native_function::NativeFunction;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::string::{JsString, StringError, StringHeap};
 use crate::{NativeCtx, NativeError};
+use otter_gc::raw::RawGc;
 
 /// One of the seven canonical native error classes.
 ///
@@ -158,6 +159,13 @@ struct ClassEntry {
     /// `prototype` own property so `Op::Instanceof` can resolve
     /// `instance instanceof Class`.
     constructor: JsObject,
+}
+
+impl ClassEntry {
+    fn trace_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        visitor(std::ptr::addr_of!(self.prototype) as *mut RawGc);
+        visitor(std::ptr::addr_of!(self.constructor) as *mut RawGc);
+    }
 }
 
 fn oom() -> StringError {
@@ -301,8 +309,7 @@ impl ErrorClassRegistry {
             &self.eval_error,
             &self.aggregate_error,
         ] {
-            entry.prototype.trace_gc_roots(visitor);
-            entry.constructor.trace_gc_roots(visitor);
+            entry.trace_roots(visitor);
         }
     }
 
@@ -906,7 +913,11 @@ impl ErrorClassRegistry {
         if let Some(text) = message {
             let heap = ctx.interp_mut().string_heap_clone();
             let s = JsString::from_str(text, &heap)?;
-            crate::object::set(obj, ctx.heap_mut(), "message", Value::String(s));
+            ctx.set_property_with_roots(obj, "message", Value::String(s), value_roots, slice_roots)
+                .map_err(|_| StringError::OutOfMemory {
+                    requested_bytes: 0,
+                    heap_limit_bytes: ctx.heap().max_heap_bytes(),
+                })?;
         }
         Ok(obj)
     }
@@ -950,7 +961,11 @@ impl ErrorClassRegistry {
                 requested_bytes: 0,
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;
-        crate::object::set(obj, ctx.heap_mut(), "errors", Value::Array(arr));
+        ctx.set_property(obj, "errors", Value::Array(arr))
+            .map_err(|_| StringError::OutOfMemory {
+                requested_bytes: 0,
+                heap_limit_bytes: ctx.heap().max_heap_bytes(),
+            })?;
         Ok(obj)
     }
 }

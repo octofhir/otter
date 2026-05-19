@@ -2208,6 +2208,15 @@ impl Interpreter {
                     {
                         return Ok(true);
                     }
+                    // §22.1.4 — Array exotic objects expose
+                    // user-installed extra string-keyed properties
+                    // through the named-properties side table.
+                    // `HasProperty` must consult it before walking
+                    // the prototype chain so e.g. `'value' in
+                    // arr_with_value_named_prop` returns true.
+                    if array::get_named_property(arr, &self.gc_heap, k).is_some() {
+                        return Ok(true);
+                    }
                     // Walk Array.prototype chain.
                     let proto = self.constructor_prototype_value("Array")?;
                     if matches!(proto, Value::Null) {

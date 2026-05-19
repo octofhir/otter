@@ -992,9 +992,25 @@ impl Interpreter {
                 None
             }
             other => {
-                return Err(VmError::TypeError {
-                    message: format!("Cannot set property '{name}' on {}", value_kind_name(other)),
-                });
+                // §10.1.9.2 OrdinarySetWithOwnDescriptor — for
+                // exotic receivers without their own [[Set]] (Map,
+                // Set, WeakMap, WeakSet, WeakRef,
+                // FinalizationRegistry, ArrayBuffer,
+                // SharedArrayBuffer, DataView, Iterator, Generator,
+                // Proxy already handled higher up), the spec
+                // delegates to the prototype's [[Set]]. The
+                // prototype is the realm's `<Kind>.prototype`
+                // (ordinary object) and the write would create an
+                // own data property on the receiver — but the
+                // receiver carries no expando slot here. Mirror
+                // [[Set]]'s observable contract: silently ignore
+                // in non-strict mode and surface TypeError in
+                // strict mode.
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot set property '{name}' on {}", value_kind_name(other)),
+                )?;
+                None
             }
         };
         if let Some(target) = target {

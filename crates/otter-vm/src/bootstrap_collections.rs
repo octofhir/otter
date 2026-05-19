@@ -154,6 +154,27 @@ pub fn install_collection_well_knowns_post_bootstrap(
                 },
             );
         }
+        // §24.2.3.6 — `Set.prototype.keys` is the same function
+        // object as `Set.prototype.values`. The individual `method`
+        // builder allocates a fresh NativeFunction per name; overwrite
+        // `keys` to point at the same value so `Set.prototype.keys
+        // === Set.prototype.values`.
+        if matches!(alias_kind, Some(CollectionKind::Set))
+            && let Some(values_value) = object::get(prototype, heap, "values")
+        {
+            object::define_own_property_partial(
+                prototype,
+                heap,
+                "keys",
+                PartialPropertyDescriptor {
+                    value: Some(values_value),
+                    writable: Some(true),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
     }
     Ok(())
 }

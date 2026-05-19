@@ -1197,6 +1197,11 @@ impl Interpreter {
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
 
+        // §23.1.3.* — the iteration helpers that accept a `thisArg`
+        // second positional pass it through `OrdinaryCallBindThis`.
+        // `reduce` / `reduceRight` / `sort` do NOT take a `thisArg`
+        // and keep the default undefined receiver.
+        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
         let result = match name {
             "forEach" => {
                 let callee = require_callable(args.first())?;
@@ -1205,7 +1210,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                 }
                 Value::Undefined
             }
@@ -1223,7 +1228,7 @@ impl Interpreter {
                     out.push(self.run_callable_sync(
                         context,
                         &callee,
-                        Value::Undefined,
+                        this_arg.clone(),
                         cb_args,
                     )?);
                 }
@@ -1244,7 +1249,7 @@ impl Interpreter {
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let kept =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                     if kept.to_boolean() {
                         out.push(crate::array::get(*arr, &self.gc_heap, i));
                     }
@@ -1329,7 +1334,7 @@ impl Interpreter {
                     };
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
                     let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                     if hit.to_boolean() {
                         found = elem;
                         break;
@@ -1349,7 +1354,7 @@ impl Interpreter {
                     };
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
                     let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                     if hit.to_boolean() {
                         idx = i as i32;
                         break;
@@ -1367,7 +1372,7 @@ impl Interpreter {
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                     if !hit.to_boolean() {
                         all = false;
                         break;
@@ -1385,7 +1390,7 @@ impl Interpreter {
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let hit =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                     if hit.to_boolean() {
                         any = true;
                         break;
@@ -1405,7 +1410,7 @@ impl Interpreter {
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let mapped =
-                        self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                     match mapped {
                         Value::Array(inner) => {
                             crate::array::with_elements(inner, &self.gc_heap, |elements| {

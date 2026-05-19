@@ -64,37 +64,37 @@ fn to_bigint(value: &Value) -> Result<BigIntValue, VmError> {
         Value::BigInt(b) => Ok(b.clone()),
         Value::Boolean(true) => Ok(BigIntValue::from_i32(1)),
         Value::Boolean(false) => Ok(BigIntValue::from_i32(0)),
+        // §21.2.1.1 step 3.a — `Number → NumberToBigInt`. The spec
+        // throws **RangeError** on non-integer / non-finite values
+        // and otherwise produces the matching integer.
         Value::Number(n) => {
             let f = n.as_f64();
-            // §7.1.13 step 5 — non-finite or non-integer floats
-            // raise RangeError; surfaced as TypeMismatch here and
-            // upgraded by the dispatcher's throwable-conversion
-            // path.
             if !f.is_finite() || f.fract() != 0.0 {
-                return Err(VmError::TypeMismatch);
+                return Err(VmError::RangeError {
+                    message: "The number is not a safe integer for BigInt".to_string(),
+                });
             }
             Ok(BigIntValue::from_inner(BigInt::from(f as i128)))
         }
         Value::String(s) => string_to_bigint(&s.to_lossy_string()),
+        // §7.1.13 step 7 — Symbol → TypeError.
+        Value::Symbol(_) => Err(VmError::TypeError {
+            message: "Cannot convert a Symbol value to a BigInt".to_string(),
+        }),
         // §7.1.13 step 4 — ToPrimitive(value, "number") then
-        // recursive ToBigInt. For Array we use the spec
-        // `Array.prototype.toString` result (= `join(",")`), which
-        // matches `display_string()` for arrays only when they are
-        // empty or single-element. For multi-element arrays the
-        // foundation result is the comma-joined form, which is then
-        // routed through `string_to_bigint`. Plain `Value::Object`
-        // without an inherited toString rejects (matches spec
-        // `OrdinaryToPrimitive` + `toString` not callable →
-        // TypeError, surfaced here as TypeMismatch).
-        // §7.1.13 step 4 — `Array.prototype.toString` = `join(",")`.
-        // We can't reach the GC heap from this free dispatcher, so
-        // the foundation handles only the value-less cases here.
-        // ToPrimitive on a non-empty Array falls back to the
-        // catch-all `TypeMismatch` until a heap-aware path lands.
-        Value::Array(_) => Err(VmError::TypeMismatch),
-        // null / undefined / objects without a usable toString raise
-        // TypeError per spec.
-        _ => Err(VmError::TypeMismatch),
+        // recursive ToBigInt. The caller (`bigint_ctor_call`) has
+        // already run `coerce_bigint_call_args` so we should see a
+        // primitive here. A remaining Object reaches the wildcard
+        // and surfaces as TypeError.
+        Value::Array(_) => Err(VmError::TypeError {
+            message: "Cannot convert Array to a BigInt".to_string(),
+        }),
+        Value::Null | Value::Undefined => Err(VmError::TypeError {
+            message: "Cannot convert null or undefined to a BigInt".to_string(),
+        }),
+        _ => Err(VmError::TypeError {
+            message: "Cannot convert value to a BigInt".to_string(),
+        }),
     }
 }
 
@@ -102,13 +102,16 @@ fn string_to_bigint(text: &str) -> Result<BigIntValue, VmError> {
     let trimmed = text.trim();
     // §7.1.14.1 StringToBigInt — empty string is 0n, accept decimal
     // / `0x` / `0o` / `0b` prefixes with optional leading sign on
-    // the decimal form.
+    // the decimal form. Otherwise spec §21.2.1.1 step 3.b raises
+    // **SyntaxError** (mapped through `vm_to_native`).
     if trimmed.is_empty() {
         return Ok(BigIntValue::from_i32(0));
     }
     BigIntValue::from_decimal(trimmed)
         .or_else(|| parse_radix_literal(trimmed))
-        .ok_or(VmError::TypeMismatch)
+        .ok_or_else(|| VmError::SyntaxError {
+            message: format!("Cannot convert {trimmed:?} to a BigInt"),
+        })
 }
 
 fn parse_radix_literal(input: &str) -> Option<BigIntValue> {

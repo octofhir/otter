@@ -619,7 +619,31 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         let description = match args.first() {
             None | Some(Value::Undefined) => None,
             Some(other) => {
-                let coerced = symbol_to_string_arg(ctx, other, "Symbol")?;
+                let context = ctx
+                    .execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "Symbol",
+                        reason: "missing execution context".to_string(),
+                    })?;
+                let coerced = ctx
+                    .cx
+                    .interp
+                    .coerce_to_string(&context, other)
+                    .map_err(|e| match e {
+                        crate::VmError::TypeError { message } => NativeError::TypeError {
+                            name: "Symbol",
+                            reason: message,
+                        },
+                        crate::VmError::Uncaught { value } => NativeError::Thrown {
+                            name: "Symbol",
+                            message: value,
+                        },
+                        other => NativeError::TypeError {
+                            name: "Symbol",
+                            reason: other.to_string(),
+                        },
+                    })?;
                 let string_heap = ctx.interp_mut().string_heap_clone();
                 let rendered = crate::string::JsString::from_str(&coerced, &string_heap)
                     .map_err(|_| NativeError::TypeError {
@@ -632,66 +656,35 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         Ok(Value::Symbol(crate::symbol::JsSymbol::new(description)))
     }
 
-    /// §7.1.17 ToString applied to a `Symbol(description)` /
-    /// `Symbol.for(key)` argument. Symbol operands throw TypeError;
-    /// object operands flow through `evaluate_to_primitive` so user
-    /// `toString` / `valueOf` / `@@toPrimitive` overrides fire.
-    fn symbol_to_string_arg(
-        ctx: &mut NativeCtx<'_>,
-        value: &Value,
-        ctor_name: &'static str,
-    ) -> Result<String, NativeError> {
-        match value {
-            Value::Undefined => Ok("undefined".to_string()),
-            Value::Null => Ok("null".to_string()),
-            Value::String(s) => Ok(s.to_lossy_string()),
-            Value::Symbol(_) => Err(NativeError::TypeError {
-                name: ctor_name,
-                reason: "Cannot convert a Symbol value to a string".to_string(),
-            }),
-            Value::Boolean(_) | Value::Number(_) | Value::BigInt(_) => Ok(value.display_string()),
-            _ => {
+    fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let key = match args.first() {
+            None | Some(Value::Undefined) => "undefined".to_string(),
+            Some(other) => {
                 let context = ctx
                     .execution_context()
                     .cloned()
                     .ok_or_else(|| NativeError::TypeError {
-                        name: ctor_name,
+                        name: "Symbol.for",
                         reason: "missing execution context".to_string(),
                     })?;
-                let primitive = ctx
-                    .cx
+                ctx.cx
                     .interp
-                    .evaluate_to_primitive(
-                        &context,
-                        value,
-                        crate::abstract_ops::ToPrimitiveHint::String,
-                    )
+                    .coerce_to_string(&context, other)
                     .map_err(|e| match e {
+                        crate::VmError::TypeError { message } => NativeError::TypeError {
+                            name: "Symbol.for",
+                            reason: message,
+                        },
                         crate::VmError::Uncaught { value } => NativeError::Thrown {
-                            name: ctor_name,
+                            name: "Symbol.for",
                             message: value,
                         },
                         other => NativeError::TypeError {
-                            name: ctor_name,
+                            name: "Symbol.for",
                             reason: other.to_string(),
                         },
-                    })?;
-                match primitive {
-                    Value::Symbol(_) => Err(NativeError::TypeError {
-                        name: ctor_name,
-                        reason: "Cannot convert a Symbol value to a string".to_string(),
-                    }),
-                    Value::String(s) => Ok(s.to_lossy_string()),
-                    other => Ok(other.display_string()),
-                }
+                    })?
             }
-        }
-    }
-
-    fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let key = match args.first() {
-            None | Some(Value::Undefined) => "undefined".to_string(),
-            Some(other) => symbol_to_string_arg(ctx, &other.clone(), "Symbol.for")?,
         };
         let string_heap = ctx.interp_mut().string_heap_clone();
         let sym = ctx
@@ -1344,83 +1337,35 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         let value = if args.is_empty() {
             crate::number::NumberValue::from_i32(0)
         } else {
-            // §21.1.1.1 step 5 — `Number(bigint)` does NOT throw; it
-            // converts to the nearest f64 representation. Generic
-            // §7.1.4 ToNumber on BigInt throws TypeError (see
-            // `language/expressions/unary-plus/bigint-throws.js`),
-            // so the constructor diverges here from `Op::ToNumber`.
-            // <https://tc39.es/ecma262/#sec-number-constructor-number-value>
-            if let Value::Symbol(_) = &args[0] {
-                // §7.1.4 ToNumber step 2 — Symbol → TypeError.
-                return Err(NativeError::TypeError {
+            // §21.1.1.1 — the `Number(value)` constructor diverges
+            // from §7.1.4 ToNumber on BigInt (converts to f64 instead
+            // of throwing). Delegate to the dedicated helper so the
+            // ToPrimitive ladder, the Symbol guard, and the BigInt
+            // path live in one place.
+            let context = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| NativeError::TypeError {
                     name: "Number",
-                    reason: "Cannot convert a Symbol value to a number".to_string(),
-                });
-            } else if let Value::BigInt(b) = &args[0] {
-                let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
-                crate::number::NumberValue::from_f64(f)
-            } else if matches!(
-                &args[0],
-                Value::Object(_)
-                    | Value::Proxy(_)
-                    | Value::Array(_)
-                    | Value::Map(_)
-                    | Value::Set(_)
-                    | Value::WeakMap(_)
-                    | Value::WeakSet(_)
-                    | Value::Promise(_)
-                    | Value::RegExp(_)
-                    | Value::ArrayBuffer(_)
-                    | Value::DataView(_)
-                    | Value::TypedArray(_)
-                    | Value::Function { .. }
-                    | Value::Closure { .. }
-                    | Value::BoundFunction(_)
-                    | Value::NativeFunction(_)
-                    | Value::ClassConstructor(_)
-            ) {
-                // §7.1.4 ToNumber step 4 — non-primitive input goes
-                // through `ToPrimitive(input, "number")` first, then
-                // recursive ToNumber on the result. `evaluate_to_primitive`
-                // handles user `valueOf` / `toString` / `@@toPrimitive`
-                // overrides and wrapper unwrapping.
-                let context = ctx
-                    .execution_context()
-                    .cloned()
-                    .ok_or_else(|| NativeError::TypeError {
+                    reason: "missing execution context".to_string(),
+                })?;
+            ctx.cx
+                .interp
+                .number_for_number_ctor(&context, &args[0])
+                .map_err(|e| match e {
+                    crate::VmError::TypeError { message } => NativeError::TypeError {
                         name: "Number",
-                        reason: "missing execution context".to_string(),
-                    })?;
-                let primitive = ctx
-                    .cx
-                    .interp
-                    .evaluate_to_primitive(
-                        &context,
-                        &args[0],
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    )
-                    .map_err(|e| NativeError::TypeError {
+                        reason: message,
+                    },
+                    crate::VmError::Uncaught { value } => NativeError::Thrown {
                         name: "Number",
-                        reason: e.to_string(),
-                    })?;
-                if let Value::Symbol(_) = &primitive {
-                    return Err(NativeError::TypeError {
+                        message: value,
+                    },
+                    other => NativeError::TypeError {
                         name: "Number",
-                        reason: "Cannot convert a Symbol value to a number".to_string(),
-                    });
-                } else if let Value::BigInt(b) = &primitive {
-                    let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
-                    crate::number::NumberValue::from_f64(f)
-                } else {
-                    crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(
-                        &primitive,
-                    ))
-                }
-            } else {
-                crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(
-                    &args[0],
-                ))
-            }
+                        reason: other.to_string(),
+                    },
+                })?
         };
         if ctx.is_construct_call() {
             let this = ctx.this_value().clone();

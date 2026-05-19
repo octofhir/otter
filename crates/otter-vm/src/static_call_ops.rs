@@ -191,7 +191,8 @@ impl Interpreter {
     /// "string")` so user-defined `@@toPrimitive` / `valueOf` /
     /// `toString` overrides fire per §7.1.1. The remaining args (none
     /// today; `Symbol.keyFor` takes a Symbol that must not be coerced)
-    /// pass through untouched.
+    /// pass through untouched. Delegates to the shared
+    /// `Interpreter::coerce_to_primitive` ladder.
     fn symbol_coerce_first_arg(
         &mut self,
         context: &ExecutionContext,
@@ -200,14 +201,7 @@ impl Interpreter {
         let Some(first) = args.first_mut() else {
             return Ok(args);
         };
-        if abstract_ops::is_primitive(first) {
-            return Ok(args);
-        }
-        let coerced = self.evaluate_to_primitive(
-            context,
-            first,
-            abstract_ops::ToPrimitiveHint::String,
-        )?;
+        let coerced = self.coerce_to_primitive(context, first, abstract_ops::ToPrimitiveHint::String)?;
         *first = coerced;
         Ok(args)
     }

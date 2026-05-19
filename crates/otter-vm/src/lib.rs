@@ -46,6 +46,7 @@ pub mod collections;
 pub mod collections_prototype;
 pub mod console;
 mod constant_ops;
+mod coerce;
 mod conversion;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.

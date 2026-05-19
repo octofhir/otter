@@ -153,6 +153,32 @@ pub(crate) fn array_like_present_entries(
         | Value::NativeFunction(_)
         | Value::BoundFunction(_)
         | Value::ClassConstructor(_) => Some(Vec::new()),
+        // §7.1.18 ToObject for object-shaped exotic values that
+        // expose user properties through a lazy expando bag
+        // (`new RegExp()`, `new Promise()`, etc). Falls back to an
+        // empty walk when the expando is absent so the spec's
+        // `LengthOfArrayLike` returns 0.
+        Value::RegExp(r) => match r.expando(heap) {
+            Some(bag) => array_like_present_entries(&Value::Object(bag), heap),
+            None => Some(Vec::new()),
+        },
+        Value::Promise(p) => match p.expando(heap) {
+            Some(bag) => array_like_present_entries(&Value::Object(bag), heap),
+            None => Some(Vec::new()),
+        },
+        // Map / Set / WeakMap / WeakSet / WeakRef / FinalizationRegistry
+        // are object-coercible but expose no own indexed properties —
+        // the spec walk yields empty.
+        Value::Map(_)
+        | Value::Set(_)
+        | Value::WeakMap(_)
+        | Value::WeakSet(_)
+        | Value::WeakRef(_)
+        | Value::FinalizationRegistry(_)
+        | Value::Generator(_)
+        | Value::Iterator(_)
+        | Value::DataView(_)
+        | Value::ArrayBuffer(_) => Some(Vec::new()),
         // String primitive: walks code-unit slots up to `length`.
         // Each unit materialises as a single-unit `JsString`.
         Value::String(s) => {
@@ -191,6 +217,16 @@ pub(crate) fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> us
         Value::Array(arr) => array::len(*arr, heap),
         Value::Object(obj) => read_array_like_length(*obj, heap),
         Value::String(s) => s.len() as usize,
+        // Exotic object-shaped values may carry a user-installed
+        // `length` via their expando bag. Probe the bag so
+        // `Array.prototype.X.call(new RegExp(), …)` sees the spec's
+        // `LengthOfArrayLike` result.
+        Value::RegExp(r) => r
+            .expando(heap)
+            .map_or(0, |bag| read_array_like_length(bag, heap)),
+        Value::Promise(p) => p
+            .expando(heap)
+            .map_or(0, |bag| read_array_like_length(bag, heap)),
         _ => 0,
     }
 }

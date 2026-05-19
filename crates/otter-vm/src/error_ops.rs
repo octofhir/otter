@@ -75,40 +75,17 @@ impl Interpreter {
     /// §20.5.1.1 step 3 — coerce the `message` argument through full
     /// §7.1.17 `ToString`. Returns `None` when the argument is
     /// `undefined` (the spec skips step 3 in that case, leaving
-    /// `message` inherited from the prototype). Throws `TypeError`
-    /// for `Symbol` per §7.1.17 step 2 and propagates any abrupt
-    /// completion from `@@toPrimitive` / `toString` / `valueOf`.
+    /// `message` inherited from the prototype). Delegates the spec
+    /// ladder to [`Interpreter::coerce_to_string`].
     fn coerce_error_message(
         &mut self,
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<Option<String>, VmError> {
-        match value {
-            Value::Undefined => Ok(None),
-            Value::String(s) => Ok(Some(s.to_lossy_string())),
-            Value::Symbol(_) => Err(VmError::TypeError {
-                message: "Cannot convert a Symbol value to a string".to_string(),
-            }),
-            Value::Null
-            | Value::Boolean(_)
-            | Value::Number(_)
-            | Value::BigInt(_)
-            | Value::Hole => Ok(Some(value.display_string())),
-            _ => {
-                let primitive = self.evaluate_to_primitive(
-                    context,
-                    value,
-                    crate::abstract_ops::ToPrimitiveHint::String,
-                )?;
-                match primitive {
-                    Value::String(s) => Ok(Some(s.to_lossy_string())),
-                    Value::Symbol(_) => Err(VmError::TypeError {
-                        message: "Cannot convert a Symbol value to a string".to_string(),
-                    }),
-                    other => Ok(Some(other.display_string())),
-                }
-            }
+        if matches!(value, Value::Undefined) {
+            return Ok(None);
         }
+        Ok(Some(self.coerce_to_string(context, value)?))
     }
 
     fn make_error_instance_with_stack_roots(

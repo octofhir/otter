@@ -825,6 +825,21 @@ impl Interpreter {
                         // TypeError instead of silently dropping.
                         self.store_computed_ordinary_property(target, &k, v, true)?;
                     }
+                    // §20.1.2.1 step 4.c.ii — `OwnPropertyKeys(O)`
+                    // returns string keys followed by symbol keys.
+                    // Copy enumerable own symbol data slots too.
+                    let sym_entries: Vec<(crate::symbol::JsSymbol, Value)> =
+                        object::with_properties(*o, self.gc_heap(), |p| {
+                            p.enumerable_symbol_data_iter().collect()
+                        });
+                    for (sym, v) in sym_entries {
+                        if !crate::object::set_symbol(target, self.gc_heap_mut(), sym, v) {
+                            return Err(VmError::TypeError {
+                                message: "Object.assign: cannot set symbol property on target"
+                                    .to_string(),
+                            });
+                        }
+                    }
                 }
                 Value::Array(arr) => {
                     // §22.1.3.3 — Array EnumerableOwnPropertyNames:

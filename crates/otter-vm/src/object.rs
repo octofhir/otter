@@ -2164,6 +2164,22 @@ impl<'a> Properties<'a> {
                 .then_some(key.as_str())
         })
     }
+
+    /// Iterate `(symbol, data-value)` pairs over enumerable
+    /// symbol-keyed own data properties in insertion order. Used by
+    /// `Object.assign` (§20.1.2.1 step 4.c.ii) which copies every
+    /// enumerable own string *and* symbol key from the source.
+    pub fn enumerable_symbol_data_iter(&self) -> impl Iterator<Item = (JsSymbol, Value)> + '_ {
+        self.body.symbol_props.iter().filter_map(|(sym, slot)| {
+            if !slot.flags.enumerable() {
+                return None;
+            }
+            match &slot.body {
+                SlotBody::Data { value } => Some((sym.clone(), value.clone())),
+                SlotBody::Accessor { .. } => None,
+            }
+        })
+    }
 }
 
 fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<(String, usize)> {

@@ -4823,9 +4823,11 @@ impl Interpreter {
                     match op {
                         Op::Equal => self.run_equal_regs(frame, dst, lhs, rhs, false)?,
                         Op::NotEqual => self.run_equal_regs(frame, dst, lhs, rhs, true)?,
-                        Op::LooseEqual => self.run_loose_equal_regs(frame, dst, lhs, rhs, false)?,
+                        Op::LooseEqual => {
+                            self.run_loose_equal_regs(context, frame, dst, lhs, rhs, false)?;
+                        }
                         Op::LooseNotEqual => {
-                            self.run_loose_equal_regs(frame, dst, lhs, rhs, true)?;
+                            self.run_loose_equal_regs(context, frame, dst, lhs, rhs, true)?;
                         }
                         Op::SameValue => self.run_same_value_regs(frame, dst, lhs, rhs)?,
                         _ => unreachable!("equality opcode group"),

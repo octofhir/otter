@@ -174,11 +174,19 @@ pub(crate) fn compile_binary(
     // <https://tc39.es/ecma262/#sec-islooselyequal>
     // <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
     let (lhs_in, rhs_in) = match op {
-        Op::Add | Op::LooseEqual | Op::LooseNotEqual => {
+        Op::Add => {
             let l = emit_to_primitive(cx, lhs, "default", span);
             let r = emit_to_primitive(cx, rhs, "default", span);
             (l, r)
         }
+        // §7.2.13 IsLooselyEqual — do NOT pre-coerce object
+        // operands. The spec returns IsStrictlyEqual when both
+        // operands are objects (reference identity), and only
+        // applies ToPrimitive in the object × primitive arm. The
+        // runtime `LooseEqual` dispatch handles that asymmetry
+        // through `evaluate_to_primitive` once it inspects the
+        // operand types.
+        Op::LooseEqual | Op::LooseNotEqual => (lhs, rhs),
         Op::LessThan | Op::LessEq | Op::GreaterThan | Op::GreaterEq => {
             let l = emit_to_primitive(cx, lhs, "number", span);
             let r = emit_to_primitive(cx, rhs, "number", span);

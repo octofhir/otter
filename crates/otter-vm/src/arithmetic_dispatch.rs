@@ -178,7 +178,8 @@ impl Interpreter {
     }
 
     pub(crate) fn run_loose_equal_regs(
-        &self,
+        &mut self,
+        context: &crate::execution_context::ExecutionContext,
         frame: &mut Frame,
         dst: u16,
         lhs: u16,
@@ -186,10 +187,44 @@ impl Interpreter {
         negate: bool,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        let eq = abstract_ops::is_loosely_equal(&lhs, &rhs);
+        let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
         write_register(frame, dst, Value::Boolean(eq ^ negate))?;
         frame.pc += 1;
         Ok(())
+    }
+
+    /// §7.2.13 `IsLooselyEqual(x, y)` with full access to the
+    /// interpreter so the object × primitive ToPrimitive arm can
+    /// invoke user-defined `@@toPrimitive` / `valueOf` / `toString`
+    /// per §7.1.1. Two object operands compare via reference
+    /// identity (§7.2.13 step 1 + IsStrictlyEqual for objects).
+    pub(crate) fn loose_equal_with_context(
+        &mut self,
+        context: &crate::execution_context::ExecutionContext,
+        x: &Value,
+        y: &Value,
+    ) -> Result<bool, VmError> {
+        if abstract_ops::is_primitive(x) && abstract_ops::is_primitive(y) {
+            return Ok(abstract_ops::is_loosely_equal(x, y));
+        }
+        // Two non-primitive operands compare via IsStrictlyEqual,
+        // which for objects is reference identity.
+        if !abstract_ops::is_primitive(x) && !abstract_ops::is_primitive(y) {
+            return Ok(abstract_ops::same_value(x, y));
+        }
+        // §7.2.13 step 11-12 — Object × primitive: ToPrimitive the
+        // object operand with the `default` hint, then recurse over
+        // the resulting primitive pair.
+        let (lhs_p, rhs_p) = if !abstract_ops::is_primitive(x) {
+            let coerced =
+                self.evaluate_to_primitive(context, x, abstract_ops::ToPrimitiveHint::Default)?;
+            (coerced, y.clone())
+        } else {
+            let coerced =
+                self.evaluate_to_primitive(context, y, abstract_ops::ToPrimitiveHint::Default)?;
+            (x.clone(), coerced)
+        };
+        Ok(abstract_ops::is_loosely_equal(&lhs_p, &rhs_p))
     }
 
     pub(crate) fn run_same_value_regs(

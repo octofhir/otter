@@ -174,16 +174,16 @@ pub fn make_date(
     {
         return f64::NAN;
     }
-    // §21.4.1.13 — years in `0..=99` map to `1900 + year`.
-    let resolved_year = if (0.0..=99.0).contains(&year) {
-        year as i32 + 1900
-    } else {
-        year as i32
-    };
+    // §21.4.1.12 `MakeDay` operates on the raw year — the
+    // 2-digit-year fixup is **not** applied here; the
+    // `Date(year, ...)` constructor / `Date.UTC` / Annex B
+    // `setYear` callers do that mapping themselves before
+    // invoking `make_date`. `setFullYear` / `setUTCFullYear`
+    // pass year through unchanged per §21.4.4.21.
     // Normalise month overflow into the year (spec lets month
     // overflow shift the year — `new Date(2024, 13, 1)` ===
     // `new Date(2025, 1, 1)`).
-    let total_months = resolved_year as i64 * 12 + month as i64;
+    let total_months = year as i64 * 12 + month as i64;
     let final_year = total_months.div_euclid(12) as i32;
     let final_month = total_months.rem_euclid(12) as u8;
 

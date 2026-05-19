@@ -5020,7 +5020,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::DateCall => {
-                    self.run_date_static_call_operands(stack, operands)?;
+                    self.run_date_static_call_operands(stack, context, operands)?;
                     continue;
                 }
                 Op::MathCall | Op::BigIntCall | Op::DataViewCall => {

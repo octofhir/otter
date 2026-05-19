@@ -329,6 +329,7 @@ impl Interpreter {
     pub(crate) fn run_date_static_call_operands(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
@@ -337,6 +338,24 @@ impl Interpreter {
             decode_static_call(frame, operands, 1, 2, 3)?
         };
         let method = method_id::DateMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
+        // §21.4.2.1 step 4 / §21.4.3.4 step 1 — `new Date(year, month,
+        // ...)` and `Date.UTC` walk their arguments through
+        // `ToNumber` in declaration order **before** assembling the
+        // resulting time value. Pre-coerce here so user
+        // `@@toPrimitive` / `valueOf` / `toString` overrides fire per
+        // spec and abrupt completions halt subsequent coercions.
+        // Single-arg `new Date(value)` (§21.4.2.2 step 3) follows
+        // its own ToPrimitive(`number`) ladder, handled inside
+        // `date::dispatch::construct_time_value`.
+        let mut args = args;
+        let needs_coerce = matches!(method, method_id::DateMethod::UTC)
+            || (matches!(method, method_id::DateMethod::Construct) && args.len() >= 2);
+        if needs_coerce {
+            for slot in args.iter_mut() {
+                let coerced = self.coerce_to_number(context, slot)?;
+                *slot = Value::Number(coerced);
+            }
+        }
         // Resolve `%Date.prototype%` so the freshly allocated
         // instance inherits the right method bag. Cheap lookup —
         // two property reads on the realm globals.

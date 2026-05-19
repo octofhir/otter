@@ -106,7 +106,7 @@ pub fn call_static(
             if args.is_empty() {
                 return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
             }
-            let year = number_arg(args, 0);
+            let year = year_with_two_digit_rule(number_arg(args, 0));
             let month = number_or(args, 1, 0.0);
             let day = number_or(args, 2, 1.0);
             let hours = number_or(args, 3, 0.0);
@@ -145,7 +145,7 @@ pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
             _ => f64::NAN,
         },
         _ => {
-            let year = number_arg(args, 0);
+            let year = year_with_two_digit_rule(number_arg(args, 0));
             let month = number_arg(args, 1);
             let day = number_or(args, 2, 1.0);
             let hours = number_or(args, 3, 0.0);
@@ -154,6 +154,22 @@ pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
             let ms = number_or(args, 6, 0.0);
             make_date(year, month, day, hours, minutes, seconds, ms)
         }
+    }
+}
+
+/// §21.4.2.1 step 4.b — `Date(year, month, ...)` and `Date.UTC`
+/// remap integer years in `0..=99` to `1900 + year`. `setFullYear`
+/// / `setUTCFullYear` / `MakeDay` itself do **not** apply this
+/// fixup, so it lives in the constructor / UTC paths only.
+fn year_with_two_digit_rule(year: f64) -> f64 {
+    if !year.is_finite() {
+        return year;
+    }
+    let int = year.trunc();
+    if int == year && (0.0..=99.0).contains(&int) {
+        int + 1900.0
+    } else {
+        year
     }
 }
 

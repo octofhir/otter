@@ -1311,6 +1311,58 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             if let Value::BigInt(b) = &args[0] {
                 let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
                 crate::number::NumberValue::from_f64(f)
+            } else if matches!(
+                &args[0],
+                Value::Object(_)
+                    | Value::Proxy(_)
+                    | Value::Array(_)
+                    | Value::Map(_)
+                    | Value::Set(_)
+                    | Value::WeakMap(_)
+                    | Value::WeakSet(_)
+                    | Value::Promise(_)
+                    | Value::RegExp(_)
+                    | Value::ArrayBuffer(_)
+                    | Value::DataView(_)
+                    | Value::TypedArray(_)
+                    | Value::Function { .. }
+                    | Value::Closure { .. }
+                    | Value::BoundFunction(_)
+                    | Value::NativeFunction(_)
+                    | Value::ClassConstructor(_)
+            ) {
+                // §7.1.4 ToNumber step 4 — non-primitive input goes
+                // through `ToPrimitive(input, "number")` first, then
+                // recursive ToNumber on the result. `evaluate_to_primitive`
+                // handles user `valueOf` / `toString` / `@@toPrimitive`
+                // overrides and wrapper unwrapping.
+                let context = ctx
+                    .execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "Number",
+                        reason: "missing execution context".to_string(),
+                    })?;
+                let primitive = ctx
+                    .cx
+                    .interp
+                    .evaluate_to_primitive(
+                        &context,
+                        &args[0],
+                        crate::abstract_ops::ToPrimitiveHint::Number,
+                    )
+                    .map_err(|e| NativeError::TypeError {
+                        name: "Number",
+                        reason: e.to_string(),
+                    })?;
+                if let Value::BigInt(b) = &primitive {
+                    let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
+                    crate::number::NumberValue::from_f64(f)
+                } else {
+                    crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(
+                        &primitive,
+                    ))
+                }
             } else {
                 crate::number::NumberValue::from_f64(crate::number::parse::to_number_value(
                     &args[0],

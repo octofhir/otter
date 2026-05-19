@@ -69,6 +69,20 @@ pub fn to_number_from_string(text: &str) -> NumberValue {
     {
         return parse_radix_digits(rest, 8);
     }
+    // §7.1.4.1.3 — the StringNumericLiteral grammar accepts only the
+    // exact tokens `Infinity` / `+Infinity` / `-Infinity` (matched
+    // above) and the DecimalNumericLiteral form below. Rust's
+    // `f64::parse` is case-insensitive and also accepts `inf` / `nan`,
+    // so reject any case-folded "infinity" / "inf" / "nan" variant
+    // that did not already match the spec-exact constants.
+    let folded = trimmed.to_ascii_lowercase();
+    let stripped = folded
+        .strip_prefix('+')
+        .or_else(|| folded.strip_prefix('-'))
+        .unwrap_or(&folded);
+    if matches!(stripped, "infinity" | "inf" | "nan") {
+        return NumberValue::Double(f64::NAN);
+    }
     match trimmed.parse::<f64>() {
         Ok(d) => NumberValue::Double(d).canonicalize(),
         Err(_) => NumberValue::Double(f64::NAN),

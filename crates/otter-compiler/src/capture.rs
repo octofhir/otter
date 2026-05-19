@@ -190,6 +190,17 @@ impl<'a> Visit<'a> for InnerRefCollector {
         // `Op::CallWithThis` against the class's statics object.
         // Treat the value expression as if it were nested so any
         // outer-scope identifier it references is marked as captured.
+        // Computed property keys (`class C { [expr] = … }`) likewise
+        // currently lower into the synthesised constructor frame, so
+        // their identifier references must escape the surrounding
+        // scope too.
+        if it.computed
+            && let Some(key) = it.key.as_expression()
+        {
+            self.nested_depth = self.nested_depth.saturating_add(1);
+            self.visit_expression(key);
+            self.nested_depth = self.nested_depth.saturating_sub(1);
+        }
         if let Some(value) = &it.value {
             self.nested_depth = self.nested_depth.saturating_add(1);
             self.visit_expression(value);

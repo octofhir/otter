@@ -1721,7 +1721,31 @@ impl Interpreter {
             }
             return Ok(true);
         }
-        if let Value::Proxy(_) = &receiver {
+        // Heap variants that walk a prototype chain in
+        // `ordinary_get_value`. Symbol / atomized string keys on
+        // Generator / Iterator / Map / Set / WeakRef / Promise /
+        // ArrayBuffer / DataView previously fell to the slow
+        // `run_load_property_regs` path whose per-type match had no
+        // arms for these receivers and surfaced a bogus
+        // `TypeMismatch`. Route through the same `[[Get]]` substrate
+        // the Object / Proxy fast paths already use so static-key
+        // reads (`iter.next`, `map.size`, `prom.then`, …) resolve
+        // consistently.
+        if matches!(
+            receiver,
+            Value::Proxy(_)
+                | Value::Generator(_)
+                | Value::Iterator(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+        ) {
             let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;

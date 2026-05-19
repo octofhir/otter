@@ -2375,6 +2375,17 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         install_proto(heap, "some", 1, iterator_proto_some)?;
         install_proto(heap, "every", 1, iterator_proto_every)?;
         install_proto(heap, "find", 1, iterator_proto_find)?;
+        // §27.1.5.1 / §22.1.5.1 / §23.1.5.1 / §24.1.5.1 / §24.2.5.1 —
+        // Otter exposes a single `%IteratorPrototype%` that carries
+        // `next`, `return`, and `throw`; the per-kind iterator
+        // sub-prototypes (Map, Set, String, Array) inherit from it.
+        // Each method routes back through `iterator_next_full` /
+        // `iterator_helper_dispatch` so the spec result record is
+        // identical whether the call comes from `Op::IteratorNext`
+        // or reflective `proto.next.call(it)`.
+        install_proto(heap, "next", 0, iterator_proto_next)?;
+        install_proto(heap, "return", 1, iterator_proto_return)?;
+        install_proto(heap, "throw", 1, iterator_proto_throw)?;
         Ok(())
     }
 }
@@ -2543,6 +2554,37 @@ fn iterator_receiver(
         _ => Err(crate::NativeError::TypeError {
             name,
             reason: "this is not an iterator".to_string(),
+        }),
+    }
+}
+
+/// Strict iterator receiver used by `%IteratorPrototype%.next/return/throw`.
+/// Only accepts built-in iterator-shaped values (`Value::Iterator`,
+/// `Value::Generator`); non-iterator receivers throw `TypeError` per
+/// §27.1.5.1.2 step 2. The looser [`iterator_receiver`] used by the
+/// helper terminals (map/filter/drop/take/forEach/…) would re-wrap an
+/// ordinary object as `IteratorState::User`, which causes infinite
+/// re-entry when the wrapped object's `next` resolves back to this
+/// same native through the prototype chain.
+fn iterator_receiver_builtin(
+    ctx: &mut crate::NativeCtx<'_>,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    let this_value = ctx.this_value().clone();
+    match this_value {
+        Value::Iterator(h) => Ok(h),
+        Value::Generator(g) => {
+            let gen_value = Value::Generator(g);
+            let state = crate::IteratorState::Generator { handle: g };
+            ctx.alloc_iterator_state(state, &[&gen_value], &[])
+                .map_err(|_| crate::NativeError::TypeError {
+                    name,
+                    reason: "iterator allocation failed".to_string(),
+                })
+        }
+        _ => Err(crate::NativeError::TypeError {
+            name,
+            reason: "this is not a built-in iterator".to_string(),
         }),
     }
 }
@@ -2912,6 +2954,110 @@ fn iterator_proto_find(
     Ok(Value::Undefined)
 }
 
+/// §27.1.5.1.2 `%IteratorPrototype%.next()` — drive one step on the
+/// receiver iterator and wrap the (value, done) pair in the spec's
+/// result record.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.next>
+fn iterator_proto_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.next")?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.next",
+                reason: "missing execution context".to_string(),
+            })?;
+    let iter_value = Value::Iterator(handle);
+    let (value, done) = ctx
+        .cx
+        .interp
+        .iterator_next_full(&exec_ctx, &handle)
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: e.to_string(),
+        })?;
+    let obj = ctx
+        .alloc_object_with_roots(&[&iter_value, &value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: "result allocation failed".to_string(),
+        })?;
+    ctx.set_property(obj, "value", value)
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: e.to_string(),
+        })?;
+    ctx.set_property(obj, "done", Value::Boolean(done))
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: e.to_string(),
+        })?;
+    Ok(Value::Object(obj))
+}
+
+/// §27.1.5.1.3 `%IteratorPrototype%.return(value)` — mark the
+/// receiver iterator exhausted and return the spec result record
+/// `{ value, done: true }`. Generator-backed iterators delegate
+/// to the generator's `return` handler through `iterator_helper_dispatch`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.return>
+fn iterator_proto_return(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.return")?;
+    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let iter_value = Value::Iterator(handle);
+    ctx.cx
+        .interp
+        .gc_heap_for_cx_mut()
+        .with_payload(handle, |state| {
+            *state = crate::IteratorState::Exhausted;
+        });
+    let obj = ctx
+        .alloc_object_with_roots(&[&iter_value, &arg], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.return",
+            reason: "result allocation failed".to_string(),
+        })?;
+    ctx.set_property(obj, "value", arg)
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.return",
+            reason: e.to_string(),
+        })?;
+    ctx.set_property(obj, "done", Value::Boolean(true))
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.return",
+            reason: e.to_string(),
+        })?;
+    Ok(Value::Object(obj))
+}
+
+/// §27.1.5.1.4 `%IteratorPrototype%.throw(value)` — propagate the
+/// argument as a thrown completion. Built-in (non-generator)
+/// iterators have no `[[Throw]]` handler, so the abstract algorithm
+/// degrades to "throw value".
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.throw>
+fn iterator_proto_throw(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let _handle = iterator_receiver_builtin(ctx, "Iterator.prototype.throw")?;
+    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    Err(crate::NativeError::Thrown {
+        name: "Iterator.prototype.throw",
+        message: arg.display_string(),
+    })
+}
+
 fn iterator_predicate_drain(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
@@ -3206,11 +3352,14 @@ mod tests {
         // grows: Map/Set/WeakMap/WeakSet (slice 9), Promise
         // (slice 10), RegExp (slice 11), WeakRef +
         // FinalizationRegistry (slice 12), `String.prototype`
-        // method spec install pass (Iter 11). Each ctor installs a
-        // `[[Construct]]` slot plus a prototype with several native
-        // methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1050;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 468 * 1024;
+        // method spec install pass (Iter 11),
+        // `<Ctor>[Symbol.species]` accessors on Array / Map / Set /
+        // RegExp / ArrayBuffer / SharedArrayBuffer plus
+        // `Iterator.prototype.{next, return, throw}` installers.
+        // Each ctor installs a `[[Construct]]` slot plus a prototype
+        // with several native methods and (for some) accessors.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1100;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 488 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

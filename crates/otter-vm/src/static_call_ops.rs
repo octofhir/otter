@@ -1855,18 +1855,34 @@ fn own_enumerable_keys_for_define(
         Value::Array(arr) => {
             // §22.1.3.3 EnumerableOwnPropertyNames for Array — indices
             // in storage order, then any named props that were
-            // installed enumerable on the array exotic.
+            // installed enumerable on the array exotic (including
+            // accessor-shaped own properties hung via
+            // `Object.defineProperty`).
             let mut out: Vec<String> = Vec::new();
             let dense_len = array::with_elements(*arr, interp.gc_heap(), |els| els.len());
             for idx in 0..dense_len {
                 out.push(idx.to_string());
             }
-            let named: Vec<String> = interp.gc_heap().read_payload(*arr, |body| {
-                body.named_properties
-                    .as_ref()
-                    .map_or_else(Vec::new, |m| m.keys().cloned().collect())
-            });
+            let (named, accessor_keys): (Vec<String>, Vec<String>) =
+                interp.gc_heap().read_payload(*arr, |body| {
+                    let named = body
+                        .named_properties
+                        .as_ref()
+                        .map_or_else(Vec::new, |m| m.keys().cloned().collect());
+                    let accessors = body.accessors.as_ref().map_or_else(Vec::new, |m| {
+                        m.keys()
+                            .filter(|k| k.parse::<usize>().is_err())
+                            .cloned()
+                            .collect()
+                    });
+                    (named, accessors)
+                });
             out.extend(named);
+            for key in accessor_keys {
+                if !out.contains(&key) {
+                    out.push(key);
+                }
+            }
             Ok(out)
         }
         Value::String(s) => {

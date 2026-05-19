@@ -441,27 +441,46 @@ impl Interpreter {
                     return Ok(None);
                 };
                 if key == "length" {
-                    Ok(Some(object::PropertyDescriptor::data(
+                    return Ok(Some(object::PropertyDescriptor::data(
                         Value::Number(NumberValue::from_i32(array::len(arr, &self.gc_heap) as i32)),
                         true,
                         false,
                         false,
-                    )))
-                } else {
-                    let Some(idx) = key
-                        .parse::<usize>()
-                        .ok()
-                        .filter(|idx| array::has_own_element(arr, &self.gc_heap, *idx))
-                    else {
-                        return Ok(None);
-                    };
-                    Ok(Some(object::PropertyDescriptor::data(
-                        array::get(arr, &self.gc_heap, idx),
-                        true,
-                        true,
-                        true,
-                    )))
+                    )));
                 }
+                // §10.4.2 — own accessor installed via
+                // `Object.defineProperty` lives in the per-array
+                // accessor side-table. Consult it before the
+                // dense / named slots so reflective probes
+                // (`Object.getOwnPropertyDescriptor(arr, "p")`) see
+                // the user-installed getter / setter.
+                if let Some((getter, setter)) = array::get_accessor(arr, &self.gc_heap, key) {
+                    return Ok(Some(object::PropertyDescriptor::accessor(
+                        getter, setter, true, true,
+                    )));
+                }
+                if let Ok(idx) = key.parse::<usize>() {
+                    if array::has_own_element(arr, &self.gc_heap, idx) {
+                        return Ok(Some(object::PropertyDescriptor::data(
+                            array::get(arr, &self.gc_heap, idx),
+                            true,
+                            true,
+                            true,
+                        )));
+                    }
+                    return Ok(None);
+                }
+                // §10.4.2 — named own properties (`arr.foo = 1`)
+                // live in the per-array `named_properties` side
+                // table.
+                if let Some(value) = self.gc_heap.read_payload(arr, |body| {
+                    body.named_properties
+                        .as_ref()
+                        .and_then(|m| m.get(key).cloned())
+                }) {
+                    return Ok(Some(object::PropertyDescriptor::data(value, true, true, true)));
+                }
+                Ok(None)
             }
             Value::RegExp(re) => {
                 if key.string_name().is_some_and(|key| key == "lastIndex") {

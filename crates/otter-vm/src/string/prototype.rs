@@ -1437,15 +1437,19 @@ pub static STRING_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "at"            / 1 => impl_at,
             "slice"         / 2 => impl_slice,
             "substring"     / 2 => impl_substring,
-            "indexOf"       / 2 => impl_index_of,
-            "lastIndexOf"   / 2 => impl_last_index_of,
-            "includes"      / 2 => impl_includes,
-            "startsWith"    / 2 => impl_starts_with,
-            "endsWith"      / 2 => impl_ends_with,
+            // §22.1.3.{6,7,9,10,14,15,24} — these spec headings list
+            // the second argument in `[ , … ]` brackets, so per
+            // §17 the function-object `length` reflects only the
+            // first required parameter (== 1).
+            "indexOf"       / 1 => impl_index_of,
+            "lastIndexOf"   / 1 => impl_last_index_of,
+            "includes"      / 1 => impl_includes,
+            "startsWith"    / 1 => impl_starts_with,
+            "endsWith"      / 1 => impl_ends_with,
             "concat"        / 1 => impl_concat,
             "repeat"        / 1 => impl_repeat,
-            "padStart"      / 2 => impl_pad_start,
-            "padEnd"        / 2 => impl_pad_end,
+            "padStart"      / 1 => impl_pad_start,
+            "padEnd"        / 1 => impl_pad_end,
             "trim"          / 0 => impl_trim,
             "trimStart"     / 0 => impl_trim_start,
             "trimEnd"       / 0 => impl_trim_end,
@@ -1885,15 +1889,15 @@ string_prototype_methods!(
     bridge_at              => "at",             1;
     bridge_slice           => "slice",          2;
     bridge_substring       => "substring",      2;
-    bridge_index_of        => "indexOf",        2;
-    bridge_last_index_of   => "lastIndexOf",    2;
-    bridge_includes        => "includes",       2;
-    bridge_starts_with     => "startsWith",     2;
-    bridge_ends_with       => "endsWith",       2;
+    bridge_index_of        => "indexOf",        1;
+    bridge_last_index_of   => "lastIndexOf",    1;
+    bridge_includes        => "includes",       1;
+    bridge_starts_with     => "startsWith",     1;
+    bridge_ends_with       => "endsWith",       1;
     bridge_concat          => "concat",         1;
     bridge_repeat          => "repeat",         1;
-    bridge_pad_start       => "padStart",       2;
-    bridge_pad_end         => "padEnd",         2;
+    bridge_pad_start       => "padStart",       1;
+    bridge_pad_end         => "padEnd",         1;
     bridge_trim            => "trim",           0;
     bridge_trim_start      => "trimStart",      0;
     bridge_trim_end        => "trimEnd",        0;

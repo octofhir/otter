@@ -1571,6 +1571,16 @@ fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         Value::TypedArray(t) => t.kind().name(),
         Value::Object(obj) if crate::object::date_data(*obj, ctx.heap()).is_some() => "Date",
         Value::Object(obj) if crate::object::call_native(*obj, ctx.heap()).is_some() => "Function",
+        // §20.1.3.6 step 14 — internal-slot driven built-in tags. Otter
+        // tags the boxed Boolean / Number / String / BigInt wrappers
+        // via the per-kind internal-slot accessors so reflective
+        // probes (`Object.prototype.toString.call(new Number(1))`) and
+        // the spec-mandated `Number.prototype.toString` /
+        // `Boolean.prototype.toString` defaults pick up the right
+        // builtinTag.
+        Value::Object(obj) if crate::object::boolean_data(*obj, ctx.heap()).is_some() => "Boolean",
+        Value::Object(obj) if crate::object::number_data(*obj, ctx.heap()).is_some() => "Number",
+        Value::Object(obj) if crate::object::string_data(*obj, ctx.heap()).is_some() => "String",
         // §20.1.3.6 step 14.b — if `O` has an `[[ErrorData]]` internal
         // slot, the built-in tag is `"Error"`. Otter does not carry
         // an explicit slot; treat any ordinary object whose prototype

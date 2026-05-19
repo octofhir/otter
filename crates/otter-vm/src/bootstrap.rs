@@ -1668,6 +1668,17 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // Number constructor.
     object::set(prototype, heap, "constructor", number_value.clone());
     define_global(global, heap, "Number", number_value);
+    // §21.1.2.{12,13} / §19.2.{4,5} — `Number.parseInt`,
+    // `Number.parseFloat`, `Number.isNaN`, `Number.isFinite` MUST be
+    // the same function object as their global-scope counterparts.
+    // The two install passes above each created fresh
+    // NativeFunctions; overwrite the `Number.*` slots with the global
+    // bindings so identity (`Number.parseInt === parseInt`) holds.
+    for shared in ["parseInt", "parseFloat", "isNaN", "isFinite"] {
+        if let Some(global_fn) = object::get(global, heap, shared) {
+            object::set(statics, heap, shared, global_fn);
+        }
+    }
     Ok(())
 }
 

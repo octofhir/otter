@@ -401,7 +401,7 @@ pub fn run_one(
     }
 
     let outcome = if frontmatter.is_module() {
-        run_module_test(&mut runtime, &combined, exec.timeout)
+        run_module_test(&mut runtime, &combined, test_path, exec.timeout)
     } else {
         run_script_test(&mut runtime, &combined, &rel_path, exec.timeout)
     };
@@ -425,10 +425,20 @@ fn run_script_test(
     map_watchdog_outcome(outcome)
 }
 
-fn run_module_test(runtime: &mut Runtime, source: &str, timeout: Duration) -> Outcome {
+fn run_module_test(
+    runtime: &mut Runtime,
+    source: &str,
+    test_path: &Path,
+    timeout: Duration,
+) -> Outcome {
     // Module entry must live on disk (the loader uses the parent
     // directory as the resolution base). Stage the combined source
-    // in a tempfile under the system temp dir.
+    // in a tempfile under the system temp dir. Use the test file's
+    // basename so self-referential imports (`import C from
+    // './<this-test>.js'`, a common pattern in `language/module-code/`
+    // for ResolveExport / instantiation tests per
+    // <https://tc39.es/ecma262/#sec-moduledeclarationinstantiation>)
+    // resolve back to the staged entry file inside the same temp dir.
     let dir = match tempfile_dir() {
         Ok(dir) => dir,
         Err(err) => {
@@ -438,7 +448,11 @@ fn run_module_test(runtime: &mut Runtime, source: &str, timeout: Duration) -> Ou
             };
         }
     };
-    let entry = dir.path().join("entry.mjs");
+    let basename = test_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| std::ffi::OsString::from("entry.mjs"));
+    let entry = dir.path().join(&basename);
     if let Err(err) = std::fs::write(&entry, source) {
         return Outcome::Fail {
             reason: format!("tempfile write failed: {err}"),

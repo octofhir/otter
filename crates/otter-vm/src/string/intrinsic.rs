@@ -178,6 +178,19 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         }
     }
 
+    // §B.2.3.{2,3} — `String.prototype.trimLeft` is the **same
+    // function object** as `String.prototype.trimStart`, and
+    // `trimRight` is the same object as `trimEnd`. Replace the
+    // independent installations with shared references so identity
+    // checks (`String.prototype.trimLeft === String.prototype.trimStart`)
+    // hold per spec.
+    if let Some(start_fn) = object::get(prototype, heap, "trimStart") {
+        object::set(prototype, heap, "trimLeft", start_fn);
+    }
+    if let Some(end_fn) = object::get(prototype, heap, "trimEnd") {
+        object::set(prototype, heap, "trimRight", end_fn);
+    }
+
     let string_value = Value::Object(constructor);
     object::set(prototype, heap, "constructor", string_value.clone());
     crate::bootstrap::define_global_value(

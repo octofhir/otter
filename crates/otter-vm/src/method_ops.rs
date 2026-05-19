@@ -637,15 +637,25 @@ impl Interpreter {
                     let Some(slot) = small_args.get_mut(idx) else {
                         continue;
                     };
-                    if !is_non_primitive(slot) {
+                    // §7.1.5 `ToIntegerOrInfinity` opens with full
+                    // `ToNumber` — Symbol / BigInt operands must
+                    // raise TypeError at *this* slot before any
+                    // subsequent argument is coerced. Going through
+                    // the shared interpreter ToNumber path also
+                    // observes user `@@toPrimitive` / `valueOf`
+                    // overrides on object operands.
+                    // Skip slots that are already primitives the
+                    // intrinsic body recognises (`undefined` is the
+                    // "absent" sentinel that some §B.2.3.1 substr-
+                    // style methods key on; let the impl decide).
+                    if matches!(
+                        slot,
+                        Value::Number(_) | Value::Boolean(_) | Value::Null | Value::Undefined
+                    ) {
                         continue;
                     }
-                    let primitive = self.evaluate_to_primitive(
-                        context,
-                        slot,
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    )?;
-                    *slot = primitive;
+                    let coerced = self.coerce_to_number(context, slot)?;
+                    *slot = Value::Number(coerced);
                 }
                 for &idx in string_str_coerce {
                     let Some(slot) = small_args.get_mut(idx) else {

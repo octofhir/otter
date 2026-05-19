@@ -913,11 +913,20 @@ impl ErrorClassRegistry {
         if let Some(text) = message {
             let heap = ctx.interp_mut().string_heap_clone();
             let s = JsString::from_str(text, &heap)?;
-            ctx.set_property_with_roots(obj, "message", Value::String(s), value_roots, slice_roots)
-                .map_err(|_| StringError::OutOfMemory {
-                    requested_bytes: 0,
-                    heap_limit_bytes: ctx.heap().max_heap_bytes(),
-                })?;
+            // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
+            // [[Writable]]: true, [[Enumerable]]: false,
+            // [[Configurable]]: true }`. Going through ordinary
+            // `set_property` would install an enumerable slot;
+            // route through `define_own_property` so reflective
+            // property descriptors match the spec.
+            let _ = crate::object::define_own_property(
+                obj,
+                ctx.heap_mut(),
+                "message",
+                crate::object::PropertyDescriptor::data(Value::String(s), true, false, true),
+            );
+            let _ = value_roots;
+            let _ = slice_roots;
         }
         Ok(obj)
     }

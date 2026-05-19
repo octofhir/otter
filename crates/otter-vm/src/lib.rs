@@ -2897,28 +2897,6 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Construction-time data store while keeping the active VM frame stack and
-    /// caller-supplied local values alive during any ShapeBody allocation.
-    pub(crate) fn set_property_with_stack_roots(
-        &mut self,
-        stack: &SmallVec<[Frame; 8]>,
-        obj: object::JsObject,
-        key: &str,
-        value: Value,
-        value_roots: &[&Value],
-    ) -> Result<(), VmError> {
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
-            }
-        };
-        self.set_property_with_extra_roots(obj, key, value, &mut external_visit)
-    }
-
     /// Field-presence-aware defineProperty path that advances the object's
     /// GC-managed hidden class when a new own property is created.
     pub(crate) fn define_own_property_partial(

@@ -85,13 +85,17 @@ impl Interpreter {
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         if let Some(text) = message {
             let s = JsString::from_str(&text, &self.string_heap)?;
-            self.set_property_with_stack_roots(
-                stack,
+            // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
+            // [[Writable]]: true, [[Enumerable]]: false,
+            // [[Configurable]]: true }`. Ordinary `set` would install
+            // an enumerable slot; route through `define_own_property`
+            // so reflective probes match the spec.
+            object::define_own_property(
                 obj,
+                &mut self.gc_heap,
                 "message",
-                Value::String(s),
-                &[message_value, &proto_value],
-            )?;
+                object::PropertyDescriptor::data(Value::String(s), true, false, true),
+            );
         }
         Ok(obj)
     }

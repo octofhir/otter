@@ -1104,6 +1104,10 @@ impl Interpreter {
             Some(c) if is_callable(c) => c.clone(),
             _ => return Err(VmError::NotCallable),
         };
+        // §24.1.3.5 / §24.2.3.6 step 4 — when `thisArg` is supplied,
+        // bind it as the callback's `this`; otherwise let
+        // `OrdinaryCallBindThis` default to undefined / globalObject.
+        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
         let entries: Vec<(Value, Value)> = match recv {
             Value::Map(m) => crate::collections::map_entries(*m, &self.gc_heap),
             Value::Set(s) => crate::collections::set_values(*s, &self.gc_heap)
@@ -1130,7 +1134,7 @@ impl Interpreter {
             cb_args.push(value);
             cb_args.push(key);
             cb_args.push(recv_for_callback.clone());
-            self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+            self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
         }
         Ok(())
     }

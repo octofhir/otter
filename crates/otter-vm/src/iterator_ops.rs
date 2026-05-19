@@ -73,6 +73,7 @@ impl Interpreter {
             Value::Array(array) => IteratorState::Array {
                 array: *array,
                 index: 0,
+                origin: crate::BuiltinIteratorOrigin::Array,
             },
             Value::String(string) => IteratorState::String {
                 string: string.clone(),
@@ -108,6 +109,7 @@ impl Interpreter {
                         &[entry_values.as_slice(), snap.as_slice()],
                     )?,
                     index: 0,
+                    origin: crate::BuiltinIteratorOrigin::Map,
                 }
             }
             Value::Set(s) => {
@@ -122,6 +124,7 @@ impl Interpreter {
                         snap.as_slice(),
                     )?,
                     index: 0,
+                    origin: crate::BuiltinIteratorOrigin::Set,
                 }
             }
             // §27.5 — generator objects are iterable; `[@@iterator]()` returns
@@ -383,6 +386,7 @@ impl Interpreter {
                     Value::Array(arr) => IteratorState::Array {
                         array: arr,
                         index: 0,
+                        origin: crate::BuiltinIteratorOrigin::Array,
                     },
                     Value::Iterator(rc) => {
                         let new_inner = rc;

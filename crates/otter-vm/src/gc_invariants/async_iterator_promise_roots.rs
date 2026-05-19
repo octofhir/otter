@@ -130,7 +130,11 @@ fn iterator_state_holding_array_object_survives_force_gc() {
             .expect("array");
     let iter = interp
         .gc_heap_mut()
-        .alloc_old(IteratorState::Array { array, index: 0 })
+        .alloc_old(IteratorState::Array {
+            array,
+            index: 0,
+            origin: crate::BuiltinIteratorOrigin::Array,
+        })
         .expect("iterator");
     let global = *interp.global_this();
     crate::object::set(global, interp.gc_heap_mut(), "iter", Value::Iterator(iter));

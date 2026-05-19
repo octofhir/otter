@@ -555,6 +555,7 @@ fn wrap_iterator(
     let state = crate::IteratorState::Array {
         array: arr,
         index: 0,
+        origin: crate::BuiltinIteratorOrigin::Array,
     };
     Ok(Value::Iterator(args.alloc_iterator_state_rooted(
         state,

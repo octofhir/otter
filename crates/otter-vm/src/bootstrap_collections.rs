@@ -1070,7 +1070,11 @@ fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     let array_value = Value::Array(array);
     let iter = ctx
         .alloc_iterator_state(
-            crate::IteratorState::Array { array, index: 0 },
+            crate::IteratorState::Array {
+                array,
+                index: 0,
+                origin: crate::BuiltinIteratorOrigin::Set,
+            },
             &[&array_value],
             &[],
         )
@@ -1094,7 +1098,11 @@ fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
     let array_value = Value::Array(array);
     let iter = ctx
         .alloc_iterator_state(
-            crate::IteratorState::Array { array, index: 0 },
+            crate::IteratorState::Array {
+                array,
+                index: 0,
+                origin: crate::BuiltinIteratorOrigin::Set,
+            },
             &[&array_value],
             &[],
         )
@@ -1618,7 +1626,11 @@ fn make_map_iterator(
     let array_value = Value::Array(array);
     let iter = ctx
         .alloc_iterator_state(
-            crate::IteratorState::Array { array, index: 0 },
+            crate::IteratorState::Array {
+                array,
+                index: 0,
+                origin: crate::BuiltinIteratorOrigin::Map,
+            },
             &[&array_value],
             &[],
         )

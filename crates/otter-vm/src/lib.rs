@@ -571,6 +571,31 @@ pub enum ArrayIterKind {
     Entry,
 }
 
+/// Origin of a built-in iterator. Used to route
+/// `[[GetPrototypeOf]]` to the correct per-kind iterator prototype
+/// (`%ArrayIteratorPrototype%` / `%MapIteratorPrototype%` /
+/// `%SetIteratorPrototype%` / `%StringIteratorPrototype%`) so that
+/// `Object.prototype.toString` and other reflective probes observe
+/// the spec-mandated `@@toStringTag` for each kind.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-array-iterator-objects>
+/// - <https://tc39.es/ecma262/#sec-map-iterator-objects>
+/// - <https://tc39.es/ecma262/#sec-set-iterator-objects>
+/// - <https://tc39.es/ecma262/#sec-string-iterator-objects>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuiltinIteratorOrigin {
+    /// `%ArrayIteratorPrototype%` — `@@toStringTag = "Array Iterator"`.
+    #[default]
+    Array,
+    /// `%MapIteratorPrototype%` — `@@toStringTag = "Map Iterator"`.
+    Map,
+    /// `%SetIteratorPrototype%` — `@@toStringTag = "Set Iterator"`.
+    Set,
+    /// `%StringIteratorPrototype%` — `@@toStringTag = "String Iterator"`.
+    String,
+}
+
 /// Runtime state for iterator handles driven via `Op::IteratorNext`.
 /// Covers both built-in array / string iterators and the lazy
 /// iterator-helpers wrappers per the proposal.
@@ -585,6 +610,11 @@ pub enum IteratorState {
         /// array's `len()` at every step so resizing the array
         /// during iteration is observed correctly.
         index: usize,
+        /// Per-kind iterator origin. Map / Set / String iterators
+        /// reuse the dense-array snapshot shape but inherit from
+        /// distinct realm prototypes (§23.1.5 / §24.1.5 / §24.2.5
+        /// / §22.1.5) carrying their kind-specific `@@toStringTag`.
+        origin: BuiltinIteratorOrigin,
     },
     /// Walks `array` yielding only its numeric indices —
     /// `Array.prototype.keys()` per §23.1.3.18.
@@ -690,6 +720,27 @@ pub enum IteratorState {
         /// `mapper` call produced an iterable.
         inner: Option<IteratorHandle>,
     },
+}
+
+impl IteratorState {
+    /// Per-kind iterator-prototype origin for the built-in
+    /// iterator variants. Returns `None` for variants whose
+    /// prototype is `%IteratorPrototype%` directly (user
+    /// iterators, helpers, generators) — those keep the
+    /// `@@toStringTag = "Iterator"` default.
+    #[must_use]
+    pub fn builtin_origin(&self) -> Option<BuiltinIteratorOrigin> {
+        match self {
+            IteratorState::Array { origin, .. } => Some(*origin),
+            // §23.1.5 — Array.prototype.{keys, entries} both
+            // produce `%ArrayIteratorPrototype%` instances.
+            IteratorState::ArrayKey { .. } | IteratorState::ArrayEntry { .. } => {
+                Some(BuiltinIteratorOrigin::Array)
+            }
+            IteratorState::String { .. } => Some(BuiltinIteratorOrigin::String),
+            _ => None,
+        }
+    }
 }
 
 impl otter_gc::SafeTraceable for IteratorState {
@@ -1660,6 +1711,18 @@ pub struct Interpreter {
     /// when the host loader settles a token through
     /// [`Self::settle_dynamic_import`].
     dynamic_import_registry: dynamic_import::DynamicImportRegistry,
+    /// Per-kind iterator prototypes — `%ArrayIteratorPrototype%`,
+    /// `%MapIteratorPrototype%`, `%SetIteratorPrototype%`,
+    /// `%StringIteratorPrototype%`. Each inherits from
+    /// `%IteratorPrototype%` and carries its own `@@toStringTag`.
+    /// Populated by bootstrap; consulted by
+    /// `intrinsic_prototype_object_for(Value::Iterator(_))` to
+    /// route `[[GetPrototypeOf]]` per ECMA-262
+    /// §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5.
+    array_iterator_prototype: Option<JsObject>,
+    map_iterator_prototype: Option<JsObject>,
+    set_iterator_prototype: Option<JsObject>,
+    string_iterator_prototype: Option<JsObject>,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -1801,7 +1864,7 @@ impl Interpreter {
         let shape_runtime = object::ShapeRuntime::new(&mut gc_heap)
             .expect("shape root fits within any positive cap");
         startup_timer.mark("vm_shape_runtime");
-        Self {
+        let mut interp = Self {
             interrupt: InterruptFlag::new(),
             string_heap,
             gc_heap,
@@ -1834,6 +1897,49 @@ impl Interpreter {
             timer_callbacks: timers::TimerCallbacks::new(),
             dynamic_import_loader: None,
             dynamic_import_registry: dynamic_import::DynamicImportRegistry::new(),
+            array_iterator_prototype: None,
+            map_iterator_prototype: None,
+            set_iterator_prototype: None,
+            string_iterator_prototype: None,
+        };
+        // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
+        // iterator prototypes once `%Iterator.prototype%` is wired
+        // into the global. The bootstrap helper owns the install
+        // logic; this site only caches the resulting handles so
+        // `intrinsic_prototype_object_for(Value::Iterator(_))` can
+        // route without a global lookup per access.
+        if let Some(Value::Object(iter_proto)) = interp
+            .constructor_prototype_value("Iterator")
+            .ok()
+        {
+            let shape_root = interp.shape_runtime.root();
+            let protos = bootstrap::build_builtin_iterator_prototypes_post_bootstrap(
+                &mut interp.gc_heap,
+                &interp.string_heap,
+                shape_root,
+                iter_proto,
+                &interp.well_known_symbols,
+            )
+            .expect("per-kind iterator prototypes fit within any positive cap");
+            interp.array_iterator_prototype = Some(protos.array);
+            interp.map_iterator_prototype = Some(protos.map);
+            interp.set_iterator_prototype = Some(protos.set);
+            interp.string_iterator_prototype = Some(protos.string);
+        }
+        interp
+    }
+
+    /// Look up `%<Kind>IteratorPrototype%` by origin.
+    #[must_use]
+    pub(crate) fn builtin_iterator_prototype_for(
+        &self,
+        origin: BuiltinIteratorOrigin,
+    ) -> Option<JsObject> {
+        match origin {
+            BuiltinIteratorOrigin::Array => self.array_iterator_prototype,
+            BuiltinIteratorOrigin::Map => self.map_iterator_prototype,
+            BuiltinIteratorOrigin::Set => self.set_iterator_prototype,
+            BuiltinIteratorOrigin::String => self.string_iterator_prototype,
         }
     }
 
@@ -5606,7 +5712,11 @@ fn array_iterator_factory_call(
             });
         }
     };
-    let state = IteratorState::Array { array, index: 0 };
+    let state = IteratorState::Array {
+        array,
+        index: 0,
+        origin: BuiltinIteratorOrigin::Array,
+    };
     Ok(Value::Iterator(ctx.alloc_iterator_state(
         state,
         &[],
@@ -5670,7 +5780,7 @@ fn step_iterator(
     }
 
     let snapshot = gc_heap.read_payload(iter, |state| match state {
-        IteratorState::Array { array, index } => FastIteratorSnapshot::Array(*array, *index),
+        IteratorState::Array { array, index, .. } => FastIteratorSnapshot::Array(*array, *index),
         IteratorState::ArrayKey { array, index } => FastIteratorSnapshot::ArrayKey(*array, *index),
         IteratorState::ArrayEntry { array, index } => {
             FastIteratorSnapshot::ArrayEntry(*array, *index)
@@ -6930,7 +7040,7 @@ mod tests {
             panic!("factory should return an iterator");
         };
         let (array, index) = interp.gc_heap().read_payload(iter, |state| match state {
-            IteratorState::Array { array, index } => (*array, *index),
+            IteratorState::Array { array, index, .. } => (*array, *index),
             _ => panic!("factory should create an array iterator"),
         });
         assert_eq!(array, source);

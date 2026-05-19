@@ -1449,6 +1449,7 @@ fn impl_values_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         crate::IteratorState::Array {
             array: arr,
             index: 0,
+            origin: crate::BuiltinIteratorOrigin::Array,
         },
         &[],
         &[],

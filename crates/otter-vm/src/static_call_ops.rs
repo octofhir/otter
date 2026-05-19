@@ -1848,6 +1848,7 @@ impl Interpreter {
                     Value::Array(arr) => IteratorState::Array {
                         array: arr,
                         index: 0,
+                        origin: crate::BuiltinIteratorOrigin::Array,
                     },
                     Value::String(s) => IteratorState::String {
                         string: s,
@@ -1864,7 +1865,11 @@ impl Interpreter {
                             &[&value_root],
                             &[args],
                         )?;
-                        IteratorState::Array { array, index: 0 }
+                        IteratorState::Array {
+                            array,
+                            index: 0,
+                            origin: crate::BuiltinIteratorOrigin::Set,
+                        }
                     }
                     Value::Map(m) => {
                         let value_root = Value::Map(m);
@@ -1884,7 +1889,11 @@ impl Interpreter {
                             &[&value_root],
                             &[args],
                         )?;
-                        IteratorState::Array { array, index: 0 }
+                        IteratorState::Array {
+                            array,
+                            index: 0,
+                            origin: crate::BuiltinIteratorOrigin::Map,
+                        }
                     }
                     Value::Object(_) => IteratorState::User { iterator: value },
                     _ => return Err(VmError::TypeMismatch),

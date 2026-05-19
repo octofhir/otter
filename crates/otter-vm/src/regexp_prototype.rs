@@ -1478,6 +1478,7 @@ pub fn native_regexp_symbol_match_all(
     let iter_state = crate::IteratorState::Array {
         array: arr,
         index: 0,
+        origin: crate::BuiltinIteratorOrigin::Array,
     };
     let arr_value = Value::Array(arr);
     let handle = ctx

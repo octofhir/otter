@@ -132,6 +132,7 @@ fn map_iter_state(
     Ok(crate::IteratorState::Array {
         array: arr,
         index: 0,
+        origin: crate::BuiltinIteratorOrigin::Map,
     })
 }
 
@@ -193,7 +194,11 @@ fn impl_set_values(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
     let array = args.array_from_elements_rooted(snap, &[], &[])?;
     Ok(make_iter_value(
         args,
-        crate::IteratorState::Array { array, index: 0 },
+        crate::IteratorState::Array {
+            array,
+            index: 0,
+            origin: crate::BuiltinIteratorOrigin::Set,
+        },
     )?)
 }
 
@@ -422,7 +427,11 @@ fn impl_set_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let array = args.array_from_elements_rooted(snap, &[], &[])?;
     Ok(make_iter_value(
         args,
-        crate::IteratorState::Array { array, index: 0 },
+        crate::IteratorState::Array {
+            array,
+            index: 0,
+            origin: crate::BuiltinIteratorOrigin::Set,
+        },
     )?)
 }
 
@@ -715,7 +724,11 @@ pub fn make_set_iterator_factory(
             let array = ctx.array_from_elements(snap)?;
             Ok(make_native_iter_value(
                 ctx,
-                crate::IteratorState::Array { array, index: 0 },
+                crate::IteratorState::Array {
+                    array,
+                    index: 0,
+                    origin: crate::BuiltinIteratorOrigin::Set,
+                },
             )?)
         },
     )
@@ -743,6 +756,7 @@ fn map_iter_state_native(
     Ok(crate::IteratorState::Array {
         array: arr,
         index: 0,
+        origin: crate::BuiltinIteratorOrigin::Map,
     })
 }
 

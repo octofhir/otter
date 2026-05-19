@@ -1382,6 +1382,7 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     let state = crate::IteratorState::Array {
         array: arr,
         index: 0,
+        origin: crate::BuiltinIteratorOrigin::Array,
     };
     let handle = args
         .gc_heap

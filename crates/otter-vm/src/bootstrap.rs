@@ -2586,6 +2586,74 @@ pub fn install_iterator_well_knowns_post_bootstrap(
     Ok(())
 }
 
+/// Per-kind iterator prototypes built off `%IteratorPrototype%`.
+/// Returned from [`build_builtin_iterator_prototypes_post_bootstrap`]
+/// so the caller can stash them on the [`crate::Interpreter`] cache
+/// used by `intrinsic_prototype_object_for(Value::Iterator(_))`.
+pub struct BuiltinIteratorPrototypes {
+    /// `%ArrayIteratorPrototype%` — §23.1.5.2.
+    pub array: JsObject,
+    /// `%MapIteratorPrototype%` — §24.1.5.2.
+    pub map: JsObject,
+    /// `%SetIteratorPrototype%` — §24.2.5.2.
+    pub set: JsObject,
+    /// `%StringIteratorPrototype%` — §22.1.5.2.
+    pub string: JsObject,
+}
+
+/// §22.1.5.2 / §23.1.5.2 / §24.1.5.2 / §24.2.5.2 — materialise the
+/// per-kind iterator prototypes. Each inherits from
+/// `%IteratorPrototype%` and carries its own `@@toStringTag`. Caller
+/// (`Interpreter::new`) caches the resulting `JsObject`s so
+/// `[[GetPrototypeOf]]` on a `Value::Iterator` routes to the right
+/// per-kind prototype.
+pub fn build_builtin_iterator_prototypes_post_bootstrap(
+    heap: &mut otter_gc::GcHeap,
+    string_heap: &crate::string::StringHeap,
+    shape_root: object::ShapeHandle,
+    parent: JsObject,
+    well_known: &crate::symbol::WellKnownSymbols,
+) -> Result<BuiltinIteratorPrototypes, JsSurfaceError> {
+    use crate::symbol::WellKnown;
+    let parent_value = Value::Object(parent);
+    let tag_sym = well_known.get(WellKnown::ToStringTag);
+    let mut make = |tag: &'static str| -> Result<JsObject, JsSurfaceError> {
+        let proto = {
+            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                parent_value.trace_value_slots(visitor);
+            };
+            object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
+                .map_err(|_| JsSurfaceError::OutOfMemory)?
+        };
+        object::set_prototype(proto, heap, Some(parent));
+        let tag_string =
+            crate::string::JsString::from_str(tag, string_heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
+        object::define_own_symbol_property_partial(
+            proto,
+            heap,
+            &tag_sym,
+            object::PartialPropertyDescriptor {
+                value: Some(Value::String(tag_string)),
+                writable: Some(false),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+        Ok(proto)
+    };
+    let array = make("Array Iterator")?;
+    let map = make("Map Iterator")?;
+    let set = make("Set Iterator")?;
+    let string = make("String Iterator")?;
+    Ok(BuiltinIteratorPrototypes {
+        array,
+        map,
+        set,
+        string,
+    })
+}
+
 fn iterator_receiver(
     ctx: &mut crate::NativeCtx<'_>,
     name: &'static str,
@@ -3238,6 +3306,7 @@ fn iterator_from_native(
             let state = crate::IteratorState::Array {
                 array: *arr,
                 index: 0,
+                origin: crate::BuiltinIteratorOrigin::Array,
             };
             let handle = ctx
                 .alloc_iterator_state(state, &[&arr_value], &[])

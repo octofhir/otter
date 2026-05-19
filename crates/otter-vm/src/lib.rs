@@ -2319,7 +2319,7 @@ impl Interpreter {
         }
     }
 
-    fn object_prototype_object_opt(&self) -> Option<JsObject> {
+    pub(crate) fn object_prototype_object_opt(&self) -> Option<JsObject> {
         match object::get(self.global_this, &self.gc_heap, "Object") {
             Some(Value::Object(ctor)) => match object::get(ctor, &self.gc_heap, "prototype") {
                 Some(Value::Object(p)) => Some(p),

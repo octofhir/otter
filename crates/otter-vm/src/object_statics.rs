@@ -1325,18 +1325,27 @@ pub fn native_prototype_proto_get(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
-    let obj = match this_value {
-        Value::Object(o) => o,
-        Value::Null | Value::Undefined => {
-            return Err(NativeError::TypeError {
-                name: "get __proto__",
-                reason: "cannot convert null or undefined to object".to_string(),
-            });
-        }
-        // Primitives ToObject-coerce; the wrapper's prototype is the
-        // constructor's `%Prototype%`. The Object intrinsic gives us
-        // that resolution path directly without materialising the
-        // wrapper.
+    if matches!(this_value, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: "get __proto__",
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
+    // §B.2.2.1.1 step 2 — `Return ? O.[[GetPrototypeOf]]()`. Proxy
+    // and other exotic receivers must dispatch through their
+    // `[[GetPrototypeOf]]` so user `getPrototypeOf` traps fire
+    // observably.
+    if let Some(exec_ctx) = ctx.execution_context().cloned() {
+        let result = ctx
+            .cx
+            .interp
+            .ordinary_get_prototype_value(&exec_ctx, this_value, 0)
+            .map_err(|err| object_native_error("get __proto__", err))?;
+        return Ok(result);
+    }
+    // Context-less fallback (sync embedders without a JS frame).
+    match this_value {
+        Value::Object(o) => Ok(crate::object::prototype_value(o, ctx.heap()).unwrap_or(Value::Null)),
         _ => {
             let name = match ctx.this_value() {
                 Value::Boolean(_) => "Boolean",
@@ -1346,14 +1355,13 @@ pub fn native_prototype_proto_get(
                 Value::BigInt(_) => "BigInt",
                 _ => return Ok(Value::Null),
             };
-            return Ok(ctx
+            Ok(ctx
                 .cx
                 .interp
                 .constructor_prototype_value(name)
-                .unwrap_or(Value::Null));
+                .unwrap_or(Value::Null))
         }
-    };
-    Ok(crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::Null))
+    }
 }
 
 /// §B.2.2.1.2 `set Object.prototype.__proto__` — installs a new
@@ -1379,16 +1387,66 @@ pub fn native_prototype_proto_set(
             reason: "cannot convert null or undefined to object".to_string(),
         });
     }
-    let obj = match this_value {
-        Value::Object(o) => o,
-        _ => return Ok(Value::Undefined),
-    };
     let proto_value = args.first().cloned().unwrap_or(Value::Undefined);
-    let proto_arg = match &proto_value {
-        Value::Object(_) | Value::Null | Value::Proxy(_) => Some(proto_value.clone()),
-        _ => return Ok(Value::Undefined),
+    // §B.2.2.1.2 step 2 — only Object / Null proto values are
+    // honoured; everything else returns undefined without
+    // mutating. Proxy-as-prototype is admissible via the broader
+    // value lattice.
+    if !matches!(
+        &proto_value,
+        Value::Object(_) | Value::Null | Value::Proxy(_)
+    ) {
+        return Ok(Value::Undefined);
+    }
+    // §B.2.2.1.2 step 3 — non-object receivers silently no-op.
+    if !matches!(this_value, Value::Object(_) | Value::Proxy(_)) {
+        return Ok(Value::Undefined);
+    }
+    // §20.1.3 — `Object.prototype` is an immutable-prototype
+    // exotic. Reject any change that would diverge from its
+    // current `[[Prototype]]` so
+    // `Object.prototype.__proto__ = X` throws TypeError unless
+    // `X` already matches.
+    if let Value::Object(obj) = this_value {
+        let object_proto = ctx
+            .cx
+            .interp
+            .object_prototype_object_opt();
+        if object_proto == Some(obj) {
+            let current = crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::Null);
+            if !crate::abstract_ops::same_value(&proto_value, &current) {
+                return Err(NativeError::TypeError {
+                    name: "set __proto__",
+                    reason: "Immutable prototype object cannot have its prototype changed"
+                        .to_string(),
+                });
+            }
+            return Ok(Value::Undefined);
+        }
+    }
+    let exec_ctx = match ctx.execution_context().cloned() {
+        Some(c) => c,
+        None => {
+            // Sync embedder fallback — apply the ordinary algorithm
+            // without proxy-trap dispatch.
+            let Value::Object(obj) = this_value else {
+                return Ok(Value::Undefined);
+            };
+            let ok = crate::object::set_prototype_value(obj, ctx.heap_mut(), Some(proto_value));
+            if !ok {
+                return Err(NativeError::TypeError {
+                    name: "set __proto__",
+                    reason: "cyclic or non-extensible prototype chain".to_string(),
+                });
+            }
+            return Ok(Value::Undefined);
+        }
     };
-    let ok = crate::object::set_prototype_value(obj, ctx.heap_mut(), proto_arg);
+    let ok = ctx
+        .cx
+        .interp
+        .set_prototype_value_proxy_aware(&exec_ctx, &this_value, &proto_value)
+        .map_err(|err| object_native_error("set __proto__", err))?;
     if !ok {
         return Err(NativeError::TypeError {
             name: "set __proto__",

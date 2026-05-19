@@ -1522,6 +1522,13 @@ pub(crate) fn ordinary_set_data_property_with_shape(
 /// Replace the prototype with a spec-legal value. `None` or
 /// `Some(Value::Null)` detaches the chain.
 ///
+/// Implements `OrdinarySetPrototypeOf` per ECMA-262 §10.1.2.1 — the
+/// `SameValue(V, current)` early-return, the non-extensibility
+/// guard, and the new-prototype cycle walk. Returns `false` for any
+/// abrupt outcome so callers (the `__proto__` setter,
+/// `Object.setPrototypeOf`, `Reflect.setPrototypeOf`) can raise the
+/// spec-mandated `TypeError`.
+///
 /// # Spec
 ///
 /// - <https://tc39.es/ecma262/#sec-ordinarysetprototypeof>
@@ -1537,6 +1544,40 @@ pub fn set_prototype_value(
         Some(value) if is_prototype_object_value(&value) => ObjectPrototype::Value(value),
         _ => return false,
     };
+    // §10.1.2.1 step 4 — `SameValue(V, current) is true → return true`.
+    let current = heap.read_payload(obj, |body| body.prototype.clone());
+    if prototype_same(&current, &new_proto) {
+        return true;
+    }
+    // §10.1.2.1 step 5 — non-extensible objects reject any change.
+    if !is_extensible(obj, heap) {
+        return false;
+    }
+    // §10.1.2.1 step 8 — walk the new chain; abort with `false` if
+    // any hop lands back on `obj` (cycle) or strays past
+    // `PROTO_CHAIN_HARD_CAP` (foundation safety net for adversarial
+    // inputs). Non-ordinary prototypes (Proxy / Value variants)
+    // terminate the walk per step 8.c.i — their `[[GetPrototypeOf]]`
+    // is not `OrdinaryGetPrototypeOf`, so the spec stops following
+    // the chain.
+    let mut cursor = new_proto.clone();
+    let mut hops = 0usize;
+    loop {
+        match cursor {
+            ObjectPrototype::Null => break,
+            ObjectPrototype::Object(p) => {
+                if p == obj {
+                    return false;
+                }
+                if hops >= PROTO_CHAIN_HARD_CAP {
+                    return false;
+                }
+                hops += 1;
+                cursor = heap.read_payload(p, |body| body.prototype.clone());
+            }
+            ObjectPrototype::Proxy(_) | ObjectPrototype::Value(_) => break,
+        }
+    }
     let barrier_value = new_proto.as_value();
     heap.with_payload(obj, |body| {
         body.prototype = new_proto;
@@ -1545,6 +1586,24 @@ pub fn set_prototype_value(
         heap.record_write(obj, value);
     }
     true
+}
+
+fn prototype_same(a: &ObjectPrototype, b: &ObjectPrototype) -> bool {
+    match (a, b) {
+        (ObjectPrototype::Null, ObjectPrototype::Null) => true,
+        (ObjectPrototype::Object(x), ObjectPrototype::Object(y)) => x == y,
+        (ObjectPrototype::Proxy(x), ObjectPrototype::Proxy(y)) => x.ptr_eq(y),
+        (ObjectPrototype::Value(x), ObjectPrototype::Value(y)) => same_prototype_value(x, y),
+        _ => false,
+    }
+}
+
+fn same_prototype_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => x == y,
+        (Value::Array(x), Value::Array(y)) => crate::array::ptr_eq(*x, *y),
+        _ => false,
+    }
 }
 
 /// Replace the prototype with an ordinary object or `null`.

@@ -598,18 +598,26 @@ impl Interpreter {
                     None => self.ordinary_get_prototype_value(context, proxy.target(), hops + 1),
                 }
             }
-            Value::Object(obj) => self.get_prototype_for_op(&Value::Object(obj)),
-            Value::Array(_) => self.constructor_prototype_value("Array"),
-            Value::NativeFunction(_)
+            Value::Object(_)
+            | Value::Array(_)
+            | Value::NativeFunction(_)
             | Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
-            | Value::ClassConstructor(_) => Ok(Value::Object(self.function_prototype_object()?)),
-            Value::RegExp(_) => self.constructor_prototype_value("RegExp"),
-            Value::Map(_) => self.constructor_prototype_value("Map"),
-            Value::Set(_) => self.constructor_prototype_value("Set"),
-            Value::WeakMap(_) => self.constructor_prototype_value("WeakMap"),
-            Value::WeakSet(_) => self.constructor_prototype_value("WeakSet"),
+            | Value::ClassConstructor(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::Promise(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Iterator(_)
+            | Value::Generator(_) => self.get_prototype_for_op(&value),
             _ => Err(VmError::TypeMismatch),
         }
     }
@@ -1550,6 +1558,35 @@ impl Interpreter {
             Value::ClassConstructor(class) => {
                 Ok(Some(Value::Object(class.prototype(&self.gc_heap))))
             }
+            Value::NativeFunction(native) => {
+                let desc = native
+                    .own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype")
+                    .map_err(VmError::from)?;
+                let value = match desc {
+                    Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Data { value },
+                        ..
+                    }) => value,
+                    Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { getter, .. },
+                        ..
+                    }) => match getter {
+                        Some(getter) if abstract_ops::is_callable(&getter) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.run_callable_sync(context, &getter, rhs.clone(), args)?
+                        }
+                        _ => Value::Undefined,
+                    },
+                    None => Value::Undefined,
+                };
+                if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                    Ok(Some(value))
+                } else {
+                    Err(VmError::TypeError {
+                        message: "instanceof prototype is not an object".to_string(),
+                    })
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -1601,6 +1638,35 @@ impl Interpreter {
             }
             Value::ClassConstructor(class) => {
                 Ok(Some(Value::Object(class.prototype(&self.gc_heap))))
+            }
+            Value::NativeFunction(native) => {
+                let desc = native
+                    .own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype")
+                    .map_err(VmError::from)?;
+                let value = match desc {
+                    Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Data { value },
+                        ..
+                    }) => value,
+                    Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { getter, .. },
+                        ..
+                    }) => match getter {
+                        Some(getter) if abstract_ops::is_callable(&getter) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.run_callable_sync(context, &getter, rhs.clone(), args)?
+                        }
+                        _ => Value::Undefined,
+                    },
+                    None => Value::Undefined,
+                };
+                if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                    Ok(Some(value))
+                } else {
+                    Err(VmError::TypeError {
+                        message: "instanceof prototype is not an object".to_string(),
+                    })
+                }
             }
             _ => Ok(None),
         }

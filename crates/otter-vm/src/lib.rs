@@ -4354,7 +4354,7 @@ impl Interpreter {
                     let msg_reg = context
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
-                    self.run_new_error_regs(&mut *stack, top_idx, dst, msg_reg)?;
+                    self.run_new_error_regs(context, &mut *stack, top_idx, dst, msg_reg)?;
                     continue;
                 }
                 Op::NewBuiltinError => {

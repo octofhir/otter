@@ -28,6 +28,7 @@ use crate::{
 impl Interpreter {
     pub(crate) fn run_new_error_regs(
         &mut self,
+        context: &ExecutionContext,
         stack: &mut SmallVec<[Frame; 8]>,
         top_idx: usize,
         dst: u16,
@@ -35,7 +36,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
         let value = read_register(frame, msg_reg)?.clone();
-        let owned_message = error_message_from_value(&value);
+        let owned_message = self.coerce_error_message(context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(
             stack,
             ErrorKind::Error,
@@ -63,12 +64,51 @@ impl Interpreter {
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
         let value = read_register(frame, msg_reg)?.clone();
-        let owned_message = error_message_from_value(&value);
+        let owned_message = self.coerce_error_message(context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(stack, kind, owned_message, &value)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::Object(obj))?;
         frame.pc += 1;
         Ok(())
+    }
+
+    /// §20.5.1.1 step 3 — coerce the `message` argument through full
+    /// §7.1.17 `ToString`. Returns `None` when the argument is
+    /// `undefined` (the spec skips step 3 in that case, leaving
+    /// `message` inherited from the prototype). Throws `TypeError`
+    /// for `Symbol` per §7.1.17 step 2 and propagates any abrupt
+    /// completion from `@@toPrimitive` / `toString` / `valueOf`.
+    fn coerce_error_message(
+        &mut self,
+        context: &ExecutionContext,
+        value: &Value,
+    ) -> Result<Option<String>, VmError> {
+        match value {
+            Value::Undefined => Ok(None),
+            Value::String(s) => Ok(Some(s.to_lossy_string())),
+            Value::Symbol(_) => Err(VmError::TypeError {
+                message: "Cannot convert a Symbol value to a string".to_string(),
+            }),
+            Value::Null
+            | Value::Boolean(_)
+            | Value::Number(_)
+            | Value::BigInt(_)
+            | Value::Hole => Ok(Some(value.display_string())),
+            _ => {
+                let primitive = self.evaluate_to_primitive(
+                    context,
+                    value,
+                    crate::abstract_ops::ToPrimitiveHint::String,
+                )?;
+                match primitive {
+                    Value::String(s) => Ok(Some(s.to_lossy_string())),
+                    Value::Symbol(_) => Err(VmError::TypeError {
+                        message: "Cannot convert a Symbol value to a string".to_string(),
+                    }),
+                    other => Ok(Some(other.display_string())),
+                }
+            }
+        }
     }
 
     fn make_error_instance_with_stack_roots(
@@ -252,14 +292,6 @@ impl Interpreter {
             );
         }
         Some(Value::Object(obj))
-    }
-}
-
-fn error_message_from_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Undefined => None,
-        Value::String(s) => Some(s.to_lossy_string()),
-        other => Some(other.display_string()),
     }
 }
 

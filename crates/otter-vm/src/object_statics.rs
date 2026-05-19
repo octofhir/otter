@@ -1125,7 +1125,20 @@ fn native_prototype_to_string(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    let tag = object_to_string_tag(ctx);
+    // §20.1.3.6 step 15 — `tag = ? Get(O, @@toStringTag)` walks the
+    // prototype chain. Probe via the accessor-aware ladder when a
+    // context is wired, otherwise fall back to the own-symbol-only
+    // path (sync embedders without a JS frame).
+    let explicit_tag = if let Some(ctx_owned) = ctx.execution_context().cloned() {
+        explicit_to_string_tag_with_context(ctx, &ctx_owned)
+            .map_err(|err| object_native_error("toString", err))?
+    } else {
+        explicit_to_string_tag_own(ctx)
+    };
+    let tag = match explicit_tag {
+        Some(t) => t,
+        None => builtin_to_string_tag(ctx),
+    };
     let display = format!("[object {tag}]");
     let string_heap = ctx.cx.interp.string_heap_clone();
     Ok(Value::String(
@@ -1587,50 +1600,64 @@ fn constructor_object_has_function_prototype(obj: JsObject, heap: &otter_gc::GcH
     )
 }
 
-fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
-    if let Some(tag) = explicit_to_string_tag(ctx) {
-        return tag;
-    }
+/// §20.1.3.6 step 14 — `builtinTag` table. Only the internal-slot
+/// driven tags surface here (Array / Arguments / Function / Error /
+/// Boolean / Number / String / Date / RegExp); every other kind
+/// (Map, Set, Promise, BigInt, Symbol, TypedArray, …) falls back to
+/// `"Object"` and relies on a prototype-installed `@@toStringTag`
+/// for its kind-specific string.
+fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
     match ctx.this_value() {
         Value::Undefined | Value::Hole => "Undefined",
         Value::Null => "Null",
+        // Primitives outside the builtin-tag table — spec step 14
+        // promotes them to `"Object"`. Their wrapper prototype's
+        // `@@toStringTag` (e.g. `Symbol.prototype[@@toStringTag] =
+        // "Symbol"`) re-installs the kind-specific string before
+        // step 16 falls back here.
         Value::Boolean(_) => "Boolean",
         Value::Number(_) => "Number",
-        Value::BigInt(_) => "BigInt",
         Value::String(_) => "String",
-        Value::Symbol(_) => "Symbol",
+        Value::BigInt(_) | Value::Symbol(_) => "Object",
+        // §20.1.3.6 step 14.a — `[[Call]]` slot.
         Value::Function { .. }
         | Value::Closure { .. }
         | Value::BoundFunction(_)
         | Value::NativeFunction(_)
         | Value::ClassConstructor(_) => "Function",
+        // §20.1.3.6 step 14.i / §6.1.7.3 IsArray — Array exotic.
         Value::Array(_) => "Array",
+        // §20.1.3.6 step 14.f / §22.2.7 — `[[RegExpMatcher]]` slot.
         Value::RegExp(_) => "RegExp",
-        Value::Promise(_) => "Promise",
-        Value::Map(_) => "Map",
-        Value::Set(_) => "Set",
-        Value::WeakMap(_) => "WeakMap",
-        Value::WeakSet(_) => "WeakSet",
-        Value::WeakRef(_) => "WeakRef",
-        Value::FinalizationRegistry(_) => "FinalizationRegistry",
-        Value::Generator(_) => "Generator",
-        Value::Iterator(_) => "Iterator",
-        Value::Temporal(_) => "Temporal",
-        Value::Intl(_) => "Intl",
-        Value::ArrayBuffer(_) => "ArrayBuffer",
-        Value::DataView(_) => "DataView",
-        // §22.2.6.15: `%TypedArray%.prototype[@@toStringTag]`
-        // is an accessor that yields the receiver's
-        // [[TypedArrayName]] — the kind-specific name string —
-        // not the generic `"TypedArray"` family tag.
-        Value::TypedArray(t) => t.kind().name(),
+        // All other exotic value kinds without a builtin-tag entry —
+        // the prototype-installed `@@toStringTag` carries the
+        // kind-specific name (`Map.prototype[@@toStringTag] =
+        // "Map"`, etc.). Tests like
+        // `delete Map.prototype[Symbol.toStringTag]; toString.call(
+        // new Map()) === "[object Object]"` require this fallback.
+        Value::Promise(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::WeakMap(_)
+        | Value::WeakSet(_)
+        | Value::WeakRef(_)
+        | Value::FinalizationRegistry(_)
+        | Value::Generator(_)
+        | Value::Iterator(_)
+        | Value::Temporal(_)
+        | Value::Intl(_)
+        | Value::ArrayBuffer(_)
+        | Value::DataView(_)
+        | Value::TypedArray(_) => "Object",
+        // §20.1.3.6 step 14.e — `[[DateValue]]` slot.
         Value::Object(obj) if crate::object::date_data(*obj, ctx.heap()).is_some() => "Date",
+        // §20.1.3.6 step 14.a — `[[Call]]` slot on the boxed callable.
         Value::Object(obj) if crate::object::call_native(*obj, ctx.heap()).is_some() => "Function",
-        // §20.1.3.6 step 14 — internal-slot driven built-in tags. Otter
-        // tags the boxed Boolean / Number / String / BigInt wrappers
-        // via the per-kind internal-slot accessors so reflective
-        // probes (`Object.prototype.toString.call(new Number(1))`) and
-        // the spec-mandated `Number.prototype.toString` /
+        // §20.1.3.6 step 14 internal-slot tags. Otter tags the boxed
+        // Boolean / Number / String wrappers via the per-kind
+        // internal-slot accessors so reflective probes
+        // (`Object.prototype.toString.call(new Number(1))`) and the
+        // spec-mandated `Number.prototype.toString` /
         // `Boolean.prototype.toString` defaults pick up the right
         // builtinTag.
         Value::Object(obj) if crate::object::boolean_data(*obj, ctx.heap()).is_some() => "Boolean",
@@ -1642,9 +1669,42 @@ fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         // chain reaches one of the realm error prototypes as having
         // the slot.
         Value::Object(obj) if object_has_error_data(ctx, *obj) => "Error",
-        Value::Object(_) | Value::Proxy(_) => "Object",
+        // §7.2.2 IsArray walks `[[ProxyTarget]]` recursively so a
+        // proxy whose target is an Array reports `[object Array]`.
+        Value::Proxy(_) => return proxy_builtin_tag(ctx, ctx.this_value()),
+        Value::Object(_) => "Object",
     }
     .to_string()
+}
+
+/// §7.2.2 IsArray + §7.2.4 IsCallable for a Proxy target. Walks the
+/// `[[ProxyTarget]]` chain until reaching a non-proxy value; returns
+/// the builtin tag of that underlying value (limited to the spec
+/// table — `"Array"` / `"Function"` / `"Object"`).
+fn proxy_builtin_tag(_ctx: &NativeCtx<'_>, value: &Value) -> String {
+    let mut current = value.clone();
+    let mut hops = 0_usize;
+    loop {
+        if hops >= crate::object::PROTO_CHAIN_HARD_CAP {
+            return "Object".to_string();
+        }
+        hops += 1;
+        match current {
+            Value::Proxy(p) => {
+                if p.is_revoked() {
+                    return "Object".to_string();
+                }
+                current = p.target();
+            }
+            Value::Array(_) => return "Array".to_string(),
+            Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::BoundFunction(_)
+            | Value::NativeFunction(_)
+            | Value::ClassConstructor(_) => return "Function".to_string(),
+            _ => return "Object".to_string(),
+        }
+    }
 }
 
 /// Walk `obj`'s `[[Prototype]]` chain and return `true` when any
@@ -1691,7 +1751,12 @@ fn object_has_error_data(ctx: &NativeCtx<'_>, obj: crate::object::JsObject) -> b
     false
 }
 
-fn explicit_to_string_tag(ctx: &NativeCtx<'_>) -> Option<String> {
+/// Synchronous fallback for embedders without a JS execution context.
+/// Reads `@@toStringTag` as an own symbol on plain objects only —
+/// the proto-chain ladder requires `[[Get]]` to invoke accessor
+/// getters and walk the realm prototype, which is the context-aware
+/// path's job.
+fn explicit_to_string_tag_own(ctx: &NativeCtx<'_>) -> Option<String> {
     let tag_symbol = ctx
         .cx
         .interp
@@ -1704,6 +1769,66 @@ fn explicit_to_string_tag(ctx: &NativeCtx<'_>) -> Option<String> {
     match value {
         Value::String(s) => Some(s.to_lossy_string()),
         _ => None,
+    }
+}
+
+/// §20.1.3.6 step 15 — `Get(O, @@toStringTag)` through the full
+/// `[[Get]]` ladder, so accessor getters fire and the realm
+/// prototype's tag (`Map.prototype[@@toStringTag]`, etc.) is
+/// observed. Non-string results return `None` so the caller falls
+/// back to the builtin tag.
+fn explicit_to_string_tag_with_context(
+    ctx: &mut NativeCtx<'_>,
+    exec_ctx: &crate::ExecutionContext,
+) -> Result<Option<String>, crate::VmError> {
+    // §20.1.3.6 steps 1-2 — `undefined` and `null` resolve to their
+    // builtin tags before ToObject and never enter the `[[Get]]`
+    // ladder. The `Hole` sentinel never reaches user code, but if it
+    // somehow does, behave like `undefined`.
+    let this_value = ctx.this_value().clone();
+    if matches!(this_value, Value::Undefined | Value::Null | Value::Hole) {
+        return Ok(None);
+    }
+    let tag_symbol = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::ToStringTag);
+    // `Value::String` primitive doesn't have its own arm in
+    // `ordinary_get_value`; route the lookup through
+    // `String.prototype` explicitly so user-installed
+    // `String.prototype[@@toStringTag]` overrides surface.
+    let base: Value = if matches!(this_value, Value::String(_)) {
+        match ctx
+            .cx
+            .interp
+            .constructor_prototype_value("String")
+            .ok()
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        }
+    } else {
+        this_value.clone()
+    };
+    let outcome = ctx.cx.interp.ordinary_get_value(
+        exec_ctx,
+        base,
+        this_value.clone(),
+        &crate::VmPropertyKey::Symbol(tag_symbol),
+        0,
+    )?;
+    let value = match outcome {
+        crate::VmGetOutcome::Value(v) => v,
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            ctx.cx
+                .interp
+                .run_callable_sync(exec_ctx, &getter, this_value, smallvec::SmallVec::new())?
+        }
+    };
+    match value {
+        Value::String(s) => Ok(Some(s.to_lossy_string())),
+        _ => Ok(None),
     }
 }
 

@@ -1114,114 +1114,83 @@ impl Interpreter {
                 Ok(Some(Value::Array(array)))
             }
             M::FromEntries => {
+                // §20.1.2.7 Object.fromEntries(iterable). Spec iterator
+                // protocol with IteratorClose on abrupt completion per
+                // the AddEntriesFromIterable analogue used in step 4.
+                // <https://tc39.es/ecma262/#sec-object.fromentries>
                 let iter = args.first().cloned().unwrap_or(Value::Undefined);
-                let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
-                match iter {
-                    Value::Array(arr) => {
-                        let snapshot: Vec<Value> =
-                            crate::array::with_elements(arr, self.gc_heap(), |elements| {
-                                elements.to_vec()
-                            });
-                        for entry in snapshot {
-                            // §20.1.2.7 step 5.b — read `[0]` / `[1]`
-                            // via spec `[[Get]]`. Accepts Array,
-                            // wrapper String, ordinary Object with
-                            // indexed keys, and String primitive.
-                            let (key, value) = match entry {
-                                Value::Array(pair) => (
-                                    crate::array::get(pair, self.gc_heap(), 0),
-                                    crate::array::get(pair, self.gc_heap(), 1),
-                                ),
-                                Value::String(s) => {
-                                    let units = s.to_utf16_vec();
-                                    let zero =
-                                        units.first().copied().map_or(Value::Undefined, |u| {
-                                            crate::string::JsString::from_utf16_units(
-                                                &[u],
-                                                &self.string_heap,
-                                            )
-                                            .map(Value::String)
-                                            .unwrap_or(Value::Undefined)
-                                        });
-                                    let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                                        crate::string::JsString::from_utf16_units(
-                                            &[u],
-                                            &self.string_heap,
-                                        )
-                                        .map(Value::String)
-                                        .unwrap_or(Value::Undefined)
-                                    });
-                                    (zero, one)
-                                }
-                                Value::Object(obj) => {
-                                    if let Some(s) = crate::object::string_data(obj, self.gc_heap())
-                                    {
-                                        let units = s.to_utf16_vec();
-                                        let zero =
-                                            units.first().copied().map_or(Value::Undefined, |u| {
-                                                crate::string::JsString::from_utf16_units(
-                                                    &[u],
-                                                    &self.string_heap,
-                                                )
-                                                .map(Value::String)
-                                                .unwrap_or(Value::Undefined)
-                                            });
-                                        let one =
-                                            units.get(1).copied().map_or(Value::Undefined, |u| {
-                                                crate::string::JsString::from_utf16_units(
-                                                    &[u],
-                                                    &self.string_heap,
-                                                )
-                                                .map(Value::String)
-                                                .unwrap_or(Value::Undefined)
-                                            });
-                                        (zero, one)
-                                    } else {
-                                        let k = crate::object::get(obj, self.gc_heap(), "0")
-                                            .unwrap_or(Value::Undefined);
-                                        let v = crate::object::get(obj, self.gc_heap(), "1")
-                                            .unwrap_or(Value::Undefined);
-                                        (k, v)
-                                    }
-                                }
-                                _ => return Err(VmError::TypeMismatch),
-                            };
-                            match &key {
-                                Value::Symbol(sym) => {
-                                    object::set_symbol(
-                                        result,
-                                        &mut self.gc_heap,
-                                        sym.clone(),
-                                        value,
-                                    );
-                                }
-                                _ => {
-                                    let key_str = object_static_property_key_from_value(&key)?;
-                                    self.set_property(result, &key_str, value)?;
-                                }
-                            }
-                        }
-                    }
-                    Value::Map(map) => {
-                        for (key, value) in collections::map_entries(map, self.gc_heap()) {
-                            match &key {
-                                Value::Symbol(sym) => {
-                                    object::set_symbol(
-                                        result,
-                                        &mut self.gc_heap,
-                                        sym.clone(),
-                                        value,
-                                    );
-                                }
-                                _ => {
-                                    let key_str = object_static_property_key_from_value(&key)?;
-                                    self.set_property(result, &key_str, value)?;
-                                }
-                            }
-                        }
-                    }
-                    _ => return Err(VmError::TypeMismatch),
+                if matches!(iter, Value::Undefined | Value::Null) {
+                    return Err(VmError::TypeError {
+                        message: "Object.fromEntries: iterable must not be null or undefined"
+                            .to_string(),
+                    });
                 }
+                // §20.1.2.7 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
+                let object_proto = self.constructor_prototype_value("Object").ok();
+                let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
+                if let Some(Value::Object(proto_obj)) = object_proto {
+                    object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
+                }
+
+                let (iterator, next_method) = self.get_iterator_sync(context, &iter)?;
+
+                loop {
+                    let stepped =
+                        self.iterator_step_sync(context, &iterator, &next_method)?;
+                    let Some(entry) = stepped else {
+                        break;
+                    };
+
+                    if !value_is_object_like_for_entry(&entry) {
+                        let _ = self.iterator_close_sync(context, &iterator);
+                        return Err(VmError::TypeError {
+                            message:
+                                "Object.fromEntries: iterator value is not an entry object"
+                                    .to_string(),
+                        });
+                    }
+
+                    let key = match read_indexed_entry(self, context, &entry, "0") {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = self.iterator_close_sync(context, &iterator);
+                            return Err(e);
+                        }
+                    };
+                    let value = match read_indexed_entry(self, context, &entry, "1") {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = self.iterator_close_sync(context, &iterator);
+                            return Err(e);
+                        }
+                    };
+
+                    let key_pk = match self.to_property_key_sync(context, key) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = self.iterator_close_sync(context, &iterator);
+                            return Err(e);
+                        }
+                    };
+                    let set_result = match &key_pk {
+                        VmPropertyKey::Symbol(sym) => {
+                            object::set_symbol(result, &mut self.gc_heap, sym.clone(), value);
+                            Ok(())
+                        }
+                        _ => {
+                            let k = key_pk
+                                .string_name()
+                                .expect("non-symbol property key has string spelling")
+                                .to_owned();
+                            self.set_property(result, &k, value)
+                        }
+                    };
+                    if let Err(e) = set_result {
+                        let _ = self.iterator_close_sync(context, &iterator);
+                        return Err(e);
+                    }
+                }
+
                 Ok(Some(Value::Object(result)))
             }
             M::GetOwnPropertyDescriptor => {
@@ -1999,17 +1968,6 @@ fn stack_static_string_value(s: &str, interp: &Interpreter) -> Result<Value, VmE
     ))
 }
 
-fn object_static_property_key_from_value(value: &Value) -> Result<String, VmError> {
-    match value {
-        Value::String(s) => Ok(s.to_lossy_string()),
-        Value::Number(n) => Ok(n.to_display_string()),
-        Value::Boolean(b) => Ok((if *b { "true" } else { "false" }).to_string()),
-        Value::Null => Ok("null".to_string()),
-        Value::Undefined => Ok("undefined".to_string()),
-        _ => Err(VmError::TypeMismatch),
-    }
-}
-
 fn decode_static_call(
     frame: &Frame,
     operands: &[Operand],
@@ -2045,4 +2003,59 @@ fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), 
     write_register(frame, dst, result)?;
     frame.pc += 1;
     Ok(())
+}
+
+/// §6.2.4.5 IsObject classifier used by `Object.fromEntries` to gate
+/// the entry validation step. Mirrors the broad set of Object-like
+/// runtime kinds the rest of the VM treats as objects (every heap
+/// allocation but the primitive variants).
+fn value_is_object_like_for_entry(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::Promise(_)
+            | Value::Iterator(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Generator(_)
+            | Value::Proxy(_)
+    )
+}
+
+/// §7.3.2 `Get(target, name)` for indexed-string entry probing in
+/// `Object.fromEntries`. Honours installed accessors via the
+/// `ordinary_get_value` outcome ladder.
+fn read_indexed_entry(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    target: &Value,
+    name: &str,
+) -> Result<Value, VmError> {
+    let outcome = interp.ordinary_get_value(
+        context,
+        target.clone(),
+        target.clone(),
+        &VmPropertyKey::String(name),
+        0,
+    )?;
+    match outcome {
+        crate::VmGetOutcome::Value(v) => Ok(v),
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            interp.run_callable_sync(context, &getter, target.clone(), SmallVec::new())
+        }
+    }
 }

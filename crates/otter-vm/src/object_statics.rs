@@ -176,7 +176,7 @@ fn native_rooted_call(
         M::Keys => native_keys_rooted(ctx, context, args).map(Some),
         M::Values => native_values_rooted(ctx, args).map(Some),
         M::Entries => native_entries_rooted(ctx, args).map(Some),
-        M::FromEntries => native_from_entries_rooted(ctx, args).map(Some),
+        M::FromEntries => native_from_entries_rooted(ctx, context, args).map(Some),
         M::GetOwnPropertyDescriptor => {
             native_get_own_property_descriptor_rooted(ctx, context, args).map(Some)
         }
@@ -472,52 +472,159 @@ fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     )?))
 }
 
-fn native_from_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
-    let iter = args.first().cloned().unwrap_or(Value::Undefined);
-    let result = ctx.alloc_object_with_roots(&[], &[args])?;
-    match iter {
-        Value::Array(arr) => {
-            let snapshot: Vec<Value> =
-                crate::array::with_elements(arr, ctx.heap(), |elements| elements.to_vec());
-            for entry in snapshot {
-                let (key, value) = read_entry_pair(ctx, &entry)?;
-                set_from_entries_key(result, &key, value, ctx)?;
-            }
-        }
-        Value::Map(map) => {
-            for (key, value) in crate::collections::map_entries(map, ctx.heap()) {
-                set_from_entries_key(result, &key, value, ctx)?;
-            }
-        }
-        _ => return Err(VmError::TypeMismatch),
-    }
-    Ok(Value::Object(result))
-}
-
-/// §20.1.2.7 step 5.b.iii — `CreateDataPropertyOrThrow(obj, key, value)`.
-/// Supports both string-keyed and Symbol-keyed entry pairs so
-/// `Object.fromEntries([[Symbol(), v]])` round-trips per
-/// `built-ins/Object/fromEntries/supports-symbols.js`.
-fn set_from_entries_key(
-    target: crate::object::JsObject,
-    key: &Value,
-    value: Value,
+/// §20.1.2.7 `Object.fromEntries(iterable)` — spec iterator protocol
+/// path with IteratorClose on abrupt completions per
+/// `AddEntriesFromIterable` (§24.1.1.2 conceptual analogue used in
+/// step 5).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-object.fromentries>
+/// - <https://tc39.es/ecma262/#sec-add-entries-from-iterable>
+fn native_from_entries_rooted(
     ctx: &mut NativeCtx<'_>,
-) -> Result<(), VmError> {
-    match key {
-        Value::Symbol(sym) => {
-            crate::object::set_symbol(target, ctx.heap_mut(), sym.clone(), value);
-            Ok(())
+    context: Option<&crate::ExecutionContext>,
+    args: &[Value],
+) -> Result<Value, VmError> {
+    let iter = args.first().cloned().unwrap_or(Value::Undefined);
+    // §7.1.4 RequireObjectCoercible — undefined / null reject before
+    // GetIterator.
+    if matches!(iter, Value::Undefined | Value::Null) {
+        return Err(VmError::TypeError {
+            message: "Object.fromEntries: iterable must not be null or undefined".to_string(),
+        });
+    }
+    let exec_ctx = context.cloned().ok_or_else(|| VmError::TypeError {
+        message: "Object.fromEntries: missing execution context".to_string(),
+    })?;
+    let result = ctx.alloc_object_with_roots(&[&iter], &[args])?;
+
+    let (iterator, next_method) = {
+        let interp = ctx.interp_mut();
+        interp.get_iterator_sync(&exec_ctx, &iter)?
+    };
+
+    loop {
+        let stepped = {
+            let interp = ctx.interp_mut();
+            interp.iterator_step_sync(&exec_ctx, &iterator, &next_method)
+        };
+        let entry = match stepped {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok(Value::Object(result)),
+            // §7.4.6 step 1 — IteratorStep is itself a throw, do not
+            // call IteratorClose (the iterator is already in an error
+            // state per §7.4.8).
+            Err(err) => return Err(err),
+        };
+
+        // §20.1.2.7 step 5.b.i — nextItem must be an Object; on
+        // failure close the iterator and propagate a TypeError.
+        if !is_object_like_value(&entry) {
+            let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
+            return Err(VmError::TypeError {
+                message: "Object.fromEntries: iterator value is not an entry object".to_string(),
+            });
         }
-        _ => {
-            let key_str = property_key_from_value(key)?;
-            ctx.set_property(target, &key_str, value)
+
+        let key = match read_entry_index(ctx, &exec_ctx, &entry, "0") {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
+                return Err(err);
+            }
+        };
+        let value = match read_entry_index(ctx, &exec_ctx, &entry, "1") {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
+                return Err(err);
+            }
+        };
+
+        // §20.1.2.7 step 5.b.iii — CreateDataPropertyOrThrow. Routes
+        // through the spec ToPropertyKey ladder so accessor-bearing
+        // key objects fire `toString` / `valueOf` here, not later.
+        let key_pk = match {
+            let interp = ctx.interp_mut();
+            interp.to_property_key_sync(&exec_ctx, key)
+        } {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
+                return Err(err);
+            }
+        };
+        let set_result = match &key_pk {
+            crate::VmPropertyKey::Symbol(sym) => {
+                crate::object::set_symbol(result, ctx.heap_mut(), sym.clone(), value);
+                Ok(())
+            }
+            _ => {
+                let k = key_pk
+                    .string_name()
+                    .expect("non-symbol key has string spelling")
+                    .to_owned();
+                ctx.set_property(result, &k, value)
+            }
+        };
+        if let Err(err) = set_result {
+            let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
+            return Err(err);
         }
     }
 }
 
-/// Heap-only variant of [`set_from_entries_key`] used by the
-/// context-less `object_statics::call` fallback path.
+fn is_object_like_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::Promise(_)
+            | Value::Iterator(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Generator(_)
+            | Value::Proxy(_)
+    )
+}
+
+fn read_entry_index(
+    ctx: &mut NativeCtx<'_>,
+    context: &crate::ExecutionContext,
+    target: &Value,
+    name: &str,
+) -> Result<Value, VmError> {
+    let interp = ctx.interp_mut();
+    let outcome = interp.ordinary_get_value(
+        context,
+        target.clone(),
+        target.clone(),
+        &crate::VmPropertyKey::String(name),
+        0,
+    )?;
+    match outcome {
+        crate::VmGetOutcome::Value(v) => Ok(v),
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            interp.run_callable_sync(context, &getter, target.clone(), smallvec::SmallVec::new())
+        }
+    }
+}
+
+/// Heap-only variant used by the context-less
+/// `object_statics::call` fallback path.
 fn set_from_entries_key_heap(
     target: crate::object::JsObject,
     key: &Value,
@@ -580,58 +687,6 @@ fn read_entry_pair_heap(
             });
             let one = units.get(1).copied().map_or(Value::Undefined, |u| {
                 crate::string::JsString::from_utf16_units(&[u], string_heap)
-                    .map(Value::String)
-                    .unwrap_or(Value::Undefined)
-            });
-            Ok((zero, one))
-        }
-        _ => Err(VmError::TypeMismatch),
-    }
-}
-
-fn read_entry_pair(ctx: &NativeCtx<'_>, entry: &Value) -> Result<(Value, Value), VmError> {
-    match entry {
-        Value::Array(pair) => Ok((
-            crate::array::get(*pair, ctx.heap(), 0),
-            crate::array::get(*pair, ctx.heap(), 1),
-        )),
-        Value::Object(obj) => {
-            // Wrapper String `Object("ab")` carries `[[StringData]]`
-            // — read its code-unit slots directly so `Object.fromEntries
-            // ([Object("ab")])` yields `{a: "b"}`.
-            if let Some(s) = crate::object::string_data(*obj, ctx.heap()) {
-                let units = s.to_utf16_vec();
-                let zero = units.first().copied().map_or(Value::Undefined, |u| {
-                    crate::string::JsString::from_utf16_units(
-                        &[u],
-                        &ctx.cx.interp.string_heap_clone(),
-                    )
-                    .map(Value::String)
-                    .unwrap_or(Value::Undefined)
-                });
-                let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                    crate::string::JsString::from_utf16_units(
-                        &[u],
-                        &ctx.cx.interp.string_heap_clone(),
-                    )
-                    .map(Value::String)
-                    .unwrap_or(Value::Undefined)
-                });
-                return Ok((zero, one));
-            }
-            let key = crate::object::get(*obj, ctx.heap(), "0").unwrap_or(Value::Undefined);
-            let value = crate::object::get(*obj, ctx.heap(), "1").unwrap_or(Value::Undefined);
-            Ok((key, value))
-        }
-        Value::String(s) => {
-            let units = s.to_utf16_vec();
-            let zero = units.first().copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(&[u], &ctx.cx.interp.string_heap_clone())
-                    .map(Value::String)
-                    .unwrap_or(Value::Undefined)
-            });
-            let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(&[u], &ctx.cx.interp.string_heap_clone())
                     .map(Value::String)
                     .unwrap_or(Value::Undefined)
             });

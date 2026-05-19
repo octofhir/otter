@@ -269,14 +269,93 @@ pub struct ErrorClassRegistry {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 #[must_use]
+/// §20.5.3.4 `Error.prototype.toString` — accessor-aware spec
+/// implementation. Walks `Get(O, "name")` / `Get(O, "message")`
+/// through the interpreter so user-defined getters fire and any
+/// abrupt completion (e.g. `Symbol` message → TypeError, throwing
+/// `valueOf` / `toString`) propagates.
+///
+/// Defaults follow §20.5.3.4: `name` defaults to `"Error"` when
+/// `Get` returns `undefined`; `message` defaults to the empty
+/// string. Both non-undefined values go through full `ToString`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
+pub(crate) fn render_error_to_string_spec(
+    interp: &mut crate::Interpreter,
+    context: &crate::ExecutionContext,
+    receiver: &Value,
+) -> Result<String, crate::VmError> {
+    fn coerce(
+        interp: &mut crate::Interpreter,
+        context: &crate::ExecutionContext,
+        receiver: &Value,
+        key: &'static str,
+        default: &str,
+    ) -> Result<String, crate::VmError> {
+        let vm_key = crate::VmPropertyKey::String(key);
+        let outcome = interp.ordinary_get_value(context, receiver.clone(), receiver.clone(), &vm_key, 0)?;
+        let value = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp.run_callable_sync(context, &getter, receiver.clone(), args)?
+            }
+        };
+        match value {
+            Value::Undefined => Ok(default.to_string()),
+            Value::Symbol(_) => Err(crate::VmError::TypeError {
+                message: format!("Cannot convert a Symbol value to a string ('{key}')"),
+            }),
+            Value::String(s) => Ok(s.to_lossy_string()),
+            Value::Null | Value::Boolean(_) | Value::Number(_) | Value::BigInt(_) => {
+                Ok(value.display_string())
+            }
+            _ => {
+                let primitive = interp.evaluate_to_primitive(
+                    context,
+                    &value,
+                    crate::abstract_ops::ToPrimitiveHint::String,
+                )?;
+                match primitive {
+                    Value::Symbol(_) => Err(crate::VmError::TypeError {
+                        message: format!("Cannot convert a Symbol value to a string ('{key}')"),
+                    }),
+                    Value::String(s) => Ok(s.to_lossy_string()),
+                    other => Ok(other.display_string()),
+                }
+            }
+        }
+    }
+
+    let name = coerce(interp, context, receiver, "name", "Error")?;
+    let message = coerce(interp, context, receiver, "message", "")?;
+    Ok(match (name.is_empty(), message.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => name,
+        (true, false) => message,
+        (false, false) => format!("{name}: {message}"),
+    })
+}
+
+/// Synchronous (non-spec) renderer used by the runtime's
+/// uncaught-throw diagnostic path. Cannot invoke accessors /
+/// `@@toPrimitive`; callers that need the spec semantics should use
+/// [`render_error_to_string_spec`].
 pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
     let Value::Object(obj) = value else {
         return value.display_string();
     };
+    // §20.5.3.4 defaults: `name` falls back to `"Error"` when
+    // missing / `undefined`; `message` falls back to the empty
+    // string. The synchronous render path (used by the unwind
+    // diagnostic) cannot invoke accessors / `@@toPrimitive` —
+    // `Error.prototype.toString` itself goes through
+    // [`render_error_to_string_spec`] for that.
     let name = match crate::object::get(*obj, gc_heap, "name") {
+        Some(Value::Undefined) | None => "Error".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(),
-        None => String::new(),
     };
     let message = match crate::object::get(*obj, gc_heap, "message") {
         Some(Value::String(s)) => s.to_lossy_string(),
@@ -371,7 +450,7 @@ impl ErrorClassRegistry {
             _args: &[Value],
         ) -> Result<Value, NativeError> {
             let receiver = ctx.this_value().clone();
-            // Step 2: Type(O) is not Object → TypeError.
+            // §20.5.3.4 step 2 — Type(O) is not Object → TypeError.
             let Value::Object(_) = &receiver else {
                 return Err(NativeError::TypeError {
                     name: "Error.prototype.toString",
@@ -379,7 +458,26 @@ impl ErrorClassRegistry {
                 });
             };
             let string_heap = ctx.interp_mut().string_heap_clone();
-            let display = render_error_to_string(&receiver, ctx.heap_mut());
+            let context = ctx
+                .execution_context()
+                .cloned()
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "Error.prototype.toString",
+                    reason: "missing execution context".to_string(),
+                })?;
+            let (interp, _) = ctx.interp_mut_and_context();
+            let display = render_error_to_string_spec(interp, &context, &receiver).map_err(
+                |err| match err {
+                    crate::VmError::Uncaught { value } => NativeError::Thrown {
+                        name: "Error.prototype.toString",
+                        message: value,
+                    },
+                    other => NativeError::TypeError {
+                        name: "Error.prototype.toString",
+                        reason: other.to_string(),
+                    },
+                },
+            )?;
             let s = JsString::from_str(&display, &string_heap).map_err(|err| {
                 NativeError::TypeError {
                     name: "Error.prototype.toString",

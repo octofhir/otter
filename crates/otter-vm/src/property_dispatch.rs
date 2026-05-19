@@ -1600,6 +1600,75 @@ impl Interpreter {
         }
     }
 
+    /// §10.1.9 `OrdinarySet` — descriptor-aware set that *invokes
+    /// accessor setters* via the synchronous interpreter entry. Used
+    /// by native helpers (e.g. `Object.assign` per §20.1.2.1
+    /// step 4.c.iii.2.b) that need full \[\[Set]] semantics outside
+    /// the bytecode dispatch loop. Returns `Ok(())` after the setter
+    /// completes; rejects in strict mode with TypeError when the
+    /// resolved descriptor is non-writable / accessor-without-setter /
+    /// non-extensible.
+    pub(crate) fn ordinary_set_with_callable_setter(
+        &mut self,
+        context: &ExecutionContext,
+        obj: JsObject,
+        key: &str,
+        value: Value,
+        strict: bool,
+    ) -> Result<(), VmError> {
+        match crate::object::resolve_set(obj, &self.gc_heap, key) {
+            object::SetOutcome::AssignData => {
+                if self.ordinary_set_data_property(obj, key, value)? {
+                    Ok(())
+                } else {
+                    Self::failed_set_result(
+                        strict,
+                        format!("Cannot assign to read-only property '{key}'"),
+                    )
+                }
+            }
+            object::SetOutcome::InvokeSetter { setter } => {
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.run_callable_sync(context, &setter, Value::Object(obj), args)?;
+                Ok(())
+            }
+            object::SetOutcome::Reject { .. } => {
+                Self::failed_set_result(strict, format!("Cannot assign to property '{key}'"))
+            }
+        }
+    }
+
+    /// Symbol-keyed counterpart to
+    /// [`Self::ordinary_set_with_callable_setter`]. Used by the
+    /// `Object.assign` symbol-key copy loop.
+    pub(crate) fn ordinary_set_symbol_with_callable_setter(
+        &mut self,
+        context: &ExecutionContext,
+        obj: JsObject,
+        sym: &crate::symbol::JsSymbol,
+        value: Value,
+        strict: bool,
+    ) -> Result<(), VmError> {
+        match crate::object::resolve_symbol_set(obj, &self.gc_heap, sym) {
+            object::SetOutcome::AssignData => {
+                if !crate::object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value) {
+                    Self::failed_set_result(strict, "Cannot assign to symbol property")?;
+                }
+                Ok(())
+            }
+            object::SetOutcome::InvokeSetter { setter } => {
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.run_callable_sync(context, &setter, Value::Object(obj), args)?;
+                Ok(())
+            }
+            object::SetOutcome::Reject { .. } => {
+                Self::failed_set_result(strict, "Cannot assign to symbol property")
+            }
+        }
+    }
+
     fn load_from_constructor_prototype(
         &mut self,
         context: &ExecutionContext,

@@ -774,7 +774,7 @@ impl Interpreter {
     /// copied yet — filed as a follow-up.
     fn do_object_assign(
         &mut self,
-        _context: &ExecutionContext,
+        context: &ExecutionContext,
         stack: &SmallVec<[Frame; 8]>,
         args: &[Value],
     ) -> Result<Value, VmError> {
@@ -823,7 +823,7 @@ impl Interpreter {
                         // *strict* flag, so frozen / sealed / non-
                         // writable / non-extensible targets surface
                         // TypeError instead of silently dropping.
-                        self.store_computed_ordinary_property(target, &k, v, true)?;
+                        self.ordinary_set_with_callable_setter(context, target, &k, v, true)?;
                     }
                     // §20.1.2.1 step 4.c.ii — `OwnPropertyKeys(O)`
                     // returns string keys followed by symbol keys.
@@ -833,12 +833,9 @@ impl Interpreter {
                             p.enumerable_symbol_data_iter().collect()
                         });
                     for (sym, v) in sym_entries {
-                        if !crate::object::set_symbol(target, self.gc_heap_mut(), sym, v) {
-                            return Err(VmError::TypeError {
-                                message: "Object.assign: cannot set symbol property on target"
-                                    .to_string(),
-                            });
-                        }
+                        self.ordinary_set_symbol_with_callable_setter(
+                            context, target, &sym, v, true,
+                        )?;
                     }
                 }
                 Value::Array(arr) => {
@@ -848,7 +845,8 @@ impl Interpreter {
                         els.iter().cloned().collect()
                     });
                     for (idx, v) in dense.into_iter().enumerate() {
-                        self.store_computed_ordinary_property(
+                        self.ordinary_set_with_callable_setter(
+                            context,
                             target,
                             &idx.to_string(),
                             v,
@@ -861,7 +859,7 @@ impl Interpreter {
                         })
                     });
                     for (k, v) in named {
-                        self.store_computed_ordinary_property(target, &k, v, true)?;
+                        self.ordinary_set_with_callable_setter(context, target, &k, v, true)?;
                     }
                 }
                 Value::String(s) => {
@@ -876,7 +874,8 @@ impl Interpreter {
                         let unit_string =
                             crate::string::JsString::from_utf16_units(units, &self.string_heap)
                                 .map_err(|_| VmError::TypeMismatch)?;
-                        self.store_computed_ordinary_property(
+                        self.ordinary_set_with_callable_setter(
+                            context,
                             target,
                             &idx.to_string(),
                             Value::String(unit_string),

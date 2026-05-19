@@ -115,7 +115,39 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
-    object::set(constructor, heap, "prototype", Value::Object(prototype));
+    // §22.1.2.3 — `String.prototype` is a non-writable, non-enumerable,
+    // non-configurable data property.
+    let _ = object::define_own_property(
+        constructor,
+        heap,
+        "prototype",
+        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+    );
+    // §22.1.2 — `String.length` is a non-writable, non-enumerable,
+    // configurable data property whose value is 1.
+    let _ = object::define_own_property(
+        constructor,
+        heap,
+        "length",
+        crate::object::PropertyDescriptor::data(
+            Value::Number(crate::number::NumberValue::from_i32(1)),
+            false,
+            false,
+            true,
+        ),
+    );
+    // §22.1.2 — `String.name` is `"String"`, non-writable,
+    // non-enumerable, configurable.
+    let string_name_value = Value::String(
+        crate::JsString::from_str("String", &crate::string::StringHeap::default())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let _ = object::define_own_property(
+        constructor,
+        heap,
+        "name",
+        crate::object::PropertyDescriptor::data(string_name_value, false, false, true),
+    );
 
     // §22.1.2 Properties of the String Constructor — install
     // JS-visible static method specs as ordinary own properties.

@@ -66,7 +66,40 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         object::set_prototype(statics, heap, Some(object_proto));
     }
     object::set_constructor_native(statics, heap, ctor_native_root);
-    object::set(statics, heap, "prototype", Value::Object(prototype));
+    // §20.3.2.1 — `Boolean.prototype` is a non-writable, non-enumerable,
+    // non-configurable data property.
+    let _ = object::define_own_property(
+        statics,
+        heap,
+        "prototype",
+        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+    );
+    // §20.3.2 — `Boolean.length` is a non-writable, non-enumerable,
+    // configurable data property whose value matches the constructor
+    // declared formal-parameter count (1).
+    let _ = object::define_own_property(
+        statics,
+        heap,
+        "length",
+        crate::object::PropertyDescriptor::data(
+            Value::Number(crate::number::NumberValue::from_i32(1)),
+            false,
+            false,
+            true,
+        ),
+    );
+    // §20.3.2 — `Boolean.name` is `"Boolean"`, non-writable,
+    // non-enumerable, configurable.
+    let name_value = Value::String(
+        crate::string::JsString::from_str("Boolean", &crate::string::StringHeap::default())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let _ = object::define_own_property(
+        statics,
+        heap,
+        "name",
+        crate::object::PropertyDescriptor::data(name_value, false, false, true),
+    );
     let boolean_value = Value::Object(statics);
     object::set(prototype, heap, "constructor", boolean_value.clone());
     crate::bootstrap::define_global_value(

@@ -1372,13 +1372,40 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // path looks up before falling back to ordinary property load.
     object::set_constructor_native(statics, heap, ctor_native_root);
     // `Number.prototype` lives as an own property on the
-    // constructor object (per §21.1.2.5). Spec posture is
-    // `[[Writable]]: false, [[Enumerable]]: false,
-    // [[Configurable]]: false`; ordinary `set` matches the first
-    // and third but installs as enumerable — the descriptor surface
-    // is tightened separately when the rest of the spec descriptors
-    // get audited.
-    object::set(statics, heap, "prototype", Value::Object(prototype));
+    // §21.1.2.5 — `Number.prototype` is a non-writable, non-enumerable,
+    // non-configurable data property.
+    let _ = object::define_own_property(
+        statics,
+        heap,
+        "prototype",
+        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+    );
+    // §21.1.2 — `Number.length` is a non-writable, non-enumerable,
+    // configurable data property whose value matches the formal
+    // parameter count of the constructor (1).
+    let _ = object::define_own_property(
+        statics,
+        heap,
+        "length",
+        crate::object::PropertyDescriptor::data(
+            Value::Number(crate::number::NumberValue::from_i32(1)),
+            false,
+            false,
+            true,
+        ),
+    );
+    // §21.1.2 — `Number.name` is `"Number"`, non-writable,
+    // non-enumerable, configurable.
+    let number_name_value = Value::String(
+        crate::string::JsString::from_str("Number", &crate::string::StringHeap::default())
+            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+    );
+    let _ = object::define_own_property(
+        statics,
+        heap,
+        "name",
+        crate::object::PropertyDescriptor::data(number_name_value, false, false, true),
+    );
 
     // §21.1.2 Number-namespace constants. Per spec, each is
     // `[[Writable]]: false, [[Enumerable]]: false,

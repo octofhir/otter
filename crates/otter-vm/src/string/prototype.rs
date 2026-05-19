@@ -1611,6 +1611,87 @@ fn native_string_method(
         return native_string_replace_callable(name == "replaceAll", ctx, args);
     }
     let receiver = ctx.this_value().clone();
+    // §B.2.3.* CreateHTML — `String.prototype.{anchor, big, blink,
+    // bold, fixed, fontcolor, fontsize, italics, link, small, strike,
+    // sub, sup}` and §B.2.3.1 `substr` start with
+    // `RequireObjectCoercible(this)` then `ToString(this)`. The
+    // intrinsic path's `receiver_string` only inspects internal
+    // slots, so non-wrapper Object receivers with a user `toString`
+    // (or one that throws) silently fall back to `"[object Object]"`.
+    // Pre-coerce here so the spec ToString ladder fires and Symbol
+    // / abrupt completions surface correctly.
+    let html_wrap = matches!(
+        name,
+        "anchor"
+            | "big"
+            | "blink"
+            | "bold"
+            | "fixed"
+            | "fontcolor"
+            | "fontsize"
+            | "italics"
+            | "link"
+            | "small"
+            | "strike"
+            | "sub"
+            | "sup"
+            | "substr"
+    );
+    let receiver = if html_wrap {
+        let needs_coerce = matches!(
+            receiver,
+            Value::Object(_)
+                | Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::Proxy(_)
+                | Value::RegExp(_)
+                | Value::Promise(_)
+                | Value::Map(_)
+                | Value::Set(_)
+        );
+        if matches!(receiver, Value::Null | Value::Undefined) {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "Cannot convert undefined or null to object".to_string(),
+            });
+        }
+        if needs_coerce
+            && let Some(exec) = ctx.execution_context().cloned()
+        {
+            let interp = ctx.interp_mut();
+            let s = interp
+                .coerce_to_string(&exec, &receiver)
+                .map_err(|e| match e {
+                    crate::VmError::Uncaught { value } => NativeError::Thrown {
+                        name,
+                        message: value,
+                    },
+                    crate::VmError::TypeError { message } => NativeError::TypeError {
+                        name,
+                        reason: message,
+                    },
+                    other => NativeError::TypeError {
+                        name,
+                        reason: other.to_string(),
+                    },
+                })?;
+            let string_heap = ctx.interp_mut().string_heap_clone();
+            Value::String(JsString::from_str(&s, &string_heap).map_err(|_| {
+                NativeError::TypeError {
+                    name,
+                    reason: "out of memory".to_string(),
+                }
+            })?)
+        } else {
+            receiver
+        }
+    } else {
+        receiver
+    };
     // §22.1.3.* String.prototype.* int / string arg coercion.
     // Mirrors the `Op::CallMethodValue` String arm in
     // `method_ops.rs` so `.call(...)` / `.apply(...)` invocations

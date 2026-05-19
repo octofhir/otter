@@ -63,6 +63,12 @@ pub struct ArrayBody {
     /// the `named_properties` data entry. Spec: §10.4.2.1
     /// ArrayExoticObject [[DefineOwnProperty]].
     pub(crate) accessors: Option<HashMap<String, (Option<Value>, Option<Value>)>>,
+    /// Symbol-keyed own properties. Stored as a vector of
+    /// `(JsSymbol, Value)` pairs (mirroring `JsObject::symbol_props`)
+    /// because `JsSymbol` is identity-based — `ptr_eq` is the
+    /// authoritative comparator. Typical arrays have zero entries,
+    /// so the `Option` keeps the inline footprint at one word.
+    pub(crate) symbol_properties: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
     /// Verbatim slice of input text captured by `JSON.parse` for the
     /// lazy stringify memcpy fast-path. `Some` only when the array
     /// originated from `JSON.parse`; the slice spans the closing
@@ -101,6 +107,11 @@ impl otter_gc::SafeTraceable for ArrayBody {
                 if let Some(s) = set {
                     s.trace_value_slots(visitor);
                 }
+            }
+        }
+        if let Some(sym_props) = &self.symbol_properties {
+            for (_sym, value) in sym_props {
+                value.trace_value_slots(visitor);
             }
         }
     }
@@ -487,6 +498,79 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
             Some(Value::Hole) | None => Value::Undefined,
             Some(other) => other,
         }
+    })
+}
+
+/// Install a symbol-keyed own property on the array exotic body.
+/// Replaces the existing slot if the symbol is already present —
+/// matching JsObject's symbol-property semantics. Used by the
+/// `StoreElement` dispatch and reflective `Object.defineProperty`
+/// when the key is a `Symbol`.
+pub fn set_symbol_property(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: &crate::symbol::JsSymbol,
+    value: Value,
+) {
+    let barrier_value = value.clone();
+    heap.with_payload(arr, |body| {
+        let table = body.symbol_properties.get_or_insert_with(Vec::new);
+        if let Some(slot) = table.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
+            slot.1 = value;
+        } else {
+            table.push((key.clone(), value));
+        }
+        body.dirty = true;
+    });
+    heap.record_write(arr, &barrier_value);
+}
+
+/// Read a symbol-keyed own property. Returns `None` when the slot
+/// is absent.
+#[must_use]
+pub fn get_symbol_property(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    key: &crate::symbol::JsSymbol,
+) -> Option<Value> {
+    heap.read_payload(arr, |body| {
+        body.symbol_properties
+            .as_ref()
+            .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| v.clone()))
+    })
+}
+
+/// Remove a symbol-keyed own property. Returns `true` when the
+/// slot was present and removed (matches `OrdinaryDelete`
+/// success). Returns `true` when absent (spec step 2: missing →
+/// success).
+pub fn delete_symbol_property(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: &crate::symbol::JsSymbol,
+) -> bool {
+    heap.with_payload(arr, |body| {
+        if let Some(table) = body.symbol_properties.as_mut() {
+            if let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key)) {
+                table.remove(pos);
+                if table.is_empty() {
+                    body.symbol_properties = None;
+                }
+                body.dirty = true;
+            }
+        }
+        true
+    })
+}
+
+/// Iterate own symbol-keyed property keys in insertion order. Used
+/// by `Object.getOwnPropertySymbols(arr)` and the ownKeys ladder.
+#[must_use]
+pub fn own_symbol_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<crate::symbol::JsSymbol> {
+    heap.read_payload(arr, |body| {
+        body.symbol_properties
+            .as_ref()
+            .map_or_else(Vec::new, |t| t.iter().map(|(k, _)| k.clone()).collect())
     })
 }
 

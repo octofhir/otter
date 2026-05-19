@@ -400,6 +400,9 @@ impl Interpreter {
             (Value::Array(arr), Value::String(s)) => {
                 crate::array::delete_named_property(*arr, &mut self.gc_heap, &s.to_lossy_string())
             }
+            (Value::Array(arr), Value::Symbol(sym)) => {
+                crate::array::delete_symbol_property(*arr, &mut self.gc_heap, &sym)
+            }
             // §10.4.3 String exotic objects expose a non-configurable
             // own property at every valid character index; integer
             // indices in `[0, length)` therefore reject deletion,
@@ -1090,7 +1093,33 @@ impl Interpreter {
                     .well_known_tag()
                     .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
             {
-                make_array_iterator_factory(*arr, &mut self.gc_heap)?
+                // §22.1.5.1 — own Symbol.iterator override on the
+                // array exotic body wins over the prototype slot so
+                // user-installed `arr[Symbol.iterator] = fn` is
+                // observable.
+                if let Some(v) = crate::array::get_symbol_property(*arr, &self.gc_heap, sym) {
+                    v
+                } else {
+                    make_array_iterator_factory(*arr, &mut self.gc_heap)?
+                }
+            }
+            // §22.1 Array exotic — symbol-keyed access reads the
+            // array's own symbol table first (e.g.
+            // `arr[Symbol.toStringTag]`); on miss, walks
+            // `Array.prototype` so inherited symbol-keyed members
+            // (e.g. `@@toStringTag` accessor) still resolve.
+            (Value::Array(arr), Value::Symbol(sym)) => {
+                match crate::array::get_symbol_property(*arr, &self.gc_heap, sym) {
+                    Some(v) => v,
+                    None => {
+                        let proto = self.constructor_prototype_value("Array")?;
+                        if let Value::Object(p) = proto {
+                            crate::object::get_symbol(p, &self.gc_heap, sym).unwrap_or(Value::Undefined)
+                        } else {
+                            Value::Undefined
+                        }
+                    }
+                }
             }
             // Computed string-key access on Array exotic objects:
             // `arr["0"]`, `arr["length"]`, `arr[i]` after `for (i in
@@ -1452,14 +1481,14 @@ impl Interpreter {
                     }
                 }
             }
-            // §22.1 Array exotic — Symbol-keyed writes are
-            // accepted but the foundation Array layout has no
-            // symbol-slot storage, so the property is dropped on
-            // the floor. Callers that read it back see
-            // `undefined`, which matches the spec default for the
-            // `Symbol.isConcatSpreadable` / `Symbol.iterator`
-            // queries the runtime fast-paths handle separately.
-            (Value::Array(_), Value::Symbol(_)) => {}
+            // §22.1 Array exotic — symbol-keyed writes land in the
+            // per-array symbol-property table so reflective probes
+            // (`arr[Symbol.toStringTag] = "X"`,
+            // `Object.getOwnPropertySymbols(arr)`,
+            // `arr[Symbol.iterator] = fn`) round-trip.
+            (Value::Array(arr), Value::Symbol(sym)) => {
+                crate::array::set_symbol_property(*arr, &mut self.gc_heap, sym, value);
+            }
             // §22.1 Array exotic — string-keyed write of an
             // integer-string lands as a dense element; everything
             // else stores on the named-properties side table so
@@ -1542,6 +1571,68 @@ impl Interpreter {
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on TypedArray".to_string(),
+                    });
+                }
+            }
+            // §22.2.6 / §27.2.5 — exotic objects that carry a lazy
+            // expando bag persist user-installed symbol-keyed
+            // properties there. Without this, `re[Symbol.toStringTag]
+            // = "tag"` and similar reflective writes would surface a
+            // bogus `TypeMismatch`.
+            (Value::RegExp(r), Value::Symbol(sym)) => {
+                let bag = regexp_ensure_expando(self, r, &recv)?;
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot store symbol property on RegExp".to_string(),
+                    });
+                }
+            }
+            (Value::Promise(p), Value::Symbol(sym)) => {
+                let bag = promise_ensure_expando_pub(&mut self.gc_heap, p)?;
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot store symbol property on Promise".to_string(),
+                    });
+                }
+            }
+            // Heap-allocated callable wrappers expose the
+            // function user-property bag for symbol-keyed writes
+            // exactly like string-keyed ones.
+            (
+                Value::Function { function_id } | Value::Closure { function_id, .. },
+                Value::Symbol(sym),
+            ) => {
+                let bag = self.function_user_bag_stack_rooted(
+                    stack,
+                    *function_id,
+                    &[&recv, &idx_value, &value],
+                )?;
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot store symbol property on function".to_string(),
+                    });
+                }
+            }
+            (Value::NativeFunction(native), Value::Symbol(sym)) => {
+                let desc = object::PartialPropertyDescriptor {
+                    value: Some(value.clone()),
+                    writable: Some(true),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    ..Default::default()
+                };
+                native.define_own_symbol_property(&mut self.gc_heap, sym, desc);
+            }
+            (Value::ClassConstructor(c), Value::Symbol(sym)) => {
+                let statics = c.statics(&self.gc_heap);
+                if !crate::object::set_symbol(
+                    statics,
+                    &mut self.gc_heap,
+                    sym.clone(),
+                    value.clone(),
+                ) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot store symbol property on class constructor".to_string(),
                     });
                 }
             }
@@ -3293,6 +3384,14 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
             // string-keyed properties through the named-properties
             // side table. `in` must consult it before falling through.
             crate::array::get_named_property(arr, &interpreter.gc_heap, &key).is_some()
+        }
+        // §22.1 Array exotic — symbol-keyed own properties live in a
+        // dedicated side table; surface them through the `in`
+        // operator so reflective probes
+        // (`Symbol.toStringTag in arr`,
+        // `Symbol.iterator in arr`) observe the installed values.
+        Value::Symbol(sym) => {
+            crate::array::get_symbol_property(arr, &interpreter.gc_heap, sym).is_some()
         }
         _ => false,
     }

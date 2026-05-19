@@ -1362,6 +1362,14 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     };
     let key_value = args.args.first().cloned().unwrap_or(Value::Undefined);
     let heap = &*args.gc_heap;
+    // §22.1 — symbol-keyed own properties live in the per-array
+    // symbol table. Surface them before the string-keyed paths so
+    // `arr.hasOwnProperty(Symbol.toStringTag)` round-trips.
+    if let Value::Symbol(sym) = &key_value {
+        return Ok(Value::Boolean(
+            array::get_symbol_property(*arr, heap, sym).is_some(),
+        ));
+    }
     // Try indexed first.
     let key_string: String = match &key_value {
         Value::String(s) => s.to_lossy_string(),

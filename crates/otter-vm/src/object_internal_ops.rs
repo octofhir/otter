@@ -437,6 +437,17 @@ impl Interpreter {
                 })
             }
             Value::Array(arr) => {
+                // §10.4.2 — own symbol-keyed properties live in a
+                // dedicated side table; surface their data
+                // descriptor before the string-keyed paths so
+                // `Object.getOwnPropertyDescriptor(arr, sym)` and
+                // `hasOwnProperty(sym)` observe the spec shape.
+                if let VmPropertyKey::Symbol(sym) = key {
+                    if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, sym) {
+                        return Ok(Some(object::PropertyDescriptor::data(value, true, true, true)));
+                    }
+                    return Ok(None);
+                }
                 let Some(key) = key.string_name() else {
                     return Ok(None);
                 };
@@ -863,6 +874,16 @@ impl Interpreter {
             // — descriptor attribute enforcement on those slots is
             // tracked separately.
             Value::Array(arr) => {
+                // §10.4.2 — symbol-keyed defineProperty on an Array
+                // stores into the per-array symbol-property table.
+                // Accessor descriptors are currently flattened to
+                // data values; full descriptor attributes will land
+                // alongside the rest of the array attribute story.
+                if let VmPropertyKey::Symbol(sym) = key {
+                    let value = descriptor.value.clone().unwrap_or(Value::Undefined);
+                    array::set_symbol_property(*arr, &mut self.gc_heap, sym, value);
+                    return Ok(true);
+                }
                 let Some(k) = key.string_name() else {
                     return Ok(false);
                 };
@@ -1242,7 +1263,7 @@ impl Interpreter {
             }
             Value::Array(arr) => {
                 let len = array::len(*arr, &self.gc_heap);
-                let mut keys: Vec<Value> = Vec::with_capacity(len + 1);
+                let mut keys: Vec<Value> = Vec::with_capacity(len + 2);
                 for idx in 0..len {
                     if array::has_own_element(*arr, &self.gc_heap, idx) {
                         let key = idx.to_string();
@@ -1255,6 +1276,12 @@ impl Interpreter {
                 keys.push(Value::String(
                     string::JsString::from_str("length", string_heap).map_err(VmError::from)?,
                 ));
+                // §10.4.2 — own symbol-keyed properties follow the
+                // string keys per §7.3.22 OrdinaryOwnPropertyKeys
+                // ordering.
+                for sym in array::own_symbol_keys(*arr, &self.gc_heap) {
+                    keys.push(Value::Symbol(sym));
+                }
                 Ok(keys)
             }
             Value::NativeFunction(native) => {
@@ -1791,14 +1818,36 @@ impl Interpreter {
             }
             Value::Array(arr) => {
                 let value = match key {
-                    VmPropertyKey::Symbol(sym)
-                        if sym
+                    VmPropertyKey::Symbol(sym) => {
+                        // §22.1 Array exotic — own symbol-keyed slot
+                        // wins over the prototype walk, matching the
+                        // `OrdinaryGet` ladder for ordinary objects.
+                        if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
+                            v
+                        } else if sym
                             .well_known_tag()
-                            .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-                    {
-                        make_array_iterator_factory_runtime_rooted(self, arr)?
+                            .is_some_and(|t| t == symbol::WellKnown::Iterator)
+                        {
+                            make_array_iterator_factory_runtime_rooted(self, arr)?
+                        } else {
+                            // §22.1.3 — walk Array.prototype for
+                            // inherited symbol-keyed members
+                            // (`@@toStringTag` accessor, etc.).
+                            let proto = self.constructor_prototype_value("Array")?;
+                            match proto {
+                                Value::Object(p) => {
+                                    return self.ordinary_get_value(
+                                        context,
+                                        Value::Object(p),
+                                        receiver,
+                                        key,
+                                        hops + 1,
+                                    );
+                                }
+                                _ => Value::Undefined,
+                            }
+                        }
                     }
-                    VmPropertyKey::Symbol(_) => Value::Undefined,
                     _ => {
                         let key_str = key
                             .string_name()
@@ -1847,11 +1896,28 @@ impl Interpreter {
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let value = match key {
-                    VmPropertyKey::Symbol(sym) => self
-                        .function_prototype_object()
-                        .ok()
-                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                        .unwrap_or(Value::Undefined),
+                    VmPropertyKey::Symbol(sym) => {
+                        // §10.2 ordinary function exotic — own
+                        // symbol-keyed properties live in the lazy
+                        // user-props bag (`f[Symbol.toStringTag] =
+                        // "tag"`). Surface those before walking
+                        // `Function.prototype` so reflective probes
+                        // (`Object.prototype.toString.call(f)`)
+                        // observe the override.
+                        let own_symbol = self
+                            .function_user_props
+                            .get(&function_id)
+                            .copied()
+                            .and_then(|bag| object::get_symbol(bag, &self.gc_heap, sym));
+                        match own_symbol {
+                            Some(v) => v,
+                            None => self
+                                .function_prototype_object()
+                                .ok()
+                                .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                                .unwrap_or(Value::Undefined),
+                        }
+                    }
                     _ => self.function_property_get(
                         context,
                         function_id,
@@ -2263,7 +2329,19 @@ impl Interpreter {
                 {
                     Ok(true)
                 }
-                VmPropertyKey::Symbol(_) => Ok(false),
+                VmPropertyKey::Symbol(sym) => {
+                    // Own symbol-keyed slot → present; otherwise
+                    // walk Array.prototype so inherited symbol keys
+                    // resolve (`@@toStringTag` accessor, etc.).
+                    if array::get_symbol_property(arr, &self.gc_heap, sym).is_some() {
+                        return Ok(true);
+                    }
+                    let proto = self.constructor_prototype_value("Array")?;
+                    if matches!(proto, Value::Null) {
+                        return Ok(false);
+                    }
+                    self.ordinary_has_property_value(context, proto, key, hops + 1)
+                }
                 _ if key.string_name().is_some_and(|k| k == "length") => Ok(true),
                 _ => {
                     let k = key
@@ -2733,9 +2811,14 @@ impl Interpreter {
                     true
                 })
             }
-            Value::Array(arr) => Ok(match key.string_name() {
-                Some(key) => array::delete_named_property(arr, &mut self.gc_heap, key),
-                None => true,
+            Value::Array(arr) => Ok(match key {
+                VmPropertyKey::Symbol(sym) => {
+                    array::delete_symbol_property(arr, &mut self.gc_heap, sym)
+                }
+                _ => match key.string_name() {
+                    Some(k) => array::delete_named_property(arr, &mut self.gc_heap, k),
+                    None => true,
+                },
             }),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 Ok(if let Some(key) = key.string_name() {

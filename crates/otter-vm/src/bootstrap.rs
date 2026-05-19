@@ -1064,6 +1064,100 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         global,
         well_known,
     )?;
+    // Default `get <Ctor>[@@species]` returning `this` for every
+    // subclassing-aware constructor that the spec lists in the
+    // species table. Each accessor body is identical (§7.3.21:
+    // SpeciesConstructor consults this slot when present).
+    //
+    // - Array      §23.1.2.4 https://tc39.es/ecma262/#sec-get-array-@@species
+    // - Map        §24.1.2.1 https://tc39.es/ecma262/#sec-get-map-@@species
+    // - Set        §24.2.2.1 https://tc39.es/ecma262/#sec-get-set-@@species
+    // - RegExp     §22.2.5.1 https://tc39.es/ecma262/#sec-get-regexp-@@species
+    // - ArrayBuffer       §25.1.5.3 https://tc39.es/ecma262/#sec-get-arraybuffer-@@species
+    // - SharedArrayBuffer §25.2.4.2 https://tc39.es/ecma262/#sec-sharedarraybuffer-@@species
+    for ctor_name in [
+        "Array",
+        "Map",
+        "Set",
+        "RegExp",
+        "ArrayBuffer",
+        "SharedArrayBuffer",
+    ] {
+        install_constructor_species_accessor(heap, string_heap, global, well_known, ctor_name)?;
+    }
+    Ok(())
+}
+
+/// Install the default `get <Ctor>[@@species]` accessor — returns the
+/// `this` value, configurable, non-enumerable. Used by every
+/// subclassing-aware builtin per §22.1.2.5 (Array), §24.1.2.1 (Map),
+/// §24.2.2.1 (Set), §22.2.5.1 (RegExp), §25.1.5.3 (ArrayBuffer),
+/// §25.2.4.2 (SharedArrayBuffer).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-symbol.species>
+fn install_constructor_species_accessor(
+    heap: &mut otter_gc::GcHeap,
+    _string_heap: &crate::string::StringHeap,
+    global: JsObject,
+    well_known: &crate::symbol::WellKnownSymbols,
+    ctor_name: &'static str,
+) -> Result<(), JsSurfaceError> {
+    use crate::symbol::WellKnown;
+
+    fn species_get(
+        ctx: &mut crate::NativeCtx<'_>,
+        _args: &[Value],
+    ) -> Result<Value, crate::NativeError> {
+        Ok(ctx.this_value().clone())
+    }
+
+    let Some(ctor_value) = object::get(global, heap, ctor_name) else {
+        return Ok(());
+    };
+    let global_root = Value::Object(global);
+    let ctor_root = ctor_value.clone();
+    let species_getter = native_static_with_value_roots(
+        heap,
+        "get [Symbol.species]",
+        0,
+        species_get,
+        &[&global_root, &ctor_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let species_sym = well_known.get(WellKnown::Species);
+    let installed = match ctor_value {
+        Value::NativeFunction(f) => f.define_own_symbol_property(
+            heap,
+            &species_sym,
+            crate::object::PartialPropertyDescriptor {
+                get: Some(Value::NativeFunction(species_getter)),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        ),
+        Value::Object(obj) => {
+            crate::object::define_own_symbol_property_partial(
+                obj,
+                heap,
+                &species_sym,
+                crate::object::PartialPropertyDescriptor {
+                    get: Some(Value::NativeFunction(species_getter)),
+                    enumerable: Some(false),
+                    configurable: Some(true),
+                    ..Default::default()
+                },
+            );
+            true
+        }
+        _ => return Ok(()),
+    };
+    if !installed {
+        return Err(JsSurfaceError::DefinePropertyFailed(
+            "constructor[Symbol.species]",
+        ));
+    }
     Ok(())
 }
 

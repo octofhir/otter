@@ -990,10 +990,35 @@ pub fn install_symbol_well_knowns_post_bootstrap(
 
     // §22.2 / §25.1 / §25.4 — install `@@toStringTag` on standard
     // namespace objects so `Object.prototype.toString.call(NS)`
-    // returns the spec-required `"[object <NS>]"` form.
+    // returns the spec-required `"[object <NS>]"` form. Also wire
+    // their `[[Prototype]]` to `%Object.prototype%` per §21.3.1 /
+    // §25.5.1 / §28.1 so inherited reads (`Math.hasOwnProperty`,
+    // `Object.prototype.value` shadowing during `ToPropertyDescriptor`)
+    // resolve correctly.
     let to_string_tag_sym = well_known.get(WellKnown::ToStringTag);
+    let object_proto = object::get(global, heap, "Object")
+        .and_then(|v| match v {
+            Value::NativeFunction(ctor) => ctor
+                .own_property_descriptor(heap, string_heap, "prototype")
+                .ok()
+                .flatten()
+                .and_then(|d| match d.kind {
+                    crate::object::DescriptorKind::Data {
+                        value: Value::Object(p),
+                    } => Some(p),
+                    _ => None,
+                }),
+            Value::Object(ctor) => match object::get(ctor, heap, "prototype") {
+                Some(Value::Object(p)) => Some(p),
+                _ => None,
+            },
+            _ => None,
+        });
     for ns_name in ["Math", "JSON", "Reflect", "Atomics"] {
         if let Some(Value::Object(ns)) = object::get(global, heap, ns_name) {
+            if let Some(proto) = object_proto {
+                object::set_prototype(ns, heap, Some(proto));
+            }
             let tag = crate::string::JsString::from_str(ns_name, string_heap)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
             object::define_own_symbol_property_partial(

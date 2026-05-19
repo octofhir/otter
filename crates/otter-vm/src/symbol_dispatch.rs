@@ -146,10 +146,19 @@ fn construct_symbol(interp: &Interpreter, args: &[Value]) -> Result<Value, Symbo
     let description = match args.first() {
         None | Some(Value::Undefined) => None,
         Some(Value::String(s)) => Some(s.clone()),
+        // §7.1.17 ToString rejects Symbol with TypeError.
+        Some(Value::Symbol(_)) => {
+            return Err(SymbolError::BadArgument {
+                name: "Symbol",
+                index: 0,
+                reason: "Cannot convert a Symbol value to a string",
+            });
+        }
         // Spec coerces to string with `ToString`. Foundation
-        // intentionally narrows to literal strings until a real
-        // `ToString` ladder lands; descriptions for primitives
-        // round-trip via `Value::display_string`.
+        // narrows to non-Symbol primitives plus a fallback to
+        // `display_string` for Object operands (no `@@toPrimitive` /
+        // `toString` invocation here — the `Op::SymbolCall`
+        // dispatcher has no `ExecutionContext`).
         Some(other) => {
             let rendered = JsString::from_str(&other.display_string(), &interp.string_heap)?;
             Some(rendered)
@@ -193,6 +202,7 @@ fn symbol_key_for(interp: &Interpreter, args: &[Value]) -> Result<Value, SymbolE
 /// Spec invokes ToString; foundation accepts strings and
 /// non-`Symbol` primitives directly.
 fn key_argument(args: &[Value], name: &'static str) -> Result<String, SymbolError> {
+    let _ = name;
     match args.first() {
         None | Some(Value::Undefined) => Ok("undefined".to_string()),
         Some(Value::String(s)) => Ok(s.to_lossy_string()),

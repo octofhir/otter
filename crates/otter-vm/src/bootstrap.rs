@@ -618,38 +618,80 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         }
         let description = match args.first() {
             None | Some(Value::Undefined) => None,
-            Some(Value::Symbol(_)) => {
-                return Err(NativeError::TypeError {
-                    name: "Symbol",
-                    reason: "Cannot convert a Symbol value to a string".to_string(),
-                });
-            }
             Some(other) => {
+                let coerced = symbol_to_string_arg(ctx, other, "Symbol")?;
                 let string_heap = ctx.interp_mut().string_heap_clone();
-                let rendered =
-                    crate::string::JsString::from_str(&other.display_string(), &string_heap)
-                        .map_err(|_| NativeError::TypeError {
-                            name: "Symbol",
-                            reason: "out of memory".to_string(),
-                        })?;
+                let rendered = crate::string::JsString::from_str(&coerced, &string_heap)
+                    .map_err(|_| NativeError::TypeError {
+                        name: "Symbol",
+                        reason: "out of memory".to_string(),
+                    })?;
                 Some(rendered)
             }
         };
         Ok(Value::Symbol(crate::symbol::JsSymbol::new(description)))
     }
 
+    /// §7.1.17 ToString applied to a `Symbol(description)` /
+    /// `Symbol.for(key)` argument. Symbol operands throw TypeError;
+    /// object operands flow through `evaluate_to_primitive` so user
+    /// `toString` / `valueOf` / `@@toPrimitive` overrides fire.
+    fn symbol_to_string_arg(
+        ctx: &mut NativeCtx<'_>,
+        value: &Value,
+        ctor_name: &'static str,
+    ) -> Result<String, NativeError> {
+        match value {
+            Value::Undefined => Ok("undefined".to_string()),
+            Value::Null => Ok("null".to_string()),
+            Value::String(s) => Ok(s.to_lossy_string()),
+            Value::Symbol(_) => Err(NativeError::TypeError {
+                name: ctor_name,
+                reason: "Cannot convert a Symbol value to a string".to_string(),
+            }),
+            Value::Boolean(_) | Value::Number(_) | Value::BigInt(_) => Ok(value.display_string()),
+            _ => {
+                let context = ctx
+                    .execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: ctor_name,
+                        reason: "missing execution context".to_string(),
+                    })?;
+                let primitive = ctx
+                    .cx
+                    .interp
+                    .evaluate_to_primitive(
+                        &context,
+                        value,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )
+                    .map_err(|e| match e {
+                        crate::VmError::Uncaught { value } => NativeError::Thrown {
+                            name: ctor_name,
+                            message: value,
+                        },
+                        other => NativeError::TypeError {
+                            name: ctor_name,
+                            reason: other.to_string(),
+                        },
+                    })?;
+                match primitive {
+                    Value::Symbol(_) => Err(NativeError::TypeError {
+                        name: ctor_name,
+                        reason: "Cannot convert a Symbol value to a string".to_string(),
+                    }),
+                    Value::String(s) => Ok(s.to_lossy_string()),
+                    other => Ok(other.display_string()),
+                }
+            }
+        }
+    }
+
     fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let key = match args.first() {
             None | Some(Value::Undefined) => "undefined".to_string(),
-            Some(Value::Null) => "null".to_string(),
-            Some(Value::String(s)) => s.to_lossy_string(),
-            Some(Value::Symbol(_)) => {
-                return Err(NativeError::TypeError {
-                    name: "Symbol.for",
-                    reason: "Cannot convert a Symbol value to a string".to_string(),
-                });
-            }
-            Some(other) => other.display_string(),
+            Some(other) => symbol_to_string_arg(ctx, &other.clone(), "Symbol.for")?,
         };
         let string_heap = ctx.interp_mut().string_heap_clone();
         let sym = ctx

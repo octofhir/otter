@@ -1953,7 +1953,32 @@ impl Interpreter {
             _ => return Ok(false),
         };
 
-        if matches!(receiver, Value::Object(_) | Value::Proxy(_)) {
+        // Heap values that walk a prototype chain in `ordinary_get_value`.
+        // `Array` / `TypedArray` / primitive wrappers / `BoundFunction` /
+        // function callables keep their own legacy fast paths below; the
+        // arms listed here previously fell through to a TypeMismatch on
+        // symbol / numeric keys because the slow `run_load_element_regs`
+        // path had no matching arm. Routing them through the common
+        // `[[Get]]` substrate gives Generator / Iterator / Map / Set /
+        // WeakRef / Promise / ArrayBuffer / DataView consistent symbol
+        // and numeric-key behaviour (notably `@@toStringTag`).
+        let prototype_routed = matches!(
+            receiver,
+            Value::Object(_)
+                | Value::Proxy(_)
+                | Value::Generator(_)
+                | Value::Iterator(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Promise(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+        );
+        if prototype_routed {
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {

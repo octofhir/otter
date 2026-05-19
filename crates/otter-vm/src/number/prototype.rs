@@ -66,25 +66,42 @@ fn receiver_number(args: &IntrinsicArgs<'_>) -> Result<NumberValue, IntrinsicErr
 /// `Number.prototype.toString(radix = 10)`.
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_number(args)?;
+    // §21.1.3.6 step 2 — `radix` defaults to 10 when `undefined`,
+    // otherwise routes through `ToIntegerOrInfinity`. Out-of-range
+    // (`< 2` or `> 36`) raises RangeError. Symbol / BigInt raise
+    // TypeError (mapped at the intrinsic error layer).
     let radix: u32 = match args.args.first() {
         None | Some(Value::Undefined) => 10,
-        Some(Value::Number(n)) => {
-            let r = n.as_f64();
-            // §21.1.3.6 step 4: radix outside `[2, 36]` raises
-            // `RangeError`.
-            if !r.is_finite() || !(2.0..=36.0).contains(&r) || r.fract() != 0.0 {
+        Some(Value::Symbol(_)) => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "Cannot convert a Symbol value to a number",
+            });
+        }
+        Some(Value::BigInt(_)) => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "Cannot convert a BigInt value to a number",
+            });
+        }
+        Some(other) => {
+            let f = match other {
+                Value::Number(n) => n.as_f64(),
+                Value::Boolean(true) => 1.0,
+                Value::Boolean(false) | Value::Null => 0.0,
+                Value::String(s) => {
+                    crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+                }
+                _ => f64::NAN,
+            };
+            let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
+            if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
                 return Err(IntrinsicError::OutOfRange {
                     index: 0,
                     reason: "must be an integer in 2..=36",
                 });
             }
-            r as u32
-        }
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a number",
-            });
+            trunc as u32
         }
     };
     if radix == 10 {

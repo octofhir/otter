@@ -818,7 +818,12 @@ impl Interpreter {
                                 .collect()
                         });
                     for (k, v) in entries {
-                        self.set_property(target, &k, v)?;
+                        // §20.1.2.1 step 4.c.iii.2.b — `Set(to, nextKey,
+                        // propValue, true)` runs OrdinarySet with the
+                        // *strict* flag, so frozen / sealed / non-
+                        // writable / non-extensible targets surface
+                        // TypeError instead of silently dropping.
+                        self.store_computed_ordinary_property(target, &k, v, true)?;
                     }
                 }
                 Value::Array(arr) => {
@@ -828,7 +833,12 @@ impl Interpreter {
                         els.iter().cloned().collect()
                     });
                     for (idx, v) in dense.into_iter().enumerate() {
-                        self.set_property(target, &idx.to_string(), v)?;
+                        self.store_computed_ordinary_property(
+                            target,
+                            &idx.to_string(),
+                            v,
+                            true,
+                        )?;
                     }
                     let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
                         body.named_properties.as_ref().map_or_else(Vec::new, |m| {
@@ -836,7 +846,7 @@ impl Interpreter {
                         })
                     });
                     for (k, v) in named {
-                        self.set_property(target, &k, v)?;
+                        self.store_computed_ordinary_property(target, &k, v, true)?;
                     }
                 }
                 Value::String(s) => {
@@ -851,7 +861,12 @@ impl Interpreter {
                         let unit_string =
                             crate::string::JsString::from_utf16_units(units, &self.string_heap)
                                 .map_err(|_| VmError::TypeMismatch)?;
-                        self.set_property(target, &idx.to_string(), Value::String(unit_string))?;
+                        self.store_computed_ordinary_property(
+                            target,
+                            &idx.to_string(),
+                            Value::String(unit_string),
+                            true,
+                        )?;
                     }
                 }
                 _ => {

@@ -1572,7 +1572,7 @@ impl Interpreter {
 
     /// Apply descriptor-aware data assignment for computed ordinary-object
     /// writes (`obj[key] = value`).
-    fn store_computed_ordinary_property(
+    pub(crate) fn store_computed_ordinary_property(
         &mut self,
         obj: JsObject,
         key: &str,

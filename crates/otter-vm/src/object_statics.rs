@@ -2371,8 +2371,10 @@ pub fn call(
         // §20.1.2.18 Object.preventExtensions(O)
         M::PreventExtensions => {
             let arg = args.first().cloned().unwrap_or(Value::Undefined);
-            if let Value::Object(o) = &arg {
-                crate::object::prevent_extensions(*o, gc_heap);
+            match &arg {
+                Value::Object(o) => crate::object::prevent_extensions(*o, gc_heap),
+                Value::Array(a) => crate::array::prevent_extensions(*a, gc_heap),
+                _ => {}
             }
             Ok(arg)
         }
@@ -2461,12 +2463,12 @@ pub fn call(
             // null / undefined sentinels return false.
             let result = match arg {
                 Value::Object(o) => crate::object::is_extensible(o, gc_heap),
+                Value::Array(arr) => crate::array::is_extensible(arr, gc_heap),
                 Value::Function { .. }
                 | Value::Closure { .. }
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
                 | Value::ClassConstructor(_)
-                | Value::Array(_)
                 | Value::RegExp(_)
                 | Value::Map(_)
                 | Value::Set(_)

@@ -707,6 +707,7 @@ impl Interpreter {
                 }
             }
             Value::Object(obj) => Ok(object::is_extensible(*obj, &self.gc_heap)),
+            Value::Array(arr) => Ok(array::is_extensible(*arr, &self.gc_heap)),
             // Per §10.1.3 every other ordinary heap value is extensible
             // by default. Non-object primitives never reach this path
             // (callers gate via `Type(O) is Object`).
@@ -1587,6 +1588,10 @@ impl Interpreter {
             Value::Object(obj) => {
                 let heap = &mut self.gc_heap;
                 object::prevent_extensions(*obj, heap);
+                Ok(true)
+            }
+            Value::Array(arr) => {
+                array::prevent_extensions(*arr, &mut self.gc_heap);
                 Ok(true)
             }
             _ => Ok(true),

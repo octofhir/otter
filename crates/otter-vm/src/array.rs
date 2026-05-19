@@ -80,6 +80,24 @@ pub struct ArrayBody {
     /// was captured. Always `false` while `source_bytes` is `None`
     /// (no fast path is in play to invalidate).
     pub(crate) dirty: bool,
+    /// `[[Extensible]]` internal slot per §10.1.3. Starts `true`
+    /// (`Default::default()`); flipped to `false` by
+    /// `Object.preventExtensions` / `seal` / `freeze` on the array
+    /// exotic. New string-keyed writes against a non-extensible
+    /// array are rejected by the foundation OrdinarySet path.
+    pub(crate) extensible: ExtensibleFlag,
+}
+
+/// One-byte `[[Extensible]]` slot. Wrapper around `bool` with a
+/// `Default = true` impl so [`ArrayBody::default()`] keeps the spec
+/// initial state without spelling the field on every constructor.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtensibleFlag(pub bool);
+
+impl Default for ExtensibleFlag {
+    fn default() -> Self {
+        Self(true)
+    }
 }
 
 impl otter_gc::SafeTraceable for ArrayBody {
@@ -501,6 +519,20 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     })
 }
 
+/// §10.1.4 `[[PreventExtensions]]` on the array exotic. Flips the
+/// `[[Extensible]]` slot to `false`. Idempotent.
+pub fn prevent_extensions(arr: JsArray, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(arr, |body| {
+        body.extensible = ExtensibleFlag(false);
+    });
+}
+
+/// §10.1.3 `[[IsExtensible]]` on the array exotic.
+#[must_use]
+pub fn is_extensible(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(arr, |body| body.extensible.0)
+}
+
 /// Install a symbol-keyed own property on the array exotic body.
 /// Replaces the existing slot if the symbol is already present —
 /// matching JsObject's symbol-property semantics. Used by the
@@ -589,6 +621,18 @@ pub fn set_named_property(
 ) -> Result<(), otter_gc::OutOfMemory> {
     if let Ok(idx) = key.parse::<usize>() {
         return set(arr, heap, idx, value);
+    }
+    // §10.4.2 — non-extensible Array exotic rejects fresh keys.
+    // Updating an existing key still succeeds (the spec routes
+    // through OrdinaryDefineOwnProperty which only fails when the
+    // property is absent and the object is non-extensible).
+    let absent = heap.read_payload(arr, |body| {
+        body.named_properties
+            .as_ref()
+            .is_none_or(|m| !m.contains_key(key))
+    });
+    if absent && !is_extensible(arr, heap) {
+        return Ok(());
     }
     let barrier_value = value.clone();
     heap.with_payload(arr, |body| {

@@ -405,11 +405,66 @@ impl Interpreter {
         // {}))` walks Function.prototype just like `ToPrimitive(fn)`.
         let unwrapped = self.unwrap_trapless_proxy(base);
         let effective = unwrapped.as_ref().unwrap_or(base);
+        // §7.1.1.1 step 4.a — `func = ? Get(O, name)` walks the
+        // receiver's own properties before the prototype chain. For
+        // callable receivers (Function / Closure / NativeFunction /
+        // BoundFunction / ClassConstructor) the user-installed own
+        // bag carries any reassignment of `valueOf` / `toString`,
+        // which must win over the inherited `Function.prototype`
+        // methods. For Object receivers the proto-route already
+        // walks own + proto via `object::get` below; non-Object
+        // exotic kinds with their own expando bag (RegExp /
+        // Promise) consult that bag first.
+        if let Some(own) = self.callable_own_property(effective, name) {
+            return Some(own);
+        }
+        if let Value::RegExp(r) = effective
+            && let Some(bag) = r.expando(&self.gc_heap)
+            && let Some(v) = object::get(bag, &self.gc_heap, name)
+        {
+            return Some(v);
+        }
+        if let Value::Promise(p) = effective
+            && let Some(bag) = p.expando(&self.gc_heap)
+            && let Some(v) = object::get(bag, &self.gc_heap, name)
+        {
+            return Some(v);
+        }
         let proto = match effective {
             Value::Object(o) => Some(*o),
             other => self.intrinsic_prototype_object_for(other),
         };
         proto.and_then(|o| object::get(o, &self.gc_heap, name))
+    }
+
+    /// §7.1.1.1 own-property lookup for callable receivers. Probes
+    /// the per-function user-property bag for ordinary
+    /// `Function` / `Closure` values; native functions and bound
+    /// functions consult their own descriptor table; class
+    /// constructors expose static properties through their statics
+    /// object. Returns `None` when no own binding exists so the
+    /// caller falls back to the prototype walk.
+    fn callable_own_property(&self, base: &Value, name: &str) -> Option<Value> {
+        match base {
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let bag = self.function_user_props.get(function_id).copied()?;
+                object::get(bag, &self.gc_heap, name)
+            }
+            Value::NativeFunction(native) => match native
+                .own_property_descriptor(&self.gc_heap, &self.string_heap, name)
+                .ok()
+                .flatten()?
+                .kind
+            {
+                object::DescriptorKind::Data { value } => Some(value),
+                object::DescriptorKind::Accessor { .. } => None,
+            },
+            Value::ClassConstructor(class) => {
+                let statics = class.statics(&self.gc_heap);
+                object::get(statics, &self.gc_heap, name)
+            }
+            _ => None,
+        }
     }
 
     /// Look up a Symbol-keyed property over a non-primitive value's

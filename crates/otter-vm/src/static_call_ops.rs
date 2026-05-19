@@ -157,8 +157,15 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
                     method_id::SymbolMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
+                // §20.4.1.1 / §20.4.2.4 / §20.4.2.6 — the description /
+                // key argument flows through `ToString`. Object operands
+                // require `evaluate_to_primitive("string")` so user
+                // `@@toPrimitive` / `toString` / `valueOf` fires. The
+                // intrinsic-table dispatcher has no execution context;
+                // pre-coerce the first argument here.
+                let coerced = self.symbol_coerce_first_arg(context, args)?;
                 let result =
-                    symbol_dispatch::call(self, method, &args).map_err(symbol_to_vm_error)?;
+                    symbol_dispatch::call(self, method, &coerced).map_err(symbol_to_vm_error)?;
                 finish_static_call(frame, dst, result)
             }
             Op::TemporalCall => {
@@ -177,6 +184,32 @@ impl Interpreter {
             }
             _ => Err(VmError::InvalidOperand),
         }
+    }
+
+    /// Coerce the first positional argument of a `Symbol(...)` /
+    /// `Symbol.for(...)` invocation through `ToPrimitive(arg,
+    /// "string")` so user-defined `@@toPrimitive` / `valueOf` /
+    /// `toString` overrides fire per §7.1.1. The remaining args (none
+    /// today; `Symbol.keyFor` takes a Symbol that must not be coerced)
+    /// pass through untouched.
+    fn symbol_coerce_first_arg(
+        &mut self,
+        context: &ExecutionContext,
+        mut args: SmallVec<[Value; 4]>,
+    ) -> Result<SmallVec<[Value; 4]>, VmError> {
+        let Some(first) = args.first_mut() else {
+            return Ok(args);
+        };
+        if abstract_ops::is_primitive(first) {
+            return Ok(args);
+        }
+        let coerced = self.evaluate_to_primitive(
+            context,
+            first,
+            abstract_ops::ToPrimitiveHint::String,
+        )?;
+        *first = coerced;
+        Ok(args)
     }
 
     /// Run `ToNumber` on each Math arg by routing non-primitives

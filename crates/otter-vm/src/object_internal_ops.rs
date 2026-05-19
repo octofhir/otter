@@ -2063,6 +2063,20 @@ impl Interpreter {
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
+            // §27.5 Generator / §27.1 Iterator — walk the realm
+            // prototype so `next` / `return` / `throw` / `toString`
+            // / `@@toStringTag` / `@@toPrimitive` resolve, and so
+            // the value flows through `ToPrimitive` (and therefore
+            // `ToPropertyKey`) without tripping `TypeMismatch` on
+            // the catch-all arm. Generator instances expose no own
+            // string keys.
+            Value::Generator(_) | Value::Iterator(_) => {
+                let proto = self.get_prototype_for_op(&base)?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
             // §10.4.5.4 IntegerIndexedExoticObject [[Get]] —
             // canonical-numeric-index short-circuit, then the lazy
             // expando bag, then the per-kind prototype chain.

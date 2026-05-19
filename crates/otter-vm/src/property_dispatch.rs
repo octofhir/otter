@@ -1916,20 +1916,6 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let lhs = read_register(&stack[top_idx], lhs_reg)?.clone();
         let rhs = read_register(&stack[top_idx], rhs_reg)?.clone();
-        // Foundation back-compat: when `rhs` is a plain Object that
-        // has no own/inherited `prototype` property AND no
-        // `@@hasInstance`, older fixtures expect the in-frame path
-        // to walk lhs's chain against `rhs` directly. Those slip
-        // through `drive_instanceof` with `Ok(false)`.
-        if let Value::Object(rhs_obj) = &rhs
-            && object::get(*rhs_obj, &self.gc_heap, "prototype").is_none()
-            && !matches!(rhs, Value::Proxy(_))
-        {
-            let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
-            if object::get_symbol(*rhs_obj, &self.gc_heap, &has_instance_sym).is_none() {
-                return Ok(false);
-            }
-        }
         let result = self.instanceof_operator_stack_rooted(context, stack, &lhs, &rhs)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;

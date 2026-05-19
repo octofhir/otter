@@ -31,23 +31,42 @@ fn receiver_bigint(args: &IntrinsicArgs<'_>) -> Result<BigIntValue, IntrinsicErr
 /// - <https://tc39.es/ecma262/#sec-bigint.prototype.tostring>
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_bigint(args)?;
+    // §21.2.3.4 step 2 — `radix` flows through
+    // `ToIntegerOrInfinity`; values outside `[2, 36]` raise
+    // RangeError. Symbol / BigInt raise TypeError (handled by the
+    // surrounding intrinsic-dispatch error mapping).
     let radix: u32 = match args.args.first() {
         None | Some(Value::Undefined) => 10,
-        Some(Value::Number(n)) => {
-            let r = n.as_f64();
-            if !r.is_finite() || !(2.0..=36.0).contains(&r) || r.fract() != 0.0 {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "must be an integer in 2..=36",
-                });
-            }
-            r as u32
-        }
-        _ => {
+        Some(Value::Symbol(_)) => {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
-                reason: "must be a number",
+                reason: "Cannot convert a Symbol value to a number",
             });
+        }
+        Some(Value::BigInt(_)) => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "Cannot convert a BigInt value to a number",
+            });
+        }
+        Some(other) => {
+            let f = match other {
+                Value::Number(n) => n.as_f64(),
+                Value::Boolean(true) => 1.0,
+                Value::Boolean(false) | Value::Null => 0.0,
+                Value::String(s) => {
+                    crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+                }
+                _ => f64::NAN,
+            };
+            let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
+            if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
+                return Err(IntrinsicError::OutOfRange {
+                    index: 0,
+                    reason: "radix must be an integer in [2, 36]",
+                });
+            }
+            trunc as u32
         }
     };
     let rendered = if radix == 10 {

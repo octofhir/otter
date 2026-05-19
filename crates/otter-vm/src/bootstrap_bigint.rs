@@ -258,23 +258,43 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             });
         }
     };
+    // §21.2.3.4 step 2 — `radix` defaults to 10 when `undefined`,
+    // otherwise routes through `ToIntegerOrInfinity`. The spec
+    // raises RangeError for `< 2` / `> 36`; non-coercible operands
+    // raise TypeError.
     let radix = match args.first() {
         None | Some(Value::Undefined) => 10u32,
-        Some(Value::Number(n)) => {
-            let f = n.as_f64();
-            if !f.is_finite() || !(2.0..=36.0).contains(&f) || f.fract() != 0.0 {
+        Some(Value::Symbol(_)) => {
+            return Err(NativeError::TypeError {
+                name: "BigInt.prototype.toString",
+                reason: "Cannot convert a Symbol value to a number".to_string(),
+            });
+        }
+        Some(Value::BigInt(_)) => {
+            return Err(NativeError::TypeError {
+                name: "BigInt.prototype.toString",
+                reason: "Cannot convert a BigInt value to a number".to_string(),
+            });
+        }
+        Some(other) => {
+            let f = match other {
+                Value::Number(n) => n.as_f64(),
+                Value::Boolean(true) => 1.0,
+                Value::Boolean(false) => 0.0,
+                Value::Null => 0.0,
+                Value::String(s) => {
+                    crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+                }
+                _ => f64::NAN,
+            };
+            let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
+            if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
                 return Err(NativeError::RangeError {
                     name: "BigInt.prototype.toString",
                     reason: "radix must be an integer in [2, 36]".to_string(),
                 });
             }
-            f as u32
-        }
-        _ => {
-            return Err(NativeError::TypeError {
-                name: "BigInt.prototype.toString",
-                reason: "radix must be a number".to_string(),
-            });
+            trunc as u32
         }
     };
     let rendered = b.as_inner().to_str_radix(radix);

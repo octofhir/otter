@@ -37,6 +37,7 @@ pub(crate) fn initialize_unmapped(
     args: SmallVec<[Value; 4]>,
     throw_type_error: Value,
 ) {
+    object::mark_as_arguments_object(obj, heap);
     for (index, value) in args.iter().cloned().enumerate() {
         let key = index.to_string();
         let descriptor = PropertyDescriptor::data(value, true, true, true);
@@ -72,6 +73,7 @@ pub(crate) fn initialize_mapped(
     callee: Value,
     mapped_entries: Vec<MappedArgumentEntry>,
 ) {
+    object::mark_as_arguments_object(obj, heap);
     for (index, value) in args.iter().cloned().enumerate() {
         let key = index.to_string();
         let descriptor = PropertyDescriptor::data(value, true, true, true);

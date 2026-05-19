@@ -388,6 +388,14 @@ pub struct ObjectBody {
     /// `[[Extensible]]` internal slot. New keys are rejected when
     /// this is `false`.
     extensible: bool,
+    /// `[[ParameterMap]]` presence marker for ECMA-262 §10.4.4
+    /// arguments-exotic objects. The mapping data itself lives in
+    /// `host_data` (`MappedArgumentsData`) when the function uses
+    /// sloppy parameter aliasing; this flag is set for both sloppy
+    /// and strict arguments objects so reflective probes
+    /// (`Object.prototype.toString.call(arguments)`) report the
+    /// `"Arguments"` builtin tag per §20.1.3.6 step 14.b.
+    is_arguments_object: bool,
 }
 
 impl std::fmt::Debug for ObjectBody {
@@ -530,6 +538,7 @@ fn empty_object_body() -> ObjectBody {
         string_data: None,
         date_data: None,
         extensible: true,
+        is_arguments_object: false,
     }
 }
 
@@ -622,6 +631,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             string_data: None,
             date_data: None,
             extensible: true,
+            is_arguments_object: false,
         },
         external_visit,
     )
@@ -651,9 +661,30 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             string_data: None,
             date_data: None,
             extensible: true,
+            is_arguments_object: false,
         },
         external_visit,
     )
+}
+
+/// Mark an object as an ECMA-262 §10.4.4 arguments-exotic object so
+/// reflective probes (`Object.prototype.toString.call(arguments)`)
+/// emit the spec `"Arguments"` builtin tag per §20.1.3.6 step 14.b.
+/// Called from `arguments_object::initialize_{mapped,unmapped}` after
+/// the body's slot table is set up.
+pub fn mark_as_arguments_object(obj: JsObject, heap: &mut otter_gc::GcHeap) {
+    heap.with_payload(obj, |body| {
+        body.is_arguments_object = true;
+    });
+}
+
+/// `true` when the object was tagged as an arguments-exotic body by
+/// [`mark_as_arguments_object`]. Reads the body slot through the GC
+/// `read_payload` accessor so callers do not have to expose
+/// [`ObjectBody`]'s internals.
+#[must_use]
+pub fn is_arguments_object(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| body.is_arguments_object)
 }
 
 pub(crate) fn install_mapped_arguments(

@@ -1720,6 +1720,9 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         | Value::ArrayBuffer(_)
         | Value::DataView(_)
         | Value::TypedArray(_) => "Object",
+        // §20.1.3.6 step 14.c — `[[ParameterMap]]` (arguments
+        // exotic) bumps the builtin tag to `"Arguments"`.
+        Value::Object(obj) if crate::object::is_arguments_object(*obj, ctx.heap()) => "Arguments",
         // §20.1.3.6 step 14.e — `[[DateValue]]` slot.
         Value::Object(obj) if crate::object::date_data(*obj, ctx.heap()).is_some() => "Date",
         // §20.1.3.6 step 14.a — `[[Call]]` slot on the boxed callable.

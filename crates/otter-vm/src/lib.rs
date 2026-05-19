@@ -6994,51 +6994,6 @@ mod tests {
     }
 
     #[test]
-    fn synthesized_iterator_next_uses_runtime_rooted_young_allocation() {
-        let module = module_with(Vec::new(), 4);
-        let mut interp = Interpreter::new();
-        let source = crate::array::from_elements_old_for_fixture(
-            interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(17))],
-        )
-        .unwrap();
-
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Array(source);
-        stack.push(frame);
-        let context = ExecutionContext::from_module(module);
-
-        interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iterator_value = stack[0].registers[1].clone();
-        let method = interp
-            .synthesize_iterator_method(&stack, "next", iterator_value)
-            .unwrap();
-
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-        let result = interp
-            .run_callable_sync(&context, &method, Value::Undefined, SmallVec::new())
-            .unwrap();
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "synthesized iterator next() should allocate its result object in young space"
-        );
-
-        let Value::Object(record) = result else {
-            panic!("synthesized iterator next() should return a result object");
-        };
-        assert_eq!(
-            object::get(record, interp.gc_heap(), "value"),
-            Some(Value::Number(NumberValue::from_i32(17)))
-        );
-        assert_eq!(
-            object::get(record, interp.gc_heap(), "done"),
-            Some(Value::Boolean(false))
-        );
-    }
-
-    #[test]
     fn iterator_result_record_uses_runtime_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let value = Value::Number(NumberValue::from_i32(44));

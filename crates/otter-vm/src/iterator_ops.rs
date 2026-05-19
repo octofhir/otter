@@ -26,7 +26,7 @@ use otter_bytecode::Operand;
 
 use crate::{
     ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IteratorHandle, IteratorState,
-    JsString, NativeError, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
+    JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
     VmPropertyKey, array, is_callable, operand_decode::register_operand, read_register,
     require_callable, step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
@@ -488,113 +488,6 @@ impl Interpreter {
                 inner = Some(new_inner);
             },
         }
-    }
-
-    /// Build a `Value::NativeFunction` that, when called, re-dispatches the
-    /// corresponding iterator method on the captured receiver. Used by
-    /// `Op::LoadProperty` so `typeof it.next === "function"` and detached
-    /// invocation (`const f = it.next; f();`) both work.
-    pub(crate) fn synthesize_iterator_method(
-        &mut self,
-        stack: &SmallVec<[Frame; 8]>,
-        name: &str,
-        receiver: Value,
-    ) -> Result<Value, VmError> {
-        let method_name: &'static str = match name {
-            "next" => "next",
-            "return" => "return",
-            "throw" => "throw",
-            _ => return Ok(Value::Undefined),
-        };
-        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![receiver];
-        let value = self.native_value_with_captures_stack_rooted(
-            stack,
-            method_name,
-            captures,
-            &[],
-            &[],
-            move |ctx, args, captures| {
-                let receiver = captures.first().cloned().unwrap_or(Value::Undefined);
-                let Value::Iterator(iter_rc) = receiver.clone() else {
-                    return Err(NativeError::TypeError {
-                        name: method_name,
-                        reason: "receiver is not an Iterator".to_string(),
-                    });
-                };
-                let (interp, exec) = ctx.interp_mut_and_context();
-                let exec = exec.ok_or_else(|| NativeError::TypeError {
-                    name: method_name,
-                    reason: "missing execution context".to_string(),
-                })?;
-                let small_args: smallvec::SmallVec<[Value; 8]> = args.iter().cloned().collect();
-                match method_name {
-                    "next" => {
-                        let (v, done) =
-                            interp.iterator_next_full(&exec, &iter_rc).map_err(|e| {
-                                NativeError::TypeError {
-                                    name: method_name,
-                                    reason: e.to_string(),
-                                }
-                            })?;
-                        let obj = interp
-                            .alloc_runtime_rooted_object_with_roots(
-                                &[&receiver, &v],
-                                &[small_args.as_slice()],
-                            )
-                            .map_err(|e| NativeError::TypeError {
-                                name: method_name,
-                                reason: e.to_string(),
-                            })?;
-                        interp.set_property(obj, "value", v).map_err(|e| {
-                            NativeError::TypeError {
-                                name: method_name,
-                                reason: e.to_string(),
-                            }
-                        })?;
-                        interp
-                            .set_property(obj, "done", Value::Boolean(done))
-                            .map_err(|e| NativeError::TypeError {
-                                name: method_name,
-                                reason: e.to_string(),
-                            })?;
-                        Ok(Value::Object(obj))
-                    }
-                    "return" => {
-                        let arg = small_args.first().cloned().unwrap_or(Value::Undefined);
-                        let obj = interp
-                            .alloc_runtime_rooted_object_with_roots(
-                                &[&receiver, &arg],
-                                &[small_args.as_slice()],
-                            )
-                            .map_err(|e| NativeError::TypeError {
-                                name: method_name,
-                                reason: e.to_string(),
-                            })?;
-                        interp.set_property(obj, "value", arg).map_err(|e| {
-                            NativeError::TypeError {
-                                name: method_name,
-                                reason: e.to_string(),
-                            }
-                        })?;
-                        interp
-                            .set_property(obj, "done", Value::Boolean(true))
-                            .map_err(|e| NativeError::TypeError {
-                                name: method_name,
-                                reason: e.to_string(),
-                            })?;
-                        Ok(Value::Object(obj))
-                    }
-                    _ => Err(NativeError::Thrown {
-                        name: method_name,
-                        message: value_kind_name(
-                            &small_args.first().cloned().unwrap_or(Value::Undefined),
-                        )
-                        .to_string(),
-                    }),
-                }
-            },
-        )?;
-        Ok(value)
     }
 
     /// Dispatch one of the §27.5 / iterator-helper-proposal methods against a

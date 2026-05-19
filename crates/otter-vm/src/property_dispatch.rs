@@ -675,12 +675,18 @@ impl Interpreter {
                 }
             }
             Value::Symbol(s) => symbol_prototype::load_property(s, name),
-            Value::Iterator(_) => match name {
-                "next" | "return" | "throw" => {
-                    self.synthesize_iterator_method(stack, name, receiver.clone())?
-                }
-                _ => Value::Undefined,
-            },
+            // §27.1.5 — read string-keyed properties through
+            // `Iterator.prototype` so the new spec-mandated
+            // `next` / `return` / `throw` natives (and the helper
+            // terminals like `map` / `forEach` / `toArray`) all
+            // resolve uniformly via the realm prototype.
+            // `this` rebinding through `Function.prototype.call`
+            // surfaces correctly because the native methods take
+            // their receiver from `ctx.this_value()` rather than
+            // synthesized captures.
+            v @ Value::Iterator(_) => {
+                self.load_from_constructor_prototype(context, "Iterator", v, name)?
+            }
             v @ (Value::WeakRef(_) | Value::FinalizationRegistry(_)) => {
                 let proto_name = match v {
                     Value::WeakRef(_) => "WeakRef",

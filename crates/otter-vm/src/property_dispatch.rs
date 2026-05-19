@@ -3282,12 +3282,17 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
         Value::String(s) => {
             let key = s.to_lossy_string();
             if key == "length" {
-                true
-            } else if let Ok(i) = key.parse::<usize>() {
-                crate::array::has_own_element(arr, &interpreter.gc_heap, i)
-            } else {
-                false
+                return true;
             }
+            if let Ok(i) = key.parse::<usize>()
+                && crate::array::has_own_element(arr, &interpreter.gc_heap, i)
+            {
+                return true;
+            }
+            // §22.1.4 — Array exotic surface user-installed extra
+            // string-keyed properties through the named-properties
+            // side table. `in` must consult it before falling through.
+            crate::array::get_named_property(arr, &interpreter.gc_heap, &key).is_some()
         }
         _ => false,
     }

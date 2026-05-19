@@ -131,15 +131,60 @@ fn parse_radix_literal(input: &str) -> Option<BigIntValue> {
     BigInt::parse_bytes(body.as_bytes(), radix).map(BigIntValue::from_inner)
 }
 
+/// §7.1.22 `ToIndex(arg)` — used by `BigInt.asIntN` /
+/// `BigInt.asUintN`'s `bits` argument. Coerces through `ToNumber`
+/// then `ToIntegerOrInfinity`, rejecting Symbol / BigInt with
+/// **TypeError**, negatives and overflow with **RangeError**, and
+/// returning `0` for NaN / undefined per the spec.
 fn expect_bits(arg: Option<&Value>) -> Result<u32, VmError> {
     let n = match arg {
+        None | Some(Value::Undefined) => return Ok(0),
         Some(Value::Number(n)) => n.as_f64(),
-        _ => return Err(VmError::TypeMismatch),
+        Some(Value::Null) => 0.0,
+        Some(Value::Boolean(true)) => 1.0,
+        Some(Value::Boolean(false)) => 0.0,
+        Some(Value::String(s)) => {
+            crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+        }
+        Some(Value::Symbol(_)) => {
+            return Err(VmError::TypeError {
+                message: "Cannot convert a Symbol value to a number".to_string(),
+            });
+        }
+        Some(Value::BigInt(_)) => {
+            return Err(VmError::TypeError {
+                message: "Cannot convert a BigInt value to a number".to_string(),
+            });
+        }
+        // Object operands should have been pre-coerced by the
+        // dispatcher's `coerce_bigint_call_args` ladder. Anything
+        // else is treated as a non-primitive that fails the
+        // ToNumber arm.
+        Some(_) => {
+            return Err(VmError::TypeError {
+                message: "Cannot convert value to a number".to_string(),
+            });
+        }
     };
-    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
-        return Err(VmError::TypeMismatch);
+    // §7.1.5 ToIntegerOrInfinity — NaN collapses to 0, infinities
+    // stay; §7.1.22 ToIndex then rejects negatives / overflows.
+    if n.is_nan() {
+        return Ok(0);
     }
-    Ok(n as u32)
+    let trunc = n.trunc();
+    if trunc.is_infinite() || trunc < 0.0 || trunc > 9_007_199_254_740_991.0 {
+        return Err(VmError::RangeError {
+            message: "Invalid bits parameter for BigInt.asIntN / asUintN".to_string(),
+        });
+    }
+    if trunc > u32::MAX as f64 {
+        // The spec allows up to 2^53-1, but the per-arm implementation
+        // can only address up to `u32::MAX` bits before overflow.
+        return Err(VmError::RangeError {
+            message: "Bits parameter exceeds supported range".to_string(),
+        });
+    }
+    Ok(trunc as u32)
 }
 
 /// §21.2.2.1 BigInt.asIntN — clip `value` to a signed N-bit

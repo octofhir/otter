@@ -1571,9 +1571,49 @@ fn object_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         Value::TypedArray(t) => t.kind().name(),
         Value::Object(obj) if crate::object::date_data(*obj, ctx.heap()).is_some() => "Date",
         Value::Object(obj) if crate::object::call_native(*obj, ctx.heap()).is_some() => "Function",
+        // §20.1.3.6 step 14.b — if `O` has an `[[ErrorData]]` internal
+        // slot, the built-in tag is `"Error"`. Otter does not carry
+        // an explicit slot; treat any ordinary object whose prototype
+        // chain reaches one of the realm error prototypes as having
+        // the slot.
+        Value::Object(obj) if object_has_error_data(ctx, *obj) => "Error",
         Value::Object(_) | Value::Proxy(_) => "Object",
     }
     .to_string()
+}
+
+/// Walk `obj`'s `[[Prototype]]` chain and return `true` when any
+/// realm error prototype is reached. Used as a substitute for the
+/// spec's `[[ErrorData]]` internal slot, which Otter does not carry
+/// on ordinary object instances.
+fn object_has_error_data(ctx: &NativeCtx<'_>, obj: crate::object::JsObject) -> bool {
+    use crate::ErrorKind;
+    let heap = ctx.heap();
+    let registry = &ctx.cx.interp.error_classes;
+    let mut current = Some(obj);
+    let mut hops = 0;
+    while let Some(o) = current {
+        if hops >= crate::object::PROTO_CHAIN_HARD_CAP {
+            return false;
+        }
+        hops += 1;
+        for kind in [
+            ErrorKind::Error,
+            ErrorKind::TypeError,
+            ErrorKind::RangeError,
+            ErrorKind::SyntaxError,
+            ErrorKind::ReferenceError,
+            ErrorKind::URIError,
+            ErrorKind::EvalError,
+            ErrorKind::AggregateError,
+        ] {
+            if registry.prototype(kind) == o {
+                return true;
+            }
+        }
+        current = crate::object::prototype(o, heap);
+    }
+    false
 }
 
 fn explicit_to_string_tag(ctx: &NativeCtx<'_>) -> Option<String> {

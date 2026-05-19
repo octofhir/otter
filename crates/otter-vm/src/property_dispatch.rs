@@ -302,6 +302,7 @@ impl Interpreter {
         dst: u16,
         obj_reg: u16,
         key: AtomizedPropertyKey<'_>,
+        strict: bool,
     ) -> Result<(), VmError> {
         let name = key.name();
         let receiver = read_register(frame, obj_reg)?.clone();
@@ -350,6 +351,13 @@ impl Interpreter {
                 });
             }
         };
+        // §13.5.1.2 step 5.c — when the result of `[[Delete]]` is
+        // `false` in strict mode, throw a TypeError.
+        if !removed && strict {
+            return Err(VmError::TypeError {
+                message: format!("Cannot delete property '{name}'"),
+            });
+        }
         write_register(frame, dst, Value::Boolean(removed))?;
         frame.pc += 1;
         Ok(())

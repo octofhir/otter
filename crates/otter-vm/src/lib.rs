@@ -4124,8 +4124,9 @@ impl Interpreter {
                     let key = context
                         .property_atom(name_idx)
                         .ok_or(VmError::InvalidOperand)?;
+                    let strict = context.function_is_strict(stack[top_idx].function_id);
                     let frame = &mut stack[top_idx];
-                    self.run_delete_property_reg(frame, dst, obj_reg, key)?;
+                    self.run_delete_property_reg(frame, dst, obj_reg, key, strict)?;
                     continue;
                 }
                 Op::DeleteElement => {

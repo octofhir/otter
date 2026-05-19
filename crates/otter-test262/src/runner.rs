@@ -459,6 +459,35 @@ fn run_module_test(
             stack: None,
         };
     }
+    // Hard-link every sibling `.js` file from the test's source
+    // directory into the temp dir so corpus-convention sibling
+    // imports (`./<other>_FIXTURE.js`, sibling test files used in
+    // ResolveExport / cycle / namespace-ambiguity coverage —
+    // <https://tc39.es/ecma262/#sec-resolveexport>) resolve. Skip
+    // the entry's own basename so the staged preamble+body wins.
+    if let Some(parent) = test_path.parent()
+        && let Ok(read_dir) = std::fs::read_dir(parent)
+    {
+        for sibling in read_dir.flatten() {
+            let sibling_path = sibling.path();
+            if !sibling_path.is_file() {
+                continue;
+            }
+            let sibling_name = match sibling_path.file_name() {
+                Some(n) => n.to_os_string(),
+                None => continue,
+            };
+            if sibling_name == basename {
+                continue;
+            }
+            if sibling_path.extension().and_then(std::ffi::OsStr::to_str) != Some("js") {
+                continue;
+            }
+            let dest = dir.path().join(&sibling_name);
+            let _ = std::fs::hard_link(&sibling_path, &dest)
+                .or_else(|_| std::fs::copy(&sibling_path, &dest).map(|_| ()));
+        }
+    }
     let outcome = run_with_watchdog(runtime, timeout, |rt| rt.run_module(&entry));
     let mapped = map_watchdog_outcome(outcome);
     drop(dir); // explicit; the temp dir auto-cleans on drop anyway

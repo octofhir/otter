@@ -388,9 +388,46 @@ pub fn compile_module_program(
                         _ => {}
                     }
                 }
+                // §16.2.3 ExportFromClause — `export {x} from "./other"`
+                // also references another module. Register the source
+                // in `import_records` so the body-compile arm can
+                // look it up via `state.import_records.get(src)`.
+                // Without this the body raises
+                // `ExportNamedDeclaration: unresolved re-export
+                // source` even though the AST is well-formed and the
+                // module loader has the target module available.
+                // <https://tc39.es/ecma262/#sec-exports>
+                if let Some(source) = decl.source.as_ref() {
+                    let specifier = source.value.as_str().to_string();
+                    if !state.import_records.contains_key(&specifier) {
+                        let uv = top.own_upvalue_count;
+                        top.own_upvalue_count =
+                            top.own_upvalue_count.checked_add(1).expect("uv overflow");
+                        state.import_records.insert(specifier.clone(), uv);
+                        import_sources_in_order.push(specifier);
+                    }
+                }
                 for spec in &decl.specifiers {
                     let exported_name = module_export_name_to_str(&spec.exported);
                     state.exported_names.insert(exported_name);
+                }
+            }
+            Statement::ExportAllDeclaration(decl) if !decl.export_kind.is_type() => {
+                // §16.2.3 ExportFromClause — `export * from "./other"`
+                // / `export * as ns from "./other"`. Register the
+                // source so the body-compile arm can look it up.
+                let specifier = decl.source.value.as_str().to_string();
+                if !state.import_records.contains_key(&specifier) {
+                    let uv = top.own_upvalue_count;
+                    top.own_upvalue_count =
+                        top.own_upvalue_count.checked_add(1).expect("uv overflow");
+                    state.import_records.insert(specifier.clone(), uv);
+                    import_sources_in_order.push(specifier);
+                }
+                if let Some(exported) = decl.exported.as_ref() {
+                    state
+                        .exported_names
+                        .insert(module_export_name_to_str(exported));
                 }
             }
             Statement::ExportDefaultDeclaration(_) => {

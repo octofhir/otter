@@ -380,9 +380,13 @@ pub fn is_loosely_equal(x: &Value, y: &Value) -> bool {
             is_loosely_equal(&coerced, other)
         }
 
-        // Steps 12: BigInt x String.
+        // Steps 12: BigInt x String. §7.1.14 StringToBigInt:
+        // whitespace-only / empty strings are valid
+        // StringIntegerLiterals representing `0n`. Strings that fail
+        // the grammar surface as `undefined`, which §7.2.13 step 8
+        // collapses to `false`.
         (Value::BigInt(big), Value::String(s)) | (Value::String(s), Value::BigInt(big)) => {
-            match BigIntValue::from_decimal(s.to_lossy_string().trim()) {
+            match string_to_big_int(&s.to_lossy_string()) {
                 Some(parsed) => big == &parsed,
                 None => false,
             }
@@ -407,6 +411,62 @@ fn same_value_non_numeric_or_strict_numeric(x: &Value, y: &Value) -> bool {
         return number::strict_equals(*a, *b);
     }
     x == y
+}
+
+/// §7.1.14 `StringToBigInt(str)`. Whitespace-trims `str` and
+/// accepts:
+///
+/// - empty / whitespace-only strings → `0n`;
+/// - decimal integer literals (with optional `+` / `-` sign);
+/// - non-decimal integer literals (`0x…`, `0o…`, `0b…`).
+///
+/// Returns `None` when `str` does not match the grammar — callers
+/// surface that as the spec's `undefined` outcome.
+pub fn string_to_big_int(text: &str) -> Option<BigIntValue> {
+    let s = text.trim();
+    if s.is_empty() {
+        return Some(BigIntValue::from_i32(0));
+    }
+    let (sign_negative, body) = match s.as_bytes().first() {
+        Some(b'+') => (false, &s[1..]),
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let parsed = if let Some(rest) = body
+        .strip_prefix("0x")
+        .or_else(|| body.strip_prefix("0X"))
+    {
+        // §12.9.3.1 NonDecimalIntegerLiteral — no sign allowed in
+        // the non-decimal form per the spec grammar; reject when
+        // we saw an explicit sign above.
+        if sign_negative {
+            return None;
+        }
+        num_bigint::BigInt::parse_bytes(rest.as_bytes(), 16)?
+    } else if let Some(rest) = body
+        .strip_prefix("0o")
+        .or_else(|| body.strip_prefix("0O"))
+    {
+        if sign_negative {
+            return None;
+        }
+        num_bigint::BigInt::parse_bytes(rest.as_bytes(), 8)?
+    } else if let Some(rest) = body
+        .strip_prefix("0b")
+        .or_else(|| body.strip_prefix("0B"))
+    {
+        if sign_negative {
+            return None;
+        }
+        num_bigint::BigInt::parse_bytes(rest.as_bytes(), 2)?
+    } else {
+        num_bigint::BigInt::parse_bytes(body.as_bytes(), 10)?
+    };
+    let parsed = if sign_negative { -parsed } else { parsed };
+    Some(BigIntValue::from_inner(parsed))
 }
 
 /// `bigint == number` — only true when `number` is finite and
@@ -452,7 +512,7 @@ pub fn abstract_relational_comparison(x: &Value, y: &Value) -> RelationalOutcome
     }
     // Step 2 / 3: BigInt x String.
     if let (Value::BigInt(big), Value::String(s)) = (x, y) {
-        return match BigIntValue::from_decimal(s.to_lossy_string().trim()) {
+        return match string_to_big_int(&s.to_lossy_string()) {
             Some(parsed) => match bigint_ops::compare(big, &parsed) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,
@@ -461,7 +521,7 @@ pub fn abstract_relational_comparison(x: &Value, y: &Value) -> RelationalOutcome
         };
     }
     if let (Value::String(s), Value::BigInt(big)) = (x, y) {
-        return match BigIntValue::from_decimal(s.to_lossy_string().trim()) {
+        return match string_to_big_int(&s.to_lossy_string()) {
             Some(parsed) => match bigint_ops::compare(&parsed, big) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,

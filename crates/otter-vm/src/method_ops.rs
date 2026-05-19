@@ -565,6 +565,11 @@ impl Interpreter {
                 // Pre-coerce so user `@@toPrimitive` / `toString` /
                 // `valueOf` fire when the arg is an Object literal.
                 "match" | "matchAll" | "search" | "normalize" => (&[], &[0]),
+                // §B.2.3.2 / .7 / .8 / .10 — attribute-bearing
+                // AnnexB HTML wrappers run `ToString(value)` on
+                // their first argument before splicing it into the
+                // tag attribute.
+                "anchor" | "fontcolor" | "fontsize" | "link" => (&[], &[0]),
                 _ => (&[], &[]),
             };
             // §24.3.1.{1,2} GetViewValue / SetViewValue on

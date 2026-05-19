@@ -1707,6 +1707,11 @@ fn native_string_method(
         "replace" | "replaceAll" => (&[], &[0]),
         "split" => (&[1], &[0]),
         "concat" => (&[], &[0, 1, 2, 3]),
+        // §B.2.3.2 / §B.2.3.7 / §B.2.3.8 / §B.2.3.10 — the
+        // attribute-bearing AnnexB HTML wrappers run
+        // `ToString(value)` on their first argument before splicing
+        // it into the resulting tag.
+        "anchor" | "fontcolor" | "fontsize" | "link" => (&[], &[0]),
         _ => (&[], &[]),
     };
     let coerced_args: smallvec::SmallVec<[Value; 4]> =

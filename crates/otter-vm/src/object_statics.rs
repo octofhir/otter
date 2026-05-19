@@ -1600,23 +1600,33 @@ fn object_has_error_data(ctx: &NativeCtx<'_>, obj: crate::object::JsObject) -> b
     use crate::ErrorKind;
     let heap = ctx.heap();
     let registry = &ctx.cx.interp.error_classes;
-    let mut current = Some(obj);
+    // §20.5.3 "The Error prototype object does not have an
+    // `[[ErrorData]]` internal slot." Treat any of the realm error
+    // prototypes as ordinary objects when probed directly — only
+    // their (transitive) descendants carry the slot.
+    let kinds = [
+        ErrorKind::Error,
+        ErrorKind::TypeError,
+        ErrorKind::RangeError,
+        ErrorKind::SyntaxError,
+        ErrorKind::ReferenceError,
+        ErrorKind::URIError,
+        ErrorKind::EvalError,
+        ErrorKind::AggregateError,
+    ];
+    for kind in kinds {
+        if registry.prototype(kind) == obj {
+            return false;
+        }
+    }
+    let mut current = crate::object::prototype(obj, heap);
     let mut hops = 0;
     while let Some(o) = current {
         if hops >= crate::object::PROTO_CHAIN_HARD_CAP {
             return false;
         }
         hops += 1;
-        for kind in [
-            ErrorKind::Error,
-            ErrorKind::TypeError,
-            ErrorKind::RangeError,
-            ErrorKind::SyntaxError,
-            ErrorKind::ReferenceError,
-            ErrorKind::URIError,
-            ErrorKind::EvalError,
-            ErrorKind::AggregateError,
-        ] {
+        for kind in kinds {
             if registry.prototype(kind) == o {
                 return true;
             }

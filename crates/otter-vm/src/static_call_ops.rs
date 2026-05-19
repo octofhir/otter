@@ -779,33 +779,51 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let target_input = args.first().cloned().unwrap_or(Value::Undefined);
-        let target = match &target_input {
-            Value::Object(o) => *o,
+        // §20.1.2.1 step 2 — `ToObject(target)`. The spec returns the
+        // resulting object as `target`, so Array / RegExp / Map / etc.
+        // exotics pass straight through; only Null / Undefined throw
+        // and only primitives go through the wrapper-boxing path.
+        let target_value: Value = match &target_input {
+            Value::Object(_)
+            | Value::Array(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::Promise(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Proxy(_) => target_input.clone(),
             Value::Null | Value::Undefined => {
                 return Err(VmError::TypeError {
                     message: "Object.assign called on null or undefined".to_string(),
                 });
             }
             _ => {
-                // §7.1.18 ToObject — wrap primitives. We thread the
-                // arg slice + a temporary target root through the
-                // boxing helper so a mid-allocation GC sees both the
-                // primitive value and the in-progress sources.
                 let arg_slice = args;
-                let boxed = self.box_sloppy_this_primitive_stack_rooted(
+                self.box_sloppy_this_primitive_stack_rooted(
                     stack,
                     target_input.clone(),
                     &[arg_slice],
-                )?;
-                match boxed {
-                    Value::Object(o) => o,
-                    _ => {
-                        return Err(VmError::TypeError {
-                            message: "Object.assign: ToObject failed".to_string(),
-                        });
-                    }
-                }
+                )?
             }
+        };
+        // Cache the object form when applicable so the existing
+        // `ordinary_set_with_callable_setter` fast path keeps working
+        // unchanged for plain-object targets. Exotic targets fall
+        // through the value-level `[[Set]]` helper below.
+        let target_object: Option<crate::object::JsObject> = match &target_value {
+            Value::Object(o) => Some(*o),
+            _ => None,
         };
         for src in args.iter().skip(1) {
             match src {
@@ -823,7 +841,7 @@ impl Interpreter {
                         // *strict* flag, so frozen / sealed / non-
                         // writable / non-extensible targets surface
                         // TypeError instead of silently dropping.
-                        self.ordinary_set_with_callable_setter(context, target, &k, v, true)?;
+                        assign_set_string(self, context, &target_value, target_object, &k, v)?;
                     }
                     // §20.1.2.1 step 4.c.ii — `OwnPropertyKeys(O)`
                     // returns string keys followed by symbol keys.
@@ -833,24 +851,31 @@ impl Interpreter {
                             p.enumerable_symbol_data_iter().collect()
                         });
                     for (sym, v) in sym_entries {
-                        self.ordinary_set_symbol_with_callable_setter(
-                            context, target, &sym, v, true,
-                        )?;
+                        assign_set_symbol(self, context, &target_value, target_object, &sym, v)?;
                     }
                 }
                 Value::Array(arr) => {
                     // §22.1.3.3 — Array EnumerableOwnPropertyNames:
-                    // dense indices then named extra slots.
-                    let dense: Vec<Value> = array::with_elements(*arr, self.gc_heap(), |els| {
-                        els.iter().cloned().collect()
-                    });
-                    for (idx, v) in dense.into_iter().enumerate() {
-                        self.ordinary_set_with_callable_setter(
+                    // dense indices then named extra slots. Skip
+                    // array holes (`Value::Hole`): the spec only
+                    // copies own properties, and a hole is the
+                    // absence of an own property.
+                    let dense: Vec<(usize, Value)> =
+                        array::with_elements(*arr, self.gc_heap(), |els| {
+                            els.iter()
+                                .enumerate()
+                                .filter(|(_, v)| !matches!(v, Value::Hole))
+                                .map(|(i, v)| (i, v.clone()))
+                                .collect()
+                        });
+                    for (idx, v) in dense.into_iter() {
+                        assign_set_string(
+                            self,
                             context,
-                            target,
+                            &target_value,
+                            target_object,
                             &idx.to_string(),
                             v,
-                            true,
                         )?;
                     }
                     let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
@@ -859,7 +884,7 @@ impl Interpreter {
                         })
                     });
                     for (k, v) in named {
-                        self.ordinary_set_with_callable_setter(context, target, &k, v, true)?;
+                        assign_set_string(self, context, &target_value, target_object, &k, v)?;
                     }
                 }
                 Value::String(s) => {
@@ -874,12 +899,13 @@ impl Interpreter {
                         let unit_string =
                             crate::string::JsString::from_utf16_units(units, &self.string_heap)
                                 .map_err(|_| VmError::TypeMismatch)?;
-                        self.ordinary_set_with_callable_setter(
+                        assign_set_string(
+                            self,
                             context,
-                            target,
+                            &target_value,
+                            target_object,
                             &idx.to_string(),
                             Value::String(unit_string),
-                            true,
                         )?;
                     }
                 }
@@ -892,7 +918,7 @@ impl Interpreter {
                 }
             }
         }
-        Ok(Value::Object(target))
+        Ok(target_value)
     }
 
     fn object_static_call_stack_rooted(
@@ -2024,6 +2050,94 @@ fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), 
     write_register(frame, dst, result)?;
     frame.pc += 1;
     Ok(())
+}
+
+/// `Object.assign` value-level write helper. Routes string-keyed
+/// writes through the matching exotic [[Set]]:
+///
+/// - Plain objects use `ordinary_set_with_callable_setter` for
+///   accessor dispatch and the strict-mode TypeError surface.
+/// - Array exotics route writes through ArraySetLength (`length`),
+///   the dense element store (canonical-numeric-index strings), or
+///   the named-property side table (everything else).
+/// - Every other exotic (RegExp, Promise, …) falls back to the
+///   ordinary path against its lazy expando bag if installed.
+///
+/// `strict` is implicit-`true` per §20.1.2.1 step 4.c.iii.2.b.
+fn assign_set_string(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    target_value: &Value,
+    target_object: Option<crate::object::JsObject>,
+    key: &str,
+    value: Value,
+) -> Result<(), VmError> {
+    if let Some(obj) = target_object {
+        return interp.ordinary_set_with_callable_setter(context, obj, key, value, true);
+    }
+    match target_value {
+        Value::Array(arr) => {
+            let arr = *arr;
+            if key == "length" {
+                let number_len = crate::coerce::to_number_or_throw(interp, context, &value)?;
+                let new_len = crate::number::bitwise::to_uint32(number_len);
+                if (new_len as f64) != number_len.as_f64() {
+                    return Err(VmError::RangeError {
+                        message: "Invalid array length".to_string(),
+                    });
+                }
+                crate::array::set_length(arr, &mut interp.gc_heap, new_len as usize)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                return Ok(());
+            }
+            if let Ok(idx) = key.parse::<u32>()
+                && key == idx.to_string()
+            {
+                crate::array::set(arr, &mut interp.gc_heap, idx as usize, value)
+                    .map_err(|_| VmError::TypeMismatch)?;
+                return Ok(());
+            }
+            crate::array::set_named_property(arr, &mut interp.gc_heap, key, value)
+                .map_err(|_| VmError::TypeMismatch)?;
+            Ok(())
+        }
+        // For other exotic value kinds, surface failure rather than
+        // silently dropping the assign step — the spec routes through
+        // the receiver's [[Set]] which would TypeError on non-writable
+        // / non-extensible / unsupported keys. Foundation: emit a
+        // descriptive TypeError so callers can iterate.
+        _ => Err(VmError::TypeError {
+            message: format!(
+                "Object.assign: cannot set '{key}' on {}",
+                crate::value_kind_name(target_value)
+            ),
+        }),
+    }
+}
+
+fn assign_set_symbol(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    target_value: &Value,
+    target_object: Option<crate::object::JsObject>,
+    sym: &crate::symbol::JsSymbol,
+    value: Value,
+) -> Result<(), VmError> {
+    if let Some(obj) = target_object {
+        return interp.ordinary_set_symbol_with_callable_setter(context, obj, sym, value, true);
+    }
+    match target_value {
+        Value::Array(arr) => {
+            crate::array::set_symbol_property(*arr, &mut interp.gc_heap, sym, value);
+            Ok(())
+        }
+        _ => Err(VmError::TypeError {
+            message: format!(
+                "Object.assign: cannot set symbol on {}",
+                crate::value_kind_name(target_value)
+            ),
+        }),
+    }
 }
 
 /// §6.2.4.5 IsObject classifier used by `Object.fromEntries` to gate

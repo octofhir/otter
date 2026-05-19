@@ -19,6 +19,23 @@ use super::data_view::JsDataView;
 use super::to_index;
 use super::typed_array::{JsTypedArray, TypedArrayKind};
 
+/// Map a `to_index` failure to a spec-correct completion. §7.1.22
+/// `ToIndex` throws **RangeError** on negative integers and on values
+/// above 2^53-1, but the underlying `ToNumber` step (§7.1.4) throws
+/// **TypeError** for `Symbol` and `BigInt` operands. The shared
+/// `to_index` helper collapses both outcomes to `None`; this wrapper
+/// recovers the spec error class from the original value.
+fn to_index_error(value: &Value, what: &str) -> VmError {
+    match value {
+        Value::Symbol(_) | Value::BigInt(_) => VmError::TypeError {
+            message: format!("Cannot convert {what} to a number"),
+        },
+        _ => VmError::RangeError {
+            message: format!("Invalid {what}"),
+        },
+    }
+}
+
 // =========================================================================
 // ArrayBuffer
 // =========================================================================
@@ -63,12 +80,15 @@ pub fn array_buffer_call_with_roots(
         M::Construct => {
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
-                Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
+                Some(v) => to_index(v).ok_or_else(|| to_index_error(v, "ArrayBuffer length"))?,
             };
             let max_byte_length = match args.get(1) {
                 Some(Value::Object(opts)) => {
                     if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
-                        Some(to_index(&v).ok_or(VmError::TypeMismatch)?)
+                        Some(
+                            to_index(&v)
+                                .ok_or_else(|| to_index_error(&v, "ArrayBuffer maxByteLength"))?,
+                        )
                     } else {
                         None
                     }
@@ -128,12 +148,16 @@ pub fn shared_array_buffer_call_with_roots(
             external_visit(&mut |_| {});
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
-                Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
+                Some(v) => {
+                    to_index(v).ok_or_else(|| to_index_error(v, "SharedArrayBuffer length"))?
+                }
             };
             let max_byte_length = match args.get(1) {
                 Some(Value::Object(opts)) => {
                     if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
-                        Some(to_index(&v).ok_or(VmError::TypeMismatch)?)
+                        Some(to_index(&v).ok_or_else(|| {
+                            to_index_error(&v, "SharedArrayBuffer maxByteLength")
+                        })?)
                     } else {
                         None
                     }

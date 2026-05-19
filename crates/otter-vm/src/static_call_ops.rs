@@ -581,123 +581,29 @@ impl Interpreter {
         if let Some(props_arg) = args.get(1)
             && !matches!(props_arg, Value::Undefined)
         {
-            // §20.1.2.2 step 4 — `properties = ToObject(Properties)`.
-            // Plain `Value::Object` uses `with_properties` directly;
-            // ClassConstructor / Array / Function-like sources route
-            // through their respective enumerable-own-key probes so
-            // user code can pass `Object.create({}, function() { ...
-            // })` with own data properties installed on the
-            // function.
-            let entries: Vec<(String, Value)> = match props_arg {
-                Value::Object(o) => object::with_properties(*o, self.gc_heap(), |p| {
-                    p.enumerable_data_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect()
-                }),
-                Value::ClassConstructor(class) => {
-                    object::with_properties(class.statics(self.gc_heap()), self.gc_heap(), |p| {
-                        p.enumerable_data_iter()
-                            .map(|(k, v)| (k.to_string(), v))
-                            .collect()
-                    })
-                }
-                Value::Array(arr) => {
-                    let mut out: Vec<(String, Value)> = Vec::new();
-                    let dense: Vec<Value> = array::with_elements(*arr, self.gc_heap(), |els| {
-                        els.iter().cloned().collect()
-                    });
-                    for (idx, v) in dense.into_iter().enumerate() {
-                        out.push((idx.to_string(), v));
+            // §20.1.2.2 step 5 — enumerate own enumerable string keys
+            // of `properties`, then `Get` each through the
+            // accessor-aware path so user-defined `valueOf` /
+            // `toString` / accessor getters fire per §6.2.5.5
+            // ToPropertyDescriptor.
+            let props_owned = props_arg.clone();
+            let keys = own_enumerable_keys_for_define(self, &props_owned)?;
+            for key in keys {
+                let vm_key = crate::VmPropertyKey::OwnedString(key.clone());
+                let outcome = self.ordinary_get_value(
+                    context,
+                    props_owned.clone(),
+                    props_owned.clone(),
+                    &vm_key,
+                    0,
+                )?;
+                let desc_value = match outcome {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, props_owned.clone(), args)?
                     }
-                    let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
-                        body.named_properties.as_ref().map_or_else(Vec::new, |m| {
-                            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                        })
-                    });
-                    out.extend(named);
-                    out
-                }
-                Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                    // Function objects carry a user-properties bag —
-                    // an ordinary JsObject — accessed via the
-                    // function-id keyed side table on the runtime.
-                    // Iterate its enumerable own data entries.
-                    let fid = *function_id;
-                    self.function_user_props
-                        .get(&fid)
-                        .copied()
-                        .map_or_else(Vec::new, |bag| {
-                            object::with_properties(bag, self.gc_heap(), |p| {
-                                p.enumerable_data_iter()
-                                    .map(|(k, v)| (k.to_string(), v))
-                                    .collect()
-                            })
-                        })
-                }
-                Value::NativeFunction(native) => native
-                    .enumerable_own_property_keys(self.gc_heap())
-                    .into_iter()
-                    .filter_map(|key| {
-                        match native.own_property_descriptor(
-                            self.gc_heap(),
-                            &self.string_heap,
-                            &key,
-                        ) {
-                            Ok(Some(desc)) => Some((
-                                key,
-                                match &desc.kind {
-                                    object::DescriptorKind::Data { value } => value.clone(),
-                                    _ => Value::Undefined,
-                                },
-                            )),
-                            _ => None,
-                        }
-                    })
-                    .collect(),
-                // §20.1.2.2 / §20.1.2.3 step 2 — `ToObject(Properties)`
-                // boxes primitives into their wrapper. Wrappers carry
-                // no observable enumerable own keys (String chars +
-                // length are non-enumerable on the wrapper object),
-                // so the spec walk yields an empty descriptor list.
-                // Return `Ok(())` rather than `TypeMismatch` so
-                // `Object.create(proto, 1n)` etc. round-trip per
-                // `properties-arg-to-object*.js`.
-                Value::Boolean(_)
-                | Value::Number(_)
-                | Value::String(_)
-                | Value::Symbol(_)
-                | Value::BigInt(_) => Vec::new(),
-                // §22.2.6 — RegExp instances walk via the generic
-                // enumerable-key probe so user-installed own
-                // properties surface, then each value is read with
-                // observable `[[Get]]` semantics (accessors fire).
-                Value::RegExp(_) => {
-                    let keys =
-                        self.enumerable_own_string_keys_for_value(context, props_arg.clone(), 0)?;
-                    let mut out = Vec::with_capacity(keys.len());
-                    for key in keys {
-                        let value =
-                            self.get_property_value_for_call(context, props_arg.clone(), &key)?;
-                        out.push((key, value));
-                    }
-                    out
-                }
-                Value::BoundFunction(bound) => {
-                    let names = crate::function_metadata::bound_enumerable_own_property_keys(
-                        bound,
-                        self.gc_heap(),
-                    );
-                    let mut out = Vec::with_capacity(names.len());
-                    for key in names {
-                        let value =
-                            self.get_property_value_for_call(context, props_arg.clone(), &key)?;
-                        out.push((key, value));
-                    }
-                    out
-                }
-                _ => return Err(VmError::TypeMismatch),
-            };
-            for (key, desc_value) in entries {
+                };
                 let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
                 if !self.define_own_property_partial(obj, &key, descriptor)? {
                     return Err(VmError::TypeError {
@@ -750,61 +656,34 @@ impl Interpreter {
         // arrays / functions / class constructors / native functions
         // behave like ordinary objects here.
         let props_value = args.get(1).cloned().unwrap_or(Value::Undefined);
-        let entries: Vec<(String, Value)> = match &props_value {
-            Value::Object(o) => object::with_properties(*o, self.gc_heap(), |p| {
-                p.enumerable_data_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect()
-            }),
-            Value::ClassConstructor(class) => {
-                object::with_properties(class.statics(self.gc_heap()), self.gc_heap(), |p| {
-                    p.enumerable_data_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect()
-                })
-            }
-            Value::Array(arr) => {
-                // §22.1.3.3 EnumerableOwnPropertyNames for Array —
-                // indices in storage order, then any named props.
-                let mut out: Vec<(String, Value)> = Vec::new();
-                let dense: Vec<Value> =
-                    array::with_elements(*arr, self.gc_heap(), |els| els.iter().cloned().collect());
-                for (idx, v) in dense.into_iter().enumerate() {
-                    out.push((idx.to_string(), v));
-                }
-                let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
-                    body.named_properties.as_ref().map_or_else(Vec::new, |m| {
-                        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    })
-                });
-                out.extend(named);
-                out
-            }
-            // §7.1.18 ToObject — `null` / `undefined` throw a
-            // TypeError. Other primitives wrap into their boxed
-            // form which has no own enumerable string-keyed
-            // properties (except `String`, where the code units
-            // surface as indexed slots).
-            Value::Null | Value::Undefined => {
-                return Err(VmError::TypeError {
-                    message: "Object.defineProperties properties must be an object".to_string(),
-                });
-            }
-            Value::String(s) => {
-                let mut out: Vec<(String, Value)> = Vec::new();
-                let units = s.to_utf16_vec();
-                for (i, &u) in units.iter().enumerate() {
-                    let unit_str = crate::JsString::from_utf16_units(&[u], &self.string_heap)
-                        .map_err(|_| VmError::TypeMismatch)?;
-                    out.push((i.to_string(), Value::String(unit_str)));
-                }
-                out
-            }
-            _ => Vec::new(),
-        };
-        for (key, desc_value) in entries {
-            let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
+        // §7.1.18 ToObject — `null` / `undefined` throw a
+        // TypeError. Other primitives wrap into their boxed
+        // form which has no own enumerable string-keyed
+        // properties (except `String`, where the code units
+        // surface as indexed slots).
+        if matches!(props_value, Value::Null | Value::Undefined) {
+            return Err(VmError::TypeError {
+                message: "Object.defineProperties properties must be an object".to_string(),
+            });
+        }
+        let keys = own_enumerable_keys_for_define(self, &props_value)?;
+        for key in keys {
+            // §6.2.5.5 step 4 — `Get(props, key)` is accessor-aware,
+            // and step 5 — `ToPropertyDescriptor(descObj)` reads the
+            // accessor / data fields off the resolved value. Thread
+            // both through the interpreter so user getters fire and
+            // any abrupt completion propagates.
             let vm_key = crate::VmPropertyKey::OwnedString(key.clone());
+            let outcome =
+                self.ordinary_get_value(context, props_value.clone(), props_value.clone(), &vm_key, 0)?;
+            let desc_value = match outcome {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                    self.run_callable_sync(context, &getter, props_value.clone(), args)?
+                }
+            };
+            let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
             let ok = self.define_own_property_value(context, &target_value, &vm_key, descriptor)?;
             if !ok {
                 return Err(VmError::TypeError {
@@ -1952,6 +1831,49 @@ impl Interpreter {
                 Ok(Value::Iterator(iter))
             }
         }
+    }
+}
+
+/// §6.2.5.5 + §20.1.2.3 — enumerate the own enumerable string keys
+/// of a `properties` argument supplied to `Object.defineProperties`
+/// / `Object.create`. Includes accessor-shaped own keys so the
+/// caller can `Get` the descriptor value through the spec's
+/// accessor-aware path.
+fn own_enumerable_keys_for_define(
+    interp: &Interpreter,
+    props: &Value,
+) -> Result<Vec<String>, VmError> {
+    match props {
+        Value::Object(o) => Ok(object::with_properties(*o, interp.gc_heap(), |p| {
+            p.enumerable_keys().map(|k| k.to_string()).collect()
+        })),
+        Value::ClassConstructor(class) => Ok(object::with_properties(
+            class.statics(interp.gc_heap()),
+            interp.gc_heap(),
+            |p| p.enumerable_keys().map(|k| k.to_string()).collect(),
+        )),
+        Value::Array(arr) => {
+            // §22.1.3.3 EnumerableOwnPropertyNames for Array — indices
+            // in storage order, then any named props that were
+            // installed enumerable on the array exotic.
+            let mut out: Vec<String> = Vec::new();
+            let dense_len = array::with_elements(*arr, interp.gc_heap(), |els| els.len());
+            for idx in 0..dense_len {
+                out.push(idx.to_string());
+            }
+            let named: Vec<String> = interp.gc_heap().read_payload(*arr, |body| {
+                body.named_properties
+                    .as_ref()
+                    .map_or_else(Vec::new, |m| m.keys().cloned().collect())
+            });
+            out.extend(named);
+            Ok(out)
+        }
+        Value::String(s) => {
+            let units = s.to_utf16_vec();
+            Ok((0..units.len()).map(|i| i.to_string()).collect())
+        }
+        _ => Ok(Vec::new()),
     }
 }
 

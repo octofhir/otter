@@ -1308,7 +1308,13 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             // `language/expressions/unary-plus/bigint-throws.js`),
             // so the constructor diverges here from `Op::ToNumber`.
             // <https://tc39.es/ecma262/#sec-number-constructor-number-value>
-            if let Value::BigInt(b) = &args[0] {
+            if let Value::Symbol(_) = &args[0] {
+                // §7.1.4 ToNumber step 2 — Symbol → TypeError.
+                return Err(NativeError::TypeError {
+                    name: "Number",
+                    reason: "Cannot convert a Symbol value to a number".to_string(),
+                });
+            } else if let Value::BigInt(b) = &args[0] {
                 let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
                 crate::number::NumberValue::from_f64(f)
             } else if matches!(
@@ -1355,7 +1361,12 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                         name: "Number",
                         reason: e.to_string(),
                     })?;
-                if let Value::BigInt(b) = &primitive {
+                if let Value::Symbol(_) = &primitive {
+                    return Err(NativeError::TypeError {
+                        name: "Number",
+                        reason: "Cannot convert a Symbol value to a number".to_string(),
+                    });
+                } else if let Value::BigInt(b) = &primitive {
                     let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
                     crate::number::NumberValue::from_f64(f)
                 } else {

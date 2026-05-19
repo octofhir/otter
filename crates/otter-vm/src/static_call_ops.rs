@@ -348,12 +348,30 @@ impl Interpreter {
         // its own ToPrimitive(`number`) ladder, handled inside
         // `date::dispatch::construct_time_value`.
         let mut args = args;
-        let needs_coerce = matches!(method, method_id::DateMethod::UTC)
+        let needs_to_number = matches!(method, method_id::DateMethod::UTC)
             || (matches!(method, method_id::DateMethod::Construct) && args.len() >= 2);
-        if needs_coerce {
+        if needs_to_number {
             for slot in args.iter_mut() {
                 let coerced = self.coerce_to_number(context, slot)?;
                 *slot = Value::Number(coerced);
+            }
+        } else if matches!(method, method_id::DateMethod::Construct) && args.len() == 1 {
+            // §21.4.2.2 step 3.b — single-arg `new Date(value)` runs
+            // `ToPrimitive(value)` (hint "default") when `value` is
+            // not already a Date instance. `String` results then
+            // drive Date.parse; everything else flows through
+            // ToNumber. Objects with `[[DateValue]]` skip ToPrimitive
+            // entirely (§21.4.2.2 step 3.a) so subclass instances
+            // copy the underlying time value verbatim.
+            let slot = &mut args[0];
+            let is_date_instance = matches!(slot, Value::Object(o) if crate::object::date_data(*o, &self.gc_heap).is_some());
+            if !is_date_instance {
+                let primitive = self.coerce_to_primitive(
+                    context,
+                    slot,
+                    crate::abstract_ops::ToPrimitiveHint::Default,
+                )?;
+                *slot = primitive;
             }
         }
         // Resolve `%Date.prototype%` so the freshly allocated

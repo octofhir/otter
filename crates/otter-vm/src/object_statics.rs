@@ -2069,6 +2069,19 @@ pub fn call(
                 // expando bag for ordinary defineProperty.
                 Some(Value::RegExp(r)) => {
                     let r = *r;
+                    let existing = match &key {
+                        PropertyKey::String(k) => r.expando(gc_heap).is_some_and(|bag| {
+                            crate::object::get_own_descriptor(bag, gc_heap, k).is_some()
+                        }),
+                        PropertyKey::Symbol(sym) => r.expando(gc_heap).is_some_and(|bag| {
+                            crate::object::get_own_symbol_descriptor(bag, gc_heap, sym).is_some()
+                        }),
+                    };
+                    if !existing && !r.is_extensible(gc_heap) {
+                        return Err(VmError::TypeError {
+                            message: format!("Cannot define property '{}'", key.label()),
+                        });
+                    }
                     let bag = crate::property_dispatch::regexp_ensure_expando_pub(gc_heap, &r)?;
                     let ok = match &key {
                         PropertyKey::String(k) => {
@@ -2374,6 +2387,7 @@ pub fn call(
             match &arg {
                 Value::Object(o) => crate::object::prevent_extensions(*o, gc_heap),
                 Value::Array(a) => crate::array::prevent_extensions(*a, gc_heap),
+                Value::RegExp(r) => r.prevent_extensions(gc_heap),
                 _ => {}
             }
             Ok(arg)
@@ -2464,12 +2478,12 @@ pub fn call(
             let result = match arg {
                 Value::Object(o) => crate::object::is_extensible(o, gc_heap),
                 Value::Array(arr) => crate::array::is_extensible(arr, gc_heap),
+                Value::RegExp(r) => r.is_extensible(gc_heap),
                 Value::Function { .. }
                 | Value::Closure { .. }
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
                 | Value::ClassConstructor(_)
-                | Value::RegExp(_)
                 | Value::Map(_)
                 | Value::Set(_)
                 | Value::WeakMap(_)

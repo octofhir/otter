@@ -322,6 +322,9 @@ pub fn set(
     idx: usize,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
+        return Ok(());
+    }
     let barrier_value = value.clone();
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
@@ -366,6 +369,9 @@ pub(crate) fn set_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
+        return Ok(());
+    }
     let barrier_value = value.clone();
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {

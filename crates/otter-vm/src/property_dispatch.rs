@@ -840,11 +840,26 @@ impl Interpreter {
                 // observability checks.
                 if name == "lastIndex" {
                     regexp_prototype::store_property(r, &mut self.gc_heap, name, value.clone());
+                    None
                 } else {
-                    let bag = regexp_ensure_expando(self, r, &receiver)?;
-                    self.set_property(bag, name, value.clone())?;
+                    let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
+                        matches!(
+                            object::lookup_own(bag, &self.gc_heap, name),
+                            object::PropertyLookup::Absent
+                        )
+                    });
+                    if absent && !r.is_extensible(&self.gc_heap) {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot add property '{name}' to non-extensible RegExp"),
+                        )?;
+                        None
+                    } else {
+                        let bag = regexp_ensure_expando(self, r, &receiver)?;
+                        self.set_property(bag, name, value.clone())?;
+                        None
+                    }
                 }
-                None
             }
             Value::Array(a) => {
                 crate::array::set_named_property(*a, &mut self.gc_heap, name, value.clone())?;
@@ -869,6 +884,9 @@ impl Interpreter {
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let fid = *function_id;
+                let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
+                    context, fid, name,
+                )?;
                 if matches!(name, "name" | "length") {
                     if let Some(desc) =
                         self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
@@ -892,6 +910,12 @@ impl Interpreter {
                         }
                         Some(bag)
                     }
+                } else if !has_own && !self.ordinary_function_is_extensible(fid) {
+                    Self::failed_set_result(
+                        strict,
+                        format!("Cannot add property '{name}' to non-extensible function"),
+                    )?;
+                    None
                 } else {
                     let bag =
                         self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?;
@@ -1114,7 +1138,8 @@ impl Interpreter {
                     None => {
                         let proto = self.constructor_prototype_value("Array")?;
                         if let Value::Object(p) = proto {
-                            crate::object::get_symbol(p, &self.gc_heap, sym).unwrap_or(Value::Undefined)
+                            crate::object::get_symbol(p, &self.gc_heap, sym)
+                                .unwrap_or(Value::Undefined)
                         } else {
                             Value::Undefined
                         }
@@ -1378,6 +1403,11 @@ impl Interpreter {
                 Value::String(key),
             ) => {
                 let key = key.to_lossy_string();
+                let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
+                    context,
+                    *function_id,
+                    &key,
+                )?;
                 match self.ordinary_function_own_property_descriptor(
                     Some(context),
                     *function_id,
@@ -1390,17 +1420,24 @@ impl Interpreter {
                         )?;
                     }
                     _ => {
-                        let bag = self.function_user_bag_stack_rooted(
-                            stack,
-                            *function_id,
-                            &[&recv, &idx_value, &value],
-                        )?;
-                        self.set_property(bag, &key, value)?;
-                        if let Some(metadata_key) =
-                            function_metadata::ordinary_function_metadata_key(&key)
-                        {
-                            self.function_deleted_metadata
-                                .remove(&(*function_id, metadata_key));
+                        if !has_own && !self.ordinary_function_is_extensible(*function_id) {
+                            Self::failed_set_result(
+                                strict,
+                                format!("Cannot add property '{key}' to non-extensible function"),
+                            )?;
+                        } else {
+                            let bag = self.function_user_bag_stack_rooted(
+                                stack,
+                                *function_id,
+                                &[&recv, &idx_value, &value],
+                            )?;
+                            self.set_property(bag, &key, value)?;
+                            if let Some(metadata_key) =
+                                function_metadata::ordinary_function_metadata_key(&key)
+                            {
+                                self.function_deleted_metadata
+                                    .remove(&(*function_id, metadata_key));
+                            }
                         }
                     }
                 }
@@ -1580,6 +1617,17 @@ impl Interpreter {
             // = "tag"` and similar reflective writes would surface a
             // bogus `TypeMismatch`.
             (Value::RegExp(r), Value::Symbol(sym)) => {
+                let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
+                    object::get_own_symbol_descriptor(bag, &self.gc_heap, sym).is_none()
+                });
+                if absent && !r.is_extensible(&self.gc_heap) {
+                    Self::failed_set_result(
+                        strict,
+                        "Cannot add symbol property to non-extensible RegExp",
+                    )?;
+                    stack[top_idx].pc += 1;
+                    return Ok(());
+                }
                 let bag = regexp_ensure_expando(self, r, &recv)?;
                 if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
                     return Err(VmError::TypeError {
@@ -1602,6 +1650,17 @@ impl Interpreter {
                 Value::Function { function_id } | Value::Closure { function_id, .. },
                 Value::Symbol(sym),
             ) => {
+                if !self
+                    .ordinary_function_has_own_symbol_property_for_extensibility(*function_id, sym)
+                    && !self.ordinary_function_is_extensible(*function_id)
+                {
+                    Self::failed_set_result(
+                        strict,
+                        "Cannot add symbol property to non-extensible function",
+                    )?;
+                    stack[top_idx].pc += 1;
+                    return Ok(());
+                }
                 let bag = self.function_user_bag_stack_rooted(
                     stack,
                     *function_id,
@@ -2700,24 +2759,100 @@ impl Interpreter {
             };
             return self.store_to_primitive_base(stack, context, receiver, key, value, scratch_reg);
         }
+        if let Value::RegExp(r) = &receiver {
+            match &key {
+                ComputedPropertyKey::String(key) if key == "lastIndex" => {
+                    regexp_prototype::store_property(r, &mut self.gc_heap, key, value);
+                }
+                ComputedPropertyKey::String(key) => {
+                    let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
+                        matches!(
+                            object::lookup_own(bag, &self.gc_heap, key),
+                            object::PropertyLookup::Absent
+                        )
+                    });
+                    if absent && !r.is_extensible(&self.gc_heap) {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            format!("Cannot add property '{key}' to non-extensible RegExp"),
+                        );
+                    }
+                    let bag = regexp_ensure_expando(self, r, &receiver)?;
+                    self.set_property(bag, key, value)?;
+                }
+                ComputedPropertyKey::Symbol(sym) => {
+                    let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
+                        object::get_own_symbol_descriptor(bag, &self.gc_heap, sym).is_none()
+                    });
+                    if absent && !r.is_extensible(&self.gc_heap) {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            "Cannot add symbol property to non-extensible RegExp",
+                        );
+                    }
+                    let bag = regexp_ensure_expando(self, r, &receiver)?;
+                    if !object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value) {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            "Cannot assign to symbol property",
+                        );
+                    }
+                }
+            }
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(true);
+        }
         let obj = match &receiver {
             Value::Object(obj) => *obj,
             Value::ClassConstructor(class) => class.statics(&self.gc_heap),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                if let ComputedPropertyKey::String(key) = &key
-                    && function_metadata::ordinary_function_metadata_key(key).is_some()
-                    && let Some(desc) = self.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        *function_id,
-                        key,
-                    )?
-                    && !desc.writable()
-                {
-                    return Self::finish_failed_set(
-                        stack,
-                        context,
-                        format!("Cannot assign to read-only property '{key}' of function"),
-                    );
+                match &key {
+                    ComputedPropertyKey::String(key) => {
+                        if function_metadata::ordinary_function_metadata_key(key).is_some()
+                            && let Some(desc) = self.ordinary_function_own_property_descriptor(
+                                Some(context),
+                                *function_id,
+                                key,
+                            )?
+                            && !desc.writable()
+                        {
+                            return Self::finish_failed_set(
+                                stack,
+                                context,
+                                format!("Cannot assign to read-only property '{key}' of function"),
+                            );
+                        }
+                        let has_own = self
+                            .ordinary_function_has_own_string_property_for_extensibility(
+                                context,
+                                *function_id,
+                                key,
+                            )?;
+                        if !has_own && !self.ordinary_function_is_extensible(*function_id) {
+                            return Self::finish_failed_set(
+                                stack,
+                                context,
+                                format!("Cannot add property '{key}' to non-extensible function"),
+                            );
+                        }
+                    }
+                    ComputedPropertyKey::Symbol(sym) => {
+                        if !self.ordinary_function_has_own_symbol_property_for_extensibility(
+                            *function_id,
+                            sym,
+                        ) && !self.ordinary_function_is_extensible(*function_id)
+                        {
+                            return Self::finish_failed_set(
+                                stack,
+                                context,
+                                "Cannot add symbol property to non-extensible function",
+                            );
+                        }
+                    }
                 }
                 self.function_user_bag_stack_rooted(stack, *function_id, &[&receiver, &value])?
             }

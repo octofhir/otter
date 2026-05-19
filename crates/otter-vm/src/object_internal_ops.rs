@@ -708,6 +708,10 @@ impl Interpreter {
             }
             Value::Object(obj) => Ok(object::is_extensible(*obj, &self.gc_heap)),
             Value::Array(arr) => Ok(array::is_extensible(*arr, &self.gc_heap)),
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                Ok(self.ordinary_function_is_extensible(*function_id))
+            }
+            Value::RegExp(regexp) => Ok(regexp.is_extensible(&self.gc_heap)),
             // Per §10.1.3 every other ordinary heap value is extensible
             // by default. Non-object primitives never reach this path
             // (callers gate via `Type(O) is Object`).
@@ -1592,6 +1596,14 @@ impl Interpreter {
             }
             Value::Array(arr) => {
                 array::prevent_extensions(*arr, &mut self.gc_heap);
+                Ok(true)
+            }
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                self.ordinary_function_prevent_extensions(*function_id);
+                Ok(true)
+            }
+            Value::RegExp(regexp) => {
+                regexp.prevent_extensions(&mut self.gc_heap);
                 Ok(true)
             }
             _ => Ok(true),
@@ -2973,6 +2985,13 @@ impl Interpreter {
             },
             Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
                 VmPropertyKey::Symbol(sym) => {
+                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(
+                        function_id,
+                        sym,
+                    ) && !self.ordinary_function_is_extensible(function_id)
+                    {
+                        return Ok(false);
+                    }
                     let bag = self.function_user_bag_runtime_rooted(function_id, &[&value], &[])?;
                     Ok(object::set_symbol(
                         bag,
@@ -2985,6 +3004,15 @@ impl Interpreter {
                     let key = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
+                    let has_own = self
+                        .ordinary_function_has_own_string_property_for_extensibility(
+                            context,
+                            function_id,
+                            key,
+                        )?;
+                    if !has_own && !self.ordinary_function_is_extensible(function_id) {
+                        return Ok(false);
+                    }
                     let descriptor = match self.ordinary_function_own_property_descriptor(
                         Some(context),
                         function_id,

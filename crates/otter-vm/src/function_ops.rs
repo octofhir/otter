@@ -790,6 +790,55 @@ impl Interpreter {
         }
     }
 
+    /// §10.1.3 / §10.1.4 ordinary function `[[Extensible]]`.
+    ///
+    /// Function objects store user expandos in an interpreter side
+    /// table, so their per-instance extensibility flag lives next
+    /// to that table rather than in a materialised ordinary object
+    /// bag.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-isextensible>
+    /// - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-preventextensions>
+    pub(crate) fn ordinary_function_is_extensible(&self, function_id: u32) -> bool {
+        !self.function_non_extensible.contains(&function_id)
+    }
+
+    pub(crate) fn ordinary_function_prevent_extensions(&mut self, function_id: u32) {
+        self.function_non_extensible.insert(function_id);
+    }
+
+    pub(crate) fn ordinary_function_has_own_string_property_for_extensibility(
+        &self,
+        context: &ExecutionContext,
+        function_id: u32,
+        key: &str,
+    ) -> Result<bool, VmError> {
+        if self
+            .ordinary_function_own_property_descriptor(Some(context), function_id, key)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(key == "prototype"
+            && !context.function_is_arrow(function_id)
+            && !self
+                .function_deleted_metadata
+                .contains(&(function_id, "prototype")))
+    }
+
+    pub(crate) fn ordinary_function_has_own_symbol_property_for_extensibility(
+        &self,
+        function_id: u32,
+        key: &crate::symbol::JsSymbol,
+    ) -> bool {
+        self.function_user_props
+            .get(&function_id)
+            .copied()
+            .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, key))
+            .is_some()
+    }
+
     /// Own string-keyed property names for an ordinary function
     /// record, in spec creation order.
     ///
@@ -929,7 +978,20 @@ impl Interpreter {
                         None => return Ok(false),
                     }
                 }
-                None => descriptor,
+                None => {
+                    let has_virtual_prototype = context.is_some_and(|context| {
+                        key == "prototype"
+                            && !context.function_is_arrow(function_id)
+                            && !self
+                                .function_deleted_metadata
+                                .contains(&(function_id, "prototype"))
+                    });
+                    if !has_virtual_prototype && !self.ordinary_function_is_extensible(function_id)
+                    {
+                        return Ok(false);
+                    }
+                    descriptor
+                }
             };
         let mut roots = Vec::with_capacity(value_roots.len() + 3);
         roots.extend_from_slice(value_roots);
@@ -1182,6 +1244,13 @@ impl Interpreter {
                 let completed = descriptor.complete_for_new_property();
                 let ok = match (&target, function_id, &key) {
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
+                        if !self.ordinary_function_has_own_symbol_property_for_extensibility(
+                            function_id,
+                            sym,
+                        ) && !self.ordinary_function_is_extensible(function_id)
+                        {
+                            return Err(VmError::TypeMismatch);
+                        }
                         let bag = match stack_roots {
                             Some(stack) => {
                                 self.function_user_bag_stack_rooted(stack, function_id, &[&target])?
@@ -1313,6 +1382,24 @@ impl Interpreter {
                 };
                 Ok(Some(Value::Boolean(present)))
             }
+            // §20.1.2.14 / §20.1.2.18 — ordinary functions keep
+            // expando storage outside `ObjectBody`, so handle their
+            // `[[Extensible]]` state before the generic static
+            // dispatcher. This mirrors §10.1.3/§10.1.4 for the
+            // side-table-backed function shape.
+            M::IsExtensible => match target {
+                Value::Function { function_id } | Value::Closure { function_id, .. } => Ok(Some(
+                    Value::Boolean(self.ordinary_function_is_extensible(function_id)),
+                )),
+                _ => Ok(None),
+            },
+            M::PreventExtensions => match target {
+                Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                    self.ordinary_function_prevent_extensions(function_id);
+                    Ok(Some(target))
+                }
+                _ => Ok(None),
+            },
             // §20.1.2 — only the methods above need the function-as-
             // object fast path; everything else falls through to the
             // ordinary object_statics dispatcher.
@@ -1325,11 +1412,9 @@ impl Interpreter {
             | M::GetOwnPropertyDescriptors
             | M::GetOwnPropertyNames
             | M::GetOwnPropertySymbols
-            | M::IsExtensible
             | M::IsFrozen
             | M::IsSealed
             | M::Keys
-            | M::PreventExtensions
             | M::Seal
             | M::Values
             | M::GroupBy => Ok(None),

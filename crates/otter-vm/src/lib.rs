@@ -1677,6 +1677,12 @@ pub struct Interpreter {
     /// underlying function so writes through any closure handle
     /// land on the same place.
     function_user_props: std::collections::HashMap<u32, JsObject>,
+    /// Function ids whose ordinary function object has had
+    /// `[[PreventExtensions]]` applied. Kept separate from the
+    /// lazy user bag so materialising spec-existing virtual
+    /// properties such as `prototype` remains valid after
+    /// `preventExtensions`.
+    function_non_extensible: std::collections::HashSet<u32>,
     /// Deleted virtual `name` / `length` own properties for ordinary
     /// bytecode functions. Stored separately from the user bag so
     /// deleting built-in function metadata does not resurrect the
@@ -1891,6 +1897,7 @@ impl Interpreter {
             pending_uncaught_throw: None,
             pending_uncaught_frames: None,
             function_user_props: std::collections::HashMap::new(),
+            function_non_extensible: std::collections::HashSet::new(),
             function_deleted_metadata: std::collections::HashSet::new(),
             console_sink: console::default_console_sink(),
             timer_scheduler: None,

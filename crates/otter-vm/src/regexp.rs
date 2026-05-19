@@ -208,6 +208,10 @@ pub struct JsRegExpBody {
     /// Mutated through `heap.with_payload` like every other GC
     /// body field; never wrap in `Cell`.
     pub expando: Option<crate::object::JsObject>,
+    /// Per-instance `[[Extensible]]` slot for RegExp exotic objects.
+    /// `Object.preventExtensions` flips this flag while existing
+    /// own slots such as `lastIndex` remain writable.
+    pub extensible: bool,
 }
 
 impl otter_gc::SafeTraceable for JsRegExpBody {
@@ -263,6 +267,7 @@ impl JsRegExp {
                 flags,
                 last_index: RefCell::new(Value::Number(NumberValue::from_i32(0))),
                 expando: None,
+                extensible: true,
             })?,
         })
     }
@@ -347,6 +352,23 @@ impl JsRegExp {
             body.expando = Some(expando);
         });
         heap.record_write(self.inner, &barrier);
+    }
+
+    /// `RegExp` exotic `[[IsExtensible]]`.
+    #[must_use]
+    pub fn is_extensible(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.extensible)
+    }
+
+    /// `RegExp` exotic `[[PreventExtensions]]`.
+    pub fn prevent_extensions(&self, heap: &mut otter_gc::GcHeap) {
+        let expando = heap.with_payload(self.inner, |body| {
+            body.extensible = false;
+            body.expando
+        });
+        if let Some(expando) = expando {
+            crate::object::prevent_extensions(expando, heap);
+        }
     }
 
     /// Parsed flag bits.

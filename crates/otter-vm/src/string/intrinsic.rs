@@ -205,7 +205,9 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 /// `String(...)` / `new String(...)` native — ECMA-262 §22.1.1.
 ///
 /// # Algorithm
-/// 1. Take the first argument or default to `undefined`.
+/// 1. If no argument was supplied, default to the empty string per
+///    §22.1.1 step 1; an explicit `undefined` still coerces to
+///    `"undefined"` through `ToString`.
 /// 2. If the value is already a primitive (`undefined`, `null`,
 ///    `Boolean`, `Number`, `BigInt`, `String`, `Symbol`), pass it
 ///    through unchanged. Otherwise call `ToPrimitive(value, "string")`
@@ -225,8 +227,19 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 /// - [`NativeError::Thrown`] — `ToPrimitive` raised an uncaught JS
 ///   exception (rethrown without wrapping).
 fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let raw = args.first().cloned().unwrap_or(Value::Undefined);
     let string_heap = ctx.interp_mut().string_heap_clone();
+    let raw = match args.first() {
+        Some(value) => value.clone(),
+        None => {
+            let empty = crate::string::JsString::from_str("", &string_heap).map_err(|_| {
+                NativeError::TypeError {
+                    name: "String",
+                    reason: "string allocation failed".to_string(),
+                }
+            })?;
+            Value::String(empty)
+        }
+    };
     let primitive = match &raw {
         Value::Undefined
         | Value::Null

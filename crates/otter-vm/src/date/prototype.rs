@@ -208,9 +208,11 @@ fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 }
 
 /// Helper for `setX`-family methods. Reads each `args.args[idx]` as
-/// a `f64` via `ToNumber`; missing args fall back to the value
-/// supplied by `fallback`. Returns `NaN` if any provided arg is
-/// non-finite or `undefined`.
+/// a `f64` value. The bridge in `method_ops.rs` pre-coerces every
+/// provided slot through the §7.1.4 `ToNumber` ladder so this fn
+/// only sees primitives; missing positional slots fall back to the
+/// component-from-time value supplied by `fallback` (§21.4.4.x
+/// "if X is present" branch).
 fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
     match args.args.get(idx) {
         None => fallback,
@@ -222,10 +224,24 @@ fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
     }
 }
 
+/// First-arg helper for `setX`-family methods. Spec treats the
+/// leading parameter as always-present (§21.4.4.x step 2 always
+/// runs `ToNumber(value)`), so a missing arg becomes
+/// `ToNumber(undefined) = NaN` rather than the component fallback.
+fn read_primary_arg_number(args: &IntrinsicArgs<'_>) -> f64 {
+    match args.args.first() {
+        None | Some(Value::Undefined) => f64::NAN,
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::Boolean(true)) => 1.0,
+        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
+        _ => f64::NAN,
+    }
+}
+
 /// §21.4.4.27 — `setTime(ms)`. Direct write, returns the time value.
 fn impl_set_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, _) = receiver_handle(args)?;
-    let ms = read_arg_number(args, 0, f64::NAN);
+    let ms = read_primary_arg_number(args);
     object::set_date_data(obj, args.gc_heap, ms);
     let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
     Ok(Value::Number(NumberValue::from_f64(written)))
@@ -265,8 +281,12 @@ fn finish_set(
 
 fn impl_set_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    let mut c = current_components(time);
-    c.0 = read_arg_number(args, 0, c.0);
+    // §21.4.4.21 step 3 — `If t is NaN, set t to +0`. setFullYear is
+    // the rare setter that writes through an invalid Date; rebase
+    // components to the epoch so a NaN receiver becomes a real date.
+    let base_time = if time.is_nan() { 0.0 } else { time };
+    let mut c = current_components(base_time);
+    c.0 = read_primary_arg_number(args);
     if args.args.len() >= 2 {
         c.1 = read_arg_number(args, 1, c.1);
     }
@@ -278,13 +298,8 @@ fn impl_set_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 
 fn impl_set_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    // §21.4.4.21 — `setMonth(month [, date])`. Invalid Date passes
-    // through (NaN year → NaN result).
-    if broken_down(time).is_none() {
-        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
-    }
     let mut c = current_components(time);
-    c.1 = read_arg_number(args, 0, c.1);
+    c.1 = read_primary_arg_number(args);
     if args.args.len() >= 2 {
         c.2 = read_arg_number(args, 1, c.2);
     }
@@ -293,21 +308,15 @@ fn impl_set_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 
 fn impl_set_date(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    if broken_down(time).is_none() {
-        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
-    }
     let mut c = current_components(time);
-    c.2 = read_arg_number(args, 0, c.2);
+    c.2 = read_primary_arg_number(args);
     finish_set(obj, args, c)
 }
 
 fn impl_set_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    if broken_down(time).is_none() {
-        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
-    }
     let mut c = current_components(time);
-    c.3 = read_arg_number(args, 0, c.3);
+    c.3 = read_primary_arg_number(args);
     if args.args.len() >= 2 {
         c.4 = read_arg_number(args, 1, c.4);
     }
@@ -322,11 +331,8 @@ fn impl_set_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 
 fn impl_set_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    if broken_down(time).is_none() {
-        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
-    }
     let mut c = current_components(time);
-    c.4 = read_arg_number(args, 0, c.4);
+    c.4 = read_primary_arg_number(args);
     if args.args.len() >= 2 {
         c.5 = read_arg_number(args, 1, c.5);
     }
@@ -338,11 +344,8 @@ fn impl_set_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
 
 fn impl_set_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    if broken_down(time).is_none() {
-        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
-    }
     let mut c = current_components(time);
-    c.5 = read_arg_number(args, 0, c.5);
+    c.5 = read_primary_arg_number(args);
     if args.args.len() >= 2 {
         c.6 = read_arg_number(args, 1, c.6);
     }
@@ -351,11 +354,8 @@ fn impl_set_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
 
 fn impl_set_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    if broken_down(time).is_none() {
-        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
-    }
     let mut c = current_components(time);
-    c.6 = read_arg_number(args, 0, c.6);
+    c.6 = read_primary_arg_number(args);
     finish_set(obj, args, c)
 }
 
@@ -390,7 +390,7 @@ fn impl_get_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 /// - <https://tc39.es/ecma262/#sec-date.prototype.setyear>
 fn impl_set_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let (obj, time) = receiver_handle(args)?;
-    let y = read_arg_number(args, 0, f64::NAN);
+    let y = read_primary_arg_number(args);
     if y.is_nan() {
         object::set_date_data(obj, args.gc_heap, f64::NAN);
         return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));

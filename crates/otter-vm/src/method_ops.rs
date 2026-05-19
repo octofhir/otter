@@ -657,6 +657,56 @@ impl Interpreter {
                     *slot = primitive;
                 }
             }
+            // §21.4.4.x `Date.prototype.set*` — capture `t` from
+            // `[[DateValue]]` BEFORE coercing args (step 3), run
+            // `ToNumber` on every provided arg in declaration order
+            // (steps 4–7), then restore captured `t` so the intrinsic
+            // body sees the value spec step 3 captured — `ToNumber`
+            // callbacks may have mutated `[[DateValue]]` via
+            // `dt.setTime(...)`, but the spec NaN-check (step 8) and
+            // component math operate on the captured value. The
+            // intrinsic's final assignment in step 12 then overwrites
+            // any in-callback mutation.
+            if let Value::Object(obj) = &recv_value
+                && let Some(captured_t) = crate::object::date_data(*obj, &self.gc_heap)
+                && name.starts_with("set")
+            {
+                for slot in small_args.iter_mut() {
+                    let coerced = self.coerce_to_number(context, slot)?;
+                    *slot = Value::Number(coerced);
+                }
+                // §21.4.4.{20..36} step 8 — `setMonth` / `setDate` /
+                // `setHours` / `setMinutes` / `setSeconds` /
+                // `setMilliseconds` (and UTC variants) **return
+                // NaN without writing** when the captured time was
+                // NaN, even though `ToNumber` callbacks may have
+                // mutated `[[DateValue]]` mid-flight. `setFullYear`,
+                // `setUTCFullYear`, `setTime` and Annex B `setYear`
+                // always write through, so they fall into the
+                // normal restore-and-dispatch path below.
+                let nan_preserving = matches!(
+                    &*name,
+                    "setMonth"
+                        | "setUTCMonth"
+                        | "setDate"
+                        | "setUTCDate"
+                        | "setHours"
+                        | "setUTCHours"
+                        | "setMinutes"
+                        | "setUTCMinutes"
+                        | "setSeconds"
+                        | "setUTCSeconds"
+                        | "setMilliseconds"
+                        | "setUTCMilliseconds"
+                );
+                if captured_t.is_nan() && nan_preserving {
+                    let frame = &mut stack[top_idx];
+                    write_register(frame, dst, Value::Number(NumberValue::from_f64(f64::NAN)))?;
+                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    return Ok(());
+                }
+                crate::object::set_date_data(*obj, &mut self.gc_heap, captured_t);
+            }
             let result = {
                 let string_heap = self.string_heap.clone();
                 let allocation_roots = self.collect_allocation_roots(stack);

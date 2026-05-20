@@ -365,6 +365,31 @@ pub fn set(
     idx: usize,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    set_index_value(arr, heap, idx, value, true)
+}
+
+/// Define an indexed data property after descriptor validation has
+/// already approved the write.
+pub(crate) fn define_index_value(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    idx: usize,
+    value: Value,
+) -> Result<(), otter_gc::OutOfMemory> {
+    set_index_value(arr, heap, idx, value, false)
+}
+
+fn set_index_value(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    idx: usize,
+    value: Value,
+    enforce_writable: bool,
+) -> Result<(), otter_gc::OutOfMemory> {
+    let key = idx.to_string();
+    if enforce_writable && !can_write_array_property(arr, heap, &key) {
+        return Ok(());
+    }
     if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
         return Ok(());
     }
@@ -415,6 +440,10 @@ pub(crate) fn set_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    let key = idx.to_string();
+    if !can_write_array_property(arr, heap, &key) {
+        return Ok(());
+    }
     if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
         return Ok(());
     }
@@ -835,6 +864,9 @@ pub fn set_named_property(
     if let Some(idx) = crate::object::array_index_property_name(key) {
         return set(arr, heap, idx as usize, value);
     }
+    if !can_write_array_property(arr, heap, key) {
+        return Ok(());
+    }
     // §10.4.2 — non-extensible Array exotic rejects fresh keys.
     // Updating an existing key still succeeds (the spec routes
     // through OrdinaryDefineOwnProperty which only fails when the
@@ -990,26 +1022,76 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
     if key == "length" {
         return false;
     }
+    if !can_delete_array_property(arr, heap, key) {
+        return false;
+    }
     if let Some(idx) = crate::object::array_index_property_name(key) {
         let idx = idx as usize;
         return heap.with_payload(arr, |body| {
+            if let Some(accessors) = body.accessors.as_mut() {
+                accessors.remove(key);
+                if accessors.is_empty() {
+                    body.accessors = None;
+                }
+            }
             if let Some(slot) = body.elements.get_mut(idx) {
                 *slot = Value::Hole;
-                body.dirty = true;
-                return true;
             }
             if let Some(sparse) = body.sparse_elements.as_mut() {
                 sparse.remove(&idx);
             }
+            if let Some(flags) = body.property_flags.as_mut() {
+                flags.remove(key);
+                if flags.is_empty() {
+                    body.property_flags = None;
+                }
+            }
+            body.dirty = true;
             true
         });
     }
     heap.with_payload(arr, |body| {
+        if let Some(accessors) = body.accessors.as_mut() {
+            accessors.remove(key);
+            if accessors.is_empty() {
+                body.accessors = None;
+            }
+        }
         if let Some(props) = body.named_properties.as_mut() {
             props.remove(key);
+            if props.is_empty() {
+                body.named_properties = None;
+            }
+        }
+        if let Some(flags) = body.property_flags.as_mut() {
+            flags.remove(key);
+            if flags.is_empty() {
+                body.property_flags = None;
+            }
         }
         body.dirty = true;
         true
+    })
+}
+
+fn can_write_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> bool {
+    heap.read_payload(arr, |body| {
+        if body.accessors.as_ref().is_some_and(|m| m.contains_key(key)) {
+            return false;
+        }
+        body.property_flags
+            .as_ref()
+            .and_then(|flags| flags.get(key))
+            .is_none_or(|flags| flags.writable())
+    })
+}
+
+fn can_delete_array_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> bool {
+    heap.read_payload(arr, |body| {
+        body.property_flags
+            .as_ref()
+            .and_then(|flags| flags.get(key))
+            .is_none_or(|flags| flags.configurable())
     })
 }
 

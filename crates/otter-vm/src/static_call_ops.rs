@@ -1392,20 +1392,6 @@ impl Interpreter {
             }
             M::GetOwnPropertyNames => {
                 let owned: Vec<String> = match args.first() {
-                    Some(Value::Object(target)) => {
-                        object::with_properties(*target, self.gc_heap(), |p| {
-                            p.keys().map(|k| k.to_string()).collect()
-                        })
-                    }
-                    Some(Value::NativeFunction(native)) => native
-                        .own_property_keys(self.gc_heap())
-                        .into_iter()
-                        .collect(),
-                    Some(Value::BoundFunction(bound)) => {
-                        crate::function_metadata::bound_own_property_keys(bound, self.gc_heap())
-                            .into_iter()
-                            .collect()
-                    }
                     Some(
                         Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_),
                     ) => Vec::new(),
@@ -1415,20 +1401,15 @@ impl Interpreter {
                         keys.push("length".to_string());
                         keys
                     }
-                    Some(Value::Array(arr)) => {
-                        let len = crate::array::len(*arr, self.gc_heap());
-                        let mut keys: Vec<String> = (0..len)
-                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
-                            .map(|i| i.to_string())
-                            .collect();
-                        let named: Vec<String> = self.gc_heap().read_payload(*arr, |body| {
-                            body.named_properties
-                                .as_ref()
-                                .map_or_else(Vec::new, |m| m.keys().cloned().collect())
-                        });
-                        keys.extend(named);
-                        keys.push("length".to_string());
-                        keys
+                    Some(target) if own_property_names_uses_internal_methods(target) => {
+                        let string_heap = self.string_heap_clone();
+                        self.own_property_keys_value(context, target, &string_heap)?
+                            .into_iter()
+                            .filter_map(|key| match key {
+                                Value::String(name) => Some(name.to_lossy_string()),
+                                _ => None,
+                            })
+                            .collect()
                     }
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
@@ -1451,14 +1432,30 @@ impl Interpreter {
                 Ok(Some(Value::Array(array)))
             }
             M::GetOwnPropertySymbols => {
-                let target = match args.first() {
-                    Some(Value::Object(target)) => *target,
+                let syms: Vec<Value> = match args.first() {
+                    Some(
+                        Value::Boolean(_)
+                        | Value::Number(_)
+                        | Value::Symbol(_)
+                        | Value::BigInt(_)
+                        | Value::String(_),
+                    ) => Vec::new(),
+                    Some(target) if own_property_names_uses_internal_methods(target) => {
+                        let string_heap = self.string_heap_clone();
+                        self.own_property_keys_value(context, target, &string_heap)?
+                            .into_iter()
+                            .filter(|key| matches!(key, Value::Symbol(_)))
+                            .collect()
+                    }
+                    Some(Value::Null) | Some(Value::Undefined) | None => {
+                        return Err(VmError::TypeError {
+                            message: "Object.getOwnPropertySymbols called on null or undefined"
+                                .to_string(),
+                        });
+                    }
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let syms: Vec<Value> = object::with_properties(target, self.gc_heap(), |p| {
-                    p.symbol_keys().map(Value::Symbol).collect()
-                });
-                let target_root = Value::Object(target);
+                let target_root = args.first().cloned().unwrap_or(Value::Undefined);
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     syms,
@@ -1959,6 +1956,19 @@ fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool {
             | Value::DataView(_)
             | Value::TypedArray(_)
             | Value::Promise(_)
+    )
+}
+
+fn own_property_names_uses_internal_methods(target: &Value) -> bool {
+    matches!(
+        target,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Proxy(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
     )
 }
 

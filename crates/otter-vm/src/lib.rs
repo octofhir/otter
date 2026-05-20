@@ -4476,8 +4476,9 @@ impl Interpreter {
                     let (dst, obj_reg, idx_reg) = context
                         .exec_register3(instr)
                         .ok_or(VmError::InvalidOperand)?;
+                    let strict = context.function_is_strict(stack[top_idx].function_id);
                     let frame = &mut stack[top_idx];
-                    self.run_delete_element_regs(frame, dst, obj_reg, idx_reg)?;
+                    self.run_delete_element_regs(frame, dst, obj_reg, idx_reg, strict)?;
                     continue;
                 }
                 Op::GetPrototype => {

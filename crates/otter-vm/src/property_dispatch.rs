@@ -407,6 +407,7 @@ impl Interpreter {
         dst: u16,
         obj_reg: u16,
         idx_reg: u16,
+        strict: bool,
     ) -> Result<(), VmError> {
         let receiver = read_register(frame, obj_reg)?.clone();
         let idx = read_register(frame, idx_reg)?.clone();
@@ -522,6 +523,11 @@ impl Interpreter {
             }
             _ => return Err(VmError::TypeMismatch),
         };
+        if !removed && strict {
+            return Err(VmError::TypeError {
+                message: "Cannot delete property".to_string(),
+            });
+        }
         write_register(frame, dst, Value::Boolean(removed))?;
         frame.pc += 1;
         Ok(())
@@ -3633,6 +3639,12 @@ impl Interpreter {
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
+        let strict = context.function_is_strict(stack[top_idx].function_id);
+        if !removed && strict {
+            return Err(VmError::TypeError {
+                message: "Cannot delete property".to_string(),
+            });
+        }
         write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
         Ok(true)
     }

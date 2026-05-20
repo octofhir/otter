@@ -37,6 +37,33 @@ use crate::{
 };
 
 impl Interpreter {
+    fn store_array_accessor_property(
+        &mut self,
+        context: &ExecutionContext,
+        arr: JsArray,
+        key: &str,
+        value: &Value,
+        strict: bool,
+    ) -> Result<bool, VmError> {
+        let Some((_getter, setter)) = crate::array::get_accessor(arr, &self.gc_heap, key) else {
+            return Ok(false);
+        };
+        match setter {
+            Some(setter) if abstract_ops::is_callable(&setter) => {
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value.clone());
+                self.run_callable_sync(context, &setter, Value::Array(arr), args)?;
+            }
+            _ => {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot assign to accessor property '{key}' without a setter"),
+                )?;
+            }
+        }
+        Ok(true)
+    }
+
     fn capture_store_property_transition_with_stack_roots(
         &mut self,
         stack: &SmallVec<[Frame; 8]>,
@@ -661,7 +688,19 @@ impl Interpreter {
             Value::String(s) => self.load_string_primitive_property(context, &receiver, s, name)?,
             v @ Value::Array(_) => {
                 let direct = if let Value::Array(a) = v {
-                    crate::array::get_named_property(*a, &self.gc_heap, name)
+                    if let Some((getter, _setter)) =
+                        crate::array::get_accessor(*a, &self.gc_heap, name)
+                    {
+                        match getter {
+                            Some(getter) if abstract_ops::is_callable(&getter) => {
+                                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                                Some(self.run_callable_sync(context, &getter, v.clone(), args)?)
+                            }
+                            _ => Some(Value::Undefined),
+                        }
+                    } else {
+                        crate::array::get_named_property(*a, &self.gc_heap, name)
+                    }
                 } else {
                     None
                 };
@@ -948,7 +987,9 @@ impl Interpreter {
                 }
             }
             Value::Array(a) => {
-                crate::array::set_named_property(*a, &mut self.gc_heap, name, value.clone())?;
+                if !self.store_array_accessor_property(context, *a, name, &value, strict)? {
+                    crate::array::set_named_property(*a, &mut self.gc_heap, name, value.clone())?;
+                }
                 None
             }
             Value::TypedArray(t) => {
@@ -1654,7 +1695,9 @@ impl Interpreter {
             // `arr["i"] = 10` round-trips.
             (Value::Array(arr), Value::String(key)) => {
                 let name = key.to_lossy_string();
-                if let Some(idx) = crate::object::array_index_property_name(&name) {
+                if self.store_array_accessor_property(context, *arr, &name, &value, strict)? {
+                    // Accessor setter handled the assignment.
+                } else if let Some(idx) = crate::object::array_index_property_name(&name) {
                     let roots = self.collect_allocation_roots(stack);
                     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                         for &slot in &roots {
@@ -1675,7 +1718,10 @@ impl Interpreter {
             }
             // Numeric-indexed array write.
             (Value::Array(arr), Value::Number(n)) => {
-                if let Some(idx) = crate::array::index_from_number(*n) {
+                let key = n.to_display_string();
+                if self.store_array_accessor_property(context, *arr, &key, &value, strict)? {
+                    // Accessor setter handled the assignment.
+                } else if let Some(idx) = crate::array::index_from_number(*n) {
                     let roots = self.collect_allocation_roots(stack);
                     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                         for &slot in &roots {
@@ -1690,13 +1736,8 @@ impl Interpreter {
                         &mut external_visit,
                     )?;
                 } else {
-                    crate::array::set_named_property(
-                        *arr,
-                        &mut self.gc_heap,
-                        &n.to_display_string(),
-                        value,
-                    )
-                    .map_err(|_| VmError::TypeMismatch)?;
+                    crate::array::set_named_property(*arr, &mut self.gc_heap, &key, value)
+                        .map_err(|_| VmError::TypeMismatch)?;
                 }
             }
             // §10.4.5.14 IntegerIndexedElementSet — out-of-range indices

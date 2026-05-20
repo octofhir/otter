@@ -1380,11 +1380,9 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         _ => return Ok(Value::Boolean(false)),
     };
     if let Some(idx) = crate::object::array_index_property_name(&key_string) {
-        return Ok(Value::Boolean(array::has_own_element(
-            *arr,
-            heap,
-            idx as usize,
-        )));
+        let has_indexed_property = array::has_own_element(*arr, heap, idx as usize)
+            || array::get_accessor(*arr, heap, &key_string).is_some();
+        return Ok(Value::Boolean(has_indexed_property));
     }
     if key_string == "length" {
         return Ok(Value::Boolean(true));
@@ -1420,11 +1418,14 @@ fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, In
         return Ok(Value::Boolean(false));
     }
     if let Some(idx) = crate::object::array_index_property_name(&key_string) {
-        return Ok(Value::Boolean(array::has_own_element(
-            *arr,
-            heap,
-            idx as usize,
-        )));
+        let has_indexed_property = array::has_own_element(*arr, heap, idx as usize)
+            || array::get_accessor(*arr, heap, &key_string).is_some();
+        if !has_indexed_property {
+            return Ok(Value::Boolean(false));
+        }
+        let flags = array::get_property_flags(*arr, heap, &key_string)
+            .unwrap_or_else(crate::object::PropertyFlags::data_default);
+        return Ok(Value::Boolean(flags.enumerable()));
     }
     let has_named = heap.read_payload(*arr, |body| {
         body.named_properties

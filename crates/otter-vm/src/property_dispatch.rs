@@ -1435,7 +1435,28 @@ impl Interpreter {
                 };
                 match recv {
                     Value::Array(a) => match idx {
-                        Some(idx) => crate::array::get(a, &self.gc_heap, idx),
+                        Some(idx) => {
+                            let key = idx.to_string();
+                            if let Some((getter, _setter)) =
+                                crate::array::get_accessor(a, &self.gc_heap, &key)
+                            {
+                                match getter {
+                                    Some(getter) if abstract_ops::is_callable(&getter) => {
+                                        let args: smallvec::SmallVec<[Value; 8]> =
+                                            smallvec::SmallVec::new();
+                                        self.run_callable_sync(
+                                            context,
+                                            &getter,
+                                            Value::Array(a),
+                                            args,
+                                        )?
+                                    }
+                                    _ => Value::Undefined,
+                                }
+                            } else {
+                                crate::array::get(a, &self.gc_heap, idx)
+                            }
+                        }
                         None => crate::array::get_named_property(
                             a,
                             &self.gc_heap,

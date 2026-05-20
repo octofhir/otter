@@ -29,7 +29,9 @@ use crate::{
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
-    symbol_dispatch, symbol_to_vm_error, temporal, temporal_to_vm_error, write_register,
+    symbol_dispatch, symbol_to_vm_error, temporal, temporal_to_vm_error,
+    value_kind::is_object_like_value,
+    write_register,
 };
 
 impl Interpreter {
@@ -715,17 +717,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let target_value = args.first().cloned().unwrap_or(Value::Undefined);
         // §20.1.2.3 step 1 — `Type(O)` must be Object.
-        if !matches!(
-            &target_value,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure { .. }
-                | Value::BoundFunction(_)
-                | Value::NativeFunction(_)
-                | Value::ClassConstructor(_)
-        ) {
+        if !is_object_like_value(&target_value) {
             return Err(VmError::TypeError {
                 message: "Object.defineProperties target must be an object".to_string(),
             });
@@ -1065,7 +1057,7 @@ impl Interpreter {
                         break;
                     };
 
-                    if !value_is_object_like_for_entry(&entry) {
+                    if !is_object_like_value(&entry) {
                         let _ = self.iterator_close_sync(context, &iterator);
                         return Err(VmError::TypeError {
                             message: "Object.fromEntries: iterator value is not an entry object"
@@ -2204,37 +2196,6 @@ fn assign_set_symbol(
             ),
         }),
     }
-}
-
-/// §6.2.4.5 IsObject classifier used by `Object.fromEntries` to gate
-/// the entry validation step. Mirrors the broad set of Object-like
-/// runtime kinds the rest of the VM treats as objects (every heap
-/// allocation but the primitive variants).
-fn value_is_object_like_for_entry(v: &Value) -> bool {
-    matches!(
-        v,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure { .. }
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Promise(_)
-            | Value::Iterator(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-            | Value::Proxy(_)
-    )
 }
 
 /// §7.3.2 `Get(target, name)` for indexed-string entry probing in

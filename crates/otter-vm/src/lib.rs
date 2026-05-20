@@ -116,6 +116,7 @@ pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
 pub mod timers;
+mod value_kind;
 pub mod weak_refs;
 
 #[cfg(test)]

@@ -981,7 +981,12 @@ impl Interpreter {
                         None
                     } else {
                         let bag = regexp_ensure_expando(self, r, &receiver)?;
-                        self.set_property(bag, name, value.clone())?;
+                        if !self.ordinary_set_data_property(bag, name, value.clone())? {
+                            Self::failed_set_result(
+                                strict,
+                                format!("Cannot assign to property '{name}'"),
+                            )?;
+                        }
                         None
                     }
                 }
@@ -3009,7 +3014,13 @@ impl Interpreter {
                         );
                     }
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
-                    self.set_property(bag, key, value)?;
+                    if !self.ordinary_set_data_property(bag, key, value)? {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            format!("Cannot assign to property '{key}'"),
+                        );
+                    }
                 }
                 ComputedPropertyKey::Symbol(sym) => {
                     let absent = r.expando(&self.gc_heap).is_none_or(|bag| {

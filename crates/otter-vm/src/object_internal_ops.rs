@@ -30,6 +30,7 @@ use crate::{
     VmGetOutcome, VmPropertyKey, abstract_ops, array, constructor_return_is_object,
     descriptor_value, function_metadata, make_array_iterator_factory_runtime_rooted, object,
     object_statics, proxy, regexp_prototype, string, symbol, to_length,
+    value_kind::is_object_like_value,
 };
 
 #[derive(Clone, Copy)]
@@ -3348,17 +3349,7 @@ impl Interpreter {
         // DefineProperty needs observable ToPropertyDescriptor for
         // every Object target, not only Proxy targets. The rest of the
         // proxy preflight is Proxy-specific.
-        if matches!(method, M::DefineProperty)
-            && matches!(
-                target,
-                Value::Object(_)
-                    | Value::Proxy(_)
-                    | Value::Array(_)
-                    | Value::Function { .. }
-                    | Value::Closure { .. }
-                    | Value::BoundFunction(_)
-            )
-        {
+        if matches!(method, M::DefineProperty) && is_object_like_value(target) {
             let key =
                 self.evaluate_to_property_key(context, args.get(1).unwrap_or(&Value::Undefined))?;
             let attributes = args.get(2).cloned().unwrap_or(Value::Undefined);

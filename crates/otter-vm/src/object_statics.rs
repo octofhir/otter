@@ -35,6 +35,7 @@ use crate::object::{
 };
 use crate::string::{JsString, StringHeap};
 use crate::symbol::JsSymbol;
+use crate::value_kind::is_object_like_value;
 use crate::{NativeCtx, NativeError, Value, VmError};
 
 enum PropertyKey {
@@ -572,33 +573,6 @@ fn native_from_entries_rooted(
             return Err(err);
         }
     }
-}
-
-fn is_object_like_value(v: &Value) -> bool {
-    matches!(
-        v,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure { .. }
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Promise(_)
-            | Value::Iterator(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-            | Value::Proxy(_)
-    )
 }
 
 fn read_entry_index(

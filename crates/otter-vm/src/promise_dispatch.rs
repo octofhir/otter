@@ -49,7 +49,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 
 struct PromiseSlots {
-    values: Vec<OnceCell<Value>>,
+    values: RefCell<Vec<OnceCell<Value>>>,
     remaining: Cell<usize>,
 }
 
@@ -101,22 +101,49 @@ impl CapabilityExecutorState {
 }
 
 impl PromiseSlots {
-    fn new(total: usize) -> Rc<Self> {
-        let values = std::iter::repeat_with(OnceCell::new).take(total).collect();
+    /// Build an empty slot set seeded with the spec's `remainingElementsCount`
+    /// = 1. Each iteration of `PerformPromiseAll` (and siblings) calls
+    /// [`Self::reserve_slot`] to extend the slot list and bump the count;
+    /// [`Self::finish_iteration`] decrements the seed +1 after the
+    /// iterator drains, so the resolve fires synchronously when every
+    /// reserved slot has been filled and the iterator is done.
+    fn new() -> Rc<Self> {
         Rc::new(Self {
-            values,
-            remaining: Cell::new(total),
+            values: RefCell::new(Vec::new()),
+            remaining: Cell::new(1),
         })
     }
 
     fn trace(&self, visitor: &mut SlotVisitor<'_>) {
-        for value in self.values.iter().filter_map(OnceCell::get) {
-            value.trace_value_slots(visitor);
+        for slot in self.values.borrow().iter() {
+            if let Some(value) = slot.get() {
+                value.trace_value_slots(visitor);
+            }
         }
     }
 
+    /// Append an empty slot, increment `remainingElementsCount`, and
+    /// return the slot index. The element-fulfillment closure stores
+    /// its eventual result at that index.
+    fn reserve_slot(&self) -> usize {
+        let mut values = self.values.borrow_mut();
+        let index = values.len();
+        values.push(OnceCell::new());
+        self.remaining.set(self.remaining.get() + 1);
+        index
+    }
+
+    /// Decrement `remainingElementsCount` once the iterator signals
+    /// completion. Returns `true` when no per-element callback is
+    /// pending and the resolving function may fire immediately.
+    fn finish_iteration(&self) -> bool {
+        let count = self.remaining.get().saturating_sub(1);
+        self.remaining.set(count);
+        count == 0
+    }
+
     fn fill(&self, index: usize, value: Value) -> bool {
-        if self.values[index].set(value).is_err() {
+        if self.values.borrow()[index].set(value).is_err() {
             return false;
         }
         let count = self.remaining.get().saturating_sub(1);
@@ -126,6 +153,7 @@ impl PromiseSlots {
 
     fn collect_values(&self) -> Vec<Value> {
         self.values
+            .borrow()
             .iter()
             .map(|slot| slot.get().cloned().unwrap_or(Value::Undefined))
             .collect()
@@ -1363,53 +1391,69 @@ fn static_try_generic(
     Ok(cap.promise)
 }
 
+/// §27.2.4.1 `Promise.all(iterable)` — drives the user iterable
+/// through `GetIterator` / `IteratorStep`, calls observable
+/// `C.resolve` on each yielded value, attaches an element-fulfillment
+/// handler, and resolves the result capability with the gathered
+/// array once every reaction has fired. On abrupt completion the
+/// iterator is closed (§7.4.8 IteratorClose) before rejecting the
+/// capability — matching the spec wording around
+/// `IfAbruptRejectPromise`.
 fn static_all_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
+    const NAME: &str = "Promise.all";
+    let iterable_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
         constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
+        &[&iterable_arg],
+        &[args],
     )?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.all",
+        name: NAME,
         reason: "missing execution context".to_string(),
     })?;
     let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    if entries.is_empty() {
-        let arr = interp
-            .alloc_runtime_rooted_array_from_values(
-                std::iter::empty::<Value>(),
-                &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
-                &[args],
-            )
-            .map_err(|_| oom_native("Promise.all"))?;
-        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
-            return reject_capability_error(interp, &cap, err);
-        }
-        return Ok(cap.promise);
-    }
-    let slots = PromiseSlots::new(entries.len());
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
-            };
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable_arg) {
+        Ok(record) => record,
+        Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(NAME, err)),
+    };
+    let slots = PromiseSlots::new();
+    loop {
+        let step = interp.iterator_step_sync(&exec, &iterator, &next_method);
+        let entry_value = match step {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                break;
+            }
+            Err(err) => {
+                return reject_capability_error(interp, &cap, promise_vm_error(NAME, err));
+            }
+        };
+        let i = slots.reserve_slot();
+        let entry_promise = match call_promise_resolve(
+            interp,
+            &exec,
+            &promise_resolve,
+            &constructor,
+            entry_value,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                }
+                return reject_capability_error(interp, &cap, err);
+            }
+        };
         let cap_for_fulfill = cap.clone();
         let slots_for_trace = slots.clone();
         let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
@@ -1426,8 +1470,15 @@ fn static_all_generic(
             1,
             smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
             trace_slots,
-            &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
-            &[args, entries.as_slice()],
+            &[
+                &cap.promise,
+                &cap.resolve,
+                &cap.reject,
+                &promise_resolve,
+                &iterator,
+                &next_method,
+            ],
+            &[args],
             move |ctx, args, _captures| {
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
                 if slots_for_fulfill.fill(i, v) {
@@ -1442,45 +1493,85 @@ fn static_all_generic(
         if let Err(err) =
             attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject.clone())
         {
+            {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+            }
+            return reject_capability_error(interp, &cap, err);
+        }
+    }
+    if slots.finish_iteration() {
+        let collected = slots.collect_values();
+        let arr = interp
+            .alloc_runtime_rooted_array_from_values(
+                collected.into_iter(),
+                &[&cap.promise, &cap.resolve, &cap.reject],
+                &[args],
+            )
+            .map_err(|_| oom_native(NAME))?;
+        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
             return reject_capability_error(interp, &cap, err);
         }
     }
     Ok(cap.promise)
 }
 
+/// §27.2.4.5 `Promise.race(iterable)` — same iterator protocol as
+/// `Promise.all`, but every element attaches the capability's
+/// resolve/reject directly so the first settled wins. Empty
+/// iterables leave the result capability forever pending per spec.
 fn static_race_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
+    const NAME: &str = "Promise.race";
+    let iterable_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
         constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
+        &[&iterable_arg],
+        &[args],
     )?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.race",
+        name: NAME,
         reason: "missing execution context".to_string(),
     })?;
     let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    for entry in entries.iter().cloned() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
-            };
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable_arg) {
+        Ok(record) => record,
+        Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(NAME, err)),
+    };
+    loop {
+        let step = interp.iterator_step_sync(&exec, &iterator, &next_method);
+        let entry_value = match step {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                break;
+            }
+            Err(err) => {
+                return reject_capability_error(interp, &cap, promise_vm_error(NAME, err));
+            }
+        };
+        let entry_promise = match call_promise_resolve(
+            interp,
+            &exec,
+            &promise_resolve,
+            &constructor,
+            entry_value,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                }
+                return reject_capability_error(interp, &cap, err);
+            }
+        };
         if let Err(err) = attach_then_value(
             interp,
             &exec,
@@ -1488,60 +1579,75 @@ fn static_race_generic(
             cap.resolve.clone(),
             cap.reject.clone(),
         ) {
+            {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+            }
             return reject_capability_error(interp, &cap, err);
         }
     }
     Ok(cap.promise)
 }
 
+/// §27.2.4.2 `Promise.allSettled(iterable)` — iterator-driven sibling
+/// of `Promise.all` that wraps each settlement in
+/// `{ status, value | reason }` records and resolves once every
+/// element settles. Closes the iterator on abrupt completion.
 fn static_all_settled_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
+    const NAME: &str = "Promise.allSettled";
+    let iterable_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
         constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
+        &[&iterable_arg],
+        &[args],
     )?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.allSettled",
+        name: NAME,
         reason: "missing execution context".to_string(),
     })?;
     let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    if entries.is_empty() {
-        let arr = interp
-            .alloc_runtime_rooted_array_from_values(
-                std::iter::empty::<Value>(),
-                &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
-                &[args],
-            )
-            .map_err(|_| oom_native("Promise.allSettled"))?;
-        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
-            return reject_capability_error(interp, &cap, err);
-        }
-        return Ok(cap.promise);
-    }
-    let slots = PromiseSlots::new(entries.len());
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable_arg) {
+        Ok(record) => record,
+        Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(NAME, err)),
+    };
+    let slots = PromiseSlots::new();
     let heap = interp.string_heap_clone();
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
-            };
+    loop {
+        let step = interp.iterator_step_sync(&exec, &iterator, &next_method);
+        let entry_value = match step {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                break;
+            }
+            Err(err) => {
+                return reject_capability_error(interp, &cap, promise_vm_error(NAME, err));
+            }
+        };
+        let i = slots.reserve_slot();
+        let entry_promise = match call_promise_resolve(
+            interp,
+            &exec,
+            &promise_resolve,
+            &constructor,
+            entry_value,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                }
+                return reject_capability_error(interp, &cap, err);
+            }
+        };
         let on_fulfill = {
             let slots = slots.clone();
             let heap = heap.clone();
@@ -1565,8 +1671,15 @@ fn static_all_settled_generic(
                 1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_slots,
-                &[&promise_root, &resolve_root, &reject_root, &promise_resolve],
-                &[args, entries.as_slice()],
+                &[
+                    &promise_root,
+                    &resolve_root,
+                    &reject_root,
+                    &promise_resolve,
+                    &iterator,
+                    &next_method,
+                ],
+                &[args],
                 move |ctx, args, _captures| {
                     let v = args.first().cloned().unwrap_or(Value::Undefined);
                     let record = build_settled_record(true, v, &heap, ctx)?;
@@ -1609,8 +1722,10 @@ fn static_all_settled_generic(
                     &reject_root,
                     &on_fulfill,
                     &promise_resolve,
+                    &iterator,
+                    &next_method,
                 ],
-                &[args, entries.as_slice()],
+                &[args],
                 move |ctx, args, _captures| {
                     let r = args.first().cloned().unwrap_or(Value::Undefined);
                     let record = build_settled_record(false, r, &heap, ctx)?;
@@ -1625,6 +1740,22 @@ fn static_all_settled_generic(
             )?
         };
         if let Err(err) = attach_then_value(interp, &exec, entry_promise, on_fulfill, on_reject) {
+            {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+            }
+            return reject_capability_error(interp, &cap, err);
+        }
+    }
+    if slots.finish_iteration() {
+        let collected = slots.collect_values();
+        let arr = interp
+            .alloc_runtime_rooted_array_from_values(
+                collected.into_iter(),
+                &[&cap.promise, &cap.resolve, &cap.reject],
+                &[args],
+            )
+            .map_err(|_| oom_native(NAME))?;
+        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
             return reject_capability_error(interp, &cap, err);
         }
     }
@@ -1756,49 +1887,68 @@ fn oom_native(name: &'static str) -> NativeError {
     }
 }
 
+/// §27.2.4.4 `Promise.any(iterable)` — iterator-driven sibling of
+/// `Promise.all`. Each entry attaches a per-element rejection handler
+/// that collects the reason into the errors list; if all elements
+/// reject, the result capability is rejected with an
+/// `AggregateError`. Closes the iterator on abrupt completion.
 fn static_any_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
+    const NAME: &str = "Promise.any";
+    let iterable_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
         constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
+        &[&iterable_arg],
+        &[args],
     )?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
-        name: "Promise.any",
+        name: NAME,
         reason: "missing execution context".to_string(),
     })?;
     let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    if entries.is_empty() {
-        let registry = interp.error_classes_clone();
-        let string_heap = interp.string_heap_clone();
-        let agg = make_aggregate_error_runtime_rooted(interp, &registry, &string_heap, Vec::new())?;
-        call_capability_reject(interp, &cap, agg)?;
-        return Ok(cap.promise);
-    }
-    let errors = PromiseSlots::new(entries.len());
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable_arg) {
+        Ok(record) => record,
+        Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(NAME, err)),
+    };
+    let errors = PromiseSlots::new();
     let heap = interp.string_heap_clone();
     let registry = interp.error_classes_clone();
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
-            };
+    loop {
+        let step = interp.iterator_step_sync(&exec, &iterator, &next_method);
+        let entry_value = match step {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                break;
+            }
+            Err(err) => {
+                return reject_capability_error(interp, &cap, promise_vm_error(NAME, err));
+            }
+        };
+        let i = errors.reserve_slot();
+        let entry_promise = match call_promise_resolve(
+            interp,
+            &exec,
+            &promise_resolve,
+            &constructor,
+            entry_value,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                }
+                return reject_capability_error(interp, &cap, err);
+            }
+        };
         let on_reject = {
             let errors = errors.clone();
             let heap = heap.clone();
@@ -1823,8 +1973,15 @@ fn static_any_generic(
                 1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_errors,
-                &[&promise_root, &resolve_root, &reject_root, &promise_resolve],
-                &[args, entries.as_slice()],
+                &[
+                    &promise_root,
+                    &resolve_root,
+                    &reject_root,
+                    &promise_resolve,
+                    &iterator,
+                    &next_method,
+                ],
+                &[args],
                 move |ctx, args, _captures| {
                     let reason = args.first().cloned().unwrap_or(Value::Undefined);
                     if errors.fill(i, reason) {
@@ -1841,6 +1998,17 @@ fn static_any_generic(
         if let Err(err) =
             attach_then_value(interp, &exec, entry_promise, cap.resolve.clone(), on_reject)
         {
+            {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+            }
+            return reject_capability_error(interp, &cap, err);
+        }
+    }
+    if errors.finish_iteration() {
+        let collected = errors.collect_values();
+        let string_heap = interp.string_heap_clone();
+        let agg = make_aggregate_error_runtime_rooted(interp, &registry, &string_heap, collected)?;
+        if let Err(err) = call_capability_reject(interp, &cap, agg) {
             return reject_capability_error(interp, &cap, err);
         }
     }

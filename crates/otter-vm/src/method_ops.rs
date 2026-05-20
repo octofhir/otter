@@ -1202,15 +1202,17 @@ impl Interpreter {
                 }
             }
             Value::Set(s) => {
-                let entries: Vec<(Value, Value)> =
-                    crate::collections::set_values(*s, &self.gc_heap)
-                        .into_iter()
-                        .map(|v| (v.clone(), v))
-                        .collect();
-                for (key, value) in entries {
+                let mut index = 0;
+                while index < crate::collections::set_raw_len(*s, &self.gc_heap) {
+                    let Some(value) = crate::collections::set_value_at(*s, &self.gc_heap, index)
+                    else {
+                        index += 1;
+                        continue;
+                    };
+                    index += 1;
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                    cb_args.push(value.clone());
                     cb_args.push(value);
-                    cb_args.push(key);
                     cb_args.push(recv_for_callback.clone());
                     self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
                 }

@@ -185,16 +185,12 @@ fn impl_set_clear(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 
 fn impl_set_values(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let snap: SmallVec<[Value; 4]> = collections::set_values(s, &*args.gc_heap)
-        .into_iter()
-        .collect();
-    let array = args.array_from_elements_rooted(snap, &[], &[])?;
     Ok(make_iter_value(
         args,
-        crate::IteratorState::Array {
-            array,
+        crate::IteratorState::SetCollection {
+            set: s,
             index: 0,
-            origin: crate::BuiltinIteratorOrigin::Set,
+            kind: crate::SetIteratorKind::Value,
         },
     )?)
 }
@@ -416,18 +412,12 @@ fn impl_set_is_disjoint_from(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intr
 /// §24.2.3.5.
 fn impl_set_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let mut snap: SmallVec<[Value; 4]> = SmallVec::new();
-    for v in collections::set_values(s, &*args.gc_heap) {
-        let pair = args.array_from_elements_rooted([v.clone(), v], &[], &[snap.as_slice()])?;
-        snap.push(Value::Array(pair));
-    }
-    let array = args.array_from_elements_rooted(snap, &[], &[])?;
     Ok(make_iter_value(
         args,
-        crate::IteratorState::Array {
-            array,
+        crate::IteratorState::SetCollection {
+            set: s,
             index: 0,
-            origin: crate::BuiltinIteratorOrigin::Set,
+            kind: crate::SetIteratorKind::Entry,
         },
     )?)
 }
@@ -715,16 +705,12 @@ pub fn make_set_iterator_factory(
                     });
                 }
             };
-            let snap: SmallVec<[Value; 4]> = collections::set_values(set, ctx.heap())
-                .into_iter()
-                .collect();
-            let array = ctx.array_from_elements(snap)?;
             Ok(make_native_iter_value(
                 ctx,
-                crate::IteratorState::Array {
-                    array,
+                crate::IteratorState::SetCollection {
+                    set,
                     index: 0,
-                    origin: crate::BuiltinIteratorOrigin::Set,
+                    kind: crate::SetIteratorKind::Value,
                 },
             )?)
         },

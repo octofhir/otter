@@ -1118,20 +1118,15 @@ fn set_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.values")?;
-    let snapshot: SmallVec<[Value; 4]> =
-        collections::set_values(s, ctx.heap()).into_iter().collect();
-    let array = ctx
-        .array_from_elements(snapshot)
-        .map_err(|_| oom("Set.prototype.values"))?;
-    let array_value = Value::Array(array);
+    let set_value = Value::Set(s);
     let iter = ctx
         .alloc_iterator_state(
-            crate::IteratorState::Array {
-                array,
+            crate::IteratorState::SetCollection {
+                set: s,
                 index: 0,
-                origin: crate::BuiltinIteratorOrigin::Set,
+                kind: crate::SetIteratorKind::Value,
             },
-            &[&array_value],
+            &[&set_value],
             &[],
         )
         .map_err(|_| oom("Set.prototype.values"))?;
@@ -1140,26 +1135,15 @@ fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.entries")?;
-    let values: Vec<Value> = collections::set_values(s, ctx.heap());
-    let mut snap: SmallVec<[Value; 4]> = SmallVec::new();
-    for v in values {
-        let pair = ctx
-            .array_from_elements([v.clone(), v])
-            .map_err(|_| oom("Set.prototype.entries"))?;
-        snap.push(Value::Array(pair));
-    }
-    let array = ctx
-        .array_from_elements(snap)
-        .map_err(|_| oom("Set.prototype.entries"))?;
-    let array_value = Value::Array(array);
+    let set_value = Value::Set(s);
     let iter = ctx
         .alloc_iterator_state(
-            crate::IteratorState::Array {
-                array,
+            crate::IteratorState::SetCollection {
+                set: s,
                 index: 0,
-                origin: crate::BuiltinIteratorOrigin::Set,
+                kind: crate::SetIteratorKind::Entry,
             },
-            &[&array_value],
+            &[&set_value],
             &[],
         )
         .map_err(|_| oom("Set.prototype.entries"))?;
@@ -1177,7 +1161,6 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         });
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let values = collections::set_values(s, ctx.heap());
     let context = ctx
         .execution_context()
         .cloned()
@@ -1186,7 +1169,13 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "no active execution context".to_string(),
         })?;
     let set_value = Value::Set(s);
-    for v in values {
+    let mut index = 0;
+    while index < collections::set_raw_len(s, ctx.heap()) {
+        let Some(v) = collections::set_value_at(s, ctx.heap(), index) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
         let interp = ctx.interp_mut();
         interp
             .run_callable_sync(
@@ -1283,7 +1272,13 @@ fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     let context = execution_context(ctx, "Set.prototype.intersection")?;
     let this_size = collections::set_len(this, ctx.heap()) as f64;
     if this_size <= other_rec.size() {
-        for value in collections::set_values(this, ctx.heap()) {
+        let mut index = 0;
+        while index < collections::set_raw_len(this, ctx.heap()) {
+            let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+                index += 1;
+                continue;
+            };
+            index += 1;
             if set_record_has(
                 ctx,
                 &context,
@@ -1382,9 +1377,12 @@ fn set_proto_symmetric_difference(
         "Set.prototype.symmetricDifference",
     )? {
         let value = normalize_set_key(value);
-        if collections::set_has(result, ctx.heap(), &value) {
-            collections::set_delete(result, ctx.heap_mut(), &value);
-        } else {
+        let already_in_result = collections::set_has(result, ctx.heap(), &value);
+        if collections::set_has(this, ctx.heap(), &value) {
+            if already_in_result {
+                collections::set_delete(result, ctx.heap_mut(), &value);
+            }
+        } else if !already_in_result {
             ctx.set_add(&mut result, value)
                 .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
         }
@@ -1404,7 +1402,13 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
         return Ok(Value::Boolean(false));
     }
     let context = execution_context(ctx, "Set.prototype.isSubsetOf")?;
-    for value in collections::set_values(this, ctx.heap()) {
+    let mut index = 0;
+    while index < collections::set_raw_len(this, ctx.heap()) {
+        let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
         if !set_record_has(
             ctx,
             &context,
@@ -1456,7 +1460,13 @@ fn set_proto_is_disjoint_from(
     let other_rec = get_set_record(ctx, other, "Set.prototype.isDisjointFrom")?;
     let context = execution_context(ctx, "Set.prototype.isDisjointFrom")?;
     if (collections::set_len(this, ctx.heap()) as f64) <= other_rec.size() {
-        for value in collections::set_values(this, ctx.heap()) {
+        let mut index = 0;
+        while index < collections::set_raw_len(this, ctx.heap()) {
+            let Some(value) = collections::set_value_at(this, ctx.heap(), index) else {
+                index += 1;
+                continue;
+            };
+            index += 1;
             if set_record_has(
                 ctx,
                 &context,

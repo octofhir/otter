@@ -585,6 +585,16 @@ pub enum MapIteratorKind {
     Entry,
 }
 
+/// Kind discriminator for `Set.prototype.{values, entries}` iterators,
+/// matching `CreateSetIterator(set, kind)` per §24.2.5.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetIteratorKind {
+    /// `values()` / `keys()` / `@@iterator` — yields each set value.
+    Value,
+    /// `entries()` — yields `[value, value]` Arrays.
+    Entry,
+}
+
 /// Origin of a built-in iterator. Used to route
 /// `[[GetPrototypeOf]]` to the correct per-kind iterator prototype
 /// (`%ArrayIteratorPrototype%` / `%MapIteratorPrototype%` /
@@ -665,6 +675,17 @@ pub enum IteratorState {
         index: usize,
         /// Yield shape.
         kind: MapIteratorKind,
+    },
+    /// Walks a live `Set` in insertion order. Additions before the
+    /// iterator is exhausted are observed by reading the set at each
+    /// step instead of snapshotting values at iterator creation.
+    SetCollection {
+        /// Backing set.
+        set: JsSet,
+        /// Next live entry index.
+        index: usize,
+        /// Yield shape.
+        kind: SetIteratorKind,
     },
     /// User-defined iterable: the result of calling
     /// `obj[@@iterator]()`. The contained `Value` is the iterator
@@ -762,6 +783,7 @@ impl IteratorState {
             }
             IteratorState::String { .. } => Some(BuiltinIteratorOrigin::String),
             IteratorState::MapCollection { .. } => Some(BuiltinIteratorOrigin::Map),
+            IteratorState::SetCollection { .. } => Some(BuiltinIteratorOrigin::Set),
             _ => None,
         }
     }
@@ -781,6 +803,10 @@ impl otter_gc::SafeTraceable for IteratorState {
             IteratorState::String { .. } | IteratorState::Exhausted => {}
             IteratorState::MapCollection { map, .. } => {
                 let p = map as *const JsMap as *mut RawGc;
+                visitor(p);
+            }
+            IteratorState::SetCollection { set, .. } => {
+                let p = set as *const JsSet as *mut RawGc;
                 visitor(p);
             }
             IteratorState::User { iterator } => iterator.trace_value_slots(visitor),
@@ -6052,6 +6078,7 @@ fn step_iterator(
         ArrayEntry(JsArray, usize),
         String(JsString, u32),
         MapCollection(JsMap, usize, MapIteratorKind),
+        SetCollection(JsSet, usize, SetIteratorKind),
         Exhausted,
         Slow,
     }
@@ -6067,6 +6094,9 @@ fn step_iterator(
         }
         IteratorState::MapCollection { map, index, kind } => {
             FastIteratorSnapshot::MapCollection(*map, *index, *kind)
+        }
+        IteratorState::SetCollection { set, index, kind } => {
+            FastIteratorSnapshot::SetCollection(*set, *index, *kind)
         }
         IteratorState::Exhausted => FastIteratorSnapshot::Exhausted,
         IteratorState::User { .. }
@@ -6193,6 +6223,47 @@ fn step_iterator(
                         };
                         crate::array::with_elements_mut(pair, gc_heap, |elements| {
                             elements.push(key);
+                            elements.push(value);
+                        });
+                        Value::Array(pair)
+                    }
+                })
+            } else {
+                None
+            }
+        }
+        FastIteratorSnapshot::SetCollection(set, index, kind) => {
+            let raw_len = crate::collections::set_raw_len(set, gc_heap);
+            let mut next_index = index;
+            let mut next_value = None;
+            while next_index < raw_len {
+                let probe_index = next_index;
+                next_index += 1;
+                if let Some(value) = crate::collections::set_value_at(set, gc_heap, probe_index) {
+                    next_value = Some(value);
+                    break;
+                }
+            }
+            if let Some(value) = next_value {
+                gc_heap.with_payload(iter, |state| {
+                    if let IteratorState::SetCollection { index, .. } = state {
+                        *index = next_index;
+                    }
+                });
+                Some(match kind {
+                    SetIteratorKind::Value => value,
+                    SetIteratorKind::Entry => {
+                        let pair = {
+                            let set_root = Value::Set(set);
+                            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                                set_root.trace_value_slots(visit);
+                                value.trace_value_slots(visit);
+                            };
+                            crate::array::alloc_array_with_roots(gc_heap, &mut visitor)
+                                .map_err(|_| VmError::TypeMismatch)?
+                        };
+                        crate::array::with_elements_mut(pair, gc_heap, |elements| {
+                            elements.push(value.clone());
                             elements.push(value);
                         });
                         Value::Array(pair)

@@ -8,7 +8,7 @@
 //!
 //! # Contents
 //! - [`JsMap`] — heap-shared, tombstone-list associative store.
-//! - [`JsSet`] — heap-shared, `IndexSet`-backed unique-element store.
+//! - [`JsSet`] — heap-shared, tombstone-list unique-element store.
 //! - [`JsWeakMap`] — GC-managed object-keyed weak map.
 //! - [`JsWeakSet`] — GC-managed object-keyed weak set.
 //! - [`MapKey`] — equality key used by `JsMap`/`JsSet`. Implements
@@ -29,8 +29,6 @@
 //! - <https://tc39.es/ecma262/#sec-weakmap-objects>
 //! - <https://tc39.es/ecma262/#sec-weakset-objects>
 //! - <https://tc39.es/ecma262/#sec-samevaluezero>
-
-use indexmap::IndexMap;
 
 use crate::Value;
 use crate::string::JsString;
@@ -506,20 +504,48 @@ pub type JsSet = otter_gc::Gc<SetBody>;
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsSet`] handle.
 pub struct SetBody {
-    /// `IndexMap<MapKey, Value>` rather than `IndexSet`: the
-    /// original `Value` lives in the map slot so iteration returns
-    /// the live handle (matching what `Map`'s tuple gives us).
-    entries: IndexMap<MapKey, Value>,
+    /// Insertion-ordered `[[SetData]]` list. Deleted entries become
+    /// tombstones so active iterators and `forEach` observe later
+    /// additions before exhaustion.
+    entries: Vec<SetEntry>,
     prototype_override: Option<Value>,
+}
+
+#[derive(Debug)]
+struct SetEntry {
+    key_hash: Option<MapKey>,
+    value: Option<Value>,
+}
+
+impl SetEntry {
+    fn live(key_hash: MapKey, value: Value) -> Self {
+        Self {
+            key_hash: Some(key_hash),
+            value: Some(value),
+        }
+    }
+
+    fn key_matches(&self, key: &MapKey) -> bool {
+        self.value.is_some() && self.key_hash.as_ref().is_some_and(|stored| stored == key)
+    }
+
+    fn clear(&mut self) {
+        self.key_hash = None;
+        self.value = None;
+    }
 }
 
 impl otter_gc::SafeTraceable for SetBody {
     const TYPE_TAG: u8 = SET_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        for (key, value) in &self.entries {
-            trace_map_key(key, visitor);
-            value.trace_value_slots(visitor);
+        for entry in &self.entries {
+            if let Some(key_hash) = &entry.key_hash {
+                trace_map_key(key_hash, visitor);
+            }
+            if let Some(value) = &entry.value {
+                value.trace_value_slots(visitor);
+            }
         }
         if let Some(proto) = &self.prototype_override {
             proto.trace_value_slots(visitor);
@@ -561,7 +587,12 @@ pub(crate) fn set_set_prototype_override(
 /// Number of unique entries.
 #[must_use]
 pub fn set_len(set: JsSet, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(set, |body| body.entries.len())
+    heap.read_payload(set, |body| {
+        body.entries
+            .iter()
+            .filter(|entry| entry.value.is_some())
+            .count()
+    })
 }
 
 /// `true` when empty.
@@ -574,7 +605,9 @@ pub fn set_is_empty(set: JsSet, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn set_has(set: JsSet, heap: &otter_gc::GcHeap, value: &Value) -> bool {
     let k = MapKey::from_value(value);
-    heap.read_payload(set, |body| body.entries.contains_key(&k))
+    heap.read_payload(set, |body| {
+        body.entries.iter().any(|entry| entry.key_matches(&k))
+    })
 }
 
 /// `Set.prototype.add` — Spec §24.2.3.1.
@@ -585,9 +618,11 @@ pub fn set_add(
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_value = value.clone();
     let k = MapKey::from_value(&value);
-    let exists = heap.read_payload(set, |body| body.entries.contains_key(&k));
+    let exists = heap.read_payload(set, |body| {
+        body.entries.iter().any(|entry| entry.key_matches(&k))
+    });
     if !exists {
-        let target_len = set_len(set, heap).saturating_add(1);
+        let target_len = heap.read_payload(set, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             value.trace_value_slots(visitor);
         };
@@ -595,8 +630,8 @@ pub fn set_add(
     }
     let k = MapKey::from_value(&value);
     heap.with_payload(set, |body| {
-        if !body.entries.contains_key(&k) {
-            body.entries.insert(k, value);
+        if !body.entries.iter().any(|entry| entry.key_matches(&k)) {
+            body.entries.push(SetEntry::live(k, value));
         }
     });
     if !exists {
@@ -614,22 +649,20 @@ pub(crate) fn set_add_with_roots(
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_value = value.clone();
     let k = MapKey::from_value(&value);
-    let exists = heap.read_payload(*set, |body| body.entries.contains_key(&k));
+    let exists = heap.read_payload(*set, |body| {
+        body.entries.iter().any(|entry| entry.key_matches(&k))
+    });
     if !exists {
+        let target_len = heap.read_payload(*set, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_set_for_target_len_with_roots(
-            set,
-            heap,
-            set_len(*set, heap).saturating_add(1),
-            &mut reserve_roots,
-        )?;
+        reserve_set_for_target_len_with_roots(set, heap, target_len, &mut reserve_roots)?;
     }
     heap.with_payload(*set, |body| {
-        if !body.entries.contains_key(&k) {
-            body.entries.insert(k, value);
+        if !body.entries.iter().any(|entry| entry.key_matches(&k)) {
+            body.entries.push(SetEntry::live(k, value));
         }
     });
     if !exists {
@@ -641,18 +674,50 @@ pub(crate) fn set_add_with_roots(
 /// `Set.prototype.delete` — Spec §24.2.3.4.
 pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> bool {
     let k = MapKey::from_value(value);
-    heap.with_payload(set, |body| body.entries.shift_remove(&k).is_some())
+    heap.with_payload(set, |body| {
+        if let Some(entry) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
+            entry.clear();
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// `Set.prototype.clear` — Spec §24.2.3.3.
 pub fn set_clear(set: JsSet, heap: &mut otter_gc::GcHeap) {
-    heap.with_payload(set, |body| body.entries.clear());
+    heap.with_payload(set, |body| {
+        for entry in &mut body.entries {
+            entry.clear();
+        }
+    });
 }
 
 /// Snapshot value list in insertion order.
 #[must_use]
 pub fn set_values(set: JsSet, heap: &otter_gc::GcHeap) -> Vec<Value> {
-    heap.read_payload(set, |body| body.entries.values().cloned().collect())
+    heap.read_payload(set, |body| {
+        body.entries
+            .iter()
+            .filter_map(|entry| entry.value.clone())
+            .collect()
+    })
+}
+
+/// Raw backing-list length, including deleted tombstone slots.
+#[must_use]
+pub(crate) fn set_raw_len(set: JsSet, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(set, |body| body.entries.len())
+}
+
+/// Read the raw set value currently at `index` in insertion order.
+#[must_use]
+pub(crate) fn set_value_at(set: JsSet, heap: &otter_gc::GcHeap, index: usize) -> Option<Value> {
+    heap.read_payload(set, |body| {
+        body.entries
+            .get(index)
+            .and_then(|entry| entry.value.clone())
+    })
 }
 
 /// Identity comparison.
@@ -1225,7 +1290,7 @@ fn map_capacity_bytes(capacity: usize) -> usize {
 }
 
 fn set_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<(MapKey, Value)>())
+    capacity.saturating_mul(std::mem::size_of::<SetEntry>())
 }
 
 fn weak_map_capacity_bytes(capacity: usize) -> usize {

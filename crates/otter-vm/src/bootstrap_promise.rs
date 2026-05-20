@@ -135,6 +135,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         promise_static_with_resolvers,
         &ctor_roots,
     )?;
+    define_ctor_method(heap, ctor, "try", 1, promise_static_try, &ctor_roots)?;
 
     // §27.2.5.2 — `Promise.prototype.constructor` back-pointer.
     object::define_own_property(
@@ -328,6 +329,10 @@ fn promise_static_with_resolvers(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::WithResolvers, args)
+}
+
+fn promise_static_try(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    invoke_static(ctx, PromiseMethod::Try, args)
 }
 
 fn invoke_static(

@@ -192,6 +192,7 @@ method_id_enum! {
         Any = 4 => "any",
         Race = 5 => "race",
         WithResolvers = 6 => "withResolvers",
+        Try = 7 => "try",
     }
 }
 

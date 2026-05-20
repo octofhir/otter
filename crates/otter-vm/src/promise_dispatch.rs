@@ -649,6 +649,7 @@ pub fn statics_call(
             M::AllSettled => static_all_settled_generic(interp, context, constructor, args),
             M::Any => static_any_generic(interp, context, constructor, args),
             M::WithResolvers => static_with_resolvers_generic(interp, context, constructor),
+            M::Try => static_try_generic(interp, context, constructor, args),
         };
     }
     match method {
@@ -659,6 +660,7 @@ pub fn statics_call(
         M::AllSettled => static_all_settled_generic(interp, context, constructor, args),
         M::Any => static_any_generic(interp, context, constructor, args),
         M::WithResolvers => static_with_resolvers(interp, context),
+        M::Try => static_try_generic(interp, context, constructor, args),
     }
 }
 
@@ -1121,6 +1123,66 @@ fn static_reject_generic(
     let reason = args.first().cloned().unwrap_or(Value::Undefined);
     let cap = new_generic_promise_capability(interp, context, constructor, &[&reason], &[args])?;
     call_capability_reject(interp, &cap, reason)?;
+    Ok(cap.promise)
+}
+
+/// §27.2.4.6 `Promise.try(callbackfn, ...args)`.
+///
+/// 1. Let C be the this value.
+/// 2. If C is not an Object, throw TypeError.
+/// 3. Let promiseCapability = NewPromiseCapability(C).
+/// 4. Let status = Completion(Call(callbackfn, undefined, args)).
+/// 5. If status is an abrupt completion: Call(reject, undefined,
+///    «status.value»).
+/// 6. Else: Call(resolve, undefined, «status.value»).
+/// 7. Return promiseCapability.[[Promise]].
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-promise.try>
+fn static_try_generic(
+    interp: &mut Interpreter,
+    context: Option<ExecutionContext>,
+    constructor: Value,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    const NAME: &str = "Promise.try";
+    if !is_object_like(&constructor) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "Promise.try `this` is not an Object".to_string(),
+        });
+    }
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name: NAME,
+        reason: "missing execution context".to_string(),
+    })?;
+    let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
+    let forwarded: SmallVec<[Value; 8]> = if args.len() > 1 {
+        args[1..].iter().cloned().collect()
+    } else {
+        SmallVec::new()
+    };
+    let cap = new_generic_promise_capability(
+        interp,
+        Some(exec.clone()),
+        constructor,
+        &[&callbackfn],
+        &[args],
+    )?;
+    let call_result = interp.run_callable_sync(&exec, &callbackfn, Value::Undefined, forwarded);
+    match call_result {
+        Ok(value) => {
+            call_capability_resolve(interp, &cap, value)?;
+        }
+        Err(crate::VmError::Uncaught { value }) => {
+            let reason = crate::error_ops::vm_err_to_value(&crate::VmError::Uncaught { value });
+            call_capability_reject(interp, &cap, reason)?;
+        }
+        Err(other) => {
+            let reason = crate::error_ops::vm_err_to_value(&other);
+            call_capability_reject(interp, &cap, reason)?;
+        }
+    }
     Ok(cap.promise)
 }
 

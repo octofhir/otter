@@ -1441,6 +1441,28 @@ impl Interpreter {
                 }
                 Ok(keys)
             }
+            Value::RegExp(regexp) => {
+                let mut keys = Vec::new();
+                keys.push(Value::String(
+                    string::JsString::from_str("lastIndex", string_heap).map_err(VmError::from)?,
+                ));
+                if let Some(expando) = regexp.expando(&self.gc_heap) {
+                    let (strings, symbols): (Vec<String>, Vec<Value>) =
+                        object::with_properties(expando, &self.gc_heap, |p| {
+                            (
+                                p.keys().map(str::to_string).collect(),
+                                p.symbol_keys().map(Value::Symbol).collect(),
+                            )
+                        });
+                    for key in strings {
+                        keys.push(Value::String(
+                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                        ));
+                    }
+                    keys.extend(symbols);
+                }
+                Ok(keys)
+            }
             _ => Ok(Vec::new()),
         }
     }

@@ -665,7 +665,7 @@ impl Interpreter {
             // `toString` / accessor getters fire per §6.2.5.5
             // ToPropertyDescriptor.
             let props_owned = props_arg.clone();
-            let keys = own_enumerable_keys_for_define(self, &props_owned)?;
+            let keys = own_enumerable_keys_for_define(self, context, &props_owned)?;
             for key in keys {
                 let vm_key = crate::VmPropertyKey::OwnedString(key.clone());
                 let outcome = self.ordinary_get_value(
@@ -744,7 +744,7 @@ impl Interpreter {
                 message: "Object.defineProperties properties must be an object".to_string(),
             });
         }
-        let keys = own_enumerable_keys_for_define(self, &props_value)?;
+        let keys = own_enumerable_keys_for_define(self, context, &props_value)?;
         for key in keys {
             // §6.2.5.5 step 4 — `Get(props, key)` is accessor-aware,
             // and step 5 — `ToPropertyDescriptor(descObj)` reads the
@@ -1831,18 +1831,36 @@ impl Interpreter {
 /// caller can `Get` the descriptor value through the spec's
 /// accessor-aware path.
 fn own_enumerable_keys_for_define(
-    interp: &Interpreter,
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
     props: &Value,
 ) -> Result<Vec<String>, VmError> {
     match props {
-        Value::Object(o) => Ok(object::with_properties(*o, interp.gc_heap(), |p| {
-            p.enumerable_keys().map(|k| k.to_string()).collect()
-        })),
-        Value::ClassConstructor(class) => Ok(object::with_properties(
-            class.statics(interp.gc_heap()),
-            interp.gc_heap(),
-            |p| p.enumerable_keys().map(|k| k.to_string()).collect(),
-        )),
+        Value::Null | Value::Undefined => Err(VmError::TypeMismatch),
+        Value::Object(_)
+        | Value::ClassConstructor(_)
+        | Value::Function { .. }
+        | Value::Closure { .. }
+        | Value::NativeFunction(_)
+        | Value::BoundFunction(_)
+        | Value::RegExp(_)
+        | Value::Proxy(_) => {
+            let string_heap = interp.string_heap_clone();
+            let keys = interp.own_property_keys_value(context, props, &string_heap)?;
+            let mut out = Vec::new();
+            for key in keys {
+                let Value::String(name) = key else { continue };
+                let desc = interp.get_own_property_descriptor_for_value(
+                    context,
+                    props.clone(),
+                    Some(&Value::String(name.clone())),
+                )?;
+                if desc.is_some_and(|desc| desc.enumerable()) {
+                    out.push(name.to_lossy_string());
+                }
+            }
+            Ok(out)
+        }
         Value::Array(arr) => {
             // §22.1.3.3 EnumerableOwnPropertyNames for Array — indices
             // in storage order, then any named props that were

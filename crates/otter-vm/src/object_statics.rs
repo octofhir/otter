@@ -1538,22 +1538,12 @@ fn define_accessor_helper(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
-    let target = match &this_value {
-        Value::Object(o) => *o,
-        Value::Null | Value::Undefined => {
-            return Err(NativeError::TypeError {
-                name: method_name,
-                reason: "cannot convert null or undefined to object".to_string(),
-            });
-        }
-        _ => {
-            // §7.1.18 ToObject — primitives wrap. The accessor lands
-            // on the transient wrapper which is discarded once the
-            // call returns, mirroring V8/JSC. Tests against
-            // Object.prototype.__defineGetter__ use plain objects.
-            return Ok(Value::Undefined);
-        }
-    };
+    if matches!(this_value, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: method_name,
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
     let callable = args.get(1).cloned().unwrap_or(Value::Undefined);
     if !crate::is_callable_value(&callable) {
         return Err(NativeError::TypeError {
@@ -1563,16 +1553,50 @@ fn define_accessor_helper(
     }
     let key = native_to_property_key(ctx, args.first(), method_name)?;
     let desc = if is_setter {
-        PropertyDescriptor::accessor(None, Some(callable), true, true)
+        PartialPropertyDescriptor {
+            set: Some(callable),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..Default::default()
+        }
     } else {
-        PropertyDescriptor::accessor(Some(callable), None, true, true)
+        PartialPropertyDescriptor {
+            get: Some(callable),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..Default::default()
+        }
+    };
+    if let Some(exec_ctx) = ctx.execution_context().cloned()
+        && is_object_like_value(&this_value)
+    {
+        let key = property_key_to_vm_key(&key);
+        let ok = ctx
+            .cx
+            .interp
+            .define_own_property_value(&exec_ctx, &this_value, &key, desc)
+            .map_err(|err| object_native_error(method_name, err))?;
+        if !ok {
+            return Err(NativeError::TypeError {
+                name: method_name,
+                reason: "cannot redefine property".to_string(),
+            });
+        }
+        return Ok(Value::Undefined);
+    }
+
+    let Value::Object(target) = this_value else {
+        // §7.1.18 ToObject — primitives wrap. The accessor lands on
+        // the transient wrapper which is discarded once the call
+        // returns, mirroring V8/JSC.
+        return Ok(Value::Undefined);
     };
     let ok = match key {
         PropertyKey::String(name) => {
-            crate::object::define_own_property(target, ctx.heap_mut(), &name, desc)
+            crate::object::define_own_property_partial(target, ctx.heap_mut(), &name, desc)
         }
         PropertyKey::Symbol(sym) => {
-            crate::object::define_own_symbol_property(target, ctx.heap_mut(), &sym, desc)
+            crate::object::define_own_symbol_property_partial(target, ctx.heap_mut(), &sym, desc)
         }
     };
     if !ok {

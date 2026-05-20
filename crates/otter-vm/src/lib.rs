@@ -1662,6 +1662,14 @@ pub struct Interpreter {
     /// original thrown value is preserved here until the outer
     /// dispatch loop re-throws it on the still-live caller stack.
     pending_uncaught_throw: Option<Value>,
+    /// Iteration-anchor stack: GC roots for in-flight iterator
+    /// drains. `iterator_to_list_sync` and similar helpers push the
+    /// iterator + next-method handles here before each
+    /// `IteratorStep` call so a GC triggered inside the user's
+    /// `next` body cannot reclaim them. Frames pop their entries on
+    /// the way out, matching the LIFO call shape. Traced by
+    /// [`RuntimeState::trace_roots`].
+    iteration_anchors: Vec<Value>,
     /// Stack-frame snapshot captured at the moment of the
     /// originating `Op::Throw` (before [`Self::unwind_throw`]
     /// pops handler-less frames). Surfaces as [`RunError::frames`]
@@ -1901,6 +1909,7 @@ impl Interpreter {
             eval_hook: None,
             pending_generator_throw: None,
             pending_uncaught_throw: None,
+            iteration_anchors: Vec::new(),
             pending_uncaught_frames: None,
             function_user_props: std::collections::HashMap::new(),
             function_non_extensible: std::collections::HashSet::new(),
@@ -3203,6 +3212,24 @@ impl Interpreter {
     #[must_use]
     pub fn pending_uncaught_throw_for_trace(&self) -> Option<&Value> {
         self.pending_uncaught_throw.as_ref()
+    }
+
+    /// Borrow the iteration-anchor stack for GC root tracing.
+    #[must_use]
+    pub(crate) fn iteration_anchors_for_trace(&self) -> &[Value] {
+        &self.iteration_anchors
+    }
+
+    /// Push a value onto the iteration-anchor stack. Returns the
+    /// new stack depth so the matching pop can sanity-check.
+    pub(crate) fn push_iteration_anchor(&mut self, value: Value) -> usize {
+        self.iteration_anchors.push(value);
+        self.iteration_anchors.len()
+    }
+
+    /// Pop entries back down to the depth captured at push time.
+    pub(crate) fn pop_iteration_anchors_to(&mut self, depth: usize) {
+        self.iteration_anchors.truncate(depth);
     }
 
     /// Consume the pending uncaught-throw payload, if any. Embedder

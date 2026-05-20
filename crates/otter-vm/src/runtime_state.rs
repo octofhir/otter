@@ -119,6 +119,13 @@ impl<'a> RuntimeState<'a> {
         if interp.pending_uncaught_throw_for_trace().is_some() {
             // No-op stub.
         }
+        // 8b) Iteration-anchor stack — handles for in-flight
+        //     iterator drains live here so a GC triggered inside a
+        //     user `next` body cannot reclaim them. See
+        //     [`Interpreter::push_iteration_anchor`].
+        for value in interp.iteration_anchors_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         // 9) Active call frames are NOT enumerated here. The
         //    frame stack lives on the call stack of
         //    `Interpreter::run_inner` (`SmallVec<[Frame; 8]>`),

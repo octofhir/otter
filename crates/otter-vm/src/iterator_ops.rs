@@ -956,18 +956,29 @@ impl Interpreter {
         }
 
         let (iterator, next_method) = self.get_iterator_sync(context, iterable)?;
+        // §7.4.13 — drive `IteratorStep` through the user iterator.
+        // Each step calls into JS (the user's `next`), which can
+        // trigger GC. Park the iterator + next-method handles on
+        // the GC-traced anchor stack so a collection inside the
+        // user code cannot reclaim them. The pop-to depth captured
+        // here matches the LIFO push order even when the inner
+        // body recurses into another `iterator_to_list_sync`.
+        let anchor_depth = self.push_iteration_anchor(iterator.clone());
+        self.push_iteration_anchor(next_method.clone());
         let mut values: Vec<Value> = Vec::new();
-        loop {
+        let result = loop {
             match self.iterator_step_sync(context, &iterator, &next_method) {
                 Ok(Some(value)) => values.push(value),
-                Ok(None) => return Ok(values),
+                Ok(None) => break Ok(values),
                 Err(err) => {
                     // Best-effort close; original error wins.
                     let _ = self.iterator_close_sync(context, &iterator);
-                    return Err(err);
+                    break Err(err);
                 }
             }
-        }
+        };
+        self.pop_iteration_anchors_to(anchor_depth - 1);
+        result
     }
 
     /// Resume a generator object — drives the saved frame on a fresh sub-stack

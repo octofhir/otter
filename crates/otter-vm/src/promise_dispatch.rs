@@ -683,6 +683,38 @@ pub fn prototype_call(
     }
 }
 
+/// §27.2.5.1 / §27.2.5.3 helper — `Invoke(receiver, "then", « on_fulfilled,
+/// on_rejected »)`. Reads `.then` via ordinary property semantics
+/// (firing accessor `[[Get]]` if present) and calls it with the
+/// supplied receiver. Used by `Promise.prototype.catch` and
+/// `Promise.prototype.finally` so user-supplied `.then` overrides
+/// (including monkey-patches on plain thenables) are observable.
+pub fn invoke_then(
+    ctx: &mut NativeCtx<'_>,
+    receiver: Value,
+    on_fulfilled: Value,
+    on_rejected: Value,
+) -> Result<Value, NativeError> {
+    const NAME: &str = "Promise.prototype";
+    let exec = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: NAME,
+            reason: "missing execution context".to_string(),
+        })?;
+    let (interp, _) = ctx.interp_mut_and_context();
+    let then = get_callable_property(interp, &exec, receiver.clone(), "then", NAME)?;
+    interp
+        .run_callable_sync(
+            &exec,
+            &then,
+            receiver,
+            smallvec![on_fulfilled, on_rejected],
+        )
+        .map_err(|err| promise_vm_error(NAME, err))
+}
+
 // -- statics --------------------------------------------------------
 
 fn is_builtin_promise_constructor(interp: &Interpreter, constructor: &Value) -> bool {

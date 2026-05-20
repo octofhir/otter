@@ -346,34 +346,49 @@ fn invoke_static(
 // ---------------------------------------------------------------
 
 fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    invoke_prototype(ctx, "then", args)
-}
-
-fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    invoke_prototype(ctx, "catch", args)
-}
-
-fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    invoke_prototype(ctx, "finally", args)
-}
-
-fn invoke_prototype(
-    ctx: &mut NativeCtx<'_>,
-    name: &str,
-    args: &[Value],
-) -> Result<Value, NativeError> {
     let promise = match ctx.this_value() {
         Value::Promise(p) => *p,
         _ => {
             return Err(NativeError::TypeError {
-                name: "Promise.prototype",
-                reason: format!("`this` is not a Promise (in {name})"),
+                name: "Promise.prototype.then",
+                reason: "`this` is not a Promise".to_string(),
             });
         }
     };
     let context = ctx.execution_context().cloned();
     let (interp, _ignored) = ctx.interp_mut_and_context();
-    promise_dispatch::prototype_call(interp, context, &promise, name, args)
+    promise_dispatch::prototype_call(interp, context, &promise, "then", args)
+}
+
+/// §27.2.5.1 `Promise.prototype.catch(onRejected)`.
+///
+/// 1. Let promise be the this value.
+/// 2. Return ? Invoke(promise, "then", « undefined, onRejected »).
+///
+/// No IsPromise check: catch is observably implemented in terms of
+/// `.then` and works on any thenable.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-promise.prototype.catch>
+fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let on_rejected = args.first().cloned().unwrap_or(Value::Undefined);
+    promise_dispatch::invoke_then(ctx, this_value, Value::Undefined, on_rejected)
+}
+
+fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let promise = match ctx.this_value() {
+        Value::Promise(p) => *p,
+        _ => {
+            return Err(NativeError::TypeError {
+                name: "Promise.prototype.finally",
+                reason: "`this` is not a Promise".to_string(),
+            });
+        }
+    };
+    let context = ctx.execution_context().cloned();
+    let (interp, _) = ctx.interp_mut_and_context();
+    promise_dispatch::prototype_call(interp, context, &promise, "finally", args)
 }
 
 // ---------------------------------------------------------------

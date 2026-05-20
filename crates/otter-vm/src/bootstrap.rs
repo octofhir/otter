@@ -3749,10 +3749,11 @@ mod tests {
         // and don't bump the namespace counter. Array entry uses an
         // ad-hoc `record_installed_entry` branch that adds
         // `ARRAY_PROTOTYPE_METHODS.len()`, which grew by 3 with the
-        // `copyWithin` / `toReversed` / `with` additions.
+        // `copyWithin` / `toReversed` / `with` additions. Number
+        // contributes `toLocaleString` as an own prototype builtin.
         assert_eq!(
             telemetry.native_functions_installed(),
-            128 + reflect::REFLECT_SPEC.methods.len(),
+            129 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

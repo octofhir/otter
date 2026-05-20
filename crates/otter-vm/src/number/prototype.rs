@@ -237,6 +237,7 @@ pub static NUMBER_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "toFixed"       / 1 => impl_to_fixed,
             "toExponential" / 1 => impl_to_exponential,
             "toPrecision"   / 1 => impl_to_precision,
+            "toLocaleString"/ 0 => impl_to_string,
             "valueOf"       / 0 => impl_value_of,
         )
     });
@@ -258,6 +259,7 @@ pub static NUMBER_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toFixed", 1, native_to_fixed),
     method("toExponential", 1, native_to_exponential),
     method("toPrecision", 1, native_to_precision),
+    method("toLocaleString", 0, native_to_locale_string),
     method("valueOf", 0, native_value_of),
 ];
 
@@ -384,6 +386,10 @@ fn native_to_exponential(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 
 fn native_to_precision(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     native_number_method("toPrecision", ctx, args)
+}
+
+fn native_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    native_number_method("toLocaleString", ctx, args)
 }
 
 fn native_value_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

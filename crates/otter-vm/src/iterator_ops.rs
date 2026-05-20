@@ -31,6 +31,29 @@ use crate::{
     step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
 
+fn string_iterator_values(
+    s: &JsString,
+    string_heap: &crate::StringHeap,
+) -> Result<Vec<Value>, VmError> {
+    let mut out = Vec::new();
+    let mut index = 0;
+    while let Some(unit) = s.char_code_at(index) {
+        let next_unit = s.char_code_at(index + 1);
+        let is_pair = (0xD800..=0xDBFF).contains(&unit)
+            && matches!(next_unit, Some(low) if (0xDC00..=0xDFFF).contains(&low));
+        let units: smallvec::SmallVec<[u16; 2]> = if is_pair {
+            smallvec::smallvec![unit, next_unit.expect("checked above")]
+        } else {
+            smallvec::smallvec![unit]
+        };
+        let advance = units.len() as u32;
+        let value = JsString::from_utf16_units(&units, string_heap)?;
+        out.push(Value::String(value));
+        index += advance;
+    }
+    Ok(out)
+}
+
 /// Cloned snapshot of an [`IteratorState`] taken before driving a
 /// helper callback so the GC body borrow does not span dispatch.
 enum IteratorStateSnapshot {
@@ -870,14 +893,7 @@ impl Interpreter {
                 return Ok(elements);
             }
             Value::String(s) => {
-                let len = s.len() as usize;
-                let mut out = Vec::with_capacity(len);
-                for i in 0..s.len() {
-                    let unit = s.char_code_at(i).unwrap_or(0);
-                    let unit_str = JsString::from_utf16_units(&[unit], &self.string_heap)?;
-                    out.push(Value::String(unit_str));
-                }
-                return Ok(out);
+                return string_iterator_values(s, &self.string_heap);
             }
             Value::Set(s) => return Ok(crate::collections::set_values(*s, &mut self.gc_heap)),
             Value::Map(m) => {

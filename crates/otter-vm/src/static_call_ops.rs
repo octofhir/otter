@@ -1430,10 +1430,7 @@ impl Interpreter {
             }
             // §20.1.2.7 `Object.groupBy(items, callbackfn)` — groups
             // an iterable into a null-prototype object keyed by the
-            // callback's return value. The foundation drives Array
-            // / array-like items directly; the spec's full
-            // `GetIterator` ladder is reachable but not exercised by
-            // the test262 buckets covered today.
+            // callback's return value.
             //
             // <https://tc39.es/ecma262/#sec-object.groupby>
             M::GroupBy => Ok(Some(self.do_object_group_by(context, stack, args)?)),
@@ -1459,48 +1456,10 @@ impl Interpreter {
                 message: "Object.groupBy: callback must be a function".to_string(),
             });
         }
+        let items_snapshot = self.iterator_to_list_sync(context, &items)?;
         let result =
             self.alloc_stack_rooted_object_with_extra_roots(stack, &[&items, &callback])?;
         object::set_prototype(result, &mut self.gc_heap, None);
-
-        let items_snapshot: Vec<Value> = match &items {
-            Value::Array(arr) => {
-                crate::array::with_elements(*arr, &self.gc_heap, |elements| elements.to_vec())
-            }
-            Value::Object(obj) => {
-                let length =
-                    crate::object::get(*obj, &self.gc_heap, "length").unwrap_or(Value::Undefined);
-                let length_n = crate::number::to_number_value(&length);
-                let length_usize = if length_n.is_nan() || length_n <= 0.0 {
-                    0
-                } else {
-                    length_n.min(9_007_199_254_740_991.0) as usize
-                };
-                let mut out: Vec<Value> = Vec::with_capacity(length_usize);
-                for i in 0..length_usize {
-                    let key = i.to_string();
-                    out.push(
-                        crate::object::get(*obj, &self.gc_heap, &key).unwrap_or(Value::Undefined),
-                    );
-                }
-                out
-            }
-            Value::String(s) => {
-                let mut out: Vec<Value> = Vec::new();
-                let units = s.to_utf16_vec();
-                for &u in &units {
-                    let unit_str = crate::JsString::from_utf16_units(&[u], &self.string_heap)
-                        .map_err(|_| VmError::TypeMismatch)?;
-                    out.push(Value::String(unit_str));
-                }
-                out
-            }
-            _ => {
-                return Err(VmError::TypeError {
-                    message: "Object.groupBy: items is not iterable".to_string(),
-                });
-            }
-        };
 
         for (idx, item) in items_snapshot.iter().enumerate() {
             let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();

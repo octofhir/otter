@@ -200,10 +200,6 @@ fn native_rooted_call(
 /// return value. Each value is an Array of `items` in iteration
 /// order. The callback receives `(item, index)`.
 ///
-/// Foundation iterates Array operands directly. Non-Array iterables
-/// would require the full `GetIterator` ladder; that path falls
-/// through to the catch-all below today.
-///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-object.groupby>
 fn native_group_by_rooted(
@@ -226,38 +222,9 @@ fn native_group_by_rooted(
     let exec_ctx = context.cloned().ok_or_else(|| VmError::TypeError {
         message: "Object.groupBy: missing execution context".to_string(),
     })?;
+    let items_snapshot = ctx.cx.interp.iterator_to_list_sync(&exec_ctx, &items)?;
     let result = ctx.alloc_object_with_roots(&[&items, &callback], &[args])?;
     crate::object::set_prototype(result, ctx.heap_mut(), None);
-
-    // Snapshot the iterable's elements. Arrays drain through their
-    // dense storage; objects with a `length` data property degrade
-    // to `for (let i = 0; i < length; i++)` so spec-classic
-    // array-likes are also accepted.
-    let items_snapshot: Vec<Value> = match &items {
-        Value::Array(arr) => {
-            crate::array::with_elements(*arr, ctx.heap(), |elements| elements.to_vec())
-        }
-        Value::Object(obj) => {
-            let length = crate::object::get(*obj, ctx.heap(), "length").unwrap_or(Value::Undefined);
-            let length_n = crate::number::to_number_value(&length);
-            let length_usize = if length_n.is_nan() || length_n <= 0.0 {
-                0
-            } else {
-                length_n.min(9_007_199_254_740_991.0) as usize
-            };
-            let mut out: Vec<Value> = Vec::with_capacity(length_usize);
-            for i in 0..length_usize {
-                let key = i.to_string();
-                out.push(crate::object::get(*obj, ctx.heap(), &key).unwrap_or(Value::Undefined));
-            }
-            out
-        }
-        _ => {
-            return Err(VmError::TypeError {
-                message: "Object.groupBy: items is not iterable".to_string(),
-            });
-        }
-    };
 
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();

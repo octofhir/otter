@@ -850,6 +850,20 @@ fn call_capability_reject(
     call_capability_function(interp, cap, &cap.reject, reason)
 }
 
+fn native_error_rejection_value(err: NativeError) -> Value {
+    let vm_error = crate::native_to_vm_error(err);
+    crate::error_ops::vm_err_to_value(&vm_error)
+}
+
+fn reject_capability_error(
+    interp: &mut Interpreter,
+    cap: &PromiseCapability,
+    err: NativeError,
+) -> Result<Value, NativeError> {
+    call_capability_reject(interp, cap, native_error_rejection_value(err))?;
+    Ok(cap.promise.clone())
+}
+
 fn get_callable_property(
     interp: &mut Interpreter,
     context: &ExecutionContext,
@@ -1003,7 +1017,10 @@ fn static_all_generic(
     }
     let slots = PromiseSlots::new(entries.len());
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
+        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
+            Ok(value) => value,
+            Err(err) => return reject_capability_error(interp, &cap, err),
+        };
         let cap_for_fulfill = cap.clone();
         let slots_for_trace = slots.clone();
         let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
@@ -1033,7 +1050,11 @@ fn static_all_generic(
                 Ok(Value::Undefined)
             },
         )?;
-        attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject.clone())?;
+        if let Err(err) =
+            attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject.clone())
+        {
+            return reject_capability_error(interp, &cap, err);
+        }
     }
     Ok(cap.promise)
 }
@@ -1062,14 +1083,19 @@ fn static_race_generic(
         reason: "missing execution context".to_string(),
     })?;
     for entry in entries.iter().cloned() {
-        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
-        attach_then_value(
+        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
+            Ok(value) => value,
+            Err(err) => return reject_capability_error(interp, &cap, err),
+        };
+        if let Err(err) = attach_then_value(
             interp,
             &exec,
             entry_promise,
             cap.resolve.clone(),
             cap.reject.clone(),
-        )?;
+        ) {
+            return reject_capability_error(interp, &cap, err);
+        }
     }
     Ok(cap.promise)
 }
@@ -1111,7 +1137,10 @@ fn static_all_settled_generic(
     let slots = PromiseSlots::new(entries.len());
     let heap = interp.string_heap_clone();
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
+        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
+            Ok(value) => value,
+            Err(err) => return reject_capability_error(interp, &cap, err),
+        };
         let on_fulfill = {
             let slots = slots.clone();
             let heap = heap.clone();
@@ -1188,7 +1217,9 @@ fn static_all_settled_generic(
                 },
             )?
         };
-        attach_then_value(interp, &exec, entry_promise, on_fulfill, on_reject)?;
+        if let Err(err) = attach_then_value(interp, &exec, entry_promise, on_fulfill, on_reject) {
+            return reject_capability_error(interp, &cap, err);
+        }
     }
     Ok(cap.promise)
 }
@@ -1352,7 +1383,10 @@ fn static_any_generic(
     let heap = interp.string_heap_clone();
     let registry = interp.error_classes_clone();
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
+        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
+            Ok(value) => value,
+            Err(err) => return reject_capability_error(interp, &cap, err),
+        };
         let on_reject = {
             let errors = errors.clone();
             let heap = heap.clone();
@@ -1392,7 +1426,11 @@ fn static_any_generic(
                 },
             )?
         };
-        attach_then_value(interp, &exec, entry_promise, cap.resolve.clone(), on_reject)?;
+        if let Err(err) =
+            attach_then_value(interp, &exec, entry_promise, cap.resolve.clone(), on_reject)
+        {
+            return reject_capability_error(interp, &cap, err);
+        }
     }
     Ok(cap.promise)
 }

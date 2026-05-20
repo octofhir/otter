@@ -28,6 +28,7 @@
 use std::time::{Duration, Instant};
 
 use crate::js_surface::{Attr, JsSurfaceError, NamespaceSpec, ObjectBuilder};
+use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
     NativeCtx, NativeError, Value, VmGetOutcome, VmPropertyKey, array, array_prototype,
@@ -2154,6 +2155,11 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(object, heap, Value::NativeFunction(ctor_native));
+    let length_desc =
+        PropertyDescriptor::data(Value::Number(NumberValue::from_i32(1)), false, false, true);
+    if !object::define_own_property(object, heap, "length", length_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("length"));
+    }
     object::set(object, heap, "prototype", Value::Object(prototype));
     {
         let mut builder = ObjectBuilder::from_object_with_value_roots(

@@ -1432,6 +1432,15 @@ impl Interpreter {
                 }
                 Ok(keys)
             }
+            Value::ClassConstructor(class) => {
+                let names = self.class_constructor_own_property_keys(Some(context), *class)?;
+                let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+                for n in names {
+                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    keys.push(Value::String(s));
+                }
+                Ok(keys)
+            }
             _ => Ok(Vec::new()),
         }
     }

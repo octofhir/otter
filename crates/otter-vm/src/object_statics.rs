@@ -903,16 +903,10 @@ fn native_get_own_property_names_rooted(
                 .collect()
         }
         Some(Value::ClassConstructor(class)) => {
-            // §15.7.13 — class constructors expose `prototype` as
-            // an own property in addition to anything installed on
-            // their static-bag object.
-            let mut keys: Vec<String> =
-                crate::object::with_properties(class.statics(ctx.heap()), ctx.heap(), |p| {
-                    p.keys().map(|k| k.to_string()).collect()
-                });
-            if !keys.iter().any(|k| k == "prototype") {
-                keys.push("prototype".to_string());
-            }
+            let keys = ctx
+                .cx
+                .interp
+                .class_constructor_own_property_keys(context, *class)?;
             keys.into_iter()
                 .map(|key| string_value(&key, &string_heap))
                 .collect::<Result<Vec<_>, _>>()?
@@ -932,6 +926,35 @@ fn native_get_own_property_names_rooted(
         &[],
         &[args],
     )?))
+}
+
+fn class_constructor_own_property_keys_without_context(
+    class: &crate::ClassConstructor,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<Vec<String>, VmError> {
+    let ctor = class.ctor(gc_heap);
+    let mut keys = match ctor {
+        Value::NativeFunction(native) => native.own_property_keys(gc_heap),
+        Value::BoundFunction(bound) => {
+            crate::function_metadata::bound_own_property_keys(&bound, gc_heap)
+        }
+        Value::ClassConstructor(inner) => {
+            class_constructor_own_property_keys_without_context(&inner, gc_heap)?
+        }
+        Value::Function { .. } | Value::Closure { .. } => return Err(VmError::InvalidOperand),
+        _ => Vec::new(),
+    };
+    if !keys.iter().any(|key| key == "prototype") {
+        keys.push("prototype".to_string());
+    }
+    for key in crate::object::with_properties(class.statics(gc_heap), gc_heap, |p| {
+        p.keys().map(str::to_string).collect::<Vec<_>>()
+    }) {
+        if !keys.iter().any(|existing| existing == &key) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
 }
 
 fn native_get_own_property_symbols_rooted(
@@ -2665,14 +2688,7 @@ pub fn call(
                     return Err(VmError::InvalidOperand);
                 }
                 Some(Value::ClassConstructor(class)) => {
-                    let mut keys: Vec<String> =
-                        crate::object::with_properties(class.statics(gc_heap), gc_heap, |p| {
-                            p.keys().map(|k| k.to_string()).collect()
-                        });
-                    if !keys.iter().any(|k| k == "prototype") {
-                        keys.push("prototype".to_string());
-                    }
-                    keys
+                    class_constructor_own_property_keys_without_context(class, gc_heap)?
                 }
                 Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
                 Some(Value::String(s)) => {

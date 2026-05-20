@@ -1969,6 +1969,7 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
             | Value::Closure { .. }
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
     )
 }
 

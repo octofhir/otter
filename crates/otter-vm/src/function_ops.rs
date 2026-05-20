@@ -911,6 +911,51 @@ impl Interpreter {
         keys
     }
 
+    /// Own string-keyed property names for constructor wrappers.
+    ///
+    /// `Value::ClassConstructor` stores the callable metadata
+    /// (`length`, `name`) on the wrapped constructor value, while
+    /// static methods live on a separate static-side object. The JS
+    /// own-property surface observes both, plus the constructor's
+    /// mandated `prototype` property.
+    pub(crate) fn class_constructor_own_property_keys(
+        &self,
+        context: Option<&ExecutionContext>,
+        class: ClassConstructor,
+    ) -> Result<Vec<String>, VmError> {
+        let ctor = class.ctor(&self.gc_heap);
+        let mut keys = match ctor {
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let Some(context) = context else {
+                    return Err(VmError::InvalidOperand);
+                };
+                self.ordinary_function_own_property_keys(context, function_id)
+            }
+            Value::NativeFunction(native) => native.own_property_keys(&self.gc_heap),
+            Value::BoundFunction(bound) => {
+                function_metadata::bound_own_property_keys(&bound, &self.gc_heap)
+            }
+            Value::ClassConstructor(inner) => {
+                self.class_constructor_own_property_keys(context, inner)?
+            }
+            _ => Vec::new(),
+        };
+
+        if !keys.iter().any(|key| key == "prototype") {
+            keys.push("prototype".to_string());
+        }
+
+        let statics = class.statics(&self.gc_heap);
+        for key in crate::object::with_properties(statics, &self.gc_heap, |p| {
+            p.keys().map(str::to_string).collect::<Vec<_>>()
+        }) {
+            if !keys.iter().any(|existing| existing == &key) {
+                keys.push(key);
+            }
+        }
+        Ok(keys)
+    }
+
     pub(crate) fn ordinary_function_own_property_descriptor(
         &self,
         context: Option<&ExecutionContext>,

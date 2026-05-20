@@ -2134,9 +2134,7 @@ fn assign_set_string(
                     .map_err(|_| VmError::TypeMismatch)?;
                 return Ok(());
             }
-            if let Ok(idx) = key.parse::<u32>()
-                && key == idx.to_string()
-            {
+            if let Some(idx) = crate::object::array_index_property_name(key) {
                 crate::array::set(arr, &mut interp.gc_heap, idx as usize, value)
                     .map_err(|_| VmError::TypeMismatch)?;
                 return Ok(());

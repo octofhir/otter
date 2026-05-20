@@ -1618,9 +1618,7 @@ impl Interpreter {
             // `arr["i"] = 10` round-trips.
             (Value::Array(arr), Value::String(key)) => {
                 let name = key.to_lossy_string();
-                if let Ok(idx) = name.parse::<u32>()
-                    && name == idx.to_string()
-                {
+                if let Some(idx) = crate::object::array_index_property_name(&name) {
                     let roots = self.collect_allocation_roots(stack);
                     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                         for &slot in &roots {
@@ -3636,8 +3634,8 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
             if key == "length" {
                 return true;
             }
-            if let Ok(i) = key.parse::<usize>()
-                && crate::array::has_own_element(arr, &interpreter.gc_heap, i)
+            if let Some(i) = crate::object::array_index_property_name(&key)
+                && crate::array::has_own_element(arr, &interpreter.gc_heap, i as usize)
             {
                 return true;
             }

@@ -47,6 +47,10 @@ pub struct ArrayBody {
     /// Dense element storage. Crate-internal callers must go through
     /// this module's helpers so growth is heap-accounted.
     pub(crate) elements: SmallVec<[Value; 4]>,
+    /// Logical `length` property. This may be larger than dense
+    /// storage when `length` is assigned directly or when sparse
+    /// elements are written.
+    pub(crate) length: usize,
     /// Sparse array-indexed own elements.
     ///
     /// This is intentionally separate from string-keyed
@@ -205,6 +209,7 @@ pub(crate) fn from_elements_old_for_fixture(
     let collected: Vec<Value> = values.into_iter().collect();
     let mut body = ArrayBody::default();
     reserve_elements_for_len(&mut body, heap, collected.len())?;
+    body.length = collected.len();
     body.elements.extend(collected);
     heap.alloc_old(body)
 }
@@ -223,6 +228,7 @@ pub(crate) fn from_elements_with_roots(
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
     let mut body = ArrayBody::default();
+    body.length = collected.len();
     {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -258,6 +264,7 @@ fn from_elements_with_source_old_for_fixture(
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
     let mut body = ArrayBody::default();
+    body.length = collected.len();
     reserve_elements_for_len(&mut body, heap, collected.len())?;
     body.elements.extend(collected);
     body.source_bytes = Some(source_bytes);
@@ -276,6 +283,7 @@ pub(crate) fn from_elements_with_source_and_roots(
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
     let mut body = ArrayBody::default();
+    body.length = collected.len();
     {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -294,7 +302,7 @@ pub(crate) fn from_elements_with_source_and_roots(
 /// Length in elements (O(1)).
 #[must_use]
 pub fn len(arr: JsArray, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(arr, |body| body.elements.len())
+    heap.read_payload(arr, |body| body.length)
 }
 
 /// `true` for an empty array.
@@ -366,6 +374,7 @@ pub fn set(
         heap.with_payload(arr, |body| {
             let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
+            body.length = body.length.max(target_len);
             body.dirty = true;
         });
         heap.record_write(arr, &barrier_value);
@@ -375,6 +384,7 @@ pub fn set(
     heap.with_payload(arr, |body| {
         if idx < body.elements.len() {
             body.elements[idx] = value;
+            body.length = body.length.max(target_len);
             body.dirty = true;
             return;
         }
@@ -384,6 +394,7 @@ pub fn set(
             body.elements.push(Value::Hole);
         }
         body.elements.push(value);
+        body.length = body.length.max(target_len);
         body.dirty = true;
     });
     heap.record_write(arr, &barrier_value);
@@ -413,6 +424,7 @@ pub(crate) fn set_with_roots(
         heap.with_payload(arr, |body| {
             let sparse = body.sparse_elements.get_or_insert_with(HashMap::new);
             sparse.insert(idx, value);
+            body.length = body.length.max(target_len);
             body.dirty = true;
         });
         heap.record_write(arr, &barrier_value);
@@ -428,6 +440,7 @@ pub(crate) fn set_with_roots(
     heap.with_payload(arr, |body| {
         if idx < body.elements.len() {
             body.elements[idx] = value;
+            body.length = body.length.max(target_len);
             body.dirty = true;
             return;
         }
@@ -437,6 +450,7 @@ pub(crate) fn set_with_roots(
             body.elements.push(Value::Hole);
         }
         body.elements.push(value);
+        body.length = body.length.max(target_len);
         body.dirty = true;
     });
     heap.record_write(arr, &barrier_value);
@@ -460,9 +474,13 @@ pub fn push(
     let new_len = heap.with_payload(arr, |body| {
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        while body.elements.len() + 1 < target_len {
+            body.elements.push(Value::Hole);
+        }
         body.elements.push(value);
+        body.length = target_len;
         body.dirty = true;
-        body.elements.len()
+        body.length
     });
     heap.record_write(arr, &barrier_value);
     Ok(new_len)
@@ -493,9 +511,13 @@ pub(crate) fn push_with_roots(
     let new_len = heap.with_payload(arr, |body| {
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
+        while body.elements.len() + 1 < target_len {
+            body.elements.push(Value::Hole);
+        }
         body.elements.push(value);
+        body.length = target_len;
         body.dirty = true;
-        body.elements.len()
+        body.length
     });
     heap.record_write(arr, &barrier_value);
     Ok(new_len)
@@ -521,6 +543,7 @@ pub fn set_length(
     }
     if new_len < cur {
         heap.with_payload(arr, |body| {
+            body.length = new_len;
             body.elements.truncate(new_len);
             if let Some(sparse) = body.sparse_elements.as_mut() {
                 sparse.retain(|k, _| *k < new_len);
@@ -544,13 +567,19 @@ pub fn set_length(
         });
         return Ok(());
     }
-    reserve_for_target_len(arr, heap, new_len)?;
+    const MAX_DENSE_LENGTH_GROWTH: usize = 1 << 20;
+    if new_len <= MAX_DENSE_LENGTH_GROWTH {
+        reserve_for_target_len(arr, heap, new_len)?;
+    }
     heap.with_payload(arr, |body| {
-        body.elements
-            .reserve_exact(new_len.saturating_sub(body.elements.len()));
-        while body.elements.len() < new_len {
-            body.elements.push(Value::Hole);
+        if new_len <= MAX_DENSE_LENGTH_GROWTH {
+            body.elements
+                .reserve_exact(new_len.saturating_sub(body.elements.len()));
+            while body.elements.len() < new_len {
+                body.elements.push(Value::Hole);
+            }
         }
+        body.length = new_len;
         body.dirty = true;
     });
     Ok(())
@@ -649,6 +678,7 @@ fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
 }
 
 fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
+    body.length = len;
     body.elements.truncate(len);
     if let Some(sparse) = body.sparse_elements.as_mut() {
         sparse.retain(|idx, _| *idx < len);
@@ -672,7 +702,7 @@ fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
 }
 
 fn array_index_at_or_above(key: &str, limit: usize) -> bool {
-    key.parse::<usize>().is_ok_and(|idx| idx >= limit)
+    crate::object::array_index_property_name(key).is_some_and(|idx| idx as usize >= limit)
 }
 
 /// Pop from the tail. Returns `Value::Undefined` for an empty array
@@ -680,10 +710,18 @@ fn array_index_at_or_above(key: &str, limit: usize) -> bool {
 #[must_use]
 pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     heap.with_payload(arr, |body| {
-        let popped = body.elements.pop();
-        if popped.is_some() {
-            body.dirty = true;
+        if body.length == 0 {
+            return Value::Undefined;
         }
+        let idx = body.length - 1;
+        let popped = if idx < body.elements.len() {
+            body.elements.get(idx).cloned()
+        } else {
+            body.sparse_elements
+                .as_mut()
+                .and_then(|sparse| sparse.remove(&idx))
+        };
+        truncate_array_body_to(body, idx);
         match popped {
             Some(Value::Hole) | None => Value::Undefined,
             Some(other) => other,
@@ -794,8 +832,8 @@ pub fn set_named_property(
     key: &str,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    if let Ok(idx) = key.parse::<usize>() {
-        return set(arr, heap, idx, value);
+    if let Some(idx) = crate::object::array_index_property_name(key) {
+        return set(arr, heap, idx as usize, value);
     }
     // §10.4.2 — non-extensible Array exotic rejects fresh keys.
     // Updating an existing key still succeeds (the spec routes
@@ -852,11 +890,12 @@ pub(crate) fn set_property_flags(
 #[must_use]
 pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
     if key == "length" {
-        return Some(Value::Number(crate::number::NumberValue::from_i32(
-            len(arr, heap) as i32,
+        return Some(Value::Number(crate::number::NumberValue::from_f64(
+            len(arr, heap) as f64,
         )));
     }
-    if let Ok(idx) = key.parse::<usize>() {
+    if let Some(idx) = crate::object::array_index_property_name(key) {
+        let idx = idx as usize;
         return heap.read_payload(arr, |body| {
             body.elements
                 .get(idx)
@@ -894,7 +933,8 @@ pub fn set_accessor(
         // Hide the underlying dense / sparse / named data slot so
         // subsequent ordinary reads see the accessor instead of the
         // previous data value.
-        if let Ok(idx) = key.parse::<usize>() {
+        if let Some(idx) = crate::object::array_index_property_name(key) {
+            let idx = idx as usize;
             if let Some(slot) = body.elements.get_mut(idx) {
                 *slot = Value::Hole;
             }
@@ -950,7 +990,8 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
     if key == "length" {
         return false;
     }
-    if let Ok(idx) = key.parse::<usize>() {
+    if let Some(idx) = crate::object::array_index_property_name(key) {
+        let idx = idx as usize;
         return heap.with_payload(arr, |body| {
             if let Some(slot) = body.elements.get_mut(idx) {
                 *slot = Value::Hole;
@@ -993,6 +1034,7 @@ pub(crate) fn with_elements_mut<R>(
 ) -> R {
     let (out, children) = heap.with_payload(arr, |body| {
         let out = f(&mut body.elements);
+        body.length = body.elements.len();
         body.dirty = true;
         let children: SmallVec<[Value; 8]> = body.elements.iter().cloned().collect();
         (out, children)

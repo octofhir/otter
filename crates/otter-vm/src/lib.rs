@@ -5178,7 +5178,7 @@ impl Interpreter {
                         Value::Array(a) => *a,
                         _ => return Err(VmError::TypeMismatch),
                     };
-                    let n = NumberValue::from_i32(crate::array::len(arr, &self.gc_heap) as i32);
+                    let n = NumberValue::from_f64(crate::array::len(arr, &self.gc_heap) as f64);
                     write_register(frame, dst, Value::Number(n))?;
                     frame.pc += 1;
                     continue;

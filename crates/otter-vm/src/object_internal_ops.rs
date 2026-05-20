@@ -497,7 +497,7 @@ impl Interpreter {
                 if key == "length" {
                     let flags = array::length_flags(arr, &self.gc_heap);
                     return Ok(Some(object::PropertyDescriptor::data(
-                        Value::Number(NumberValue::from_i32(array::len(arr, &self.gc_heap) as i32)),
+                        Value::Number(NumberValue::from_f64(array::len(arr, &self.gc_heap) as f64)),
                         flags.writable(),
                         flags.enumerable(),
                         flags.configurable(),
@@ -517,7 +517,8 @@ impl Interpreter {
                         flags,
                     }));
                 }
-                if let Ok(idx) = key.parse::<usize>() {
+                if let Some(idx) = object::array_index_property_name(key) {
+                    let idx = idx as usize;
                     if array::has_own_element(arr, &self.gc_heap, idx) {
                         let flags = array::get_property_flags(arr, &self.gc_heap, key)
                             .unwrap_or_else(object::PropertyFlags::data_default);
@@ -983,8 +984,8 @@ impl Interpreter {
                     }
                     return Ok(true);
                 }
-                if let Ok(idx) = k.parse::<usize>() {
-                    return self.define_array_index_property(*arr, k, idx, descriptor);
+                if let Some(idx) = object::array_index_property_name(k) {
+                    return self.define_array_index_property(*arr, k, idx as usize, descriptor);
                 }
                 if descriptor.is_accessor() {
                     // §10.4.2.1 Array exotic [[DefineOwnProperty]] —
@@ -1552,8 +1553,8 @@ impl Interpreter {
                     }
                     if let Some(accessors) = &body.accessors {
                         for key in accessors.keys() {
-                            if let Ok(index) = key.parse::<usize>() {
-                                indices.insert(index);
+                            if let Some(index) = object::array_index_property_name(key) {
+                                indices.insert(index as usize);
                             } else if !string_keys.iter().any(|existing| existing == key) {
                                 string_keys.push(key.clone());
                             }
@@ -2834,7 +2835,8 @@ impl Interpreter {
                     let k = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    if let Ok(idx) = k.parse::<usize>()
+                    if let Some(idx) = object::array_index_property_name(k)
+                        .map(|idx| idx as usize)
                         && array::has_own_element(arr, &self.gc_heap, idx)
                     {
                         return Ok(true);

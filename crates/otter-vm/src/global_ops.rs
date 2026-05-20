@@ -17,7 +17,7 @@
 //! - [`crate::executable`]
 //! - [`crate::object`]
 
-use crate::{ExecutionContext, Frame, Interpreter, Value, VmError, write_register};
+use crate::{ExecutionContext, Frame, Interpreter, Value, VmError, object, write_register};
 
 impl Interpreter {
     pub(crate) fn run_load_global_this_reg(
@@ -64,6 +64,38 @@ impl Interpreter {
         let value =
             crate::object::get(self.global_this, &self.gc_heap, name).unwrap_or(Value::Undefined);
         write_register(frame, dst, value)?;
+        frame.pc += 1;
+        Ok(())
+    }
+
+    pub(crate) fn run_define_global_var_reg(
+        &mut self,
+        context: &ExecutionContext,
+        frame: &mut Frame,
+        name_idx: u32,
+        value_reg: u16,
+    ) -> Result<(), VmError> {
+        let name = context
+            .string_constant_str(name_idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let value = crate::read_register(frame, value_reg)?.clone();
+        let descriptor = object::PartialPropertyDescriptor {
+            value: Some(value),
+            writable: Some(true),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..Default::default()
+        };
+        if !object::define_own_property_partial(
+            self.global_this,
+            &mut self.gc_heap,
+            name,
+            descriptor,
+        ) {
+            return Err(VmError::TypeError {
+                message: format!("Cannot declare global var '{name}'"),
+            });
+        }
         frame.pc += 1;
         Ok(())
     }

@@ -344,6 +344,7 @@ mod tests {
             | Op::ImportMetaResolve
             | Op::ImportNamespaceDynamic
             | Op::Yield => vec![reg(0), reg(1)],
+            Op::DefineGlobalVar => vec![konst(0), reg(1)],
             Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => vec![imm(2), reg(1)],
             Op::LoadLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue => {
                 vec![reg(0), imm(1)]

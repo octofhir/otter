@@ -554,6 +554,14 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-typeof-operator>
     LoadGlobalOrUndefined,
 
+    /// Define/update a global `var` binding on `globalThis`.
+    /// Operands: `ConstIndex(name), Register(value)`.
+    ///
+    /// This is distinct from `StoreProperty`: global declaration
+    /// instantiation creates an own property on the global object and
+    /// therefore ignores non-writable inherited properties.
+    DefineGlobalVar,
+
     /// `r<dst> = import.meta.resolve(r<spec>)`. Operands:
     /// `Register(dst), Register(specifier_reg)`.
     ///
@@ -1096,6 +1104,7 @@ impl Op {
             Op::LoadGlobalThis => "LOAD_GLOBAL_THIS",
             Op::LoadGlobalOrThrow => "LOAD_GLOBAL_OR_THROW",
             Op::LoadGlobalOrUndefined => "LOAD_GLOBAL_OR_UNDEFINED",
+            Op::DefineGlobalVar => "DEFINE_GLOBAL_VAR",
             Op::CollectArguments => "COLLECT_ARGUMENTS",
             Op::Eval => "EVAL",
             Op::NewFunction => "NEW_FUNCTION",
@@ -1169,7 +1178,8 @@ impl Op {
             | Op::IsArray
             | Op::LoadBuiltinError
             | Op::LoadGlobalOrThrow
-            | Op::LoadGlobalOrUndefined => 2,
+            | Op::LoadGlobalOrUndefined
+            | Op::DefineGlobalVar => 2,
             Op::GetStringIndex
             | Op::Add
             | Op::Sub
@@ -1298,6 +1308,8 @@ impl Op {
             | Op::LoadBuiltinError
             | Op::LoadGlobalOrThrow
             | Op::LoadGlobalOrUndefined => pos == 1,
+            // [name_const, value_reg]
+            Op::DefineGlobalVar => pos == 0,
             // [reg, reg, const]
             Op::LoadProperty | Op::DeleteProperty | Op::ToPrimitive => pos == 2,
             // [reg, kind_const, reg]

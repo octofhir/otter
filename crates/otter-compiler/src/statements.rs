@@ -80,6 +80,14 @@ pub(crate) fn compile_statement(
                         })?;
                         let init_reg = compile_expr(cx, init, span)?;
                         cx.emit_store_storage(init_reg, info.storage, span);
+                        if cx.stack.len() == 1 && cx.module_state.is_none() {
+                            let name_idx = cx.intern_string_constant(&name);
+                            cx.emit(
+                                Op::DefineGlobalVar,
+                                [Operand::ConstIndex(name_idx), Operand::Register(init_reg)],
+                                span,
+                            );
+                        }
                         cx.emit_module_export_mirror(&name, init_reg, span);
                         continue;
                     }

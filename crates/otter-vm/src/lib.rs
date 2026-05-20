@@ -4763,6 +4763,17 @@ impl Interpreter {
                     self.run_load_global_or_undefined_reg(context, frame, dst, name_idx)?;
                     continue;
                 }
+                Op::DefineGlobalVar => {
+                    let name_idx = context
+                        .exec_const_index(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let value_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_define_global_var_reg(context, frame, name_idx, value_reg)?;
+                    continue;
+                }
                 Op::ImportNamespace => {
                     let dst = context
                         .exec_register(instr, 0)
@@ -5292,6 +5303,7 @@ impl Interpreter {
                 | Op::LoadGlobalThis
                 | Op::LoadGlobalOrThrow
                 | Op::LoadGlobalOrUndefined
+                | Op::DefineGlobalVar
                 | Op::CollectRest
                 | Op::CollectArguments
                 | Op::ImportNamespace

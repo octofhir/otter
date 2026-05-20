@@ -1417,16 +1417,43 @@ fn native_prototype_is_prototype_of(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let function_prototype = ctx.cx.interp.function_prototype_object().ok();
     let this_value = ctx.this_value().clone();
-    let target = args.first().cloned();
-    let result = match (this_value, target) {
-        (Value::Object(proto), Some(value)) => {
-            value_has_prototype_in_chain(&value, proto, ctx.heap(), function_prototype)
+    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    if !is_object_like_value(&target) {
+        return Ok(Value::Boolean(false));
+    }
+    if matches!(this_value, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: "isPrototypeOf",
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
+    if !is_object_like_value(&this_value) {
+        return Ok(Value::Boolean(false));
+    }
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "isPrototypeOf",
+            reason: "missing execution context".to_string(),
+        })?;
+    let mut current = target;
+    for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
+        let proto = ctx
+            .cx
+            .interp
+            .ordinary_get_prototype_value(&exec_ctx, current, 0)
+            .map_err(|err| object_native_error("isPrototypeOf", err))?;
+        if matches!(proto, Value::Null) {
+            return Ok(Value::Boolean(false));
         }
-        _ => false,
-    };
-    Ok(Value::Boolean(result))
+        if crate::abstract_ops::same_value(&this_value, &proto) {
+            return Ok(Value::Boolean(true));
+        }
+        current = proto;
+    }
+    Ok(Value::Boolean(false))
 }
 
 /// §B.2.2.1.1 `get Object.prototype.__proto__` — returns the
@@ -1805,47 +1832,6 @@ fn property_key_to_vm_key(key: &PropertyKey) -> crate::VmPropertyKey<'static> {
         PropertyKey::String(name) => crate::VmPropertyKey::OwnedString(name.clone()),
         PropertyKey::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
     }
-}
-
-fn value_has_prototype_in_chain(
-    value: &Value,
-    target: JsObject,
-    heap: &otter_gc::GcHeap,
-    function_prototype: Option<JsObject>,
-) -> bool {
-    match value {
-        Value::Object(obj) if constructor_object_has_function_prototype(*obj, heap) => {
-            function_value_has_prototype_in_chain(target, heap, function_prototype)
-        }
-        Value::Object(obj) => crate::object::has_in_proto_chain(*obj, heap, target),
-        Value::Function { .. }
-        | Value::Closure { .. }
-        | Value::BoundFunction(_)
-        | Value::NativeFunction(_)
-        | Value::ClassConstructor(_) => {
-            function_value_has_prototype_in_chain(target, heap, function_prototype)
-        }
-        _ => false,
-    }
-}
-
-fn function_value_has_prototype_in_chain(
-    target: JsObject,
-    heap: &otter_gc::GcHeap,
-    function_prototype: Option<JsObject>,
-) -> bool {
-    let Some(function_prototype) = function_prototype else {
-        return false;
-    };
-    function_prototype == target
-        || crate::object::has_in_proto_chain(function_prototype, heap, target)
-}
-
-fn constructor_object_has_function_prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
-    matches!(
-        crate::object::constructor_native(obj, heap),
-        Some(Value::NativeFunction(_))
-    )
 }
 
 /// §20.1.3.6 step 14 — `builtinTag` table. Only the internal-slot

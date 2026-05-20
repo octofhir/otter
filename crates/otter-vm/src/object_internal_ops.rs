@@ -680,7 +680,7 @@ impl Interpreter {
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
                 match self.invoke_proxy_trap(context, &proxy, "getPrototypeOf", trap_args)? {
                     Some(result) => {
-                        if !matches!(result, Value::Object(_) | Value::Proxy(_) | Value::Null) {
+                        if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
                             return Err(VmError::TypeError {
                                 message: "Proxy getPrototypeOf trap returned non-object"
                                     .to_string(),
@@ -723,6 +723,34 @@ impl Interpreter {
             | Value::Generator(_) => self.get_prototype_for_op(&value),
             _ => Err(VmError::TypeMismatch),
         }
+    }
+
+    fn proxy_get_prototype_result_is_object_or_null(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::Null
+                | Value::Object(_)
+                | Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure { .. }
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::Promise(_)
+                | Value::Iterator(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+                | Value::Generator(_)
+                | Value::Proxy(_)
+        )
     }
 
     /// §10.5.3 / §10.1.3 — value-level `[[IsExtensible]]`.

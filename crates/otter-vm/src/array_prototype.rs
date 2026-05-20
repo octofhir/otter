@@ -1395,12 +1395,6 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     Ok(Value::Boolean(has_named))
 }
 
-/// §20.1.3.3 — `Array.prototype.isPrototypeOf(V)`. Foundation: arrays
-/// are not in a real prototype chain target; always returns false.
-fn impl_is_prototype_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::Boolean(false))
-}
-
 /// §20.1.3.4 — `Array.prototype.propertyIsEnumerable(V)`. Indexed
 /// slots + named props are enumerable; `length` is not.
 fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -1688,7 +1682,6 @@ pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "values"      / 0 => impl_values_iter,
             "entries"     / 0 => impl_entries_iter,
             "hasOwnProperty"      / 1 => impl_has_own_property,
-            "isPrototypeOf"       / 1 => impl_is_prototype_of,
             "propertyIsEnumerable" / 1 => impl_property_is_enumerable,
             // §23.1.3.32 toLocaleString — foundation form delegates
             // to the default `join(",")` shape until per-locale

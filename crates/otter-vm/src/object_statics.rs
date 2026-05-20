@@ -702,7 +702,7 @@ fn native_get_own_property_descriptor_rooted(
     args: &[Value],
 ) -> Result<Value, VmError> {
     let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
-    if matches!(
+    let uses_internal_get_own_property_descriptor = matches!(
         target,
         Value::Proxy(_)
             | Value::Array(_)
@@ -711,7 +711,9 @@ fn native_get_own_property_descriptor_rooted(
             | Value::Closure { .. }
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
-    ) {
+            | Value::String(_)
+    ) || matches!(target, Value::Object(obj) if crate::object::string_data(obj, ctx.heap()).is_some());
+    if uses_internal_get_own_property_descriptor {
         let Some(context) = context else {
             return Err(VmError::InvalidOperand);
         };
@@ -2366,8 +2368,22 @@ pub fn call(
             let key = expect_property_key(args.get(1))?;
             match args.first() {
                 Some(Value::Object(target)) => match &key {
-                    PropertyKey::String(key) => {
-                        match crate::object::get_own_descriptor(*target, gc_heap, key) {
+                    PropertyKey::String(string_key) => {
+                        if let Some(value) = crate::object::string_data(*target, gc_heap)
+                            && let Some(desc) = crate::string::exotic::descriptor_for_name(
+                                &value,
+                                string_key,
+                                string_heap,
+                            )?
+                        {
+                            return Ok(Value::Object(descriptor_to_object_with_roots(
+                                &desc,
+                                gc_heap,
+                                &[],
+                                &[args],
+                            )?));
+                        }
+                        match crate::object::get_own_descriptor(*target, gc_heap, string_key) {
                             Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
@@ -2435,6 +2451,23 @@ pub fn call(
                         None => Ok(Value::Undefined),
                     }
                 }
+                Some(Value::String(value)) => {
+                    let desc = match &key {
+                        PropertyKey::String(key) => {
+                            crate::string::exotic::descriptor_for_name(value, key, string_heap)?
+                        }
+                        PropertyKey::Symbol(_) => None,
+                    };
+                    match desc {
+                        Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                            &desc,
+                            gc_heap,
+                            &[],
+                            &[args],
+                        )?)),
+                        None => Ok(Value::Undefined),
+                    }
+                }
                 // §20.1.2.7 Object.getOwnPropertyDescriptor performs
                 // `obj = ? ToObject(O)` first. Primitive Boolean /
                 // Number / String / Symbol / BigInt coerce to their
@@ -2444,11 +2477,7 @@ pub fn call(
                 // the common "no such own property" case matches
                 // spec without materialising a transient wrapper.
                 Some(
-                    Value::Boolean(_)
-                    | Value::Number(_)
-                    | Value::String(_)
-                    | Value::Symbol(_)
-                    | Value::BigInt(_),
+                    Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_),
                 ) => Ok(Value::Undefined),
                 Some(Value::Null) | Some(Value::Undefined) | None => Err(VmError::TypeError {
                     message:

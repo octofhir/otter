@@ -261,29 +261,7 @@ impl Interpreter {
         let Some(value) = object::string_data(obj, &self.gc_heap) else {
             return Ok(None);
         };
-        let Some(key) = key.string_name() else {
-            return Ok(None);
-        };
-        if key == "length" {
-            return Ok(Some(object::PropertyDescriptor::data(
-                Value::Number(NumberValue::from_i32(value.len() as i32)),
-                false,
-                false,
-                false,
-            )));
-        }
-        let Ok(index) = key.parse::<u32>() else {
-            return Ok(None);
-        };
-        let Some(unit) = value.char_code_at(index) else {
-            return Ok(None);
-        };
-        Ok(Some(object::PropertyDescriptor::data(
-            Value::String(JsString::from_utf16_units(&[unit], &self.string_heap)?),
-            false,
-            true,
-            false,
-        )))
+        string::exotic::descriptor_for_key(&value, key, &self.string_heap)
     }
 
     fn target_is_non_extensible_object(&self, target: &Value) -> bool {
@@ -536,6 +514,9 @@ impl Interpreter {
                 } else {
                     None
                 })
+            }
+            Value::String(value) => {
+                string::exotic::descriptor_for_key(&value, key, &self.string_heap)
             }
             Value::Array(arr) => {
                 // §10.4.2 — own symbol-keyed properties live in a
@@ -988,6 +969,9 @@ impl Interpreter {
                     descriptor,
                 ),
                 _ => {
+                    if let Some(current) = self.string_object_exotic_descriptor(*obj, key)? {
+                        return Ok(is_compatible_partial_descriptor(&current, &descriptor));
+                    }
                     let k = key
                         .string_name()
                         .expect("non-symbol key has string spelling");

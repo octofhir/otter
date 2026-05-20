@@ -1119,17 +1119,14 @@ impl Interpreter {
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1))?;
                 let desc = match args.first() {
-                    Some(Value::Object(target)) => match &key {
-                        VmPropertyKey::Symbol(sym) => {
-                            object::get_own_symbol_descriptor(*target, self.gc_heap(), sym)
-                        }
-                        _ => object::get_own_descriptor(
-                            *target,
-                            self.gc_heap(),
-                            key.string_name()
-                                .expect("non-symbol property key has string spelling"),
-                        ),
-                    },
+                    Some(target @ (Value::Object(_) | Value::String(_))) => self
+                        .ordinary_get_own_property_descriptor_value_stack_rooted(
+                            context,
+                            stack,
+                            target.clone(),
+                            &key,
+                            0,
+                        )?,
                     Some(Value::ClassConstructor(class)) => match &key {
                         VmPropertyKey::Symbol(sym) => object::get_own_symbol_descriptor(
                             class.statics(self.gc_heap()),
@@ -1197,7 +1194,6 @@ impl Interpreter {
                     },
                     Some(Value::Boolean(_))
                     | Some(Value::Number(_))
-                    | Some(Value::String(_))
                     | Some(Value::Symbol(_))
                     | Some(Value::BigInt(_)) => None,
                     Some(Value::Null) | Some(Value::Undefined) | None => {

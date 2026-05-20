@@ -42,12 +42,14 @@
 //!
 //! - [`dispatch`] — compile-time `String.<static>` dispatcher used by
 //!   the `StringCall` opcode.
+//! - [`exotic`] — String exotic object virtual own-property helpers.
 //! - [`ops`] — lower-level VM string opcodes (concat, slice, etc.).
 //! - [`prototype`] — `String.prototype.*` intrinsic implementations.
 //! - [`statics`] — JS-visible static method specs installed on the
 //!   `String` constructor object (`fromCharCode`, `fromCodePoint`).
 
 pub mod dispatch;
+pub(crate) mod exotic;
 pub mod gc_body;
 pub mod intrinsic;
 pub mod ops;

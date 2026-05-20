@@ -861,6 +861,18 @@ pub fn set_named_property(
     key: &str,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
+    if key == "length" {
+        if !length_writable(arr, heap) {
+            return Ok(());
+        }
+        let number_len =
+            crate::number::NumberValue::from_f64(crate::number::to_number_value(&value));
+        let new_len = crate::number::bitwise::to_uint32(number_len);
+        if (new_len as f64) != number_len.as_f64() {
+            return Ok(());
+        }
+        return set_length(arr, heap, new_len as usize);
+    }
     if let Some(idx) = crate::object::array_index_property_name(key) {
         return set(arr, heap, idx as usize, value);
     }

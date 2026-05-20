@@ -26,9 +26,9 @@ use otter_bytecode::Operand;
 
 use crate::{
     ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IteratorHandle, IteratorState,
-    JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
-    VmPropertyKey, array, is_callable, operand_decode::register_operand, read_register,
-    require_callable, step_iterator, symbol, take_drop_count, value_kind_name, write_register,
+    JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome, VmPropertyKey,
+    array, is_callable, operand_decode::register_operand, read_register, require_callable,
+    step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
 
 /// Cloned snapshot of an [`IteratorState`] taken before driving a

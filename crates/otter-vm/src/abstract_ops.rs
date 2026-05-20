@@ -435,10 +435,7 @@ pub fn string_to_big_int(text: &str) -> Option<BigIntValue> {
     if body.is_empty() {
         return None;
     }
-    let parsed = if let Some(rest) = body
-        .strip_prefix("0x")
-        .or_else(|| body.strip_prefix("0X"))
-    {
+    let parsed = if let Some(rest) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         // §12.9.3.1 NonDecimalIntegerLiteral — no sign allowed in
         // the non-decimal form per the spec grammar; reject when
         // we saw an explicit sign above.
@@ -446,18 +443,12 @@ pub fn string_to_big_int(text: &str) -> Option<BigIntValue> {
             return None;
         }
         num_bigint::BigInt::parse_bytes(rest.as_bytes(), 16)?
-    } else if let Some(rest) = body
-        .strip_prefix("0o")
-        .or_else(|| body.strip_prefix("0O"))
-    {
+    } else if let Some(rest) = body.strip_prefix("0o").or_else(|| body.strip_prefix("0O")) {
         if sign_negative {
             return None;
         }
         num_bigint::BigInt::parse_bytes(rest.as_bytes(), 8)?
-    } else if let Some(rest) = body
-        .strip_prefix("0b")
-        .or_else(|| body.strip_prefix("0B"))
-    {
+    } else if let Some(rest) = body.strip_prefix("0b").or_else(|| body.strip_prefix("0B")) {
         if sign_negative {
             return None;
         }

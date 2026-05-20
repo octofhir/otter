@@ -227,6 +227,7 @@ pub type JsMap = otter_gc::Gc<MapBody>;
 /// GC-allocated storage backing every [`JsMap`] handle.
 pub struct MapBody {
     entries: IndexMap<MapKey, (Value, Value)>,
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for MapBody {
@@ -237,6 +238,9 @@ impl otter_gc::SafeTraceable for MapBody {
             trace_map_key(key, visitor);
             original_key.trace_value_slots(visitor);
             value.trace_value_slots(visitor);
+        }
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
         }
     }
 }
@@ -252,6 +256,24 @@ pub(crate) fn alloc_map_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsMap, otter_gc::OutOfMemory> {
     heap.alloc_with_roots(MapBody::default(), external_visit)
+}
+
+pub(crate) fn map_prototype_override(map: JsMap, heap: &otter_gc::GcHeap) -> Option<Value> {
+    heap.read_payload(map, |body| body.prototype_override.clone())
+}
+
+pub(crate) fn set_map_prototype_override(
+    map: JsMap,
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) {
+    let barrier_value = proto.clone();
+    heap.with_payload(map, |body| {
+        body.prototype_override = proto;
+    });
+    if let Some(value) = &barrier_value {
+        heap.record_write(map, value);
+    }
 }
 
 /// Number of entries.
@@ -411,6 +433,7 @@ pub struct SetBody {
     /// original `Value` lives in the map slot so iteration returns
     /// the live handle (matching what `Map`'s tuple gives us).
     entries: IndexMap<MapKey, Value>,
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for SetBody {
@@ -420,6 +443,9 @@ impl otter_gc::SafeTraceable for SetBody {
         for (key, value) in &self.entries {
             trace_map_key(key, visitor);
             value.trace_value_slots(visitor);
+        }
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
         }
     }
 }
@@ -435,6 +461,24 @@ pub(crate) fn alloc_set_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsSet, otter_gc::OutOfMemory> {
     heap.alloc_with_roots(SetBody::default(), external_visit)
+}
+
+pub(crate) fn set_prototype_override(set: JsSet, heap: &otter_gc::GcHeap) -> Option<Value> {
+    heap.read_payload(set, |body| body.prototype_override.clone())
+}
+
+pub(crate) fn set_set_prototype_override(
+    set: JsSet,
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) {
+    let barrier_value = proto.clone();
+    heap.with_payload(set, |body| {
+        body.prototype_override = proto;
+    });
+    if let Some(value) = &barrier_value {
+        heap.record_write(set, value);
+    }
 }
 
 /// Number of unique entries.
@@ -547,14 +591,18 @@ pub type JsWeakMap = otter_gc::Gc<WeakMapBody>;
 /// GC-allocated storage backing every [`JsWeakMap`] handle.
 pub struct WeakMapBody {
     entries: Vec<(RawGc, Value)>,
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for WeakMapBody {
     const TYPE_TAG: u8 = WEAK_MAP_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         // Ephemeron entries are not ordinary strong edges. The VM
         // fixpoint marks values only after the key is already live.
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
+        }
     }
 
     fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
@@ -582,6 +630,27 @@ pub(crate) fn alloc_weak_map_with_roots(
     let map = heap.alloc_with_roots(WeakMapBody::default(), external_visit)?;
     heap.register_ephemeron_table(map);
     Ok(map)
+}
+
+pub(crate) fn weak_map_prototype_override(
+    map: JsWeakMap,
+    heap: &otter_gc::GcHeap,
+) -> Option<Value> {
+    heap.read_payload(map, |body| body.prototype_override.clone())
+}
+
+pub(crate) fn set_weak_map_prototype_override(
+    map: JsWeakMap,
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) {
+    let barrier_value = proto.clone();
+    heap.with_payload(map, |body| {
+        body.prototype_override = proto;
+    });
+    if let Some(value) = &barrier_value {
+        heap.record_write(map, value);
+    }
 }
 
 /// `WeakMap.prototype.get` — Spec §24.3.3.3.
@@ -732,13 +801,17 @@ pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 /// GC-allocated storage backing every [`JsWeakSet`] handle.
 pub struct WeakSetBody {
     entries: Vec<RawGc>,
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for WeakSetBody {
     const TYPE_TAG: u8 = WEAK_SET_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         // WeakSet keys are weak and never traced as strong edges.
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
+        }
     }
 
     fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
@@ -765,6 +838,27 @@ pub(crate) fn alloc_weak_set_with_roots(
     let set = heap.alloc_with_roots(WeakSetBody::default(), external_visit)?;
     heap.register_ephemeron_table(set);
     Ok(set)
+}
+
+pub(crate) fn weak_set_prototype_override(
+    set: JsWeakSet,
+    heap: &otter_gc::GcHeap,
+) -> Option<Value> {
+    heap.read_payload(set, |body| body.prototype_override.clone())
+}
+
+pub(crate) fn set_weak_set_prototype_override(
+    set: JsWeakSet,
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) {
+    let barrier_value = proto.clone();
+    heap.with_payload(set, |body| {
+        body.prototype_override = proto;
+    });
+    if let Some(value) = &barrier_value {
+        heap.record_write(set, value);
+    }
 }
 
 /// `WeakSet.prototype.has` — Spec §24.4.3.4.

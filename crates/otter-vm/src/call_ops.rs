@@ -757,6 +757,40 @@ impl Interpreter {
         self.dispatch_construct(stack, context, callee, args, dst)
     }
 
+    pub(crate) fn do_super_construct_spread(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let dst = register_operand(operands.first())?;
+        let callee_reg = register_operand(operands.get(1))?;
+        let args_reg = register_operand(operands.get(2))?;
+        let top_idx = stack.len() - 1;
+        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        if !is_constructor_runtime(&callee, context, &self.gc_heap) {
+            return Err(VmError::NotCallable);
+        }
+        let new_target = stack[top_idx]
+            .new_target
+            .clone()
+            .unwrap_or_else(|| callee.clone());
+        let args_value = read_register(&stack[top_idx], args_reg)?.clone();
+        let arr = match args_value {
+            Value::Array(a) => a,
+            _ => return Err(VmError::TypeMismatch),
+        };
+        let args: SmallVec<[Value; 8]> =
+            crate::array::with_elements(arr, &self.gc_heap, |elements| {
+                elements.iter().cloned().collect()
+            });
+        stack[top_idx].pc = stack[top_idx]
+            .pc
+            .checked_add(1)
+            .ok_or(VmError::InvalidOperand)?;
+        self.dispatch_construct_with_new_target(stack, context, callee, new_target, args, dst)
+    }
+
     pub(crate) fn dispatch_construct(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -765,9 +799,21 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
+        self.dispatch_construct_with_new_target(stack, context, callee.clone(), callee, args, dst)
+    }
+
+    fn dispatch_construct_with_new_target(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        callee: Value,
+        new_target: Value,
+        args: SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
         self.record_runtime_construct_call();
         let mut callee = callee;
-        let mut new_target = callee.clone();
+        let mut new_target = new_target;
         let mut args = args;
         let mut hops: u32 = 0;
         while let Value::BoundFunction(bound) = &callee {
@@ -799,11 +845,8 @@ impl Interpreter {
                 &[&callee, &new_target],
                 args.as_slice(),
             )?;
-            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(),
-                Value::Array(argv_array),
-                Value::Proxy(proxy.clone()),
-            ];
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(), Value::Array(argv_array), new_target.clone(),];
             let result = match self.invoke_proxy_trap(context, &proxy, "construct", trap_args)? {
                 Some(v) => {
                     // §10.5.13 step 9 — trap result must be an Object;
@@ -820,7 +863,7 @@ impl Interpreter {
                     // target via `run_construct_sync`, which honours
                     // bound/proxy/native paths and re-checks the
                     // constructor-return invariants.
-                    self.run_construct_sync(context, &proxy.target(), callee.clone(), args)?
+                    self.run_construct_sync(context, &proxy.target(), new_target.clone(), args)?
                 }
             };
             let top_idx = stack.len() - 1;

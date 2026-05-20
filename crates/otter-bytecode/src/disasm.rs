@@ -222,6 +222,7 @@ mod tests {
             Op::CallSpread,
             Op::New,
             Op::NewSpread,
+            Op::SuperConstructSpread,
             Op::MakeClass,
             Op::MathLoad,
             Op::MathCall,
@@ -375,6 +376,7 @@ mod tests {
             | Op::GetIterator
             | Op::ArrayPush
             | Op::NewSpread
+            | Op::SuperConstructSpread
             | Op::NewCollection
             | Op::LoadElement
             | Op::DeleteElement

@@ -294,7 +294,8 @@ pub(crate) fn render_error_to_string_spec(
         default: &str,
     ) -> Result<String, crate::VmError> {
         let vm_key = crate::VmPropertyKey::String(key);
-        let outcome = interp.ordinary_get_value(context, receiver.clone(), receiver.clone(), &vm_key, 0)?;
+        let outcome =
+            interp.ordinary_get_value(context, receiver.clone(), receiver.clone(), &vm_key, 0)?;
         let value = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -458,13 +459,13 @@ impl ErrorClassRegistry {
                 });
             };
             let string_heap = ctx.interp_mut().string_heap_clone();
-            let context = ctx
-                .execution_context()
-                .cloned()
-                .ok_or_else(|| NativeError::TypeError {
-                    name: "Error.prototype.toString",
-                    reason: "missing execution context".to_string(),
-                })?;
+            let context =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "Error.prototype.toString",
+                        reason: "missing execution context".to_string(),
+                    })?;
             let (interp, _) = ctx.interp_mut_and_context();
             let display = render_error_to_string_spec(interp, &context, &receiver).map_err(
                 |err| match err {

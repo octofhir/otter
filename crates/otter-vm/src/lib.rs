@@ -41,12 +41,12 @@ pub mod bigint;
 pub mod binary;
 pub mod boolean;
 mod call_ops;
+mod coerce;
 mod collection_ops;
 pub mod collections;
 pub mod collections_prototype;
 pub mod console;
 mod constant_ops;
-mod coerce;
 mod conversion;
 pub mod date;
 // `date` is a directory module — see `date/mod.rs`.
@@ -1915,9 +1915,7 @@ impl Interpreter {
         // logic; this site only caches the resulting handles so
         // `intrinsic_prototype_object_for(Value::Iterator(_))` can
         // route without a global lookup per access.
-        if let Some(Value::Object(iter_proto)) = interp
-            .constructor_prototype_value("Iterator")
-            .ok()
+        if let Some(Value::Object(iter_proto)) = interp.constructor_prototype_value("Iterator").ok()
         {
             let shape_root = interp.shape_runtime.root();
             let protos = bootstrap::build_builtin_iterator_prototypes_post_bootstrap(
@@ -2272,6 +2270,57 @@ impl Interpreter {
                 }
                 Ok(Value::Object(self.function_prototype_object()?))
             }
+            Value::Array(arr) => {
+                if let Some(over) = array::prototype_override(*arr, &self.gc_heap) {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::Map(map) => {
+                if let Some(over) = crate::collections::map_prototype_override(*map, &self.gc_heap)
+                {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::Set(set) => {
+                if let Some(over) = crate::collections::set_prototype_override(*set, &self.gc_heap)
+                {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::WeakMap(map) => {
+                if let Some(over) =
+                    crate::collections::weak_map_prototype_override(*map, &self.gc_heap)
+                {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::WeakSet(set) => {
+                if let Some(over) =
+                    crate::collections::weak_set_prototype_override(*set, &self.gc_heap)
+                {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
             Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
@@ -2287,12 +2336,7 @@ impl Interpreter {
             // is "OrdinaryGetPrototypeOf", which reads the slot the
             // class set at allocation time.
             // <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
-            Value::Array(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
+            Value::RegExp(_)
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_)
             | Value::Promise(_)
@@ -3727,6 +3771,11 @@ impl Interpreter {
                     self.do_construct_spread(stack, context, operands)?;
                     continue;
                 }
+                Op::SuperConstructSpread => {
+                    let operands = context.exec_operands(instr);
+                    self.do_super_construct_spread(stack, context, operands)?;
+                    continue;
+                }
                 Op::Throw => {
                     let src = register_operand(context.exec_operand(instr, 0))?;
                     let value = stack[top_idx]
@@ -5014,6 +5063,7 @@ impl Interpreter {
                 | Op::CallSpread
                 | Op::New
                 | Op::NewSpread
+                | Op::SuperConstructSpread
                 | Op::Throw
                 | Op::EndFinally
                 | Op::Await

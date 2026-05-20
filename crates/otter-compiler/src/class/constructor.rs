@@ -53,7 +53,7 @@ pub(crate) fn compile_synthetic_constructor(
         parent.emit(Op::CollectRest, [Operand::Register(args_reg)], span);
         let dst = parent.alloc_scratch();
         parent.emit(
-            Op::NewSpread,
+            Op::SuperConstructSpread,
             vec![
                 Operand::Register(dst),
                 Operand::Register(super_ctor),

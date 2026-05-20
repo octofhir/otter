@@ -25,9 +25,9 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value, VmError,
-    VmGetOutcome, VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata,
-    make_array_iterator_factory_runtime_rooted, object, object_statics, proxy, regexp_prototype,
-    string, symbol, to_length,
+    VmGetOutcome, VmPropertyKey, abstract_ops, array, constructor_return_is_object,
+    descriptor_value, function_metadata, make_array_iterator_factory_runtime_rooted, object,
+    object_statics, proxy, regexp_prototype, string, symbol, to_length,
 };
 
 /// Convert an already-primitive value to a [`VmPropertyKey`] per
@@ -444,7 +444,9 @@ impl Interpreter {
                 // `hasOwnProperty(sym)` observe the spec shape.
                 if let VmPropertyKey::Symbol(sym) = key {
                     if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, sym) {
-                        return Ok(Some(object::PropertyDescriptor::data(value, true, true, true)));
+                        return Ok(Some(object::PropertyDescriptor::data(
+                            value, true, true, true,
+                        )));
                     }
                     return Ok(None);
                 }
@@ -1554,6 +1556,27 @@ impl Interpreter {
                     proto_opt,
                 ))
             }
+            Value::Array(arr) => {
+                let current_proto = self.get_prototype_for_op(target)?;
+                if abstract_ops::same_value(proto, &current_proto) {
+                    return Ok(true);
+                }
+                if !array::is_extensible(*arr, &self.gc_heap) {
+                    return Ok(false);
+                }
+                if abstract_ops::same_value(proto, target) {
+                    return Ok(false);
+                }
+                let proto_opt = match proto {
+                    Value::Null => None,
+                    v if constructor_return_is_object(v) || matches!(v, Value::Proxy(_)) => {
+                        Some(v.clone())
+                    }
+                    _ => return Ok(false),
+                };
+                array::set_prototype_override(*arr, &mut self.gc_heap, proto_opt);
+                Ok(true)
+            }
             _ => Ok(true),
         }
     }
@@ -1839,7 +1862,8 @@ impl Interpreter {
                         // §22.1 Array exotic — own symbol-keyed slot
                         // wins over the prototype walk, matching the
                         // `OrdinaryGet` ladder for ordinary objects.
-                        if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
+                        if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym)
+                        {
                             v
                         } else if sym
                             .well_known_tag()

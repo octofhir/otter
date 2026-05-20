@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 use crate::js_surface::{Attr, JsSurfaceError, NamespaceSpec, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
-    Value, array_prototype, array_statics, atomics, console, function_prototype, json, math,
-    object_statics, reflect,
+    Value, array, array_prototype, array_statics, atomics, console, constructor_return_is_object,
+    descriptor_value, function_prototype, json, math, object_statics, reflect,
 };
 
 pub(crate) fn alloc_object_with_value_roots(
@@ -616,43 +616,44 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 reason: "Symbol is not a constructor".to_string(),
             });
         }
-        let description = match args.first() {
-            None | Some(Value::Undefined) => None,
-            Some(other) => {
-                let context = ctx
-                    .execution_context()
-                    .cloned()
-                    .ok_or_else(|| NativeError::TypeError {
-                        name: "Symbol",
-                        reason: "missing execution context".to_string(),
-                    })?;
-                let coerced = ctx
-                    .cx
-                    .interp
-                    .coerce_to_string(&context, other)
-                    .map_err(|e| match e {
-                        crate::VmError::TypeError { message } => NativeError::TypeError {
+        let description =
+            match args.first() {
+                None | Some(Value::Undefined) => None,
+                Some(other) => {
+                    let context =
+                        ctx.execution_context()
+                            .cloned()
+                            .ok_or_else(|| NativeError::TypeError {
+                                name: "Symbol",
+                                reason: "missing execution context".to_string(),
+                            })?;
+                    let coerced = ctx
+                        .cx
+                        .interp
+                        .coerce_to_string(&context, other)
+                        .map_err(|e| match e {
+                            crate::VmError::TypeError { message } => NativeError::TypeError {
+                                name: "Symbol",
+                                reason: message,
+                            },
+                            crate::VmError::Uncaught { value } => NativeError::Thrown {
+                                name: "Symbol",
+                                message: value,
+                            },
+                            other => NativeError::TypeError {
+                                name: "Symbol",
+                                reason: other.to_string(),
+                            },
+                        })?;
+                    let string_heap = ctx.interp_mut().string_heap_clone();
+                    let rendered = crate::string::JsString::from_str(&coerced, &string_heap)
+                        .map_err(|_| NativeError::TypeError {
                             name: "Symbol",
-                            reason: message,
-                        },
-                        crate::VmError::Uncaught { value } => NativeError::Thrown {
-                            name: "Symbol",
-                            message: value,
-                        },
-                        other => NativeError::TypeError {
-                            name: "Symbol",
-                            reason: other.to_string(),
-                        },
-                    })?;
-                let string_heap = ctx.interp_mut().string_heap_clone();
-                let rendered = crate::string::JsString::from_str(&coerced, &string_heap)
-                    .map_err(|_| NativeError::TypeError {
-                        name: "Symbol",
-                        reason: "out of memory".to_string(),
-                    })?;
-                Some(rendered)
-            }
-        };
+                            reason: "out of memory".to_string(),
+                        })?;
+                    Some(rendered)
+                }
+            };
         Ok(Value::Symbol(crate::symbol::JsSymbol::new(description)))
     }
 
@@ -660,13 +661,13 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         let key = match args.first() {
             None | Some(Value::Undefined) => "undefined".to_string(),
             Some(other) => {
-                let context = ctx
-                    .execution_context()
-                    .cloned()
-                    .ok_or_else(|| NativeError::TypeError {
-                        name: "Symbol.for",
-                        reason: "missing execution context".to_string(),
-                    })?;
+                let context =
+                    ctx.execution_context()
+                        .cloned()
+                        .ok_or_else(|| NativeError::TypeError {
+                            name: "Symbol.for",
+                            reason: "missing execution context".to_string(),
+                        })?;
                 ctx.cx
                     .interp
                     .coerce_to_string(&context, other)
@@ -996,24 +997,23 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     // `Object.prototype.value` shadowing during `ToPropertyDescriptor`)
     // resolve correctly.
     let to_string_tag_sym = well_known.get(WellKnown::ToStringTag);
-    let object_proto = object::get(global, heap, "Object")
-        .and_then(|v| match v {
-            Value::NativeFunction(ctor) => ctor
-                .own_property_descriptor(heap, string_heap, "prototype")
-                .ok()
-                .flatten()
-                .and_then(|d| match d.kind {
-                    crate::object::DescriptorKind::Data {
-                        value: Value::Object(p),
-                    } => Some(p),
-                    _ => None,
-                }),
-            Value::Object(ctor) => match object::get(ctor, heap, "prototype") {
-                Some(Value::Object(p)) => Some(p),
+    let object_proto = object::get(global, heap, "Object").and_then(|v| match v {
+        Value::NativeFunction(ctor) => ctor
+            .own_property_descriptor(heap, string_heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|d| match d.kind {
+                crate::object::DescriptorKind::Data {
+                    value: Value::Object(p),
+                } => Some(p),
                 _ => None,
-            },
+            }),
+        Value::Object(ctor) => match object::get(ctor, heap, "prototype") {
+            Some(Value::Object(p)) => Some(p),
             _ => None,
-        });
+        },
+        _ => None,
+    });
     for ns_name in ["Math", "JSON", "Reflect", "Atomics"] {
         if let Some(Value::Object(ns)) = object::get(global, heap, ns_name) {
             if let Some(proto) = object_proto {
@@ -1277,6 +1277,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                     reason: "out of memory while allocating array".to_string(),
                 }
             })?;
+            apply_array_new_target_prototype(ctx, arr)?;
             return Ok(Value::Array(arr));
         }
         let arr =
@@ -1305,9 +1306,40 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                         reason: "out of memory while sizing array".to_string(),
                     })?;
             }
+            apply_array_new_target_prototype(ctx, arr)?;
             return Ok(Value::Array(arr));
         }
         unreachable!("non-numeric Array(...) arguments returned above")
+    }
+
+    fn apply_array_new_target_prototype(
+        ctx: &mut NativeCtx<'_>,
+        arr: array::JsArray,
+    ) -> Result<(), NativeError> {
+        let Some(new_target) = ctx.new_target().cloned() else {
+            return Ok(());
+        };
+        let proto = match new_target {
+            Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
+            Value::Object(obj) => object::get(obj, ctx.heap(), "prototype").filter(|value| {
+                constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
+            }),
+            Value::NativeFunction(native) => native
+                .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+                .map_err(|err| NativeError::TypeError {
+                    name: "Array",
+                    reason: err.to_string(),
+                })?
+                .map(|descriptor| descriptor_value(&descriptor))
+                .filter(|value| {
+                    constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
+                }),
+            _ => None,
+        };
+        if let Some(proto) = proto {
+            array::set_prototype_override(arr, ctx.heap_mut(), Some(proto));
+        }
+        Ok(())
     }
 
     let ctor_native = native_static_with_value_roots(
@@ -1367,13 +1399,13 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             // of throwing). Delegate to the dedicated helper so the
             // ToPrimitive ladder, the Symbol guard, and the BigInt
             // path live in one place.
-            let context = ctx
-                .execution_context()
-                .cloned()
-                .ok_or_else(|| NativeError::TypeError {
-                    name: "Number",
-                    reason: "missing execution context".to_string(),
-                })?;
+            let context =
+                ctx.execution_context()
+                    .cloned()
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "Number",
+                        reason: "missing execution context".to_string(),
+                    })?;
             ctx.cx
                 .interp
                 .number_for_number_ctor(&context, &args[0])
@@ -1934,6 +1966,9 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     ///
     /// <https://tc39.es/ecma262/#sec-object-value>
     fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        if ctx.is_construct_call() && !matches!(ctx.new_target(), Some(Value::Object(_))) {
+            return Ok(ctx.this_value().clone());
+        }
         match args.first() {
             None | Some(Value::Undefined | Value::Null) => {
                 let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
@@ -2626,8 +2661,8 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
                 .map_err(|_| JsSurfaceError::OutOfMemory)?
         };
         object::set_prototype(proto, heap, Some(parent));
-        let tag_string =
-            crate::string::JsString::from_str(tag, string_heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let tag_string = crate::string::JsString::from_str(tag, string_heap)
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
         object::define_own_symbol_property_partial(
             proto,
             heap,

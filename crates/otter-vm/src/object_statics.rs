@@ -1358,7 +1358,9 @@ pub fn native_prototype_proto_get(
     }
     // Context-less fallback (sync embedders without a JS frame).
     match this_value {
-        Value::Object(o) => Ok(crate::object::prototype_value(o, ctx.heap()).unwrap_or(Value::Null)),
+        Value::Object(o) => {
+            Ok(crate::object::prototype_value(o, ctx.heap()).unwrap_or(Value::Null))
+        }
         _ => {
             let name = match ctx.this_value() {
                 Value::Boolean(_) => "Boolean",
@@ -1421,10 +1423,7 @@ pub fn native_prototype_proto_set(
     // `Object.prototype.__proto__ = X` throws TypeError unless
     // `X` already matches.
     if let Value::Object(obj) = this_value {
-        let object_proto = ctx
-            .cx
-            .interp
-            .object_prototype_object_opt();
+        let object_proto = ctx.cx.interp.object_prototype_object_opt();
         if object_proto == Some(obj) {
             let current = crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::Null);
             if !crate::abstract_ops::same_value(&proto_value, &current) {
@@ -1873,12 +1872,7 @@ fn explicit_to_string_tag_with_context(
     // `String.prototype` explicitly so user-installed
     // `String.prototype[@@toStringTag]` overrides surface.
     let base: Value = if matches!(this_value, Value::String(_)) {
-        match ctx
-            .cx
-            .interp
-            .constructor_prototype_value("String")
-            .ok()
-        {
+        match ctx.cx.interp.constructor_prototype_value("String").ok() {
             Some(p) => p,
             None => return Ok(None),
         }
@@ -1894,11 +1888,12 @@ fn explicit_to_string_tag_with_context(
     )?;
     let value = match outcome {
         crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            ctx.cx
-                .interp
-                .run_callable_sync(exec_ctx, &getter, this_value, smallvec::SmallVec::new())?
-        }
+        crate::VmGetOutcome::InvokeGetter { getter } => ctx.cx.interp.run_callable_sync(
+            exec_ctx,
+            &getter,
+            this_value,
+            smallvec::SmallVec::new(),
+        )?,
     };
     match value {
         Value::String(s) => Ok(Some(s.to_lossy_string())),

@@ -344,12 +344,47 @@ impl Interpreter {
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_) => return self.function_prototype_object().ok(),
-            Value::Array(_) => "Array",
+            Value::Array(arr) => {
+                if let Some(Value::Object(proto)) =
+                    crate::array::prototype_override(*arr, &self.gc_heap)
+                {
+                    return Some(proto);
+                }
+                "Array"
+            }
             Value::RegExp(_) => "RegExp",
-            Value::Map(_) => "Map",
-            Value::Set(_) => "Set",
-            Value::WeakMap(_) => "WeakMap",
-            Value::WeakSet(_) => "WeakSet",
+            Value::Map(map) => {
+                if let Some(Value::Object(proto)) =
+                    crate::collections::map_prototype_override(*map, &self.gc_heap)
+                {
+                    return Some(proto);
+                }
+                "Map"
+            }
+            Value::Set(set) => {
+                if let Some(Value::Object(proto)) =
+                    crate::collections::set_prototype_override(*set, &self.gc_heap)
+                {
+                    return Some(proto);
+                }
+                "Set"
+            }
+            Value::WeakMap(map) => {
+                if let Some(Value::Object(proto)) =
+                    crate::collections::weak_map_prototype_override(*map, &self.gc_heap)
+                {
+                    return Some(proto);
+                }
+                "WeakMap"
+            }
+            Value::WeakSet(set) => {
+                if let Some(Value::Object(proto)) =
+                    crate::collections::weak_set_prototype_override(*set, &self.gc_heap)
+                {
+                    return Some(proto);
+                }
+                "WeakSet"
+            }
             Value::WeakRef(_) => "WeakRef",
             Value::FinalizationRegistry(_) => "FinalizationRegistry",
             Value::Promise(_) => "Promise",

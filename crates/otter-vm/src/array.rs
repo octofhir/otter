@@ -86,6 +86,10 @@ pub struct ArrayBody {
     /// exotic. New string-keyed writes against a non-extensible
     /// array are rejected by the foundation OrdinarySet path.
     pub(crate) extensible: ExtensibleFlag,
+    /// Per-instance `[[Prototype]]` override for Array exotic
+    /// objects constructed through subclassing. Plain arrays leave
+    /// this unset and resolve to the realm `%Array.prototype%`.
+    pub(crate) prototype_override: Option<Value>,
 }
 
 /// One-byte `[[Extensible]]` slot. Wrapper around `bool` with a
@@ -132,6 +136,32 @@ impl otter_gc::SafeTraceable for ArrayBody {
                 value.trace_value_slots(visitor);
             }
         }
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
+        }
+    }
+}
+
+/// Read the Array exotic's per-instance `[[Prototype]]` override.
+pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {
+    heap.read_payload(arr, |body| body.prototype_override.clone())
+}
+
+/// Set the Array exotic's per-instance `[[Prototype]]` override.
+///
+/// Spec: §10.4.2 Array exotic objects still have ordinary
+/// `[[GetPrototypeOf]]` / `[[SetPrototypeOf]]`; subclassing Array
+/// needs a per-object slot rather than a realm-level intrinsic
+/// fallback.
+///
+/// <https://tc39.es/ecma262/#sec-array-exotic-objects>
+pub(crate) fn set_prototype_override(arr: JsArray, heap: &mut GcHeap, proto: Option<Value>) {
+    let barrier_value = proto.clone();
+    heap.with_payload(arr, |body| {
+        body.prototype_override = proto;
+    });
+    if let Some(value) = &barrier_value {
+        heap.record_write(arr, value);
     }
 }
 
@@ -572,9 +602,12 @@ pub fn get_symbol_property(
     key: &crate::symbol::JsSymbol,
 ) -> Option<Value> {
     heap.read_payload(arr, |body| {
-        body.symbol_properties
-            .as_ref()
-            .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| v.clone()))
+        body.symbol_properties.as_ref().and_then(|table| {
+            table
+                .iter()
+                .find(|(k, _)| k.ptr_eq(key))
+                .map(|(_, v)| v.clone())
+        })
     })
 }
 

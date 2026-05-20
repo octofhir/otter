@@ -1660,9 +1660,7 @@ fn native_string_method(
                 reason: "Cannot convert undefined or null to object".to_string(),
             });
         }
-        if needs_coerce
-            && let Some(exec) = ctx.execution_context().cloned()
-        {
+        if needs_coerce && let Some(exec) = ctx.execution_context().cloned() {
             let interp = ctx.interp_mut();
             let s = interp
                 .coerce_to_string(&exec, &receiver)

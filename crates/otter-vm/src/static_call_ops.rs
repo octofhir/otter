@@ -201,7 +201,8 @@ impl Interpreter {
         let Some(first) = args.first_mut() else {
             return Ok(args);
         };
-        let coerced = self.coerce_to_primitive(context, first, abstract_ops::ToPrimitiveHint::String)?;
+        let coerced =
+            self.coerce_to_primitive(context, first, abstract_ops::ToPrimitiveHint::String)?;
         *first = coerced;
         Ok(args)
     }
@@ -738,8 +739,13 @@ impl Interpreter {
             // both through the interpreter so user getters fire and
             // any abrupt completion propagates.
             let vm_key = crate::VmPropertyKey::OwnedString(key.clone());
-            let outcome =
-                self.ordinary_get_value(context, props_value.clone(), props_value.clone(), &vm_key, 0)?;
+            let outcome = self.ordinary_get_value(
+                context,
+                props_value.clone(),
+                props_value.clone(),
+                &vm_key,
+                0,
+            )?;
             let desc_value = match outcome {
                 crate::VmGetOutcome::Value(v) => v,
                 crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1161,8 +1167,7 @@ impl Interpreter {
                 let (iterator, next_method) = self.get_iterator_sync(context, &iter)?;
 
                 loop {
-                    let stepped =
-                        self.iterator_step_sync(context, &iterator, &next_method)?;
+                    let stepped = self.iterator_step_sync(context, &iterator, &next_method)?;
                     let Some(entry) = stepped else {
                         break;
                     };
@@ -1170,9 +1175,8 @@ impl Interpreter {
                     if !value_is_object_like_for_entry(&entry) {
                         let _ = self.iterator_close_sync(context, &iterator);
                         return Err(VmError::TypeError {
-                            message:
-                                "Object.fromEntries: iterator value is not an entry object"
-                                    .to_string(),
+                            message: "Object.fromEntries: iterator value is not an entry object"
+                                .to_string(),
                         });
                     }
 

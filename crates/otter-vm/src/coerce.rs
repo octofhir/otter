@@ -149,9 +149,9 @@ pub(crate) fn to_number_or_throw(
         Value::BigInt(_) => Err(VmError::TypeError {
             message: "Cannot convert a BigInt value to a number".to_string(),
         }),
-        other => Ok(NumberValue::from_f64(crate::number::parse::to_number_value(
-            &other,
-        ))),
+        other => Ok(NumberValue::from_f64(
+            crate::number::parse::to_number_value(&other),
+        )),
     }
 }
 
@@ -186,9 +186,9 @@ pub(crate) fn to_number_for_number_ctor(
             let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
             Ok(NumberValue::from_f64(f))
         }
-        other => Ok(NumberValue::from_f64(crate::number::parse::to_number_value(
-            &other,
-        ))),
+        other => Ok(NumberValue::from_f64(
+            crate::number::parse::to_number_value(&other),
+        )),
     }
 }
 
@@ -216,11 +216,11 @@ pub(crate) fn to_big_int_or_throw(
         Value::BigInt(b) => Ok(b),
         Value::Boolean(true) => Ok(BigIntValue::from_i32(1)),
         Value::Boolean(false) => Ok(BigIntValue::from_i32(0)),
-        Value::String(s) => abstract_ops::string_to_big_int(&s.to_lossy_string()).ok_or(
-            VmError::SyntaxError {
+        Value::String(s) => {
+            abstract_ops::string_to_big_int(&s.to_lossy_string()).ok_or(VmError::SyntaxError {
                 message: format!("Cannot convert {:?} to a BigInt", s.to_lossy_string()),
-            },
-        ),
+            })
+        }
         Value::Number(_) => Err(VmError::TypeError {
             message: "Cannot convert a Number to a BigInt".to_string(),
         }),

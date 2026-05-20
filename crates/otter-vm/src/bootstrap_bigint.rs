@@ -159,8 +159,7 @@ fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         });
     }
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt")?;
-    bigint::dispatch::call(BigIntMethod::Construct, &coerced)
-        .map_err(|e| vm_to_native(e, "BigInt"))
+    bigint::dispatch::call(BigIntMethod::Construct, &coerced).map_err(|e| vm_to_native(e, "BigInt"))
 }
 
 fn bigint_static_as_int_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

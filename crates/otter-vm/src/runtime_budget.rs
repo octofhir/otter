@@ -279,6 +279,7 @@ pub(crate) const fn opcode_reductions(op: Op) -> u64 {
         | Op::CallSpread
         | Op::New
         | Op::NewSpread
+        | Op::SuperConstructSpread
         | Op::Await
         | Op::Yield => 8,
         Op::LoadProperty

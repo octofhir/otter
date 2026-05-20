@@ -152,18 +152,19 @@ pub fn shared_array_buffer_call_with_roots(
                     to_index(v).ok_or_else(|| to_index_error(v, "SharedArrayBuffer length"))?
                 }
             };
-            let max_byte_length = match args.get(1) {
-                Some(Value::Object(opts)) => {
-                    if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
-                        Some(to_index(&v).ok_or_else(|| {
-                            to_index_error(&v, "SharedArrayBuffer maxByteLength")
-                        })?)
-                    } else {
-                        None
+            let max_byte_length =
+                match args.get(1) {
+                    Some(Value::Object(opts)) => {
+                        if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
+                            Some(to_index(&v).ok_or_else(|| {
+                                to_index_error(&v, "SharedArrayBuffer maxByteLength")
+                            })?)
+                        } else {
+                            None
+                        }
                     }
-                }
-                _ => None,
-            };
+                    _ => None,
+                };
             let len = length as usize;
             let buf = match max_byte_length {
                 Some(max) => {

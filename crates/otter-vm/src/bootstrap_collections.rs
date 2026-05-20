@@ -37,7 +37,10 @@ use smallvec::SmallVec;
 use crate::collections::{self, CollectionError};
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
-use crate::{NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey};
+use crate::{
+    NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey,
+    constructor_return_is_object, descriptor_value,
+};
 
 // ---------------------------------------------------------------
 // Public bootstrap install entry points
@@ -693,6 +696,7 @@ fn construct_collection(
         });
     }
     let target = alloc_collection(ctx, kind)?;
+    apply_collection_new_target_prototype(ctx, &target, kind)?;
     let iterable = args.first().cloned().unwrap_or(Value::Undefined);
     if matches!(iterable, Value::Undefined | Value::Null) {
         return Ok(target);
@@ -715,6 +719,52 @@ fn alloc_collection(ctx: &mut NativeCtx<'_>, kind: CollectionKind) -> Result<Val
             .map(Value::WeakSet)
             .map_err(|_| oom(name)),
     }
+}
+
+fn apply_collection_new_target_prototype(
+    ctx: &mut NativeCtx<'_>,
+    target: &Value,
+    kind: CollectionKind,
+) -> Result<(), NativeError> {
+    let Some(new_target) = ctx.new_target().cloned() else {
+        return Ok(());
+    };
+    let proto = match new_target {
+        Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
+        Value::Object(obj) => object::get(obj, ctx.heap(), "prototype").filter(|value| {
+            constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
+        }),
+        Value::NativeFunction(native) => native
+            .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+            .map_err(|err| NativeError::TypeError {
+                name: kind.name(),
+                reason: err.to_string(),
+            })?
+            .map(|descriptor| descriptor_value(&descriptor))
+            .filter(|value| {
+                constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
+            }),
+        _ => None,
+    };
+    let Some(proto) = proto else {
+        return Ok(());
+    };
+    match target {
+        Value::Map(map) => {
+            collections::set_map_prototype_override(*map, ctx.heap_mut(), Some(proto))
+        }
+        Value::Set(set) => {
+            collections::set_set_prototype_override(*set, ctx.heap_mut(), Some(proto))
+        }
+        Value::WeakMap(map) => {
+            collections::set_weak_map_prototype_override(*map, ctx.heap_mut(), Some(proto))
+        }
+        Value::WeakSet(set) => {
+            collections::set_weak_set_prototype_override(*set, ctx.heap_mut(), Some(proto))
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// §24.1.1.2 AddEntriesFromIterable — fetch the adder method via

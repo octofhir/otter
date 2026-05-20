@@ -3214,6 +3214,18 @@ impl Interpreter {
         self.pending_uncaught_throw.take()
     }
 
+    /// Stash a [`Value`] on the pending-uncaught-throw side channel
+    /// so the surrounding microtask drain / sync entry point can
+    /// surface the original [[Value]] verbatim after the native
+    /// returns [`NativeError::Thrown`]. The pairing with
+    /// `NativeError::Thrown` (which carries only a display rendering)
+    /// preserves identity per §27.2.1.3.2 step 1.f.iii for natives
+    /// that need to re-throw a JS value verbatim — such as the
+    /// `thrower` function CreateCatchFinally(C, onFinally) installs.
+    pub(crate) fn set_pending_uncaught_throw(&mut self, value: Value) {
+        self.pending_uncaught_throw = Some(value);
+    }
+
     /// Borrow the per-isolate GC heap (read-only).
     #[must_use]
     pub fn gc_heap(&self) -> &otter_gc::GcHeap {
@@ -3507,8 +3519,18 @@ impl Interpreter {
                     if result_capability.is_some() {
                         // Reaction-mode: route the error into the
                         // downstream promise as a rejection rather
-                        // than aborting the drain.
-                        let reason = vm_err_to_value(&vm_err);
+                        // than aborting the drain. If a sub-dispatch
+                        // (e.g. `run_callable_sync` from within the
+                        // native body) caught a user `throw`, the
+                        // original `Value` was stashed on
+                        // `pending_uncaught_throw` — prefer it over a
+                        // stringified `vm_err_to_value` rendering so
+                        // identity is preserved per §27.2.1.3.2 step
+                        // 1.f.iii.
+                        let reason = self
+                            .pending_uncaught_throw
+                            .take()
+                            .unwrap_or_else(|| vm_err_to_value(&vm_err));
                         self.settle_microtask_capability(context, result_capability, Err(reason));
                         Ok(())
                     } else {

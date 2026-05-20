@@ -382,18 +382,9 @@ fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 }
 
 fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let promise = match ctx.this_value() {
-        Value::Promise(p) => *p,
-        _ => {
-            return Err(NativeError::TypeError {
-                name: "Promise.prototype.finally",
-                reason: "`this` is not a Promise".to_string(),
-            });
-        }
-    };
-    let context = ctx.execution_context().cloned();
-    let (interp, _) = ctx.interp_mut_and_context();
-    promise_dispatch::prototype_call(interp, context, &promise, "finally", args)
+    let this_value = ctx.this_value().clone();
+    let on_finally = args.first().cloned().unwrap_or(Value::Undefined);
+    promise_dispatch::method_finally_invoke(ctx, this_value, on_finally)
 }
 
 // ---------------------------------------------------------------

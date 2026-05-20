@@ -42,7 +42,7 @@ use crate::promise::{
     PromiseThenOutcome,
 };
 use crate::string::{JsString, StringHeap};
-use crate::{Frame, Interpreter, Microtask, NativeCtx, Value};
+use crate::{Frame, Interpreter, NativeCtx, Value};
 use otter_gc::raw::{RawGc, SlotVisitor};
 use smallvec::{SmallVec, smallvec};
 use std::cell::{Cell, OnceCell, RefCell};
@@ -268,29 +268,6 @@ impl PromiseBuilder {
         JsPromiseHandle::pending_with_roots(ctx.heap_mut(), &mut external_visit)
     }
 
-    pub(crate) fn rejected_native_rooted(
-        &self,
-        ctx: &mut NativeCtx<'_>,
-        reason: Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-    ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = ctx.collect_native_roots();
-        let this_value = ctx.this_value().clone();
-        let new_target = ctx.new_target().cloned();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            crate::runtime_cx::visit_native_roots(
-                visitor,
-                &roots,
-                &this_value,
-                new_target.as_ref(),
-                value_roots,
-                slice_roots,
-            );
-        };
-        JsPromiseHandle::rejected_with_roots(ctx.heap_mut(), reason, &mut external_visit)
-    }
-
     pub(crate) fn construct_runtime_rooted(
         &self,
         interp: &mut Interpreter,
@@ -434,30 +411,6 @@ fn visit_runtime_roots(
             value.trace_value_slots(visitor);
         }
     }
-}
-
-fn native_value_with_captures_runtime_rooted<F>(
-    interp: &mut Interpreter,
-    name: &'static str,
-    captures: smallvec::SmallVec<[Value; 4]>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-    call: F,
-) -> Result<Value, otter_gc::OutOfMemory>
-where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
-{
-    let roots = interp.collect_runtime_roots();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
-    };
-    native_value_with_captures_unchecked_with_roots(
-        interp.gc_heap_mut(),
-        name,
-        captures,
-        &mut external_visit,
-        call,
-    )
 }
 
 fn native_value_with_captures_native_rooted<F>(
@@ -677,7 +630,12 @@ pub fn prototype_call(
     match name {
         "then" => method_then(interp, context, promise, args),
         "catch" => Ok(method_catch(interp, context, promise, args)),
-        "finally" => Ok(method_finally(interp, context, promise, args)),
+        "finally" => method_finally_value(
+            interp,
+            context,
+            Value::Promise(*promise),
+            args.first().cloned().unwrap_or(Value::Undefined),
+        ),
         other => Err(NativeError::TypeError {
             name: "Promise.prototype",
             reason: format!("method `{other}` is not defined"),
@@ -697,24 +655,243 @@ pub fn invoke_then(
     on_fulfilled: Value,
     on_rejected: Value,
 ) -> Result<Value, NativeError> {
-    const NAME: &str = "Promise.prototype";
     let exec = ctx
         .execution_context()
         .cloned()
         .ok_or_else(|| NativeError::TypeError {
-            name: NAME,
+            name: "Promise.prototype",
             reason: "missing execution context".to_string(),
         })?;
     let (interp, _) = ctx.interp_mut_and_context();
-    let then = get_callable_property(interp, &exec, receiver.clone(), "then", NAME)?;
+    invoke_then_interp(interp, &exec, receiver, on_fulfilled, on_rejected)
+}
+
+fn invoke_then_interp(
+    interp: &mut Interpreter,
+    exec: &ExecutionContext,
+    receiver: Value,
+    on_fulfilled: Value,
+    on_rejected: Value,
+) -> Result<Value, NativeError> {
+    const NAME: &str = "Promise.prototype";
+    let then = get_callable_property(interp, exec, receiver.clone(), "then", NAME)?;
     interp
-        .run_callable_sync(
-            &exec,
-            &then,
-            receiver,
-            smallvec![on_fulfilled, on_rejected],
-        )
+        .run_callable_sync(exec, &then, receiver, smallvec![on_fulfilled, on_rejected])
         .map_err(|err| promise_vm_error(NAME, err))
+}
+
+/// §27.2.5.3 `Promise.prototype.finally(onFinally)`.
+///
+/// 1. Let promise be the this value.
+/// 2. If Type(promise) is not Object, throw TypeError.
+/// 3. Let C = SpeciesConstructor(promise, %Promise%).
+/// 4. If IsCallable(onFinally) is false, thenFinally = catchFinally = onFinally.
+///    Else build the spec'd thenFinally / catchFinally closures.
+/// 5. Return ? Invoke(promise, "then", « thenFinally, catchFinally »).
+///
+/// The catchFinally closure has to *throw* the original rejection
+/// reason verbatim (per spec a `thrower` function). It does so by
+/// stashing the value on [`Interpreter::set_pending_uncaught_throw`]
+/// and returning `NativeError::Thrown`; the surrounding microtask
+/// drain consumes that slot to settle the downstream promise with
+/// identity preserved.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-promise.prototype.finally>
+/// Public entry point for `Promise.prototype.finally` invoked via
+/// ordinary native dispatch (`Promise.prototype.finally.call(obj,
+/// ...)`). Threads through to [`method_finally_value`] so any
+/// receiver, not just a `Value::Promise`, can be processed.
+pub fn method_finally_invoke(
+    ctx: &mut NativeCtx<'_>,
+    receiver: Value,
+    on_finally: Value,
+) -> Result<Value, NativeError> {
+    let context = ctx.execution_context().cloned();
+    let (interp, _) = ctx.interp_mut_and_context();
+    method_finally_value(interp, context, receiver, on_finally)
+}
+
+fn method_finally_value(
+    interp: &mut Interpreter,
+    context: Option<ExecutionContext>,
+    receiver: Value,
+    on_finally: Value,
+) -> Result<Value, NativeError> {
+    const NAME: &str = "Promise.prototype.finally";
+    if !is_object_like(&receiver) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "`this` is not an Object".to_string(),
+        });
+    }
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name: NAME,
+        reason: "missing execution context".to_string(),
+    })?;
+    if !crate::is_callable_value(&on_finally) {
+        return invoke_then_interp(interp, &exec, receiver, on_finally.clone(), on_finally);
+    }
+    let default_ctor = builtin_promise_constructor(interp)?;
+    let c = species_constructor_runtime(interp, &exec, &receiver, &default_ctor, NAME)?;
+    let then_finally = make_then_finally(interp, &exec, c.clone(), on_finally.clone())?;
+    let catch_finally = make_catch_finally(interp, &exec, c, on_finally)?;
+    invoke_then_interp(interp, &exec, receiver, then_finally, catch_finally)
+}
+
+fn make_then_finally(
+    interp: &mut Interpreter,
+    exec: &ExecutionContext,
+    constructor: Value,
+    on_finally: Value,
+) -> Result<Value, NativeError> {
+    let captures: SmallVec<[Value; 4]> = smallvec![constructor.clone(), on_finally.clone()];
+    let trace = trace_captures(&captures);
+    let exec_for_call = exec.clone();
+    let constructor_root = constructor;
+    let on_finally_root = on_finally;
+    let runtime_roots = interp.collect_runtime_roots();
+    let value_roots: &[&Value] = &[&constructor_root, &on_finally_root];
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+    };
+    traced_native_value_with_length(
+        interp.gc_heap_mut(),
+        "",
+        1,
+        captures,
+        trace,
+        &mut external_visit,
+        move |ctx, args, captures| {
+            let c = captures[0].clone();
+            let on_finally = captures[1].clone();
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let result = {
+                let (interp, _) = ctx.interp_mut_and_context();
+                interp
+                    .run_callable_sync(
+                        &exec_for_call,
+                        &on_finally,
+                        Value::Undefined,
+                        SmallVec::new(),
+                    )
+                    .map_err(|err| promise_vm_error("Promise.prototype.finally", err))?
+            };
+            let resolved = {
+                let (interp, _) = ctx.interp_mut_and_context();
+                let resolve_fn = get_promise_resolve(interp, &exec_for_call, &c)?;
+                call_promise_resolve(interp, &exec_for_call, &resolve_fn, &c, result)?
+            };
+            let value_thunk = make_value_thunk(ctx, value)?;
+            invoke_then(ctx, resolved, value_thunk, Value::Undefined)
+        },
+    )
+    .map_err(|_| oom_native("Promise.prototype.finally"))
+}
+
+fn make_catch_finally(
+    interp: &mut Interpreter,
+    exec: &ExecutionContext,
+    constructor: Value,
+    on_finally: Value,
+) -> Result<Value, NativeError> {
+    let captures: SmallVec<[Value; 4]> = smallvec![constructor.clone(), on_finally.clone()];
+    let trace = trace_captures(&captures);
+    let exec_for_call = exec.clone();
+    let constructor_root = constructor;
+    let on_finally_root = on_finally;
+    let runtime_roots = interp.collect_runtime_roots();
+    let value_roots: &[&Value] = &[&constructor_root, &on_finally_root];
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+    };
+    traced_native_value_with_length(
+        interp.gc_heap_mut(),
+        "",
+        1,
+        captures,
+        trace,
+        &mut external_visit,
+        move |ctx, args, captures| {
+            let c = captures[0].clone();
+            let on_finally = captures[1].clone();
+            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            let result = {
+                let (interp, _) = ctx.interp_mut_and_context();
+                interp
+                    .run_callable_sync(
+                        &exec_for_call,
+                        &on_finally,
+                        Value::Undefined,
+                        SmallVec::new(),
+                    )
+                    .map_err(|err| promise_vm_error("Promise.prototype.finally", err))?
+            };
+            let resolved = {
+                let (interp, _) = ctx.interp_mut_and_context();
+                let resolve_fn = get_promise_resolve(interp, &exec_for_call, &c)?;
+                call_promise_resolve(interp, &exec_for_call, &resolve_fn, &c, result)?
+            };
+            let thrower = make_thrower(ctx, reason)?;
+            invoke_then(ctx, resolved, thrower, Value::Undefined)
+        },
+    )
+    .map_err(|_| oom_native("Promise.prototype.finally"))
+}
+
+fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
+    let captures: SmallVec<[Value; 4]> = smallvec![value.clone()];
+    let trace = trace_captures(&captures);
+    let value_root = value;
+    let (interp, _) = ctx.interp_mut_and_context();
+    let runtime_roots = interp.collect_runtime_roots();
+    let value_roots: &[&Value] = &[&value_root];
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+    };
+    traced_native_value_with_length(
+        interp.gc_heap_mut(),
+        "",
+        0,
+        captures,
+        trace,
+        &mut external_visit,
+        move |_ctx, _args, captures| Ok(captures[0].clone()),
+    )
+    .map_err(|_| oom_native("Promise.prototype.finally"))
+}
+
+fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeError> {
+    let captures: SmallVec<[Value; 4]> = smallvec![reason.clone()];
+    let trace = trace_captures(&captures);
+    let reason_root = reason;
+    let (interp, _) = ctx.interp_mut_and_context();
+    let runtime_roots = interp.collect_runtime_roots();
+    let value_roots: &[&Value] = &[&reason_root];
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+    };
+    traced_native_value_with_length(
+        interp.gc_heap_mut(),
+        "",
+        0,
+        captures,
+        trace,
+        &mut external_visit,
+        move |ctx, _args, captures| {
+            let reason = captures[0].clone();
+            // Stash the original Value so the microtask drain can
+            // settle the chained promise with identity preserved.
+            // NativeError::Thrown alone would render the reason as
+            // a string and lose object/Symbol identity.
+            ctx.interp_mut().set_pending_uncaught_throw(reason);
+            Err(NativeError::Thrown {
+                name: "Promise.prototype.finally",
+                message: String::new(),
+            })
+        },
+    )
+    .map_err(|_| oom_native("Promise.prototype.finally"))
 }
 
 // -- statics --------------------------------------------------------
@@ -1847,104 +2024,6 @@ fn method_catch(
         _ => None,
     };
     perform_then_with_handlers(interp, context, promise, None, on_rejected)
-}
-
-fn method_finally(
-    interp: &mut Interpreter,
-    context: Option<ExecutionContext>,
-    promise: &JsPromiseHandle,
-    args: &[Value],
-) -> Value {
-    // Spec §27.2.5.3 — when `onFinally` is not callable, fall back
-    // to a no-op `then` that propagates the original settlement.
-    let on_finally = match args.first() {
-        Some(v) if crate::is_callable_value(v) => v.clone(),
-        _ => return perform_then_with_handlers(interp, context, promise, None, None),
-    };
-    // Build wrapper reactions that:
-    // 1. Invoke `onFinally()` synchronously via a microtask.
-    // 2. Forward the original fulfilment value / rejection reason
-    //    through the chained promise (returning a fresh rejected
-    //    promise re-throws through the resolve adoption path).
-    // Foundation simplification: we don't await onFinally's return
-    // value (the spec calls for that for thenable returns); the
-    // common case of a synchronous cleanup is preserved.
-    let promise_root = Value::Promise(*promise);
-    let then_handler = {
-        let on_finally_root = on_finally.clone();
-        let on_finally_call = on_finally.clone();
-        match native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.prototype.finally then",
-            smallvec![on_finally_root.clone()],
-            &[&promise_root, &on_finally_root],
-            &[args],
-            move |ctx, args, _captures| {
-                let context = ctx.execution_context().cloned();
-                let interp = ctx.interp_mut();
-                let value = args.first().cloned().unwrap_or(Value::Undefined);
-                interp.microtasks_mut().enqueue(Microtask {
-                    callee: on_finally_call.clone(),
-                    this_value: Value::Undefined,
-                    args: smallvec![],
-                    context: context.clone(),
-                    result_capability: None,
-                    kind: crate::microtask::MicrotaskKind::Call,
-                });
-                Ok(value)
-            },
-        ) {
-            Ok(value) => value,
-            Err(_) => return perform_then_with_handlers(interp, context, promise, None, None),
-        }
-    };
-    let catch_handler = {
-        let on_finally_root = on_finally.clone();
-        let on_finally_call = on_finally.clone();
-        match native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.prototype.finally catch",
-            smallvec![on_finally_root.clone()],
-            &[&promise_root, &on_finally_root, &then_handler],
-            &[args],
-            move |ctx, args, _captures| {
-                let context = ctx.execution_context().cloned();
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                let reason_root = reason.clone();
-                let rejected = PromiseBuilder::with_optional_context(context.clone())
-                    .rejected_native_rooted(
-                        ctx,
-                        reason,
-                        &[&on_finally_call, &reason_root],
-                        &[args],
-                    )?;
-                let interp = ctx.interp_mut();
-                interp.microtasks_mut().enqueue(Microtask {
-                    callee: on_finally_call.clone(),
-                    this_value: Value::Undefined,
-                    args: smallvec![],
-                    context: context.clone(),
-                    result_capability: None,
-                    kind: crate::microtask::MicrotaskKind::Call,
-                });
-                // Re-raise the original rejection through the chained
-                // promise. The resolve-native adopts the returned
-                // promise's state, so a rejected handle propagates as
-                // expected.
-                Ok(Value::Promise(rejected))
-            },
-        ) {
-            Ok(value) => value,
-            Err(_) => return perform_then_with_handlers(interp, context, promise, None, None),
-        }
-    };
-    perform_then_with_handlers(
-        interp,
-        context,
-        promise,
-        Some(then_handler),
-        Some(catch_handler),
-    )
 }
 
 // -- helpers -------------------------------------------------------

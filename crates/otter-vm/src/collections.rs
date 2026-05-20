@@ -1,16 +1,16 @@
 //! `Map`, `Set`, `WeakMap`, `WeakSet` collection value types.
 //!
 //! `Map` and `Set` preserve insertion order (ECMA-262 §24.1 /
-//! §24.2). `WeakMap` and `WeakSet` are object-keyed and keep
-//! entries through ephemeron tables: keys are weak, and values
-//! are marked only when their key is already reachable through
-//! another path.
+//! §24.2). `WeakMap` and `WeakSet` accept object keys and
+//! unregistered symbol keys. Object-keyed entries flow through
+//! ephemeron tables: values are marked only when their object key is
+//! already reachable through another path.
 //!
 //! # Contents
 //! - [`JsMap`] — heap-shared, tombstone-list associative store.
 //! - [`JsSet`] — heap-shared, tombstone-list unique-element store.
-//! - [`JsWeakMap`] — GC-managed object-keyed weak map.
-//! - [`JsWeakSet`] — GC-managed object-keyed weak set.
+//! - [`JsWeakMap`] — GC-managed weak map.
+//! - [`JsWeakSet`] — GC-managed weak set.
 //! - [`MapKey`] — equality key used by `JsMap`/`JsSet`. Implements
 //!   ECMA-262 SameValueZero so `+0` / `-0` collapse and `NaN`
 //!   matches itself.
@@ -20,7 +20,7 @@
 //!   an existing key does not change its position.
 //! - Two `JsMap` handles cloned from the same heap object share
 //!   storage — both observe subsequent mutations.
-//! - `JsWeakMap` / `JsWeakSet` reject non-object keys with
+//! - `JsWeakMap` / `JsWeakSet` reject values that cannot be held weakly with
 //!   [`CollectionError::NonObjectKey`].
 //!
 //! # See also
@@ -191,8 +191,8 @@ pub enum CollectionError {
         /// Expected JS-visible name (`"Map"` / `"WeakSet"` / …).
         expected: &'static str,
     },
-    /// `WeakMap` / `WeakSet` rejects primitive keys.
-    #[error("WeakMap / WeakSet keys must be objects")]
+    /// `WeakMap` / `WeakSet` rejects keys that cannot be held weakly.
+    #[error("WeakMap / WeakSet keys must be objects or unregistered symbols")]
     NonObjectKey,
     /// Allocation or accounting failed while growing collection storage.
     #[error("out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}")]
@@ -726,13 +726,36 @@ pub fn set_ptr_eq(a: JsSet, b: JsSet) -> bool {
     a == b
 }
 
-/// JS `WeakMap` — object-keyed ephemeron table.
+/// JS `WeakMap` — weakly-held object / unregistered-symbol-key table.
 pub type JsWeakMap = otter_gc::Gc<WeakMapBody>;
+
+#[derive(Debug, Clone)]
+enum WeakCollectionKey {
+    Object(RawGc),
+    Symbol(JsSymbol),
+}
+
+impl WeakCollectionKey {
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Object(a), Self::Object(b)) => a == b,
+            (Self::Symbol(a), Self::Symbol(b)) => a.ptr_eq(b),
+            _ => false,
+        }
+    }
+
+    fn is_live_object_key(&self) -> bool {
+        match self {
+            Self::Object(raw) => !raw.is_null(),
+            Self::Symbol(_) => true,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsWeakMap`] handle.
 pub struct WeakMapBody {
-    entries: Vec<(RawGc, Value)>,
+    entries: Vec<(WeakCollectionKey, Value)>,
     prototype_override: Option<Value>,
 }
 
@@ -749,10 +772,12 @@ impl otter_gc::SafeTraceable for WeakMapBody {
 
     fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
         for (key, value) in &mut self.entries {
-            let key_slot = key as *mut RawGc;
-            let mut visit_value_slots =
-                |slot_visitor: &mut SlotVisitor<'_>| value.trace_value_slots(slot_visitor);
-            visitor(key_slot, &mut visit_value_slots);
+            if let WeakCollectionKey::Object(raw) = key {
+                let key_slot = raw as *mut RawGc;
+                let mut visit_value_slots =
+                    |slot_visitor: &mut SlotVisitor<'_>| value.trace_value_slots(slot_visitor);
+                visitor(key_slot, &mut visit_value_slots);
+            }
         }
     }
 }
@@ -801,11 +826,11 @@ pub fn weak_map_get(
     heap: &otter_gc::GcHeap,
     key: &Value,
 ) -> Result<Option<Value>, CollectionError> {
-    let key = object_gc_key(key)?;
+    let key = weak_collection_key(key)?;
     Ok(heap.read_payload(map, |body| {
         body.entries
             .iter()
-            .find_map(|(entry_key, value)| (*entry_key == key).then(|| value.clone()))
+            .find_map(|(entry_key, value)| entry_key.matches(&key).then(|| value.clone()))
     }))
 }
 
@@ -815,9 +840,11 @@ pub fn weak_map_has(
     heap: &otter_gc::GcHeap,
     key: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = object_gc_key(key)?;
+    let key = weak_collection_key(key)?;
     Ok(heap.read_payload(map, |body| {
-        body.entries.iter().any(|(entry_key, _)| *entry_key == key)
+        body.entries
+            .iter()
+            .any(|(entry_key, _)| entry_key.matches(&key))
     }))
 }
 
@@ -827,7 +854,7 @@ pub fn weak_map_len(map: JsWeakMap, heap: &otter_gc::GcHeap) -> usize {
     heap.read_payload(map, |body| {
         body.entries
             .iter()
-            .filter(|(entry_key, _)| !entry_key.is_null())
+            .filter(|(entry_key, _)| entry_key.is_live_object_key())
             .count()
     })
 }
@@ -842,11 +869,11 @@ pub fn weak_map_set(
     let barrier_value = value.clone();
     let key_root = key.clone();
     let value_root = value.clone();
-    let key_raw = object_gc_key(&key)?;
+    let key_for_exists = weak_collection_key(&key)?;
     let exists = heap.read_payload(map, |body| {
         body.entries
             .iter()
-            .any(|(entry_key, _)| *entry_key == key_raw)
+            .any(|(entry_key, _)| entry_key.matches(&key_for_exists))
     });
     if !exists {
         let target_len = weak_map_len(map, heap).saturating_add(1);
@@ -856,12 +883,12 @@ pub fn weak_map_set(
         };
         reserve_weak_map_for_target_len_with_roots(&mut map, heap, target_len, &mut reserve_roots)?;
     }
-    let key = object_gc_key(&key)?;
+    let key = weak_collection_key(&key)?;
     heap.with_payload(map, |body| {
         if let Some((_, existing)) = body
             .entries
             .iter_mut()
-            .find(|(entry_key, _)| *entry_key == key)
+            .find(|(entry_key, _)| entry_key.matches(&key))
         {
             *existing = value;
         } else {
@@ -883,9 +910,11 @@ pub(crate) fn weak_map_set_with_roots(
     let barrier_value = value.clone();
     let key_root = key.clone();
     let value_root = value.clone();
-    let key = object_gc_key(&key)?;
+    let key = weak_collection_key(&key)?;
     let exists = heap.read_payload(*map, |body| {
-        body.entries.iter().any(|(entry_key, _)| *entry_key == key)
+        body.entries
+            .iter()
+            .any(|(entry_key, _)| entry_key.matches(&key))
     });
     if !exists {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -904,7 +933,7 @@ pub(crate) fn weak_map_set_with_roots(
         if let Some((_, existing)) = body
             .entries
             .iter_mut()
-            .find(|(entry_key, _)| *entry_key == key)
+            .find(|(entry_key, _)| entry_key.matches(&key))
         {
             *existing = value;
         } else {
@@ -921,12 +950,12 @@ pub fn weak_map_delete(
     heap: &mut otter_gc::GcHeap,
     key: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = object_gc_key(key)?;
+    let key = weak_collection_key(key)?;
     Ok(heap.with_payload(map, |body| {
         if let Some(index) = body
             .entries
             .iter()
-            .position(|(entry_key, _)| *entry_key == key)
+            .position(|(entry_key, _)| entry_key.matches(&key))
         {
             body.entries.remove(index);
             true
@@ -936,13 +965,13 @@ pub fn weak_map_delete(
     }))
 }
 
-/// JS `WeakSet` — object-keyed weak set.
+/// JS `WeakSet` — weakly-held object / unregistered-symbol set.
 pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsWeakSet`] handle.
 pub struct WeakSetBody {
-    entries: Vec<RawGc>,
+    entries: Vec<WeakCollectionKey>,
     prototype_override: Option<Value>,
 }
 
@@ -958,9 +987,11 @@ impl otter_gc::SafeTraceable for WeakSetBody {
 
     fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
         for key in &mut self.entries {
-            let key_slot = key as *mut RawGc;
-            let mut visit_value_slots = |_slot_visitor: &mut SlotVisitor<'_>| {};
-            visitor(key_slot, &mut visit_value_slots);
+            if let WeakCollectionKey::Object(raw) = key {
+                let key_slot = raw as *mut RawGc;
+                let mut visit_value_slots = |_slot_visitor: &mut SlotVisitor<'_>| {};
+                visitor(key_slot, &mut visit_value_slots);
+            }
         }
     }
 }
@@ -1009,9 +1040,9 @@ pub fn weak_set_has(
     heap: &otter_gc::GcHeap,
     value: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = object_gc_key(value)?;
+    let key = weak_collection_key(value)?;
     Ok(heap.read_payload(set, |body| {
-        body.entries.iter().any(|entry_key| *entry_key == key)
+        body.entries.iter().any(|entry_key| entry_key.matches(&key))
     }))
 }
 
@@ -1021,7 +1052,7 @@ pub fn weak_set_len(set: JsWeakSet, heap: &otter_gc::GcHeap) -> usize {
     heap.read_payload(set, |body| {
         body.entries
             .iter()
-            .filter(|entry_key| !entry_key.is_null())
+            .filter(|entry_key| entry_key.is_live_object_key())
             .count()
     })
 }
@@ -1033,8 +1064,12 @@ pub fn weak_set_add(
     value: Value,
 ) -> Result<(), CollectionError> {
     let value_root = value.clone();
-    let key_raw = object_gc_key(&value)?;
-    let exists = heap.read_payload(set, |body| body.entries.contains(&key_raw));
+    let key_for_exists = weak_collection_key(&value)?;
+    let exists = heap.read_payload(set, |body| {
+        body.entries
+            .iter()
+            .any(|entry_key| entry_key.matches(&key_for_exists))
+    });
     if !exists {
         let target_len = weak_set_len(set, heap).saturating_add(1);
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -1042,9 +1077,9 @@ pub fn weak_set_add(
         };
         reserve_weak_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
     }
-    let key = object_gc_key(&value)?;
+    let key = weak_collection_key(&value)?;
     heap.with_payload(set, |body| {
-        if !body.entries.contains(&key) {
+        if !body.entries.iter().any(|entry_key| entry_key.matches(&key)) {
             body.entries.push(key);
         }
     });
@@ -1059,8 +1094,10 @@ pub(crate) fn weak_set_add_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), CollectionError> {
     let value_root = value.clone();
-    let key = object_gc_key(&value)?;
-    let exists = heap.read_payload(*set, |body| body.entries.contains(&key));
+    let key = weak_collection_key(&value)?;
+    let exists = heap.read_payload(*set, |body| {
+        body.entries.iter().any(|entry_key| entry_key.matches(&key))
+    });
     if !exists {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -1074,7 +1111,7 @@ pub(crate) fn weak_set_add_with_roots(
         )?;
     }
     heap.with_payload(*set, |body| {
-        if !body.entries.contains(&key) {
+        if !body.entries.iter().any(|entry_key| entry_key.matches(&key)) {
             body.entries.push(key);
         }
     });
@@ -1087,9 +1124,13 @@ pub fn weak_set_delete(
     heap: &mut otter_gc::GcHeap,
     value: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = object_gc_key(value)?;
+    let key = weak_collection_key(value)?;
     Ok(heap.with_payload(set, |body| {
-        if let Some(index) = body.entries.iter().position(|entry_key| *entry_key == key) {
+        if let Some(index) = body
+            .entries
+            .iter()
+            .position(|entry_key| entry_key.matches(&key))
+        {
             body.entries.remove(index);
             true
         } else {
@@ -1112,11 +1153,19 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
                         continue;
                     };
                     heap.read_payload(map, |body| {
-                        for (key, value) in body.entries.iter().filter(|(key, _)| !key.is_null()) {
-                            if heap.is_marked(*key)
-                                && let Some(value_raw) = value.as_gc_raw()
-                            {
-                                additions.push(value_raw);
+                        for (key, value) in &body.entries {
+                            match key {
+                                WeakCollectionKey::Object(raw) if heap.is_marked(*raw) => {
+                                    if let Some(value_raw) = value.as_gc_raw() {
+                                        additions.push(value_raw);
+                                    }
+                                }
+                                WeakCollectionKey::Symbol(_) => {
+                                    if let Some(value_raw) = value.as_gc_raw() {
+                                        additions.push(value_raw);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     });
@@ -1139,30 +1188,39 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
                 let Some(map) = heap.cast_raw_if_type::<WeakMapBody>(raw) else {
                     continue;
                 };
-                let live_keys: std::collections::HashSet<_> = heap
+                let live_keys = heap
                     .read_payload(map, |body| {
-                        body.entries.iter().map(|(key, _)| *key).collect::<Vec<_>>()
+                        body.entries
+                            .iter()
+                            .map(|(key, _)| key.clone())
+                            .collect::<Vec<_>>()
                     })
                     .into_iter()
-                    .filter(|key| !key.is_null())
-                    .filter(|key| heap.is_marked(*key))
-                    .collect();
+                    .filter(|key| match key {
+                        WeakCollectionKey::Object(raw) => !raw.is_null() && heap.is_marked(*raw),
+                        WeakCollectionKey::Symbol(_) => true,
+                    })
+                    .collect::<Vec<_>>();
                 heap.with_payload(map, |body| {
-                    body.entries.retain(|(key, _)| live_keys.contains(key));
+                    body.entries
+                        .retain(|(key, _)| live_keys.iter().any(|live| live.matches(key)));
                 });
             }
             Some(WEAK_SET_BODY_TYPE_TAG) => {
                 let Some(set) = heap.cast_raw_if_type::<WeakSetBody>(raw) else {
                     continue;
                 };
-                let live_keys: std::collections::HashSet<_> = heap
+                let live_keys = heap
                     .read_payload(set, |body| body.entries.clone())
                     .into_iter()
-                    .filter(|key| !key.is_null())
-                    .filter(|key| heap.is_marked(*key))
-                    .collect();
+                    .filter(|key| match key {
+                        WeakCollectionKey::Object(raw) => !raw.is_null() && heap.is_marked(*raw),
+                        WeakCollectionKey::Symbol(_) => true,
+                    })
+                    .collect::<Vec<_>>();
                 heap.with_payload(set, |body| {
-                    body.entries.retain(|key| live_keys.contains(key));
+                    body.entries
+                        .retain(|key| live_keys.iter().any(|live| live.matches(key)));
                 });
             }
             _ => {}
@@ -1170,9 +1228,17 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
     }
 }
 
-/// Project an object-shaped [`Value`] to a migrated GC key.
-fn object_gc_key(value: &Value) -> Result<RawGc, CollectionError> {
-    value.as_gc_raw().ok_or(CollectionError::NonObjectKey)
+/// Project a value accepted by `CanBeHeldWeakly` to a weak collection key.
+fn weak_collection_key(value: &Value) -> Result<WeakCollectionKey, CollectionError> {
+    if let Some(raw) = value.as_gc_raw() {
+        return Ok(WeakCollectionKey::Object(raw));
+    }
+    match value {
+        Value::Symbol(symbol) if !symbol.is_registered() => {
+            Ok(WeakCollectionKey::Symbol(symbol.clone()))
+        }
+        _ => Err(CollectionError::NonObjectKey),
+    }
 }
 
 fn trace_map_key(key: &MapKey, visitor: &mut SlotVisitor<'_>) {
@@ -1294,11 +1360,11 @@ fn set_capacity_bytes(capacity: usize) -> usize {
 }
 
 fn weak_map_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<(RawGc, Value)>())
+    capacity.saturating_mul(std::mem::size_of::<(WeakCollectionKey, Value)>())
 }
 
 fn weak_set_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<RawGc>())
+    capacity.saturating_mul(std::mem::size_of::<WeakCollectionKey>())
 }
 
 #[cfg(test)]

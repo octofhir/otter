@@ -56,6 +56,10 @@ pub struct SymbolBody {
     /// fast-path well-known checks (e.g. `Symbol.iterator`,
     /// `Symbol.toPrimitive`) without walking a comparison table.
     pub well_known: Option<WellKnown>,
+    /// `true` for symbols created by `Symbol.for`. Registered
+    /// symbols are shared through the global registry and cannot be
+    /// used as WeakMap / WeakSet keys.
+    pub registered: bool,
 }
 
 /// Heap handle for [`Value::Symbol`].
@@ -81,6 +85,7 @@ impl JsSymbol {
             body: Rc::new(SymbolBody {
                 description,
                 well_known: None,
+                registered: false,
             }),
         }
     }
@@ -94,8 +99,15 @@ impl JsSymbol {
             body: Rc::new(SymbolBody {
                 description: Some(description),
                 well_known: Some(tag),
+                registered: false,
             }),
         }
+    }
+
+    /// Whether this symbol came from `Symbol.for`.
+    #[must_use]
+    pub fn is_registered(&self) -> bool {
+        self.body.registered
     }
 
     /// Borrow the description, if any.
@@ -331,7 +343,13 @@ impl SymbolRegistry {
             return Ok(sym);
         }
         let desc = JsString::from_str(key, heap)?;
-        let sym = JsSymbol::new(Some(desc));
+        let sym = JsSymbol {
+            body: Rc::new(SymbolBody {
+                description: Some(desc),
+                well_known: None,
+                registered: true,
+            }),
+        };
         self.entries
             .borrow_mut()
             .push((key.to_string(), sym.clone()));

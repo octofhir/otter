@@ -1552,6 +1552,11 @@ impl Interpreter {
                 name,
             );
         }
+        if let Some(proto) = self.function_kind_prototype_for(context, function_id)
+            && let Some(value) = object::get(proto, &self.gc_heap, name)
+        {
+            return Ok(value);
+        }
         if let Some(value) = self
             .load_function_prototype_method(name)
             .or_else(|| self.load_object_prototype_method(name))
@@ -1592,6 +1597,17 @@ impl Interpreter {
                 crate::object::get(object_ctor, &self.gc_heap, "prototype")
         {
             crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
+        }
+        if context
+            .function(function_id)
+            .is_some_and(|function| function.is_generator)
+        {
+            let proto_value = Value::Object(proto);
+            let parent = self.alloc_stack_rooted_object_with_extra_roots(
+                stack,
+                &[&function_root, &bag_root, &proto_value],
+            )?;
+            self.finish_generator_function_prototype(context, function_id, proto, parent)?;
         }
         let proto_value = Value::Object(proto);
         let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
@@ -1641,6 +1657,19 @@ impl Interpreter {
         {
             crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
         }
+        if context
+            .function(function_id)
+            .is_some_and(|function| function.is_generator)
+        {
+            let proto_value = Value::Object(proto);
+            let mut parent_roots = Vec::with_capacity(value_roots.len() + 3);
+            parent_roots.push(&function_root);
+            parent_roots.push(&bag_root);
+            parent_roots.push(&proto_value);
+            parent_roots.extend_from_slice(value_roots);
+            let parent = self.alloc_runtime_rooted_object_with_roots(&parent_roots, slice_roots)?;
+            self.finish_generator_function_prototype(context, function_id, proto, parent)?;
+        }
         let proto_value = Value::Object(proto);
         let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
         let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
@@ -1648,6 +1677,40 @@ impl Interpreter {
             object::PropertyDescriptor::data(proto_value.clone(), true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
         Ok(proto_value)
+    }
+
+    fn finish_generator_function_prototype(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        proto: JsObject,
+        parent: JsObject,
+    ) -> Result<(), VmError> {
+        if let Ok(Value::Object(iterator_proto)) = self.constructor_prototype_value("Iterator") {
+            object::set_prototype(parent, &mut self.gc_heap, Some(iterator_proto));
+        }
+        let tag_name = match context.function(function_id) {
+            Some(function) if function.is_async_generator => "AsyncGenerator",
+            _ => "Generator",
+        };
+        let tag = JsString::from_str(tag_name, &self.string_heap)?;
+        let tag_sym = self
+            .well_known_symbols()
+            .get(symbol::WellKnown::ToStringTag);
+        object::define_own_symbol_property_partial(
+            parent,
+            &mut self.gc_heap,
+            &tag_sym,
+            object::PartialPropertyDescriptor {
+                value: Some(Value::String(tag)),
+                writable: Some(false),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+        object::set_prototype(proto, &mut self.gc_heap, Some(parent));
+        Ok(())
     }
 
     pub(crate) fn load_global_prototype_method(

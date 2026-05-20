@@ -2499,9 +2499,18 @@ impl Interpreter {
                             }) {
                             Some(desc) => descriptor_to_lookup(desc),
                             None => self
-                                .function_prototype_object()
-                                .ok()
-                                .map(|proto| object::lookup_symbol(proto, &self.gc_heap, sym))
+                                .function_kind_prototype_for(context, function_id)
+                                .and_then(|proto| {
+                                    match object::lookup_symbol(proto, &self.gc_heap, sym) {
+                                        object::PropertyLookup::Absent => None,
+                                        lookup => Some(lookup),
+                                    }
+                                })
+                                .or_else(|| {
+                                    self.function_prototype_object().ok().map(|proto| {
+                                        object::lookup_symbol(proto, &self.gc_heap, sym)
+                                    })
+                                })
                                 .unwrap_or(object::PropertyLookup::Absent),
                         }
                     }
@@ -2517,9 +2526,18 @@ impl Interpreter {
                         match own {
                             Some(desc) => descriptor_to_lookup(desc),
                             None => self
-                                .function_prototype_object()
-                                .ok()
-                                .map(|proto| object::lookup(proto, &self.gc_heap, key_name))
+                                .function_kind_prototype_for(context, function_id)
+                                .and_then(|proto| {
+                                    match object::lookup(proto, &self.gc_heap, key_name) {
+                                        object::PropertyLookup::Absent => None,
+                                        lookup => Some(lookup),
+                                    }
+                                })
+                                .or_else(|| {
+                                    self.function_prototype_object()
+                                        .ok()
+                                        .map(|proto| object::lookup(proto, &self.gc_heap, key_name))
+                                })
                                 .unwrap_or(object::PropertyLookup::Absent),
                         }
                     }

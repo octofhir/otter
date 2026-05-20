@@ -67,6 +67,7 @@ mod executable;
 pub mod execution_context;
 mod frame_ops;
 mod frame_state;
+mod function_kind;
 pub mod function_metadata;
 mod function_ops;
 pub mod function_prototype;
@@ -1743,6 +1744,7 @@ pub struct Interpreter {
     map_iterator_prototype: Option<JsObject>,
     set_iterator_prototype: Option<JsObject>,
     string_iterator_prototype: Option<JsObject>,
+    function_kind_prototypes: function_kind::FunctionKindPrototypes,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -1924,6 +1926,7 @@ impl Interpreter {
             map_iterator_prototype: None,
             set_iterator_prototype: None,
             string_iterator_prototype: None,
+            function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
         };
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
         // iterator prototypes once `%Iterator.prototype%` is wired
@@ -1947,6 +1950,7 @@ impl Interpreter {
             interp.set_iterator_prototype = Some(protos.set);
             interp.string_iterator_prototype = Some(protos.string);
         }
+        interp.install_function_kind_prototypes_post_bootstrap();
         interp
     }
 
@@ -2440,12 +2444,19 @@ impl Interpreter {
                     None => Ok(Value::Null),
                 }
             }
-            Value::Iterator(_) | Value::Generator(_) => {
+            Value::Generator(generator) => {
+                if let Some(proto) = generator.prototype_override(&self.gc_heap) {
+                    return Ok(proto);
+                }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
                     None => Ok(Value::Null),
                 }
             }
+            Value::Iterator(_) => match self.intrinsic_prototype_object_for(value) {
+                Some(o) => Ok(Value::Object(o)),
+                None => Ok(Value::Null),
+            },
             // §20.1.2.10 Object.getPrototypeOf: when applied to a
             // primitive value, the spec performs `ToObject(value)`
             // first (§7.1.18) and then walks the resulting wrapper's

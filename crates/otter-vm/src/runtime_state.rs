@@ -99,6 +99,7 @@ impl<'a> RuntimeState<'a> {
         for obj in interp.function_user_props_for_trace() {
             obj.trace_gc_roots(visitor);
         }
+        interp.trace_function_kind_roots(visitor);
         // 6b) Prototype overrides for non-GC exotic payloads.
         for value in interp.non_gc_exotic_prototype_overrides_for_trace() {
             value.trace_value_slots(visitor);

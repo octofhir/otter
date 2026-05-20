@@ -36,6 +36,7 @@ struct PreparedBytecodeFrame {
     frame: Frame,
     is_generator: bool,
     is_async_generator: bool,
+    generator_prototype: Option<Value>,
 }
 
 impl Interpreter {
@@ -221,6 +222,16 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
+        let generator_prototype = if function.is_generator {
+            Some(self.function_property_get_stack_rooted(
+                context,
+                stack,
+                function.id,
+                "prototype",
+            )?)
+        } else {
+            None
+        };
         let mut new_frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
@@ -236,7 +247,11 @@ impl Interpreter {
         if function.is_generator {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
-            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, new_frame)?;
+            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
+                &mut self.gc_heap,
+                new_frame,
+                generator_prototype,
+            )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
             // Backlink the generator into the frame so `Op::Yield`
             // can find its owner once execution starts.
@@ -267,6 +282,16 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, function, parent_upvalues)?;
         let this_for_callee =
             self.this_for_bytecode_call_stack_rooted(function, stack, this_for_callee, &[])?;
+        let generator_prototype = if function.is_generator {
+            Some(self.function_property_get_stack_rooted(
+                context,
+                stack,
+                function_id,
+                "prototype",
+            )?)
+        } else {
+            None
+        };
         let mut frame = Frame::with_exec_return_upvalues_and_this(
             function,
             return_register,
@@ -279,6 +304,7 @@ impl Interpreter {
             frame,
             is_generator: function.is_generator,
             is_async_generator: function.is_async_generator,
+            generator_prototype,
         })
     }
 
@@ -292,10 +318,15 @@ impl Interpreter {
             mut frame,
             is_generator,
             is_async_generator,
+            generator_prototype,
         } = prepared;
         if is_generator {
             frame.return_register = None;
-            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, frame)?;
+            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
+                &mut self.gc_heap,
+                frame,
+                generator_prototype,
+            )?;
             gen_handle.set_async(&mut self.gc_heap, is_async_generator);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let top_idx = stack.len() - 1;
@@ -1301,6 +1332,17 @@ impl Interpreter {
             this_for_callee,
             &[effective_args.as_slice()],
         )?;
+        let generator_prototype = if function.is_generator {
+            Some(self.function_property_get_runtime_rooted(
+                context,
+                function_id,
+                "prototype",
+                &[&this_for_callee],
+                &[effective_args.as_slice()],
+            )?)
+        } else {
+            None
+        };
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
@@ -1314,7 +1356,11 @@ impl Interpreter {
         if function.is_generator {
             new_frame.return_register = None;
             let async_gen = function.is_async_generator;
-            let gen_handle = crate::generator::JsGenerator::new(&mut self.gc_heap, new_frame)?;
+            let gen_handle = crate::generator::JsGenerator::new_with_prototype(
+                &mut self.gc_heap,
+                new_frame,
+                generator_prototype,
+            )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             return Ok(Value::Generator(gen_handle));

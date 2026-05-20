@@ -1117,13 +1117,22 @@ fn native_is(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 /// respective `%X.prototype%` per §7.1.18.
 fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Object.getPrototypeOf",
+            reason: "missing execution context".to_string(),
+        })?;
     let interp = ctx.interp_mut();
-    interp.get_prototype_for_op(&target).map_err(|err| {
-        object_native_error(
-            otter_bytecode::method_id::ObjectMethod::PreventExtensions.name(),
-            err,
-        )
-    })
+    if let Value::Function { function_id } | Value::Closure { function_id, .. } = &target
+        && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, *function_id)
+    {
+        return Ok(Value::Object(proto));
+    }
+    interp
+        .get_prototype_for_op(&target)
+        .map_err(|err| object_native_error("Object.getPrototypeOf", err))
 }
 
 /// §20.1.2.21 `Object.setPrototypeOf(O, proto)` — assigns the
@@ -1172,19 +1181,22 @@ fn native_prototype_to_string(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    // §20.1.3.6 step 15 — `tag = ? Get(O, @@toStringTag)` walks the
-    // prototype chain. Probe via the accessor-aware ladder when a
-    // context is wired, otherwise fall back to the own-symbol-only
-    // path (sync embedders without a JS frame).
-    let explicit_tag = if let Some(ctx_owned) = ctx.execution_context().cloned() {
-        explicit_to_string_tag_with_context(ctx, &ctx_owned)
-            .map_err(|err| object_native_error("toString", err))?
-    } else {
-        explicit_to_string_tag_own(ctx)
-    };
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "toString",
+            reason: "missing execution context".to_string(),
+        })?;
+    // §20.1.3.6 computes `builtinTag` before the observable
+    // `Get(O, @@toStringTag)` call, so proxy revocation triggered by
+    // the tag getter cannot retroactively change the builtin tag.
+    let builtin_tag = builtin_to_string_tag(ctx);
+    let explicit_tag = explicit_to_string_tag_with_context(ctx, &exec_ctx)
+        .map_err(|err| object_native_error("toString", err))?;
     let tag = match explicit_tag {
         Some(t) => t,
-        None => builtin_to_string_tag(ctx),
+        None => builtin_tag,
     };
     let display = format!("[object {tag}]");
     let string_heap = ctx.cx.interp.string_heap_clone();
@@ -1846,11 +1858,10 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         Value::String(_) => "String",
         Value::BigInt(_) | Value::Symbol(_) => "Object",
         // §20.1.3.6 step 14.a — `[[Call]]` slot.
-        Value::Function { .. }
-        | Value::Closure { .. }
-        | Value::BoundFunction(_)
-        | Value::NativeFunction(_)
-        | Value::ClassConstructor(_) => "Function",
+        Value::Function { .. } | Value::Closure { .. } => "Function",
+        Value::BoundFunction(_) | Value::NativeFunction(_) | Value::ClassConstructor(_) => {
+            "Function"
+        }
         // §20.1.3.6 step 14.i / §6.1.7.3 IsArray — Array exotic.
         Value::Array(_) => "Array",
         // §20.1.3.6 step 14.f / §22.2.7 — `[[RegExpMatcher]]` slot.
@@ -1900,17 +1911,16 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         Value::Object(obj) if object_has_error_data(ctx, *obj) => "Error",
         // §7.2.2 IsArray walks `[[ProxyTarget]]` recursively so a
         // proxy whose target is an Array reports `[object Array]`.
-        Value::Proxy(_) => return proxy_builtin_tag(ctx, ctx.this_value()),
+        Value::Proxy(_) => return proxy_builtin_tag(ctx.this_value()),
         Value::Object(_) => "Object",
     }
     .to_string()
 }
 
 /// §7.2.2 IsArray + §7.2.4 IsCallable for a Proxy target. Walks the
-/// `[[ProxyTarget]]` chain until reaching a non-proxy value; returns
-/// the builtin tag of that underlying value (limited to the spec
-/// table — `"Array"` / `"Function"` / `"Object"`).
-fn proxy_builtin_tag(_ctx: &NativeCtx<'_>, value: &Value) -> String {
+/// `[[ProxyTarget]]` chain until reaching a non-proxy value and
+/// returns the builtin tag of that underlying value.
+fn proxy_builtin_tag(value: &Value) -> String {
     let mut current = value.clone();
     let mut hops = 0_usize;
     loop {
@@ -1926,11 +1936,10 @@ fn proxy_builtin_tag(_ctx: &NativeCtx<'_>, value: &Value) -> String {
                 current = p.target();
             }
             Value::Array(_) => return "Array".to_string(),
-            Value::Function { .. }
-            | Value::Closure { .. }
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_)
-            | Value::ClassConstructor(_) => return "Function".to_string(),
+            Value::Function { .. } | Value::Closure { .. } => return "Function".to_string(),
+            Value::BoundFunction(_) | Value::NativeFunction(_) | Value::ClassConstructor(_) => {
+                return "Function".to_string();
+            }
             _ => return "Object".to_string(),
         }
     }
@@ -1978,27 +1987,6 @@ fn object_has_error_data(ctx: &NativeCtx<'_>, obj: crate::object::JsObject) -> b
         current = crate::object::prototype(o, heap);
     }
     false
-}
-
-/// Synchronous fallback for embedders without a JS execution context.
-/// Reads `@@toStringTag` as an own symbol on plain objects only —
-/// the proto-chain ladder requires `[[Get]]` to invoke accessor
-/// getters and walk the realm prototype, which is the context-aware
-/// path's job.
-fn explicit_to_string_tag_own(ctx: &NativeCtx<'_>) -> Option<String> {
-    let tag_symbol = ctx
-        .cx
-        .interp
-        .well_known_symbols()
-        .get(crate::symbol::WellKnown::ToStringTag);
-    let value = match ctx.this_value() {
-        Value::Object(obj) => crate::object::get_symbol(*obj, ctx.heap(), &tag_symbol),
-        _ => None,
-    }?;
-    match value {
-        Value::String(s) => Some(s.to_lossy_string()),
-        _ => None,
-    }
 }
 
 /// §20.1.3.6 step 15 — `Get(O, @@toStringTag)` through the full

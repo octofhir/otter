@@ -60,6 +60,9 @@ pub struct GeneratorBody {
     pub yielded: Option<crate::Value>,
     /// `true` for `async function*` generators.
     pub is_async: bool,
+    /// `[[Prototype]]` captured from the generator function's own
+    /// `prototype` property at call time.
+    pub prototype_override: Option<crate::Value>,
     /// Pending Promise capability for an in-flight async-generator
     /// request.
     pub pending_request: Option<crate::promise::PromiseCapability>,
@@ -73,6 +76,9 @@ impl otter_gc::SafeTraceable for GeneratorBody {
             frame.trace_frame_slots(visitor);
         }
         if let Some(value) = &self.yielded {
+            value.trace_value_slots(visitor);
+        }
+        if let Some(value) = &self.prototype_override {
             value.trace_value_slots(visitor);
         }
         if let Some(capability) = &self.pending_request {
@@ -102,6 +108,16 @@ impl otter_gc::SafeTraceable for ParkedFrameBody {
 impl JsGenerator {
     /// Allocate a fresh generator over `frame`.
     pub fn new(heap: &mut otter_gc::GcHeap, frame: Frame) -> Result<Self, otter_gc::OutOfMemory> {
+        Self::new_with_prototype(heap, frame, None)
+    }
+
+    /// Allocate a fresh generator over `frame` with the call-time
+    /// generator prototype.
+    pub fn new_with_prototype(
+        heap: &mut otter_gc::GcHeap,
+        frame: Frame,
+        prototype_override: Option<crate::Value>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self {
             inner: heap.alloc_old(GeneratorBody {
                 frame: Some(Box::new(frame)),
@@ -109,6 +125,7 @@ impl JsGenerator {
                 done: false,
                 yielded: None,
                 is_async: false,
+                prototype_override,
                 pending_request: None,
             })?,
         })
@@ -152,6 +169,12 @@ impl JsGenerator {
     #[must_use]
     pub fn is_async(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| body.is_async)
+    }
+
+    /// Call-time `[[Prototype]]` override.
+    #[must_use]
+    pub fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
+        heap.read_payload(self.inner, |body| body.prototype_override.clone())
     }
 
     /// `true` when a frame is currently saved on the generator.

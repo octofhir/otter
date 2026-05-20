@@ -2202,17 +2202,37 @@ impl Interpreter {
             // `finally` / `constructor` resolve through the same
             // internal-method substrate as other builtins.
             Value::Promise(promise) => {
-                if let Some(name) = key.string_name()
-                    && let Some(bag) = promise.expando(&self.gc_heap)
-                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
-                {
-                    return Ok(VmGetOutcome::Value(value));
-                }
-                if let VmPropertyKey::Symbol(sym) = key
-                    && let Some(bag) = promise.expando(&self.gc_heap)
-                    && let Some(value) = crate::object::get_symbol(bag, &self.gc_heap, sym)
-                {
-                    return Ok(VmGetOutcome::Value(value));
+                // §10.1.8.1 OrdinaryGet — expando own properties may
+                // be accessor descriptors installed via
+                // `Object.defineProperty(p, key, {get: ...})`.
+                // Surface them through `InvokeGetter` so callers like
+                // SpeciesConstructor observe poisoned getters.
+                if let Some(bag) = promise.expando(&self.gc_heap) {
+                    let lookup = match key {
+                        VmPropertyKey::Symbol(sym) => {
+                            object::lookup_own_symbol(bag, &self.gc_heap, sym)
+                        }
+                        _ => {
+                            let name = key
+                                .string_name()
+                                .expect("non-symbol key has string spelling");
+                            object::lookup_own(bag, &self.gc_heap, name)
+                        }
+                    };
+                    match lookup {
+                        object::PropertyLookup::Data { value, .. } => {
+                            return Ok(VmGetOutcome::Value(value));
+                        }
+                        object::PropertyLookup::Accessor { getter, .. } => {
+                            return Ok(match getter {
+                                Some(g) if abstract_ops::is_callable(&g) => {
+                                    VmGetOutcome::InvokeGetter { getter: g }
+                                }
+                                _ => VmGetOutcome::Value(Value::Undefined),
+                            });
+                        }
+                        object::PropertyLookup::Absent => {}
+                    }
                 }
                 let proto = self.constructor_prototype_value("Promise")?;
                 if matches!(proto, Value::Null | Value::Undefined) {

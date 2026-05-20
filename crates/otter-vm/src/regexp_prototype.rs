@@ -1928,7 +1928,7 @@ pub fn load_property(
 /// (foundation: the spec marks accessors non-writable, so a real
 /// `TypeError` belongs in a later strict-mode slice).
 pub fn store_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str, value: Value) {
-    if name == "lastIndex" {
+    if name == "lastIndex" && re.last_index_writable(gc_heap) {
         re.set_last_index_value(gc_heap, value);
     }
 }

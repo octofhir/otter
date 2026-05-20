@@ -1127,8 +1127,10 @@ impl Interpreter {
         let Some(target) = args.first().cloned() else {
             return Ok(None);
         };
-        if matches!(target, Value::Array(_))
-            && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
+        if matches!(
+            target,
+            Value::Array(_) | Value::Function { .. } | Value::Closure { .. } | Value::RegExp(_)
+        ) && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
         {
             let Some(context) = context else {
                 return Err(VmError::InvalidOperand);

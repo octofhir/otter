@@ -8,8 +8,8 @@
 //! `regress` does not implement the JavaScript `g` (global) or `y`
 //! (sticky) flags — those are stateful and live above the engine
 //! per spec. We model both flags here through [`JsRegExp::flag_global`]
-//! / [`JsRegExp::flag_sticky`] and the [`JsRegExp::last_index`] cell;
-//! method implementations consult these during pattern execution.
+//! / [`JsRegExp::flag_sticky`] and the `lastIndex` cell plus descriptor
+//! flags; method implementations consult these during pattern execution.
 //!
 //! # Contents
 //! - [`JsRegExp`] — the cheap-to-clone handle used in [`crate::Value`].
@@ -202,6 +202,9 @@ pub struct JsRegExpBody {
     /// RegExp execution coerces it numerically, but ordinary JS
     /// reads/writes observe the exact stored value.
     pub last_index: RefCell<Value>,
+    /// Writable bit for the `lastIndex` own data property. Its
+    /// enumerable/configurable bits are spec-fixed at `false`.
+    pub last_index_writable: bool,
     /// Lazy expando bag for non-spec own properties — user
     /// installations such as `re.global = false` /
     /// `re.exec = fn` per the §22.2.6 spec-observable hook tests.
@@ -272,6 +275,7 @@ impl JsRegExp {
                 source,
                 flags,
                 last_index: RefCell::new(Value::Number(NumberValue::from_i32(0))),
+                last_index_writable: true,
                 expando: None,
                 extensible: true,
                 prototype_override: None,
@@ -425,6 +429,19 @@ impl JsRegExp {
     #[must_use]
     pub fn last_index_value(&self, heap: &otter_gc::GcHeap) -> Value {
         heap.read_payload(self.inner, |body| body.last_index.borrow().clone())
+    }
+
+    /// Read the writable bit of the JS-visible `lastIndex` data property.
+    #[must_use]
+    pub fn last_index_writable(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.last_index_writable)
+    }
+
+    /// Update the writable bit of the JS-visible `lastIndex` data property.
+    pub fn set_last_index_writable(&self, heap: &mut otter_gc::GcHeap, writable: bool) {
+        heap.with_payload(self.inner, |body| {
+            body.last_index_writable = writable;
+        });
     }
 
     /// Update `lastIndex`. Pattern-arg methods use this to step

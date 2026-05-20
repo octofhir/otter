@@ -65,6 +65,50 @@ fn property_key_value_to_vm_key(value: &Value) -> Result<VmPropertyKey<'static>,
     }
 }
 
+fn complete_partial_descriptor_against_current(
+    current: &object::PropertyDescriptor,
+    partial: &object::PartialPropertyDescriptor,
+) -> object::PropertyDescriptor {
+    match &current.kind {
+        object::DescriptorKind::Data { value } if !partial.is_accessor() => {
+            object::PropertyDescriptor::data(
+                partial.value.clone().unwrap_or_else(|| value.clone()),
+                partial.writable.unwrap_or(current.writable()),
+                partial.enumerable.unwrap_or(current.enumerable()),
+                partial.configurable.unwrap_or(current.configurable()),
+            )
+        }
+        object::DescriptorKind::Accessor { getter, setter } if !partial.is_data() => {
+            object::PropertyDescriptor::accessor(
+                if partial.get.is_some() {
+                    normalize_accessor_slot(partial.get.clone())
+                } else {
+                    getter.clone()
+                },
+                if partial.set.is_some() {
+                    normalize_accessor_slot(partial.set.clone())
+                } else {
+                    setter.clone()
+                },
+                partial.enumerable.unwrap_or(current.enumerable()),
+                partial.configurable.unwrap_or(current.configurable()),
+            )
+        }
+        _ if partial.is_accessor() => object::PropertyDescriptor::accessor(
+            normalize_accessor_slot(partial.get.clone()),
+            normalize_accessor_slot(partial.set.clone()),
+            partial.enumerable.unwrap_or(false),
+            partial.configurable.unwrap_or(false),
+        ),
+        _ => object::PropertyDescriptor::data(
+            partial.value.clone().unwrap_or(Value::Undefined),
+            partial.writable.unwrap_or(false),
+            partial.enumerable.unwrap_or(false),
+            partial.configurable.unwrap_or(false),
+        ),
+    }
+}
+
 fn normalize_accessor_slot(value: Option<Value>) -> Option<Value> {
     value.filter(|value| !matches!(value, Value::Undefined))
 }
@@ -568,7 +612,7 @@ impl Interpreter {
                 if key.string_name().is_some_and(|key| key == "lastIndex") {
                     return Ok(Some(object::PropertyDescriptor::data(
                         re.last_index_value(&self.gc_heap),
-                        true,
+                        re.last_index_writable(&self.gc_heap),
                         false,
                         false,
                     )));
@@ -966,6 +1010,75 @@ impl Interpreter {
                     )
                 }
             }),
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                if let VmPropertyKey::Symbol(sym) = key {
+                    let bag = self.function_user_bag_runtime_rooted(*function_id, &[], &[])?;
+                    return Ok(object::define_own_symbol_property_partial(
+                        bag,
+                        &mut self.gc_heap,
+                        sym,
+                        descriptor,
+                    ));
+                }
+                let Some(k) = key.string_name() else {
+                    return Ok(false);
+                };
+                let completed = match self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    *function_id,
+                    k,
+                )? {
+                    Some(current) => {
+                        complete_partial_descriptor_against_current(&current, &descriptor)
+                    }
+                    None => descriptor.complete_for_new_property(),
+                };
+                self.ordinary_function_define_own_property(
+                    Some(context),
+                    *function_id,
+                    k,
+                    None,
+                    completed,
+                )
+            }
+            Value::RegExp(regexp) => {
+                if key.string_name().is_some_and(|key| key == "lastIndex") {
+                    let current = object::PropertyDescriptor::data(
+                        regexp.last_index_value(&self.gc_heap),
+                        regexp.last_index_writable(&self.gc_heap),
+                        false,
+                        false,
+                    );
+                    let completed =
+                        complete_partial_descriptor_against_current(&current, &descriptor);
+                    let Some(updated) = object::validate_descriptor_update(&current, &completed)
+                    else {
+                        return Ok(false);
+                    };
+                    let object::DescriptorKind::Data { value } = &updated.kind else {
+                        return Ok(false);
+                    };
+                    regexp.set_last_index_value(&mut self.gc_heap, value.clone());
+                    regexp.set_last_index_writable(&mut self.gc_heap, updated.writable());
+                    return Ok(true);
+                }
+                let bag =
+                    crate::property_dispatch::regexp_ensure_expando_pub(&mut self.gc_heap, regexp)?;
+                Ok(match key {
+                    VmPropertyKey::Symbol(sym) => object::define_own_symbol_property_partial(
+                        bag,
+                        &mut self.gc_heap,
+                        sym,
+                        descriptor,
+                    ),
+                    _ => {
+                        let k = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        self.define_own_property_partial(bag, k, descriptor)?
+                    }
+                })
+            }
             // §10.4.2 ArrayExoticObject [[DefineOwnProperty]] —
             // foundation surface handles indexed writes by routing to
             // dense storage; descriptor attributes are not yet

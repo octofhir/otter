@@ -781,6 +781,9 @@ impl Interpreter {
             let result = match name {
                 "hasOwnProperty" => {
                     let key = property_key_from_arg(arg_values.first())?;
+                    if key == "prototype" {
+                        let _ = self.function_property_get(context, *function_id, "prototype")?;
+                    }
                     self.ordinary_function_own_property_descriptor(
                         Some(context),
                         *function_id,
@@ -790,6 +793,9 @@ impl Interpreter {
                 }
                 "propertyIsEnumerable" => {
                     let key = property_key_from_arg(arg_values.first())?;
+                    if key == "prototype" {
+                        let _ = self.function_property_get(context, *function_id, "prototype")?;
+                    }
                     self.ordinary_function_own_property_descriptor(
                         Some(context),
                         *function_id,

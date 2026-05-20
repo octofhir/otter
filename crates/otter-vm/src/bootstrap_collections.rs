@@ -891,7 +891,11 @@ fn add_entries_lazy(
             interp.run_callable_sync(context, adder, target.clone(), call_args)
         };
         if let Err(err) = call_result {
+            let original_throw = ctx.interp_mut().take_pending_uncaught_throw();
             let _ = ctx.interp_mut().iterator_close_sync(context, &iterator);
+            if let Some(value) = original_throw {
+                ctx.interp_mut().set_pending_uncaught_throw(value);
+            }
             return Err(vm_to_native(err, ctor_name));
         }
     }
@@ -925,7 +929,11 @@ fn build_adder_args(
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
+                let original_throw = ctx.interp_mut().take_pending_uncaught_throw();
                 let _ = ctx.interp_mut().iterator_close_sync(context, iterator);
+                if let Some(value) = original_throw {
+                    ctx.interp_mut().set_pending_uncaught_throw(value);
+                }
             }
             return Err(vm_to_native(err, ctor_name));
         }
@@ -934,7 +942,11 @@ fn build_adder_args(
         Ok(v) => v,
         Err(err) => {
             if let Some(iterator) = iterator_for_close {
+                let original_throw = ctx.interp_mut().take_pending_uncaught_throw();
                 let _ = ctx.interp_mut().iterator_close_sync(context, iterator);
+                if let Some(value) = original_throw {
+                    ctx.interp_mut().set_pending_uncaught_throw(value);
+                }
             }
             return Err(vm_to_native(err, ctor_name));
         }

@@ -2025,7 +2025,7 @@ fn make_resolve_native_runtime_rooted(
     let captured_context = context;
     promise_native_runtime(
         interp,
-        "Promise resolve",
+        "",
         1,
         smallvec![Value::Promise(promise)],
         value_roots,
@@ -2046,7 +2046,7 @@ fn make_resolve_native_stack_rooted(
     promise_native_stack(
         interp,
         stack,
-        "Promise resolve",
+        "",
         1,
         smallvec![Value::Promise(promise)],
         value_roots,
@@ -2065,7 +2065,7 @@ fn make_resolve_native_native_rooted(
     let captured_context = context;
     promise_native_ctx(
         ctx,
-        "Promise resolve",
+        "",
         1,
         smallvec![Value::Promise(promise)],
         value_roots,
@@ -2165,7 +2165,7 @@ fn make_reject_native_runtime_rooted(
 ) -> Result<Value, otter_gc::OutOfMemory> {
     promise_native_runtime(
         interp,
-        "Promise reject",
+        "",
         1,
         smallvec![Value::Promise(promise)],
         value_roots,
@@ -2192,7 +2192,7 @@ fn make_reject_native_stack_rooted(
     promise_native_stack(
         interp,
         stack,
-        "Promise reject",
+        "",
         1,
         smallvec![Value::Promise(promise)],
         value_roots,
@@ -2217,7 +2217,7 @@ fn make_reject_native_native_rooted(
 ) -> Result<Value, otter_gc::OutOfMemory> {
     promise_native_ctx(
         ctx,
-        "Promise reject",
+        "",
         1,
         smallvec![Value::Promise(promise)],
         value_roots,

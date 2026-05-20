@@ -1052,9 +1052,19 @@ fn native_descriptor_to_object_rooted(
 }
 
 fn object_native_error(name: &'static str, err: VmError) -> NativeError {
-    NativeError::TypeError {
-        name,
-        reason: err.to_string(),
+    match err {
+        VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
+        VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name,
+            reason: other.to_string(),
+        },
     }
 }
 
@@ -1551,8 +1561,7 @@ fn define_accessor_helper(
             reason: "argument is not a function".to_string(),
         });
     }
-    let key =
-        expect_property_key(args.first()).map_err(|err| object_native_error(method_name, err))?;
+    let key = native_to_property_key(ctx, args.first(), method_name)?;
     let desc = if is_setter {
         PropertyDescriptor::accessor(None, Some(callable), true, true)
     } else {
@@ -1629,8 +1638,7 @@ fn lookup_accessor_helper(
         }
         _ => return Ok(Value::Undefined),
     };
-    let key =
-        expect_property_key(args.first()).map_err(|err| object_native_error(method_name, err))?;
+    let key = native_to_property_key(ctx, args.first(), method_name)?;
     while let Some(obj) = current {
         let lookup = match &key {
             PropertyKey::String(name) => crate::object::lookup_own(obj, ctx.heap(), name),
@@ -2955,6 +2963,29 @@ fn expect_property_key(arg: Option<&Value>) -> Result<PropertyKey, VmError> {
         Some(Value::Undefined) | None => Ok(PropertyKey::String("undefined".to_string())),
         Some(Value::Symbol(sym)) => Ok(PropertyKey::Symbol(sym.clone())),
         _ => Err(VmError::TypeMismatch),
+    }
+}
+
+fn native_to_property_key(
+    ctx: &mut NativeCtx<'_>,
+    arg: Option<&Value>,
+    method_name: &'static str,
+) -> Result<PropertyKey, NativeError> {
+    let value = arg.cloned().unwrap_or(Value::Undefined);
+    let Some(exec_ctx) = ctx.execution_context().cloned() else {
+        return expect_property_key(Some(&value))
+            .map_err(|err| object_native_error(method_name, err));
+    };
+    let key = ctx
+        .cx
+        .interp
+        .to_property_key_sync(&exec_ctx, value)
+        .map_err(|err| object_native_error(method_name, err))?;
+    match key {
+        crate::VmPropertyKey::Symbol(sym) => Ok(PropertyKey::Symbol(sym)),
+        crate::VmPropertyKey::Atom(atom) => Ok(PropertyKey::String(atom.name().to_string())),
+        crate::VmPropertyKey::String(s) => Ok(PropertyKey::String(s.to_string())),
+        crate::VmPropertyKey::OwnedString(s) => Ok(PropertyKey::String(s)),
     }
 }
 

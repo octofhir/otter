@@ -284,6 +284,12 @@ fn run_compare_values(
     rhs: Value,
     op: Op,
 ) -> Result<(), VmError> {
+    // §7.2.14 step 3.b — relational comparison applies ToNumeric
+    // after ToPrimitive(number). Symbols cannot be converted to a
+    // numeric value, so all four relational operators throw.
+    if matches!(lhs, Value::Symbol(_)) || matches!(rhs, Value::Symbol(_)) {
+        return Err(VmError::TypeMismatch);
+    }
     let truthy = match op {
         Op::LessThan => matches!(
             abstract_ops::abstract_relational_comparison(&lhs, &rhs),

@@ -478,124 +478,56 @@ impl Interpreter {
         }
     }
 
-    /// Look up a string-keyed property over a non-primitive value's
-    /// `[[Prototype]]` chain. Returns `None` when the chain has no
-    /// inherited definition. This is the §7.1.1.1 `OrdinaryToPrimitive`
-    /// fast path for `valueOf` / `toString` and intentionally does
-    /// not invoke accessor getters: callers want the raw `[[Value]]`
-    /// of an inherited data property (typically the realm's installed
-    /// `valueOf` / `toString` callables) and treat accessor hits as
-    /// "no callable found" so the next stage runs.
-    fn get_proto_string_for_to_primitive(&self, base: &Value, name: &str) -> Option<Value> {
-        // §10.5.5 [[Get]] on a trap-less Proxy falls through to the
-        // target. Unwrap proxy chains so `ToPrimitive(new Proxy(fn,
-        // {}))` walks Function.prototype just like `ToPrimitive(fn)`.
-        let unwrapped = self.unwrap_trapless_proxy(base);
-        let effective = unwrapped.as_ref().unwrap_or(base);
-        // §7.1.1.1 step 4.a — `func = ? Get(O, name)` walks the
-        // receiver's own properties before the prototype chain. For
-        // callable receivers (Function / Closure / NativeFunction /
-        // BoundFunction / ClassConstructor) the user-installed own
-        // bag carries any reassignment of `valueOf` / `toString`,
-        // which must win over the inherited `Function.prototype`
-        // methods. For Object receivers the proto-route already
-        // walks own + proto via `object::get` below; non-Object
-        // exotic kinds with their own expando bag (RegExp /
-        // Promise) consult that bag first.
-        if let Some(own) = self.callable_own_property(effective, name) {
-            return Some(own);
-        }
-        if let Value::RegExp(r) = effective
-            && let Some(bag) = r.expando(&self.gc_heap)
-            && let Some(v) = object::get(bag, &self.gc_heap, name)
-        {
-            return Some(v);
-        }
-        if let Value::Promise(p) = effective
-            && let Some(bag) = p.expando(&self.gc_heap)
-            && let Some(v) = object::get(bag, &self.gc_heap, name)
-        {
-            return Some(v);
-        }
-        let proto = match effective {
-            Value::Object(o) => Some(*o),
-            other => self.intrinsic_prototype_object_for(other),
-        };
-        proto.and_then(|o| object::get(o, &self.gc_heap, name))
-    }
-
-    /// §7.1.1.1 own-property lookup for callable receivers. Probes
-    /// the per-function user-property bag for ordinary
-    /// `Function` / `Closure` values; native functions and bound
-    /// functions consult their own descriptor table; class
-    /// constructors expose static properties through their statics
-    /// object. Returns `None` when no own binding exists so the
-    /// caller falls back to the prototype walk.
-    fn callable_own_property(&self, base: &Value, name: &str) -> Option<Value> {
-        match base {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                let bag = self.function_user_props.get(function_id).copied()?;
-                object::get(bag, &self.gc_heap, name)
-            }
-            Value::NativeFunction(native) => match native
-                .own_property_descriptor(&self.gc_heap, &self.string_heap, name)
-                .ok()
-                .flatten()?
-                .kind
-            {
-                object::DescriptorKind::Data { value } => Some(value),
-                object::DescriptorKind::Accessor { .. } => None,
-            },
-            Value::ClassConstructor(class) => {
-                let statics = class.statics(&self.gc_heap);
-                object::get(statics, &self.gc_heap, name)
-            }
-            _ => None,
-        }
-    }
-
-    /// Look up a Symbol-keyed property over a non-primitive value's
-    /// `[[Prototype]]` chain. Used by the §7.1.1 step 2 lookup of
-    /// `[Symbol.toPrimitive]`. Same accessor policy as
-    /// [`Self::get_proto_string_for_to_primitive`].
-    fn get_proto_symbol_for_to_primitive(
-        &self,
+    /// §7.1.1.1 step 4.a — `func = ? Get(O, name)`.
+    ///
+    /// Accessor getters are invoked before callability is tested, and
+    /// a present non-callable result is observable as "skip this
+    /// method" rather than as a missing property.
+    fn get_string_for_to_primitive(
+        &mut self,
+        context: &ExecutionContext,
         base: &Value,
-        sym: &symbol::JsSymbol,
-    ) -> Option<Value> {
-        let unwrapped = self.unwrap_trapless_proxy(base);
-        let effective = unwrapped.as_ref().unwrap_or(base);
-        let proto = match effective {
-            Value::Object(o) => Some(*o),
-            other => self.intrinsic_prototype_object_for(other),
-        };
-        proto.and_then(|o| object::get_symbol(o, &self.gc_heap, sym))
+        name: &str,
+    ) -> Result<Option<Value>, VmError> {
+        match self.ordinary_get_value(
+            context,
+            base.clone(),
+            base.clone(),
+            &VmPropertyKey::String(name),
+            0,
+        )? {
+            VmGetOutcome::Value(Value::Undefined) => Ok(None),
+            VmGetOutcome::Value(value) => Ok(Some(value)),
+            VmGetOutcome::InvokeGetter { getter } => {
+                let value =
+                    self.run_callable_sync(context, &getter, base.clone(), SmallVec::new())?;
+                Ok(Some(value))
+            }
+        }
     }
 
-    /// Walk a Proxy chain through trap-less handlers and return the
-    /// underlying target, or `None` if `base` is not a Proxy / the
-    /// chain encounters a handler with a `get` trap (where spec
-    /// behaviour requires actually invoking the trap — handled at
-    /// the call site).
-    fn unwrap_trapless_proxy(&self, base: &Value) -> Option<Value> {
-        let mut current = base.clone();
-        let mut unwrapped = false;
-        while let Value::Proxy(p) = &current {
-            if p.is_revoked() {
-                return None;
+    /// §7.1.1 step 2.a — `exoticToPrim = ? GetMethod(input, @@toPrimitive)`.
+    fn get_symbol_for_to_primitive(
+        &mut self,
+        context: &ExecutionContext,
+        base: &Value,
+        sym: symbol::JsSymbol,
+    ) -> Result<Option<Value>, VmError> {
+        match self.ordinary_get_value(
+            context,
+            base.clone(),
+            base.clone(),
+            &VmPropertyKey::Symbol(sym),
+            0,
+        )? {
+            VmGetOutcome::Value(Value::Undefined) => Ok(None),
+            VmGetOutcome::Value(value) => Ok(Some(value)),
+            VmGetOutcome::InvokeGetter { getter } => {
+                let value =
+                    self.run_callable_sync(context, &getter, base.clone(), SmallVec::new())?;
+                Ok(Some(value))
             }
-            let handler = p.handler();
-            let Value::Object(handler_obj) = handler else {
-                return None;
-            };
-            match object::get(handler_obj, &self.gc_heap, "get") {
-                Some(Value::Undefined) | None => {}
-                _ => return None,
-            }
-            current = p.target();
-            unwrapped = true;
         }
-        if unwrapped { Some(current) } else { None }
     }
 
     /// Run a single stage of the §7.1.1 / §7.1.1.1 ladder, falling
@@ -615,44 +547,50 @@ impl Interpreter {
             match stage {
                 ToPrimitiveStage::SymbolToPrim => {
                     let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-                    let callee = self.get_proto_symbol_for_to_primitive(&obj, &to_prim_sym);
-                    if let Some(callee) = callee
-                        && self.is_callable_runtime(&callee)
-                    {
-                        let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
-                        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                        args.push(Value::String(hint_str));
-                        // §7.1.1 step 5.d. The resume guard
-                        // upstream validates the result is a
-                        // primitive — if not, that branch lands
-                        // on `OrdinaryFirst` which is **wrong**
-                        // per spec (a non-primitive return from
-                        // `[Symbol.toPrimitive]` is supposed to
-                        // throw TypeError directly). The runtime
-                        // currently routes that case through the
-                        // ordinary chain rather than throwing, to
-                        // mirror the existing `Op::ToNumber` hook
-                        // behaviour. Task 25 + a follow-up will
-                        // tighten this branch to spec.
-                        return self.push_to_primitive_call(
-                            stack,
-                            context,
-                            dst,
-                            obj.clone(),
-                            hint,
-                            ToPrimitiveStage::OrdinaryFirst,
-                            &callee,
-                            obj.clone(),
-                            args,
-                        );
+                    match self.get_symbol_for_to_primitive(context, &obj, to_prim_sym)? {
+                        Some(Value::Undefined | Value::Null) | None => {
+                            stage = ToPrimitiveStage::OrdinaryFirst;
+                        }
+                        Some(callee) if self.is_callable_runtime(&callee) => {
+                            let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
+                            let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                            args.push(Value::String(hint_str));
+                            // §7.1.1 step 5.d. The resume guard
+                            // upstream validates the result is a
+                            // primitive — if not, that branch lands
+                            // on `OrdinaryFirst` which is **wrong**
+                            // per spec (a non-primitive return from
+                            // `[Symbol.toPrimitive]` is supposed to
+                            // throw TypeError directly). The runtime
+                            // currently routes that case through the
+                            // ordinary chain rather than throwing, to
+                            // mirror the existing `Op::ToNumber` hook
+                            // behaviour. Task 25 + a follow-up will
+                            // tighten this branch to spec.
+                            return self.push_to_primitive_call(
+                                stack,
+                                context,
+                                dst,
+                                obj.clone(),
+                                hint,
+                                ToPrimitiveStage::OrdinaryFirst,
+                                &callee,
+                                obj.clone(),
+                                args,
+                            );
+                        }
+                        Some(_) => {
+                            return Err(VmError::TypeError {
+                                message: "Symbol.toPrimitive method is not callable".to_string(),
+                            });
+                        }
                     }
-                    stage = ToPrimitiveStage::OrdinaryFirst;
                 }
                 ToPrimitiveStage::OrdinaryFirst => {
                     let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_proto_string_for_to_primitive(&obj, method);
-                    if let Some(callee) = callee
-                        && self.is_callable_runtime(&callee)
+                    let callee = self.get_string_for_to_primitive(context, &obj, method)?;
+                    if let Some(callee) = &callee
+                        && self.is_callable_runtime(callee)
                     {
                         // OrdinaryToPrimitive calls valueOf /
                         // toString with `this = obj` and no args.
@@ -664,7 +602,7 @@ impl Interpreter {
                             obj.clone(),
                             hint,
                             ToPrimitiveStage::OrdinarySecond,
-                            &callee,
+                            callee,
                             obj.clone(),
                             args,
                         );
@@ -677,7 +615,9 @@ impl Interpreter {
                     // through). This keeps behaviour consistent
                     // for plain object literals which never receive
                     // a real Object.prototype linkage.
-                    if let Value::Object(o) = &obj {
+                    if callee.is_none()
+                        && let Value::Object(o) = &obj
+                    {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
                         if let Some(v) = object_prototype_intercept(
                             o,
@@ -702,9 +642,9 @@ impl Interpreter {
                 }
                 ToPrimitiveStage::OrdinarySecond => {
                     let method = ordinary_method_for(hint, stage);
-                    let callee = self.get_proto_string_for_to_primitive(&obj, method);
-                    if let Some(callee) = callee
-                        && self.is_callable_runtime(&callee)
+                    let callee = self.get_string_for_to_primitive(context, &obj, method)?;
+                    if let Some(callee) = &callee
+                        && self.is_callable_runtime(callee)
                     {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         // After OrdinarySecond the only spec-legal
@@ -720,7 +660,7 @@ impl Interpreter {
                             obj.clone(),
                             hint,
                             ToPrimitiveStage::Exhausted,
-                            &callee,
+                            callee,
                             obj.clone(),
                             args,
                         );
@@ -730,7 +670,9 @@ impl Interpreter {
                     // (`toString` for hint=number, `valueOf` for
                     // hint=string) when the chain has nothing
                     // callable.
-                    if let Value::Object(o) = &obj {
+                    if callee.is_none()
+                        && let Value::Object(o) = &obj
+                    {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
                         if let Some(v) = object_prototype_intercept(
                             o,

@@ -70,12 +70,13 @@ pub(crate) fn compile_template_literal(
     };
     for (i, expr) in t.expressions.iter().enumerate() {
         let expr_reg = compile_expr(cx, expr, span)?;
-        // Mirror the BinaryExpression `+` lowering: pass each operand
-        // through ToPrimitive(default) so `Op::Add`'s string-or-
-        // numeric ladder fires correctly when an object exposes
-        // `[Symbol.toPrimitive]` / `valueOf` / `toString`.
+        // §13.2.8.6 template interpolation applies ToString to each
+        // substitution. `Op::Add` still performs the final string
+        // concatenation, but object operands must enter the
+        // ToPrimitive ladder with the string hint so ordinary
+        // `toString` wins over `valueOf`.
         let lhs_in = emit_to_primitive(cx, acc, "default", span);
-        let rhs_in = emit_to_primitive(cx, expr_reg, "default", span);
+        let rhs_in = emit_to_primitive(cx, expr_reg, "string", span);
         let dst = cx.alloc_scratch();
         cx.emit(
             Op::Add,

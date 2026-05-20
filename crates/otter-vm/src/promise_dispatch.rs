@@ -896,21 +896,29 @@ fn get_callable_property(
     Ok(value)
 }
 
-fn invoke_constructor_resolve(
+fn get_promise_resolve(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     constructor: &Value,
-    value: Value,
 ) -> Result<Value, NativeError> {
-    let resolve = get_callable_property(
+    get_callable_property(
         interp,
         context,
         constructor.clone(),
         "resolve",
         "Promise.resolve",
-    )?;
+    )
+}
+
+fn call_promise_resolve(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    resolve_fn: &Value,
+    constructor: &Value,
+    value: Value,
+) -> Result<Value, NativeError> {
     interp
-        .run_callable_sync(context, &resolve, constructor.clone(), smallvec![value])
+        .run_callable_sync(context, resolve_fn, constructor.clone(), smallvec![value])
         .map_err(|err| promise_vm_error("Promise.resolve", err))
 }
 
@@ -1004,11 +1012,15 @@ fn static_all_generic(
         name: "Promise.all",
         reason: "missing execution context".to_string(),
     })?;
+    let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
+        Ok(value) => value,
+        Err(err) => return reject_capability_error(interp, &cap, err),
+    };
     if entries.is_empty() {
         let arr = interp
             .alloc_runtime_rooted_array_from_values(
                 std::iter::empty::<Value>(),
-                &[&cap.promise, &cap.resolve, &cap.reject],
+                &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
                 &[args],
             )
             .map_err(|_| oom_native("Promise.all"))?;
@@ -1017,10 +1029,11 @@ fn static_all_generic(
     }
     let slots = PromiseSlots::new(entries.len());
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
-            Ok(value) => value,
-            Err(err) => return reject_capability_error(interp, &cap, err),
-        };
+        let entry_promise =
+            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
+                Ok(value) => value,
+                Err(err) => return reject_capability_error(interp, &cap, err),
+            };
         let cap_for_fulfill = cap.clone();
         let slots_for_trace = slots.clone();
         let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
@@ -1037,7 +1050,7 @@ fn static_all_generic(
             1,
             smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
             trace_slots,
-            &[&cap.promise, &cap.resolve, &cap.reject],
+            &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
             &[args, entries.as_slice()],
             move |ctx, args, _captures| {
                 let v = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1082,11 +1095,16 @@ fn static_race_generic(
         name: "Promise.race",
         reason: "missing execution context".to_string(),
     })?;
+    let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
+        Ok(value) => value,
+        Err(err) => return reject_capability_error(interp, &cap, err),
+    };
     for entry in entries.iter().cloned() {
-        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
-            Ok(value) => value,
-            Err(err) => return reject_capability_error(interp, &cap, err),
-        };
+        let entry_promise =
+            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
+                Ok(value) => value,
+                Err(err) => return reject_capability_error(interp, &cap, err),
+            };
         if let Err(err) = attach_then_value(
             interp,
             &exec,
@@ -1123,11 +1141,15 @@ fn static_all_settled_generic(
         name: "Promise.allSettled",
         reason: "missing execution context".to_string(),
     })?;
+    let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
+        Ok(value) => value,
+        Err(err) => return reject_capability_error(interp, &cap, err),
+    };
     if entries.is_empty() {
         let arr = interp
             .alloc_runtime_rooted_array_from_values(
                 std::iter::empty::<Value>(),
-                &[&cap.promise, &cap.resolve, &cap.reject],
+                &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
                 &[args],
             )
             .map_err(|_| oom_native("Promise.allSettled"))?;
@@ -1137,10 +1159,11 @@ fn static_all_settled_generic(
     let slots = PromiseSlots::new(entries.len());
     let heap = interp.string_heap_clone();
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
-            Ok(value) => value,
-            Err(err) => return reject_capability_error(interp, &cap, err),
-        };
+        let entry_promise =
+            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
+                Ok(value) => value,
+                Err(err) => return reject_capability_error(interp, &cap, err),
+            };
         let on_fulfill = {
             let slots = slots.clone();
             let heap = heap.clone();
@@ -1164,7 +1187,7 @@ fn static_all_settled_generic(
                 1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_slots,
-                &[&promise_root, &resolve_root, &reject_root],
+                &[&promise_root, &resolve_root, &reject_root, &promise_resolve],
                 &[args, entries.as_slice()],
                 move |ctx, args, _captures| {
                     let v = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1202,7 +1225,13 @@ fn static_all_settled_generic(
                 1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_slots,
-                &[&promise_root, &resolve_root, &reject_root, &on_fulfill],
+                &[
+                    &promise_root,
+                    &resolve_root,
+                    &reject_root,
+                    &on_fulfill,
+                    &promise_resolve,
+                ],
                 &[args, entries.as_slice()],
                 move |ctx, args, _captures| {
                     let r = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1372,6 +1401,10 @@ fn static_any_generic(
         name: "Promise.any",
         reason: "missing execution context".to_string(),
     })?;
+    let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
+        Ok(value) => value,
+        Err(err) => return reject_capability_error(interp, &cap, err),
+    };
     if entries.is_empty() {
         let registry = interp.error_classes_clone();
         let string_heap = interp.string_heap_clone();
@@ -1383,10 +1416,11 @@ fn static_any_generic(
     let heap = interp.string_heap_clone();
     let registry = interp.error_classes_clone();
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = match invoke_constructor_resolve(interp, &exec, &constructor, entry) {
-            Ok(value) => value,
-            Err(err) => return reject_capability_error(interp, &cap, err),
-        };
+        let entry_promise =
+            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
+                Ok(value) => value,
+                Err(err) => return reject_capability_error(interp, &cap, err),
+            };
         let on_reject = {
             let errors = errors.clone();
             let heap = heap.clone();
@@ -1411,7 +1445,7 @@ fn static_any_generic(
                 1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_errors,
-                &[&promise_root, &resolve_root, &reject_root],
+                &[&promise_root, &resolve_root, &reject_root, &promise_resolve],
                 &[args, entries.as_slice()],
                 move |ctx, args, _captures| {
                     let reason = args.first().cloned().unwrap_or(Value::Undefined);

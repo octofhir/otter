@@ -40,6 +40,7 @@ pub(super) fn ordinary_set_data_property(
 ) -> bool {
     let barrier_value = value.clone();
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
+    let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let slot = &mut body.slots[offset as usize];
@@ -57,6 +58,9 @@ pub(super) fn ordinary_set_data_property(
             return false;
         }
         body.dictionary_shape_id = next_shape_id();
+        if let Some(dictionary_keys) = dictionary_keys {
+            body.dictionary_keys = dictionary_keys;
+        }
         body.dictionary_keys.push(key.to_owned());
         body.shape = ShapeHandle::null();
         body.slots.push(PropertySlot::data_default(value));

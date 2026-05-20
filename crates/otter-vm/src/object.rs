@@ -1753,6 +1753,7 @@ pub fn define_own_property_partial(
     let barrier_descriptor = completed.clone();
     let map_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let existing = body.slots[offset as usize].clone();
@@ -1768,6 +1769,9 @@ pub fn define_own_property_partial(
                 return false;
             }
             body.dictionary_shape_id = next_shape_id();
+            if let Some(dictionary_keys) = dictionary_keys {
+                body.dictionary_keys = dictionary_keys;
+            }
             body.dictionary_keys.push(key.to_owned());
             body.shape = ShapeHandle::null();
             body.slots
@@ -1896,6 +1900,7 @@ pub fn define_own_property(
     let barrier_descriptor = descriptor.clone();
     let map_descriptor = descriptor.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
             let existing = body.slots[offset as usize].clone();
@@ -1911,6 +1916,9 @@ pub fn define_own_property(
                 return false;
             }
             body.dictionary_shape_id = next_shape_id();
+            if let Some(dictionary_keys) = dictionary_keys {
+                body.dictionary_keys = dictionary_keys;
+            }
             body.dictionary_keys.push(key.to_owned());
             body.shape = ShapeHandle::null();
             body.slots.push(PropertySlot::from_descriptor(descriptor));
@@ -2302,6 +2310,19 @@ fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec
             .collect();
     }
     body.dictionary_keys.clone()
+}
+
+fn dictionary_keys_for_shape_transition(
+    heap: &otter_gc::GcHeap,
+    obj: JsObject,
+    existing_offset: Option<u16>,
+) -> Option<Vec<String>> {
+    if existing_offset.is_some() {
+        return None;
+    }
+    heap.read_payload(obj, |body| {
+        (!body.shape.is_null()).then(|| string_keys_in_shape_order(heap, body))
+    })
 }
 
 fn order_string_key_entries(entries: Vec<(String, usize)>) -> Vec<(String, usize)> {

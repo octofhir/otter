@@ -1002,6 +1002,30 @@ where
     )?))
 }
 
+pub(crate) fn traced_native_value_with_length<F>(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    captures: SmallVec<[Value; 4]>,
+    trace: Rc<NativeTraceFn>,
+    external_visit: &mut RootSlotVisitor<'_>,
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
+        heap,
+        name,
+        length,
+        NativeCallStorage::LocalDynamic(Rc::new(call)),
+        captures,
+        Some(trace),
+        NativeFunctionMetadata::BUILTIN,
+        external_visit,
+    )?))
+}
+
 fn native_builtin_descriptor(
     body: &NativeFunctionBody,
     string_heap: &StringHeap,

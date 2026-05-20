@@ -2021,9 +2021,31 @@ impl Interpreter {
                         let key = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
-                        self.load_function_prototype_method(key)
-                            .or_else(|| self.load_object_prototype_method(key))
-                            .unwrap_or(Value::Undefined)
+                        match native.own_property_descriptor(
+                            &self.gc_heap,
+                            &self.string_heap,
+                            key,
+                        )? {
+                            Some(object::PropertyDescriptor {
+                                kind: object::DescriptorKind::Data { value },
+                                ..
+                            }) => value,
+                            Some(object::PropertyDescriptor {
+                                kind: object::DescriptorKind::Accessor { getter, .. },
+                                ..
+                            }) => {
+                                return Ok(match getter {
+                                    Some(getter) if abstract_ops::is_callable(&getter) => {
+                                        VmGetOutcome::InvokeGetter { getter }
+                                    }
+                                    _ => VmGetOutcome::Value(Value::Undefined),
+                                });
+                            }
+                            None => self
+                                .load_function_prototype_method(key)
+                                .or_else(|| self.load_object_prototype_method(key))
+                                .unwrap_or(Value::Undefined),
+                        }
                     }
                 };
                 if let Some(outcome) =
@@ -2171,7 +2193,19 @@ impl Interpreter {
             // Walk `Promise.prototype` so `then` / `catch` /
             // `finally` / `constructor` resolve through the same
             // internal-method substrate as other builtins.
-            Value::Promise(_) => {
+            Value::Promise(promise) => {
+                if let Some(name) = key.string_name()
+                    && let Some(bag) = promise.expando(&self.gc_heap)
+                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+                {
+                    return Ok(VmGetOutcome::Value(value));
+                }
+                if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(bag) = promise.expando(&self.gc_heap)
+                    && let Some(value) = crate::object::get_symbol(bag, &self.gc_heap, sym)
+                {
+                    return Ok(VmGetOutcome::Value(value));
+                }
                 let proto = self.constructor_prototype_value("Promise")?;
                 if matches!(proto, Value::Null | Value::Undefined) {
                     return Ok(VmGetOutcome::Value(Value::Undefined));

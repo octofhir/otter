@@ -36,7 +36,7 @@ use crate::error_classes::{ErrorClassRegistry, ErrorKind};
 use crate::execution_context::ExecutionContext;
 use crate::native_function::{
     NativeError, native_value_with_captures_unchecked_with_roots,
-    native_value_with_trace_unchecked_with_roots,
+    native_value_with_trace_unchecked_with_roots, traced_native_value_with_length,
 };
 use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
@@ -461,31 +461,6 @@ where
     )
 }
 
-fn native_value_with_captures_stack_rooted<F>(
-    interp: &mut Interpreter,
-    stack: &SmallVec<[Frame; 8]>,
-    name: &'static str,
-    captures: smallvec::SmallVec<[Value; 4]>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-    call: F,
-) -> Result<Value, otter_gc::OutOfMemory>
-where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
-{
-    let roots = interp.collect_allocation_roots(stack);
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
-    };
-    native_value_with_captures_unchecked_with_roots(
-        interp.gc_heap_mut(),
-        name,
-        captures,
-        &mut external_visit,
-        call,
-    )
-}
-
 fn native_value_with_captures_native_rooted<F>(
     ctx: &mut NativeCtx<'_>,
     name: &'static str,
@@ -545,6 +520,139 @@ where
     )
 }
 
+fn trace_captures(
+    captures: &smallvec::SmallVec<[Value; 4]>,
+) -> Rc<crate::native_function::NativeTraceFn> {
+    let captures = captures.clone();
+    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+        for capture in captures.iter() {
+            capture.trace_value_slots(visitor);
+        }
+    })
+}
+
+fn promise_native_runtime<F>(
+    interp: &mut Interpreter,
+    name: &'static str,
+    length: u8,
+    captures: smallvec::SmallVec<[Value; 4]>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    let trace = trace_captures(&captures);
+    let roots = interp.collect_runtime_roots();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+    };
+    traced_native_value_with_length(
+        interp.gc_heap_mut(),
+        name,
+        length,
+        captures,
+        trace,
+        &mut external_visit,
+        call,
+    )
+}
+
+fn promise_native_stack<F>(
+    interp: &mut Interpreter,
+    stack: &SmallVec<[Frame; 8]>,
+    name: &'static str,
+    length: u8,
+    captures: smallvec::SmallVec<[Value; 4]>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    let trace = trace_captures(&captures);
+    let roots = interp.collect_allocation_roots(stack);
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+    };
+    traced_native_value_with_length(
+        interp.gc_heap_mut(),
+        name,
+        length,
+        captures,
+        trace,
+        &mut external_visit,
+        call,
+    )
+}
+
+fn promise_native_ctx<F>(
+    ctx: &mut NativeCtx<'_>,
+    name: &'static str,
+    length: u8,
+    captures: smallvec::SmallVec<[Value; 4]>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    let trace = trace_captures(&captures);
+    let roots = ctx.collect_native_roots();
+    let this_value = ctx.this_value().clone();
+    let new_target = ctx.new_target().cloned();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        crate::runtime_cx::visit_native_roots(
+            visitor,
+            &roots,
+            &this_value,
+            new_target.as_ref(),
+            value_roots,
+            slice_roots,
+        );
+    };
+    traced_native_value_with_length(
+        ctx.heap_mut(),
+        name,
+        length,
+        captures,
+        trace,
+        &mut external_visit,
+        call,
+    )
+}
+
+fn promise_element_function<F>(
+    interp: &mut Interpreter,
+    name: &'static str,
+    length: u8,
+    captures: smallvec::SmallVec<[Value; 4]>,
+    trace: Rc<crate::native_function::NativeTraceFn>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+    call: F,
+) -> Result<Value, otter_gc::OutOfMemory>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    let roots = interp.collect_runtime_roots();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+    };
+    traced_native_value_with_length(
+        interp.gc_heap_mut(),
+        name,
+        length,
+        captures,
+        trace,
+        &mut external_visit,
+        call,
+    )
+}
+
 /// Dispatch a `Promise.<method>(args...)` static call. Routes
 /// the typed [`PromiseMethod`] emitted by the compiler.
 pub fn statics_call(
@@ -555,9 +663,11 @@ pub fn statics_call(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     use otter_bytecode::method_id::PromiseMethod as M;
-    if let Some(constructor) = constructor
-        && !is_builtin_promise_constructor(interp, &constructor)
-    {
+    let constructor = match constructor {
+        Some(constructor) => constructor,
+        None => builtin_promise_constructor(interp)?,
+    };
+    if !is_builtin_promise_constructor(interp, &constructor) {
         return match method {
             M::Resolve => static_resolve_generic(interp, context, constructor, args),
             M::Reject => static_reject_generic(interp, context, constructor, args),
@@ -571,10 +681,10 @@ pub fn statics_call(
     match method {
         M::Resolve => Ok(Value::Promise(static_resolve(interp, args)?)),
         M::Reject => Ok(Value::Promise(static_reject(interp, args)?)),
-        M::All => static_all(interp, context, args),
-        M::Race => static_race(interp, context, args),
-        M::AllSettled => static_all_settled(interp, context, args),
-        M::Any => static_any(interp, context, args),
+        M::All => static_all_generic(interp, context, constructor, args),
+        M::Race => static_race_generic(interp, context, constructor, args),
+        M::AllSettled => static_all_settled_generic(interp, context, constructor, args),
+        M::Any => static_any_generic(interp, context, constructor, args),
         M::WithResolvers => static_with_resolvers(interp, context),
     }
 }
@@ -607,6 +717,15 @@ fn is_builtin_promise_constructor(interp: &Interpreter, constructor: &Value) -> 
         constructor,
         Value::NativeFunction(native) if native.name(interp.gc_heap()) == "Promise"
     )
+}
+
+fn builtin_promise_constructor(interp: &Interpreter) -> Result<Value, NativeError> {
+    crate::object::get(*interp.global_this(), interp.gc_heap(), "Promise").ok_or_else(|| {
+        NativeError::TypeError {
+            name: "Promise",
+            reason: "Promise constructor is not installed".to_string(),
+        }
+    })
 }
 
 fn promise_vm_error(name: &'static str, err: crate::VmError) -> NativeError {
@@ -731,6 +850,81 @@ fn call_capability_reject(
     call_capability_function(interp, cap, &cap.reject, reason)
 }
 
+fn get_callable_property(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    receiver: Value,
+    key: &'static str,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let property_key = crate::VmPropertyKey::String(key);
+    let value = match interp
+        .ordinary_get_value(
+            context,
+            receiver.clone(),
+            receiver.clone(),
+            &property_key,
+            0,
+        )
+        .map_err(|err| promise_vm_error(name, err))?
+    {
+        crate::VmGetOutcome::Value(value) => value,
+        crate::VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(context, &getter, receiver.clone(), SmallVec::new())
+            .map_err(|err| promise_vm_error(name, err))?,
+    };
+    if !interp.is_callable_runtime(&value) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: format!("{key} is not callable"),
+        });
+    }
+    Ok(value)
+}
+
+fn invoke_constructor_resolve(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    constructor: &Value,
+    value: Value,
+) -> Result<Value, NativeError> {
+    let resolve = get_callable_property(
+        interp,
+        context,
+        constructor.clone(),
+        "resolve",
+        "Promise.resolve",
+    )?;
+    interp
+        .run_callable_sync(context, &resolve, constructor.clone(), smallvec![value])
+        .map_err(|err| promise_vm_error("Promise.resolve", err))
+}
+
+fn attach_then_value(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    promise: Value,
+    on_fulfilled: Value,
+    on_rejected: Value,
+) -> Result<(), NativeError> {
+    let then = get_callable_property(
+        interp,
+        context,
+        promise.clone(),
+        "then",
+        "Promise combinator",
+    )?;
+    interp
+        .run_callable_sync(
+            context,
+            &then,
+            promise,
+            smallvec![on_fulfilled, on_rejected],
+        )
+        .map_err(|err| promise_vm_error("Promise combinator", err))?;
+    Ok(())
+}
+
 fn static_resolve(
     interp: &mut Interpreter,
     args: &[Value],
@@ -773,129 +967,6 @@ fn static_reject_generic(
     Ok(cap.promise)
 }
 
-fn static_all(
-    interp: &mut Interpreter,
-    context: Option<ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let entries =
-        match args.first() {
-            Some(Value::Array(arr)) => {
-                crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-            }
-            _ => {
-                // Foundation: only array iterables. Generic iterables
-                // arrive once `Symbol.iterator` is in.
-                return Ok(Value::Promise(
-                    PromiseBuilder::with_optional_context(context.clone())
-                        .rejected_runtime_rooted(interp, Value::Undefined, &[], &[args])?,
-                ));
-            }
-        };
-    let result = PromiseBuilder::with_optional_context(context.clone()).pending_runtime_rooted(
-        interp,
-        &[],
-        &[args, entries.as_slice()],
-    )?;
-    if entries.is_empty() {
-        // Spec: empty iterable resolves immediately with [].
-        let result_value = Value::Promise(result);
-        let arr = match interp.alloc_runtime_rooted_array_from_values(
-            std::iter::empty::<Value>(),
-            &[&result_value],
-            &[],
-        ) {
-            Ok(arr) => arr,
-            Err(_) => {
-                return Ok(Value::Promise(
-                    PromiseBuilder::with_optional_context(context.clone())
-                        .rejected_runtime_rooted(
-                            interp,
-                            Value::Undefined,
-                            &[&result_value],
-                            &[args],
-                        )?,
-                ));
-            }
-        };
-        let jobs = result.fulfill(interp.gc_heap_mut(), Value::Array(arr));
-        for j in jobs.jobs {
-            interp.microtasks_mut().enqueue(j);
-        }
-        return Ok(Value::Promise(result));
-    }
-    // Track per-slot fulfillment via shared Rust state that each
-    // per-element resolver mutates. The native function bodies
-    // install trace hooks over this state, so any fulfilled GC
-    // values remain live while the combinator is pending.
-    let slots = PromiseSlots::new(entries.len());
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let slots = slots.clone();
-        let result_clone = result;
-        let result_root = Value::Promise(result);
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&result_root],
-                    &[args, entries.as_slice()],
-                )?,
-        };
-        let trace_slots = {
-            let slots = slots.clone();
-            Rc::new(move |visitor: &mut SlotVisitor<'_>| slots.trace(visitor))
-        };
-        let on_fulfill = native_value_with_trace_runtime_rooted(
-            interp,
-            "Promise.all element",
-            smallvec![Value::Promise(result_clone)],
-            trace_slots,
-            &[&result_root],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                if slots.fill(i, v) {
-                    let collected = slots.collect_values();
-                    let arr = ctx.array_from_elements(collected)?;
-                    let interp = ctx.interp_mut();
-                    let jobs = result_clone.fulfill(interp.gc_heap_mut(), Value::Array(arr));
-                    for j in jobs.jobs {
-                        interp.microtasks_mut().enqueue(j);
-                    }
-                }
-                Ok(Value::Undefined)
-            },
-        )?;
-        let result_for_reject = result;
-        let on_reject = native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.all reject",
-            smallvec![Value::Promise(result_for_reject)],
-            &[&result_root, &on_fulfill],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let interp = ctx.interp_mut();
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
-                for j in jobs.jobs {
-                    interp.microtasks_mut().enqueue(j);
-                }
-                Ok(Value::Undefined)
-            },
-        )?;
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
-    }
-    Ok(Value::Promise(result))
-}
-
 fn static_all_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
@@ -911,10 +982,14 @@ fn static_all_generic(
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
-        constructor,
+        constructor.clone(),
         &[],
         &[args, entries.as_slice()],
     )?;
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name: "Promise.all",
+        reason: "missing execution context".to_string(),
+    })?;
     if entries.is_empty() {
         let arr = interp
             .alloc_runtime_rooted_array_from_values(
@@ -928,16 +1003,7 @@ fn static_all_generic(
     }
     let slots = PromiseSlots::new(entries.len());
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&cap.promise, &cap.resolve, &cap.reject],
-                    &[args, entries.as_slice()],
-                )?,
-        };
+        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
         let cap_for_fulfill = cap.clone();
         let slots_for_trace = slots.clone();
         let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
@@ -948,9 +1014,10 @@ fn static_all_generic(
         });
         let cap_for_fulfill = cap.clone();
         let slots_for_fulfill = slots.clone();
-        let on_fulfill = native_value_with_trace_runtime_rooted(
+        let on_fulfill = promise_element_function(
             interp,
-            "Promise.all generic element",
+            "",
+            1,
             smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
             trace_slots,
             &[&cap.promise, &cap.resolve, &cap.reject],
@@ -966,108 +1033,9 @@ fn static_all_generic(
                 Ok(Value::Undefined)
             },
         )?;
-        let cap_for_reject = cap.clone();
-        let on_reject = native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.all generic reject",
-            smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-            &[&cap.promise, &cap.resolve, &cap.reject, &on_fulfill],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                let interp = ctx.interp_mut();
-                call_capability_reject(interp, &cap_for_reject, reason)?;
-                Ok(Value::Undefined)
-            },
-        )?;
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
+        attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject.clone())?;
     }
     Ok(cap.promise)
-}
-
-fn static_race(
-    interp: &mut Interpreter,
-    context: Option<ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let entries =
-        match args.first() {
-            Some(Value::Array(arr)) => {
-                crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-            }
-            _ => {
-                return Ok(Value::Promise(
-                    PromiseBuilder::with_optional_context(context.clone())
-                        .rejected_runtime_rooted(interp, Value::Undefined, &[], &[args])?,
-                ));
-            }
-        };
-    let result = PromiseBuilder::with_optional_context(context.clone()).pending_runtime_rooted(
-        interp,
-        &[],
-        &[args, entries.as_slice()],
-    )?;
-    for entry in entries.iter().cloned() {
-        let result_root = Value::Promise(result);
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&result_root],
-                    &[args, entries.as_slice()],
-                )?,
-        };
-        let result_for_fulfill = result;
-        let on_fulfill = native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.race fulfill",
-            smallvec![Value::Promise(result_for_fulfill)],
-            &[&result_root],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let interp = ctx.interp_mut();
-                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let jobs = result_for_fulfill.fulfill(interp.gc_heap_mut(), v);
-                for j in jobs.jobs {
-                    interp.microtasks_mut().enqueue(j);
-                }
-                Ok(Value::Undefined)
-            },
-        )?;
-        let result_for_reject = result;
-        let on_reject = native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.race reject",
-            smallvec![Value::Promise(result_for_reject)],
-            &[&result_root, &on_fulfill],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let interp = ctx.interp_mut();
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                let jobs = result_for_reject.reject(interp.gc_heap_mut(), reason);
-                for j in jobs.jobs {
-                    interp.microtasks_mut().enqueue(j);
-                }
-                Ok(Value::Undefined)
-            },
-        )?;
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
-    }
-    Ok(Value::Promise(result))
 }
 
 fn static_race_generic(
@@ -1085,181 +1053,25 @@ fn static_race_generic(
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
-        constructor,
+        constructor.clone(),
         &[],
         &[args, entries.as_slice()],
     )?;
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name: "Promise.race",
+        reason: "missing execution context".to_string(),
+    })?;
     for entry in entries.iter().cloned() {
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&cap.promise, &cap.resolve, &cap.reject],
-                    &[args, entries.as_slice()],
-                )?,
-        };
-        let cap_for_fulfill = cap.clone();
-        let on_fulfill = native_value_with_captures_runtime_rooted(
+        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
+        attach_then_value(
             interp,
-            "Promise.race generic fulfill",
-            smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-            &[&cap.promise, &cap.resolve, &cap.reject],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let interp = ctx.interp_mut();
-                call_capability_resolve(interp, &cap_for_fulfill, v)?;
-                Ok(Value::Undefined)
-            },
+            &exec,
+            entry_promise,
+            cap.resolve.clone(),
+            cap.reject.clone(),
         )?;
-        let cap_for_reject = cap.clone();
-        let on_reject = native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.race generic reject",
-            smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-            &[&cap.promise, &cap.resolve, &cap.reject, &on_fulfill],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                let interp = ctx.interp_mut();
-                call_capability_reject(interp, &cap_for_reject, reason)?;
-                Ok(Value::Undefined)
-            },
-        )?;
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
     }
     Ok(cap.promise)
-}
-
-/// §27.2.4.2 `Promise.allSettled(iterable)` — settle with an array
-/// of `{status: "fulfilled", value}` / `{status: "rejected",
-/// reason}` records once every input promise settles.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-promise.allsettled>
-fn static_all_settled(
-    interp: &mut Interpreter,
-    context: Option<ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let entries =
-        match args.first() {
-            Some(Value::Array(arr)) => {
-                crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-            }
-            _ => {
-                return Ok(Value::Promise(
-                    PromiseBuilder::with_optional_context(context.clone())
-                        .rejected_runtime_rooted(interp, Value::Undefined, &[], &[args])?,
-                ));
-            }
-        };
-    let result = PromiseBuilder::with_optional_context(context.clone()).pending_runtime_rooted(
-        interp,
-        &[],
-        &[args, entries.as_slice()],
-    )?;
-    if entries.is_empty() {
-        let result_value = Value::Promise(result);
-        let arr = match interp.alloc_runtime_rooted_array_from_values(
-            std::iter::empty::<Value>(),
-            &[&result_value],
-            &[],
-        ) {
-            Ok(arr) => arr,
-            Err(_) => {
-                return Ok(Value::Promise(
-                    PromiseBuilder::with_optional_context(context.clone())
-                        .rejected_runtime_rooted(
-                            interp,
-                            Value::Undefined,
-                            &[&result_value],
-                            &[args],
-                        )?,
-                ));
-            }
-        };
-        let jobs = result.fulfill(interp.gc_heap_mut(), Value::Array(arr));
-        for j in jobs.jobs {
-            interp.microtasks_mut().enqueue(j);
-        }
-        return Ok(Value::Promise(result));
-    }
-    let slots = PromiseSlots::new(entries.len());
-    let heap = interp.string_heap_clone();
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let result_root = Value::Promise(result);
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&result_root],
-                    &[args, entries.as_slice()],
-                )?,
-        };
-        let on_fulfill = {
-            let slots = slots.clone();
-            let heap = heap.clone();
-            let trace_slots = {
-                let slots = slots.clone();
-                Rc::new(move |visitor: &mut SlotVisitor<'_>| slots.trace(visitor))
-            };
-            native_value_with_trace_runtime_rooted(
-                interp,
-                "Promise.allSettled fulfill",
-                smallvec![Value::Promise(result)],
-                trace_slots,
-                &[&result_root],
-                &[args, entries.as_slice()],
-                move |ctx, args, _captures| {
-                    let v = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(true, v, &heap, ctx)?;
-                    finalize_settled(&slots, &result, i, record, ctx)?;
-                    Ok(Value::Undefined)
-                },
-            )?
-        };
-        let on_reject = {
-            let slots = slots.clone();
-            let heap = heap.clone();
-            let trace_slots = {
-                let slots = slots.clone();
-                Rc::new(move |visitor: &mut SlotVisitor<'_>| slots.trace(visitor))
-            };
-            native_value_with_trace_runtime_rooted(
-                interp,
-                "Promise.allSettled reject",
-                smallvec![Value::Promise(result)],
-                trace_slots,
-                &[&result_root, &on_fulfill],
-                &[args, entries.as_slice()],
-                move |ctx, args, _captures| {
-                    let r = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(false, r, &heap, ctx)?;
-                    finalize_settled(&slots, &result, i, record, ctx)?;
-                    Ok(Value::Undefined)
-                },
-            )?
-        };
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
-    }
-    Ok(Value::Promise(result))
 }
 
 fn static_all_settled_generic(
@@ -1277,10 +1089,14 @@ fn static_all_settled_generic(
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
-        constructor,
+        constructor.clone(),
         &[],
         &[args, entries.as_slice()],
     )?;
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name: "Promise.allSettled",
+        reason: "missing execution context".to_string(),
+    })?;
     if entries.is_empty() {
         let arr = interp
             .alloc_runtime_rooted_array_from_values(
@@ -1295,16 +1111,7 @@ fn static_all_settled_generic(
     let slots = PromiseSlots::new(entries.len());
     let heap = interp.string_heap_clone();
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&cap.promise, &cap.resolve, &cap.reject],
-                    &[args, entries.as_slice()],
-                )?,
-        };
+        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
         let on_fulfill = {
             let slots = slots.clone();
             let heap = heap.clone();
@@ -1322,9 +1129,10 @@ fn static_all_settled_generic(
                     cap.reject.trace_value_slots(visitor);
                 })
             };
-            native_value_with_trace_runtime_rooted(
+            promise_element_function(
                 interp,
-                "Promise.allSettled generic fulfill",
+                "",
+                1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_slots,
                 &[&promise_root, &resolve_root, &reject_root],
@@ -1359,9 +1167,10 @@ fn static_all_settled_generic(
                     cap.reject.trace_value_slots(visitor);
                 })
             };
-            native_value_with_trace_runtime_rooted(
+            promise_element_function(
                 interp,
-                "Promise.allSettled generic reject",
+                "",
+                1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_slots,
                 &[&promise_root, &resolve_root, &reject_root, &on_fulfill],
@@ -1379,13 +1188,7 @@ fn static_all_settled_generic(
                 },
             )?
         };
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
+        attach_then_value(interp, &exec, entry_promise, on_fulfill, on_reject)?;
     }
     Ok(cap.promise)
 }
@@ -1418,25 +1221,6 @@ fn build_settled_record(
             reason: err.to_string(),
         })?;
     Ok(Value::Object(obj))
-}
-
-fn finalize_settled(
-    slots: &PromiseSlots,
-    result: &JsPromiseHandle,
-    index: usize,
-    record: Value,
-    ctx: &mut NativeCtx<'_>,
-) -> Result<(), NativeError> {
-    if slots.fill(index, record) {
-        let collected = slots.collect_values();
-        let arr = ctx.array_from_elements(collected)?;
-        let interp = ctx.interp_mut();
-        let jobs = result.fulfill(interp.gc_heap_mut(), Value::Array(arr));
-        for j in jobs.jobs {
-            interp.microtasks_mut().enqueue(j);
-        }
-    }
-    Ok(())
 }
 
 fn make_aggregate_error_runtime_rooted(
@@ -1534,121 +1318,6 @@ fn oom_native(name: &'static str) -> NativeError {
     }
 }
 
-/// §27.2.4.3 `Promise.any(iterable)` — short-circuits on the first
-/// fulfillment; rejects with `AggregateError` once every input
-/// rejects.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-promise.any>
-fn static_any(
-    interp: &mut Interpreter,
-    context: Option<ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let entries =
-        match args.first() {
-            Some(Value::Array(arr)) => {
-                crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-            }
-            _ => {
-                return Ok(Value::Promise(
-                    PromiseBuilder::with_optional_context(context.clone())
-                        .rejected_runtime_rooted(interp, Value::Undefined, &[], &[args])?,
-                ));
-            }
-        };
-    let result = PromiseBuilder::with_optional_context(context.clone()).pending_runtime_rooted(
-        interp,
-        &[],
-        &[args, entries.as_slice()],
-    )?;
-    if entries.is_empty() {
-        // Spec: empty iterable rejects with an AggregateError whose
-        // `errors` array is empty.
-        let registry = interp.error_classes_clone();
-        let string_heap = interp.string_heap_clone();
-        let agg = make_aggregate_error_runtime_rooted(interp, &registry, &string_heap, Vec::new())?;
-        let jobs = result.reject(interp.gc_heap_mut(), agg);
-        for j in jobs.jobs {
-            interp.microtasks_mut().enqueue(j);
-        }
-        return Ok(Value::Promise(result));
-    }
-    let errors = PromiseSlots::new(entries.len());
-    let heap = interp.string_heap_clone();
-    let registry = interp.error_classes_clone();
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let result_root = Value::Promise(result);
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&result_root],
-                    &[args, entries.as_slice()],
-                )?,
-        };
-        let on_fulfill = {
-            native_value_with_captures_runtime_rooted(
-                interp,
-                "Promise.any fulfill",
-                smallvec![Value::Promise(result)],
-                &[&result_root],
-                &[args, entries.as_slice()],
-                move |ctx, args, _captures| {
-                    let interp = ctx.interp_mut();
-                    let v = args.first().cloned().unwrap_or(Value::Undefined);
-                    let jobs = result.fulfill(interp.gc_heap_mut(), v);
-                    for j in jobs.jobs {
-                        interp.microtasks_mut().enqueue(j);
-                    }
-                    Ok(Value::Undefined)
-                },
-            )?
-        };
-        let on_reject = {
-            let errors = errors.clone();
-            let heap = heap.clone();
-            let registry = registry.clone();
-            let trace_errors = {
-                let errors = errors.clone();
-                Rc::new(move |visitor: &mut SlotVisitor<'_>| errors.trace(visitor))
-            };
-            native_value_with_trace_runtime_rooted(
-                interp,
-                "Promise.any reject",
-                smallvec![Value::Promise(result)],
-                trace_errors,
-                &[&result_root, &on_fulfill],
-                &[args, entries.as_slice()],
-                move |ctx, args, _captures| {
-                    let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                    if errors.fill(i, reason) {
-                        let collected = errors.collect_values();
-                        let agg =
-                            make_aggregate_error_native_rooted(ctx, &registry, &heap, collected)?;
-                        let interp = ctx.interp_mut();
-                        let jobs = result.reject(interp.gc_heap_mut(), agg);
-                        for j in jobs.jobs {
-                            interp.microtasks_mut().enqueue(j);
-                        }
-                    }
-                    Ok(Value::Undefined)
-                },
-            )?
-        };
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
-    }
-    Ok(Value::Promise(result))
-}
-
 fn static_any_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
@@ -1664,10 +1333,14 @@ fn static_any_generic(
     let cap = new_generic_promise_capability(
         interp,
         context.clone(),
-        constructor,
+        constructor.clone(),
         &[],
         &[args, entries.as_slice()],
     )?;
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name: "Promise.any",
+        reason: "missing execution context".to_string(),
+    })?;
     if entries.is_empty() {
         let registry = interp.error_classes_clone();
         let string_heap = interp.string_heap_clone();
@@ -1679,30 +1352,7 @@ fn static_any_generic(
     let heap = interp.string_heap_clone();
     let registry = interp.error_classes_clone();
     for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise = match entry {
-            Value::Promise(p) => p,
-            other => PromiseBuilder::with_optional_context(context.clone())
-                .fulfilled_runtime_rooted(
-                    interp,
-                    other,
-                    &[&cap.promise, &cap.resolve, &cap.reject],
-                    &[args, entries.as_slice()],
-                )?,
-        };
-        let cap_for_fulfill = cap.clone();
-        let on_fulfill = native_value_with_captures_runtime_rooted(
-            interp,
-            "Promise.any generic fulfill",
-            smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-            &[&cap.promise, &cap.resolve, &cap.reject],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                let interp = ctx.interp_mut();
-                call_capability_resolve(interp, &cap_for_fulfill, v)?;
-                Ok(Value::Undefined)
-            },
-        )?;
+        let entry_promise = invoke_constructor_resolve(interp, &exec, &constructor, entry)?;
         let on_reject = {
             let errors = errors.clone();
             let heap = heap.clone();
@@ -1721,12 +1371,13 @@ fn static_any_generic(
                     cap.reject.trace_value_slots(visitor);
                 })
             };
-            native_value_with_trace_runtime_rooted(
+            promise_element_function(
                 interp,
-                "Promise.any generic reject",
+                "",
+                1,
                 smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
                 trace_errors,
-                &[&promise_root, &resolve_root, &reject_root, &on_fulfill],
+                &[&promise_root, &resolve_root, &reject_root],
                 &[args, entries.as_slice()],
                 move |ctx, args, _captures| {
                     let reason = args.first().cloned().unwrap_or(Value::Undefined);
@@ -1741,13 +1392,7 @@ fn static_any_generic(
                 },
             )?
         };
-        attach_then(
-            interp,
-            context.clone(),
-            &entry_promise,
-            Some(on_fulfill),
-            Some(on_reject),
-        );
+        attach_then_value(interp, &exec, entry_promise, cap.resolve.clone(), on_reject)?;
     }
     Ok(cap.promise)
 }
@@ -2063,9 +1708,10 @@ fn make_resolve_native_runtime_rooted(
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     let captured_context = context;
-    native_value_with_captures_runtime_rooted(
+    promise_native_runtime(
         interp,
         "Promise resolve",
+        1,
         smallvec![Value::Promise(promise)],
         value_roots,
         slice_roots,
@@ -2082,10 +1728,11 @@ fn make_resolve_native_stack_rooted(
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     let captured_context = context;
-    native_value_with_captures_stack_rooted(
+    promise_native_stack(
         interp,
         stack,
         "Promise resolve",
+        1,
         smallvec![Value::Promise(promise)],
         value_roots,
         slice_roots,
@@ -2101,9 +1748,10 @@ fn make_resolve_native_native_rooted(
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     let captured_context = context;
-    native_value_with_captures_native_rooted(
+    promise_native_ctx(
         ctx,
         "Promise resolve",
+        1,
         smallvec![Value::Promise(promise)],
         value_roots,
         slice_roots,
@@ -2200,9 +1848,10 @@ fn make_reject_native_runtime_rooted(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    native_value_with_captures_runtime_rooted(
+    promise_native_runtime(
         interp,
         "Promise reject",
+        1,
         smallvec![Value::Promise(promise)],
         value_roots,
         slice_roots,
@@ -2225,10 +1874,11 @@ fn make_reject_native_stack_rooted(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    native_value_with_captures_stack_rooted(
+    promise_native_stack(
         interp,
         stack,
         "Promise reject",
+        1,
         smallvec![Value::Promise(promise)],
         value_roots,
         slice_roots,
@@ -2250,9 +1900,10 @@ fn make_reject_native_native_rooted(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    native_value_with_captures_native_rooted(
+    promise_native_ctx(
         ctx,
         "Promise reject",
+        1,
         smallvec![Value::Promise(promise)],
         value_roots,
         slice_roots,

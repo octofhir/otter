@@ -2234,7 +2234,15 @@ impl Interpreter {
                         object::PropertyLookup::Absent => {}
                     }
                 }
-                let proto = self.constructor_prototype_value("Promise")?;
+                // §27.2.4.7.1 — subclass instances built via
+                // `OrdinaryCreateFromConstructor(SubPromise, ...)`
+                // override [[Prototype]]; honour the override so
+                // `promise.constructor` walks the subclass chain
+                // rather than the realm `%Promise.prototype%`.
+                let proto = match promise.prototype_override(&self.gc_heap) {
+                    Some(over) => over,
+                    None => self.constructor_prototype_value("Promise")?,
+                };
                 if matches!(proto, Value::Null | Value::Undefined) {
                     return Ok(VmGetOutcome::Value(Value::Undefined));
                 }

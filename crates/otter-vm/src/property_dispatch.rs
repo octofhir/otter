@@ -752,8 +752,7 @@ impl Interpreter {
             v @ Value::Promise(_) => {
                 // §27.2.5 — user-installed own properties
                 // (`promise.then = fn`) live in a lazy expando bag;
-                // honour them before the realm `Promise.prototype`
-                // walk.
+                // honour them before the prototype walk.
                 let p = if let Value::Promise(p) = v {
                     *p
                 } else {
@@ -764,7 +763,32 @@ impl Interpreter {
                 {
                     value
                 } else {
-                    self.load_from_constructor_prototype(context, "Promise", v, name)?
+                    // §27.2.4.7.1 OrdinaryCreateFromConstructor —
+                    // when `new SubPromise(executor)` set
+                    // `prototype_override` to `SubPromise.prototype`,
+                    // walk *that* chain, not the realm
+                    // `%Promise.prototype%`. Without this the
+                    // sub-class instance's `.constructor` resolves
+                    // to the parent Promise and SpeciesConstructor
+                    // misroutes downstream chained promises.
+                    let proto = match p.prototype_override(&self.gc_heap) {
+                        Some(proto) => proto,
+                        None => self.constructor_prototype_value("Promise")?,
+                    };
+                    if matches!(proto, Value::Null | Value::Undefined) {
+                        Value::Undefined
+                    } else {
+                        let key = VmPropertyKey::String(name);
+                        match self.ordinary_get_value(context, proto, v.clone(), &key, 0)? {
+                            VmGetOutcome::Value(value) => value,
+                            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                                context,
+                                &getter,
+                                v.clone(),
+                                smallvec::SmallVec::new(),
+                            )?,
+                        }
+                    }
                 }
             }
             v @ (Value::Map(_) | Value::Set(_) | Value::WeakMap(_) | Value::WeakSet(_)) => {

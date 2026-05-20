@@ -528,6 +528,18 @@ pub fn set_length(
                     body.sparse_elements = None;
                 }
             }
+            if let Some(accessors) = body.accessors.as_mut() {
+                accessors.retain(|key, _| !array_index_at_or_above(key, new_len));
+                if accessors.is_empty() {
+                    body.accessors = None;
+                }
+            }
+            if let Some(flags) = body.property_flags.as_mut() {
+                flags.retain(|key, _| key == "length" || !array_index_at_or_above(key, new_len));
+                if flags.is_empty() {
+                    body.property_flags = None;
+                }
+            }
             body.dirty = true;
         });
         return Ok(());
@@ -542,6 +554,125 @@ pub fn set_length(
         body.dirty = true;
     });
     Ok(())
+}
+
+/// Shrink `length` through ArraySetLength deletion semantics.
+///
+/// Returns `false` when a non-configurable indexed property blocks
+/// deletion. In that case all higher configurable elements have been
+/// removed and `length` is left at the blocked index + 1, matching
+/// §10.4.2.4 step 17.
+pub(crate) fn set_length_checked(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    new_len: usize,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    let cur = len(arr, heap);
+    if new_len >= cur {
+        set_length(arr, heap, new_len)?;
+        return Ok(true);
+    }
+    let ok = heap.with_payload(arr, |body| {
+        for idx in (new_len..cur).rev() {
+            let key = idx.to_string();
+            let exists = body
+                .elements
+                .get(idx)
+                .is_some_and(|slot| !matches!(slot, Value::Hole))
+                || body
+                    .sparse_elements
+                    .as_ref()
+                    .is_some_and(|sparse| sparse.contains_key(&idx))
+                || body
+                    .accessors
+                    .as_ref()
+                    .is_some_and(|accessors| accessors.contains_key(&key));
+            if exists {
+                let configurable = body
+                    .property_flags
+                    .as_ref()
+                    .and_then(|flags| flags.get(&key))
+                    .is_none_or(|flags| flags.configurable());
+                if !configurable {
+                    truncate_array_body_to(body, idx + 1);
+                    return false;
+                }
+            }
+            delete_array_body_index(body, idx);
+        }
+        truncate_array_body_to(body, new_len);
+        true
+    });
+    Ok(ok)
+}
+
+#[must_use]
+pub(crate) fn length_flags(arr: JsArray, heap: &otter_gc::GcHeap) -> PropertyFlags {
+    get_property_flags(arr, heap, "length")
+        .unwrap_or_else(|| PropertyFlags::new(true, false, false))
+}
+
+#[must_use]
+pub(crate) fn length_writable(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
+    length_flags(arr, heap).writable()
+}
+
+pub(crate) fn set_length_writable(arr: JsArray, heap: &mut otter_gc::GcHeap, writable: bool) {
+    let flags = length_flags(arr, heap).with_writable(writable);
+    set_property_flags(arr, heap, "length", flags);
+}
+
+fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
+    if let Some(slot) = body.elements.get_mut(idx) {
+        *slot = Value::Hole;
+    }
+    if let Some(sparse) = body.sparse_elements.as_mut() {
+        sparse.remove(&idx);
+        if sparse.is_empty() {
+            body.sparse_elements = None;
+        }
+    }
+    let key = idx.to_string();
+    if let Some(accessors) = body.accessors.as_mut() {
+        accessors.remove(&key);
+        if accessors.is_empty() {
+            body.accessors = None;
+        }
+    }
+    if let Some(flags) = body.property_flags.as_mut() {
+        flags.remove(&key);
+        if flags.is_empty() {
+            body.property_flags = None;
+        }
+    }
+    body.dirty = true;
+}
+
+fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
+    body.elements.truncate(len);
+    if let Some(sparse) = body.sparse_elements.as_mut() {
+        sparse.retain(|idx, _| *idx < len);
+        if sparse.is_empty() {
+            body.sparse_elements = None;
+        }
+    }
+    if let Some(accessors) = body.accessors.as_mut() {
+        accessors.retain(|key, _| !array_index_at_or_above(key, len));
+        if accessors.is_empty() {
+            body.accessors = None;
+        }
+    }
+    if let Some(flags) = body.property_flags.as_mut() {
+        flags.retain(|key, _| key == "length" || !array_index_at_or_above(key, len));
+        if flags.is_empty() {
+            body.property_flags = None;
+        }
+    }
+    body.dirty = true;
+}
+
+fn array_index_at_or_above(key: &str, limit: usize) -> bool {
+    key.parse::<usize>().is_ok_and(|idx| idx >= limit)
 }
 
 /// Pop from the tail. Returns `Value::Undefined` for an empty array

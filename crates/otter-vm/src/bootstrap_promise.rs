@@ -333,8 +333,9 @@ fn invoke_static(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
+    let constructor = Some(ctx.this_value().clone());
     let (interp, _ignored_ctx) = ctx.interp_mut_and_context();
-    promise_dispatch::statics_call(interp, context, method, args)
+    promise_dispatch::statics_call(interp, context, constructor, method, args)
 }
 
 // ---------------------------------------------------------------

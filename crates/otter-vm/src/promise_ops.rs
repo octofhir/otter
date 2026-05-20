@@ -116,9 +116,14 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let args = collect_variadic_args(&stack[top_idx], operands, 2, 3)?;
         stack[top_idx].pc += 1;
-        let result =
-            promise_dispatch::statics_call(self, Some(context.clone()), method, args.as_slice())
-                .map_err(native_to_vm_error)?;
+        let result = promise_dispatch::statics_call(
+            self,
+            Some(context.clone()),
+            None,
+            method,
+            args.as_slice(),
+        )
+        .map_err(native_to_vm_error)?;
         let top_idx = stack.len() - 1;
         write_register(&mut stack[top_idx], dst, result)
     }

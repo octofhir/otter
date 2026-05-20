@@ -585,7 +585,10 @@ impl Interpreter {
                 return None;
             }
             let handler = p.handler();
-            match object::get(handler, &self.gc_heap, "get") {
+            let Value::Object(handler_obj) = handler else {
+                return None;
+            };
+            match object::get(handler_obj, &self.gc_heap, "get") {
                 Some(Value::Undefined) | None => {}
                 _ => return None,
             }

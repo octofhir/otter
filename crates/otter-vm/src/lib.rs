@@ -9103,7 +9103,10 @@ mod tests {
             Value::Number(NumberValue::Smi(42)),
         );
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(Value::Object(target), handler));
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(
+            Value::Object(target),
+            Value::Object(handler),
+        ));
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -9153,7 +9156,7 @@ mod tests {
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, handler));
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, Value::Object(handler)));
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -9230,7 +9233,7 @@ mod tests {
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
         let proxy = Value::Proxy(crate::proxy::JsProxy::new(
             Value::Function { function_id: 1 },
-            handler,
+            Value::Object(handler),
         ));
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
@@ -9275,7 +9278,7 @@ mod tests {
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, handler));
+        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, Value::Object(handler)));
         let args: SmallVec<[Value; 8]> = smallvec::smallvec![
             Value::Number(NumberValue::Smi(3)),
             Value::Number(NumberValue::Smi(5)),
@@ -9389,7 +9392,7 @@ mod tests {
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
         let proxy = Value::Proxy(crate::proxy::JsProxy::new(
             Value::Function { function_id: 1 },
-            handler,
+            Value::Object(handler),
         ));
         let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::Number(NumberValue::Smi(13))];
 

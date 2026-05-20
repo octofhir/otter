@@ -27,8 +27,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::Value;
-use crate::object::JsObject;
-use otter_gc::raw::{RawGc, SlotVisitor};
+use otter_gc::raw::SlotVisitor;
 
 /// Cheap-to-clone Proxy handle.
 #[derive(Debug, Clone)]
@@ -45,7 +44,7 @@ pub struct ProxyBody {
     /// the underlying function directly.
     target: Value,
     /// Handler object trap properties live on.
-    handler: JsObject,
+    handler: Value,
     /// `true` once `Proxy.revocable().revoke()` has fired.
     revoked: Cell<bool>,
 }
@@ -53,7 +52,7 @@ pub struct ProxyBody {
 impl JsProxy {
     /// Construct a proxy over `target` with `handler`.
     #[must_use]
-    pub fn new(target: Value, handler: JsObject) -> Self {
+    pub fn new(target: Value, handler: Value) -> Self {
         Self {
             inner: Rc::new(ProxyBody {
                 target,
@@ -71,8 +70,8 @@ impl JsProxy {
 
     /// Handler object.
     #[must_use]
-    pub fn handler(&self) -> JsObject {
-        self.inner.handler
+    pub fn handler(&self) -> Value {
+        self.inner.handler.clone()
     }
 
     /// `true` once revoked.
@@ -102,8 +101,7 @@ impl JsProxy {
     /// handler slots.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         self.inner.target.trace_value_slots(visitor);
-        let p = &self.inner.handler as *const JsObject as *mut RawGc;
-        visitor(p);
+        self.inner.handler.trace_value_slots(visitor);
     }
 }
 

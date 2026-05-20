@@ -973,11 +973,6 @@ impl Interpreter {
             }
             M::Values => {
                 let values: Vec<Value> = match args.first() {
-                    Some(Value::Object(target)) => {
-                        object::with_properties(*target, self.gc_heap(), |p| {
-                            p.enumerable_data_iter().map(|(_, value)| value).collect()
-                        })
-                    }
                     Some(Value::Boolean(_))
                     | Some(Value::Number(_))
                     | Some(Value::Symbol(_))
@@ -1000,6 +995,12 @@ impl Interpreter {
                             .map(|i| crate::array::get(*arr, self.gc_heap(), i))
                             .collect()
                     }
+                    Some(target) if enumerable_own_names_uses_internal_methods(target) => {
+                        enumerable_own_string_entries(self, context, target, args)?
+                            .into_iter()
+                            .map(|(_, value)| value)
+                            .collect()
+                    }
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
                             message: "Object.values called on null or undefined".to_string(),
@@ -1017,13 +1018,6 @@ impl Interpreter {
             }
             M::Entries => {
                 let raw: Vec<(String, Value)> = match args.first() {
-                    Some(Value::Object(target)) => {
-                        object::with_properties(*target, self.gc_heap(), |p| {
-                            p.enumerable_data_iter()
-                                .map(|(key, value)| (key.to_string(), value))
-                                .collect()
-                        })
-                    }
                     Some(Value::Boolean(_))
                     | Some(Value::Number(_))
                     | Some(Value::Symbol(_))
@@ -1051,37 +1045,8 @@ impl Interpreter {
                             .map(|i| (i.to_string(), crate::array::get(*arr, self.gc_heap(), i)))
                             .collect()
                     }
-                    // §20.1.2.5 — `Object.entries` walks enumerable
-                    // own string keys per `EnumerableOwnPropertyNames`
-                    // and reads each value via the spec `[[Get]]`.
-                    // Callable shapes expose `name` / `length` /
-                    // `prototype` plus a user-properties bag —
-                    // enumerable keys come from
-                    // [`Interpreter::enumerable_own_string_keys_for_value`]
-                    // and per-key values from `get_property_value_for_call`.
-                    Some(
-                        target @ (Value::Function { .. }
-                        | Value::Closure { .. }
-                        | Value::NativeFunction(_)
-                        | Value::BoundFunction(_)
-                        | Value::ClassConstructor(_)),
-                    ) => {
-                        let target_value = target.clone();
-                        let keys = self.enumerable_own_string_keys_for_value(
-                            context,
-                            target_value.clone(),
-                            0,
-                        )?;
-                        let mut entries = Vec::with_capacity(keys.len());
-                        for key in keys {
-                            let value = self.get_property_value_for_call(
-                                context,
-                                target_value.clone(),
-                                &key,
-                            )?;
-                            entries.push((key, value));
-                        }
-                        entries
+                    Some(target) if enumerable_own_names_uses_internal_methods(target) => {
+                        enumerable_own_string_entries(self, context, target, args)?
                     }
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
@@ -1786,22 +1751,16 @@ impl Interpreter {
         match method {
             M::Construct => {
                 let target = coerce_proxy_target(args.first())?;
-                let handler = match args.get(1) {
-                    Some(Value::Object(o)) => *o,
-                    _ => return Err(VmError::TypeMismatch),
-                };
+                let handler = coerce_proxy_target(args.get(1))?;
                 Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
             }
             M::Revocable => {
                 let target = coerce_proxy_target(args.first())?;
-                let handler = match args.get(1) {
-                    Some(Value::Object(o)) => *o,
-                    _ => return Err(VmError::TypeMismatch),
-                };
-                let proxy = crate::proxy::JsProxy::new(target.clone(), handler);
+                let handler = coerce_proxy_target(args.get(1))?;
+                let proxy = crate::proxy::JsProxy::new(target.clone(), handler.clone());
                 let proxy_value = Value::Proxy(proxy.clone());
                 let target_root = target;
-                let handler_root = Value::Object(handler);
+                let handler_root = handler;
                 let roots = self.collect_allocation_roots(stack);
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                     for &slot in &roots {
@@ -2018,6 +1977,71 @@ fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), 
     write_register(frame, dst, result)?;
     frame.pc += 1;
     Ok(())
+}
+
+fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool {
+    matches!(
+        target,
+        Value::Object(_)
+            | Value::Proxy(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Promise(_)
+    )
+}
+
+fn enumerable_own_string_entries(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    target: &Value,
+    args: &[Value],
+) -> Result<Vec<(String, Value)>, VmError> {
+    let string_heap = interp.string_heap_clone();
+    let keys = interp.own_property_keys_value(context, target, &string_heap)?;
+    let mut entries = Vec::new();
+    for key_value in &keys {
+        let Value::String(name) = key_value else {
+            continue;
+        };
+        let key_name = name.to_lossy_string();
+        let key = VmPropertyKey::OwnedString(key_name.clone());
+        let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+            context,
+            target.clone(),
+            &key,
+            0,
+            &[target],
+            &[args, keys.as_slice()],
+        )?;
+        let Some(desc) = desc else {
+            continue;
+        };
+        if !desc.enumerable() {
+            continue;
+        }
+        let value =
+            match interp.ordinary_get_value(context, target.clone(), target.clone(), &key, 0)? {
+                crate::VmGetOutcome::Value(value) => value,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    interp.run_callable_sync(context, &getter, target.clone(), SmallVec::new())?
+                }
+            };
+        entries.push((key_name, value));
+    }
+    Ok(entries)
 }
 
 fn assign_source_uses_own_property_keys(source: &Value) -> bool {

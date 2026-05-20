@@ -572,9 +572,9 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         }
     }
 
-    fn proxy_handler_arg(args: &[Value]) -> Result<JsObject, NativeError> {
+    fn proxy_handler_arg(args: &[Value]) -> Result<Value, NativeError> {
         match args.get(1) {
-            Some(Value::Object(handler)) => Ok(*handler),
+            Some(value) if proxy_target_is_object(value) => Ok(value.clone()),
             _ => Err(NativeError::TypeError {
                 name: "Proxy",
                 reason: "handler must be an object".to_string(),

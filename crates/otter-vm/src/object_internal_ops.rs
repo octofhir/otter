@@ -102,12 +102,25 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         }
         let handler = proxy.handler();
-        let trap_fn = match crate::object::get(handler, &self.gc_heap, trap) {
-            Some(v) if self.is_callable_runtime(&v) => v,
-            Some(Value::Undefined) | Some(Value::Null) | None => return Ok(None),
+        let trap_key = VmPropertyKey::String(trap);
+        let trap_value = match self.ordinary_get_value(
+            context,
+            handler.clone(),
+            handler.clone(),
+            &trap_key,
+            0,
+        )? {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, handler.clone(), SmallVec::new())?
+            }
+        };
+        let trap_fn = match trap_value {
+            v if self.is_callable_runtime(&v) => v,
+            Value::Undefined | Value::Null => return Ok(None),
             _ => return Err(VmError::TypeMismatch),
         };
-        let result = self.run_callable_sync(context, &trap_fn, Value::Object(handler), args)?;
+        let result = self.run_callable_sync(context, &trap_fn, handler, args)?;
         Ok(Some(result))
     }
 
@@ -1324,6 +1337,15 @@ impl Interpreter {
                 // ordering.
                 for sym in array::own_symbol_keys(*arr, &self.gc_heap) {
                     keys.push(Value::Symbol(sym));
+                }
+                Ok(keys)
+            }
+            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                let names = self.ordinary_function_own_property_keys(context, *function_id);
+                let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+                for n in names {
+                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    keys.push(Value::String(s));
                 }
                 Ok(keys)
             }

@@ -1215,12 +1215,27 @@ impl Interpreter {
                     }
                     hops += 1;
                     let handler = proxy.handler();
-                    let trap_value = crate::object::get(handler, &self.gc_heap, "apply");
+                    let trap_key = VmPropertyKey::String("apply");
+                    let trap_value = match self.ordinary_get_value(
+                        context,
+                        handler.clone(),
+                        handler.clone(),
+                        &trap_key,
+                        0,
+                    )? {
+                        VmGetOutcome::Value(value) => value,
+                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                            context,
+                            &getter,
+                            handler.clone(),
+                            SmallVec::new(),
+                        )?,
+                    };
                     match trap_value {
-                        Some(trap) if self.is_callable_runtime(&trap) => {
+                        trap if self.is_callable_runtime(&trap) => {
                             let argv_array = self.alloc_runtime_rooted_array_from_values(
                                 effective_args.iter().cloned(),
-                                &[&current, &effective_this, &trap],
+                                &[&current, &effective_this, &handler, &trap],
                                 &[effective_args.as_slice()],
                             )?;
                             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
@@ -1228,17 +1243,12 @@ impl Interpreter {
                                 effective_this.clone(),
                                 Value::Array(argv_array),
                             ];
-                            return self.run_callable_sync(
-                                context,
-                                &trap,
-                                Value::Object(handler),
-                                trap_args,
-                            );
+                            return self.run_callable_sync(context, &trap, handler, trap_args);
                         }
-                        Some(Value::Undefined) | Some(Value::Null) | None => {
+                        Value::Undefined | Value::Null => {
                             current = proxy.target();
                         }
-                        Some(_) => {
+                        _ => {
                             return Err(VmError::TypeError {
                                 message: "Proxy apply trap is not callable".to_string(),
                             });
@@ -1366,13 +1376,34 @@ impl Interpreter {
                     }
                     hops += 1;
                     let handler = proxy.handler();
-                    let trap_value = crate::object::get(handler, &self.gc_heap, "construct");
+                    let trap_key = VmPropertyKey::String("construct");
+                    let trap_value = match self.ordinary_get_value(
+                        context,
+                        handler.clone(),
+                        handler.clone(),
+                        &trap_key,
+                        0,
+                    )? {
+                        VmGetOutcome::Value(value) => value,
+                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                            context,
+                            &getter,
+                            handler.clone(),
+                            SmallVec::new(),
+                        )?,
+                    };
                     match trap_value {
-                        Some(trap) if self.is_callable_runtime(&trap) => {
+                        trap if self.is_callable_runtime(&trap) => {
                             let target_value = proxy.target();
                             let argv_array = self.alloc_runtime_rooted_array_from_values(
                                 effective_args.iter().cloned(),
-                                &[&current, &target_value, &effective_new_target, &trap],
+                                &[
+                                    &current,
+                                    &target_value,
+                                    &effective_new_target,
+                                    &handler,
+                                    &trap,
+                                ],
                                 &[effective_args.as_slice()],
                             )?;
                             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
@@ -1380,12 +1411,8 @@ impl Interpreter {
                                 Value::Array(argv_array),
                                 effective_new_target.clone(),
                             ];
-                            let result = self.run_callable_sync(
-                                context,
-                                &trap,
-                                Value::Object(handler),
-                                trap_args,
-                            )?;
+                            let result =
+                                self.run_callable_sync(context, &trap, handler, trap_args)?;
                             if !constructor_return_is_object(&result) {
                                 return Err(VmError::TypeError {
                                     message: "Proxy construct trap returned non-object".to_string(),
@@ -1393,10 +1420,10 @@ impl Interpreter {
                             }
                             return Ok(result);
                         }
-                        Some(Value::Undefined) | Some(Value::Null) | None => {
+                        Value::Undefined | Value::Null => {
                             current = proxy.target();
                         }
-                        Some(_) => {
+                        _ => {
                             return Err(VmError::TypeError {
                                 message: "Proxy construct trap is not callable".to_string(),
                             });

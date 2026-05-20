@@ -1379,8 +1379,12 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         Value::Undefined => "undefined".to_string(),
         _ => return Ok(Value::Boolean(false)),
     };
-    if let Ok(idx) = key_string.parse::<usize>() {
-        return Ok(Value::Boolean(array::has_own_element(*arr, heap, idx)));
+    if let Some(idx) = crate::object::array_index_property_name(&key_string) {
+        return Ok(Value::Boolean(array::has_own_element(
+            *arr,
+            heap,
+            idx as usize,
+        )));
     }
     if key_string == "length" {
         return Ok(Value::Boolean(true));
@@ -1415,8 +1419,12 @@ fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, In
     if key_string == "length" {
         return Ok(Value::Boolean(false));
     }
-    if let Ok(idx) = key_string.parse::<usize>() {
-        return Ok(Value::Boolean(array::has_own_element(*arr, heap, idx)));
+    if let Some(idx) = crate::object::array_index_property_name(&key_string) {
+        return Ok(Value::Boolean(array::has_own_element(
+            *arr,
+            heap,
+            idx as usize,
+        )));
     }
     let has_named = heap.read_payload(*arr, |body| {
         body.named_properties

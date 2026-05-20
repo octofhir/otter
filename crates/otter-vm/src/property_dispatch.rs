@@ -1426,22 +1426,37 @@ impl Interpreter {
                 }
             }
             _ => {
-                let idx = match &idx_value {
-                    Value::Number(n) => {
-                        crate::array::index_from_number(*n).ok_or(VmError::TypeMismatch)?
-                    }
+                let (idx, fallback_key) = match &idx_value {
+                    Value::Number(n) => match crate::array::index_from_number(*n) {
+                        Some(idx) => (Some(idx), None),
+                        None => (None, Some(n.to_display_string())),
+                    },
                     _ => return Err(VmError::TypeMismatch),
                 };
                 match recv {
-                    Value::Array(a) => crate::array::get(a, &self.gc_heap, idx),
-                    Value::String(s) => match s.char_code_at(idx as u32) {
-                        Some(unit) => Value::String(crate::JsString::from_utf16_units(
-                            &[unit],
-                            &self.string_heap,
-                        )?),
-                        None => Value::String(crate::JsString::empty(&self.string_heap)?),
+                    Value::Array(a) => match idx {
+                        Some(idx) => crate::array::get(a, &self.gc_heap, idx),
+                        None => crate::array::get_named_property(
+                            a,
+                            &self.gc_heap,
+                            fallback_key.as_deref().expect("fallback key"),
+                        )
+                        .unwrap_or(Value::Undefined),
                     },
-                    Value::TypedArray(t) => t.get(idx),
+                    Value::String(s) => match idx {
+                        Some(idx) => match s.char_code_at(idx as u32) {
+                            Some(unit) => Value::String(crate::JsString::from_utf16_units(
+                                &[unit],
+                                &self.string_heap,
+                            )?),
+                            None => Value::String(crate::JsString::empty(&self.string_heap)?),
+                        },
+                        None => Value::Undefined,
+                    },
+                    Value::TypedArray(t) => match idx {
+                        Some(idx) => t.get(idx),
+                        None => Value::Undefined,
+                    },
                     _ => return Err(VmError::TypeMismatch),
                 }
             }
@@ -1639,20 +1654,29 @@ impl Interpreter {
             }
             // Numeric-indexed array write.
             (Value::Array(arr), Value::Number(n)) => {
-                let idx = crate::array::index_from_number(*n).ok_or(VmError::TypeMismatch)?;
-                let roots = self.collect_allocation_roots(stack);
-                let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    for &slot in &roots {
-                        visitor(slot);
-                    }
-                };
-                crate::array::set_with_roots(
-                    *arr,
-                    &mut self.gc_heap,
-                    idx,
-                    value,
-                    &mut external_visit,
-                )?;
+                if let Some(idx) = crate::array::index_from_number(*n) {
+                    let roots = self.collect_allocation_roots(stack);
+                    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                        for &slot in &roots {
+                            visitor(slot);
+                        }
+                    };
+                    crate::array::set_with_roots(
+                        *arr,
+                        &mut self.gc_heap,
+                        idx,
+                        value,
+                        &mut external_visit,
+                    )?;
+                } else {
+                    crate::array::set_named_property(
+                        *arr,
+                        &mut self.gc_heap,
+                        &n.to_display_string(),
+                        value,
+                    )
+                    .map_err(|_| VmError::TypeMismatch)?;
+                }
             }
             // §10.4.5.14 IntegerIndexedElementSet — out-of-range indices
             // silently no-op; element-type / value-type mismatches raise
@@ -3627,7 +3651,10 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
             Some(i) if i >= 0 => {
                 crate::array::has_own_element(arr, &interpreter.gc_heap, i as usize)
             }
-            _ => false,
+            _ => {
+                crate::array::get_named_property(arr, &interpreter.gc_heap, &n.to_display_string())
+                    .is_some()
+            }
         },
         Value::String(s) => {
             let key = s.to_lossy_string();

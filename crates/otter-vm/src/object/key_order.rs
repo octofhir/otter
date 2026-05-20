@@ -14,7 +14,7 @@
 //! - <https://tc39.es/ecma262/#sec-ordinaryownpropertykeys>
 //! - <https://tc39.es/ecma262/#array-index>
 
-pub(super) fn array_index_property_name(key: &str) -> Option<u32> {
+pub(crate) fn array_index_property_name(key: &str) -> Option<u32> {
     if key.is_empty() {
         return None;
     }

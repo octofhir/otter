@@ -877,45 +877,30 @@ fn native_get_own_property_names_rooted(
     context: Option<&crate::ExecutionContext>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    if let Some(target @ Value::Proxy(_)) = args.first() {
-        let Some(context) = context else {
-            return Err(VmError::InvalidOperand);
-        };
-        let target = target.clone();
-        let string_heap = ctx.cx.interp.string_heap_clone();
-        let trap_keys = ctx
-            .cx
-            .interp
-            .own_property_keys_value(context, &target, &string_heap)?;
-        let values: Vec<Value> = trap_keys
-            .into_iter()
-            .filter(|v| matches!(v, Value::String(_)))
-            .collect();
-        return Ok(Value::Array(ctx.array_from_elements_with_roots(
-            values,
-            &[&target],
-            &[args],
-        )?));
-    }
-    let owned: Vec<String> = match args.first() {
-        Some(Value::Object(target)) => crate::object::with_properties(*target, ctx.heap(), |p| {
-            p.keys().map(|k| k.to_string()).collect()
-        }),
-        Some(Value::NativeFunction(native)) => {
-            native.own_property_keys(ctx.heap()).into_iter().collect()
-        }
-        Some(Value::BoundFunction(bound)) => {
-            crate::function_metadata::bound_own_property_keys(bound, ctx.heap())
-                .into_iter()
-                .collect()
-        }
-        Some(Value::Function { function_id }) | Some(Value::Closure { function_id, .. }) => {
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    let values: Vec<Value> = match args.first() {
+        Some(target)
+            if matches!(
+                target,
+                Value::Object(_)
+                    | Value::Array(_)
+                    | Value::Proxy(_)
+                    | Value::Function { .. }
+                    | Value::Closure { .. }
+                    | Value::NativeFunction(_)
+                    | Value::BoundFunction(_)
+            ) =>
+        {
             let Some(context) = context else {
                 return Err(VmError::InvalidOperand);
             };
+            let target = target.clone();
             ctx.cx
                 .interp
-                .ordinary_function_own_property_keys(context, *function_id)
+                .own_property_keys_value(context, &target, &string_heap)?
+                .into_iter()
+                .filter(|v| matches!(v, Value::String(_)))
+                .collect()
         }
         Some(Value::ClassConstructor(class)) => {
             // §15.7.13 — class constructors expose `prototype` as
@@ -928,23 +913,22 @@ fn native_get_own_property_names_rooted(
             if !keys.iter().any(|k| k == "prototype") {
                 keys.push("prototype".to_string());
             }
-            keys
+            keys.into_iter()
+                .map(|key| string_value(&key, &string_heap))
+                .collect::<Result<Vec<_>, _>>()?
         }
         Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
         Some(Value::String(s)) => {
             let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
             keys.push("length".to_string());
-            keys
+            keys.into_iter()
+                .map(|key| string_value(&key, &string_heap))
+                .collect::<Result<Vec<_>, _>>()?
         }
         _ => return Err(VmError::TypeMismatch),
     };
-    let string_heap = ctx.cx.interp.string_heap_clone();
-    let mut names = Vec::with_capacity(owned.len());
-    for key in owned {
-        names.push(string_value(&key, &string_heap)?);
-    }
     Ok(Value::Array(ctx.array_from_elements_with_roots(
-        names,
+        values,
         &[],
         &[args],
     )?))

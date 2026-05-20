@@ -1307,30 +1307,53 @@ impl Interpreter {
                             string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
                         ));
                     }
+                }
+                let is_string_exotic = string_data.is_some();
+                let (ordinary_strings, symbols): (Vec<String>, Vec<Value>) =
+                    object::with_properties(*obj, &self.gc_heap, |p| {
+                        (
+                            p.keys().map(str::to_string).collect(),
+                            p.symbol_keys().map(Value::Symbol).collect(),
+                        )
+                    });
+                if is_string_exotic {
+                    let string_len = string_data.as_ref().map_or(0, |value| value.len());
+                    let mut indexed = BTreeSet::new();
+                    let mut non_index_strings = Vec::new();
+                    for key in ordinary_strings {
+                        if key == "length" {
+                            continue;
+                        }
+                        match object::array_index_property_name(&key) {
+                            Some(index) if index >= string_len => {
+                                indexed.insert(index);
+                            }
+                            Some(_) => {}
+                            None => non_index_strings.push(key),
+                        }
+                    }
+                    for index in indexed {
+                        let key = index.to_string();
+                        keys.push(Value::String(
+                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                        ));
+                    }
                     keys.push(Value::String(
                         string::JsString::from_str("length", string_heap).map_err(VmError::from)?,
                     ));
+                    for key in non_index_strings {
+                        keys.push(Value::String(
+                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                        ));
+                    }
+                } else {
+                    for key in ordinary_strings {
+                        keys.push(Value::String(
+                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                        ));
+                    }
                 }
-                let is_string_exotic = string_data.is_some();
-                let ordinary_keys: Vec<Value> = object::with_properties(*obj, &self.gc_heap, |p| {
-                    let mut keys: Vec<Value> = p
-                        .keys()
-                        .filter(|k| {
-                            if !is_string_exotic {
-                                return true;
-                            }
-                            *k != "length" && k.parse::<usize>().is_err()
-                        })
-                        .map(|k| {
-                            string::JsString::from_str(k, string_heap)
-                                .map(Value::String)
-                                .unwrap_or(Value::Undefined)
-                        })
-                        .collect();
-                    keys.extend(p.symbol_keys().map(Value::Symbol));
-                    keys
-                });
-                keys.extend(ordinary_keys);
+                keys.extend(symbols);
                 Ok(keys)
             }
             Value::Array(arr) => {

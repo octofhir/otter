@@ -1104,65 +1104,18 @@ impl Interpreter {
             };
             if matches!(method, M::GetOwnPropertyNames) {
                 // §20.1.2.12 — `getOwnPropertyNames(O)` returns
-                // every own string-keyed property, regardless of
-                // enumerability. Ordinary functions + closures
-                // expose `length` / `name` / (non-arrow) `prototype`
-                // plus user-installed own properties; native and
-                // bound functions and proxies already have
-                // descriptor-table-driven enumerations elsewhere, so
-                // route per-shape here.
-                let names: Vec<String> = match &target {
-                    Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                        self.ordinary_function_own_property_keys(context, *function_id)
-                    }
-                    Value::NativeFunction(native) => native
-                        .own_property_keys(&self.gc_heap)
-                        .into_iter()
-                        .collect(),
-                    Value::BoundFunction(bound) => {
-                        function_metadata::bound_own_property_keys(bound, &self.gc_heap)
-                            .into_iter()
-                            .collect()
-                    }
-                    Value::Proxy(_) => {
-                        let string_heap = self.string_heap.clone();
-                        let trap_keys =
-                            self.own_property_keys_value(context, &target, &string_heap)?;
-                        let values: Vec<Value> = trap_keys
-                            .into_iter()
-                            .filter(|v| matches!(v, Value::String(_)))
-                            .collect();
-                        return Ok(Some(Value::Array(self.function_static_array_from_values(
-                            stack_roots,
-                            values,
-                            &[&target],
-                            &[args],
-                        )?)));
-                    }
-                    Value::Array(arr) => {
-                        let len = crate::array::len(*arr, &self.gc_heap);
-                        let mut keys: Vec<String> = (0..len)
-                            .filter(|&i| crate::array::has_own_element(*arr, &self.gc_heap, i))
-                            .map(|i| i.to_string())
-                            .collect();
-                        let named: Vec<String> = self.gc_heap.read_payload(*arr, |body| {
-                            body.named_properties
-                                .as_ref()
-                                .map_or_else(Vec::new, |m| m.keys().cloned().collect())
-                        });
-                        keys.extend(named);
-                        keys.push("length".to_string());
-                        keys
-                    }
-                    _ => return Ok(None),
-                };
-                let mut values = Vec::with_capacity(names.len());
-                for key in names {
-                    values.push(Value::String(
-                        JsString::from_str(&key, &self.string_heap)
-                            .map_err(|_| VmError::TypeMismatch)?,
-                    ));
-                }
+                // every own string-keyed property in
+                // `[[OwnPropertyKeys]]` order, regardless of
+                // enumerability. Route all exotic/function shapes
+                // through the shared internal-method implementation
+                // so Arrays, string wrappers, functions, and Proxies
+                // agree with `Reflect.ownKeys`.
+                let string_heap = self.string_heap.clone();
+                let values: Vec<Value> = self
+                    .own_property_keys_value(context, &target, &string_heap)?
+                    .into_iter()
+                    .filter(|v| matches!(v, Value::String(_)))
+                    .collect();
                 return Ok(Some(Value::Array(self.function_static_array_from_values(
                     stack_roots,
                     values,

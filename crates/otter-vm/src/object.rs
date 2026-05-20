@@ -90,6 +90,7 @@ mod shape_transition;
 pub use descriptor::{
     DescriptorKind, PartialPropertyDescriptor, PropertyDescriptor, PropertyFlags,
 };
+pub(crate) use key_order::array_index_property_name;
 pub use lookup::{PropertyLookup, SetOutcome, SetRejectReason};
 pub(crate) use shape_body::ShapeHandle;
 pub(crate) use shape_cache::{ShapeCacheInvalidation, ShapeCacheMode};

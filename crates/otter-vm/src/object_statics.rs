@@ -1628,6 +1628,58 @@ fn lookup_accessor_helper(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
+    let key = native_to_property_key(ctx, args.first(), method_name)?;
+    if let Some(exec_ctx) = ctx.execution_context().cloned() {
+        let key = property_key_to_vm_key(&key);
+        let mut current = match this_value {
+            Value::Null | Value::Undefined => {
+                return Err(NativeError::TypeError {
+                    name: method_name,
+                    reason: "cannot convert null or undefined to object".to_string(),
+                });
+            }
+            value if is_object_like_value(&value) => Some(value),
+            _ => return Ok(Value::Undefined),
+        };
+        while let Some(value) = current {
+            let desc = ctx
+                .cx
+                .interp
+                .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    &exec_ctx,
+                    value.clone(),
+                    &key,
+                    0,
+                    &[&value],
+                    &[],
+                )
+                .map_err(|err| object_native_error(method_name, err))?;
+            if let Some(desc) = desc {
+                return Ok(match desc.kind {
+                    DescriptorKind::Accessor { getter, setter } => {
+                        if lookup_setter {
+                            setter.unwrap_or(Value::Undefined)
+                        } else {
+                            getter.unwrap_or(Value::Undefined)
+                        }
+                    }
+                    DescriptorKind::Data { .. } => Value::Undefined,
+                });
+            }
+            let proto = ctx
+                .cx
+                .interp
+                .ordinary_get_prototype_value(&exec_ctx, value, 0)
+                .map_err(|err| object_native_error(method_name, err))?;
+            current = if matches!(proto, Value::Null) {
+                None
+            } else {
+                Some(proto)
+            };
+        }
+        return Ok(Value::Undefined);
+    }
+
     let mut current = match this_value {
         Value::Object(o) => Some(o),
         Value::Null | Value::Undefined => {
@@ -1638,7 +1690,6 @@ fn lookup_accessor_helper(
         }
         _ => return Ok(Value::Undefined),
     };
-    let key = native_to_property_key(ctx, args.first(), method_name)?;
     while let Some(obj) = current {
         let lookup = match &key {
             PropertyKey::String(name) => crate::object::lookup_own(obj, ctx.heap(), name),
@@ -1656,6 +1707,13 @@ fn lookup_accessor_helper(
         }
     }
     Ok(Value::Undefined)
+}
+
+fn property_key_to_vm_key(key: &PropertyKey) -> crate::VmPropertyKey<'static> {
+    match key {
+        PropertyKey::String(name) => crate::VmPropertyKey::OwnedString(name.clone()),
+        PropertyKey::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
+    }
 }
 
 fn value_has_prototype_in_chain(

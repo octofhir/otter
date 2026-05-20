@@ -514,16 +514,15 @@ impl Interpreter {
                 read_register(frame, proto_reg)?.clone()
             }
             Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
-            Value::NativeFunction(_) => {
-                // §15.7.14 ClassDefinitionEvaluation links the
-                // constructor's static side to the superclass value.
-                // Native constructors store statics directly on the
-                // callable rather than in a JsObject-shaped statics
-                // bag, so there is no object prototype to mutate.
-                // <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
-                frame.pc += 1;
-                return Ok(());
-            }
+            // §15.7.14 ClassDefinitionEvaluation step 6.b — `class D
+            // extends C` sets D.[[Prototype]] (the static side) to
+            // the parent constructor C verbatim, so static methods on
+            // a native parent (`Promise.reject`, `Map[@@species]`, …)
+            // resolve through the ordinary [[Get]] ladder. Carry the
+            // native callable through as an `ObjectPrototype::Value`
+            // — the prototype walker in `ordinary_get_value` knows
+            // how to walk into a NativeFunction receiver.
+            Value::NativeFunction(_) => read_register(frame, proto_reg)?.clone(),
             _ => return Err(VmError::TypeMismatch),
         };
         let receiver = read_register(frame, obj_reg)?.clone();
@@ -577,30 +576,74 @@ impl Interpreter {
                 if name == "prototype" {
                     Value::Object(c.prototype(&self.gc_heap))
                 } else {
-                    match crate::object::get(c.statics(&self.gc_heap), &self.gc_heap, name) {
-                        Some(v) => v,
-                        None if name == "name" || name == "length" => {
-                            let ctor = c.ctor(&self.gc_heap);
-                            match &ctor {
-                                Value::Function { .. }
-                                | Value::Closure { .. }
-                                | Value::NativeFunction(_)
-                                | Value::BoundFunction(_) => {
-                                    let ctx = function_metadata::FunctionMetadataContext::new(
-                                        context,
-                                        &self.gc_heap,
-                                        &self.string_heap,
-                                        &self.function_user_props,
-                                        &self.function_deleted_metadata,
-                                    );
-                                    function_metadata::callable_intrinsic_property(
-                                        &ctx, &ctor, name,
-                                    )?
+                    let statics = c.statics(&self.gc_heap);
+                    let direct = crate::object::get(statics, &self.gc_heap, name);
+                    if let Some(v) = direct {
+                        v
+                    } else {
+                        // §15.7.10 step 6.b — `class D extends C` sets
+                        // D.[[Prototype]] = C. When the parent is a
+                        // non-Object callable (NativeFunction such as
+                        // `Promise`, ClassConstructor for a user
+                        // class), the proto chain walked by
+                        // `object::get` stops at the first non-Object
+                        // hop. Fall back to `ordinary_get_value` on
+                        // the statics's stored prototype so static
+                        // inheritance (`Foo.reject`,
+                        // `MySet[Symbol.species]`, ...) resolves.
+                        let parent = crate::object::prototype_value(statics, &self.gc_heap);
+                        let walked = match parent {
+                            Some(p)
+                                if !matches!(
+                                    p,
+                                    Value::Object(_) | Value::Null | Value::Undefined
+                                ) =>
+                            {
+                                match self.ordinary_get_value(
+                                    context,
+                                    p,
+                                    receiver.clone(),
+                                    &VmPropertyKey::String(name),
+                                    0,
+                                )? {
+                                    VmGetOutcome::Value(v) => Some(v),
+                                    VmGetOutcome::InvokeGetter { getter } => {
+                                        Some(self.run_callable_sync(
+                                            context,
+                                            &getter,
+                                            receiver.clone(),
+                                            SmallVec::new(),
+                                        )?)
+                                    }
                                 }
-                                _ => Value::Undefined,
                             }
+                            _ => None,
+                        };
+                        match walked {
+                            Some(v) if !matches!(v, Value::Undefined) => v,
+                            _ if name == "name" || name == "length" => {
+                                let ctor = c.ctor(&self.gc_heap);
+                                match &ctor {
+                                    Value::Function { .. }
+                                    | Value::Closure { .. }
+                                    | Value::NativeFunction(_)
+                                    | Value::BoundFunction(_) => {
+                                        let ctx = function_metadata::FunctionMetadataContext::new(
+                                            context,
+                                            &self.gc_heap,
+                                            &self.string_heap,
+                                            &self.function_user_props,
+                                            &self.function_deleted_metadata,
+                                        );
+                                        function_metadata::callable_intrinsic_property(
+                                            &ctx, &ctor, name,
+                                        )?
+                                    }
+                                    _ => Value::Undefined,
+                                }
+                            }
+                            _ => Value::Undefined,
                         }
-                        None => Value::Undefined,
                     }
                 }
             }

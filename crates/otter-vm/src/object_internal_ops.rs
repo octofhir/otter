@@ -2088,21 +2088,29 @@ impl Interpreter {
                 Ok(VmGetOutcome::Value(value))
             }
             Value::ClassConstructor(class) => {
-                let value = match key {
-                    VmPropertyKey::Symbol(sym) => {
-                        object::get_symbol(class.statics(&self.gc_heap), &self.gc_heap, sym)
-                            .unwrap_or(Value::Undefined)
-                    }
-                    _ if key.string_name().is_some_and(|key| key == "prototype") => {
-                        Value::Object(class.prototype(&self.gc_heap))
-                    }
-                    _ => object::get(
-                        class.statics(&self.gc_heap),
-                        &self.gc_heap,
-                        key.string_name()
-                            .expect("non-symbol key has string spelling"),
-                    )
-                    .unwrap_or(Value::Undefined),
+                if key.string_name().is_some_and(|k| k == "prototype") {
+                    return Ok(VmGetOutcome::Value(Value::Object(
+                        class.prototype(&self.gc_heap),
+                    )));
+                }
+                // §15.7.10 ClassDefinitionEvaluation step 6.b — the
+                // statics object's [[Prototype]] chains to the parent
+                // class value (a NativeFunction for `extends Promise`,
+                // a ClassConstructor for `extends UserClass`, an
+                // Object otherwise). Route through `ordinary_get_value`
+                // on the statics receiver so the proto walk handles
+                // every prototype kind uniformly.
+                let statics = class.statics(&self.gc_heap);
+                let outcome = self.ordinary_get_value(
+                    context,
+                    Value::Object(statics),
+                    receiver,
+                    key,
+                    hops + 1,
+                )?;
+                let value = match &outcome {
+                    VmGetOutcome::Value(v) => v.clone(),
+                    VmGetOutcome::InvokeGetter { .. } => return Ok(outcome),
                 };
                 if let Some(outcome) =
                     self.callable_realm_prototype_accessor_outcome(&value, key)?

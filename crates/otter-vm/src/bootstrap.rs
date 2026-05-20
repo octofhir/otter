@@ -1320,7 +1320,12 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         object::set_prototype(array, heap, Some(object_proto));
         object::set_prototype(prototype, heap, Some(object_proto));
     }
-    object::set(array, heap, "prototype", Value::Object(prototype));
+    let _ = object::define_own_property(
+        array,
+        heap,
+        "prototype",
+        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+    );
     {
         let mut builder = ObjectBuilder::from_object_with_value_roots(
             heap,
@@ -1878,7 +1883,12 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     let number_value = Value::Object(statics);
     // §21.1.3.1 `Number.prototype.constructor` points back at the
     // Number constructor.
-    object::set(prototype, heap, "constructor", number_value.clone());
+    let _ = object::define_own_property(
+        prototype,
+        heap,
+        "constructor",
+        crate::object::PropertyDescriptor::data(number_value.clone(), true, false, true),
+    );
     define_global(global, heap, "Number", number_value);
     // §21.1.2.{12,13} / §19.2.{4,5} — `Number.parseInt`,
     // `Number.parseFloat`, `Number.isNaN`, `Number.isFinite` MUST be
@@ -2243,7 +2253,12 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             return Err(JsSurfaceError::DefinePropertyFailed("__proto__"));
         }
     }
-    object::set(prototype, heap, "constructor", Value::Object(object));
+    let _ = object::define_own_property(
+        prototype,
+        heap,
+        "constructor",
+        PropertyDescriptor::data(Value::Object(object), true, false, true),
+    );
     define_global(global, heap, "Object", Value::Object(object));
     Ok(())
 }
@@ -2331,7 +2346,12 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
-    object::set(constructor, heap, "prototype", Value::Object(prototype));
+    let _ = object::define_own_property(
+        constructor,
+        heap,
+        "prototype",
+        PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+    );
 
     // §21.4.4 Properties of the Date Prototype Object — install
     // JS-visible prototype method specs so `(new Date()).getTime`
@@ -2379,7 +2399,12 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
     }
 
     let date_value = Value::Object(constructor);
-    object::set(prototype, heap, "constructor", date_value.clone());
+    let _ = object::define_own_property(
+        prototype,
+        heap,
+        "constructor",
+        PropertyDescriptor::data(date_value.clone(), true, false, true),
+    );
     define_global(global, heap, "Date", date_value);
     Ok(())
 }

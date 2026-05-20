@@ -192,7 +192,12 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     }
 
     let string_value = Value::Object(constructor);
-    object::set(prototype, heap, "constructor", string_value.clone());
+    let _ = object::define_own_property(
+        prototype,
+        heap,
+        "constructor",
+        crate::object::PropertyDescriptor::data(string_value.clone(), true, false, true),
+    );
     crate::bootstrap::define_global_value(
         global,
         heap,

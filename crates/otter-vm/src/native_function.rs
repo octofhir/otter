@@ -979,29 +979,6 @@ where
     )?))
 }
 
-pub(crate) fn native_value_with_trace_unchecked_with_roots<F>(
-    heap: &mut otter_gc::GcHeap,
-    name: &'static str,
-    captures: SmallVec<[Value; 4]>,
-    trace: Rc<NativeTraceFn>,
-    external_visit: &mut RootSlotVisitor<'_>,
-    call: F,
-) -> Result<Value, otter_gc::OutOfMemory>
-where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
-{
-    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
-        heap,
-        name,
-        0,
-        NativeCallStorage::LocalDynamic(Rc::new(call)),
-        captures,
-        Some(trace),
-        NativeFunctionMetadata::BUILTIN,
-        external_visit,
-    )?))
-}
-
 pub(crate) fn traced_native_value_with_length<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,

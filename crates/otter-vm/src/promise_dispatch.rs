@@ -35,8 +35,7 @@
 use crate::error_classes::{ErrorClassRegistry, ErrorKind};
 use crate::execution_context::ExecutionContext;
 use crate::native_function::{
-    NativeError, native_value_with_captures_unchecked_with_roots,
-    native_value_with_trace_unchecked_with_roots, traced_native_value_with_length,
+    NativeError, native_value_with_captures_unchecked_with_roots, traced_native_value_with_length,
 };
 use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
@@ -494,32 +493,6 @@ where
     )
 }
 
-fn native_value_with_trace_runtime_rooted<F>(
-    interp: &mut Interpreter,
-    name: &'static str,
-    captures: smallvec::SmallVec<[Value; 4]>,
-    trace: Rc<crate::native_function::NativeTraceFn>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
-    call: F,
-) -> Result<Value, otter_gc::OutOfMemory>
-where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
-{
-    let roots = interp.collect_runtime_roots();
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
-    };
-    native_value_with_trace_unchecked_with_roots(
-        interp.gc_heap_mut(),
-        name,
-        captures,
-        trace,
-        &mut external_visit,
-        call,
-    )
-}
-
 fn trace_captures(
     captures: &smallvec::SmallVec<[Value; 4]>,
 ) -> Rc<crate::native_function::NativeTraceFn> {
@@ -700,7 +673,7 @@ pub fn prototype_call(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     match name {
-        "then" => Ok(method_then(interp, context, promise, args)),
+        "then" => method_then(interp, context, promise, args),
         "catch" => Ok(method_catch(interp, context, promise, args)),
         "finally" => Ok(method_finally(interp, context, promise, args)),
         other => Err(NativeError::TypeError {
@@ -779,15 +752,23 @@ fn new_generic_promise_capability(
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.extend_from_slice(value_roots);
     roots.push(&constructor);
-    let executor = native_value_with_trace_runtime_rooted(
-        interp,
-        "Promise capability executor",
-        SmallVec::new(),
-        trace_state,
-        roots.as_slice(),
-        slice_roots,
-        move |_ctx, args, _captures| state_for_call.call(args),
-    )?;
+    // §27.2.1.5.1 — the GetCapabilitiesExecutor has length 2.
+    let executor = {
+        let runtime_roots = interp.collect_runtime_roots();
+        let roots_slice = roots.as_slice();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_runtime_roots(visitor, &runtime_roots, roots_slice, slice_roots);
+        };
+        crate::native_function::traced_native_value_with_length(
+            interp.gc_heap_mut(),
+            "",
+            2,
+            SmallVec::new(),
+            trace_state,
+            &mut external_visit,
+            move |_ctx, args, _captures| state_for_call.call(args),
+        )?
+    };
     let promise = interp
         .run_construct_sync(
             &exec,
@@ -862,6 +843,128 @@ fn reject_capability_error(
 ) -> Result<Value, NativeError> {
     call_capability_reject(interp, cap, native_error_rejection_value(err))?;
     Ok(cap.promise.clone())
+}
+
+/// Read an own/inherited property by string key without callability check.
+///
+/// Invokes any accessor `[[Get]]` exactly once per §10.1.8.1.
+fn get_property_runtime(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    receiver: Value,
+    key: &'static str,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let property_key = crate::VmPropertyKey::String(key);
+    match interp
+        .ordinary_get_value(
+            context,
+            receiver.clone(),
+            receiver.clone(),
+            &property_key,
+            0,
+        )
+        .map_err(|err| promise_vm_error(name, err))?
+    {
+        crate::VmGetOutcome::Value(value) => Ok(value),
+        crate::VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(context, &getter, receiver, SmallVec::new())
+            .map_err(|err| promise_vm_error(name, err)),
+    }
+}
+
+/// Read an own/inherited property by symbol key without callability check.
+fn get_symbol_property_runtime(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    receiver: Value,
+    sym: &crate::symbol::JsSymbol,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let property_key = crate::VmPropertyKey::Symbol(sym.clone());
+    match interp
+        .ordinary_get_value(
+            context,
+            receiver.clone(),
+            receiver.clone(),
+            &property_key,
+            0,
+        )
+        .map_err(|err| promise_vm_error(name, err))?
+    {
+        crate::VmGetOutcome::Value(value) => Ok(value),
+        crate::VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(context, &getter, receiver, SmallVec::new())
+            .map_err(|err| promise_vm_error(name, err)),
+    }
+}
+
+/// §7.3.21 `SpeciesConstructor(O, defaultConstructor)` — picks the
+/// constructor to use when an algorithm needs a fresh instance derived
+/// from `O`. Returns `defaultConstructor` when `O.constructor` is
+/// `undefined`, throws `TypeError` if `constructor` is a non-object,
+/// returns `C` when `C[@@species]` is `null`/`undefined`, and otherwise
+/// returns `C[@@species]` after validating it is a constructor.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-speciesconstructor>
+fn species_constructor_runtime(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    obj: &Value,
+    default_ctor: &Value,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let c = get_property_runtime(interp, context, obj.clone(), "constructor", name)?;
+    if matches!(c, Value::Undefined) {
+        return Ok(default_ctor.clone());
+    }
+    if !is_object_like(&c) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "constructor is not an Object".to_string(),
+        });
+    }
+    let species_sym = interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Species);
+    let s = get_symbol_property_runtime(interp, context, c.clone(), &species_sym, name)?;
+    if matches!(s, Value::Undefined | Value::Null) {
+        return Ok(c);
+    }
+    if crate::is_constructor_runtime(&s, context, interp.gc_heap()) {
+        return Ok(s);
+    }
+    Err(NativeError::TypeError {
+        name,
+        reason: "Symbol.species is not a constructor".to_string(),
+    })
+}
+
+fn is_object_like(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::Proxy(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::Promise(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Generator(_)
+    )
 }
 
 fn get_callable_property(
@@ -1572,12 +1675,32 @@ fn static_with_resolvers_generic(
 
 // -- prototype methods ---------------------------------------------
 
+/// §27.2.5.4 `Promise.prototype.then(onFulfilled, onRejected)`.
+///
+/// 1. Let promise be the this value.
+/// 2. If IsPromise(promise) is false, throw TypeError.
+/// 3. Let C = SpeciesConstructor(promise, %Promise%).
+/// 4. Let resultCapability = NewPromiseCapability(C).
+/// 5. Return PerformPromiseThen(promise, onFulfilled, onRejected,
+///    resultCapability).
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-promise.prototype.then>
 fn method_then(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     promise: &JsPromiseHandle,
     args: &[Value],
-) -> Value {
+) -> Result<Value, NativeError> {
+    const NAME: &str = "Promise.prototype.then";
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name: NAME,
+        reason: "missing execution context".to_string(),
+    })?;
+    let promise_root = Value::Promise(*promise);
+    let default_ctor = builtin_promise_constructor(interp)?;
+    let c = species_constructor_runtime(interp, &exec, &promise_root, &default_ctor, NAME)?;
+
     let on_fulfilled = match args.first() {
         Some(v) if crate::is_callable_value(v) => Some(v.clone()),
         _ => None,
@@ -1586,7 +1709,33 @@ fn method_then(
         Some(v) if crate::is_callable_value(v) => Some(v.clone()),
         _ => None,
     };
-    perform_then_with_handlers(interp, context, promise, on_fulfilled, on_rejected)
+
+    let mut roots: Vec<&Value> = vec![&promise_root, &c];
+    if let Some(value) = &on_fulfilled {
+        roots.push(value);
+    }
+    if let Some(value) = &on_rejected {
+        roots.push(value);
+    }
+    let capability = if is_builtin_promise_constructor(interp, &c) {
+        PromiseBuilder::with_optional_context(context.clone())
+            .capability_runtime_rooted(interp, &roots, &[])
+            .map_err(|_| oom_native(NAME))?
+    } else {
+        new_generic_promise_capability(interp, context.clone(), c.clone(), &roots, &[])?
+    };
+
+    let outcome = promise.perform_then_with_context(
+        interp.gc_heap_mut(),
+        on_fulfilled,
+        on_rejected,
+        capability.clone(),
+        context,
+    );
+    if let Some(job) = outcome.immediate_job {
+        interp.microtasks_mut().enqueue(job);
+    }
+    Ok(capability.promise)
 }
 
 fn method_catch(

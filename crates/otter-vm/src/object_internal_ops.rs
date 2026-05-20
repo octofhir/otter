@@ -21,6 +21,8 @@
 //! - [`crate::property_dispatch`]
 //! - [`crate::object`]
 
+use std::collections::BTreeSet;
+
 use smallvec::SmallVec;
 
 use crate::{
@@ -495,18 +497,23 @@ impl Interpreter {
                 // (`Object.getOwnPropertyDescriptor(arr, "p")`) see
                 // the user-installed getter / setter.
                 if let Some((getter, setter)) = array::get_accessor(arr, &self.gc_heap, key) {
-                    return Ok(Some(object::PropertyDescriptor::accessor(
-                        getter, setter, true, true,
-                    )));
+                    let flags = array::get_property_flags(arr, &self.gc_heap, key)
+                        .unwrap_or_else(|| object::PropertyFlags::new(false, true, true));
+                    return Ok(Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Accessor { getter, setter },
+                        flags,
+                    }));
                 }
                 if let Ok(idx) = key.parse::<usize>() {
                     if array::has_own_element(arr, &self.gc_heap, idx) {
-                        return Ok(Some(object::PropertyDescriptor::data(
-                            array::get(arr, &self.gc_heap, idx),
-                            true,
-                            true,
-                            true,
-                        )));
+                        let flags = array::get_property_flags(arr, &self.gc_heap, key)
+                            .unwrap_or_else(object::PropertyFlags::data_default);
+                        return Ok(Some(object::PropertyDescriptor {
+                            kind: object::DescriptorKind::Data {
+                                value: array::get(arr, &self.gc_heap, idx),
+                            },
+                            flags,
+                        }));
                     }
                     return Ok(None);
                 }
@@ -518,9 +525,12 @@ impl Interpreter {
                         .as_ref()
                         .and_then(|m| m.get(key).cloned())
                 }) {
-                    return Ok(Some(object::PropertyDescriptor::data(
-                        value, true, true, true,
-                    )));
+                    let flags = array::get_property_flags(arr, &self.gc_heap, key)
+                        .unwrap_or_else(object::PropertyFlags::data_default);
+                    return Ok(Some(object::PropertyDescriptor {
+                        kind: object::DescriptorKind::Data { value },
+                        flags,
+                    }));
                 }
                 Ok(None)
             }
@@ -928,10 +938,13 @@ impl Interpreter {
                     // hidden so subsequent reads invoke the getter.
                     let getter = descriptor.get.clone();
                     let setter = descriptor.set.clone();
+                    let flags = descriptor.complete_for_new_property().flags;
                     array::set_accessor(*arr, &mut self.gc_heap, k, getter, setter);
+                    array::set_property_flags(*arr, &mut self.gc_heap, k, flags);
                     return Ok(true);
                 }
                 if let Ok(idx) = k.parse::<usize>() {
+                    let flags = descriptor.complete_for_new_property().flags;
                     let value = descriptor
                         .value
                         .clone()
@@ -946,6 +959,7 @@ impl Interpreter {
                     array::delete_accessor(*arr, &mut self.gc_heap, k);
                     array::set(*arr, &mut self.gc_heap, idx, value)
                         .map_err(|_| VmError::TypeMismatch)?;
+                    array::set_property_flags(*arr, &mut self.gc_heap, k, flags);
                     return Ok(true);
                 }
                 if k == "length" {
@@ -969,9 +983,11 @@ impl Interpreter {
                     return Ok(true);
                 }
                 array::delete_accessor(*arr, &mut self.gc_heap, k);
+                let flags = descriptor.complete_for_new_property().flags;
                 let value = descriptor.value.clone().unwrap_or(Value::Undefined);
                 array::set_named_property(*arr, &mut self.gc_heap, k, value)
                     .map_err(|_| VmError::TypeMismatch)?;
+                array::set_property_flags(*arr, &mut self.gc_heap, k, flags);
                 Ok(true)
             }
             _ => Ok(false),
@@ -1318,20 +1334,46 @@ impl Interpreter {
                 Ok(keys)
             }
             Value::Array(arr) => {
-                let len = array::len(*arr, &self.gc_heap);
-                let mut keys: Vec<Value> = Vec::with_capacity(len + 2);
-                for idx in 0..len {
-                    if array::has_own_element(*arr, &self.gc_heap, idx) {
-                        let key = idx.to_string();
-                        let s =
-                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?;
-                        keys.push(Value::String(s));
+                let (indices, string_keys) = self.gc_heap.read_payload(*arr, |body| {
+                    let mut indices = BTreeSet::new();
+                    for (idx, value) in body.elements.iter().enumerate() {
+                        if !matches!(value, Value::Hole) {
+                            indices.insert(idx);
+                        }
                     }
+                    if let Some(sparse) = &body.sparse_elements {
+                        indices.extend(sparse.keys().copied());
+                    }
+                    let mut string_keys = Vec::new();
+                    if let Some(named) = &body.named_properties {
+                        string_keys.extend(named.keys().cloned());
+                    }
+                    if let Some(accessors) = &body.accessors {
+                        for key in accessors.keys() {
+                            if let Ok(index) = key.parse::<usize>() {
+                                indices.insert(index);
+                            } else if !string_keys.iter().any(|existing| existing == key) {
+                                string_keys.push(key.clone());
+                            }
+                        }
+                    }
+                    (indices, string_keys)
+                });
+                let mut keys: Vec<Value> =
+                    Vec::with_capacity(indices.len() + string_keys.len() + 2);
+                for idx in indices {
+                    let key = idx.to_string();
+                    let s = string::JsString::from_str(&key, string_heap).map_err(VmError::from)?;
+                    keys.push(Value::String(s));
                 }
                 // §10.4.2 Array exotic objects always expose `length`.
                 keys.push(Value::String(
                     string::JsString::from_str("length", string_heap).map_err(VmError::from)?,
                 ));
+                for key in string_keys {
+                    let s = string::JsString::from_str(&key, string_heap).map_err(VmError::from)?;
+                    keys.push(Value::String(s));
+                }
                 // §10.4.2 — own symbol-keyed properties follow the
                 // string keys per §7.3.22 OrdinaryOwnPropertyKeys
                 // ordering.
@@ -2903,14 +2945,30 @@ impl Interpreter {
                 Ok(keys)
             }
             Value::Array(arr) => {
-                let len = crate::array::len(arr, &self.gc_heap);
-                let mut keys = Vec::new();
-                for idx in 0..len {
-                    if crate::array::has_own_element(arr, &self.gc_heap, idx) {
-                        keys.push(idx.to_string());
+                let target = Value::Array(arr);
+                let string_heap = self.string_heap_clone();
+                let own_keys = self.own_property_keys_value(context, &target, &string_heap)?;
+                let mut out = Vec::new();
+                for key_value in own_keys {
+                    let Value::String(name) = key_value else {
+                        continue;
+                    };
+                    let key = name.to_lossy_string();
+                    if let Some(desc) = self
+                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                            context,
+                            target.clone(),
+                            &VmPropertyKey::OwnedString(key.clone()),
+                            hops + 1,
+                            &[&target],
+                            &[],
+                        )?
+                        && desc.enumerable()
+                    {
+                        out.push(key);
                     }
                 }
-                Ok(keys)
+                Ok(out)
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 // §20.1.2.5 / §10.2.4 — enumerable own string keys in

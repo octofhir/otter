@@ -27,6 +27,7 @@ use smallvec::SmallVec;
 
 use crate::Value;
 use crate::number::NumberValue;
+use crate::object::PropertyFlags;
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -63,6 +64,10 @@ pub struct ArrayBody {
     /// the `named_properties` data entry. Spec: §10.4.2.1
     /// ArrayExoticObject [[DefineOwnProperty]].
     pub(crate) accessors: Option<HashMap<String, (Option<Value>, Option<Value>)>>,
+    /// Descriptor flags for properties installed through
+    /// `Object.defineProperty`. Missing entries use the ordinary
+    /// array defaults for data properties.
+    pub(crate) property_flags: Option<HashMap<String, PropertyFlags>>,
     /// Symbol-keyed own properties. Stored as a vector of
     /// `(JsSymbol, Value)` pairs (mirroring `JsObject::symbol_props`)
     /// because `JsSymbol` is identity-based — `ptr_eq` is the
@@ -681,6 +686,34 @@ pub fn set_named_property(
     });
     heap.record_write(arr, &barrier_value);
     Ok(())
+}
+
+/// Read descriptor flags installed for a string-keyed array own property.
+#[must_use]
+pub(crate) fn get_property_flags(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    key: &str,
+) -> Option<PropertyFlags> {
+    heap.read_payload(arr, |body| {
+        body.property_flags
+            .as_ref()
+            .and_then(|flags| flags.get(key).copied())
+    })
+}
+
+/// Store descriptor flags for a string-keyed array own property.
+pub(crate) fn set_property_flags(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    flags: PropertyFlags,
+) {
+    heap.with_payload(arr, |body| {
+        let map = body.property_flags.get_or_insert_with(HashMap::new);
+        map.insert(key.to_string(), flags);
+        body.dirty = true;
+    });
 }
 
 /// Read a string-keyed own property. Numeric strings route to indexed

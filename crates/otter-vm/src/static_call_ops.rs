@@ -909,23 +909,6 @@ impl Interpreter {
         match method {
             M::Keys => {
                 let owned: Vec<String> = match args.first() {
-                    Some(Value::Object(target)) => {
-                        object::with_properties(*target, self.gc_heap(), |p| {
-                            p.enumerable_keys().map(|k| k.to_string()).collect()
-                        })
-                    }
-                    Some(Value::NativeFunction(native)) => native
-                        .enumerable_own_property_keys(self.gc_heap())
-                        .into_iter()
-                        .collect(),
-                    Some(Value::BoundFunction(bound)) => {
-                        crate::function_metadata::bound_enumerable_own_property_keys(
-                            bound,
-                            self.gc_heap(),
-                        )
-                        .into_iter()
-                        .collect()
-                    }
                     // §7.1.18 ToObject — Boolean / Number / Symbol /
                     // BigInt wrappers expose no own enumerable
                     // string keys; String wrappers carry indexed
@@ -938,19 +921,8 @@ impl Interpreter {
                         let len = s.len() as usize;
                         (0..len).map(|i| i.to_string()).collect()
                     }
-                    Some(Value::Array(arr)) => {
-                        let len = crate::array::len(*arr, self.gc_heap());
-                        let mut keys: Vec<String> = (0..len)
-                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
-                            .map(|i| i.to_string())
-                            .collect();
-                        let named: Vec<String> = self.gc_heap().read_payload(*arr, |body| {
-                            body.named_properties
-                                .as_ref()
-                                .map_or_else(Vec::new, |m| m.keys().cloned().collect())
-                        });
-                        keys.extend(named);
-                        keys
+                    Some(target) if enumerable_own_names_uses_internal_methods(target) => {
+                        self.enumerable_own_string_keys_for_value(context, target.clone(), 0)?
                     }
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
@@ -986,13 +958,6 @@ impl Interpreter {
                                     .map(Value::String)
                                     .unwrap_or(Value::Undefined)
                             })
-                            .collect()
-                    }
-                    Some(Value::Array(arr)) => {
-                        let len = crate::array::len(*arr, self.gc_heap());
-                        (0..len)
-                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
-                            .map(|i| crate::array::get(*arr, self.gc_heap(), i))
                             .collect()
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
@@ -1036,13 +1001,6 @@ impl Interpreter {
                                 .unwrap_or(Value::Undefined);
                                 (i.to_string(), v)
                             })
-                            .collect()
-                    }
-                    Some(Value::Array(arr)) => {
-                        let len = crate::array::len(*arr, self.gc_heap());
-                        (0..len)
-                            .filter(|&i| crate::array::has_own_element(*arr, self.gc_heap(), i))
-                            .map(|i| (i.to_string(), crate::array::get(*arr, self.gc_heap(), i)))
                             .collect()
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
@@ -1983,6 +1941,7 @@ fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool {
     matches!(
         target,
         Value::Object(_)
+            | Value::Array(_)
             | Value::Proxy(_)
             | Value::Function { .. }
             | Value::Closure { .. }

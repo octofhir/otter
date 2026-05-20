@@ -1287,9 +1287,29 @@ impl Interpreter {
             // <https://tc39.es/ecma262/#sec-array-exotic-objects-get-p-receiver>
             (Value::Array(arr), Value::String(key)) => {
                 let name = key.to_lossy_string();
-                match crate::array::get_named_property(*arr, &self.gc_heap, &name) {
-                    Some(v) => v,
-                    None => self.load_from_constructor_prototype(context, "Array", &recv, &name)?,
+                if name == "length" {
+                    Value::Number(NumberValue::from_f64(
+                        crate::array::len(*arr, &self.gc_heap) as f64,
+                    ))
+                } else if let Some((getter, _setter)) =
+                    crate::array::get_accessor(*arr, &self.gc_heap, &name)
+                {
+                    match getter {
+                        Some(getter) if abstract_ops::is_callable(&getter) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.run_callable_sync(context, &getter, recv.clone(), args)?
+                        }
+                        _ => Value::Undefined,
+                    }
+                } else if let Some(idx) = crate::object::array_index_property_name(&name) {
+                    crate::array::get(*arr, &self.gc_heap, idx as usize)
+                } else {
+                    match crate::array::get_named_property(*arr, &self.gc_heap, &name) {
+                        Some(v) => v,
+                        None => {
+                            self.load_from_constructor_prototype(context, "Array", &recv, &name)?
+                        }
+                    }
                 }
             }
             // §10.4.5.4 IntegerIndexedExoticObject [[Get]]:

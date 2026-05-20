@@ -1115,9 +1115,23 @@ impl Interpreter {
                     {
                         return Ok(false);
                     }
+                    let old_len = array::len(*arr, &self.gc_heap);
                     let length_writable = array::length_writable(*arr, &self.gc_heap);
                     if !length_writable {
-                        return Ok(false);
+                        if matches!(descriptor.writable, Some(true)) {
+                            return Ok(false);
+                        }
+                        if let Some(v) = descriptor.value.clone() {
+                            let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
+                            let new_len = crate::number::bitwise::to_uint32(number_len);
+                            if (new_len as f64) != number_len.as_f64() {
+                                return Err(VmError::RangeError {
+                                    message: "Invalid array length".to_string(),
+                                });
+                            }
+                            return Ok(new_len as usize == old_len);
+                        }
+                        return Ok(true);
                     }
                     let new_writable = descriptor.writable.unwrap_or(true);
                     if let Some(v) = descriptor.value.clone() {

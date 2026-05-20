@@ -1197,7 +1197,50 @@ fn native_prototype_value_of(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    Ok(ctx.this_value().clone())
+    object_prototype_to_object(ctx, "valueOf")
+}
+
+fn object_prototype_to_object(
+    ctx: &mut NativeCtx<'_>,
+    method_name: &'static str,
+) -> Result<Value, NativeError> {
+    let this_value = ctx.this_value().clone();
+    let (proto_name, setter): (&str, fn(JsObject, &mut otter_gc::GcHeap, &Value)) =
+        match &this_value {
+            Value::Null | Value::Undefined => {
+                return Err(NativeError::TypeError {
+                    name: method_name,
+                    reason: "cannot convert null or undefined to object".to_string(),
+                });
+            }
+            Value::Boolean(_) => ("Boolean", set_primitive_wrapper_data),
+            Value::Number(_) => ("Number", set_primitive_wrapper_data),
+            Value::String(_) => ("String", set_primitive_wrapper_data),
+            Value::Symbol(_) => ("Symbol", set_primitive_wrapper_data),
+            Value::BigInt(_) => ("BigInt", set_primitive_wrapper_data),
+            _ => return Ok(this_value),
+        };
+    let proto = match ctx.cx.interp.constructor_prototype_value(proto_name).ok() {
+        Some(Value::Object(proto)) => Some(proto),
+        _ => ctx.cx.interp.object_prototype_object_opt(),
+    };
+    let wrapper = ctx.alloc_object_with_roots(&[&this_value], &[])?;
+    if let Some(proto) = proto {
+        crate::object::set_prototype(wrapper, ctx.heap_mut(), Some(proto));
+    }
+    setter(wrapper, ctx.heap_mut(), &this_value);
+    Ok(Value::Object(wrapper))
+}
+
+fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, value: &Value) {
+    match value {
+        Value::Boolean(value) => crate::object::set_boolean_data(wrapper, heap, *value),
+        Value::Number(value) => crate::object::set_number_data(wrapper, heap, *value),
+        Value::String(value) => crate::object::set_string_data(wrapper, heap, value.clone()),
+        Value::Symbol(value) => crate::object::set_symbol_data(wrapper, heap, value.clone()),
+        Value::BigInt(value) => crate::object::set_bigint_data(wrapper, heap, value.clone()),
+        _ => {}
+    }
 }
 
 /// §20.1.3.5 `Object.prototype.toLocaleString ( [ reserved1 [ , reserved2 ] ] )`.
@@ -1241,6 +1284,12 @@ fn native_prototype_has_own_property(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
+    if matches!(this_value, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: "hasOwnProperty",
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
     if let Some(context) = ctx.execution_context().cloned() {
         let desc = ctx
             .cx
@@ -1279,6 +1328,12 @@ fn native_prototype_property_is_enumerable(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
+    if matches!(this_value, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: "propertyIsEnumerable",
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
     if let Some(context) = ctx.execution_context().cloned() {
         let desc = ctx
             .cx

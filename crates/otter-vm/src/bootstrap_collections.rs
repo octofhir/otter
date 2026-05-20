@@ -334,37 +334,16 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             name: "Map.groupBy",
             reason: "missing execution context".to_string(),
         })?;
+    let items_snapshot = ctx
+        .cx
+        .interp
+        .iterator_to_list_sync(&exec_ctx, &items)
+        .map_err(map_group_by_vm_error)?;
     let result = ctx.alloc_map().map_err(|_| NativeError::TypeError {
         name: "Map.groupBy",
         reason: "out of memory".to_string(),
     })?;
     let result_value = Value::Map(result);
-    let items_snapshot: Vec<Value> = match &items {
-        Value::Array(arr) => {
-            crate::array::with_elements(*arr, ctx.heap(), |elements| elements.to_vec())
-        }
-        Value::Object(obj) => {
-            let length = crate::object::get(*obj, ctx.heap(), "length").unwrap_or(Value::Undefined);
-            let len = crate::number::to_number_value(&length);
-            let n = if len.is_nan() || len <= 0.0 {
-                0
-            } else {
-                len.min(9_007_199_254_740_991.0) as usize
-            };
-            let mut out: Vec<Value> = Vec::with_capacity(n);
-            for i in 0..n {
-                let key = i.to_string();
-                out.push(crate::object::get(*obj, ctx.heap(), &key).unwrap_or(Value::Undefined));
-            }
-            out
-        }
-        _ => {
-            return Err(NativeError::TypeError {
-                name: "Map.groupBy",
-                reason: "items is not iterable".to_string(),
-            });
-        }
-    };
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(item.clone());
@@ -375,10 +354,7 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             .cx
             .interp
             .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)
-            .map_err(|e| NativeError::TypeError {
-                name: "Map.groupBy",
-                reason: e.to_string(),
-            })?;
+            .map_err(map_group_by_vm_error)?;
         let existing = crate::collections::map_get(result, ctx.heap(), &key);
         let group_arr = match existing {
             Some(Value::Array(arr)) => arr,
@@ -419,6 +395,19 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             })?;
     }
     Ok(result_value)
+}
+
+fn map_group_by_vm_error(err: crate::VmError) -> NativeError {
+    match err {
+        crate::VmError::Uncaught { value } => NativeError::Thrown {
+            name: "Map.groupBy",
+            message: value,
+        },
+        other => NativeError::TypeError {
+            name: "Map.groupBy",
+            reason: other.to_string(),
+        },
+    }
 }
 
 fn install_prototype_methods(

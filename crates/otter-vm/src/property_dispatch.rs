@@ -999,6 +999,36 @@ impl Interpreter {
             }
             Value::Array(a) => {
                 if !self.store_array_accessor_property(context, *a, name, &value, strict)? {
+                    let has_own_named =
+                        crate::array::get_named_property(*a, &self.gc_heap, name).is_some();
+                    if !has_own_named {
+                        let proto = self.constructor_prototype_value("Array")?;
+                        if let Value::Object(proto) = proto {
+                            match crate::object::resolve_set(proto, &self.gc_heap, name) {
+                                object::SetOutcome::InvokeSetter { setter } => {
+                                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                    args.push(value.clone());
+                                    self.run_callable_sync(
+                                        context,
+                                        &setter,
+                                        Value::Array(*a),
+                                        args,
+                                    )?;
+                                    stack[top_idx].pc += 1;
+                                    return Ok(());
+                                }
+                                object::SetOutcome::Reject { .. } => {
+                                    Self::failed_set_result(
+                                        strict,
+                                        format!("Cannot assign to property '{name}'"),
+                                    )?;
+                                    stack[top_idx].pc += 1;
+                                    return Ok(());
+                                }
+                                object::SetOutcome::AssignData => {}
+                            }
+                        }
+                    }
                     crate::array::set_named_property(*a, &mut self.gc_heap, name, value.clone())?;
                 }
                 None

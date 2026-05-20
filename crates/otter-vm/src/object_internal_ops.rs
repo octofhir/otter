@@ -2224,13 +2224,7 @@ impl Interpreter {
             // ArrayBuffer / DataView — walk realm prototypes for
             // instance method lookups.
             Value::ArrayBuffer(_) | Value::DataView(_) => {
-                let proto_name = match base {
-                    Value::ArrayBuffer(buf) if buf.is_shared() => "SharedArrayBuffer",
-                    Value::ArrayBuffer(_) => "ArrayBuffer",
-                    Value::DataView(_) => "DataView",
-                    _ => unreachable!(),
-                };
-                let proto = self.constructor_prototype_value(proto_name)?;
+                let proto = self.get_prototype_for_op(&base)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
                     return Ok(VmGetOutcome::Value(Value::Undefined));
                 }
@@ -2279,7 +2273,8 @@ impl Interpreter {
                 {
                     return Ok(VmGetOutcome::Value(v));
                 }
-                let proto = self.constructor_prototype_value(t.kind().name())?;
+                let this_value = Value::TypedArray(t.clone());
+                let proto = self.get_prototype_for_op(&this_value)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
                     return Ok(VmGetOutcome::Value(Value::Undefined));
                 }

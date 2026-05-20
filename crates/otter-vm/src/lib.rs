@@ -1688,6 +1688,12 @@ pub struct Interpreter {
     /// deleting built-in function metadata does not resurrect the
     /// intrinsic fallback on later reads.
     function_deleted_metadata: std::collections::HashSet<(u32, &'static str)>,
+    /// Per-instance `[[Prototype]]` overrides for object-shaped
+    /// exotics whose payloads are still `Rc` / `Arc` backed rather
+    /// than GC-managed. Values stored here are traced from the
+    /// interpreter root set, which keeps subclass prototypes safe
+    /// without embedding untraced `Value` slots in non-GC bodies.
+    non_gc_exotic_prototype_overrides: std::collections::HashMap<usize, Value>,
     /// Embedder-overridable sink behind the `console` namespace.
     /// Defaults to `println!` / `eprintln!` via
     /// [`console::StdConsoleSink`].
@@ -1899,6 +1905,7 @@ impl Interpreter {
             function_user_props: std::collections::HashMap::new(),
             function_non_extensible: std::collections::HashSet::new(),
             function_deleted_metadata: std::collections::HashSet::new(),
+            non_gc_exotic_prototype_overrides: std::collections::HashMap::new(),
             console_sink: console::default_console_sink(),
             timer_scheduler: None,
             timer_callbacks: timers::TimerCallbacks::new(),
@@ -2222,6 +2229,44 @@ impl Interpreter {
         }
     }
 
+    fn non_gc_exotic_prototype_override_key(value: &Value) -> Option<usize> {
+        match value {
+            Value::ArrayBuffer(buffer) => Some(buffer.identity_addr() as usize),
+            Value::DataView(view) => Some(view.identity_addr() as usize),
+            Value::TypedArray(array) => Some(array.identity_addr() as usize),
+            _ => None,
+        }
+    }
+
+    /// Store the allocation-time `[[Prototype]]` selected by
+    /// ECMA-262 `GetPrototypeFromConstructor` for exotics whose
+    /// bodies are not GC-managed yet.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    pub(crate) fn set_non_gc_exotic_prototype_override(
+        &mut self,
+        value: &Value,
+        proto: Option<Value>,
+    ) {
+        let Some(key) = Self::non_gc_exotic_prototype_override_key(value) else {
+            return;
+        };
+        match proto {
+            Some(proto) => {
+                self.non_gc_exotic_prototype_overrides.insert(key, proto);
+            }
+            None => {
+                self.non_gc_exotic_prototype_overrides.remove(&key);
+            }
+        }
+    }
+
+    pub(crate) fn non_gc_exotic_prototype_override(&self, value: &Value) -> Option<Value> {
+        let key = Self::non_gc_exotic_prototype_override_key(value)?;
+        self.non_gc_exotic_prototype_overrides.get(&key).cloned()
+    }
+
     /// `[[GetPrototypeOf]]` for non-Proxy heap values. Centralises
     /// the foundation rule that constructor-shaped Objects whose
     /// stored `[[Prototype]]` is missing — or is the realm's
@@ -2321,6 +2366,47 @@ impl Interpreter {
                     None => Ok(Value::Null),
                 }
             }
+            Value::Promise(promise) => {
+                if let Some(over) = promise.prototype_override(&self.gc_heap) {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::RegExp(regexp) => {
+                if let Some(over) = regexp.prototype_override(&self.gc_heap) {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::WeakRef(weak_ref) => {
+                if let Some(over) =
+                    crate::weak_refs::weak_ref_prototype_override(*weak_ref, &self.gc_heap)
+                {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::FinalizationRegistry(registry) => {
+                if let Some(over) = crate::weak_refs::finalization_registry_prototype_override(
+                    *registry,
+                    &self.gc_heap,
+                ) {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
             Value::Function { .. }
             | Value::Closure { .. }
             | Value::BoundFunction(_)
@@ -2336,18 +2422,21 @@ impl Interpreter {
             // is "OrdinaryGetPrototypeOf", which reads the slot the
             // class set at allocation time.
             // <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
-            Value::RegExp(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Promise(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Iterator(_)
-            | Value::Generator(_) => match self.intrinsic_prototype_object_for(value) {
-                Some(o) => Ok(Value::Object(o)),
-                None => Ok(Value::Null),
-            },
+            Value::ArrayBuffer(_) | Value::DataView(_) | Value::TypedArray(_) => {
+                if let Some(over) = self.non_gc_exotic_prototype_override(value) {
+                    return Ok(over);
+                }
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
+            Value::Iterator(_) | Value::Generator(_) => {
+                match self.intrinsic_prototype_object_for(value) {
+                    Some(o) => Ok(Value::Object(o)),
+                    None => Ok(Value::Null),
+                }
+            }
             // §20.1.2.10 Object.getPrototypeOf: when applied to a
             // primitive value, the spec performs `ToObject(value)`
             // first (§7.1.18) and then walks the resulting wrapper's
@@ -2849,6 +2938,14 @@ impl Interpreter {
     /// `JsObject` carrying user-side `f.foo = bar` writes.
     pub fn function_user_props_for_trace(&self) -> impl Iterator<Item = &JsObject> {
         self.function_user_props.values()
+    }
+
+    /// Iterator over non-GC exotic prototype override values.
+    /// Used by the GC root walker because the side table can retain
+    /// subclass prototype objects for `ArrayBuffer`, `DataView`, and
+    /// `TypedArray` instances.
+    pub fn non_gc_exotic_prototype_overrides_for_trace(&self) -> impl Iterator<Item = &Value> {
+        self.non_gc_exotic_prototype_overrides.values()
     }
 
     /// Borrow the GC-managed shape side tables for root tracing.

@@ -99,6 +99,10 @@ impl<'a> RuntimeState<'a> {
         for obj in interp.function_user_props_for_trace() {
             obj.trace_gc_roots(visitor);
         }
+        // 6b) Prototype overrides for non-GC exotic payloads.
+        for value in interp.non_gc_exotic_prototype_overrides_for_trace() {
+            value.trace_value_slots(visitor);
+        }
         // 7) GC-managed hidden-class root/key/transition side tables.
         interp.shape_runtime_for_trace().trace_roots(visitor);
         // 7b) Store-property ICs can retain cached GC shape transitions.

@@ -212,6 +212,9 @@ pub struct JsRegExpBody {
     /// `Object.preventExtensions` flips this flag while existing
     /// own slots such as `lastIndex` remain writable.
     pub extensible: bool,
+    /// Per-instance `[[Prototype]]` override for RegExp subclass
+    /// construction.
+    pub prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for JsRegExpBody {
@@ -221,6 +224,9 @@ impl otter_gc::SafeTraceable for JsRegExpBody {
         self.last_index.borrow().trace_value_slots(visitor);
         if let Some(expando) = &self.expando {
             Value::Object(*expando).trace_value_slots(visitor);
+        }
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
         }
     }
 }
@@ -268,6 +274,7 @@ impl JsRegExp {
                 last_index: RefCell::new(Value::Number(NumberValue::from_i32(0))),
                 expando: None,
                 extensible: true,
+                prototype_override: None,
             })?,
         })
     }
@@ -304,6 +311,7 @@ impl JsRegExp {
             body.source = source;
             body.flags = flags;
             *body.last_index.borrow_mut() = Value::Number(NumberValue::from_i32(0));
+            body.prototype_override = None;
         });
         Ok(())
     }
@@ -358,6 +366,20 @@ impl JsRegExp {
     #[must_use]
     pub fn is_extensible(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| body.extensible)
+    }
+
+    pub(crate) fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
+        heap.read_payload(self.inner, |body| body.prototype_override.clone())
+    }
+
+    pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
+        let barrier_value = proto.clone();
+        heap.with_payload(self.inner, |body| {
+            body.prototype_override = proto;
+        });
+        if let Some(value) = &barrier_value {
+            heap.record_write(self.inner, value);
+        }
     }
 
     /// `RegExp` exotic `[[PreventExtensions]]`.

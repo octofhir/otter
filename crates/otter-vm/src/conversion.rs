@@ -352,7 +352,12 @@ impl Interpreter {
                 }
                 "Array"
             }
-            Value::RegExp(_) => "RegExp",
+            Value::RegExp(regexp) => {
+                if let Some(Value::Object(proto)) = regexp.prototype_override(&self.gc_heap) {
+                    return Some(proto);
+                }
+                "RegExp"
+            }
             Value::Map(map) => {
                 if let Some(Value::Object(proto)) =
                     crate::collections::map_prototype_override(*map, &self.gc_heap)
@@ -385,18 +390,53 @@ impl Interpreter {
                 }
                 "WeakSet"
             }
-            Value::WeakRef(_) => "WeakRef",
-            Value::FinalizationRegistry(_) => "FinalizationRegistry",
-            Value::Promise(_) => "Promise",
+            Value::WeakRef(weak_ref) => {
+                if let Some(Value::Object(proto)) =
+                    crate::weak_refs::weak_ref_prototype_override(*weak_ref, &self.gc_heap)
+                {
+                    return Some(proto);
+                }
+                "WeakRef"
+            }
+            Value::FinalizationRegistry(registry) => {
+                if let Some(Value::Object(proto)) =
+                    crate::weak_refs::finalization_registry_prototype_override(
+                        *registry,
+                        &self.gc_heap,
+                    )
+                {
+                    return Some(proto);
+                }
+                "FinalizationRegistry"
+            }
+            Value::Promise(promise) => {
+                if let Some(Value::Object(proto)) = promise.prototype_override(&self.gc_heap) {
+                    return Some(proto);
+                }
+                "Promise"
+            }
             Value::ArrayBuffer(b) => {
+                if let Some(Value::Object(proto)) = self.non_gc_exotic_prototype_override(value) {
+                    return Some(proto);
+                }
                 if b.is_shared() {
                     "SharedArrayBuffer"
                 } else {
                     "ArrayBuffer"
                 }
             }
-            Value::DataView(_) => "DataView",
-            Value::TypedArray(t) => t.kind().name(),
+            Value::DataView(_) => {
+                if let Some(Value::Object(proto)) = self.non_gc_exotic_prototype_override(value) {
+                    return Some(proto);
+                }
+                "DataView"
+            }
+            Value::TypedArray(t) => {
+                if let Some(Value::Object(proto)) = self.non_gc_exotic_prototype_override(value) {
+                    return Some(proto);
+                }
+                t.kind().name()
+            }
             // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — per-kind
             // iterator prototypes inherit from `%IteratorPrototype%`
             // and override `@@toStringTag`. Route through the cached

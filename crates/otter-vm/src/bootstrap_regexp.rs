@@ -473,6 +473,9 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
             reason: format!("{err}"),
         }
     })?;
+    if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "RegExp")? {
+        re.set_prototype_override(ctx.heap_mut(), Some(proto));
+    }
     Ok(Value::RegExp(re))
 }
 

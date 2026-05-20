@@ -595,6 +595,11 @@ impl ErrorClassRegistry {
                     name: kind.class_name(),
                     reason: err.to_string(),
                 })?;
+            if let Some(proto) =
+                crate::bootstrap::native_new_target_prototype(ctx, kind.class_name())?
+            {
+                let _ = object::set_prototype_value(obj, ctx.heap_mut(), Some(proto));
+            }
             if let Some(cause) = cause {
                 install_error_cause(obj, cause, ctx.heap_mut());
             }
@@ -694,6 +699,10 @@ impl ErrorClassRegistry {
                     name: "AggregateError",
                     reason: err.to_string(),
                 })?;
+            if let Some(proto) = crate::bootstrap::native_new_target_prototype(c, "AggregateError")?
+            {
+                let _ = object::set_prototype_value(obj, c.heap_mut(), Some(proto));
+            }
             if let Some(cause) = cause {
                 install_error_cause(obj, cause, c.heap_mut());
             }

@@ -259,13 +259,26 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             &[args],
         );
     };
-    dispatch::shared_array_buffer_call_with_roots(
+    let value = dispatch::shared_array_buffer_call_with_roots(
         SharedArrayBufferMethod::Construct,
         args,
         ctx.heap_mut(),
         &mut external_visit,
     )
-    .map_err(|e| vm_to_native(e, "SharedArrayBuffer"))
+    .map_err(|e| vm_to_native(e, "SharedArrayBuffer"))?;
+    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
+    // construction forwards `new.target`, so the allocated exotic
+    // receives `Subclass.prototype` as its observable [[Prototype]].
+    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    if needs_proto_override
+        && let Some(proto) =
+            crate::bootstrap::native_new_target_prototype(ctx, "SharedArrayBuffer")?
+    {
+        ctx.interp_mut()
+            .set_non_gc_exotic_prototype_override(&value, Some(proto));
+    }
+    Ok(value)
 }
 
 fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -385,13 +398,25 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
             &[args],
         );
     };
-    dispatch::array_buffer_call_with_roots(
+    let value = dispatch::array_buffer_call_with_roots(
         ArrayBufferMethod::Construct,
         args,
         ctx.heap_mut(),
         &mut external_visit,
     )
-    .map_err(|e| vm_to_native(e, "ArrayBuffer"))
+    .map_err(|e| vm_to_native(e, "ArrayBuffer"))?;
+    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
+    // construction forwards `new.target`, so the allocated exotic
+    // receives `Subclass.prototype` as its observable [[Prototype]].
+    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    if needs_proto_override
+        && let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "ArrayBuffer")?
+    {
+        ctx.interp_mut()
+            .set_non_gc_exotic_prototype_override(&value, Some(proto));
+    }
+    Ok(value)
 }
 
 fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

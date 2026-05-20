@@ -268,6 +268,9 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let (handle, resolve, reject) = PromiseBuilder::with_context(context.clone())
         .construct_native_rooted(ctx, &[&executor], &[args])
         .map_err(|_| oom("Promise"))?;
+    if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "Promise")? {
+        handle.set_prototype_override(ctx.heap_mut(), Some(proto));
+    }
     let promise_value = Value::Promise(handle);
     let invoke_args: SmallVec<[Value; 8]> = smallvec::smallvec![resolve, reject.clone()];
     let invoke_result =

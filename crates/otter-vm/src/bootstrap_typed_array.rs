@@ -1202,14 +1202,28 @@ fn ta_ctor_dispatch(
             &[coerced_slice],
         );
     };
-    dispatch::typed_array_call_with_roots(
+    let value = dispatch::typed_array_call_with_roots(
         kind,
         TypedArrayMethod::Construct,
         coerced_slice,
         ctx.heap_mut(),
         &mut external_visit,
     )
-    .map_err(|e| vm_to_native(e, typed_array_name(kind)))
+    .map_err(|e| vm_to_native(e, typed_array_name(kind)))?;
+    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
+    // construction forwards `new.target`, so the allocated typed
+    // array receives `Subclass.prototype` as its observable
+    // [[Prototype]].
+    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    if needs_proto_override
+        && let Some(proto) =
+            crate::bootstrap::native_new_target_prototype(ctx, typed_array_name(kind))?
+    {
+        ctx.interp_mut()
+            .set_non_gc_exotic_prototype_override(&value, Some(proto));
+    }
+    Ok(value)
 }
 
 const fn typed_array_name(kind: TypedArrayKind) -> &'static str {

@@ -281,6 +281,9 @@ pub struct PurePromiseBody {
     /// user-installed `then` / `constructor` overrides per the
     /// Promise resolution-callback observation tests.
     expando: Option<crate::object::JsObject>,
+    /// Per-instance `[[Prototype]]` override for Promise subclass
+    /// construction.
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for PurePromiseBody {
@@ -298,6 +301,9 @@ impl otter_gc::SafeTraceable for PurePromiseBody {
         if let Some(expando) = &self.expando {
             Value::Object(*expando).trace_value_slots(visitor);
         }
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
+        }
     }
 }
 
@@ -311,6 +317,7 @@ impl PurePromise {
                 reject_reactions: Vec::new(),
                 is_handled: false,
                 expando: None,
+                prototype_override: None,
             })?,
         })
     }
@@ -328,6 +335,7 @@ impl PurePromise {
                     reject_reactions: Vec::new(),
                     is_handled: false,
                     expando: None,
+                    prototype_override: None,
                 },
                 external_visit,
             )?,
@@ -346,6 +354,7 @@ impl PurePromise {
                 reject_reactions: Vec::new(),
                 is_handled: false,
                 expando: None,
+                prototype_override: None,
             })?,
         })
     }
@@ -364,6 +373,7 @@ impl PurePromise {
                     reject_reactions: Vec::new(),
                     is_handled: false,
                     expando: None,
+                    prototype_override: None,
                 },
                 external_visit,
             )?,
@@ -382,6 +392,7 @@ impl PurePromise {
                 reject_reactions: Vec::new(),
                 is_handled: false,
                 expando: None,
+                prototype_override: None,
             })?,
         })
     }
@@ -400,6 +411,7 @@ impl PurePromise {
                     reject_reactions: Vec::new(),
                     is_handled: false,
                     expando: None,
+                    prototype_override: None,
                 },
                 external_visit,
             )?,
@@ -431,6 +443,21 @@ impl PurePromise {
             body.expando = Some(expando);
         });
         heap.record_write(self.inner, &barrier);
+    }
+
+    #[must_use]
+    pub(crate) fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
+        heap.read_payload(self.inner, |body| body.prototype_override.clone())
+    }
+
+    pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
+        let barrier_value = proto.clone();
+        let _ = heap.with_payload(self.inner, |body| {
+            body.prototype_override = proto;
+        });
+        if let Some(value) = &barrier_value {
+            heap.record_write(self.inner, value);
+        }
     }
 
     #[cfg(test)]
@@ -665,6 +692,19 @@ impl JsPromiseHandle {
     pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
         match &self.inner {
             PromiseRepr::Pure(p) => p.set_expando(heap, expando),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
+        match &self.inner {
+            PromiseRepr::Pure(p) => p.prototype_override(heap),
+        }
+    }
+
+    pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
+        match &self.inner {
+            PromiseRepr::Pure(p) => p.set_prototype_override(heap, proto),
         }
     }
 

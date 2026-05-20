@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 use crate::js_surface::{Attr, JsSurfaceError, NamespaceSpec, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
-    Value, array, array_prototype, array_statics, atomics, console, constructor_return_is_object,
-    descriptor_value, function_prototype, json, math, object_statics, reflect,
+    NativeCtx, NativeError, Value, array, array_prototype, array_statics, atomics, console,
+    constructor_return_is_object, descriptor_value, function_prototype, json, math, object_statics,
+    reflect,
 };
 
 pub(crate) fn alloc_object_with_value_roots(
@@ -65,6 +66,29 @@ pub(crate) fn native_constructor_static_with_value_roots(
         call,
         &mut external_visit,
     )
+}
+
+pub(crate) fn native_new_target_prototype(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<Option<Value>, NativeError> {
+    let Some(new_target) = ctx.new_target().cloned() else {
+        return Ok(None);
+    };
+    let proto = match new_target {
+        Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
+        Value::Object(obj) => object::get(obj, ctx.heap(), "prototype"),
+        Value::NativeFunction(native) => native
+            .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+            .map_err(|err| NativeError::TypeError {
+                name,
+                reason: err.to_string(),
+            })?
+            .map(|descriptor| descriptor_value(&descriptor)),
+        _ => None,
+    };
+    Ok(proto
+        .filter(|value| constructor_return_is_object(value) || matches!(value, Value::Proxy(_))))
 }
 
 pub(crate) fn native_static_with_value_roots(
@@ -1834,6 +1858,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     }
 
     fn function_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        let new_target_proto = native_new_target_prototype(ctx, "Function")?;
         let (interp, context) = ctx.interp_mut_and_context();
         let Some(context) = context else {
             return Err(NativeError::TypeError {
@@ -1841,7 +1866,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
                 reason: "missing execution context for Function constructor".to_string(),
             });
         };
-        interp
+        let result = interp
             .build_function_constructor_with_roots(&context, args, None, &[], &[args])
             .map_err(|err| {
                 let reason = format!("{err}");
@@ -1855,7 +1880,11 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
                         reason,
                     },
                 }
-            })
+            })?;
+        if let (Value::NativeFunction(native), Some(proto)) = (&result, new_target_proto) {
+            native.set_prototype_override(interp.gc_heap_mut(), Some(proto));
+        }
+        Ok(result)
     }
 
     let global_root = Value::Object(global);

@@ -208,6 +208,9 @@ fn weak_ref_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let weak_ref = ctx
         .alloc_weak_ref(&target, &[], &[args])
         .map_err(|_| oom("WeakRef"))?;
+    if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "WeakRef")? {
+        weak_refs::set_weak_ref_prototype_override(weak_ref, ctx.heap_mut(), Some(proto));
+    }
     Ok(Value::WeakRef(weak_ref))
 }
 
@@ -229,6 +232,14 @@ fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let registry = ctx
         .alloc_finalization_registry(cleanup, context, &[], &[args])
         .map_err(|_| oom("FinalizationRegistry"))?;
+    if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "FinalizationRegistry")?
+    {
+        weak_refs::set_finalization_registry_prototype_override(
+            registry,
+            ctx.heap_mut(),
+            Some(proto),
+        );
+    }
     Ok(Value::FinalizationRegistry(registry))
 }
 

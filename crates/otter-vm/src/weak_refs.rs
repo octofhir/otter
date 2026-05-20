@@ -58,17 +58,21 @@ pub type JsWeakRef = otter_gc::Gc<WeakRefBody>;
 pub type JsFinalizationRegistry = otter_gc::Gc<FinalizationRegistryBody>;
 
 /// GC-allocated payload backing every [`JsWeakRef`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WeakRefBody {
     target: RawGc,
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for WeakRefBody {
     const TYPE_TAG: u8 = WEAK_REF_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         // The target is weak by spec and is cleared by
         // `process_weak_refs_and_finalizers` after marking.
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
+        }
     }
 }
 
@@ -86,6 +90,7 @@ pub struct FinalizationRegistryBody {
     cleanup_callback: Value,
     cleanup_context: Option<ExecutionContext>,
     cells: Vec<FinalizerCell>,
+    prototype_override: Option<Value>,
 }
 
 impl otter_gc::SafeTraceable for FinalizationRegistryBody {
@@ -95,6 +100,9 @@ impl otter_gc::SafeTraceable for FinalizationRegistryBody {
         self.cleanup_callback.trace_value_slots(visitor);
         for cell in &self.cells {
             cell.held_value.trace_value_slots(visitor);
+        }
+        if let Some(proto) = &self.prototype_override {
+            proto.trace_value_slots(visitor);
         }
     }
 }
@@ -130,6 +138,7 @@ pub(crate) fn alloc_weak_ref_with_roots(
     let weak_ref = heap.alloc_with_roots(
         WeakRefBody {
             target: RawGc::NULL,
+            prototype_override: None,
         },
         &mut allocation_roots,
     )?;
@@ -147,9 +156,33 @@ pub(crate) fn alloc_weak_ref_for_mark_sweep_fixture(
     target: &Value,
 ) -> Result<JsWeakRef, crate::VmError> {
     let target = weak_target_raw(target)?;
-    let weak_ref = heap.alloc_old(WeakRefBody { target })?;
+    let weak_ref = heap.alloc_old(WeakRefBody {
+        target,
+        prototype_override: None,
+    })?;
     heap.register_weak_ref(weak_ref);
     Ok(weak_ref)
+}
+
+pub(crate) fn weak_ref_prototype_override(
+    weak_ref: JsWeakRef,
+    heap: &otter_gc::GcHeap,
+) -> Option<Value> {
+    heap.read_payload(weak_ref, |body| body.prototype_override.clone())
+}
+
+pub(crate) fn set_weak_ref_prototype_override(
+    weak_ref: JsWeakRef,
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) {
+    let barrier_value = proto.clone();
+    heap.with_payload(weak_ref, |body| {
+        body.prototype_override = proto;
+    });
+    if let Some(value) = &barrier_value {
+        heap.record_write(weak_ref, value);
+    }
 }
 
 /// Return the target while live, otherwise `undefined`.
@@ -185,6 +218,7 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
             cleanup_callback,
             cleanup_context,
             cells: Vec::new(),
+            prototype_override: None,
         },
         &mut allocation_roots,
     )?;
@@ -206,10 +240,32 @@ pub(crate) fn alloc_finalization_registry_for_mark_sweep_fixture(
         cleanup_callback,
         cleanup_context,
         cells: Vec::new(),
+        prototype_override: None,
     })?;
     heap.register_finalization_registry(registry);
     heap.record_write(registry, &barrier_cleanup_callback);
     Ok(registry)
+}
+
+pub(crate) fn finalization_registry_prototype_override(
+    registry: JsFinalizationRegistry,
+    heap: &otter_gc::GcHeap,
+) -> Option<Value> {
+    heap.read_payload(registry, |body| body.prototype_override.clone())
+}
+
+pub(crate) fn set_finalization_registry_prototype_override(
+    registry: JsFinalizationRegistry,
+    heap: &mut otter_gc::GcHeap,
+    proto: Option<Value>,
+) {
+    let barrier_value = proto.clone();
+    heap.with_payload(registry, |body| {
+        body.prototype_override = proto;
+    });
+    if let Some(value) = &barrier_value {
+        heap.record_write(registry, value);
+    }
 }
 
 /// Register a target/held-value pair.

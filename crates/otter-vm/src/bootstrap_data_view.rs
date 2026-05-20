@@ -183,8 +183,20 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    crate::binary::dispatch::data_view_call(DataViewMethod::Construct, args)
-        .map_err(|e| vm_to_native(e, "DataView"))
+    let value = crate::binary::dispatch::data_view_call(DataViewMethod::Construct, args)
+        .map_err(|e| vm_to_native(e, "DataView"))?;
+    // §10.1.13 GetPrototypeFromConstructor — derived `super()`
+    // construction forwards `new.target`, so the allocated exotic
+    // receives `Subclass.prototype` as its observable [[Prototype]].
+    // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
+    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    if needs_proto_override
+        && let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "DataView")?
+    {
+        ctx.interp_mut()
+            .set_non_gc_exotic_prototype_override(&value, Some(proto));
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------

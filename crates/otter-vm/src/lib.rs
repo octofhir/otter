@@ -4215,6 +4215,9 @@ impl Interpreter {
                             &[&callee],
                             &elements,
                         )?;
+                        if let Some(proto) = self.object_prototype_object_opt() {
+                            object::set_prototype(obj, &mut self.gc_heap, Some(proto));
+                        }
                         crate::arguments_object::initialize_mapped(
                             obj,
                             &mut self.gc_heap,
@@ -4230,6 +4233,9 @@ impl Interpreter {
                             &[&thrower],
                             &elements,
                         )?;
+                        if let Some(proto) = self.object_prototype_object_opt() {
+                            object::set_prototype(obj, &mut self.gc_heap, Some(proto));
+                        }
                         crate::arguments_object::initialize_unmapped(
                             obj,
                             &mut self.gc_heap,

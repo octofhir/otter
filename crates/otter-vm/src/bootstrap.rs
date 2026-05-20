@@ -506,6 +506,11 @@ fn build_global_this_impl(
             t.record_skipped_entry();
         }
     }
+    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    {
+        object::set_prototype(global, heap, Some(object_proto));
+    }
     if let (Some(t), Some(before)) = (telemetry, before) {
         let after = allocation_snapshot(heap);
         t.finish_allocations(before, after);

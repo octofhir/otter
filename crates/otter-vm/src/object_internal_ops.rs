@@ -1586,8 +1586,7 @@ impl Interpreter {
         match descriptor.kind.clone() {
             object::DescriptorKind::Data { value } => {
                 array::delete_accessor(arr, &mut self.gc_heap, key);
-                array::set_named_property(arr, &mut self.gc_heap, key, value)
-                    .map_err(|_| VmError::TypeMismatch)?;
+                array::define_named_data_property(arr, &mut self.gc_heap, key, value);
             }
             object::DescriptorKind::Accessor { getter, setter } => {
                 array::set_accessor(arr, &mut self.gc_heap, key, getter, setter);

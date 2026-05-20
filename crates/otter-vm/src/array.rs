@@ -901,6 +901,27 @@ pub fn set_named_property(
     Ok(())
 }
 
+/// Store a non-index string-keyed data property as part of
+/// `[[DefineOwnProperty]]`.
+///
+/// Unlike assignment, descriptor definition has already validated
+/// compatibility with the current descriptor, so this bypasses the
+/// `[[Writable]]` check used by [`set_named_property`].
+pub(crate) fn define_named_data_property(
+    arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    key: &str,
+    value: Value,
+) {
+    let barrier_value = value.clone();
+    heap.with_payload(arr, |body| {
+        let map = body.named_properties.get_or_insert_with(HashMap::new);
+        map.insert(key.to_string(), value);
+        body.dirty = true;
+    });
+    heap.record_write(arr, &barrier_value);
+}
+
 /// Read descriptor flags installed for a string-keyed array own property.
 #[must_use]
 pub(crate) fn get_property_flags(

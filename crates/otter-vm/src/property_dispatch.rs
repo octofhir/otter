@@ -1743,6 +1743,36 @@ impl Interpreter {
                         &mut external_visit,
                     )?;
                 } else {
+                    let has_own_named =
+                        crate::array::get_named_property(*arr, &self.gc_heap, &name).is_some();
+                    if !has_own_named {
+                        let proto = self.constructor_prototype_value("Array")?;
+                        if let Value::Object(proto) = proto {
+                            match crate::object::resolve_set(proto, &self.gc_heap, &name) {
+                                object::SetOutcome::InvokeSetter { setter } => {
+                                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                    args.push(value);
+                                    self.run_callable_sync(
+                                        context,
+                                        &setter,
+                                        Value::Array(*arr),
+                                        args,
+                                    )?;
+                                    stack[top_idx].pc += 1;
+                                    return Ok(());
+                                }
+                                object::SetOutcome::Reject { .. } => {
+                                    Self::failed_set_result(
+                                        strict,
+                                        format!("Cannot assign to property '{name}'"),
+                                    )?;
+                                    stack[top_idx].pc += 1;
+                                    return Ok(());
+                                }
+                                object::SetOutcome::AssignData => {}
+                            }
+                        }
+                    }
                     crate::array::set_named_property(*arr, &mut self.gc_heap, &name, value)
                         .map_err(|_| VmError::TypeMismatch)?;
                 }

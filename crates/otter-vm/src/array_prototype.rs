@@ -1391,6 +1391,10 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         body.named_properties
             .as_ref()
             .is_some_and(|m| m.contains_key(&key_string))
+            || body
+                .accessors
+                .as_ref()
+                .is_some_and(|m| m.contains_key(&key_string))
     });
     Ok(Value::Boolean(has_named))
 }

@@ -1091,8 +1091,30 @@ impl Interpreter {
             if !current.configurable() {
                 return Ok(false);
             }
-            let completed = descriptor.complete_for_new_property();
-            self.store_array_index_descriptor(arr, key, idx, completed)?;
+            let updated = if descriptor.is_data() {
+                object::PropertyDescriptor::data(
+                    descriptor.value.clone().unwrap_or(Value::Undefined),
+                    descriptor.writable.unwrap_or(false),
+                    descriptor.enumerable.unwrap_or(current.enumerable()),
+                    descriptor.configurable.unwrap_or(current.configurable()),
+                )
+            } else {
+                object::PropertyDescriptor::accessor(
+                    if descriptor.get.is_some() {
+                        normalize_accessor_slot(descriptor.get.clone())
+                    } else {
+                        None
+                    },
+                    if descriptor.set.is_some() {
+                        normalize_accessor_slot(descriptor.set.clone())
+                    } else {
+                        None
+                    },
+                    descriptor.enumerable.unwrap_or(current.enumerable()),
+                    descriptor.configurable.unwrap_or(current.configurable()),
+                )
+            };
+            self.store_array_index_descriptor(arr, key, idx, updated)?;
             return Ok(true);
         }
 

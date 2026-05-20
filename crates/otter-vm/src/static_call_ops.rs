@@ -659,20 +659,19 @@ impl Interpreter {
         if let Some(props_arg) = args.get(1)
             && !matches!(props_arg, Value::Undefined)
         {
-            // §20.1.2.2 step 5 — enumerate own enumerable string keys
-            // of `properties`, then `Get` each through the
+            // §20.1.2.2 step 5 — enumerate own enumerable property
+            // keys of `properties`, then `Get` each through the
             // accessor-aware path so user-defined `valueOf` /
             // `toString` / accessor getters fire per §6.2.5.5
             // ToPropertyDescriptor.
             let props_owned = props_arg.clone();
             let keys = own_enumerable_keys_for_define(self, context, &props_owned)?;
             for key in keys {
-                let vm_key = crate::VmPropertyKey::OwnedString(key.clone());
                 let outcome = self.ordinary_get_value(
                     context,
                     props_owned.clone(),
                     props_owned.clone(),
-                    &vm_key,
+                    &key,
                     0,
                 )?;
                 let desc_value = match outcome {
@@ -683,9 +682,14 @@ impl Interpreter {
                     }
                 };
                 let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
-                if !self.define_own_property_partial(obj, &key, descriptor)? {
+                if !self.define_own_property_value(
+                    context,
+                    &Value::Object(obj),
+                    &key,
+                    descriptor,
+                )? {
                     return Err(VmError::TypeError {
-                        message: format!("Cannot define property '{key}'"),
+                        message: format!("Cannot define property '{}'", property_key_label(&key)),
                     });
                 }
             }
@@ -751,12 +755,11 @@ impl Interpreter {
             // accessor / data fields off the resolved value. Thread
             // both through the interpreter so user getters fire and
             // any abrupt completion propagates.
-            let vm_key = crate::VmPropertyKey::OwnedString(key.clone());
             let outcome = self.ordinary_get_value(
                 context,
                 props_value.clone(),
                 props_value.clone(),
-                &vm_key,
+                &key,
                 0,
             )?;
             let desc_value = match outcome {
@@ -767,10 +770,13 @@ impl Interpreter {
                 }
             };
             let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
-            let ok = self.define_own_property_value(context, &target_value, &vm_key, descriptor)?;
+            let ok = self.define_own_property_value(context, &target_value, &key, descriptor)?;
             if !ok {
                 return Err(VmError::TypeError {
-                    message: format!("Object.defineProperties: cannot define '{key}'"),
+                    message: format!(
+                        "Object.defineProperties: cannot define '{}'",
+                        property_key_label(&key)
+                    ),
                 });
             }
         }
@@ -1780,7 +1786,7 @@ impl Interpreter {
     }
 }
 
-/// §6.2.5.5 + §20.1.2.3 — enumerate the own enumerable string keys
+/// §6.2.5.5 + §20.1.2.3 — enumerate the own enumerable property keys
 /// of a `properties` argument supplied to `Object.defineProperties`
 /// / `Object.create`. Includes accessor-shaped own keys so the
 /// caller can `Get` the descriptor value through the spec's
@@ -1789,7 +1795,7 @@ fn own_enumerable_keys_for_define(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     props: &Value,
-) -> Result<Vec<String>, VmError> {
+) -> Result<Vec<VmPropertyKey<'static>>, VmError> {
     match props {
         Value::Null | Value::Undefined => Err(VmError::TypeMismatch),
         Value::Object(_)
@@ -1804,14 +1810,14 @@ fn own_enumerable_keys_for_define(
             let keys = interp.own_property_keys_value(context, props, &string_heap)?;
             let mut out = Vec::new();
             for key in keys {
-                let Value::String(name) = key else { continue };
+                let vm_key = value_to_static_property_key(&key)?;
                 let desc = interp.get_own_property_descriptor_for_value(
                     context,
                     props.clone(),
-                    Some(&Value::String(name.clone())),
+                    Some(&key),
                 )?;
                 if desc.is_some_and(|desc| desc.enumerable()) {
-                    out.push(name.to_lossy_string());
+                    out.push(vm_key);
                 }
             }
             Ok(out)
@@ -1847,13 +1853,35 @@ fn own_enumerable_keys_for_define(
                     out.push(key);
                 }
             }
-            Ok(out)
+            Ok(out.into_iter().map(VmPropertyKey::OwnedString).collect())
         }
         Value::String(s) => {
             let units = s.to_utf16_vec();
-            Ok((0..units.len()).map(|i| i.to_string()).collect())
+            Ok((0..units.len())
+                .map(|i| VmPropertyKey::OwnedString(i.to_string()))
+                .collect())
         }
         _ => Ok(Vec::new()),
+    }
+}
+
+fn value_to_static_property_key(value: &Value) -> Result<VmPropertyKey<'static>, VmError> {
+    match value {
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
+        _ => Err(VmError::TypeError {
+            message: "property key must be a string or symbol".to_string(),
+        }),
+    }
+}
+
+fn property_key_label(key: &VmPropertyKey<'_>) -> String {
+    match key {
+        VmPropertyKey::Symbol(sym) => sym.descriptive_string(),
+        _ => key
+            .string_name()
+            .expect("non-symbol key has string spelling")
+            .to_string(),
     }
 }
 

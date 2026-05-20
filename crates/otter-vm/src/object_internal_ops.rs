@@ -32,6 +32,12 @@ use crate::{
     object_statics, proxy, regexp_prototype, string, symbol, to_length,
 };
 
+#[derive(Clone, Copy)]
+pub(crate) enum ObjectIntegrityLevel {
+    Sealed,
+    Frozen,
+}
+
 /// Convert an already-primitive value to a [`VmPropertyKey`] per
 /// §7.1.19 step 2-3: Symbol values pass through unchanged; every
 /// other primitive coerces to a UTF-16 string spelling.
@@ -46,6 +52,16 @@ fn primitive_to_property_key(value: Value) -> Result<VmPropertyKey<'static>, VmE
         Value::Undefined => Ok(VmPropertyKey::String("undefined")),
         Value::BigInt(b) => Ok(VmPropertyKey::OwnedString(b.to_decimal_string())),
         _ => Err(VmError::TypeMismatch),
+    }
+}
+
+fn property_key_value_to_vm_key(value: &Value) -> Result<VmPropertyKey<'static>, VmError> {
+    match value {
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
+        _ => Err(VmError::TypeError {
+            message: "property key must be a string or symbol".to_string(),
+        }),
     }
 }
 
@@ -1019,6 +1035,96 @@ impl Interpreter {
             }
             _ => Ok(false),
         }
+    }
+
+    /// §7.3.15 `SetIntegrityLevel(O, level)`.
+    ///
+    /// Runs through value-level internal methods so Proxy traps see
+    /// `ownKeys`, `preventExtensions`, `getOwnPropertyDescriptor`, and
+    /// `defineProperty` in the spec order.
+    pub(crate) fn set_integrity_level_value(
+        &mut self,
+        context: &ExecutionContext,
+        target: &Value,
+        level: ObjectIntegrityLevel,
+    ) -> Result<bool, VmError> {
+        let string_heap = self.string_heap.clone();
+        let keys = self.own_property_keys_value(context, target, &string_heap)?;
+        if !self.prevent_extensions_value(context, target)? {
+            return Ok(false);
+        }
+        for key_value in &keys {
+            let key = property_key_value_to_vm_key(key_value)?;
+            let descriptor = match level {
+                ObjectIntegrityLevel::Sealed => object::PartialPropertyDescriptor {
+                    configurable: Some(false),
+                    ..Default::default()
+                },
+                ObjectIntegrityLevel::Frozen => {
+                    let current = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                        context,
+                        target.clone(),
+                        &key,
+                        0,
+                        &[target],
+                        &[],
+                    )?;
+                    let Some(current) = current else {
+                        continue;
+                    };
+                    let mut desc = object::PartialPropertyDescriptor {
+                        configurable: Some(false),
+                        ..Default::default()
+                    };
+                    if current.is_data() {
+                        desc.writable = Some(false);
+                    }
+                    desc
+                }
+            };
+            if !self.define_own_property_value(context, target, &key, descriptor)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// §7.3.16 `TestIntegrityLevel(O, level)`.
+    ///
+    /// Uses internal methods for Proxy targets, preserving observable
+    /// trap order and symbol keys from `[[OwnPropertyKeys]]`.
+    pub(crate) fn test_integrity_level_value(
+        &mut self,
+        context: &ExecutionContext,
+        target: &Value,
+        level: ObjectIntegrityLevel,
+    ) -> Result<bool, VmError> {
+        if self.is_extensible_value(context, target)? {
+            return Ok(false);
+        }
+        let string_heap = self.string_heap.clone();
+        let keys = self.own_property_keys_value(context, target, &string_heap)?;
+        for key_value in &keys {
+            let key = property_key_value_to_vm_key(key_value)?;
+            let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                context,
+                target.clone(),
+                &key,
+                0,
+                &[target],
+                &[],
+            )?;
+            let Some(desc) = desc else {
+                continue;
+            };
+            if desc.configurable() {
+                return Ok(false);
+            }
+            if matches!(level, ObjectIntegrityLevel::Frozen) && desc.is_data() && desc.writable() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn define_array_named_property(
@@ -3158,6 +3264,32 @@ impl Interpreter {
             return Ok(None);
         }
         match method {
+            M::Freeze => {
+                if !self.set_integrity_level_value(context, target, ObjectIntegrityLevel::Frozen)? {
+                    return Err(VmError::TypeError {
+                        message: "Object.freeze failed".to_string(),
+                    });
+                }
+                Ok(Some(target.clone()))
+            }
+            M::Seal => {
+                if !self.set_integrity_level_value(context, target, ObjectIntegrityLevel::Sealed)? {
+                    return Err(VmError::TypeError {
+                        message: "Object.seal failed".to_string(),
+                    });
+                }
+                Ok(Some(target.clone()))
+            }
+            M::IsFrozen => {
+                let frozen =
+                    self.test_integrity_level_value(context, target, ObjectIntegrityLevel::Frozen)?;
+                Ok(Some(Value::Boolean(frozen)))
+            }
+            M::IsSealed => {
+                let sealed =
+                    self.test_integrity_level_value(context, target, ObjectIntegrityLevel::Sealed)?;
+                Ok(Some(Value::Boolean(sealed)))
+            }
             M::IsExtensible => {
                 let ext = self.is_extensible_value(context, target)?;
                 Ok(Some(Value::Boolean(ext)))

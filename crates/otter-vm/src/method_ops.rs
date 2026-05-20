@@ -740,35 +740,27 @@ impl Interpreter {
             return Ok(());
         }
 
-        // §20.1.3 Object.prototype methods that ordinary objects
-        // inherit. Foundation has no installed Object.prototype yet,
-        // so the runtime intercepts the canonical names directly when
-        // the receiver is an ordinary `JsObject`. Once the prototype
-        // tree is real (task 61 follow-up) these route through the
-        // standard property lookup below.
-        // <https://tc39.es/ecma262/#sec-properties-of-the-object-prototype-object>
-        if let Value::Object(obj) = &recv_value {
-            // Only intercept when the user hasn't overridden the
-            // method via an own / inherited data property. This
-            // keeps `Object.create({hasOwnProperty: () => 'shadow'})`
-            // observable.
-            if matches!(
+        if let Value::Object(obj) = &recv_value
+            && self.object_prototype_object_opt() != Some(*obj)
+            && matches!(
                 crate::object::lookup(*obj, &self.gc_heap, &name),
                 crate::object::PropertyLookup::Absent
-            ) && let Some(result) = object_prototype_intercept(
+            )
+            && let Some(result) = object_prototype_intercept(
                 obj,
                 &name,
                 &arg_values,
                 &self.string_heap,
                 &self.gc_heap,
                 self.function_prototype_object().ok(),
-            )? {
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, result)?;
-                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                return Ok(());
-            }
+            )?
+        {
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(());
         }
+
         // Functions / closures inherit Object.prototype-style
         // methods. Foundation routes the call through the user-
         // properties bag attached to the compiled function.

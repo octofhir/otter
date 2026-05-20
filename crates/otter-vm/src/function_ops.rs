@@ -1127,6 +1127,56 @@ impl Interpreter {
         let Some(target) = args.first().cloned() else {
             return Ok(None);
         };
+        if matches!(target, Value::Array(_))
+            && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
+        {
+            let Some(context) = context else {
+                return Err(VmError::InvalidOperand);
+            };
+            match method {
+                M::Freeze => {
+                    if !self.set_integrity_level_value(
+                        context,
+                        &target,
+                        crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
+                    )? {
+                        return Err(VmError::TypeError {
+                            message: "Object.freeze failed".to_string(),
+                        });
+                    }
+                    return Ok(Some(target));
+                }
+                M::Seal => {
+                    if !self.set_integrity_level_value(
+                        context,
+                        &target,
+                        crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
+                    )? {
+                        return Err(VmError::TypeError {
+                            message: "Object.seal failed".to_string(),
+                        });
+                    }
+                    return Ok(Some(target));
+                }
+                M::IsFrozen => {
+                    let frozen = self.test_integrity_level_value(
+                        context,
+                        &target,
+                        crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
+                    )?;
+                    return Ok(Some(Value::Boolean(frozen)));
+                }
+                M::IsSealed => {
+                    let sealed = self.test_integrity_level_value(
+                        context,
+                        &target,
+                        crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
+                    )?;
+                    return Ok(Some(Value::Boolean(sealed)));
+                }
+                _ => unreachable!("integrity methods are matched above"),
+            }
+        }
         if matches!(
             target,
             Value::Proxy(_)

@@ -1221,7 +1221,9 @@ fn static_all_generic(
                 &[args],
             )
             .map_err(|_| oom_native("Promise.all"))?;
-        call_capability_resolve(interp, &cap, Value::Array(arr))?;
+        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
+            return reject_capability_error(interp, &cap, err);
+        }
         return Ok(cap.promise);
     }
     let slots = PromiseSlots::new(entries.len());
@@ -1350,7 +1352,9 @@ fn static_all_settled_generic(
                 &[args],
             )
             .map_err(|_| oom_native("Promise.allSettled"))?;
-        call_capability_resolve(interp, &cap, Value::Array(arr))?;
+        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
+            return reject_capability_error(interp, &cap, err);
+        }
         return Ok(cap.promise);
     }
     let slots = PromiseSlots::new(entries.len());

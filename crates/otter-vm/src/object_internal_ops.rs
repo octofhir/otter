@@ -2006,9 +2006,8 @@ impl Interpreter {
                             // §22.1.3 — walk Array.prototype for
                             // inherited symbol-keyed members
                             // (`@@toStringTag` accessor, etc.).
-                            let proto = self.constructor_prototype_value("Array")?;
-                            match proto {
-                                Value::Object(p) => {
+                            match self.constructor_prototype_value("Array") {
+                                Ok(Value::Object(p)) => {
                                     return self.ordinary_get_value(
                                         context,
                                         Value::Object(p),
@@ -2017,7 +2016,7 @@ impl Interpreter {
                                         hops + 1,
                                     );
                                 }
-                                _ => Value::Undefined,
+                                Ok(_) | Err(_) => Value::Undefined,
                             }
                         }
                     }

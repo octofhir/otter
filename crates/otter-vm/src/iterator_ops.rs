@@ -787,34 +787,16 @@ impl Interpreter {
                 message: "iterator result is not an object".to_string(),
             });
         }
-        let done_value = match self.ordinary_get_value(
-            context,
-            result.clone(),
-            result.clone(),
-            &VmPropertyKey::String("done"),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
-            }
-        };
-        if done_value.to_boolean() {
-            return Ok(None);
-        }
-        let value = match self.ordinary_get_value(
-            context,
-            result.clone(),
-            result.clone(),
-            &VmPropertyKey::String("value"),
-            0,
-        )? {
-            VmGetOutcome::Value(v) => v,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
-            }
-        };
-        Ok(Some(value))
+        // §7.4.6 IteratorStep — anchor the result on the GC root
+        // stack across the subsequent `done` / `value` property
+        // reads. Without this, a GC triggered inside an accessor
+        // getter (or by allocations on the way to the slot lookup)
+        // could reclaim the IterResult — its shape/keys would then
+        // dangle when the second read walks the same shape chain.
+        let anchor_depth = self.push_iteration_anchor(result.clone());
+        let outcome = iterator_step_read(self, context, &result);
+        self.pop_iteration_anchors_to(anchor_depth - 1);
+        outcome
     }
 
     /// §7.4.8 IteratorClose — invoke `return` if present.
@@ -1368,4 +1350,39 @@ impl Interpreter {
         self.invoke(stack, context, &next_fn, user_iter_value, args, value_dst)?;
         Ok(true)
     }
+}
+
+fn iterator_step_read(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    result: &Value,
+) -> Result<Option<Value>, VmError> {
+    let done_value = match interp.ordinary_get_value(
+        context,
+        result.clone(),
+        result.clone(),
+        &VmPropertyKey::String("done"),
+        0,
+    )? {
+        VmGetOutcome::Value(v) => v,
+        VmGetOutcome::InvokeGetter { getter } => {
+            interp.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
+        }
+    };
+    if done_value.to_boolean() {
+        return Ok(None);
+    }
+    let value = match interp.ordinary_get_value(
+        context,
+        result.clone(),
+        result.clone(),
+        &VmPropertyKey::String("value"),
+        0,
+    )? {
+        VmGetOutcome::Value(v) => v,
+        VmGetOutcome::InvokeGetter { getter } => {
+            interp.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
+        }
+    };
+    Ok(Some(value))
 }

@@ -193,6 +193,8 @@ method_id_enum! {
         Race = 5 => "race",
         WithResolvers = 6 => "withResolvers",
         Try = 7 => "try",
+        AllKeyed = 8 => "allKeyed",
+        AllSettledKeyed = 9 => "allSettledKeyed",
     }
 }
 

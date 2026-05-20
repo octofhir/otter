@@ -26,10 +26,10 @@ use smallvec::SmallVec;
 
 use crate::{
     AsyncFrameState, ExecutableFunction, ExecutionContext, Frame, Interpreter, JsObject,
-    NativeCallInfo, NativeCtx, NativeFunction, UpvalueCell, Value, VmError, abstract_ops,
-    argument_window::BytecodeArgumentWindow, constructor_return_is_object, is_constructor_runtime,
-    native_to_vm_error, operand_decode::register_operand, promise_dispatch, read_register,
-    write_register,
+    NativeCallInfo, NativeCtx, NativeFunction, UpvalueCell, Value, VmError, VmGetOutcome,
+    VmPropertyKey, abstract_ops, argument_window::BytecodeArgumentWindow,
+    constructor_return_is_object, is_constructor_runtime, native_to_vm_error,
+    operand_decode::register_operand, promise_dispatch, read_register, write_register,
 };
 
 struct PreparedBytecodeFrame {
@@ -870,6 +870,18 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
+        if let Some(native) = self.native_promise_constructor(&callee) {
+            let constructed = self.invoke_native_construct(
+                context,
+                native,
+                &Value::Undefined,
+                &new_target,
+                args.as_slice(),
+            )?;
+            let top_idx = stack.len() - 1;
+            write_register(&mut stack[top_idx], dst, constructed)?;
+            return Ok(());
+        }
         // Allocate receiver and link its prototype before pushing
         // the new frame. The constructor might mutate the receiver
         // immediately, so the prototype link must already be in
@@ -991,10 +1003,7 @@ impl Interpreter {
                 Some(proto) if constructor_return_is_object(&proto) => Some(proto),
                 _ => None,
             }),
-            Value::BoundFunction(b) => {
-                let (target, _, _) = b.parts(&self.gc_heap);
-                self.construct_prototype_for_callee_stack_rooted(context, stack, &target)
-            }
+            Value::BoundFunction(_) => self.construct_prototype_via_get(context, callee),
             Value::NativeFunction(_) => Ok(None),
             _ => Ok(None),
         }
@@ -1025,18 +1034,38 @@ impl Interpreter {
                 Some(proto) if constructor_return_is_object(&proto) => Some(proto),
                 _ => None,
             }),
-            Value::BoundFunction(b) => {
-                let (target, _, _) = b.parts(&self.gc_heap);
-                self.construct_prototype_for_callee_runtime_rooted(
-                    context,
-                    &target,
-                    value_roots,
-                    slice_roots,
-                )
-            }
+            Value::BoundFunction(_) => self.construct_prototype_via_get(context, callee),
             Value::NativeFunction(_) => Ok(None),
             _ => Ok(None),
         }
+    }
+
+    fn construct_prototype_via_get(
+        &mut self,
+        context: &ExecutionContext,
+        callee: &Value,
+    ) -> Result<Option<Value>, VmError> {
+        let key = VmPropertyKey::String("prototype");
+        let proto =
+            match self.ordinary_get_value(context, callee.clone(), callee.clone(), &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, callee.clone(), SmallVec::new())?
+                }
+            };
+        Ok(constructor_return_is_object(&proto).then_some(proto))
+    }
+
+    fn native_promise_constructor(&self, callee: &Value) -> Option<NativeFunction> {
+        let native = match callee {
+            Value::NativeFunction(native) => *native,
+            Value::Object(obj) => match crate::object::constructor_native(*obj, &self.gc_heap) {
+                Some(Value::NativeFunction(native)) => native,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        (native.name(&self.gc_heap) == "Promise").then_some(native)
     }
 
     /// Handle `Op::CallSpread`: read the args array, fan it out
@@ -1376,6 +1405,16 @@ impl Interpreter {
                 }
                 _ => break,
             }
+        }
+
+        if let Some(native) = self.native_promise_constructor(&current) {
+            return self.invoke_native_construct(
+                context,
+                native,
+                &Value::Undefined,
+                &effective_new_target,
+                effective_args.as_slice(),
+            );
         }
 
         let proto = self.construct_prototype_for_callee_runtime_rooted(

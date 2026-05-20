@@ -136,6 +136,22 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &ctor_roots,
     )?;
     define_ctor_method(heap, ctor, "try", 1, promise_static_try, &ctor_roots)?;
+    define_ctor_method(
+        heap,
+        ctor,
+        "allKeyed",
+        1,
+        promise_static_all_keyed,
+        &ctor_roots,
+    )?;
+    define_ctor_method(
+        heap,
+        ctor,
+        "allSettledKeyed",
+        1,
+        promise_static_all_settled_keyed,
+        &ctor_roots,
+    )?;
 
     // §27.2.5.2 — `Promise.prototype.constructor` back-pointer.
     object::define_own_property(
@@ -318,6 +334,17 @@ fn promise_static_all_settled(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::AllSettled, args)
+}
+
+fn promise_static_all_keyed(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    invoke_static(ctx, PromiseMethod::AllKeyed, args)
+}
+
+fn promise_static_all_settled_keyed(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    invoke_static(ctx, PromiseMethod::AllSettledKeyed, args)
 }
 
 fn promise_static_any(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

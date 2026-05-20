@@ -269,6 +269,10 @@ impl Interpreter {
                         .flatten()
                         .is_some()
                         || matches!(name, "call" | "apply" | "bind" | "toString")
+                } else if let Value::Symbol(sym) = &lhs {
+                    native
+                        .own_symbol_property_descriptor(&self.gc_heap, sym)
+                        .is_some()
                 } else {
                     false
                 }
@@ -337,6 +341,13 @@ impl Interpreter {
                         true
                     }
                 } else if let Some(bag) = t.expando() {
+                    crate::object::delete(bag, &mut self.gc_heap, name)
+                } else {
+                    true
+                }
+            }
+            Value::Promise(promise) => {
+                if let Some(bag) = promise.expando(&self.gc_heap) {
                     crate::object::delete(bag, &mut self.gc_heap, name)
                 } else {
                     true
@@ -696,7 +707,15 @@ impl Interpreter {
                 &self.string_heap,
                 name,
             )? {
-                Some(desc) => descriptor_value(&desc),
+                Some(desc) => match &desc.kind {
+                    object::DescriptorKind::Data { value } => value.clone(),
+                    object::DescriptorKind::Accessor { getter, .. } => match getter {
+                        Some(g) if abstract_ops::is_callable(g) => {
+                            self.run_callable_sync(context, g, receiver.clone(), SmallVec::new())?
+                        }
+                        _ => Value::Undefined,
+                    },
+                },
                 None => self
                     .load_function_prototype_method(name)
                     .or_else(|| self.load_object_prototype_method(name))
@@ -2811,6 +2830,46 @@ impl Interpreter {
                     }
                 }
             }
+        }
+        if let (Value::NativeFunction(native), ComputedPropertyKey::Symbol(sym)) = (&receiver, &key)
+        {
+            let obj = native.own_properties_object(&self.gc_heap);
+            match object::resolve_symbol_set(obj, &self.gc_heap, sym) {
+                object::SetOutcome::AssignData => {
+                    if !object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value) {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            "Cannot assign to symbol property",
+                        );
+                    }
+                }
+                object::SetOutcome::InvokeSetter { setter } => {
+                    if !abstract_ops::is_callable(&setter) {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            "Cannot assign to accessor property without a setter",
+                        );
+                    }
+                    let pc = stack[top_idx].pc;
+                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                    args.push(value);
+                    self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
+                    return Ok(true);
+                }
+                object::SetOutcome::Reject { .. } => {
+                    return Self::finish_failed_set(
+                        stack,
+                        context,
+                        "Cannot assign to symbol property",
+                    );
+                }
+            }
+            let pc = stack[top_idx].pc;
+            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            return Ok(true);
         }
         if matches!(
             receiver,

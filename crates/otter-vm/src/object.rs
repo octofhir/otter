@@ -379,6 +379,8 @@ pub struct ObjectBody {
     number_data: Option<NumberValue>,
     /// `[[StringData]]` internal slot for String wrapper objects.
     string_data: Option<JsString>,
+    /// `[[SymbolData]]` internal slot for Symbol wrapper objects.
+    symbol_data: Option<crate::symbol::JsSymbol>,
     /// `[[DateValue]]` internal slot for Date instances per
     /// ECMA-262 §21.4.5. Holds the time value as UTC epoch
     /// milliseconds (or `NaN` for an Invalid Date). Mutation goes
@@ -424,6 +426,7 @@ impl std::fmt::Debug for ObjectBody {
             .field("has_boolean_data", &self.boolean_data.is_some())
             .field("has_number_data", &self.number_data.is_some())
             .field("has_string_data", &self.string_data.is_some())
+            .field("has_symbol_data", &self.symbol_data.is_some())
             .field("has_date_data", &self.date_data.is_some())
             .field("extensible", &self.extensible)
             .finish()
@@ -536,6 +539,7 @@ fn empty_object_body() -> ObjectBody {
         boolean_data: None,
         number_data: None,
         string_data: None,
+        symbol_data: None,
         date_data: None,
         extensible: true,
         is_arguments_object: false,
@@ -629,6 +633,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             boolean_data: None,
             number_data: None,
             string_data: None,
+            symbol_data: None,
             date_data: None,
             extensible: true,
             is_arguments_object: false,
@@ -659,6 +664,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             boolean_data: None,
             number_data: None,
             string_data: None,
+            symbol_data: None,
             date_data: None,
             extensible: true,
             is_arguments_object: false,
@@ -1299,6 +1305,19 @@ pub fn set_string_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: JsStri
 #[must_use]
 pub fn string_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
     heap.read_payload(obj, |body| body.string_data.clone())
+}
+
+/// Store the `[[SymbolData]]` internal slot for a Symbol wrapper.
+pub fn set_symbol_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: crate::symbol::JsSymbol) {
+    heap.with_payload(obj, |body| {
+        body.symbol_data = Some(value);
+    });
+}
+
+/// Read the `[[SymbolData]]` internal slot for a Symbol wrapper.
+#[must_use]
+pub fn symbol_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<crate::symbol::JsSymbol> {
+    heap.read_payload(obj, |body| body.symbol_data.clone())
 }
 
 /// §21.4.1.6 TimeClip — every store into a `[[DateValue]]` internal

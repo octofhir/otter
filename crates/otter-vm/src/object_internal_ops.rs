@@ -47,6 +47,20 @@ fn primitive_to_property_key(value: Value) -> Result<VmPropertyKey<'static>, VmE
     }
 }
 
+fn descriptor_to_lookup(desc: object::PropertyDescriptor) -> object::PropertyLookup {
+    match desc.kind {
+        object::DescriptorKind::Data { value } => object::PropertyLookup::Data {
+            value,
+            flags: desc.flags,
+        },
+        object::DescriptorKind::Accessor { getter, setter } => object::PropertyLookup::Accessor {
+            getter,
+            setter,
+            flags: desc.flags,
+        },
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DescriptorAllocationRoots<'a> {
     Runtime {
@@ -1254,9 +1268,30 @@ impl Interpreter {
                 }
             }
             Value::Object(obj) => {
-                let keys: Vec<Value> = object::with_properties(*obj, &self.gc_heap, |p| {
+                let mut keys: Vec<Value> = Vec::new();
+                let string_data = object::string_data(*obj, &self.gc_heap);
+                if let Some(value) = &string_data {
+                    keys.reserve(value.len() as usize + 1);
+                    for idx in 0..value.len() {
+                        let key = idx.to_string();
+                        keys.push(Value::String(
+                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                        ));
+                    }
+                    keys.push(Value::String(
+                        string::JsString::from_str("length", string_heap).map_err(VmError::from)?,
+                    ));
+                }
+                let is_string_exotic = string_data.is_some();
+                let ordinary_keys: Vec<Value> = object::with_properties(*obj, &self.gc_heap, |p| {
                     let mut keys: Vec<Value> = p
                         .keys()
+                        .filter(|k| {
+                            if !is_string_exotic {
+                                return true;
+                            }
+                            *k != "length" && k.parse::<usize>().is_err()
+                        })
                         .map(|k| {
                             string::JsString::from_str(k, string_heap)
                                 .map(Value::String)
@@ -1266,6 +1301,7 @@ impl Interpreter {
                     keys.extend(p.symbol_keys().map(Value::Symbol));
                     keys
                 });
+                keys.extend(ordinary_keys);
                 Ok(keys)
             }
             Value::Array(arr) => {
@@ -1936,7 +1972,7 @@ impl Interpreter {
                 Ok(VmGetOutcome::Value(value))
             }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                let value = match key {
+                let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
                         // §10.2 ordinary function exotic — own
                         // symbol-keyed properties live in the lazy
@@ -1945,26 +1981,51 @@ impl Interpreter {
                         // `Function.prototype` so reflective probes
                         // (`Object.prototype.toString.call(f)`)
                         // observe the override.
-                        let own_symbol = self
+                        match self
                             .function_user_props
                             .get(&function_id)
                             .copied()
-                            .and_then(|bag| object::get_symbol(bag, &self.gc_heap, sym));
-                        match own_symbol {
-                            Some(v) => v,
+                            .and_then(|bag| {
+                                object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
+                            }) {
+                            Some(desc) => descriptor_to_lookup(desc),
                             None => self
                                 .function_prototype_object()
                                 .ok()
-                                .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                                .unwrap_or(Value::Undefined),
+                                .map(|proto| object::lookup_symbol(proto, &self.gc_heap, sym))
+                                .unwrap_or(object::PropertyLookup::Absent),
                         }
                     }
-                    _ => self.function_property_get(
-                        context,
-                        function_id,
-                        key.string_name()
-                            .expect("non-symbol key has string spelling"),
-                    )?,
+                    _ => {
+                        let key_name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        let own = self.ordinary_function_own_property_descriptor(
+                            Some(context),
+                            function_id,
+                            key_name,
+                        )?;
+                        match own {
+                            Some(desc) => descriptor_to_lookup(desc),
+                            None => self
+                                .function_prototype_object()
+                                .ok()
+                                .map(|proto| object::lookup(proto, &self.gc_heap, key_name))
+                                .unwrap_or(object::PropertyLookup::Absent),
+                        }
+                    }
+                };
+                let value = match lookup {
+                    object::PropertyLookup::Data { value, .. } => value,
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(getter) if abstract_ops::is_callable(&getter) => {
+                                VmGetOutcome::InvokeGetter { getter }
+                            }
+                            _ => VmGetOutcome::Value(Value::Undefined),
+                        });
+                    }
+                    object::PropertyLookup::Absent => Value::Undefined,
                 };
                 if let Some(outcome) =
                     self.callable_realm_prototype_accessor_outcome(&value, key)?
@@ -1998,24 +2059,6 @@ impl Interpreter {
                                 .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
                                 .unwrap_or(Value::Undefined),
                         }
-                    }
-                    _ if key
-                        .string_name()
-                        .is_some_and(|key| key == "name" || key == "length") =>
-                    {
-                        let key = key.string_name().expect("guard checked string key");
-                        let ctx = function_metadata::FunctionMetadataContext::new(
-                            context,
-                            &self.gc_heap,
-                            &self.string_heap,
-                            &self.function_user_props,
-                            &self.function_deleted_metadata,
-                        );
-                        function_metadata::callable_intrinsic_property(
-                            &ctx,
-                            &Value::NativeFunction(native),
-                            key,
-                        )?
                     }
                     _ => {
                         let key = key
@@ -2072,7 +2115,19 @@ impl Interpreter {
                             &self.string_heap,
                             key,
                         )? {
-                            Some(desc) => descriptor_value(&desc),
+                            Some(desc) => match &desc.kind {
+                                object::DescriptorKind::Data { value } => value.clone(),
+                                object::DescriptorKind::Accessor { getter, .. } => {
+                                    return Ok(match getter {
+                                        Some(getter) if abstract_ops::is_callable(getter) => {
+                                            VmGetOutcome::InvokeGetter {
+                                                getter: getter.clone(),
+                                            }
+                                        }
+                                        _ => VmGetOutcome::Value(Value::Undefined),
+                                    });
+                                }
+                            },
                             None => self
                                 .load_function_prototype_method(key)
                                 .or_else(|| self.load_object_prototype_method(key))

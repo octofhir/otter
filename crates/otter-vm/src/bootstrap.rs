@@ -30,10 +30,11 @@ use std::time::{Duration, Instant};
 use crate::js_surface::{Attr, JsSurfaceError, NamespaceSpec, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
-    NativeCtx, NativeError, Value, array, array_prototype, array_statics, atomics, console,
-    constructor_return_is_object, descriptor_value, function_prototype, json, math, object_statics,
-    reflect,
+    NativeCtx, NativeError, Value, VmGetOutcome, VmPropertyKey, array, array_prototype,
+    array_statics, atomics, console, constructor_return_is_object, descriptor_value,
+    function_prototype, json, math, object_statics, reflect,
 };
+use smallvec::SmallVec;
 
 pub(crate) fn alloc_object_with_value_roots(
     heap: &mut otter_gc::GcHeap,
@@ -69,26 +70,57 @@ pub(crate) fn native_constructor_static_with_value_roots(
 }
 
 pub(crate) fn native_new_target_prototype(
-    ctx: &NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     name: &'static str,
 ) -> Result<Option<Value>, NativeError> {
     let Some(new_target) = ctx.new_target().cloned() else {
         return Ok(None);
     };
-    let proto = match new_target {
-        Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
-        Value::Object(obj) => object::get(obj, ctx.heap(), "prototype"),
-        Value::NativeFunction(native) => native
-            .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+    let proto = if let Some(exec) = ctx.execution_context().cloned() {
+        let key = VmPropertyKey::String("prototype");
+        let (interp, _) = ctx.interp_mut_and_context();
+        match interp
+            .ordinary_get_value(&exec, new_target.clone(), new_target.clone(), &key, 0)
             .map_err(|err| NativeError::TypeError {
                 name,
                 reason: err.to_string(),
-            })?
-            .map(|descriptor| descriptor_value(&descriptor)),
-        _ => None,
+            })? {
+            VmGetOutcome::Value(value) => Some(value),
+            VmGetOutcome::InvokeGetter { getter } => Some(
+                interp
+                    .run_callable_sync(&exec, &getter, new_target, SmallVec::new())
+                    .map_err(|err| native_new_target_error(name, err))?,
+            ),
+        }
+    } else {
+        match new_target {
+            Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
+            Value::Object(obj) => object::get(obj, ctx.heap(), "prototype"),
+            Value::NativeFunction(native) => native
+                .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+                .map_err(|err| NativeError::TypeError {
+                    name,
+                    reason: err.to_string(),
+                })?
+                .map(|descriptor| descriptor_value(&descriptor)),
+            _ => None,
+        }
     };
     Ok(proto
         .filter(|value| constructor_return_is_object(value) || matches!(value, Value::Proxy(_))))
+}
+
+fn native_new_target_error(name: &'static str, err: crate::VmError) -> NativeError {
+    match err {
+        crate::VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
+        other => NativeError::TypeError {
+            name,
+            reason: other.to_string(),
+        },
+    }
 }
 
 pub(crate) fn native_static_with_value_roots(
@@ -754,6 +786,13 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         let this = ctx.this_value().clone();
         let sym = match &this {
             Value::Symbol(sym) => sym.clone(),
+            Value::Object(obj) => {
+                let heap = ctx.interp_mut().gc_heap();
+                crate::object::symbol_data(*obj, heap).ok_or_else(|| NativeError::TypeError {
+                    name: "Symbol.prototype.toString",
+                    reason: "this is not a Symbol".to_string(),
+                })?
+            }
             _ => {
                 return Err(NativeError::TypeError {
                     name: "Symbol.prototype.toString",
@@ -774,8 +813,17 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         ctx: &mut NativeCtx<'_>,
         _args: &[Value],
     ) -> Result<Value, NativeError> {
-        match ctx.this_value() {
+        match ctx.this_value().clone() {
             Value::Symbol(sym) => Ok(Value::Symbol(sym.clone())),
+            Value::Object(obj) => {
+                let heap = ctx.interp_mut().gc_heap();
+                crate::object::symbol_data(obj, heap)
+                    .map(Value::Symbol)
+                    .ok_or_else(|| NativeError::TypeError {
+                        name: "Symbol.prototype.valueOf",
+                        reason: "this is not a Symbol".to_string(),
+                    })
+            }
             _ => Err(NativeError::TypeError {
                 name: "Symbol.prototype.valueOf",
                 reason: "this is not a Symbol".to_string(),

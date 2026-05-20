@@ -150,22 +150,21 @@ pub(crate) fn compile_method_call(
             && find_module_import_binding(cx, "Reflect").is_none()
         {
             let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::ReflectMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Reflect.{method_name}"),
-                    span,
-                });
-            };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::ReflectCall, operands, span);
-            return Ok(dst);
+            if let Some(method_id) = otter_bytecode::method_id::ReflectMethod::from_str(method_name)
+            {
+                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+                let dst = cx.alloc_scratch();
+                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+                operands.push(Operand::Register(dst));
+                operands.push(Operand::ConstIndex(method_id.as_u32()));
+                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+                operands.extend(arg_regs.into_iter().map(Operand::Register));
+                cx.emit(Op::ReflectCall, operands, span);
+                return Ok(dst);
+            }
+            // Not every property read from the Reflect namespace is a
+            // Reflect intrinsic. Let ordinary property-call lowering
+            // handle cases such as `Reflect.hasOwnProperty(...)`.
         }
         // Iterator-helpers proposal — `Iterator.from(iter)` and
         // future statics. Typed dispatch via [`IteratorMethod`].
@@ -246,16 +245,15 @@ pub(crate) fn compile_method_call(
             let method = member.property.name.as_str();
             if method == "isArray" {
                 let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                if arg_regs.len() != 1 {
-                    return Err(CompileError::Unsupported {
-                        node: format!("Array.isArray/{}", arg_regs.len()),
-                        span,
-                    });
-                }
+                let src = arg_regs.first().copied().unwrap_or_else(|| {
+                    let undefined = cx.alloc_scratch();
+                    cx.emit(Op::LoadUndefined, [Operand::Register(undefined)], span);
+                    undefined
+                });
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::IsArray,
-                    [Operand::Register(dst), Operand::Register(arg_regs[0])],
+                    [Operand::Register(dst), Operand::Register(src)],
                     span,
                 );
                 return Ok(dst);

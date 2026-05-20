@@ -45,11 +45,12 @@ use crate::string::{JsString, StringHeap};
 use crate::{Frame, Interpreter, NativeCtx, Value};
 use otter_gc::raw::{RawGc, SlotVisitor};
 use smallvec::{SmallVec, smallvec};
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 struct PromiseSlots {
-    values: Vec<OnceCell<Value>>,
+    values: crate::array::JsArray,
+    keys: Option<crate::array::JsArray>,
     remaining: Cell<usize>,
 }
 
@@ -101,22 +102,141 @@ impl CapabilityExecutorState {
 }
 
 impl PromiseSlots {
-    fn new(total: usize) -> Rc<Self> {
-        let values = std::iter::repeat_with(OnceCell::new).take(total).collect();
-        Rc::new(Self {
+    fn new(
+        interp: &mut Interpreter,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Rc<Self>, NativeError> {
+        let values = interp
+            .alloc_runtime_rooted_array_from_values(
+                std::iter::empty::<Value>(),
+                value_roots,
+                slice_roots,
+            )
+            .map_err(|_| oom_native("Promise combinator"))?;
+        Ok(Rc::new(Self {
             values,
-            remaining: Cell::new(total),
-        })
+            keys: None,
+            remaining: Cell::new(1),
+        }))
+    }
+
+    fn new_keyed(
+        interp: &mut Interpreter,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Rc<Self>, NativeError> {
+        let values = interp
+            .alloc_runtime_rooted_array_from_values(
+                std::iter::empty::<Value>(),
+                value_roots,
+                slice_roots,
+            )
+            .map_err(|_| oom_native("Promise keyed combinator"))?;
+        let values_root = Value::Array(values);
+        let mut key_roots = Vec::with_capacity(value_roots.len() + 1);
+        key_roots.extend_from_slice(value_roots);
+        key_roots.push(&values_root);
+        let keys = interp
+            .alloc_runtime_rooted_array_from_values(
+                std::iter::empty::<Value>(),
+                &key_roots,
+                slice_roots,
+            )
+            .map_err(|_| oom_native("Promise keyed combinator"))?;
+        Ok(Rc::new(Self {
+            values,
+            keys: Some(keys),
+            remaining: Cell::new(1),
+        }))
     }
 
     fn trace(&self, visitor: &mut SlotVisitor<'_>) {
-        for value in self.values.iter().filter_map(OnceCell::get) {
-            value.trace_value_slots(visitor);
+        self.array_value().trace_value_slots(visitor);
+        if let Some(keys) = self.keys {
+            Value::Array(keys).trace_value_slots(visitor);
         }
     }
 
-    fn fill(&self, index: usize, value: Value) -> bool {
-        if self.values[index].set(value).is_err() {
+    fn array_value(&self) -> Value {
+        Value::Array(self.values)
+    }
+
+    fn keys_value(&self) -> Option<Value> {
+        self.keys.map(Value::Array)
+    }
+
+    fn reserve_slot(
+        &self,
+        interp: &mut Interpreter,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<usize, NativeError> {
+        let roots = interp.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+        };
+        let len = crate::array::push_with_roots(
+            self.values,
+            interp.gc_heap_mut(),
+            Value::Hole,
+            &mut external_visit,
+        )
+        .map_err(|_| oom_native("Promise combinator"))?;
+        self.remaining.set(self.remaining.get().saturating_add(1));
+        Ok(len - 1)
+    }
+
+    fn reserve_keyed_slot(
+        &self,
+        interp: &mut Interpreter,
+        key: Value,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<usize, NativeError> {
+        let Some(keys) = self.keys else {
+            return Err(NativeError::TypeError {
+                name: "Promise keyed combinator",
+                reason: "missing keyed slots".to_string(),
+            });
+        };
+        let key_root = key.clone();
+        let values_root = self.array_value();
+        let keys_root = Value::Array(keys);
+        let mut roots = Vec::with_capacity(value_roots.len() + 3);
+        roots.extend_from_slice(value_roots);
+        roots.push(&key_root);
+        roots.push(&values_root);
+        roots.push(&keys_root);
+        let runtime_roots = interp.collect_runtime_roots();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_runtime_roots(visitor, &runtime_roots, &roots, slice_roots);
+        };
+        crate::array::push_with_roots(keys, interp.gc_heap_mut(), key, &mut external_visit)
+            .map_err(|_| oom_native("Promise keyed combinator"))?;
+        let len = crate::array::push_with_roots(
+            self.values,
+            interp.gc_heap_mut(),
+            Value::Hole,
+            &mut external_visit,
+        )
+        .map_err(|_| oom_native("Promise keyed combinator"))?;
+        self.remaining.set(self.remaining.get().saturating_add(1));
+        Ok(len - 1)
+    }
+
+    fn fill(&self, heap: &mut otter_gc::GcHeap, index: usize, value: Value) -> bool {
+        let did_fill = crate::array::with_elements_mut(self.values, heap, |elements| {
+            let Some(slot) = elements.get_mut(index) else {
+                return false;
+            };
+            if !matches!(slot, Value::Hole) {
+                return false;
+            }
+            *slot = value;
+            true
+        });
+        if !did_fill {
             return false;
         }
         let count = self.remaining.get().saturating_sub(1);
@@ -124,11 +244,32 @@ impl PromiseSlots {
         count == 0
     }
 
-    fn collect_values(&self) -> Vec<Value> {
-        self.values
-            .iter()
-            .map(|slot| slot.get().cloned().unwrap_or(Value::Undefined))
-            .collect()
+    fn finish_iteration(&self) -> bool {
+        let count = self.remaining.get().saturating_sub(1);
+        self.remaining.set(count);
+        count == 0
+    }
+
+    fn collect_values(&self, heap: &otter_gc::GcHeap) -> Vec<Value> {
+        crate::array::with_elements(self.values, heap, |elements| {
+            elements
+                .iter()
+                .map(|slot| {
+                    if matches!(slot, Value::Hole) {
+                        Value::Undefined
+                    } else {
+                        slot.clone()
+                    }
+                })
+                .collect()
+        })
+    }
+
+    fn collect_keys(&self, heap: &otter_gc::GcHeap) -> Vec<Value> {
+        let Some(keys) = self.keys else {
+            return Vec::new();
+        };
+        crate::array::with_elements(keys, heap, |elements| elements.to_vec())
     }
 }
 
@@ -603,10 +744,20 @@ pub fn statics_call(
             M::Any => static_any_generic(interp, context, constructor, args),
             M::WithResolvers => static_with_resolvers_generic(interp, context, constructor),
             M::Try => static_try_generic(interp, context, constructor, args),
+            M::AllKeyed => {
+                static_all_keyed_generic(interp, context, constructor, args, KeyedVariant::All)
+            }
+            M::AllSettledKeyed => static_all_keyed_generic(
+                interp,
+                context,
+                constructor,
+                args,
+                KeyedVariant::AllSettled,
+            ),
         };
     }
     match method {
-        M::Resolve => Ok(Value::Promise(static_resolve(interp, args)?)),
+        M::Resolve => static_resolve(interp, context, constructor, args),
         M::Reject => Ok(Value::Promise(static_reject(interp, args)?)),
         M::All => static_all_generic(interp, context, constructor, args),
         M::Race => static_race_generic(interp, context, constructor, args),
@@ -614,6 +765,12 @@ pub fn statics_call(
         M::Any => static_any_generic(interp, context, constructor, args),
         M::WithResolvers => static_with_resolvers(interp, context),
         M::Try => static_try_generic(interp, context, constructor, args),
+        M::AllKeyed => {
+            static_all_keyed_generic(interp, context, constructor, args, KeyedVariant::All)
+        }
+        M::AllSettledKeyed => {
+            static_all_keyed_generic(interp, context, constructor, args, KeyedVariant::AllSettled)
+        }
     }
 }
 
@@ -1043,8 +1200,30 @@ fn call_capability_reject(
 }
 
 fn native_error_rejection_value(err: NativeError) -> Value {
+    if let NativeError::Thrown { message, .. } = err {
+        return Value::String(
+            crate::JsString::from_str(&message, &crate::StringHeap::default()).unwrap_or_else(
+                |_| {
+                    crate::JsString::from_str("", &crate::StringHeap::default())
+                        .expect("empty string allocates")
+                },
+            ),
+        );
+    }
     let vm_error = crate::native_to_vm_error(err);
     crate::error_ops::vm_err_to_value(&vm_error)
+}
+
+fn native_error_rejection_value_preserving_throw(
+    interp: &mut Interpreter,
+    err: NativeError,
+) -> Value {
+    if matches!(err, NativeError::Thrown { .. })
+        && let Some(value) = interp.take_pending_uncaught_throw()
+    {
+        return value;
+    }
+    native_error_rejection_value(err)
 }
 
 fn reject_capability_error(
@@ -1052,7 +1231,8 @@ fn reject_capability_error(
     cap: &PromiseCapability,
     err: NativeError,
 ) -> Result<Value, NativeError> {
-    call_capability_reject(interp, cap, native_error_rejection_value(err))?;
+    let reason = native_error_rejection_value_preserving_throw(interp, err);
+    call_capability_reject(interp, cap, reason)?;
     Ok(cap.promise.clone())
 }
 
@@ -1263,15 +1443,30 @@ fn attach_then_value(
 
 fn static_resolve(
     interp: &mut Interpreter,
+    context: Option<ExecutionContext>,
+    constructor: Value,
     args: &[Value],
-) -> Result<JsPromiseHandle, NativeError> {
+) -> Result<Value, NativeError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
-    // Spec: if `value` is already a Promise we'd return it
-    // unchanged. Foundation matches that for our concrete handle.
     if let Value::Promise(p) = &value {
-        return Ok(*p);
+        if let Some(exec) = context.as_ref() {
+            let value_constructor = get_property_runtime(
+                interp,
+                exec,
+                value.clone(),
+                "constructor",
+                "Promise.resolve",
+            )?;
+            if crate::abstract_ops::same_value(&value_constructor, &constructor) {
+                return Ok(Value::Promise(*p));
+            }
+        } else {
+            return Ok(Value::Promise(*p));
+        }
     }
-    Ok(PromiseBuilder::new().fulfilled_runtime_rooted(interp, value, &[], &[args])?)
+    Ok(Value::Promise(
+        PromiseBuilder::new().fulfilled_runtime_rooted(interp, value, &[], &[args])?,
+    ))
 }
 
 fn static_reject(interp: &mut Interpreter, args: &[Value]) -> Result<JsPromiseHandle, NativeError> {
@@ -1363,25 +1558,374 @@ fn static_try_generic(
     Ok(cap.promise)
 }
 
+#[derive(Clone, Copy)]
+enum KeyedVariant {
+    All,
+    AllSettled,
+}
+
+impl KeyedVariant {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::All => "Promise.allKeyed",
+            Self::AllSettled => "Promise.allSettledKeyed",
+        }
+    }
+}
+
+fn static_all_keyed_generic(
+    interp: &mut Interpreter,
+    context: Option<ExecutionContext>,
+    constructor: Value,
+    args: &[Value],
+    variant: KeyedVariant,
+) -> Result<Value, NativeError> {
+    let name = variant.name();
+    let cap =
+        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
+    let exec = context.clone().ok_or_else(|| NativeError::TypeError {
+        name,
+        reason: "missing execution context".to_string(),
+    })?;
+    let promise_resolve = match get_promise_resolve(interp, &exec, &constructor) {
+        Ok(value) => value,
+        Err(err) => return reject_capability_error(interp, &cap, err),
+    };
+    let promises = args.first().cloned().unwrap_or(Value::Undefined);
+    if !is_object_like(&promises) {
+        return reject_capability_error(
+            interp,
+            &cap,
+            NativeError::TypeError {
+                name,
+                reason: "promises argument is not an Object".to_string(),
+            },
+        );
+    }
+    let string_heap = interp.string_heap_clone();
+    let all_keys = match interp.own_property_keys_value(&exec, &promises, &string_heap) {
+        Ok(keys) => keys,
+        Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(name, err)),
+    };
+    let outcome = (|| -> Result<Value, NativeError> {
+        let slots = PromiseSlots::new_keyed(
+            interp,
+            &[
+                &cap.promise,
+                &cap.resolve,
+                &cap.reject,
+                &promise_resolve,
+                &constructor,
+                &promises,
+            ],
+            &[args, all_keys.as_slice()],
+        )?;
+        let slots_root = slots.array_value();
+        let keys_root = slots.keys_value().unwrap_or(Value::Undefined);
+        interp.push_iteration_anchor(slots_root.clone());
+        interp.push_iteration_anchor(keys_root.clone());
+        for key in all_keys {
+            let Some(vm_key) = vm_property_key_from_value(&key) else {
+                continue;
+            };
+            let desc = match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                &exec,
+                promises.clone(),
+                &vm_key,
+                0,
+                &[
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
+                    &promise_resolve,
+                    &constructor,
+                    &promises,
+                    &slots_root,
+                    &keys_root,
+                    &key,
+                ],
+                &[args],
+            ) {
+                Ok(desc) => desc,
+                Err(err) => {
+                    return reject_capability_error(interp, &cap, promise_vm_error(name, err));
+                }
+            };
+            if !desc.as_ref().is_some_and(|desc| desc.enumerable()) {
+                continue;
+            }
+            let next_value = match keyed_get(interp, &exec, promises.clone(), &vm_key, name) {
+                Ok(value) => value,
+                Err(err) => return reject_capability_error(interp, &cap, err),
+            };
+            let i = slots.reserve_keyed_slot(
+                interp,
+                key.clone(),
+                &[
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
+                    &promise_resolve,
+                    &constructor,
+                    &promises,
+                    &slots_root,
+                    &keys_root,
+                    &key,
+                    &next_value,
+                ],
+                &[args],
+            )?;
+            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let entry_promise_result =
+                call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
+            interp.pop_iteration_anchors_to(value_anchor_base);
+            let entry_promise = match entry_promise_result {
+                Ok(value) => value,
+                Err(err) => return reject_capability_error(interp, &cap, err),
+            };
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let on_fulfill = keyed_element_function(
+                interp,
+                slots.clone(),
+                cap.clone(),
+                variant,
+                true,
+                i,
+                &string_heap,
+                &[
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
+                    &promise_resolve,
+                    &constructor,
+                    &promises,
+                    &entry_promise,
+                    &slots_root,
+                    &keys_root,
+                ],
+                &[args],
+            )?;
+            let on_reject = match variant {
+                KeyedVariant::All => cap.reject.clone(),
+                KeyedVariant::AllSettled => keyed_element_function(
+                    interp,
+                    slots.clone(),
+                    cap.clone(),
+                    variant,
+                    false,
+                    i,
+                    &string_heap,
+                    &[
+                        &cap.promise,
+                        &cap.resolve,
+                        &cap.reject,
+                        &on_fulfill,
+                        &promise_resolve,
+                        &constructor,
+                        &promises,
+                        &entry_promise,
+                        &slots_root,
+                        &keys_root,
+                    ],
+                    &[args],
+                )?,
+            };
+            let attach_result =
+                attach_then_value(interp, &exec, entry_promise, on_fulfill, on_reject);
+            interp.pop_iteration_anchors_to(entry_anchor_base);
+            if let Err(err) = attach_result {
+                return reject_capability_error(interp, &cap, err);
+            }
+        }
+        if slots.finish_iteration() {
+            resolve_keyed_slots_runtime(
+                interp,
+                &cap,
+                &slots,
+                name,
+                &[
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
+                    &promise_resolve,
+                    &constructor,
+                    &promises,
+                ],
+                &[args],
+            )?;
+        }
+        Ok(cap.promise.clone())
+    })();
+    outcome
+}
+
+fn vm_property_key_from_value(key: &Value) -> Option<crate::VmPropertyKey<'static>> {
+    match key {
+        Value::String(s) => Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::Symbol(sym) => Some(crate::VmPropertyKey::Symbol(sym.clone())),
+        _ => None,
+    }
+}
+
+fn keyed_get(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    receiver: Value,
+    key: &crate::VmPropertyKey<'_>,
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    match interp
+        .ordinary_get_value(context, receiver.clone(), receiver.clone(), key, 0)
+        .map_err(|err| promise_vm_error(name, err))?
+    {
+        crate::VmGetOutcome::Value(value) => Ok(value),
+        crate::VmGetOutcome::InvokeGetter { getter } => interp
+            .run_callable_sync(context, &getter, receiver, SmallVec::new())
+            .map_err(|err| promise_vm_error(name, err)),
+    }
+}
+
+fn keyed_element_function(
+    interp: &mut Interpreter,
+    slots: Rc<PromiseSlots>,
+    cap: PromiseCapability,
+    variant: KeyedVariant,
+    fulfilled: bool,
+    index: usize,
+    string_heap: &std::sync::Arc<StringHeap>,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<Value, NativeError> {
+    let name = variant.name();
+    let heap = string_heap.clone();
+    let trace_slots = {
+        let slots = slots.clone();
+        let cap = cap.clone();
+        Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+            slots.trace(visitor);
+            cap.promise.trace_value_slots(visitor);
+            cap.resolve.trace_value_slots(visitor);
+            cap.reject.trace_value_slots(visitor);
+        })
+    };
+    promise_element_function(
+        interp,
+        "",
+        1,
+        smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+        trace_slots,
+        value_roots,
+        slice_roots,
+        move |ctx, args, _captures| {
+            let payload = args.first().cloned().unwrap_or(Value::Undefined);
+            let value = match variant {
+                KeyedVariant::All => payload,
+                KeyedVariant::AllSettled => build_settled_record(fulfilled, payload, &heap, ctx)?,
+            };
+            if slots.fill(ctx.heap_mut(), index, value) {
+                resolve_keyed_slots_native(ctx, &cap, &slots, name)?;
+            }
+            Ok(Value::Undefined)
+        },
+    )
+    .map_err(|_| oom_native(name))
+}
+
+fn resolve_keyed_slots_runtime(
+    interp: &mut Interpreter,
+    cap: &PromiseCapability,
+    slots: &PromiseSlots,
+    name: &'static str,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<(), NativeError> {
+    let keys = slots.collect_keys(interp.gc_heap());
+    let values = slots.collect_values(interp.gc_heap());
+    let result =
+        create_keyed_result_runtime(interp, name, &keys, &values, value_roots, slice_roots)?;
+    call_capability_resolve(interp, cap, result)
+}
+
+fn resolve_keyed_slots_native(
+    ctx: &mut NativeCtx<'_>,
+    cap: &PromiseCapability,
+    slots: &PromiseSlots,
+    name: &'static str,
+) -> Result<(), NativeError> {
+    let keys = slots.collect_keys(ctx.heap());
+    let values = slots.collect_values(ctx.heap());
+    let result = create_keyed_result_native(ctx, name, &keys, &values)?;
+    let interp = ctx.interp_mut();
+    call_capability_resolve(interp, cap, result)
+}
+
+fn create_keyed_result_runtime(
+    interp: &mut Interpreter,
+    name: &'static str,
+    keys: &[Value],
+    values: &[Value],
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<Value, NativeError> {
+    let mut all_slice_roots = Vec::with_capacity(slice_roots.len() + 2);
+    all_slice_roots.extend_from_slice(slice_roots);
+    all_slice_roots.push(keys);
+    all_slice_roots.push(values);
+    let obj = interp
+        .alloc_runtime_rooted_object_with_roots(value_roots, all_slice_roots.as_slice())
+        .map_err(|_| oom_native(name))?;
+    define_keyed_result_properties(obj, interp.gc_heap_mut(), keys, values, name)?;
+    Ok(Value::Object(obj))
+}
+
+fn create_keyed_result_native(
+    ctx: &mut NativeCtx<'_>,
+    name: &'static str,
+    keys: &[Value],
+    values: &[Value],
+) -> Result<Value, NativeError> {
+    let obj = ctx
+        .alloc_object_with_roots(&[], &[keys, values])
+        .map_err(|_| oom_native(name))?;
+    define_keyed_result_properties(obj, ctx.heap_mut(), keys, values, name)?;
+    Ok(Value::Object(obj))
+}
+
+fn define_keyed_result_properties(
+    obj: crate::object::JsObject,
+    heap: &mut otter_gc::GcHeap,
+    keys: &[Value],
+    values: &[Value],
+    name: &'static str,
+) -> Result<(), NativeError> {
+    for (key, value) in keys.iter().zip(values.iter()) {
+        let desc = crate::object::PropertyDescriptor::data(value.clone(), true, true, true);
+        let ok = match key {
+            Value::String(s) => {
+                let key = s.to_lossy_string();
+                crate::object::define_own_property(obj, heap, &key, desc)
+            }
+            Value::Symbol(sym) => crate::object::define_own_symbol_property(obj, heap, sym, desc),
+            _ => true,
+        };
+        if !ok {
+            return Err(NativeError::TypeError {
+                name,
+                reason: "failed to define keyed result property".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn static_all_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
-    let cap = new_generic_promise_capability(
-        interp,
-        context.clone(),
-        constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
-    )?;
+    let cap =
+        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.all",
         reason: "missing execution context".to_string(),
@@ -1390,62 +1934,152 @@ fn static_all_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    if entries.is_empty() {
-        let arr = interp
-            .alloc_runtime_rooted_array_from_values(
-                std::iter::empty::<Value>(),
-                &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
-                &[args],
-            )
-            .map_err(|_| oom_native("Promise.all"))?;
-        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
-            return reject_capability_error(interp, &cap, err);
+    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
+        Ok(record) => record,
+        Err(err) => {
+            return reject_capability_error(interp, &cap, promise_vm_error("Promise.all", err));
         }
-        return Ok(cap.promise);
-    }
-    let slots = PromiseSlots::new(entries.len());
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
-            };
-        let cap_for_fulfill = cap.clone();
-        let slots_for_trace = slots.clone();
-        let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-            slots_for_trace.trace(visitor);
-            cap_for_fulfill.promise.trace_value_slots(visitor);
-            cap_for_fulfill.resolve.trace_value_slots(visitor);
-            cap_for_fulfill.reject.trace_value_slots(visitor);
-        });
-        let cap_for_fulfill = cap.clone();
-        let slots_for_fulfill = slots.clone();
-        let on_fulfill = promise_element_function(
+    };
+    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
+    interp.push_iteration_anchor(next_method.clone());
+    let outcome = (|| -> Result<Value, NativeError> {
+        let slots = PromiseSlots::new(
             interp,
-            "",
-            1,
-            smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-            trace_slots,
-            &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
-            &[args, entries.as_slice()],
-            move |ctx, args, _captures| {
-                let v = args.first().cloned().unwrap_or(Value::Undefined);
-                if slots_for_fulfill.fill(i, v) {
-                    let collected = slots_for_fulfill.collect_values();
-                    let arr = ctx.array_from_elements(collected)?;
-                    let interp = ctx.interp_mut();
-                    call_capability_resolve(interp, &cap_for_fulfill, Value::Array(arr))?;
-                }
-                Ok(Value::Undefined)
-            },
+            &[
+                &cap.promise,
+                &cap.resolve,
+                &cap.reject,
+                &promise_resolve,
+                &constructor,
+                &iterable,
+                &iterator,
+                &next_method,
+            ],
+            &[args],
         )?;
-        if let Err(err) =
-            attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject.clone())
-        {
-            return reject_capability_error(interp, &cap, err);
+        let slots_root = slots.array_value();
+        interp.push_iteration_anchor(slots_root.clone());
+        loop {
+            let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(err) => {
+                    return reject_capability_error(
+                        interp,
+                        &cap,
+                        promise_vm_error("Promise.all", err),
+                    );
+                }
+            };
+            let i = slots.reserve_slot(
+                interp,
+                &[
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
+                    &promise_resolve,
+                    &constructor,
+                    &iterable,
+                    &iterator,
+                    &next_method,
+                    &slots_root,
+                    &next_value,
+                ],
+                &[args],
+            )?;
+            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let entry_promise_result =
+                call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
+            interp.pop_iteration_anchors_to(value_anchor_base);
+            let entry_promise = match entry_promise_result {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                    return reject_capability_error(interp, &cap, err);
+                }
+            };
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let cap_for_fulfill = cap.clone();
+            let slots_for_trace = slots.clone();
+            let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+                slots_for_trace.trace(visitor);
+                cap_for_fulfill.promise.trace_value_slots(visitor);
+                cap_for_fulfill.resolve.trace_value_slots(visitor);
+                cap_for_fulfill.reject.trace_value_slots(visitor);
+            });
+            let cap_for_fulfill = cap.clone();
+            let slots_for_fulfill = slots.clone();
+            let on_fulfill = promise_element_function(
+                interp,
+                "",
+                1,
+                smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                trace_slots,
+                &[
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
+                    &promise_resolve,
+                    &constructor,
+                    &entry_promise,
+                    &slots_root,
+                ],
+                &[args],
+                move |ctx, args, _captures| {
+                    let v = args.first().cloned().unwrap_or(Value::Undefined);
+                    if slots_for_fulfill.fill(ctx.heap_mut(), i, v) {
+                        let collected = slots_for_fulfill.collect_values(ctx.heap());
+                        let arr = ctx.array_from_elements_with_roots(
+                            collected.iter().cloned(),
+                            &[
+                                &cap_for_fulfill.promise,
+                                &cap_for_fulfill.resolve,
+                                &cap_for_fulfill.reject,
+                            ],
+                            &[collected.as_slice()],
+                        )?;
+                        let interp = ctx.interp_mut();
+                        call_capability_resolve(interp, &cap_for_fulfill, Value::Array(arr))?;
+                    }
+                    Ok(Value::Undefined)
+                },
+            )?;
+            let attach_result =
+                attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject.clone());
+            interp.pop_iteration_anchors_to(entry_anchor_base);
+            if let Err(err) = attach_result {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+                return reject_capability_error(interp, &cap, err);
+            }
         }
-    }
-    Ok(cap.promise)
+        if slots.finish_iteration() {
+            let collected = slots.collect_values(interp.gc_heap());
+            let arr = interp
+                .alloc_runtime_rooted_array_from_values(
+                    collected.iter().cloned(),
+                    &[
+                        &cap.promise,
+                        &cap.resolve,
+                        &cap.reject,
+                        &promise_resolve,
+                        &constructor,
+                        &iterable,
+                        &iterator,
+                        &next_method,
+                        &slots_root,
+                    ],
+                    &[args, collected.as_slice()],
+                )
+                .map_err(|_| oom_native("Promise.all"))?;
+            if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
+                return reject_capability_error(interp, &cap, err);
+            }
+        }
+        Ok(cap.promise.clone())
+    })();
+    interp.pop_iteration_anchors_to(anchor_base);
+    outcome
 }
 
 fn static_race_generic(
@@ -1454,19 +2088,8 @@ fn static_race_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
-    let cap = new_generic_promise_capability(
-        interp,
-        context.clone(),
-        constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
-    )?;
+    let cap =
+        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.race",
         reason: "missing execution context".to_string(),
@@ -1475,23 +2098,57 @@ fn static_race_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    for entry in entries.iter().cloned() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
-            };
-        if let Err(err) = attach_then_value(
-            interp,
-            &exec,
-            entry_promise,
-            cap.resolve.clone(),
-            cap.reject.clone(),
-        ) {
-            return reject_capability_error(interp, &cap, err);
+    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
+        Ok(record) => record,
+        Err(err) => {
+            return reject_capability_error(interp, &cap, promise_vm_error("Promise.race", err));
         }
-    }
-    Ok(cap.promise)
+    };
+    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
+    interp.push_iteration_anchor(next_method.clone());
+    let outcome = (|| -> Result<Value, NativeError> {
+        loop {
+            let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(err) => {
+                    return reject_capability_error(
+                        interp,
+                        &cap,
+                        promise_vm_error("Promise.race", err),
+                    );
+                }
+            };
+            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let entry_promise_result =
+                call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
+            interp.pop_iteration_anchors_to(value_anchor_base);
+            let entry_promise = match entry_promise_result {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                    return reject_capability_error(interp, &cap, err);
+                }
+            };
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let attach_result = attach_then_value(
+                interp,
+                &exec,
+                entry_promise,
+                cap.resolve.clone(),
+                cap.reject.clone(),
+            );
+            interp.pop_iteration_anchors_to(entry_anchor_base);
+            if let Err(err) = attach_result {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+                return reject_capability_error(interp, &cap, err);
+            }
+        }
+        Ok(cap.promise.clone())
+    })();
+    interp.pop_iteration_anchors_to(anchor_base);
+    outcome
 }
 
 fn static_all_settled_generic(
@@ -1500,19 +2157,8 @@ fn static_all_settled_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
-    let cap = new_generic_promise_capability(
-        interp,
-        context.clone(),
-        constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
-    )?;
+    let cap =
+        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.allSettled",
         reason: "missing execution context".to_string(),
@@ -1521,114 +2167,213 @@ fn static_all_settled_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    if entries.is_empty() {
-        let arr = interp
-            .alloc_runtime_rooted_array_from_values(
-                std::iter::empty::<Value>(),
-                &[&cap.promise, &cap.resolve, &cap.reject, &promise_resolve],
-                &[args],
-            )
-            .map_err(|_| oom_native("Promise.allSettled"))?;
-        if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
-            return reject_capability_error(interp, &cap, err);
+    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
+        Ok(record) => record,
+        Err(err) => {
+            return reject_capability_error(
+                interp,
+                &cap,
+                promise_vm_error("Promise.allSettled", err),
+            );
         }
-        return Ok(cap.promise);
-    }
-    let slots = PromiseSlots::new(entries.len());
+    };
+    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
+    interp.push_iteration_anchor(next_method.clone());
     let heap = interp.string_heap_clone();
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
+    let outcome = (|| -> Result<Value, NativeError> {
+        let slots = PromiseSlots::new(
+            interp,
+            &[
+                &cap.promise,
+                &cap.resolve,
+                &cap.reject,
+                &promise_resolve,
+                &constructor,
+                &iterable,
+                &iterator,
+                &next_method,
+            ],
+            &[args],
+        )?;
+        let slots_root = slots.array_value();
+        interp.push_iteration_anchor(slots_root.clone());
+        loop {
+            let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(err) => {
+                    return reject_capability_error(
+                        interp,
+                        &cap,
+                        promise_vm_error("Promise.allSettled", err),
+                    );
+                }
             };
-        let on_fulfill = {
-            let slots = slots.clone();
-            let heap = heap.clone();
-            let cap = cap.clone();
-            let promise_root = cap.promise.clone();
-            let resolve_root = cap.resolve.clone();
-            let reject_root = cap.reject.clone();
-            let trace_slots = {
-                let slots = slots.clone();
-                let cap = cap.clone();
-                Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-                    slots.trace(visitor);
-                    cap.promise.trace_value_slots(visitor);
-                    cap.resolve.trace_value_slots(visitor);
-                    cap.reject.trace_value_slots(visitor);
-                })
-            };
-            promise_element_function(
+            let i = slots.reserve_slot(
                 interp,
-                "",
-                1,
-                smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-                trace_slots,
-                &[&promise_root, &resolve_root, &reject_root, &promise_resolve],
-                &[args, entries.as_slice()],
-                move |ctx, args, _captures| {
-                    let v = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(true, v, &heap, ctx)?;
-                    if slots.fill(i, record) {
-                        let collected = slots.collect_values();
-                        let arr = ctx.array_from_elements(collected)?;
-                        let interp = ctx.interp_mut();
-                        call_capability_resolve(interp, &cap, Value::Array(arr))?;
-                    }
-                    Ok(Value::Undefined)
-                },
-            )?
-        };
-        let on_reject = {
-            let slots = slots.clone();
-            let heap = heap.clone();
-            let cap = cap.clone();
-            let promise_root = cap.promise.clone();
-            let resolve_root = cap.resolve.clone();
-            let reject_root = cap.reject.clone();
-            let trace_slots = {
-                let slots = slots.clone();
-                let cap = cap.clone();
-                Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-                    slots.trace(visitor);
-                    cap.promise.trace_value_slots(visitor);
-                    cap.resolve.trace_value_slots(visitor);
-                    cap.reject.trace_value_slots(visitor);
-                })
-            };
-            promise_element_function(
-                interp,
-                "",
-                1,
-                smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-                trace_slots,
                 &[
-                    &promise_root,
-                    &resolve_root,
-                    &reject_root,
-                    &on_fulfill,
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
                     &promise_resolve,
+                    &constructor,
+                    &iterable,
+                    &iterator,
+                    &next_method,
+                    &slots_root,
+                    &next_value,
                 ],
-                &[args, entries.as_slice()],
-                move |ctx, args, _captures| {
-                    let r = args.first().cloned().unwrap_or(Value::Undefined);
-                    let record = build_settled_record(false, r, &heap, ctx)?;
-                    if slots.fill(i, record) {
-                        let collected = slots.collect_values();
-                        let arr = ctx.array_from_elements(collected)?;
-                        let interp = ctx.interp_mut();
-                        call_capability_resolve(interp, &cap, Value::Array(arr))?;
-                    }
-                    Ok(Value::Undefined)
-                },
-            )?
-        };
-        if let Err(err) = attach_then_value(interp, &exec, entry_promise, on_fulfill, on_reject) {
-            return reject_capability_error(interp, &cap, err);
+                &[args],
+            )?;
+            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let entry_promise_result =
+                call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
+            interp.pop_iteration_anchors_to(value_anchor_base);
+            let entry_promise = match entry_promise_result {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                    return reject_capability_error(interp, &cap, err);
+                }
+            };
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let on_fulfill = {
+                let slots = slots.clone();
+                let heap = heap.clone();
+                let cap = cap.clone();
+                let promise_root = cap.promise.clone();
+                let resolve_root = cap.resolve.clone();
+                let reject_root = cap.reject.clone();
+                let trace_slots = {
+                    let slots = slots.clone();
+                    let cap = cap.clone();
+                    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+                        slots.trace(visitor);
+                        cap.promise.trace_value_slots(visitor);
+                        cap.resolve.trace_value_slots(visitor);
+                        cap.reject.trace_value_slots(visitor);
+                    })
+                };
+                promise_element_function(
+                    interp,
+                    "",
+                    1,
+                    smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                    trace_slots,
+                    &[
+                        &promise_root,
+                        &resolve_root,
+                        &reject_root,
+                        &promise_resolve,
+                        &constructor,
+                        &entry_promise,
+                        &slots_root,
+                    ],
+                    &[args],
+                    move |ctx, args, _captures| {
+                        let v = args.first().cloned().unwrap_or(Value::Undefined);
+                        let record = build_settled_record(true, v, &heap, ctx)?;
+                        if slots.fill(ctx.heap_mut(), i, record) {
+                            let collected = slots.collect_values(ctx.heap());
+                            let arr = ctx.array_from_elements_with_roots(
+                                collected.iter().cloned(),
+                                &[&cap.promise, &cap.resolve, &cap.reject],
+                                &[collected.as_slice()],
+                            )?;
+                            let interp = ctx.interp_mut();
+                            call_capability_resolve(interp, &cap, Value::Array(arr))?;
+                        }
+                        Ok(Value::Undefined)
+                    },
+                )?
+            };
+            let on_reject = {
+                let slots = slots.clone();
+                let heap = heap.clone();
+                let cap = cap.clone();
+                let promise_root = cap.promise.clone();
+                let resolve_root = cap.resolve.clone();
+                let reject_root = cap.reject.clone();
+                let trace_slots = {
+                    let slots = slots.clone();
+                    let cap = cap.clone();
+                    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+                        slots.trace(visitor);
+                        cap.promise.trace_value_slots(visitor);
+                        cap.resolve.trace_value_slots(visitor);
+                        cap.reject.trace_value_slots(visitor);
+                    })
+                };
+                promise_element_function(
+                    interp,
+                    "",
+                    1,
+                    smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                    trace_slots,
+                    &[
+                        &promise_root,
+                        &resolve_root,
+                        &reject_root,
+                        &on_fulfill,
+                        &promise_resolve,
+                        &constructor,
+                        &entry_promise,
+                        &slots_root,
+                    ],
+                    &[args],
+                    move |ctx, args, _captures| {
+                        let r = args.first().cloned().unwrap_or(Value::Undefined);
+                        let record = build_settled_record(false, r, &heap, ctx)?;
+                        if slots.fill(ctx.heap_mut(), i, record) {
+                            let collected = slots.collect_values(ctx.heap());
+                            let arr = ctx.array_from_elements_with_roots(
+                                collected.iter().cloned(),
+                                &[&cap.promise, &cap.resolve, &cap.reject],
+                                &[collected.as_slice()],
+                            )?;
+                            let interp = ctx.interp_mut();
+                            call_capability_resolve(interp, &cap, Value::Array(arr))?;
+                        }
+                        Ok(Value::Undefined)
+                    },
+                )?
+            };
+            let attach_result =
+                attach_then_value(interp, &exec, entry_promise, on_fulfill, on_reject);
+            interp.pop_iteration_anchors_to(entry_anchor_base);
+            if let Err(err) = attach_result {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+                return reject_capability_error(interp, &cap, err);
+            }
         }
-    }
-    Ok(cap.promise)
+        if slots.finish_iteration() {
+            let collected = slots.collect_values(interp.gc_heap());
+            let arr = interp
+                .alloc_runtime_rooted_array_from_values(
+                    collected.iter().cloned(),
+                    &[
+                        &cap.promise,
+                        &cap.resolve,
+                        &cap.reject,
+                        &promise_resolve,
+                        &constructor,
+                        &iterable,
+                        &iterator,
+                        &next_method,
+                        &slots_root,
+                    ],
+                    &[args, collected.as_slice()],
+                )
+                .map_err(|_| oom_native("Promise.allSettled"))?;
+            if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
+                return reject_capability_error(interp, &cap, err);
+            }
+        }
+        Ok(cap.promise.clone())
+    })();
+    interp.pop_iteration_anchors_to(anchor_base);
+    outcome
 }
 
 fn build_settled_record(
@@ -1692,7 +2437,11 @@ fn make_aggregate_error_runtime_rooted(
         })?;
     let obj_value = Value::Object(obj);
     let arr = interp
-        .alloc_runtime_rooted_array_from_values(errors, &[&obj_value], &[])
+        .alloc_runtime_rooted_array_from_values(
+            errors.iter().cloned(),
+            &[&obj_value],
+            &[errors.as_slice()],
+        )
         .map_err(|_| oom_native("Promise.any"))?;
     interp
         .set_property(obj, "errors", Value::Array(arr))
@@ -1728,7 +2477,7 @@ fn make_aggregate_error_native_rooted(
         })?;
     let obj_value = Value::Object(obj);
     let arr = ctx
-        .array_from_elements_with_roots(errors, &[&obj_value], &[])
+        .array_from_elements_with_roots(errors.iter().cloned(), &[&obj_value], &[errors.as_slice()])
         .map_err(|_| oom_native("Promise.any"))?;
     ctx.set_property(obj, "errors", Value::Array(arr))
         .map_err(|err| NativeError::TypeError {
@@ -1756,25 +2505,30 @@ fn oom_native(name: &'static str) -> NativeError {
     }
 }
 
+fn alloc_object_result_with_object_proto(
+    interp: &mut Interpreter,
+    name: &'static str,
+    value_roots: &[&Value],
+    slice_roots: &[&[Value]],
+) -> Result<crate::object::JsObject, NativeError> {
+    match interp.constructor_prototype_value("Object") {
+        Ok(Value::Object(proto)) => interp
+            .alloc_runtime_rooted_object_with_proto(proto, value_roots, slice_roots)
+            .map_err(|_| oom_native(name)),
+        _ => interp
+            .alloc_runtime_rooted_object_with_roots(value_roots, slice_roots)
+            .map_err(|_| oom_native(name)),
+    }
+}
+
 fn static_any_generic(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let entries = match args.first() {
-        Some(Value::Array(arr)) => {
-            crate::array::with_elements(*arr, interp.gc_heap(), |elements| elements.to_vec())
-        }
-        _ => Vec::new(),
-    };
-    let cap = new_generic_promise_capability(
-        interp,
-        context.clone(),
-        constructor.clone(),
-        &[],
-        &[args, entries.as_slice()],
-    )?;
+    let cap =
+        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.any",
         reason: "missing execution context".to_string(),
@@ -1783,68 +2537,139 @@ fn static_any_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    if entries.is_empty() {
-        let registry = interp.error_classes_clone();
-        let string_heap = interp.string_heap_clone();
-        let agg = make_aggregate_error_runtime_rooted(interp, &registry, &string_heap, Vec::new())?;
-        call_capability_reject(interp, &cap, agg)?;
-        return Ok(cap.promise);
-    }
-    let errors = PromiseSlots::new(entries.len());
+    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
+        Ok(record) => record,
+        Err(err) => {
+            return reject_capability_error(interp, &cap, promise_vm_error("Promise.any", err));
+        }
+    };
+    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
+    interp.push_iteration_anchor(next_method.clone());
     let heap = interp.string_heap_clone();
     let registry = interp.error_classes_clone();
-    for (i, entry) in entries.iter().cloned().enumerate() {
-        let entry_promise =
-            match call_promise_resolve(interp, &exec, &promise_resolve, &constructor, entry) {
-                Ok(value) => value,
-                Err(err) => return reject_capability_error(interp, &cap, err),
+    let outcome = (|| -> Result<Value, NativeError> {
+        let errors = PromiseSlots::new(
+            interp,
+            &[
+                &cap.promise,
+                &cap.resolve,
+                &cap.reject,
+                &promise_resolve,
+                &constructor,
+                &iterable,
+                &iterator,
+                &next_method,
+            ],
+            &[args],
+        )?;
+        let errors_root = errors.array_value();
+        interp.push_iteration_anchor(errors_root.clone());
+        loop {
+            let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
+                Ok(Some(value)) => value,
+                Ok(None) => break,
+                Err(err) => {
+                    return reject_capability_error(
+                        interp,
+                        &cap,
+                        promise_vm_error("Promise.any", err),
+                    );
+                }
             };
-        let on_reject = {
-            let errors = errors.clone();
-            let heap = heap.clone();
-            let registry = registry.clone();
-            let cap = cap.clone();
-            let promise_root = cap.promise.clone();
-            let resolve_root = cap.resolve.clone();
-            let reject_root = cap.reject.clone();
-            let trace_errors = {
-                let errors = errors.clone();
-                let cap = cap.clone();
-                Rc::new(move |visitor: &mut SlotVisitor<'_>| {
-                    errors.trace(visitor);
-                    cap.promise.trace_value_slots(visitor);
-                    cap.resolve.trace_value_slots(visitor);
-                    cap.reject.trace_value_slots(visitor);
-                })
-            };
-            promise_element_function(
+            let i = errors.reserve_slot(
                 interp,
-                "",
-                1,
-                smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
-                trace_errors,
-                &[&promise_root, &resolve_root, &reject_root, &promise_resolve],
-                &[args, entries.as_slice()],
-                move |ctx, args, _captures| {
-                    let reason = args.first().cloned().unwrap_or(Value::Undefined);
-                    if errors.fill(i, reason) {
-                        let collected = errors.collect_values();
-                        let agg =
-                            make_aggregate_error_native_rooted(ctx, &registry, &heap, collected)?;
-                        let interp = ctx.interp_mut();
-                        call_capability_reject(interp, &cap, agg)?;
-                    }
-                    Ok(Value::Undefined)
-                },
-            )?
-        };
-        if let Err(err) =
-            attach_then_value(interp, &exec, entry_promise, cap.resolve.clone(), on_reject)
-        {
-            return reject_capability_error(interp, &cap, err);
+                &[
+                    &cap.promise,
+                    &cap.resolve,
+                    &cap.reject,
+                    &promise_resolve,
+                    &constructor,
+                    &iterable,
+                    &iterator,
+                    &next_method,
+                    &errors_root,
+                    &next_value,
+                ],
+                &[args],
+            )?;
+            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let entry_promise_result =
+                call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
+            interp.pop_iteration_anchors_to(value_anchor_base);
+            let entry_promise = match entry_promise_result {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = interp.iterator_close_sync(&exec, &iterator);
+                    return reject_capability_error(interp, &cap, err);
+                }
+            };
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let on_reject = {
+                let errors = errors.clone();
+                let heap = heap.clone();
+                let registry = registry.clone();
+                let cap = cap.clone();
+                let promise_root = cap.promise.clone();
+                let resolve_root = cap.resolve.clone();
+                let reject_root = cap.reject.clone();
+                let trace_errors = {
+                    let errors = errors.clone();
+                    let cap = cap.clone();
+                    Rc::new(move |visitor: &mut SlotVisitor<'_>| {
+                        errors.trace(visitor);
+                        cap.promise.trace_value_slots(visitor);
+                        cap.resolve.trace_value_slots(visitor);
+                        cap.reject.trace_value_slots(visitor);
+                    })
+                };
+                promise_element_function(
+                    interp,
+                    "",
+                    1,
+                    smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                    trace_errors,
+                    &[
+                        &promise_root,
+                        &resolve_root,
+                        &reject_root,
+                        &promise_resolve,
+                        &constructor,
+                        &entry_promise,
+                        &errors_root,
+                    ],
+                    &[args],
+                    move |ctx, args, _captures| {
+                        let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                        if errors.fill(ctx.heap_mut(), i, reason) {
+                            let collected = errors.collect_values(ctx.heap());
+                            let agg = make_aggregate_error_native_rooted(
+                                ctx, &registry, &heap, collected,
+                            )?;
+                            let interp = ctx.interp_mut();
+                            call_capability_reject(interp, &cap, agg)?;
+                        }
+                        Ok(Value::Undefined)
+                    },
+                )?
+            };
+            let attach_result =
+                attach_then_value(interp, &exec, entry_promise, cap.resolve.clone(), on_reject);
+            interp.pop_iteration_anchors_to(entry_anchor_base);
+            if let Err(err) = attach_result {
+                let _ = interp.iterator_close_sync(&exec, &iterator);
+                return reject_capability_error(interp, &cap, err);
+            }
         }
-    }
-    Ok(cap.promise)
+        if errors.finish_iteration() {
+            let collected = errors.collect_values(interp.gc_heap());
+            let agg = make_aggregate_error_runtime_rooted(interp, &registry, &heap, collected)?;
+            call_capability_reject(interp, &cap, agg)?;
+        }
+        Ok(cap.promise.clone())
+    })();
+    interp.pop_iteration_anchors_to(anchor_base);
+    outcome
 }
 
 /// §27.2.4.6 `Promise.withResolvers()` — returns
@@ -1861,12 +2686,12 @@ fn static_with_resolvers(
         &[],
         &[],
     )?;
-    let obj = match interp
-        .alloc_runtime_rooted_object_with_roots(&[&cap.promise, &cap.resolve, &cap.reject], &[])
-    {
-        Ok(o) => o,
-        Err(_) => return Ok(Value::Undefined),
-    };
+    let obj = alloc_object_result_with_object_proto(
+        interp,
+        "Promise.withResolvers",
+        &[&cap.promise, &cap.resolve, &cap.reject],
+        &[],
+    )?;
     let mut cap_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         cap.promise.trace_value_slots(visitor);
         cap.resolve.trace_value_slots(visitor);
@@ -1909,9 +2734,12 @@ fn static_with_resolvers_generic(
     constructor: Value,
 ) -> Result<Value, NativeError> {
     let cap = new_generic_promise_capability(interp, context, constructor, &[], &[])?;
-    let obj = interp
-        .alloc_runtime_rooted_object_with_roots(&[&cap.promise, &cap.resolve, &cap.reject], &[])
-        .map_err(|_| oom_native("Promise.withResolvers"))?;
+    let obj = alloc_object_result_with_object_proto(
+        interp,
+        "Promise.withResolvers",
+        &[&cap.promise, &cap.resolve, &cap.reject],
+        &[],
+    )?;
     let mut cap_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         cap.promise.trace_value_slots(visitor);
         cap.resolve.trace_value_slots(visitor);
@@ -2388,13 +3216,18 @@ mod tests {
         let args = [Value::Number(NumberValue::from_i32(7))];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
-        let promise = static_resolve(&mut interp, &args).expect("Promise.resolve");
+        let constructor = Value::Undefined;
+        let promise_value =
+            static_resolve(&mut interp, None, constructor, &args).expect("Promise.resolve");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
             after > before,
             "Promise.resolve should allocate non-promise results through runtime-rooted young allocation"
         );
+        let Value::Promise(promise) = promise_value else {
+            panic!("expected promise");
+        };
         assert!(matches!(
             promise.state(interp.gc_heap()),
             PromiseState::Fulfilled(Value::Number(_))

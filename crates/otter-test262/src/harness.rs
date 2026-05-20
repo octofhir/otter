@@ -31,11 +31,11 @@ use crate::metadata::Frontmatter;
 pub const DONE_POLYFILL_STUB: &str = r#"
 var __OTTER_TEST262_DONE_RESULT = undefined;
 var __OTTER_TEST262_DONE_FIRED = false;
-function $DONE(reason) {
+globalThis.$DONE = function $DONE(reason) {
     if (__OTTER_TEST262_DONE_FIRED) { return; }
     __OTTER_TEST262_DONE_FIRED = true;
     __OTTER_TEST262_DONE_RESULT = reason;
-}
+};
 "#;
 
 /// `$262` host harness — single-thread surface (slice 19a).

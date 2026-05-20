@@ -532,6 +532,19 @@ impl Interpreter {
                 return finish_static_call(&mut stack[top_idx], dst, result);
             }
             method_id::ObjectMethod::GetOwnPropertyDescriptor | method_id::ObjectMethod::HasOwn => {
+                // §20.1.2.10 / §20.1.2.13 step 1: `obj = ? ToObject(O)`.
+                // Preserve the observable ordering before the
+                // context-aware `ToPropertyKey(P)` path below: null /
+                // undefined receivers must throw before key coercion
+                // can invoke user code.
+                if matches!(
+                    args.first(),
+                    None | Some(Value::Null) | Some(Value::Undefined)
+                ) {
+                    return Err(VmError::TypeError {
+                        message: "Object static method called on null or undefined".to_string(),
+                    });
+                }
                 // §20.1.2.10 / §20.1.2.13 step 2: `key = ? ToPropertyKey(P)`.
                 // The ToPrimitive ladder may invoke user
                 // `Symbol.toPrimitive` / `toString` / `valueOf`, so
@@ -834,65 +847,6 @@ impl Interpreter {
         for src in args.iter().skip(1) {
             match src {
                 Value::Undefined | Value::Null => continue,
-                Value::Object(o) => {
-                    let entries: Vec<(String, Value)> =
-                        object::with_properties(*o, self.gc_heap(), |p| {
-                            p.enumerable_data_iter()
-                                .map(|(k, v)| (k.to_string(), v))
-                                .collect()
-                        });
-                    for (k, v) in entries {
-                        // §20.1.2.1 step 4.c.iii.2.b — `Set(to, nextKey,
-                        // propValue, true)` runs OrdinarySet with the
-                        // *strict* flag, so frozen / sealed / non-
-                        // writable / non-extensible targets surface
-                        // TypeError instead of silently dropping.
-                        assign_set_string(self, context, &target_value, target_object, &k, v)?;
-                    }
-                    // §20.1.2.1 step 4.c.ii — `OwnPropertyKeys(O)`
-                    // returns string keys followed by symbol keys.
-                    // Copy enumerable own symbol data slots too.
-                    let sym_entries: Vec<(crate::symbol::JsSymbol, Value)> =
-                        object::with_properties(*o, self.gc_heap(), |p| {
-                            p.enumerable_symbol_data_iter().collect()
-                        });
-                    for (sym, v) in sym_entries {
-                        assign_set_symbol(self, context, &target_value, target_object, &sym, v)?;
-                    }
-                }
-                Value::Array(arr) => {
-                    // §22.1.3.3 — Array EnumerableOwnPropertyNames:
-                    // dense indices then named extra slots. Skip
-                    // array holes (`Value::Hole`): the spec only
-                    // copies own properties, and a hole is the
-                    // absence of an own property.
-                    let dense: Vec<(usize, Value)> =
-                        array::with_elements(*arr, self.gc_heap(), |els| {
-                            els.iter()
-                                .enumerate()
-                                .filter(|(_, v)| !matches!(v, Value::Hole))
-                                .map(|(i, v)| (i, v.clone()))
-                                .collect()
-                        });
-                    for (idx, v) in dense.into_iter() {
-                        assign_set_string(
-                            self,
-                            context,
-                            &target_value,
-                            target_object,
-                            &idx.to_string(),
-                            v,
-                        )?;
-                    }
-                    let named: Vec<(String, Value)> = self.gc_heap().read_payload(*arr, |body| {
-                        body.named_properties.as_ref().map_or_else(Vec::new, |m| {
-                            m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                        })
-                    });
-                    for (k, v) in named {
-                        assign_set_string(self, context, &target_value, target_object, &k, v)?;
-                    }
-                }
                 Value::String(s) => {
                     // §22.1.4 — String exotic exposes its code units
                     // as own indexed properties plus a `length`. The
@@ -915,11 +869,21 @@ impl Interpreter {
                         )?;
                     }
                 }
+                source if assign_source_uses_own_property_keys(source) => {
+                    assign_copy_source_keys(
+                        self,
+                        context,
+                        &target_value,
+                        target_object,
+                        source,
+                        args,
+                    )?;
+                }
                 _ => {
-                    // Other object-typed sources: skip the spread for
-                    // now (no observable own enumerable string keys
-                    // exposed through the legacy `with_properties`
-                    // probe). Sym sources are intentionally skipped.
+                    // Primitive Boolean / Number / Symbol / BigInt
+                    // wrappers have no enumerable own properties in
+                    // this VM slice, so ToObject(source) contributes
+                    // an empty key list.
                     continue;
                 }
             }
@@ -2056,6 +2020,92 @@ fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), 
     Ok(())
 }
 
+fn assign_source_uses_own_property_keys(source: &Value) -> bool {
+    matches!(
+        source,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Proxy(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::RegExp(_)
+            | Value::Map(_)
+            | Value::Set(_)
+            | Value::WeakMap(_)
+            | Value::WeakSet(_)
+            | Value::WeakRef(_)
+            | Value::FinalizationRegistry(_)
+            | Value::ArrayBuffer(_)
+            | Value::DataView(_)
+            | Value::TypedArray(_)
+            | Value::Promise(_)
+    )
+}
+
+fn assign_copy_source_keys(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    target_value: &Value,
+    target_object: Option<crate::object::JsObject>,
+    source: &Value,
+    args: &[Value],
+) -> Result<(), VmError> {
+    let string_heap = interp.string_heap_clone();
+    let keys = interp.own_property_keys_value(context, source, &string_heap)?;
+    for key_value in &keys {
+        let key = match key_value {
+            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+            Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+            _ => {
+                return Err(VmError::TypeError {
+                    message: "Object.assign source ownKeys returned non-property key".to_string(),
+                });
+            }
+        };
+        let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
+            context,
+            source.clone(),
+            &key,
+            0,
+            &[target_value, source],
+            &[args, keys.as_slice()],
+        )?;
+        let Some(desc) = desc else {
+            continue;
+        };
+        if !desc.enumerable() {
+            continue;
+        }
+        let value =
+            match interp.ordinary_get_value(context, source.clone(), source.clone(), &key, 0)? {
+                crate::VmGetOutcome::Value(value) => value,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    interp.run_callable_sync(context, &getter, source.clone(), SmallVec::new())?
+                }
+            };
+        match &key {
+            VmPropertyKey::Symbol(sym) => {
+                assign_set_symbol(interp, context, target_value, target_object, sym, value)?;
+            }
+            _ => {
+                assign_set_string(
+                    interp,
+                    context,
+                    target_value,
+                    target_object,
+                    key.string_name()
+                        .expect("non-symbol key has string spelling"),
+                    value,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `Object.assign` value-level write helper. Routes string-keyed
 /// writes through the matching exotic [[Set]]:
 ///
@@ -2077,6 +2127,14 @@ fn assign_set_string(
     value: Value,
 ) -> Result<(), VmError> {
     if let Some(obj) = target_object {
+        if let Some(desc) =
+            interp.string_object_exotic_descriptor(obj, &VmPropertyKey::String(key))?
+            && !desc.writable()
+        {
+            return Err(VmError::TypeError {
+                message: format!("Cannot assign to read-only property '{key}'"),
+            });
+        }
         return interp.ordinary_set_with_callable_setter(context, obj, key, value, true);
     }
     match target_value {

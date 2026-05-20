@@ -1284,19 +1284,37 @@ fn native_prototype_has_own_property(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
+    if let Some(context) = ctx.execution_context().cloned() {
+        let key = ctx
+            .cx
+            .interp
+            .to_property_key_sync(&context, args.first().cloned().unwrap_or(Value::Undefined))
+            .map_err(|err| object_native_error("hasOwnProperty", err))?;
+        if matches!(this_value, Value::Null | Value::Undefined) {
+            return Err(NativeError::TypeError {
+                name: "hasOwnProperty",
+                reason: "cannot convert null or undefined to object".to_string(),
+            });
+        }
+        let desc = ctx
+            .cx
+            .interp
+            .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                &context,
+                this_value.clone(),
+                &key,
+                0,
+                &[&this_value],
+                &[],
+            )
+            .map_err(|err| object_native_error("hasOwnProperty", err))?;
+        return Ok(Value::Boolean(desc.is_some()));
+    }
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
             name: "hasOwnProperty",
             reason: "cannot convert null or undefined to object".to_string(),
         });
-    }
-    if let Some(context) = ctx.execution_context().cloned() {
-        let desc = ctx
-            .cx
-            .interp
-            .get_own_property_descriptor_for_value(&context, this_value.clone(), args.first())
-            .map_err(|err| object_native_error("hasOwnProperty", err))?;
-        return Ok(Value::Boolean(desc.is_some()));
     }
     let present = match ctx.this_value() {
         Value::Object(obj) => has_own_property(*obj, ctx.heap(), args.first())
@@ -1707,16 +1725,16 @@ fn lookup_accessor_helper(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let this_value = ctx.this_value().clone();
+    if matches!(this_value, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: method_name,
+            reason: "cannot convert null or undefined to object".to_string(),
+        });
+    }
     let key = native_to_property_key(ctx, args.first(), method_name)?;
     if let Some(exec_ctx) = ctx.execution_context().cloned() {
         let key = property_key_to_vm_key(&key);
         let mut current = match this_value {
-            Value::Null | Value::Undefined => {
-                return Err(NativeError::TypeError {
-                    name: method_name,
-                    reason: "cannot convert null or undefined to object".to_string(),
-                });
-            }
             value if is_object_like_value(&value) => Some(value),
             _ => return Ok(Value::Undefined),
         };
@@ -1761,12 +1779,6 @@ fn lookup_accessor_helper(
 
     let mut current = match this_value {
         Value::Object(o) => Some(o),
-        Value::Null | Value::Undefined => {
-            return Err(NativeError::TypeError {
-                name: method_name,
-                reason: "cannot convert null or undefined to object".to_string(),
-            });
-        }
         _ => return Ok(Value::Undefined),
     };
     while let Some(obj) = current {

@@ -2744,9 +2744,15 @@ impl Interpreter {
                 object::set_symbol_data(obj, &mut self.gc_heap, sym.clone());
                 obj
             }
-            Value::BigInt(_) => {
+            Value::BigInt(value) => {
                 let proto = self.primitive_wrapper_prototype("BigInt")?;
-                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?
+                let obj = self.alloc_runtime_rooted_object_with_proto(
+                    proto,
+                    &[&this_value],
+                    slice_roots,
+                )?;
+                object::set_bigint_data(obj, &mut self.gc_heap, value.clone());
+                obj
             }
             _ => return Ok(this_value),
         };
@@ -2804,14 +2810,16 @@ impl Interpreter {
                 object::set_symbol_data(obj, &mut self.gc_heap, sym.clone());
                 obj
             }
-            Value::BigInt(_) => {
+            Value::BigInt(value) => {
                 let proto = self.primitive_wrapper_prototype("BigInt")?;
-                self.alloc_stack_rooted_object_with_proto(
+                let obj = self.alloc_stack_rooted_object_with_proto(
                     stack,
                     proto,
                     &[&this_value],
                     slice_roots,
-                )?
+                )?;
+                object::set_bigint_data(obj, &mut self.gc_heap, value.clone());
+                obj
             }
             _ => return Ok(this_value),
         };

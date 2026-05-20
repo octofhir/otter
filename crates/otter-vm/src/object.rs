@@ -68,6 +68,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use smallvec::SmallVec;
 
+use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
 use crate::proxy::JsProxy;
@@ -382,6 +383,8 @@ pub struct ObjectBody {
     string_data: Option<JsString>,
     /// `[[SymbolData]]` internal slot for Symbol wrapper objects.
     symbol_data: Option<crate::symbol::JsSymbol>,
+    /// `[[BigIntData]]` internal slot for BigInt wrapper objects.
+    bigint_data: Option<BigIntValue>,
     /// `[[DateValue]]` internal slot for Date instances per
     /// ECMA-262 §21.4.5. Holds the time value as UTC epoch
     /// milliseconds (or `NaN` for an Invalid Date). Mutation goes
@@ -541,6 +544,7 @@ fn empty_object_body() -> ObjectBody {
         number_data: None,
         string_data: None,
         symbol_data: None,
+        bigint_data: None,
         date_data: None,
         extensible: true,
         is_arguments_object: false,
@@ -635,6 +639,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             number_data: None,
             string_data: None,
             symbol_data: None,
+            bigint_data: None,
             date_data: None,
             extensible: true,
             is_arguments_object: false,
@@ -666,6 +671,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             number_data: None,
             string_data: None,
             symbol_data: None,
+            bigint_data: None,
             date_data: None,
             extensible: true,
             is_arguments_object: false,
@@ -1319,6 +1325,19 @@ pub fn set_symbol_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: crate:
 #[must_use]
 pub fn symbol_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<crate::symbol::JsSymbol> {
     heap.read_payload(obj, |body| body.symbol_data.clone())
+}
+
+/// Store the `[[BigIntData]]` internal slot for a BigInt wrapper.
+pub fn set_bigint_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: BigIntValue) {
+    heap.with_payload(obj, |body| {
+        body.bigint_data = Some(value);
+    });
+}
+
+/// Read the `[[BigIntData]]` internal slot for a BigInt wrapper.
+#[must_use]
+pub fn bigint_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<BigIntValue> {
+    heap.read_payload(obj, |body| body.bigint_data.clone())
 }
 
 /// §21.4.1.6 TimeClip — every store into a `[[DateValue]]` internal

@@ -250,6 +250,12 @@ fn coerce_bigint_call_args(
 fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let b = match ctx.this_value() {
         Value::BigInt(b) => b.clone(),
+        Value::Object(obj) => {
+            crate::object::bigint_data(*obj, ctx.heap()).ok_or_else(|| NativeError::TypeError {
+                name: "BigInt.prototype.toString",
+                reason: "this is not a BigInt".to_string(),
+            })?
+        }
         _ => {
             return Err(NativeError::TypeError {
                 name: "BigInt.prototype.toString",
@@ -306,6 +312,12 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
         Value::BigInt(b) => Ok(Value::BigInt(b.clone())),
+        Value::Object(obj) => crate::object::bigint_data(*obj, ctx.heap())
+            .map(Value::BigInt)
+            .ok_or_else(|| NativeError::TypeError {
+                name: "BigInt.prototype.valueOf",
+                reason: "this is not a BigInt".to_string(),
+            }),
         _ => Err(NativeError::TypeError {
             name: "BigInt.prototype.valueOf",
             reason: "this is not a BigInt".to_string(),

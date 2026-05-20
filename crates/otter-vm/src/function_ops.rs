@@ -135,6 +135,23 @@ impl Interpreter {
             statics,
             &mut external_visit,
         )?;
+        // §15.7.10 ClassDefinitionEvaluation step 24 — install
+        // `C.prototype.constructor = C` so reflective probes
+        // (`new Sub(...).constructor === Sub`) walk to the
+        // class constructor itself rather than to the inherited
+        // parent class's `constructor` slot.
+        let constructor_desc = object::PropertyDescriptor::data(
+            Value::ClassConstructor(class),
+            /* writable */ true,
+            /* enumerable */ false,
+            /* configurable */ true,
+        );
+        let _ = object::define_own_property(
+            prototype,
+            &mut self.gc_heap,
+            "constructor",
+            constructor_desc,
+        );
         let frame = &mut stack[frame_idx];
         write_register(frame, dst, Value::ClassConstructor(class))?;
         frame.pc += 1;

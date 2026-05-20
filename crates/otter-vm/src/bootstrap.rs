@@ -2202,6 +2202,13 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     if !object::define_own_property(object, heap, "length", length_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("length"));
     }
+    let bootstrap_string_heap = crate::StringHeap::default();
+    let name_value = crate::JsString::from_latin1(b"Object", &bootstrap_string_heap)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let name_desc = PropertyDescriptor::data(Value::String(name_value), false, false, true);
+    if !object::define_own_property(object, heap, "name", name_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("name"));
+    }
     let prototype_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !object::define_own_property(object, heap, "prototype", prototype_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));

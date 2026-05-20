@@ -7,7 +7,7 @@
 //! another path.
 //!
 //! # Contents
-//! - [`JsMap`] — heap-shared, `IndexMap`-backed associative store.
+//! - [`JsMap`] — heap-shared, tombstone-list associative store.
 //! - [`JsSet`] — heap-shared, `IndexSet`-backed unique-element store.
 //! - [`JsWeakMap`] — GC-managed object-keyed weak map.
 //! - [`JsWeakSet`] — GC-managed object-keyed weak set.
@@ -217,27 +217,64 @@ impl From<otter_gc::OutOfMemory> for CollectionError {
 
 /// JS `Map` — ordered associative store.
 ///
-/// Cloning shares storage. Storage is `IndexMap<MapKey, (Value, Value)>`
-/// where the tuple holds `(original_key_value, value)` so iteration
-/// can hand back the original key (e.g. the actual object handle,
-/// not the pointer-projected key form).
+/// Cloning shares storage. Storage is an insertion-ordered raw list
+/// with tombstones for deleted entries, matching the spec's
+/// `[[MapData]]` list so active iterators and `forEach` observe
+/// deletes, clears, and later additions correctly.
 pub type JsMap = otter_gc::Gc<MapBody>;
 
 #[derive(Debug, Default)]
 /// GC-allocated storage backing every [`JsMap`] handle.
 pub struct MapBody {
-    entries: IndexMap<MapKey, (Value, Value)>,
+    entries: Vec<MapEntry>,
     prototype_override: Option<Value>,
+}
+
+#[derive(Debug)]
+struct MapEntry {
+    key_hash: Option<MapKey>,
+    key: Option<Value>,
+    value: Option<Value>,
+}
+
+impl MapEntry {
+    fn live(key_hash: MapKey, key: Value, value: Value) -> Self {
+        Self {
+            key_hash: Some(key_hash),
+            key: Some(key),
+            value: Some(value),
+        }
+    }
+
+    fn key_matches(&self, key: &MapKey) -> bool {
+        self.value.is_some() && self.key_hash.as_ref().is_some_and(|stored| stored == key)
+    }
+
+    fn pair(&self) -> Option<(Value, Value)> {
+        Some((self.key.as_ref()?.clone(), self.value.as_ref()?.clone()))
+    }
+
+    fn clear(&mut self) {
+        self.key_hash = None;
+        self.key = None;
+        self.value = None;
+    }
 }
 
 impl otter_gc::SafeTraceable for MapBody {
     const TYPE_TAG: u8 = MAP_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        for (key, (original_key, value)) in &self.entries {
-            trace_map_key(key, visitor);
-            original_key.trace_value_slots(visitor);
-            value.trace_value_slots(visitor);
+        for entry in &self.entries {
+            if let Some(key_hash) = &entry.key_hash {
+                trace_map_key(key_hash, visitor);
+            }
+            if let Some(key) = &entry.key {
+                key.trace_value_slots(visitor);
+            }
+            if let Some(value) = &entry.value {
+                value.trace_value_slots(visitor);
+            }
         }
         if let Some(proto) = &self.prototype_override {
             proto.trace_value_slots(visitor);
@@ -279,7 +316,12 @@ pub(crate) fn set_map_prototype_override(
 /// Number of entries.
 #[must_use]
 pub fn map_len(map: JsMap, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(map, |body| body.entries.len())
+    heap.read_payload(map, |body| {
+        body.entries
+            .iter()
+            .filter(|entry| entry.value.is_some())
+            .count()
+    })
 }
 
 /// `true` when empty.
@@ -292,14 +334,21 @@ pub fn map_is_empty(map: JsMap, heap: &otter_gc::GcHeap) -> bool {
 #[must_use]
 pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value> {
     let k = MapKey::from_value(key);
-    heap.read_payload(map, |body| body.entries.get(&k).map(|(_, v)| v.clone()))
+    heap.read_payload(map, |body| {
+        body.entries
+            .iter()
+            .find(|entry| entry.key_matches(&k))
+            .and_then(|entry| entry.value.clone())
+    })
 }
 
 /// `Map.prototype.has` — Spec §24.1.3.7.
 #[must_use]
 pub fn map_has(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> bool {
     let k = MapKey::from_value(key);
-    heap.read_payload(map, |body| body.entries.contains_key(&k))
+    heap.read_payload(map, |body| {
+        body.entries.iter().any(|entry| entry.key_matches(&k))
+    })
 }
 
 /// `Map.prototype.set` — Spec §24.1.3.9. Updates in place
@@ -313,9 +362,11 @@ pub fn map_set(
     let barrier_key = key.clone();
     let barrier_value = value.clone();
     let k = MapKey::from_value(&key);
-    let exists = heap.read_payload(map, |body| body.entries.contains_key(&k));
+    let exists = heap.read_payload(map, |body| {
+        body.entries.iter().any(|entry| entry.key_matches(&k))
+    });
     if !exists {
-        let target_len = map_len(map, heap).saturating_add(1);
+        let target_len = heap.read_payload(map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             key.trace_value_slots(visitor);
             value.trace_value_slots(visitor);
@@ -324,10 +375,10 @@ pub fn map_set(
     }
     let k = MapKey::from_value(&key);
     heap.with_payload(map, |body| {
-        if let Some(slot) = body.entries.get_mut(&k) {
-            slot.1 = value;
+        if let Some(slot) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
+            slot.value = Some(value);
         } else {
-            body.entries.insert(k, (key, value));
+            body.entries.push(MapEntry::live(k, key, value));
         }
     });
     if !exists {
@@ -348,25 +399,23 @@ pub(crate) fn map_set_with_roots(
     let barrier_key = key.clone();
     let barrier_value = value.clone();
     let k = MapKey::from_value(&key);
-    let exists = heap.read_payload(*map, |body| body.entries.contains_key(&k));
+    let exists = heap.read_payload(*map, |body| {
+        body.entries.iter().any(|entry| entry.key_matches(&k))
+    });
     if !exists {
+        let target_len = heap.read_payload(*map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             key.trace_value_slots(visitor);
             value.trace_value_slots(visitor);
         };
-        reserve_map_for_target_len_with_roots(
-            map,
-            heap,
-            map_len(*map, heap).saturating_add(1),
-            &mut reserve_roots,
-        )?;
+        reserve_map_for_target_len_with_roots(map, heap, target_len, &mut reserve_roots)?;
     }
     heap.with_payload(*map, |body| {
-        if let Some(slot) = body.entries.get_mut(&k) {
-            slot.1 = value;
+        if let Some(slot) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
+            slot.value = Some(value);
         } else {
-            body.entries.insert(k, (key, value));
+            body.entries.push(MapEntry::live(k, key, value));
         }
     });
     if !exists {
@@ -380,21 +429,33 @@ pub(crate) fn map_set_with_roots(
 /// the entry existed.
 pub fn map_delete(map: JsMap, heap: &mut otter_gc::GcHeap, key: &Value) -> bool {
     let k = MapKey::from_value(key);
-    // `shift_remove` preserves the order of remaining entries
-    // (matches spec iteration semantics).
-    heap.with_payload(map, |body| body.entries.shift_remove(&k).is_some())
+    heap.with_payload(map, |body| {
+        if let Some(entry) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
+            entry.clear();
+            true
+        } else {
+            false
+        }
+    })
 }
 
 /// `Map.prototype.clear` — Spec §24.1.3.2.
 pub fn map_clear(map: JsMap, heap: &mut otter_gc::GcHeap) {
-    heap.with_payload(map, |body| body.entries.clear());
+    heap.with_payload(map, |body| {
+        for entry in &mut body.entries {
+            entry.clear();
+        }
+    });
 }
 
 /// Snapshot key list (in insertion order).
 #[must_use]
 pub fn map_keys(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
-        body.entries.values().map(|(k, _)| k.clone()).collect()
+        body.entries
+            .iter()
+            .filter_map(|entry| entry.key.clone())
+            .collect()
     })
 }
 
@@ -402,7 +463,10 @@ pub fn map_keys(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
 #[must_use]
 pub fn map_values(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
-        body.entries.values().map(|(_, v)| v.clone()).collect()
+        body.entries
+            .iter()
+            .filter_map(|entry| entry.value.clone())
+            .collect()
     })
 }
 
@@ -410,11 +474,24 @@ pub fn map_values(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
 #[must_use]
 pub fn map_entries(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<(Value, Value)> {
     heap.read_payload(map, |body| {
-        body.entries
-            .values()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        body.entries.iter().filter_map(MapEntry::pair).collect()
     })
+}
+
+/// Raw backing-list length, including deleted tombstone slots.
+#[must_use]
+pub(crate) fn map_raw_len(map: JsMap, heap: &otter_gc::GcHeap) -> usize {
+    heap.read_payload(map, |body| body.entries.len())
+}
+
+/// Read the raw entry currently at `index` in insertion order.
+#[must_use]
+pub(crate) fn map_entry_at(
+    map: JsMap,
+    heap: &otter_gc::GcHeap,
+    index: usize,
+) -> Option<(Value, Value)> {
+    heap.read_payload(map, |body| body.entries.get(index).and_then(MapEntry::pair))
 }
 
 /// Identity comparison.
@@ -1144,7 +1221,7 @@ fn reserve_weak_set_for_target_len_with_roots(
 }
 
 fn map_capacity_bytes(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<(MapKey, (Value, Value))>())
+    capacity.saturating_mul(std::mem::size_of::<MapEntry>())
 }
 
 fn set_capacity_bytes(capacity: usize) -> usize {

@@ -1031,7 +1031,6 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         });
     }
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let entries = collections::map_entries(m, ctx.heap_mut());
     let context = ctx
         .execution_context()
         .cloned()
@@ -1040,7 +1039,13 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "no active execution context".to_string(),
         })?;
     let map_value = Value::Map(m);
-    for (k, v) in entries {
+    let mut index = 0;
+    while index < collections::map_raw_len(m, ctx.heap()) {
+        let Some((k, v)) = collections::map_entry_at(m, ctx.heap(), index) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
         let interp = ctx.interp_mut();
         interp
             .run_callable_sync(
@@ -1599,6 +1604,16 @@ enum MapIterKind {
     Entries,
 }
 
+impl MapIterKind {
+    fn iterator_kind(self) -> crate::MapIteratorKind {
+        match self {
+            Self::Keys => crate::MapIteratorKind::Key,
+            Self::Values => crate::MapIteratorKind::Value,
+            Self::Entries => crate::MapIteratorKind::Entry,
+        }
+    }
+}
+
 #[derive(Clone)]
 enum SetRecord {
     Set {
@@ -1644,33 +1659,15 @@ fn make_map_iterator(
     m: crate::JsMap,
     kind: MapIterKind,
 ) -> Result<Value, NativeError> {
-    let entries = collections::map_entries(m, ctx.heap_mut());
-    let mut snapshot: SmallVec<[Value; 4]> = SmallVec::with_capacity(entries.len());
-    for (k, v) in entries {
-        let element = match kind {
-            MapIterKind::Keys => k,
-            MapIterKind::Values => v,
-            MapIterKind::Entries => {
-                let pair = ctx
-                    .array_from_elements([k, v])
-                    .map_err(|_| oom("Map.prototype.entries"))?;
-                Value::Array(pair)
-            }
-        };
-        snapshot.push(element);
-    }
-    let array = ctx
-        .array_from_elements(snapshot)
-        .map_err(|_| oom("Map iterator"))?;
-    let array_value = Value::Array(array);
+    let map_value = Value::Map(m);
     let iter = ctx
         .alloc_iterator_state(
-            crate::IteratorState::Array {
-                array,
+            crate::IteratorState::MapCollection {
+                map: m,
                 index: 0,
-                origin: crate::BuiltinIteratorOrigin::Map,
+                kind: kind.iterator_kind(),
             },
-            &[&array_value],
+            &[&map_value],
             &[],
         )
         .map_err(|_| oom("Map iterator"))?;

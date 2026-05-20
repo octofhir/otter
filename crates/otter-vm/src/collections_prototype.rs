@@ -111,28 +111,25 @@ enum MapIterKind {
     Entries,
 }
 
+impl MapIterKind {
+    fn iterator_kind(self) -> crate::MapIteratorKind {
+        match self {
+            Self::Keys => crate::MapIteratorKind::Key,
+            Self::Values => crate::MapIteratorKind::Value,
+            Self::Entries => crate::MapIteratorKind::Entry,
+        }
+    }
+}
+
 fn map_iter_state(
-    args: &mut IntrinsicArgs<'_>,
+    _args: &mut IntrinsicArgs<'_>,
     kind: MapIterKind,
     m: JsMap,
 ) -> Result<crate::IteratorState, otter_gc::OutOfMemory> {
-    let entries = collections::map_entries(m, &*args.gc_heap);
-    let mut snapshot: SmallVec<[Value; 4]> = SmallVec::with_capacity(entries.len());
-    for (k, v) in entries {
-        snapshot.push(match kind {
-            MapIterKind::Keys => k,
-            MapIterKind::Values => v,
-            MapIterKind::Entries => {
-                let pair = args.array_from_elements_rooted([k, v], &[], &[snapshot.as_slice()])?;
-                Value::Array(pair)
-            }
-        });
-    }
-    let arr = args.array_from_elements_rooted(snapshot, &[], &[])?;
-    Ok(crate::IteratorState::Array {
-        array: arr,
+    Ok(crate::IteratorState::MapCollection {
+        map: m,
         index: 0,
-        origin: crate::BuiltinIteratorOrigin::Map,
+        kind: kind.iterator_kind(),
     })
 }
 

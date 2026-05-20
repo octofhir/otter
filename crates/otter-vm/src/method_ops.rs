@@ -1136,17 +1136,13 @@ impl Interpreter {
     /// invoke the callback on each entry in insertion order.
     ///
     /// # Algorithm
-    /// 1. Snapshot the entry list at call time (matches Spec
-    ///    §24.1.3.5 / §24.2.3.6 — observable mutation during the
-    ///    walk is captured by re-reading the live receiver, but the
-    ///    snapshot still gates `index < snapshot.len()`).
-    /// 2. For each entry, enqueue an inline call: every callback is
+    /// 1. For each live Map/Set entry, enqueue an inline call: every callback is
     ///    invoked synchronously through `self.invoke`. Because each
     ///    invoke pushes a frame and returns through the dispatch
     ///    loop, the foundation chains them by stashing the iteration
     ///    state in a tiny native closure that re-enters this helper.
-    /// 3. Foundation simplification: rather than a re-entrant
-    ///    chain, walk the snapshot here and synchronously invoke
+    /// 2. Foundation simplification: rather than a re-entrant
+    ///    chain, walk the receiver here and synchronously invoke
     ///    each callback via a fresh dispatch_loop run on a new
     ///    stack. This matches the synchronous-callback model the
     ///    rest of the foundation already uses (see
@@ -1171,14 +1167,9 @@ impl Interpreter {
         // bind it as the callback's `this`; otherwise let
         // `OrdinaryCallBindThis` default to undefined / globalObject.
         let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-        let entries: Vec<(Value, Value)> = match recv {
-            Value::Map(m) => crate::collections::map_entries(*m, &self.gc_heap),
-            Value::Set(s) => crate::collections::set_values(*s, &self.gc_heap)
-                .into_iter()
-                .map(|v| (v.clone(), v))
-                .collect(),
-            _ => return Err(VmError::TypeMismatch),
-        };
+        if !matches!(recv, Value::Map(_) | Value::Set(_)) {
+            return Err(VmError::TypeMismatch);
+        }
         // Advance pc *before* invoking the callbacks so each
         // callback returns to the next instruction in the caller
         // frame.
@@ -1192,12 +1183,39 @@ impl Interpreter {
         // produces values.
         write_register(&mut stack[top_idx], dst, Value::Undefined)?;
         let recv_for_callback = recv.clone();
-        for (key, value) in entries {
-            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-            cb_args.push(value);
-            cb_args.push(key);
-            cb_args.push(recv_for_callback.clone());
-            self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+        match recv {
+            Value::Map(m) => {
+                let mut index = 0;
+                while index < crate::collections::map_raw_len(*m, &self.gc_heap) {
+                    let Some((key, value)) =
+                        crate::collections::map_entry_at(*m, &self.gc_heap, index)
+                    else {
+                        index += 1;
+                        continue;
+                    };
+                    index += 1;
+                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                    cb_args.push(value);
+                    cb_args.push(key);
+                    cb_args.push(recv_for_callback.clone());
+                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                }
+            }
+            Value::Set(s) => {
+                let entries: Vec<(Value, Value)> =
+                    crate::collections::set_values(*s, &self.gc_heap)
+                        .into_iter()
+                        .map(|v| (v.clone(), v))
+                        .collect();
+                for (key, value) in entries {
+                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                    cb_args.push(value);
+                    cb_args.push(key);
+                    cb_args.push(recv_for_callback.clone());
+                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                }
+            }
+            _ => unreachable!(),
         }
         Ok(())
     }

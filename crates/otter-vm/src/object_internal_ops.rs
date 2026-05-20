@@ -2241,6 +2241,36 @@ impl Interpreter {
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
+            // §7.1.18 ToObject — primitive String receiver. Surface
+            // the §22.1.4 indexed-character exotic + `length` first;
+            // anything else walks `String.prototype` so inherited
+            // methods (`charAt`, `slice`, monkey-patched `.then`, …)
+            // resolve through the same ladder as for boxed wrappers.
+            Value::String(ref s) => {
+                if let Some(name) = key.string_name() {
+                    if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
+                        && n.is_finite()
+                        && n.fract() == 0.0
+                        && n >= 0.0
+                        && (n as usize) < s.len() as usize
+                    {
+                        let unit = s.char_code_at(n as u32).unwrap_or(0);
+                        let unit_str =
+                            crate::JsString::from_utf16_units(&[unit], &self.string_heap)?;
+                        return Ok(VmGetOutcome::Value(Value::String(unit_str)));
+                    }
+                    if name == "length" {
+                        return Ok(VmGetOutcome::Value(Value::Number(
+                            crate::number::NumberValue::from_i32(s.len() as i32),
+                        )));
+                    }
+                }
+                let proto = self.constructor_prototype_value("String")?;
+                if matches!(proto, Value::Null | Value::Undefined) {
+                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            }
             // §26.1.4 / §26.2.4 — walk the realm prototype for
             // `WeakRef` / `FinalizationRegistry` instances.
             Value::WeakRef(_) | Value::FinalizationRegistry(_) => {

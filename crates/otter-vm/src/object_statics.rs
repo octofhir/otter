@@ -2877,6 +2877,9 @@ pub fn call(
         M::GroupBy => Err(VmError::TypeError {
             message: "Object.groupBy requires an active execution context".to_string(),
         }),
+        M::ForInKeys => Err(VmError::TypeError {
+            message: "Object.__forInKeys requires an active execution context".to_string(),
+        }),
     }
 }
 

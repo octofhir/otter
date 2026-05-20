@@ -3707,6 +3707,58 @@ impl Interpreter {
         }
     }
 
+    pub(crate) fn enumerable_for_in_string_keys_for_value(
+        &mut self,
+        context: &ExecutionContext,
+        target: Value,
+    ) -> Result<Vec<String>, VmError> {
+        if matches!(target, Value::Null | Value::Undefined) {
+            return Ok(Vec::new());
+        }
+
+        let mut current = target;
+        let mut visited = BTreeSet::new();
+        let mut out = Vec::new();
+        let string_heap = self.string_heap_clone();
+
+        for hops in 0..object::PROTO_CHAIN_HARD_CAP {
+            if matches!(current, Value::Null) {
+                break;
+            }
+
+            let keys = self.own_property_keys_value(context, &current, &string_heap)?;
+            for key in &keys {
+                let Value::String(name) = key else {
+                    continue;
+                };
+                let name = name.to_lossy_string();
+                if !visited.insert(name.clone()) {
+                    continue;
+                }
+
+                let key = VmPropertyKey::OwnedString(name.clone());
+                let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    context,
+                    current.clone(),
+                    &key,
+                    hops + 1,
+                    &[&current],
+                    &[keys.as_slice()],
+                )?;
+                if desc
+                    .as_ref()
+                    .is_some_and(object::PropertyDescriptor::enumerable)
+                {
+                    out.push(name);
+                }
+            }
+
+            current = self.ordinary_get_prototype_value(context, current, hops + 1)?;
+        }
+
+        Ok(out)
+    }
+
     pub(crate) fn ordinary_delete_value(
         &mut self,
         context: &ExecutionContext,

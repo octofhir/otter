@@ -1488,7 +1488,8 @@ impl Interpreter {
             | M::Keys
             | M::Seal
             | M::Values
-            | M::GroupBy => Ok(None),
+            | M::GroupBy
+            | M::ForInKeys => Ok(None),
         }
     }
 

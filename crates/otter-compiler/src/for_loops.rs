@@ -133,17 +133,14 @@ pub(crate) fn compile_for_in_statement(
 ) -> Result<Option<u16>, CompileError> {
     let span = (s.span.start, s.span.end);
 
-    // Foundation lowering: convert `for (k in o)` into
-    // `for (k of Object.keys(o))` using the existing iterator
-    // machinery. The key set is captured at loop entry per
-    // step (2) above. `Object.keys` returns own enumerable
-    // string-keyed properties — close enough to the spec's
-    // EnumerateObjectProperties for foundation use cases; full
-    // proto-chain enumeration is filed as a follow-up.
+    // Lower through the VM's internal for-in enumerable-key snapshot
+    // helper. It intentionally does not alias `Object.keys`: `keys`
+    // is own-only, while `for-in` walks enumerable string keys across
+    // the prototype chain.
     //
     // We emit:
     //   r_obj = <right>;
-    //   r_keys = Object.keys(r_obj);   // Op::ObjectCall
+    //   r_keys = Object.__forInKeys(r_obj);   // internal Op::ObjectCall
     //   r_iter = GetIterator(r_keys);
     //   loop_top:
     //     IteratorNext r_value, r_done, r_iter
@@ -158,7 +155,7 @@ pub(crate) fn compile_for_in_statement(
         Op::ObjectCall,
         vec![
             Operand::Register(keys_reg),
-            Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Keys.as_u32()),
+            Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::ForInKeys.as_u32()),
             Operand::ConstIndex(1),
             Operand::Register(obj_reg),
         ],

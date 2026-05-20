@@ -905,6 +905,21 @@ impl Interpreter {
         }
         use method_id::ObjectMethod as M;
         match method {
+            M::ForInKeys => {
+                let target = args.first().cloned().unwrap_or(Value::Undefined);
+                let keys = self.enumerable_for_in_string_keys_for_value(context, target)?;
+                let mut names = Vec::with_capacity(keys.len());
+                for key in keys {
+                    names.push(stack_static_string_value(&key, self)?);
+                }
+                let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                    stack,
+                    names,
+                    &[],
+                    &[args],
+                )?;
+                Ok(Some(Value::Array(array)))
+            }
             M::Keys => {
                 let owned: Vec<String> = match args.first() {
                     // §7.1.18 ToObject — Boolean / Number / Symbol /

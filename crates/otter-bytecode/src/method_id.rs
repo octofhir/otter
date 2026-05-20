@@ -147,6 +147,7 @@ method_id_enum! {
         Seal = 17 => "seal",
         Values = 18 => "values",
         GroupBy = 19 => "groupBy",
+        ForInKeys = 20 => "__forInKeys",
     }
 }
 

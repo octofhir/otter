@@ -2192,7 +2192,10 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     if !object::define_own_property(object, heap, "length", length_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("length"));
     }
-    object::set(object, heap, "prototype", Value::Object(prototype));
+    let prototype_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    if !object::define_own_property(object, heap, "prototype", prototype_desc) {
+        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+    }
     {
         let mut builder = ObjectBuilder::from_object_with_value_roots(
             heap,

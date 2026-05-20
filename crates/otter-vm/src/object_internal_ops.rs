@@ -2051,6 +2051,13 @@ impl Interpreter {
                 let obj = *obj;
                 let current_proto =
                     object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::Null);
+                // §20.1.3 — %Object.prototype% is an
+                // immutable-prototype exotic object. It reports
+                // success only when the requested prototype is
+                // SameValue with its current [[Prototype]].
+                if self.object_prototype_object_opt() == Some(obj) {
+                    return Ok(abstract_ops::same_value(proto, &current_proto));
+                }
                 if abstract_ops::same_value(proto, &current_proto) {
                     return Ok(true);
                 }

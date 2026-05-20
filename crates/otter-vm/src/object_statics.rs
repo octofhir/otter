@@ -1132,37 +1132,40 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     let proto = args.get(1).cloned().unwrap_or(Value::Undefined);
-    match (&target, &proto) {
-        (Value::Null | Value::Undefined, _) => {
-            return Err(NativeError::TypeError {
-                name: "Object.setPrototypeOf",
-                reason: "Object.setPrototypeOf called on null or undefined".to_string(),
-            });
-        }
-        (_, Value::Object(_) | Value::Null) => {}
-        _ => {
-            return Err(NativeError::TypeError {
-                name: "Object.setPrototypeOf",
-                reason: "Object.setPrototypeOf prototype must be an Object or null".to_string(),
-            });
-        }
+    if matches!(target, Value::Null | Value::Undefined) {
+        return Err(NativeError::TypeError {
+            name: "Object.setPrototypeOf",
+            reason: "Object.setPrototypeOf called on null or undefined".to_string(),
+        });
     }
-    match &target {
-        Value::Object(obj) => {
-            let proto_obj = if let Value::Object(p) = &proto {
-                Some(*p)
-            } else {
-                None
-            };
-            crate::object::set_prototype(*obj, ctx.heap_mut(), proto_obj);
-            Ok(target)
-        }
-        // Primitive operands: ToObject would wrap but spec §20.1.2.21
-        // step 5 says "Return O" unchanged when ToObject would
-        // produce a transient wrapper. We mirror that and skip the
-        // prototype write — the wrapper would be unreachable anyway.
-        _ => Ok(target),
+    if !matches!(proto, Value::Null) && !is_object_like_value(&proto) {
+        return Err(NativeError::TypeError {
+            name: "Object.setPrototypeOf",
+            reason: "Object.setPrototypeOf prototype must be an Object or null".to_string(),
+        });
     }
+    if !is_object_like_value(&target) {
+        return Ok(target);
+    }
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Object.setPrototypeOf",
+            reason: "missing execution context".to_string(),
+        })?;
+    let ok = ctx
+        .cx
+        .interp
+        .set_prototype_value_proxy_aware(&exec_ctx, &target, &proto)
+        .map_err(|err| object_native_error("Object.setPrototypeOf", err))?;
+    if !ok {
+        return Err(NativeError::TypeError {
+            name: "Object.setPrototypeOf",
+            reason: "Object.setPrototypeOf failed".to_string(),
+        });
+    }
+    Ok(target)
 }
 
 fn native_prototype_to_string(
@@ -1567,24 +1570,13 @@ pub fn native_prototype_proto_set(
             return Ok(Value::Undefined);
         }
     }
-    let exec_ctx = match ctx.execution_context().cloned() {
-        Some(c) => c,
-        None => {
-            // Sync embedder fallback — apply the ordinary algorithm
-            // without proxy-trap dispatch.
-            let Value::Object(obj) = this_value else {
-                return Ok(Value::Undefined);
-            };
-            let ok = crate::object::set_prototype_value(obj, ctx.heap_mut(), Some(proto_value));
-            if !ok {
-                return Err(NativeError::TypeError {
-                    name: "set __proto__",
-                    reason: "cyclic or non-extensible prototype chain".to_string(),
-                });
-            }
-            return Ok(Value::Undefined);
-        }
-    };
+    let exec_ctx = ctx
+        .execution_context()
+        .cloned()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "set __proto__",
+            reason: "missing execution context".to_string(),
+        })?;
     let ok = ctx
         .cx
         .interp

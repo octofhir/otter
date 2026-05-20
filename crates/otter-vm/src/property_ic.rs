@@ -485,6 +485,9 @@ impl LoadPropertyIc {
         {
             return Some((Self::own_data(hit), value));
         }
+        if atom_lookup.hit.is_some() {
+            return None;
+        }
         let proto = object::prototype(obj, heap)?;
         if !object::supports_fast_property_ic(proto, heap) {
             return None;

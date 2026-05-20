@@ -181,7 +181,7 @@ fn native_rooted_call(
             native_get_own_property_descriptor_rooted(ctx, context, args).map(Some)
         }
         M::GetOwnPropertyDescriptors => {
-            native_get_own_property_descriptors_rooted(ctx, args).map(Some)
+            native_get_own_property_descriptors_rooted(ctx, context, args).map(Some)
         }
         M::GetOwnPropertyNames => {
             native_get_own_property_names_rooted(ctx, context, args).map(Some)
@@ -827,46 +827,60 @@ fn native_get_own_property_descriptor_rooted(
 
 fn native_get_own_property_descriptors_rooted(
     ctx: &mut NativeCtx<'_>,
+    context: Option<&crate::ExecutionContext>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    let target = expect_object(args.first())?;
-    let target_root = Value::Object(target);
+    let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
+    if matches!(target, Value::Null | Value::Undefined) {
+        return Err(VmError::TypeError {
+            message: "Object.getOwnPropertyDescriptors called on null or undefined".to_string(),
+        });
+    }
     // §20.1.2.9 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
     let object_proto = ctx.cx.interp.constructor_prototype_value("Object").ok();
-    let result = ctx.alloc_object_with_roots(&[&target_root], &[args])?;
+    let result = ctx.alloc_object_with_roots(&[&target], &[args])?;
     if let Some(Value::Object(proto_obj)) = object_proto {
         crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
     }
-    let result_root = Value::Object(result);
-    let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
-        crate::object::with_properties(target, ctx.heap(), |p| {
-            (
-                p.keys().map(|s| s.to_string()).collect(),
-                p.symbol_keys().collect(),
-            )
-        });
-    for key in keys {
-        if let Some(desc) = crate::object::get_own_descriptor(target, ctx.heap(), &key) {
-            let desc_obj = native_descriptor_to_object_rooted(
-                ctx,
-                &desc,
-                &[&target_root, &result_root],
-                args,
-            )?;
-            ctx.set_property(result, &key, Value::Object(desc_obj))?;
-        }
+    if !is_object_like_value(&target) {
+        return Ok(Value::Object(result));
     }
-    for sym in symbols {
-        if let Some(desc) = crate::object::get_own_symbol_descriptor(target, ctx.heap(), &sym) {
-            let desc_obj = native_descriptor_to_object_rooted(
-                ctx,
-                &desc,
-                &[&target_root, &result_root],
-                args,
-            )?;
-            if !crate::object::set_symbol(result, ctx.heap_mut(), sym, Value::Object(desc_obj)) {
-                return Err(VmError::TypeMismatch);
+    let Some(context) = context else {
+        return Err(VmError::InvalidOperand);
+    };
+    let result_root = Value::Object(result);
+    let string_heap = ctx.cx.interp.string_heap_clone();
+    let keys = ctx
+        .cx
+        .interp
+        .own_property_keys_value(context, &target, &string_heap)?;
+    for key in keys {
+        let key_for_descriptor = match &key {
+            Value::String(s) => Value::String(s.clone()),
+            Value::Symbol(sym) => Value::Symbol(sym.clone()),
+            _ => continue,
+        };
+        let Some(desc) = ctx.cx.interp.get_own_property_descriptor_for_value(
+            context,
+            target.clone(),
+            Some(&key_for_descriptor),
+        )?
+        else {
+            continue;
+        };
+        let desc_obj =
+            native_descriptor_to_object_rooted(ctx, &desc, &[&target, &result_root], args)?;
+        match key {
+            Value::String(s) => {
+                ctx.set_property(result, &s.to_lossy_string(), Value::Object(desc_obj))?;
             }
+            Value::Symbol(sym) => {
+                if !crate::object::set_symbol(result, ctx.heap_mut(), sym, Value::Object(desc_obj))
+                {
+                    return Err(VmError::TypeMismatch);
+                }
+            }
+            _ => {}
         }
     }
     Ok(Value::Object(result))

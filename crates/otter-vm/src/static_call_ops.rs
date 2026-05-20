@@ -1282,19 +1282,19 @@ impl Interpreter {
                         )?;
                         self.set_property(result, "length", Value::Object(length_obj))?;
                     }
-                    Some(Value::Proxy(proxy)) => {
+                    Some(target) if own_property_descriptors_uses_internal_methods(target) => {
                         // §20.1.2.10.1 step 3 — drive the spec
-                        // ladder via `own_property_keys_value`
-                        // (full §10.5.11 trap + invariant validation),
-                        // read each descriptor through the
-                        // `getOwnPropertyDescriptor` trap, and skip
-                        // any key whose descriptor is `undefined`.
-                        let proxy_value = Value::Proxy(proxy.clone());
+                        // ladder via `own_property_keys_value`, then
+                        // read each descriptor through the target's
+                        // `[[GetOwnProperty]]`. This keeps RegExp
+                        // `lastIndex`, callable metadata, proxies, and
+                        // expando bags on the same reflective path.
+                        let target_value = target.clone();
                         let result_root = Value::Object(result);
                         let string_heap = self.string_heap.clone();
-                        let trap_keys =
-                            self.own_property_keys_value(context, &proxy_value, &string_heap)?;
-                        for key in trap_keys {
+                        let keys =
+                            self.own_property_keys_value(context, &target_value, &string_heap)?;
+                        for key in keys {
                             let vm_key = match &key {
                                 Value::String(s) => {
                                     crate::VmPropertyKey::OwnedString(s.to_lossy_string())
@@ -1306,7 +1306,7 @@ impl Interpreter {
                                 .ordinary_get_own_property_descriptor_value_stack_rooted(
                                     context,
                                     stack,
-                                    proxy_value.clone(),
+                                    target_value.clone(),
                                     &vm_key,
                                     0,
                                 )?;
@@ -1316,7 +1316,7 @@ impl Interpreter {
                             let desc_obj = self.descriptor_to_object_stack_rooted(
                                 stack,
                                 &desc,
-                                &[&proxy_value, &result_root],
+                                &[&target_value, &result_root],
                                 args,
                             )?;
                             match &key {
@@ -1338,51 +1338,6 @@ impl Interpreter {
                                     }
                                 }
                                 _ => {}
-                            }
-                        }
-                    }
-                    Some(Value::Object(target)) => {
-                        let target = *target;
-                        let target_root = Value::Object(target);
-                        let result_root = Value::Object(result);
-                        let (keys, symbols): (Vec<String>, Vec<crate::symbol::JsSymbol>) =
-                            object::with_properties(target, self.gc_heap(), |p| {
-                                (
-                                    p.keys().map(|s| s.to_string()).collect(),
-                                    p.symbol_keys().collect(),
-                                )
-                            });
-                        for key in keys {
-                            if let Some(desc) =
-                                object::get_own_descriptor(target, self.gc_heap(), &key)
-                            {
-                                let desc_obj = self.descriptor_to_object_stack_rooted(
-                                    stack,
-                                    &desc,
-                                    &[&target_root, &result_root],
-                                    args,
-                                )?;
-                                self.set_property(result, &key, Value::Object(desc_obj))?;
-                            }
-                        }
-                        for sym in symbols {
-                            if let Some(desc) =
-                                object::get_own_symbol_descriptor(target, self.gc_heap(), &sym)
-                            {
-                                let desc_obj = self.descriptor_to_object_stack_rooted(
-                                    stack,
-                                    &desc,
-                                    &[&target_root, &result_root],
-                                    args,
-                                )?;
-                                if !object::set_symbol(
-                                    result,
-                                    &mut self.gc_heap,
-                                    sym,
-                                    Value::Object(desc_obj),
-                                ) {
-                                    return Err(VmError::TypeMismatch);
-                                }
                             }
                         }
                     }
@@ -1988,6 +1943,21 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
+    )
+}
+
+fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
+    matches!(
+        target,
+        Value::Object(_)
+            | Value::Array(_)
+            | Value::Proxy(_)
+            | Value::Function { .. }
+            | Value::Closure { .. }
+            | Value::NativeFunction(_)
+            | Value::BoundFunction(_)
+            | Value::ClassConstructor(_)
+            | Value::RegExp(_)
     )
 }
 

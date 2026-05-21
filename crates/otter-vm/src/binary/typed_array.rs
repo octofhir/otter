@@ -360,6 +360,70 @@ fn value_to_biguint64(value: &Value) -> u64 {
     wrapped.to_u64().unwrap_or(0)
 }
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`TypedArrayBodyGc`].
+pub const TYPED_ARRAY_BODY_TYPE_TAG: u8 = 0x2b;
+
+/// GC-managed migration target for [`TypedArrayBody`].
+///
+/// Diverges from the legacy body in one way: `expando` is a plain
+/// `Option<JsObject>` rather than `Cell<Option<JsObject>>`. Lazy
+/// creation flips it through [`otter_gc::GcHeap::with_payload`],
+/// honouring the project-wide rule against `Cell`/`RefCell` inside
+/// GC bodies. The trace impl walks `expando` when present so the
+/// marker reaches non-element own properties; once the backing
+/// `JsArrayBuffer` migrates onto a GC body, the trace must also
+/// yield the buffer handle.
+#[derive(Debug)]
+pub struct TypedArrayBodyGc {
+    /// Backing buffer (still `Rc`/`Arc`-based).
+    pub buffer: JsArrayBuffer,
+    /// Element-type kind.
+    pub kind: TypedArrayKind,
+    /// Byte offset into the backing buffer at construction time.
+    pub byte_offset: usize,
+    /// Element count at construction time.
+    pub length: usize,
+    /// Lazy expando bag for non-canonical-numeric own properties.
+    pub expando: Option<crate::object::JsObject>,
+}
+
+impl otter_gc::SafeTraceable for TypedArrayBodyGc {
+    const TYPE_TAG: u8 = TYPED_ARRAY_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        if let Some(expando) = &self.expando
+            && !expando.is_null()
+        {
+            let p = expando as *const crate::object::JsObject as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
+    }
+}
+
+/// 4-byte compressed GC handle to a [`TypedArrayBodyGc`]. `Copy`.
+pub type TypedArrayHandle = otter_gc::Gc<TypedArrayBodyGc>;
+
+/// Allocate a TypedArray body on the GC heap.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_typed_array(
+    heap: &mut otter_gc::GcHeap,
+    buffer: JsArrayBuffer,
+    kind: TypedArrayKind,
+    byte_offset: usize,
+    length: usize,
+) -> Result<TypedArrayHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(TypedArrayBodyGc {
+        buffer,
+        kind,
+        byte_offset,
+        length,
+        expando: None,
+    })
+}
+
 /// Cheap-to-clone TypedArray view.
 #[derive(Debug, Clone)]
 pub struct JsTypedArray {

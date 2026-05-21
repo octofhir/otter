@@ -49,7 +49,7 @@ pub mod tag;
 
 use crate::array::{ArrayBody, JsArray};
 use crate::bigint::{BigIntBody, BigIntHandle};
-use crate::binary::{DataViewBodyGc, DataViewHandle};
+use crate::binary::{DataViewBodyGc, DataViewHandle, TypedArrayBodyGc, TypedArrayHandle};
 use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
 use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
 use crate::generator::{GeneratorBody, JsGenerator};
@@ -444,6 +444,14 @@ impl Value {
     #[must_use]
     pub fn data_view_gc(v: DataViewHandle) -> Self {
         Self::from_object_gc(v.raw())
+    }
+
+    /// GC-managed TypedArray body handle. Migration target for the
+    /// legacy `JsTypedArray { inner: Rc<TypedArrayBody> }` wrapper.
+    #[inline]
+    #[must_use]
+    pub fn typed_array_gc(t: TypedArrayHandle) -> Self {
+        Self::from_object_gc(t.raw())
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1186,6 +1194,25 @@ impl Value {
         self.is_object_like()
             && self.read_gc_type_tag()
                 == Some(<DataViewBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// GC-managed TypedArray body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_typed_array_gc(self) -> Option<TypedArrayHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<TypedArrayBodyGc>()
+    }
+
+    /// `true` when the value is a GC-managed TypedArray body.
+    #[inline]
+    #[must_use]
+    pub fn is_typed_array_gc(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<TypedArrayBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 }
 

@@ -34,7 +34,10 @@ pub use array_buffer::JsArrayBuffer;
 pub use data_view::{
     DATA_VIEW_BODY_TYPE_TAG, DataViewBodyGc, DataViewHandle, JsDataView, alloc_data_view,
 };
-pub use typed_array::{JsTypedArray, TypedArrayKind};
+pub use typed_array::{
+    JsTypedArray, TYPED_ARRAY_BODY_TYPE_TAG, TypedArrayBodyGc, TypedArrayHandle, TypedArrayKind,
+    alloc_typed_array,
+};
 
 use crate::Value;
 use crate::number::NumberValue;

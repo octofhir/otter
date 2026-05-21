@@ -93,6 +93,85 @@ const _: () = {
     }
 };
 
+/// Per-body classification for object-family / function-family /
+/// other-family pointer payloads. Returned by
+/// [`Value::object_family_kind`] / [`Value::function_family_kind`] /
+/// [`Value::other_family_kind`] so call sites can dispatch through a
+/// single match instead of N predicate calls. Cheaper than calling
+/// `is_array() || is_map() || …` because it reads `GcHeader::type_tag`
+/// once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectFamilyKind {
+    /// Ordinary object body (`ObjectBody`).
+    Object,
+    /// Dense array body (`ArrayBody`).
+    Array,
+    /// `Map` body.
+    Map,
+    /// `Set` body.
+    Set,
+    /// `WeakMap` body.
+    WeakMap,
+    /// `WeakSet` body.
+    WeakSet,
+    /// `WeakRef` body.
+    WeakRef,
+    /// `FinalizationRegistry` body.
+    FinalizationRegistry,
+    /// Promise body.
+    Promise,
+    /// Iterator state body.
+    Iterator,
+    /// Generator body.
+    Generator,
+    /// RegExp body.
+    RegExp,
+    /// Temporal body (GC-managed migration target).
+    Temporal,
+    /// Intl body (GC-managed migration target).
+    Intl,
+    /// Proxy body (GC-managed migration target).
+    Proxy,
+    /// DataView body (GC-managed migration target).
+    DataView,
+    /// TypedArray body (GC-managed migration target).
+    TypedArray,
+    /// Non-shared `ArrayBuffer` body (GC-managed migration target).
+    LocalArrayBuffer,
+    /// `SharedArrayBuffer` body (GC-managed migration target).
+    SharedArrayBuffer,
+    /// Tag matched `TAG_PTR_OBJECT` but the body type tag is not
+    /// one of the families above. Indicates a future body kind or
+    /// a stale GC reference; callers should treat as opaque.
+    Unknown,
+}
+
+/// Per-body classification for callable-family pointer payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionFamilyKind {
+    /// Closure body (`JsClosureBody`).
+    Closure,
+    /// Bound function body (`BoundFunctionBody`).
+    Bound,
+    /// Native (host-implemented) function body.
+    Native,
+    /// Class-constructor wrapper body.
+    ClassConstructor,
+    /// `TAG_PTR_FUNCTION` with an unknown body type tag.
+    Unknown,
+}
+
+/// Per-body classification for the `TAG_PTR_OTHER` family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtherFamilyKind {
+    /// Symbol body.
+    Symbol,
+    /// BigInt body.
+    BigInt,
+    /// `TAG_PTR_OTHER` with an unknown body type tag.
+    Unknown,
+}
+
 /// Coarse value family used by [`Value::kind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueKind {
@@ -1280,6 +1359,119 @@ impl Value {
     pub fn is_array_buffer_gc(self) -> bool {
         self.is_local_array_buffer_gc() || self.is_shared_array_buffer_gc()
     }
+
+    // -----------------------------------------------------------------------
+    // Coarse family-kind dispatch.
+    //
+    // Single match against `GcHeader::type_tag()` returning a typed
+    // enum. Cheaper than calling `is_array() || is_map() || …` because
+    // the header read happens once. Use these when the call site is
+    // about to switch on multiple body kinds.
+    // -----------------------------------------------------------------------
+
+    /// Classify a `TAG_PTR_OBJECT` value into its concrete body kind.
+    /// Returns `None` when the value is not in the object family.
+    #[inline]
+    #[must_use]
+    pub fn object_family_kind(self) -> Option<ObjectFamilyKind> {
+        if !self.is_object_like() {
+            return None;
+        }
+        let tag = self.read_gc_type_tag()?;
+        Some(match tag {
+            t if t == <ObjectBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::Object
+            }
+            t if t == <ArrayBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Array,
+            t if t == <MapBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Map,
+            t if t == <SetBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Set,
+            t if t == <WeakMapBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::WeakMap
+            }
+            t if t == <WeakSetBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::WeakSet
+            }
+            t if t == <WeakRefBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::WeakRef
+            }
+            t if t == <FinalizationRegistryBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::FinalizationRegistry
+            }
+            t if t == <PurePromiseBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::Promise
+            }
+            t if t == <IteratorState as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::Iterator
+            }
+            t if t == <GeneratorBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::Generator
+            }
+            t if t == <JsRegExpBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::RegExp
+            }
+            t if t == <TemporalBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::Temporal
+            }
+            t if t == <IntlBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Intl,
+            t if t == <ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::Proxy
+            }
+            t if t == <DataViewBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::DataView
+            }
+            t if t == <TypedArrayBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::TypedArray
+            }
+            t if t == <LocalArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::LocalArrayBuffer
+            }
+            t if t == <SharedArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => {
+                ObjectFamilyKind::SharedArrayBuffer
+            }
+            _ => ObjectFamilyKind::Unknown,
+        })
+    }
+
+    /// Classify a `TAG_PTR_FUNCTION` value into its concrete body kind.
+    /// Returns `None` for non-callable values (including
+    /// `function_id` immediates, which are bytecode-only).
+    #[inline]
+    #[must_use]
+    pub fn function_family_kind(self) -> Option<FunctionFamilyKind> {
+        if top_tag(self.0) != TAG_PTR_FUNCTION {
+            return None;
+        }
+        let tag = self.read_gc_type_tag()?;
+        Some(match tag {
+            JS_CLOSURE_BODY_TYPE_TAG => FunctionFamilyKind::Closure,
+            t if t == <BoundFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                FunctionFamilyKind::Bound
+            }
+            t if t == <NativeFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                FunctionFamilyKind::Native
+            }
+            t if t == <ClassConstructorBody as otter_gc::SafeTraceable>::TYPE_TAG => {
+                FunctionFamilyKind::ClassConstructor
+            }
+            _ => FunctionFamilyKind::Unknown,
+        })
+    }
+
+    /// Classify a `TAG_PTR_OTHER` value into its concrete body kind.
+    /// Returns `None` for non-other-family values.
+    #[inline]
+    #[must_use]
+    pub fn other_family_kind(self) -> Option<OtherFamilyKind> {
+        if !self.is_other_primitive() {
+            return None;
+        }
+        let tag = self.read_gc_type_tag()?;
+        Some(match tag {
+            t if t == <SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG => OtherFamilyKind::Symbol,
+            t if t == <BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG => OtherFamilyKind::BigInt,
+            _ => OtherFamilyKind::Unknown,
+        })
+    }
 }
 
 /// Default to `undefined`.
@@ -1439,6 +1631,43 @@ mod tests {
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
         assert_eq!(v.as_closure(), None);
+    }
+
+    #[test]
+    fn family_kind_dispatch_separates_object_function_other() {
+        use crate::object::alloc_object_with_roots;
+        use crate::{alloc_closure, alloc_upvalue, Value as LegacyValue};
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
+        let closure =
+            alloc_closure(&mut heap, 1, vec![cell].into_boxed_slice(), None).expect("closure");
+
+        let vobj = Value::object(obj);
+        let vclo = Value::closure(closure);
+        let vfid = Value::function_id(0);
+
+        // Object dispatch.
+        assert_eq!(vobj.object_family_kind(), Some(ObjectFamilyKind::Object));
+        assert_eq!(vobj.function_family_kind(), None);
+        assert_eq!(vobj.other_family_kind(), None);
+
+        // Function dispatch.
+        assert_eq!(vclo.function_family_kind(), Some(FunctionFamilyKind::Closure));
+        assert_eq!(vclo.object_family_kind(), None);
+        assert_eq!(vclo.other_family_kind(), None);
+
+        // function_id doesn't classify as TAG_PTR_FUNCTION.
+        assert_eq!(vfid.function_family_kind(), None);
+        assert_eq!(vfid.object_family_kind(), None);
+
+        // Immediates don't classify either.
+        assert_eq!(Value::undefined().object_family_kind(), None);
+        assert_eq!(Value::number_i32(0).function_family_kind(), None);
     }
 
     #[test]

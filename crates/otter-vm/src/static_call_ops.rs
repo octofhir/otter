@@ -240,7 +240,7 @@ impl Interpreter {
                 Value::Object(_)
                     | Value::Array(_)
                     | Value::Function { .. }
-                    | Value::Closure { .. }
+                    | Value::Closure(_)
                     | Value::NativeFunction(_)
                     | Value::BoundFunction(_)
                     | Value::ClassConstructor(_)
@@ -819,7 +819,7 @@ impl Interpreter {
             Value::Object(_)
             | Value::Array(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
@@ -1783,7 +1783,7 @@ fn own_enumerable_keys_for_define(
         Value::Object(_)
         | Value::ClassConstructor(_)
         | Value::Function { .. }
-        | Value::Closure { .. }
+        | Value::Closure(_)
         | Value::NativeFunction(_)
         | Value::BoundFunction(_)
         | Value::RegExp(_)
@@ -1924,7 +1924,7 @@ fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool {
             | Value::Array(_)
             | Value::Proxy(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
@@ -1949,7 +1949,7 @@ fn own_property_names_uses_internal_methods(target: &Value) -> bool {
             | Value::Array(_)
             | Value::Proxy(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
@@ -1963,7 +1963,7 @@ fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
             | Value::Array(_)
             | Value::Proxy(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
@@ -2019,7 +2019,7 @@ fn assign_source_uses_own_property_keys(source: &Value) -> bool {
             | Value::Array(_)
             | Value::Proxy(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)

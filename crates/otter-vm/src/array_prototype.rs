@@ -149,7 +149,7 @@ pub(crate) fn array_like_present_entries(
         // matching ToObject + LengthOfArrayLike. The callback
         // observes `undefined` slots if `length > 0`.
         Value::Function { .. }
-        | Value::Closure { .. }
+        | Value::Closure(_)
         | Value::NativeFunction(_)
         | Value::BoundFunction(_)
         | Value::ClassConstructor(_) => Some(Vec::new()),
@@ -1520,7 +1520,7 @@ fn impl_to_sorted(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         && !matches!(
             first,
             Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -1811,7 +1811,7 @@ fn native_array_method(
                     Value::Object(_)
                         | Value::Array(_)
                         | Value::Function { .. }
-                        | Value::Closure { .. }
+                        | Value::Closure(_)
                         | Value::NativeFunction(_)
                         | Value::BoundFunction(_)
                         | Value::ClassConstructor(_)

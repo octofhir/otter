@@ -290,21 +290,15 @@ pub enum Value {
     /// JS array — dense, heap-shared. See [`JsArray`].
     Array(JsArray),
     /// Closure — function with captured upvalues. See
-    /// [`UpvalueCell`].
-    Closure {
-        /// Index into [`otter_bytecode::BytecodeModule::functions`].
-        function_id: u32,
-        /// Captured cells, in declaration order. The compiler emits
-        /// `MakeFunction` for closure-less, non-arrow functions and
-        /// reserves `MakeClosure` for the capture path and for all
-        /// arrow expressions.
-        upvalues: std::rc::Rc<[UpvalueCell]>,
-        /// `Some(this)` for arrow closures: the lexically-captured
-        /// receiver always wins over whatever the call site passes.
-        /// `None` for non-arrow closures, which take their `this`
-        /// from the call site.
-        bound_this: Option<Box<Value>>,
-    },
+    /// [`UpvalueCell`]. The wrapper carries a 4-byte GC handle to the
+    /// underlying [`crate::closure::JsClosureBody`] plus a cached
+    /// `function_id` so the call path stays heap-free.
+    ///
+    /// `MakeFunction` is emitted for closure-less, non-arrow functions
+    /// (their `function_id` flows through [`Value::Function`]);
+    /// `MakeClosure` allocates this variant for the capture path and
+    /// for all arrow expressions.
+    Closure(crate::closure::JsClosure),
     /// Result of `Function.prototype.bind(thisArg, ...prefix)`. When
     /// invoked, forwards to `target` with `this = bound_this` and
     /// `prefix ++ call_args` as the argument list. Cheap to clone:
@@ -1303,11 +1297,8 @@ impl Value {
     /// scavenger may rewrite slots.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         match self {
-            Value::Closure { upvalues, .. } => {
-                for slot in upvalues.iter() {
-                    let p = slot as *const UpvalueCell as *mut RawGc;
-                    visitor(p);
-                }
+            Value::Closure(c) => {
+                c.trace_value_slots(visitor);
             }
             // Task 77 — `JsObject` is a `Gc<ObjectBody>` handle.
             // Yield the slot's storage address so the scavenger
@@ -1418,7 +1409,11 @@ impl Value {
             Value::BigInt(b) => b.to_decimal_string(heap),
             Value::String(s) => s.to_lossy_string(),
             Value::Symbol(s) => s.descriptive_string(),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 format!("[Function #{function_id}]")
             }
             Value::BoundFunction(_) => "[BoundFunction]".to_string(),
@@ -1483,7 +1478,7 @@ impl Value {
             // every object-shaped reference type.
             Value::Symbol(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
             | Value::Object(_)
@@ -1588,7 +1583,7 @@ impl Value {
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
             Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
             | Value::ClassConstructor(_) => "function",
@@ -1644,12 +1639,10 @@ impl Value {
 
 impl otter_gc::GcStore for Value {
     fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
-        if let Value::Closure { upvalues, .. } = self {
-            for cell in upvalues.iter() {
-                if let Some(edge) = otter_gc::GcEdge::from_gc(*cell) {
-                    visitor(edge);
-                }
-            }
+        if let Value::Closure(c) = self
+            && let Some(edge) = otter_gc::GcEdge::from_gc(c.handle)
+        {
+            visitor(edge);
         }
         if let Some(raw) = self.as_gc_raw()
             && let Some(edge) = otter_gc::GcEdge::from_raw(raw)
@@ -1684,18 +1677,7 @@ impl PartialEq for Value {
             (Value::Object(a), Value::Object(b)) => a == b,
             (Value::Array(a), Value::Array(b)) => crate::array::ptr_eq(*a, *b),
             (Value::Function { function_id: a }, Value::Function { function_id: b }) => a == b,
-            (
-                Value::Closure {
-                    function_id: a,
-                    upvalues: ua,
-                    ..
-                },
-                Value::Closure {
-                    function_id: b,
-                    upvalues: ub,
-                    ..
-                },
-            ) => a == b && std::rc::Rc::ptr_eq(ua, ub),
+            (Value::Closure(a), Value::Closure(b)) => a.ptr_eq(*b),
             (Value::BoundFunction(a), Value::BoundFunction(b)) => a.ptr_eq(b),
             (Value::NativeFunction(a), Value::NativeFunction(b)) => a.ptr_eq(b),
             (Value::Promise(a), Value::Promise(b)) => a.ptr_eq(b as &dyn JsPromise),
@@ -2592,7 +2574,7 @@ impl Interpreter {
                 }
             }
             Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_) => Ok(Value::Object(self.function_prototype_object()?)),
             // §10.4 exotic objects (Array, Map, Set, WeakMap,
@@ -3783,7 +3765,7 @@ impl Interpreter {
             };
         }
         let (function_id, parent_upvalues, this_for_callee) =
-            match Self::bytecode_call_target_parts(current, effective_this) {
+            match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
                 Ok(parts) => parts,
                 Err(error) => {
                     return Err(RunError {
@@ -5847,7 +5829,7 @@ fn value_has_prototype_in_chain(
         }
         Value::Object(obj) => object::has_in_proto_chain(*obj, gc_heap, target),
         Value::Function { .. }
-        | Value::Closure { .. }
+        | Value::Closure(_)
         | Value::BoundFunction(_)
         | Value::NativeFunction(_)
         | Value::ClassConstructor(_) => {
@@ -5935,7 +5917,7 @@ pub(crate) fn value_kind_name(value: &Value) -> &'static str {
         Value::BigInt(_) => "bigint",
         Value::Object(_) => "object",
         Value::Array(_) => "array",
-        Value::Function { .. } | Value::Closure { .. } => "function",
+        Value::Function { .. } | Value::Closure(_) => "function",
         Value::NativeFunction(_) => "function",
         Value::BoundFunction(_) => "function",
         Value::ClassConstructor(_) => "class constructor",
@@ -6428,7 +6410,7 @@ fn constructor_return_is_object(value: &Value) -> bool {
         Value::Object(_)
             | Value::Array(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
@@ -8974,11 +8956,10 @@ mod tests {
     #[test]
     fn is_callable_recognises_call_shapes() {
         assert!(is_callable(&Value::Function { function_id: 7 }));
-        assert!(is_callable(&Value::Closure {
-            function_id: 7,
-            upvalues: Frame::empty_upvalues(),
-            bound_this: None,
-        }));
+        let mut closure_heap = otter_gc::GcHeap::new().expect("closure heap");
+        let closure_handle =
+            crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None).expect("closure");
+        assert!(is_callable(&Value::Closure(closure_handle)));
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let bound = BoundFunction::new(
             &mut heap,
@@ -9837,11 +9818,14 @@ mod tests {
         // the lexical override is working.
         let mut interp = Interpreter::new();
         let bound = JsString::from_str("outer", interp.string_heap()).unwrap();
-        let closure = Value::Closure {
-            function_id: 1,
-            upvalues: Frame::empty_upvalues(),
-            bound_this: Some(Box::new(Value::String(bound.clone()))),
-        };
+        let closure_handle = crate::closure::alloc_closure(
+            interp.gc_heap_mut(),
+            1,
+            Vec::new(),
+            Some(Value::String(bound.clone())),
+        )
+        .expect("closure alloc");
+        let closure = Value::Closure(closure_handle);
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let context = ExecutionContext::from_module(module.clone());

@@ -257,7 +257,11 @@ impl Interpreter {
             // canonical `call` / `apply` / `bind` / `toString` shims.
             // Lookups for symbol keys fall through to `false` because
             // the foundation Function layout has no symbol slot.
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 if let Some(name) = key_name.as_deref() {
                     let bag_has = self
                         .function_user_props
@@ -345,9 +349,11 @@ impl Interpreter {
             // protects `length` from deletion); named keys route
             // through the array exotic's named-property store.
             Value::Array(arr) => crate::array::delete_named_property(*arr, &mut self.gc_heap, name),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                self.ordinary_function_delete_own_property(*function_id, name)
-            }
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => self.ordinary_function_delete_own_property(*function_id, name),
             Value::NativeFunction(native) => native.delete_own_property(&mut self.gc_heap, name),
             Value::BoundFunction(bound) => {
                 function_metadata::bound_delete_own_property(bound, &mut self.gc_heap, name)
@@ -452,7 +458,11 @@ impl Interpreter {
             }
             (Value::String(_), _) => true,
             (
-                Value::Function { function_id } | Value::Closure { function_id, .. },
+                Value::Function { function_id }
+                | Value::Closure(crate::closure::JsClosure {
+                    cached_function_id: function_id,
+                    ..
+                }),
                 Value::String(s),
             ) => self.ordinary_function_delete_own_property(*function_id, &s.to_lossy_string()),
             (Value::NativeFunction(native), Value::Symbol(sym)) => {
@@ -568,7 +578,7 @@ impl Interpreter {
                 }
             }
             Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_) => {}
             // §20.1.2.21 step 4 — `Object.setPrototypeOf(primitive,
@@ -657,7 +667,7 @@ impl Interpreter {
                                 let ctor = c.ctor(&self.gc_heap);
                                 match &ctor {
                                     Value::Function { .. }
-                                    | Value::Closure { .. }
+                                    | Value::Closure(_)
                                     | Value::NativeFunction(_)
                                     | Value::BoundFunction(_) => {
                                         let ctx = function_metadata::FunctionMetadataContext::new(
@@ -707,7 +717,10 @@ impl Interpreter {
                 let fid = *function_id;
                 self.function_property_get_stack_rooted(context, stack, fid, name)?
             }
-            Value::Closure { function_id, .. } => {
+            Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let fid = *function_id;
                 self.function_property_get_stack_rooted(context, stack, fid, name)?
             }
@@ -1043,7 +1056,11 @@ impl Interpreter {
                 }
                 None
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let fid = *function_id;
                 let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
                     context, fid, name,
@@ -1240,7 +1257,11 @@ impl Interpreter {
                 crate::object::get(*obj, &self.gc_heap, &key).unwrap_or(Value::Undefined)
             }
             (
-                Value::Function { function_id } | Value::Closure { function_id, .. },
+                Value::Function { function_id }
+                | Value::Closure(crate::closure::JsClosure {
+                    cached_function_id: function_id,
+                    ..
+                }),
                 Value::String(key),
             ) => {
                 match self.ordinary_function_own_property_descriptor(
@@ -1454,7 +1475,7 @@ impl Interpreter {
             // accessor outcomes) fires correctly.
             (
                 Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -1622,7 +1643,11 @@ impl Interpreter {
                 self.store_computed_ordinary_property(*obj, &key, value, strict)?;
             }
             (
-                Value::Function { function_id } | Value::Closure { function_id, .. },
+                Value::Function { function_id }
+                | Value::Closure(crate::closure::JsClosure {
+                    cached_function_id: function_id,
+                    ..
+                }),
                 Value::String(key),
             ) => {
                 let key = key.to_lossy_string();
@@ -1915,7 +1940,11 @@ impl Interpreter {
             // function user-property bag for symbol-keyed writes
             // exactly like string-keyed ones.
             (
-                Value::Function { function_id } | Value::Closure { function_id, .. },
+                Value::Function { function_id }
+                | Value::Closure(crate::closure::JsClosure {
+                    cached_function_id: function_id,
+                    ..
+                }),
                 Value::Symbol(sym),
             ) => {
                 if !self
@@ -2338,12 +2367,16 @@ impl Interpreter {
         if matches!(
             receiver,
             Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::ClassConstructor(_)
         ) {
             let own_present = match &receiver {
-                Value::Function { function_id } | Value::Closure { function_id, .. } => self
+                Value::Function { function_id }
+                | Value::Closure(crate::closure::JsClosure {
+                    cached_function_id: function_id,
+                    ..
+                }) => self
                     .function_user_props
                     .get(function_id)
                     .copied()
@@ -2383,7 +2416,11 @@ impl Interpreter {
         let obj = match &receiver {
             Value::Object(o) => *o,
             Value::ClassConstructor(c) => c.statics(&self.gc_heap),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let fid = *function_id;
                 match self.function_user_props.get(&fid).copied() {
                     Some(bag) => bag,
@@ -2576,7 +2613,11 @@ impl Interpreter {
                 }
                 class.statics(&self.gc_heap)
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let Some(bag) = self.function_user_props.get(function_id).copied() else {
                     return Ok(false);
                 };
@@ -3123,7 +3164,11 @@ impl Interpreter {
         let obj = match &receiver {
             Value::Object(obj) => *obj,
             Value::ClassConstructor(class) => class.statics(&self.gc_heap),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 match &key {
                     ComputedPropertyKey::String(key) => {
                         if function_metadata::ordinary_function_metadata_key(key).is_some()
@@ -3483,7 +3528,11 @@ impl Interpreter {
         let obj = match &receiver {
             Value::Object(o) => *o,
             Value::ClassConstructor(c) => c.statics(&self.gc_heap),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let fid = *function_id;
                 if function_metadata::ordinary_function_metadata_key(name).is_some()
                     && let Some(desc) =

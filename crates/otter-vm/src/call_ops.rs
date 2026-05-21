@@ -65,20 +65,19 @@ impl Interpreter {
     pub(crate) fn bytecode_call_target_parts(
         current: Value,
         effective_this: Value,
+        heap: &otter_gc::GcHeap,
     ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>, Value), VmError> {
         match current {
             Value::Function { function_id } => {
                 Ok((function_id, Frame::empty_upvalues(), effective_this))
             }
-            Value::Closure {
-                function_id,
-                upvalues,
-                bound_this,
-            } => {
-                let this_value = match bound_this {
-                    Some(t) => *t,
-                    None => effective_this,
-                };
+            Value::Closure(c) => {
+                let function_id = c.function_id();
+                let (upvalues, bound_this) = heap.read_payload(c.handle, |body| {
+                    let ups: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(&body.upvalues[..]);
+                    (ups, body.bound_this.clone())
+                });
+                let this_value = bound_this.unwrap_or(effective_this);
                 Ok((function_id, upvalues, this_value))
             }
             _ => Err(VmError::NotCallable),
@@ -87,14 +86,17 @@ impl Interpreter {
 
     fn bytecode_construct_target_parts(
         current: Value,
+        heap: &otter_gc::GcHeap,
     ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>), VmError> {
         match current {
             Value::Function { function_id } => Ok((function_id, Frame::empty_upvalues())),
-            Value::Closure {
-                function_id,
-                upvalues,
-                ..
-            } => Ok((function_id, upvalues)),
+            Value::Closure(c) => {
+                let function_id = c.function_id();
+                let upvalues = heap.read_payload(c.handle, |body| {
+                    std::rc::Rc::<[UpvalueCell]>::from(&body.upvalues[..])
+                });
+                Ok((function_id, upvalues))
+            }
             _ => Err(VmError::NotCallable),
         }
     }
@@ -108,7 +110,8 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
         return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
-        let (function_id, parent_upvalues) = Self::bytecode_construct_target_parts(current)?;
+        let (function_id, parent_upvalues) =
+            Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -135,7 +138,8 @@ impl Interpreter {
         args: &BytecodeArgumentWindow<'_>,
         return_register: Option<u16>,
     ) -> Result<Frame, VmError> {
-        let (function_id, parent_upvalues) = Self::bytecode_construct_target_parts(current)?;
+        let (function_id, parent_upvalues) =
+            Self::bytecode_construct_target_parts(current, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -366,11 +370,11 @@ impl Interpreter {
                 _ => break,
             }
         }
-        if !matches!(current, Value::Function { .. } | Value::Closure { .. }) {
+        if !matches!(current, Value::Function { .. } | Value::Closure(_)) {
             return Ok(false);
         }
         let (function_id, parent_upvalues, this_for_callee) =
-            Self::bytecode_call_target_parts(current, effective_this)?;
+            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -568,9 +572,9 @@ impl Interpreter {
                 _ => break,
             }
         }
-        if matches!(current, Value::Function { .. } | Value::Closure { .. }) {
+        if matches!(current, Value::Function { .. } | Value::Closure(_)) {
             let (function_id, parent_upvalues, this_for_callee) =
-                Self::bytecode_call_target_parts(current, effective_this)?;
+                Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
             return self.push_bytecode_call_frame(
                 stack,
                 context,
@@ -652,7 +656,7 @@ impl Interpreter {
             return Ok(());
         }
         let (function_id, parent_upvalues, this_for_callee) =
-            Self::bytecode_call_target_parts(current, effective_this)?;
+            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         self.push_bytecode_call_frame(
             stack,
             context,
@@ -722,7 +726,7 @@ impl Interpreter {
         if let Value::ClassConstructor(class) = &current {
             current = class.ctor(&self.gc_heap).clone();
         }
-        if !matches!(current, Value::Function { .. } | Value::Closure { .. }) {
+        if !matches!(current, Value::Function { .. } | Value::Closure(_)) {
             return Ok(false);
         }
 
@@ -994,10 +998,7 @@ impl Interpreter {
             Value::ClassConstructor(class) => class.ctor(&self.gc_heap).clone(),
             _ => callee.clone(),
         };
-        if matches!(
-            bytecode_callee,
-            Value::Function { .. } | Value::Closure { .. }
-        ) {
+        if matches!(bytecode_callee, Value::Function { .. } | Value::Closure(_)) {
             let frame = self.build_construct_bytecode_frame(
                 context,
                 bytecode_callee,
@@ -1026,7 +1027,11 @@ impl Interpreter {
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         match callee {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 match self.function_property_get_stack_rooted(
                     context,
                     stack,
@@ -1056,7 +1061,11 @@ impl Interpreter {
         slice_roots: &[&[Value]],
     ) -> Result<Option<Value>, VmError> {
         match callee {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 match self.function_property_get_runtime_rooted(
                     context,
                     *function_id,
@@ -1329,7 +1338,7 @@ impl Interpreter {
                 .map_err(native_to_vm_error);
         }
         let (function_id, parent_upvalues, this_for_callee) =
-            Self::bytecode_call_target_parts(current, effective_this)?;
+            Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;

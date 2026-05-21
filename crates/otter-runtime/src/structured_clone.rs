@@ -564,7 +564,7 @@ fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Symbol(_) => "symbol",
         Value::Function { .. } => "function",
-        Value::Closure { .. } => "closure",
+        Value::Closure(_) => "closure",
         Value::BoundFunction(_) => "bound_function",
         Value::NativeFunction(_) => "native_function",
         Value::Iterator(_) => "iterator",

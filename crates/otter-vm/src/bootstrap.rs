@@ -545,7 +545,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
             Value::Object(_)
                 | Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -3674,7 +3674,7 @@ fn iterator_from_native(
         | Value::Set(_)
         | Value::Map(_)
         | Value::Function { .. }
-        | Value::Closure { .. }
+        | Value::Closure(_)
         | Value::NativeFunction(_)
         | Value::BoundFunction(_)
         | Value::ClassConstructor(_)

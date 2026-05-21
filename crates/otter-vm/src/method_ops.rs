@@ -370,7 +370,7 @@ impl Interpreter {
                     Value::Object(_)
                     | Value::Array(_)
                     | Value::Function { .. }
-                    | Value::Closure { .. }
+                    | Value::Closure(_)
                     | Value::NativeFunction(_)
                     | Value::BoundFunction(_)
                     | Value::ClassConstructor(_)
@@ -467,7 +467,7 @@ impl Interpreter {
                         Value::Object(_)
                             | Value::Array(_)
                             | Value::Function { .. }
-                            | Value::Closure { .. }
+                            | Value::Closure(_)
                             | Value::NativeFunction(_)
                             | Value::BoundFunction(_)
                             | Value::ClassConstructor(_)
@@ -519,7 +519,7 @@ impl Interpreter {
                         Value::Object(_)
                             | Value::Array(_)
                             | Value::Function { .. }
-                            | Value::Closure { .. }
+                            | Value::Closure(_)
                             | Value::NativeFunction(_)
                             | Value::BoundFunction(_)
                             | Value::ClassConstructor(_)
@@ -592,7 +592,7 @@ impl Interpreter {
                         Value::Object(_)
                             | Value::Array(_)
                             | Value::Function { .. }
-                            | Value::Closure { .. }
+                            | Value::Closure(_)
                             | Value::NativeFunction(_)
                             | Value::BoundFunction(_)
                             | Value::ClassConstructor(_)
@@ -624,7 +624,7 @@ impl Interpreter {
                         Value::Object(_)
                             | Value::Array(_)
                             | Value::Function { .. }
-                            | Value::Closure { .. }
+                            | Value::Closure(_)
                             | Value::NativeFunction(_)
                             | Value::BoundFunction(_)
                             | Value::ClassConstructor(_)
@@ -762,7 +762,11 @@ impl Interpreter {
         // Functions / closures inherit Object.prototype-style
         // methods. Foundation routes the call through the user-
         // properties bag attached to the compiled function.
-        if let Value::Function { function_id } | Value::Closure { function_id, .. } = &recv_value
+        if let Value::Function { function_id }
+        | Value::Closure(crate::closure::JsClosure {
+            cached_function_id: function_id,
+            ..
+        }) = &recv_value
             && matches!(
                 name,
                 "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
@@ -959,7 +963,11 @@ impl Interpreter {
             // resolve via the function-properties side table; the
             // fallback to `Function.prototype.{call,apply,bind}`
             // happens below if we hand back `Undefined`.
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let fid = *function_id;
                 Some(self.function_property_get_stack_rooted(context, stack, fid, name)?)
             }

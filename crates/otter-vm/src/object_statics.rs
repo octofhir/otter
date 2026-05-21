@@ -323,7 +323,7 @@ fn native_keys_rooted(
             | Value::Array(_)
             | Value::RegExp(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
     ) {
@@ -652,7 +652,7 @@ fn native_get_own_property_descriptor_rooted(
             | Value::Array(_)
             | Value::RegExp(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
             | Value::String(_)
@@ -852,7 +852,7 @@ fn native_get_own_property_names_rooted(
                     | Value::Array(_)
                     | Value::Proxy(_)
                     | Value::Function { .. }
-                    | Value::Closure { .. }
+                    | Value::Closure(_)
                     | Value::NativeFunction(_)
                     | Value::BoundFunction(_)
             ) =>
@@ -907,7 +907,7 @@ fn class_constructor_own_property_keys_without_context(
         Value::ClassConstructor(inner) => {
             class_constructor_own_property_keys_without_context(&inner, gc_heap)?
         }
-        Value::Function { .. } | Value::Closure { .. } => return Err(VmError::InvalidOperand),
+        Value::Function { .. } | Value::Closure(_) => return Err(VmError::InvalidOperand),
         _ => Vec::new(),
     };
     if !keys.iter().any(|key| key == "prototype") {
@@ -1081,7 +1081,11 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             reason: "missing execution context".to_string(),
         })?;
     let interp = ctx.interp_mut();
-    if let Value::Function { function_id } | Value::Closure { function_id, .. } = &target
+    if let Value::Function { function_id }
+    | Value::Closure(crate::closure::JsClosure {
+        cached_function_id: function_id,
+        ..
+    }) = &target
         && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, *function_id)
     {
         return Ok(Value::Object(proto));
@@ -1813,7 +1817,7 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         Value::String(_) => "String",
         Value::BigInt(_) | Value::Symbol(_) => "Object",
         // §20.1.3.6 step 14.a — `[[Call]]` slot.
-        Value::Function { .. } | Value::Closure { .. } => "Function",
+        Value::Function { .. } | Value::Closure(_) => "Function",
         Value::BoundFunction(_) | Value::NativeFunction(_) | Value::ClassConstructor(_) => {
             "Function"
         }
@@ -1891,7 +1895,7 @@ fn proxy_builtin_tag(value: &Value, heap: &otter_gc::GcHeap) -> String {
                 current = p.target(heap);
             }
             Value::Array(_) => return "Array".to_string(),
-            Value::Function { .. } | Value::Closure { .. } => return "Function".to_string(),
+            Value::Function { .. } | Value::Closure(_) => return "Function".to_string(),
             Value::BoundFunction(_) | Value::NativeFunction(_) | Value::ClassConstructor(_) => {
                 return "Function".to_string();
             }
@@ -2527,7 +2531,7 @@ pub fn call(
                 Value::Object(o) => crate::object::is_frozen(o, gc_heap),
                 Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
                 | Value::ClassConstructor(_)
@@ -2567,7 +2571,7 @@ pub fn call(
                 Value::Object(o) => crate::object::is_sealed(o, gc_heap),
                 Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
                 | Value::ClassConstructor(_)
@@ -2604,7 +2608,7 @@ pub fn call(
                 Value::Array(arr) => crate::array::is_extensible(arr, gc_heap),
                 Value::RegExp(r) => r.is_extensible(gc_heap),
                 Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
                 | Value::ClassConstructor(_)
@@ -2806,7 +2810,7 @@ pub fn call(
                 // caller fall through to the array shape it expects
                 // (the realistic fast paths already produced a
                 // result before landing here).
-                Some(Value::Function { .. }) | Some(Value::Closure { .. }) => {
+                Some(Value::Function { .. }) | Some(Value::Closure(_)) => {
                     return Err(VmError::InvalidOperand);
                 }
                 Some(Value::ClassConstructor(class)) => {

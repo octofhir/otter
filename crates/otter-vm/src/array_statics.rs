@@ -97,7 +97,7 @@ fn is_constructor(value: &Value) -> bool {
     matches!(
         value,
         Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)

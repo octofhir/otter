@@ -1215,7 +1215,7 @@ fn ta_ctor_dispatch(
                     Value::Object(_)
                         | Value::Array(_)
                         | Value::Function { .. }
-                        | Value::Closure { .. }
+                        | Value::Closure(_)
                         | Value::NativeFunction(_)
                         | Value::BoundFunction(_)
                         | Value::ClassConstructor(_)

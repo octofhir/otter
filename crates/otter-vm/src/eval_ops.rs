@@ -194,7 +194,7 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
-        if !matches!(value, Value::Function { .. } | Value::Closure { .. }) {
+        if !matches!(value, Value::Function { .. } | Value::Closure(_)) {
             return Ok(value);
         }
         let metadata_ctx = function_metadata::FunctionMetadataContext::new(
@@ -209,7 +209,11 @@ impl Interpreter {
         let length_value =
             function_metadata::callable_intrinsic_property(&metadata_ctx, &value, "length")?;
         let prototype_value = match &value {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let mut roots = Vec::with_capacity(value_roots.len() + 1);
                 roots.push(&value);
                 roots.extend_from_slice(value_roots);

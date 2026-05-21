@@ -230,7 +230,7 @@ fn coerce_bigint_call_args(
             // re-coerced by the BigInt dispatcher.
             Value::Object(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)

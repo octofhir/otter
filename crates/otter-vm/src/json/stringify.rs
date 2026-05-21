@@ -370,7 +370,7 @@ fn emit_value(
         // existing wildcard behaviour.
         Value::Symbol(_)
         | Value::Function { .. }
-        | Value::Closure { .. }
+        | Value::Closure(_)
         | Value::BoundFunction(_)
         | Value::NativeFunction(_)
         | Value::Iterator(_)
@@ -421,7 +421,7 @@ fn is_serialisable(value: &Value) -> bool {
         value,
         Value::Undefined
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
             | Value::Iterator(_)

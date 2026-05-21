@@ -1644,7 +1644,7 @@ fn native_string_method(
             Value::Object(_)
                 | Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -1725,7 +1725,7 @@ fn native_string_method(
                         Value::Object(_)
                             | Value::Array(_)
                             | Value::Function { .. }
-                            | Value::Closure { .. }
+                            | Value::Closure(_)
                             | Value::NativeFunction(_)
                             | Value::BoundFunction(_)
                             | Value::ClassConstructor(_)

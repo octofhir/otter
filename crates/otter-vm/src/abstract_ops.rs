@@ -246,7 +246,7 @@ pub fn is_callable(value: &Value) -> bool {
     matches!(
         value,
         Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
             | Value::ClassConstructor(_)
@@ -283,9 +283,11 @@ pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc
     match value {
         Value::ClassConstructor(_) => true,
         Value::NativeFunction(native) => native.is_constructable(heap),
-        Value::Function { function_id } | Value::Closure { function_id, .. } => {
-            !context.function_is_arrow(*function_id)
-        }
+        Value::Function { function_id }
+        | Value::Closure(crate::closure::JsClosure {
+            cached_function_id: function_id,
+            ..
+        }) => !context.function_is_arrow(*function_id),
         Value::BoundFunction(b) => {
             let (target, _, _) = b.parts(heap);
             is_constructor(&target, context, heap)

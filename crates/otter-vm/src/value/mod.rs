@@ -540,7 +540,7 @@ impl Value {
     /// function id, bound, native, class constructor wrapper).
     #[inline]
     #[must_use]
-    pub fn as_closure(self) -> Option<JsClosure> {
+    pub fn as_closure(self, heap: &otter_gc::GcHeap) -> Option<JsClosure> {
         if top_tag(self.0) != TAG_PTR_FUNCTION {
             return None;
         }
@@ -548,7 +548,9 @@ impl Value {
         if raw.header_type_tag()? != JS_CLOSURE_BODY_TYPE_TAG {
             return None;
         }
-        raw.checked_cast::<JsClosureBody>()
+        let handle = raw.checked_cast::<JsClosureBody>()?;
+        let function_id = heap.read_payload(handle, |body| body.function_id);
+        Some(JsClosure::from_parts(handle, function_id))
     }
 
     /// Ordinary object handle.
@@ -1553,12 +1555,12 @@ mod tests {
 
         let mut heap = GcHeap::new().expect("heap");
         let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
-        let upvalues = vec![cell].into_boxed_slice();
+        let upvalues = vec![cell];
         let closure = alloc_closure(&mut heap, 99, upvalues, None).expect("alloc");
         let v = Value::closure(closure);
         assert!(v.is_callable());
         assert!(!v.is_function_id());
-        assert_eq!(v.as_closure(), Some(closure));
+        assert_eq!(v.as_closure(&heap), Some(closure));
         assert_eq!(v.kind(), ValueKind::PtrFunction);
     }
 
@@ -1582,7 +1584,7 @@ mod tests {
         assert_eq!(v.as_array(), None);
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
-        assert_eq!(v.as_closure(), None);
+        assert_eq!(v.as_closure(&heap), None);
     }
 
     #[test]
@@ -1596,8 +1598,7 @@ mod tests {
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
         let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
-        let closure =
-            alloc_closure(&mut heap, 1, vec![cell].into_boxed_slice(), None).expect("closure");
+        let closure = alloc_closure(&mut heap, 1, vec![cell], None).expect("closure");
 
         let vobj = Value::object(obj);
         let vclo = Value::closure(closure);
@@ -1694,7 +1695,7 @@ mod tests {
         assert_eq!(v.as_string_gc(), Some(body));
         // String must not collapse into object-family or callable-family.
         assert_eq!(v.as_object(), None);
-        assert_eq!(v.as_closure(), None);
+        assert_eq!(v.as_closure(&heap), None);
         // Typeof reads purely from the tag.
         assert_eq!(v.typeof_pure(), Some("string"));
     }
@@ -1761,8 +1762,7 @@ mod tests {
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
         let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
-        let closure =
-            alloc_closure(&mut heap, 1, vec![cell].into_boxed_slice(), None).expect("closure");
+        let closure = alloc_closure(&mut heap, 1, vec![cell], None).expect("closure");
 
         let vo = Value::object(obj);
         let vc = Value::closure(closure);
@@ -1798,8 +1798,9 @@ mod tests {
 
     #[test]
     fn as_closure_rejects_non_closure_function_id() {
+        let heap = otter_gc::GcHeap::new().expect("heap");
         let v = Value::function_id(0);
-        assert_eq!(v.as_closure(), None);
+        assert_eq!(v.as_closure(&heap), None);
         assert!(v.is_callable());
     }
 

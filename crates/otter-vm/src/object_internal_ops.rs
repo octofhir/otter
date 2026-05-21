@@ -630,7 +630,11 @@ impl Interpreter {
                 }
                 Ok(None)
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => match key {
                 VmPropertyKey::Symbol(sym) => {
                     let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                         return Ok(None);
@@ -765,7 +769,7 @@ impl Interpreter {
             | Value::Array(_)
             | Value::NativeFunction(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
             | Value::RegExp(_)
@@ -792,7 +796,7 @@ impl Interpreter {
                 | Value::Object(_)
                 | Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -851,9 +855,11 @@ impl Interpreter {
             }
             Value::Object(obj) => Ok(object::is_extensible(*obj, &self.gc_heap)),
             Value::Array(arr) => Ok(array::is_extensible(*arr, &self.gc_heap)),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                Ok(self.ordinary_function_is_extensible(*function_id))
-            }
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => Ok(self.ordinary_function_is_extensible(*function_id)),
             Value::RegExp(regexp) => Ok(regexp.is_extensible(&self.gc_heap)),
             // Per §10.1.3 every other ordinary heap value is extensible
             // by default. Non-object primitives never reach this path
@@ -1045,7 +1051,11 @@ impl Interpreter {
                     }
                 })
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 if let VmPropertyKey::Symbol(sym) = key {
                     let bag = self.function_user_bag_runtime_rooted(*function_id, &[], &[])?;
                     return Ok(object::define_own_symbol_property_partial(
@@ -1811,7 +1821,7 @@ impl Interpreter {
                 | Value::Proxy(_)
                 | Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
                 | Value::ClassConstructor(_)
@@ -2065,7 +2075,11 @@ impl Interpreter {
                 }
                 Ok(keys)
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let names = self.ordinary_function_own_property_keys(context, *function_id);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
@@ -2452,7 +2466,11 @@ impl Interpreter {
                 array::prevent_extensions(*arr, &mut self.gc_heap);
                 Ok(true)
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 self.ordinary_function_prevent_extensions(*function_id);
                 Ok(true)
             }
@@ -2493,7 +2511,11 @@ impl Interpreter {
                     }
                 }
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let value = self.function_property_get(context, *function_id, "prototype")?;
                 if matches!(value, Value::Object(_) | Value::Proxy(_)) {
                     Ok(Some(value))
@@ -2569,7 +2591,11 @@ impl Interpreter {
                     }
                 }
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let value = self.function_property_get_stack_rooted(
                     context,
                     stack,
@@ -2773,7 +2799,11 @@ impl Interpreter {
                 };
                 Ok(VmGetOutcome::Value(value))
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
                         // §10.2 ordinary function exotic — own
@@ -3385,7 +3415,7 @@ impl Interpreter {
                 }
             },
             Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::NativeFunction(_)
             | Value::ClassConstructor(_)
@@ -3749,7 +3779,11 @@ impl Interpreter {
                 }
                 Ok(out)
             }
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 // §20.1.2.5 / §10.2.4 — enumerable own string keys in
                 // spec creation order. Intrinsic metadata (`length`,
                 // `name`, non-arrow `prototype`) is older than any
@@ -3927,19 +3961,21 @@ impl Interpreter {
                     None => true,
                 },
             }),
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                Ok(if let Some(key) = key.string_name() {
-                    self.ordinary_function_delete_own_property(function_id, key)
-                } else if let VmPropertyKey::Symbol(sym) = key {
-                    self.function_user_props
-                        .get(&function_id)
-                        .copied()
-                        .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, sym))
-                        .unwrap_or(true)
-                } else {
-                    true
-                })
-            }
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => Ok(if let Some(key) = key.string_name() {
+                self.ordinary_function_delete_own_property(function_id, key)
+            } else if let VmPropertyKey::Symbol(sym) = key {
+                self.function_user_props
+                    .get(&function_id)
+                    .copied()
+                    .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, sym))
+                    .unwrap_or(true)
+            } else {
+                true
+            }),
             Value::NativeFunction(native) => Ok(match key.string_name() {
                 Some(key) => native.delete_own_property(&mut self.gc_heap, key),
                 None if let VmPropertyKey::Symbol(sym) = key => {
@@ -4076,7 +4112,11 @@ impl Interpreter {
                 }
                 _ => Ok(false),
             },
-            Value::Function { function_id } | Value::Closure { function_id, .. } => match key {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => match key {
                 VmPropertyKey::Symbol(sym) => {
                     if !self.ordinary_function_has_own_symbol_property_for_extensibility(
                         function_id,

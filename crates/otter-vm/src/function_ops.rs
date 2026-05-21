@@ -53,7 +53,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_make_closure_operands(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
         operands: &[Operand],
@@ -79,23 +79,18 @@ impl Interpreter {
                 .ok_or(VmError::InvalidOperand)?;
             cells.push(cell);
         }
-        let upvalues: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(cells);
+        let upvalues = cells;
         // Arrow-closure receivers are bound lexically: every later invocation
         // ignores the call site and uses the enclosing frame's `this`.
         let bound_this = if context.function_is_arrow(function_id) {
-            Some(Box::new(frame.this_value.clone()))
+            Some(frame.this_value.clone())
         } else {
             None
         };
-        write_register(
-            frame,
-            dst,
-            Value::Closure {
-                function_id,
-                upvalues,
-                bound_this,
-            },
-        )?;
+        let closure =
+            crate::closure::alloc_closure(&mut self.gc_heap, function_id, upvalues, bound_this)
+                .map_err(crate::oom_to_vm)?;
+        write_register(frame, dst, Value::Closure(closure))?;
         frame.pc += 1;
         Ok(())
     }
@@ -447,7 +442,7 @@ impl Interpreter {
                 | Value::Proxy(_)
                 | Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -497,7 +492,7 @@ impl Interpreter {
                 | Value::Proxy(_)
                 | Value::Array(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -543,7 +538,7 @@ impl Interpreter {
             Value::Object(_)
                 | Value::Proxy(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -600,7 +595,7 @@ impl Interpreter {
             Value::Object(_)
                 | Value::Proxy(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -663,7 +658,7 @@ impl Interpreter {
                 | Value::Array(_)
                 | Value::Proxy(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::NativeFunction(_)
                 | Value::BoundFunction(_)
                 | Value::ClassConstructor(_)
@@ -720,7 +715,11 @@ impl Interpreter {
         key: &str,
     ) -> Result<BindMetadataGet, VmError> {
         match target {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 match self.ordinary_function_own_property_descriptor(
                     Some(context),
                     *function_id,
@@ -925,7 +924,11 @@ impl Interpreter {
     ) -> Result<Vec<String>, VmError> {
         let ctor = class.ctor(&self.gc_heap);
         let mut keys = match ctor {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => {
                 let Some(context) = context else {
                     return Err(VmError::InvalidOperand);
                 };
@@ -1130,7 +1133,7 @@ impl Interpreter {
         };
         if matches!(
             target,
-            Value::Array(_) | Value::Function { .. } | Value::Closure { .. } | Value::RegExp(_)
+            Value::Array(_) | Value::Function { .. } | Value::Closure(_) | Value::RegExp(_)
         ) && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
         {
             let Some(context) = context else {
@@ -1186,7 +1189,7 @@ impl Interpreter {
                 | Value::Array(_)
                 | Value::RegExp(_)
                 | Value::Function { .. }
-                | Value::Closure { .. }
+                | Value::Closure(_)
                 | Value::BoundFunction(_)
                 | Value::NativeFunction(_)
         ) && matches!(
@@ -1299,9 +1302,11 @@ impl Interpreter {
             };
         }
         let function_id = match &target {
-            Value::Function { function_id } | Value::Closure { function_id, .. } => {
-                Some(*function_id)
-            }
+            Value::Function { function_id }
+            | Value::Closure(crate::closure::JsClosure {
+                cached_function_id: function_id,
+                ..
+            }) => Some(*function_id),
             Value::BoundFunction(_) => None,
             _ => return Ok(None),
         };
@@ -1460,13 +1465,21 @@ impl Interpreter {
             // dispatcher. This mirrors §10.1.3/§10.1.4 for the
             // side-table-backed function shape.
             M::IsExtensible => match target {
-                Value::Function { function_id } | Value::Closure { function_id, .. } => Ok(Some(
-                    Value::Boolean(self.ordinary_function_is_extensible(function_id)),
-                )),
+                Value::Function { function_id }
+                | Value::Closure(crate::closure::JsClosure {
+                    cached_function_id: function_id,
+                    ..
+                }) => Ok(Some(Value::Boolean(
+                    self.ordinary_function_is_extensible(function_id),
+                ))),
                 _ => Ok(None),
             },
             M::PreventExtensions => match target {
-                Value::Function { function_id } | Value::Closure { function_id, .. } => {
+                Value::Function { function_id }
+                | Value::Closure(crate::closure::JsClosure {
+                    cached_function_id: function_id,
+                    ..
+                }) => {
                     self.ordinary_function_prevent_extensions(function_id);
                     Ok(Some(target))
                 }

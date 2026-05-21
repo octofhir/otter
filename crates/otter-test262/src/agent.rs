@@ -252,7 +252,7 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     if !matches!(
         handler,
         Value::NativeFunction(_)
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)
     ) {

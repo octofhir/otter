@@ -336,7 +336,11 @@ fn callable_metadata_value(
 
 fn callable_name(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<String, VmError> {
     match callee {
-        Value::Function { function_id } | Value::Closure { function_id, .. } => {
+        Value::Function { function_id }
+        | Value::Closure(crate::closure::JsClosure {
+            cached_function_id: function_id,
+            ..
+        }) => {
             if let Some(value) = ordinary_function_user_property(ctx, *function_id, "name") {
                 return Ok(match value {
                     Value::String(s) => s.to_lossy_string(),
@@ -383,7 +387,11 @@ fn callable_name(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<St
 
 fn callable_length(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<f64, VmError> {
     match callee {
-        Value::Function { function_id } | Value::Closure { function_id, .. } => {
+        Value::Function { function_id }
+        | Value::Closure(crate::closure::JsClosure {
+            cached_function_id: function_id,
+            ..
+        }) => {
             if let Some(value) = ordinary_function_user_property(ctx, *function_id, "length") {
                 return Ok(match value {
                     Value::Number(n) => to_integer_or_infinity(n.as_f64()),

@@ -177,7 +177,7 @@ fn is_prototype_object_value(value: &Value) -> bool {
         Value::Object(_)
             | Value::Array(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)

@@ -772,7 +772,7 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
             | Value::Proxy(_)
             | Value::Array(_)
             | Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_)

@@ -42,7 +42,7 @@ pub(crate) fn to_number_primitive(value: &Value) -> Result<NumberValue, VmError>
         Value::Undefined
         | Value::Hole
         | Value::Function { .. }
-        | Value::Closure { .. }
+        | Value::Closure(_)
         | Value::BoundFunction(_)
         | Value::NativeFunction(_)
         | Value::Object(_)
@@ -346,7 +346,7 @@ impl Interpreter {
     pub(crate) fn intrinsic_prototype_object_for(&self, value: &Value) -> Option<JsObject> {
         let constructor_name = match value {
             Value::Function { .. }
-            | Value::Closure { .. }
+            | Value::Closure(_)
             | Value::NativeFunction(_)
             | Value::BoundFunction(_)
             | Value::ClassConstructor(_) => return self.function_prototype_object().ok(),

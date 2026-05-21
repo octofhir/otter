@@ -57,6 +57,7 @@ use crate::object::{JsObject, ObjectBody};
 use crate::promise::{JsPromiseHandle, PurePromise, PurePromiseBody};
 use crate::regexp::{JsRegExp, JsRegExpBody};
 use crate::string::{JsStringBody, JsStringHandle};
+use crate::intl::{IntlBody, IntlHandle};
 use crate::symbol::{SymbolBody, SymbolHandle};
 use crate::temporal::{TemporalBody, TemporalHandle};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
@@ -414,6 +415,16 @@ impl Value {
     #[must_use]
     pub fn temporal_gc(t: TemporalHandle) -> Self {
         Self::from_object_gc(t.raw())
+    }
+
+    /// GC-managed Intl body handle. Migration target for the
+    /// legacy `JsIntl { inner: Rc<IntlPayload> }` wrapper.
+    /// Packs under `TAG_PTR_OBJECT` because `Intl.*` instances are
+    /// object-shaped per ECMA-402.
+    #[inline]
+    #[must_use]
+    pub fn intl_gc(i: IntlHandle) -> Self {
+        Self::from_object_gc(i.raw())
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1099,6 +1110,25 @@ impl Value {
         self.is_object_like()
             && self.read_gc_type_tag()
                 == Some(<TemporalBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// GC-managed Intl body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_intl_gc(self) -> Option<IntlHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<IntlBody>()
+    }
+
+    /// `true` when the value is a GC-managed Intl body.
+    #[inline]
+    #[must_use]
+    pub fn is_intl_gc(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<IntlBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 }
 

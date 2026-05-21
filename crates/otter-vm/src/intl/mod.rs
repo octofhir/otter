@@ -51,7 +51,8 @@ pub mod segmenter;
 
 pub use dispatch::{IntlError, construct};
 pub use payload::{
-    CollatorPayload, DateTimeFormatPayload, IntlKind, IntlPayload, JsIntl, NumberFormatPayload,
+    CollatorPayload, DateTimeFormatPayload, INTL_BODY_TYPE_TAG, IntlBody, IntlHandle, IntlKind,
+    IntlPayload, JsIntl, NumberFormatPayload, alloc_intl,
 };
 
 use crate::Value;

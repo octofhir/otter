@@ -242,6 +242,41 @@ impl IntlKind {
     }
 }
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`IntlBody`].
+pub const INTL_BODY_TYPE_TAG: u8 = 0x28;
+
+/// GC-managed body for [`crate::Value::Intl`] — migration target for
+/// the legacy `JsIntl { inner: Rc<IntlPayload> }` wrapper.
+#[derive(Debug)]
+pub struct IntlBody {
+    /// Variant-typed Intl payload (Collator / NumberFormat /
+    /// DateTimeFormat / …).
+    pub payload: IntlPayload,
+}
+
+impl otter_gc::SafeTraceable for IntlBody {
+    const TYPE_TAG: u8 = INTL_BODY_TYPE_TAG;
+
+    /// No outgoing GC slots — Intl payloads wrap ICU library state
+    /// (collators, formatters) which holds no GC references.
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {}
+}
+
+/// 4-byte compressed GC handle to an [`IntlBody`]. `Copy`.
+pub type IntlHandle = otter_gc::Gc<IntlBody>;
+
+/// Allocate an Intl body on the GC heap.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_intl(
+    heap: &mut otter_gc::GcHeap,
+    payload: IntlPayload,
+) -> Result<IntlHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(IntlBody { payload })
+}
+
 /// Heap handle for [`crate::Value::Intl`].
 #[derive(Debug, Clone)]
 pub struct JsIntl {

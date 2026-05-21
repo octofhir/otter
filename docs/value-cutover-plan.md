@@ -129,10 +129,12 @@ Ordered by call-site count, smallest first:
 | `JsSymbol`        | done — this commit                              | —         | —             | WellKnownSymbols/SymbolRegistry `&mut GcHeap`; root scan walks registry + table; SymbolCall dispatch `&mut Interpreter` |
 | `BigIntValue`     | done — `21b6c90c`                               | —         | —             | pure 4-byte `Gc<BigIntBody>`, no Rc cache; `with_inner` / `clone_inner` / `to_decimal_string(heap)` / `sign(heap)` / `is_zero(heap)` / `numeric_eq(other, heap)`; `PartialEq` = handle `ptr_eq`; `abstract_ops::same_value(heap)` routes spec-numeric BigInt eq; ~50 files threaded `&GcHeap`/`&mut GcHeap`. MapKey::BigInt hashes by handle offset. |
 | `JsProxy`         | done — this commit                              | —         | —             | pure 4-byte `Gc<ProxyBodyGc>`, no Rc, no `Cell`; `target(heap) / handler(heap) / is_revoked(heap)` read through `heap.read_payload`; `revoke(&mut heap)` flips `revoked = true` + clears target/handler to `Value::Null` via `heap.with_payload` (matches §28.2.2.1 RevokeProxy step 4); `new` returns `Result<Self, OutOfMemory>`; `JsProxy` becomes `Copy`; 9 caller files (abstract_ops, bootstrap, call_ops, lib.rs, object, object_internal_ops, object_statics, property_dispatch, static_call_ops) all thread heap; `object_statics::proxy_builtin_tag` takes heap |
-| `JsDataView`      | `Rc<DataViewBody>`                              | TBD       | `DataViewBodyGc` | thin wrapper; few read sites |
-| `JsTypedArray`    | `Rc<TypedArrayBody>` + `Cell<expando>`          | TBD       | `TypedArrayBodyGc` | expando lazy-init becomes `with_payload` |
-| `JsArrayBuffer`   | `BufferStorage::{Local(Rc), Shared(Arc)}`       | TBD       | two bodies   | shared keeps `Arc<SharedBody>` (cross-thread); local moves bytes into GC body |
-| `JsString`        | `Arc<StringRepr>`                               | ~580      | `JsStringBody` (already chunked GC body exists) | biggest; cons/sliced/thin reprs need GC bodies too; rope ops need recurse-through-GC |
+| `JsArrayBuffer`   | done — `4cd29737`                               | —         | —            | tagged `BufferStorage::{Local(Handle), Shared(Handle)}`; `with_bytes` / `with_bytes_mut` closures; ~25 caller files |
+| `JsDataView`      | done — `42afe305`                               | —         | —            | pure 4-byte `Gc<DataViewBodyGc>`; readers via `heap.read_payload`; `data_view_call` upgraded to `&mut GcHeap` + `Result` |
+| `JsTypedArray`    | done — `26ddf9fb`                               | —         | —            | pure 4-byte `Gc<TypedArrayBodyGc>` + cached `TypedArrayKind`; expando through `with_payload`; ~7 caller files |
+| `JsString` body   | done — `c9e23ea6`                               | —         | —            | `JsStringBody` rebuilt as variant-enum (`Flat`/`Latin1`/`Cons`/`Sliced`); single alloc per string; heap-level `concat`/`slice`/`flatten`/`equals`/`hash` |
+| `JsString` bridge | done — `aa3e3b96`                               | —         | —            | `JsString::to_gc_handle(&mut heap)` / `from_gc_handle(heap, handle, string_heap)` converters in both directions |
+| `JsString` wrapper| `Arc<StringRepr>`                               | ~540      | `JsStringBody` (variant-enum) | Stage 2 full: wrapper switches to `Gc<JsStringBody>` handle + cached `len`; ~540 caller sites; reader API gains `&GcHeap` parameter (or thread-local heap pattern). |
 
 ### Wrapper migration template (from JsIntl)
 
@@ -166,25 +168,28 @@ Ordered by call-site count, smallest first:
 
 ## Next-step priority
 
-Recommended order:
+All small-and-medium wrappers landed (BigInt, Proxy, ArrayBuffer,
+DataView, TypedArray). String body unified + bridged. Remaining:
 
-1. **`BigIntValue`** — `.as_inner()` returns `&BigInt` from ~71
-   sites; need to introduce a `with_inner<F, R>` closure helper
-   and convert each call site. `BigInt::clone()` is too expensive
-   for hot arithmetic, so `with_inner` is the only viable path.
-2. **`JsDataView` / `JsTypedArray` / `JsArrayBuffer`** — all
-   interrelated. ArrayBuffer migrates first (Local body to GC,
-   Shared keeps Arc inside a GC body). DataView + TypedArray then
-   migrate to hold the new buffer handles.
-3. **`JsProxy`** — `.target() / .handler() / .is_revoked() /
-   .revoke()` × 80 sites. Revoke becomes `&mut GcHeap` via
-   `with_payload`. Touches `object_internal_ops.rs` extensively.
-4. **`JsString`** — biggest scope (~580 sites). Cons / sliced /
-   thin string reprs all need GC bodies; rope concatenation must
-   re-enter the GC heap; the string heap accountant must thread
-   through GC alloc. Plan for a separate session series.
+1. **`JsString` wrapper full migration** (~540 sites). Switch
+   `JsString { repr: Arc<StringRepr> }` to `JsString { handle:
+   JsStringHandle, cached_len: u32 }` (`Copy`). Options:
+   - Thread `&GcHeap` / `&mut GcHeap` through every call site
+     that needs payload access (`to_lossy_string`, `to_utf16_vec`,
+     `as_latin1`, `concat`, `slice`, …). Most invasive but
+     spec-clean.
+   - Register a thread-local `GcHeap` raw pointer on isolate
+     entry (per the historical `THREAD_STRING_TABLE` pattern):
+     keep call signatures intact, route allocations through the
+     thread-local. Cheaper churn but adds an indirection on
+     every read.
+2. **`Value::Closure { … }` inline variant** → `Value::Closure(JsClosure)`.
+   ~122 pattern-match sites. `JsClosureBody` already lives at
+   `crates/otter-vm/src/closure.rs` (type tag `0x23`). Shrinks
+   the legacy `Value` enum payload and unblocks the final
+   cut-over.
 
-## Final cut-over (after all wrappers migrate)
+## Final cut-over (after JsString + Closure variant migrate)
 
 1. Delete the legacy `pub enum Value` body in
    `crates/otter-vm/src/lib.rs:217-401`.

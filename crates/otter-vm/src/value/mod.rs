@@ -50,9 +50,13 @@ pub mod tag;
 use crate::array::{ArrayBody, JsArray};
 use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
 use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
+use crate::native_function::NativeFunctionBody;
 use crate::object::{JsObject, ObjectBody};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
-use crate::{JsClosure, NumberValue};
+use crate::{
+    BoundFunction, BoundFunctionBody, ClassConstructor, ClassConstructorBody, JsClosure,
+    NativeFunction, NumberValue,
+};
 
 use tag::*;
 
@@ -311,6 +315,27 @@ impl Value {
         Self::from_object_gc(r.raw())
     }
 
+    /// Bound function value (result of `Function.prototype.bind`).
+    #[inline]
+    #[must_use]
+    pub fn bound_function(b: BoundFunction) -> Self {
+        Self::from_function_gc(b.raw())
+    }
+
+    /// Host-implemented callable.
+    #[inline]
+    #[must_use]
+    pub fn native_function(n: NativeFunction) -> Self {
+        Self::from_function_gc(n.raw())
+    }
+
+    /// `class` value — constructor + prototype + statics wrapper.
+    #[inline]
+    #[must_use]
+    pub fn class_constructor(c: ClassConstructor) -> Self {
+        Self::from_function_gc(c.raw())
+    }
+
     /// Recover a closure handle when this value carries one.
     ///
     /// Returns `None` for any other callable family (bytecode
@@ -406,6 +431,39 @@ impl Value {
             return None;
         }
         self.as_raw_gc()?.checked_cast::<FinalizationRegistryBody>()
+    }
+
+    /// Bound function handle.
+    #[inline]
+    #[must_use]
+    pub fn as_bound_function(self) -> Option<BoundFunction> {
+        if top_tag(self.0) != TAG_PTR_FUNCTION {
+            return None;
+        }
+        let gc = self.as_raw_gc()?.checked_cast::<BoundFunctionBody>()?;
+        Some(BoundFunction::from_gc(gc))
+    }
+
+    /// Native function handle.
+    #[inline]
+    #[must_use]
+    pub fn as_native_function(self) -> Option<NativeFunction> {
+        if top_tag(self.0) != TAG_PTR_FUNCTION {
+            return None;
+        }
+        let gc = self.as_raw_gc()?.checked_cast::<NativeFunctionBody>()?;
+        Some(NativeFunction::from_gc(gc))
+    }
+
+    /// Class-constructor handle.
+    #[inline]
+    #[must_use]
+    pub fn as_class_constructor(self) -> Option<ClassConstructor> {
+        if top_tag(self.0) != TAG_PTR_FUNCTION {
+            return None;
+        }
+        let gc = self.as_raw_gc()?.checked_cast::<ClassConstructorBody>()?;
+        Some(ClassConstructor::from_gc(gc))
     }
 
     // -----------------------------------------------------------------------

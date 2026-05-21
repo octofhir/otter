@@ -560,6 +560,16 @@ impl NativeFunction {
         self.inner.raw()
     }
 
+    /// Reinterpret a body handle as the public [`NativeFunction`]
+    /// wrapper. Used by [`crate::value::Value::as_native_function`]
+    /// after a `GcHeader::type_tag` check has confirmed the body is
+    /// a [`NativeFunctionBody`].
+    #[inline]
+    #[must_use]
+    pub fn from_gc(inner: otter_gc::Gc<NativeFunctionBody>) -> Self {
+        Self { inner }
+    }
+
     /// Stable identity token.
     #[must_use]
     pub fn identity_addr(&self) -> *const () {

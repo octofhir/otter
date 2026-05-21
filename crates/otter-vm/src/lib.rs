@@ -573,6 +573,16 @@ impl ClassConstructor {
     pub fn raw(self) -> RawGc {
         self.inner.raw()
     }
+
+    /// Reinterpret a body handle as the public [`ClassConstructor`]
+    /// wrapper. Used by [`crate::value::Value::as_class_constructor`]
+    /// after a `GcHeader::type_tag` check has confirmed the body is
+    /// a [`ClassConstructorBody`].
+    #[inline]
+    #[must_use]
+    pub fn from_gc(inner: otter_gc::Gc<ClassConstructorBody>) -> Self {
+        Self { inner }
+    }
 }
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`IteratorState`].
@@ -1070,6 +1080,16 @@ impl BoundFunction {
     #[must_use]
     pub(crate) fn raw(&self) -> RawGc {
         self.inner.raw()
+    }
+
+    /// Reinterpret a body handle as the public [`BoundFunction`]
+    /// wrapper. Used by [`crate::value::Value::as_bound_function`]
+    /// after a `GcHeader::type_tag` check has confirmed the body is
+    /// a [`BoundFunctionBody`].
+    #[inline]
+    #[must_use]
+    pub fn from_gc(inner: otter_gc::Gc<BoundFunctionBody>) -> Self {
+        Self { inner }
     }
 
     /// Stable identity token.

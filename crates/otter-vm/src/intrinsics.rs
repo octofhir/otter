@@ -682,7 +682,7 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        assert_eq!(result.display_string(), "abcd");
+        assert_eq!(result.display_string(&gc_heap), "abcd");
     }
 
     #[test]

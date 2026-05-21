@@ -553,14 +553,14 @@ fn arg_to_string_primitive(
         Value::Boolean(true) => "true".to_string(),
         Value::Boolean(false) => "false".to_string(),
         Value::Number(n) => n.to_display_string(),
-        Value::BigInt(b) => b.to_decimal_string(),
+        Value::BigInt(b) => b.to_decimal_string(&*args.gc_heap),
         Value::Symbol(_) => {
             return Err(IntrinsicError::BadArgument {
                 index: index as u16,
                 reason: "cannot convert a Symbol to a string",
             });
         }
-        other => other.display_string(),
+        other => other.display_string(&*args.gc_heap),
     };
     Ok(JsString::from_str(&text, args.string_heap)?)
 }
@@ -708,7 +708,7 @@ fn advance_string_index(units: &[u16], index: usize, unicode: bool) -> usize {
 }
 
 fn string_arg_to_jsstring(
-    _ctx: &mut NativeCtx<'_>,
+    ctx: &mut NativeCtx<'_>,
     args: &[Value],
     index: usize,
     method_name: &'static str,
@@ -722,14 +722,14 @@ fn string_arg_to_jsstring(
         Value::Boolean(true) => "true".to_string(),
         Value::Boolean(false) => "false".to_string(),
         Value::Number(n) => n.to_display_string(),
-        Value::BigInt(b) => b.to_decimal_string(),
+        Value::BigInt(b) => b.to_decimal_string(ctx.heap()),
         Value::Symbol(_) => {
             return Err(crate::NativeError::TypeError {
                 name: method_name,
                 reason: "cannot convert a Symbol to a string".to_string(),
             });
         }
-        other => other.display_string(),
+        other => other.display_string(ctx.heap()),
     };
     JsString::from_str(&text, string_heap).map_err(|_| crate::NativeError::TypeError {
         name: method_name,
@@ -1944,9 +1944,18 @@ mod tests {
         match r {
             Value::Array(arr) => {
                 assert_eq!(crate::array::len(arr, &gc_heap), 3);
-                assert_eq!(crate::array::get(arr, &gc_heap, 0).display_string(), "ab");
-                assert_eq!(crate::array::get(arr, &gc_heap, 1).display_string(), "a");
-                assert_eq!(crate::array::get(arr, &gc_heap, 2).display_string(), "b");
+                assert_eq!(
+                    crate::array::get(arr, &gc_heap, 0).display_string(&gc_heap),
+                    "ab"
+                );
+                assert_eq!(
+                    crate::array::get(arr, &gc_heap, 1).display_string(&gc_heap),
+                    "a"
+                );
+                assert_eq!(
+                    crate::array::get(arr, &gc_heap, 2).display_string(&gc_heap),
+                    "b"
+                );
             }
             _ => panic!("expected array"),
         }
@@ -1996,7 +2005,10 @@ mod tests {
         let r1 = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         match (&r1, &re) {
             (Value::Array(arr), Value::RegExp(rx)) => {
-                assert_eq!(crate::array::get(*arr, &gc_heap, 0).display_string(), "a");
+                assert_eq!(
+                    crate::array::get(*arr, &gc_heap, 0).display_string(&gc_heap),
+                    "a"
+                );
                 assert_eq!(rx.last_index(&gc_heap), 1);
             }
             _ => panic!(),
@@ -2025,9 +2037,9 @@ mod tests {
         )
         .unwrap();
         let src = load_property(&re, &gc_heap, "source", &heap);
-        assert_eq!(src.display_string(), "ab+c");
+        assert_eq!(src.display_string(&gc_heap), "ab+c");
         let flags = load_property(&re, &gc_heap, "flags", &heap);
-        assert_eq!(flags.display_string(), "gi");
+        assert_eq!(flags.display_string(&gc_heap), "gi");
         assert_eq!(
             load_property(&re, &gc_heap, "global", &heap),
             Value::Boolean(true)

@@ -277,6 +277,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         otter_bytecode::method_id::StringMethod::Construct,
         std::slice::from_ref(&primitive),
         &string_heap,
+        ctx.heap(),
     )
     .map_err(|err| NativeError::TypeError {
         name: "String",

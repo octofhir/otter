@@ -53,20 +53,20 @@ pub fn install_fs_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
     );
     let caps = ctx.capabilities().clone();
     let write_file_sync = std::sync::Arc::new(
-        move |_ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            write_file_sync(args, &caps)
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            write_file_sync(ctx, args, &caps)
         },
     );
     let caps = ctx.capabilities().clone();
     let exists_sync = std::sync::Arc::new(
-        move |_ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            exists_sync(args, &caps)
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            exists_sync(ctx, args, &caps)
         },
     );
     let caps = ctx.capabilities().clone();
     let mkdir_sync = std::sync::Arc::new(
-        move |_ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            mkdir_sync(args, &caps)
+        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            mkdir_sync(ctx, args, &caps)
         },
     );
 
@@ -86,9 +86,9 @@ fn read_file_sync(
     args: &[Value],
     capabilities: &CapabilitySet,
 ) -> Result<Value, NativeError> {
-    let path = path_arg(args, 0, "fs.readFileSync")?;
+    let path = path_arg(ctx, args, 0, "fs.readFileSync")?;
     require_read(&path, capabilities).map_err(fs_error)?;
-    let encoding = runtime_optional_arg_to_string(args, 1);
+    let encoding = runtime_optional_arg_to_string(args, 1, ctx.heap());
     validate_text_encoding(encoding.as_deref()).map_err(fs_error)?;
     let text = std::fs::read_to_string(&path).map_err(|err| {
         fs_error(FsError::Io {
@@ -99,11 +99,15 @@ fn read_file_sync(
     crate::string_value(ctx, &text)
 }
 
-fn write_file_sync(args: &[Value], capabilities: &CapabilitySet) -> Result<Value, NativeError> {
-    let path = path_arg(args, 0, "fs.writeFileSync")?;
+fn write_file_sync(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    capabilities: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let path = path_arg(ctx, args, 0, "fs.writeFileSync")?;
     require_write(&path, capabilities).map_err(fs_error)?;
-    let data = crate::arg_string(args, 1, "fs.writeFileSync")?;
-    let encoding = runtime_optional_arg_to_string(args, 2);
+    let data = crate::arg_string(args, 1, "fs.writeFileSync", ctx.heap())?;
+    let encoding = runtime_optional_arg_to_string(args, 2, ctx.heap());
     validate_text_encoding(encoding.as_deref()).map_err(fs_error)?;
     std::fs::write(&path, data).map_err(|err| {
         fs_error(FsError::Io {
@@ -114,16 +118,24 @@ fn write_file_sync(args: &[Value], capabilities: &CapabilitySet) -> Result<Value
     Ok(Value::Undefined)
 }
 
-fn exists_sync(args: &[Value], capabilities: &CapabilitySet) -> Result<Value, NativeError> {
-    let path = path_arg(args, 0, "fs.existsSync")?;
+fn exists_sync(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    capabilities: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let path = path_arg(ctx, args, 0, "fs.existsSync")?;
     if !capabilities.read.matches_path(&path) {
         return Ok(Value::Boolean(false));
     }
     Ok(Value::Boolean(path.exists()))
 }
 
-fn mkdir_sync(args: &[Value], capabilities: &CapabilitySet) -> Result<Value, NativeError> {
-    let path = path_arg(args, 0, "fs.mkdirSync")?;
+fn mkdir_sync(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    capabilities: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    let path = path_arg(ctx, args, 0, "fs.mkdirSync")?;
     require_write(&path, capabilities).map_err(fs_error)?;
     std::fs::create_dir(&path).map_err(|err| {
         fs_error(FsError::Io {
@@ -134,8 +146,13 @@ fn mkdir_sync(args: &[Value], capabilities: &CapabilitySet) -> Result<Value, Nat
     Ok(Value::Undefined)
 }
 
-fn path_arg(args: &[Value], index: usize, name: &'static str) -> Result<PathBuf, NativeError> {
-    let path = crate::arg_string(args, index, name)?;
+fn path_arg(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    index: usize,
+    name: &'static str,
+) -> Result<PathBuf, NativeError> {
+    let path = crate::arg_string(args, index, name, ctx.heap())?;
     if path.is_empty() {
         return Err(crate::type_error(name, "path is required"));
     }

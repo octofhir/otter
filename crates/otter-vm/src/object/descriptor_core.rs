@@ -147,6 +147,7 @@ pub(super) fn ordinary_set_symbol_data_property(
 pub(super) fn validate_and_apply_partial(
     existing: &PropertySlot,
     incoming: &PartialPropertyDescriptor,
+    heap: &otter_gc::GcHeap,
 ) -> Option<PropertySlot> {
     let existing_is_data = matches!(existing.body, SlotBody::Data { .. });
     let incoming_is_accessor = incoming.is_accessor();
@@ -177,7 +178,7 @@ pub(super) fn validate_and_apply_partial(
                 return None;
             }
             if let (Some(in_v), SlotBody::Data { value: ex_v }) = (&incoming.value, &existing.body)
-                && !same_value(ex_v, in_v)
+                && !same_value(ex_v, in_v, heap)
             {
                 return None;
             }
@@ -190,10 +191,10 @@ pub(super) fn validate_and_apply_partial(
                 setter: ex_set,
             } = &existing.body
         {
-            if incoming.get.is_some() && !optional_value_eq(ex_get, &incoming.get) {
+            if incoming.get.is_some() && !optional_value_eq(ex_get, &incoming.get, heap) {
                 return None;
             }
-            if incoming.set.is_some() && !optional_value_eq(ex_set, &incoming.set) {
+            if incoming.set.is_some() && !optional_value_eq(ex_set, &incoming.set, heap) {
                 return None;
             }
         }
@@ -259,6 +260,7 @@ pub(super) fn validate_and_apply_partial(
 pub(super) fn validate_and_apply(
     existing: &PropertySlot,
     incoming: &PropertyDescriptor,
+    heap: &otter_gc::GcHeap,
 ) -> Option<PropertySlot> {
     let existing_kind_is_data = matches!(existing.body, SlotBody::Data { .. });
     let incoming_kind_is_data = matches!(incoming.kind, DescriptorKind::Data { .. });
@@ -287,7 +289,7 @@ pub(super) fn validate_and_apply(
                 }
                 if let DescriptorKind::Data { value: incoming_v } = &incoming.kind
                     && let SlotBody::Data { value: existing_v } = &existing.body
-                    && !same_value(existing_v, incoming_v)
+                    && !same_value(existing_v, incoming_v, heap)
                 {
                     return None;
                 }
@@ -302,7 +304,8 @@ pub(super) fn validate_and_apply(
                     getter: ex_get,
                     setter: ex_set,
                 } = &existing.body
-                && (!optional_value_eq(ex_get, in_get) || !optional_value_eq(ex_set, in_set))
+                && (!optional_value_eq(ex_get, in_get, heap)
+                    || !optional_value_eq(ex_set, in_set, heap))
             {
                 return None;
             }
@@ -319,12 +322,13 @@ pub(super) fn validate_and_apply(
 pub(super) fn validate_descriptor_update(
     existing: &PropertyDescriptor,
     incoming: &PropertyDescriptor,
+    heap: &otter_gc::GcHeap,
 ) -> Option<PropertyDescriptor> {
     let existing = PropertySlot::from_descriptor(existing.clone());
-    validate_and_apply(&existing, incoming).map(|slot| slot.to_descriptor())
+    validate_and_apply(&existing, incoming, heap).map(|slot| slot.to_descriptor())
 }
 
-fn optional_value_eq(a: &Option<Value>, b: &Option<Value>) -> bool {
+fn optional_value_eq(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc::GcHeap) -> bool {
     // §10.1.6.3 — a missing accessor side (`[[Get]]` / `[[Set]]`) is
     // spec-defined to be `undefined`, so a stored `None` slot
     // compares SameValue-equal to an incoming explicit
@@ -332,10 +336,10 @@ fn optional_value_eq(a: &Option<Value>, b: &Option<Value>) -> bool {
     match (a, b) {
         (None, None) => true,
         (None, Some(v)) | (Some(v), None) => matches!(v, Value::Undefined),
-        (Some(x), Some(y)) => same_value(x, y),
+        (Some(x), Some(y)) => same_value(x, y, heap),
     }
 }
 
-fn same_value(a: &Value, b: &Value) -> bool {
-    crate::abstract_ops::same_value(a, b)
+fn same_value(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
+    crate::abstract_ops::same_value(a, b, heap)
 }

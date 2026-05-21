@@ -123,9 +123,11 @@ fn parse_instant_arg(
     }
 }
 
-/// Property reads on a `Temporal.Instant` receiver.
-#[must_use]
-pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+/// Property reads on a `Temporal.Instant` receiver. The
+/// `epochNanoseconds` accessor allocates a BigInt body and so takes
+/// `&mut GcHeap`; the `epochMilliseconds` arm is heap-free but
+/// shares the signature for uniform dispatch.
+pub fn load_property(temporal: &JsTemporal, gc_heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     let inst = match temporal.payload_clone(gc_heap) {
         TemporalPayload::Instant(v) => v,
         _ => return Value::Undefined,
@@ -135,8 +137,16 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &s
             Value::Number(NumberValue::from_f64(inst.epoch_milliseconds() as f64))
         }
         "epochNanoseconds" => {
-            // Per spec returns a BigInt.
-            Value::BigInt(crate::bigint::BigIntValue::from_i128(inst.as_i128()))
+            // Per spec returns a BigInt. On allocation failure the
+            // accessor returns `undefined` — the caller has no error
+            // channel; this matches the spec's "throws abrupt" only
+            // when the GC cap is hit, which `RangeError` would
+            // normally surface but the property-load path can't
+            // propagate that here without a wider API change.
+            match crate::bigint::BigIntValue::from_i128(gc_heap, inst.as_i128()) {
+                Ok(handle) => Value::BigInt(handle),
+                Err(_) => Value::Undefined,
+            }
         }
         _ => Value::Undefined,
     }

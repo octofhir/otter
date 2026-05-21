@@ -57,9 +57,7 @@ pub fn resolve(
     }
 }
 
-fn require_date_time(
-    args: &IntrinsicArgs<'_>,
-) -> Result<DateTimeFormatPayload, IntrinsicError> {
+fn require_date_time(args: &IntrinsicArgs<'_>) -> Result<DateTimeFormatPayload, IntrinsicError> {
     match args.receiver {
         Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::DateTimeFormat(d) => Ok(d),

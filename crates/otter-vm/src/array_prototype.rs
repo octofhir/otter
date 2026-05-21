@@ -634,7 +634,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => ",".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
-        Some(other) => other.display_string(),
+        Some(other) => other.display_string(args.gc_heap),
     };
     if let Value::Array(arr) = args.receiver {
         let parts: Vec<String> = array::with_elements(*arr, heap, |elements| {
@@ -642,7 +642,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 .iter()
                 .map(|v| match v {
                     Value::Undefined | Value::Null | Value::Hole => String::new(),
-                    other => other.display_string(),
+                    other => other.display_string(args.gc_heap),
                 })
                 .collect()
         });
@@ -671,7 +671,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
             parts[i] = match v {
                 Value::Undefined | Value::Null | Value::Hole => String::new(),
-                other => other.display_string(),
+                other => other.display_string(args.gc_heap),
             };
         }
         let joined = parts.join(&separator);
@@ -698,7 +698,7 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
         let found = array::with_elements(*arr, heap, |elements| {
             elements.iter().any(|v| match v {
                 Value::Hole => needle_is_undefined,
-                other => crate::abstract_ops::same_value_zero(other, &needle),
+                other => crate::abstract_ops::same_value_zero(other, &needle, heap),
             })
         });
         return Ok(Value::Boolean(found));
@@ -707,7 +707,7 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
         .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
     let found = entries
         .iter()
-        .any(|(_, v)| crate::abstract_ops::same_value_zero(v, &needle));
+        .any(|(_, v)| crate::abstract_ops::same_value_zero(v, &needle, heap));
     Ok(Value::Boolean(found))
 }
 
@@ -1178,21 +1178,38 @@ fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = receiver_array(args)?;
     if let Some(Value::Undefined) | None = args.args.first() {
-        let heap = &mut *args.gc_heap;
         // §23.1.3.30.2 SortCompare (no comparator) — undefined values
         // sort to the end; remaining values compare by their
-        // ToString result.
+        // ToString result. Render every element's decimal once
+        // outside the mut-borrow before driving the sort so the
+        // comparator stays heap-free.
+        let keys: Vec<Option<String>> = array::with_elements(arr, &*args.gc_heap, |elements| {
+            elements
+                .iter()
+                .map(|v| match v {
+                    Value::Undefined => None,
+                    other => Some(other.display_string(&*args.gc_heap)),
+                })
+                .collect()
+        });
+        let heap = &mut *args.gc_heap;
         array::with_elements_mut(arr, heap, |elements| {
-            elements.sort_by(|a, b| {
-                let a_undef = matches!(a, Value::Undefined);
-                let b_undef = matches!(b, Value::Undefined);
-                match (a_undef, b_undef) {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => a.display_string().cmp(&b.display_string()),
+            // Pair each element with its precomputed key for the
+            // comparator, then sort in place.
+            let mut indexed: Vec<(usize, Value)> = elements.iter().cloned().enumerate().collect();
+            indexed.sort_by(|(ia, _), (ib, _)| {
+                let a_key = keys.get(*ia).and_then(|k| k.as_ref());
+                let b_key = keys.get(*ib).and_then(|k| k.as_ref());
+                match (a_key, b_key) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (Some(a), Some(b)) => a.cmp(b),
                 }
-            })
+            });
+            for (slot, (_, v)) in elements.iter_mut().zip(indexed) {
+                *slot = v;
+            }
         });
         Ok(Value::Array(arr))
     } else {
@@ -1552,7 +1569,9 @@ fn impl_to_sorted(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
             (true, true) => std::cmp::Ordering::Equal,
             (true, false) => std::cmp::Ordering::Greater,
             (false, true) => std::cmp::Ordering::Less,
-            (false, false) => a.display_string().cmp(&b.display_string()),
+            (false, false) => a
+                .display_string(args.gc_heap)
+                .cmp(&b.display_string(args.gc_heap)),
         }
     });
     Ok(Value::Array(args.array_from_elements_rooted(
@@ -1960,23 +1979,23 @@ fn array_callback_native_dispatch(
         match name {
             "forEach" => {}
             "map" => out.push((idx, result)),
-            "filter" if result.to_boolean() => {
+            "filter" if result.to_boolean(interp.gc_heap()) => {
                 out.push((idx, v));
             }
-            "find" | "findLast" if result.to_boolean() => {
+            "find" | "findLast" if result.to_boolean(interp.gc_heap()) => {
                 found_val = v.clone();
                 found_idx = Some(idx);
                 break;
             }
-            "findIndex" | "findLastIndex" if result.to_boolean() => {
+            "findIndex" | "findLastIndex" if result.to_boolean(interp.gc_heap()) => {
                 found_idx = Some(idx);
                 break;
             }
-            "every" if !result.to_boolean() => {
+            "every" if !result.to_boolean(interp.gc_heap()) => {
                 bool_acc = false;
                 break;
             }
-            "some" if result.to_boolean() => {
+            "some" if result.to_boolean(interp.gc_heap()) => {
                 bool_acc = true;
                 break;
             }
@@ -2148,11 +2167,11 @@ mod tests {
             Value::Array(arr) => crate::array::with_elements(*arr, gc_heap, |elements| {
                 elements
                     .iter()
-                    .map(Value::display_string)
+                    .map(|v| v.display_string(gc_heap))
                     .collect::<Vec<_>>()
                     .join(",")
             }),
-            other => other.display_string(),
+            other => other.display_string(gc_heap),
         }
     }
 
@@ -2166,7 +2185,7 @@ mod tests {
             &[Value::Number(NumberValue::from_i32(3))],
             &mut gc_heap,
         );
-        assert_eq!(r.display_string(), "3");
+        assert_eq!(r.display_string(&gc_heap), "3");
         assert_eq!(render(&arr, &gc_heap), "1,2,3");
     }
 
@@ -2175,7 +2194,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let arr = make_arr(&mut gc_heap, &[1, 2, 3]);
         let r = call("pop", arr.clone(), &[], &mut gc_heap);
-        assert_eq!(r.display_string(), "3");
+        assert_eq!(r.display_string(&gc_heap), "3");
         assert_eq!(render(&arr, &gc_heap), "1,2");
     }
 
@@ -2184,7 +2203,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let arr = make_arr(&mut gc_heap, &[10, 20, 30]);
         let r = call("shift", arr.clone(), &[], &mut gc_heap);
-        assert_eq!(r.display_string(), "10");
+        assert_eq!(r.display_string(&gc_heap), "10");
         assert_eq!(render(&arr, &gc_heap), "20,30");
     }
 
@@ -2223,7 +2242,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let arr = make_arr(&mut gc_heap, &[1, 2, 3]);
         let r = call("join", arr, &[], &mut gc_heap);
-        assert_eq!(r.display_string(), "1,2,3");
+        assert_eq!(r.display_string(&gc_heap), "1,2,3");
     }
 
     #[test]
@@ -2250,6 +2269,6 @@ mod tests {
             &[Value::Number(NumberValue::from_i32(30))],
             &mut gc_heap,
         );
-        assert_eq!(idx.display_string(), "2");
+        assert_eq!(idx.display_string(&gc_heap), "2");
     }
 }

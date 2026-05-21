@@ -243,7 +243,7 @@ fn coerce_json_parse_args(
                 });
             }
             ref primitive if crate::abstract_ops::is_primitive(primitive) => {
-                let text = primitive.display_string();
+                let text = primitive.display_string(ctx.heap());
                 JsString::from_str(&text, &string_heap).map_err(|_| NativeError::TypeError {
                     name: "parse",
                     reason: "out of memory".to_string(),
@@ -274,7 +274,7 @@ fn coerce_json_parse_args(
                         });
                     }
                     other => {
-                        let text = other.display_string();
+                        let text = other.display_string(ctx.heap());
                         JsString::from_str(&text, &string_heap).map_err(|_| {
                             NativeError::TypeError {
                                 name: "parse",
@@ -395,24 +395,26 @@ mod tests {
 
     #[test]
     fn stringify_primitives() {
-        let heap = make_heap();
-        assert_eq!(stringify(&Value::Null, &heap).unwrap().unwrap(), "null");
+        let mut heap = make_heap();
+        assert_eq!(stringify(&Value::Null, &mut heap).unwrap().unwrap(), "null");
         assert_eq!(
-            stringify(&Value::Boolean(true), &heap).unwrap().unwrap(),
+            stringify(&Value::Boolean(true), &mut heap)
+                .unwrap()
+                .unwrap(),
             "true"
         );
-        assert_eq!(stringify(&n(42), &heap).unwrap().unwrap(), "42");
+        assert_eq!(stringify(&n(42), &mut heap).unwrap().unwrap(), "42");
         // Undefined → omitted (returns None).
-        assert!(stringify(&Value::Undefined, &heap).unwrap().is_none());
+        assert!(stringify(&Value::Undefined, &mut heap).unwrap().is_none());
     }
 
     #[test]
     fn stringify_nan_and_infinity_become_null() {
-        let heap = make_heap();
+        let mut heap = make_heap();
         let nan = Value::Number(NumberValue::Double(f64::NAN));
         let inf = Value::Number(NumberValue::Double(f64::INFINITY));
-        assert_eq!(stringify(&nan, &heap).unwrap().unwrap(), "null");
-        assert_eq!(stringify(&inf, &heap).unwrap().unwrap(), "null");
+        assert_eq!(stringify(&nan, &mut heap).unwrap().unwrap(), "null");
+        assert_eq!(stringify(&inf, &mut heap).unwrap().unwrap(), "null");
     }
 
     #[test]
@@ -421,15 +423,19 @@ mod tests {
         let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         crate::object::set(obj, &mut heap, "b", n(1));
         crate::object::set(obj, &mut heap, "a", n(2));
-        let s = stringify(&Value::Object(obj), &heap).unwrap().unwrap();
+        let s = stringify(&Value::Object(obj), &mut heap).unwrap().unwrap();
         assert_eq!(s, "{\"b\":1,\"a\":2}");
     }
 
     #[test]
     fn stringify_rejects_bigint() {
-        let heap = make_heap();
-        let bi = Value::BigInt(crate::bigint::BigIntValue::from_decimal("1").unwrap());
-        assert!(matches!(stringify(&bi, &heap), Err(JsonError::BigInt)));
+        let mut heap = make_heap();
+        let bi = Value::BigInt(
+            crate::bigint::BigIntValue::from_decimal(&mut heap, "1")
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(matches!(stringify(&bi, &mut heap), Err(JsonError::BigInt)));
     }
 
     #[test]
@@ -438,7 +444,7 @@ mod tests {
         let sheap = StringHeap::default();
         let parsed = parse("[1,2,3,4]", &sheap, &mut heap).unwrap();
         // Re-stringify should reproduce the input verbatim.
-        let s = stringify(&parsed, &heap).unwrap().unwrap();
+        let s = stringify(&parsed, &mut heap).unwrap().unwrap();
         assert_eq!(s, "[1,2,3,4]");
     }
 
@@ -452,7 +458,7 @@ mod tests {
         // Mutating the array invalidates source_bytes; stringify must
         // still produce a correct (though re-rendered) result.
         crate::array::set(arr, &mut heap, 0, Value::Number(NumberValue::from_i32(99))).unwrap();
-        let s = stringify(&Value::Array(arr), &heap).unwrap().unwrap();
+        let s = stringify(&Value::Array(arr), &mut heap).unwrap().unwrap();
         assert_eq!(s, "[99,2,3]");
     }
 
@@ -462,7 +468,7 @@ mod tests {
         let sheap = StringHeap::default();
         let parsed = parse("[1,2,3]", &sheap, &mut heap).unwrap();
         let opts = StringifyOptions::from_space(&Value::Number(NumberValue::from_i32(2))).unwrap();
-        let s = stringify_with_options(&parsed, &opts, &heap)
+        let s = stringify_with_options(&parsed, &opts, &mut heap)
             .unwrap()
             .unwrap();
         // Pretty output must reflect the indent setting, proving we
@@ -478,7 +484,7 @@ mod tests {
         if let Value::Object(o) = v {
             if let Some(Value::Array(arr)) = crate::object::get(o, &heap, "x") {
                 assert_eq!(crate::array::len(arr, &heap), 3);
-                assert_eq!(crate::array::get(arr, &heap, 1).display_string(), "2");
+                assert_eq!(crate::array::get(arr, &heap, 1).display_string(&heap), "2");
             } else {
                 panic!("expected x: array");
             }
@@ -494,7 +500,7 @@ mod tests {
         let mut heap = make_heap();
         let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         crate::object::set(obj, &mut heap, "self", Value::Object(obj));
-        let err = stringify(&Value::Object(obj), &heap).unwrap_err();
+        let err = stringify(&Value::Object(obj), &mut heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
         assert_eq!(
             err.to_string(),
@@ -502,8 +508,12 @@ mod tests {
         );
 
         // BigInt.
-        let bi = Value::BigInt(crate::bigint::BigIntValue::from_decimal("1").unwrap());
-        let err = stringify(&bi, &heap).unwrap_err();
+        let bi = Value::BigInt(
+            crate::bigint::BigIntValue::from_decimal(&mut heap, "1")
+                .unwrap()
+                .unwrap(),
+        );
+        let err = stringify(&bi, &mut heap).unwrap_err();
         assert_eq!(
             err.to_string(),
             "JSON.stringify cannot serialize BigInt values.",

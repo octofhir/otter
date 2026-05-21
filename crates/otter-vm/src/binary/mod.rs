@@ -88,10 +88,10 @@ pub fn to_index(value: &Value) -> Option<u64> {
 /// `undefined` argument falls back to `false` (big-endian, the spec
 /// default). Truthiness on the value follows §7.1.2 `ToBoolean`.
 #[must_use]
-pub fn to_little_endian_flag(value: Option<&Value>) -> bool {
+pub fn to_little_endian_flag(value: Option<&Value>, heap: &otter_gc::GcHeap) -> bool {
     match value {
         None | Some(Value::Undefined) => false,
-        Some(v) => v.to_boolean(),
+        Some(v) => v.to_boolean(heap),
     }
 }
 

@@ -69,11 +69,14 @@ pub(crate) fn to_number_primitive(value: &Value) -> Result<NumberValue, VmError>
     Ok(number)
 }
 
-pub(crate) fn to_string_primitive(value: &Value) -> Result<String, VmError> {
+pub(crate) fn to_string_primitive(
+    value: &Value,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<String, VmError> {
     match value {
         Value::String(s) => Ok(s.to_lossy_string()),
         Value::Number(n) => Ok(n.to_display_string()),
-        Value::BigInt(b) => Ok(b.to_decimal_string()),
+        Value::BigInt(b) => Ok(b.to_decimal_string(gc_heap)),
         Value::Boolean(true) => Ok("true".to_string()),
         Value::Boolean(false) => Ok("false".to_string()),
         Value::Null => Ok("null".to_string()),
@@ -85,34 +88,37 @@ pub(crate) fn to_string_primitive(value: &Value) -> Result<String, VmError> {
 
 pub(crate) fn to_js_string_primitive(
     value: &Value,
-    heap: &StringHeap,
+    string_heap: &StringHeap,
 ) -> Result<JsString, VmError> {
     match value {
         Value::String(s) => Ok(s.clone()),
-        Value::Number(n) => {
-            number::ecma::number_to_string(n.as_f64(), heap).map_err(|_| VmError::TypeMismatch)
-        }
-        _ => JsString::from_str(&to_string_primitive(value)?, heap)
+        Value::Number(n) => number::ecma::number_to_string(n.as_f64(), string_heap)
             .map_err(|_| VmError::TypeMismatch),
+        // BigInt arm cannot fire here without a GcHeap; the caller is
+        // expected to coerce BigInt through
+        // `to_string_primitive(..., heap)` upstream of this helper.
+        _ => Err(VmError::TypeMismatch),
     }
 }
 
 pub(crate) fn string_constructor_js_string(
     value: Option<&Value>,
-    heap: &StringHeap,
+    string_heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
     match value {
-        Some(Value::Symbol(s)) => {
-            JsString::from_str(&s.descriptive_string(), heap).map_err(|_| VmError::TypeMismatch)
-        }
-        Some(value) => match to_js_string_primitive(value, heap) {
+        Some(Value::Symbol(s)) => JsString::from_str(&s.descriptive_string(), string_heap)
+            .map_err(|_| VmError::TypeMismatch),
+        Some(value) => match to_js_string_primitive(value, string_heap) {
             Ok(value) => Ok(value),
             Err(VmError::TypeMismatch) => {
-                JsString::from_str(&value.display_string(), heap).map_err(|_| VmError::TypeMismatch)
+                let rendered = to_string_primitive(value, gc_heap)
+                    .unwrap_or_else(|_| value.display_string(gc_heap));
+                JsString::from_str(&rendered, string_heap).map_err(|_| VmError::TypeMismatch)
             }
             Err(err) => Err(err),
         },
-        None => JsString::empty(heap).map_err(|_| VmError::TypeMismatch),
+        None => JsString::empty(string_heap).map_err(|_| VmError::TypeMismatch),
     }
 }
 

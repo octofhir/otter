@@ -310,7 +310,7 @@ pub(crate) fn render_error_to_string_spec(
             }),
             Value::String(s) => Ok(s.to_lossy_string()),
             Value::Null | Value::Boolean(_) | Value::Number(_) | Value::BigInt(_) => {
-                Ok(value.display_string())
+                Ok(value.display_string(interp.gc_heap()))
             }
             _ => {
                 let primitive = interp.evaluate_to_primitive(
@@ -323,7 +323,7 @@ pub(crate) fn render_error_to_string_spec(
                         message: format!("Cannot convert a Symbol value to a string ('{key}')"),
                     }),
                     Value::String(s) => Ok(s.to_lossy_string()),
-                    other => Ok(other.display_string()),
+                    other => Ok(other.display_string(interp.gc_heap())),
                 }
             }
         }
@@ -345,7 +345,7 @@ pub(crate) fn render_error_to_string_spec(
 /// [`render_error_to_string_spec`].
 pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
     let Value::Object(obj) = value else {
-        return value.display_string();
+        return value.display_string(gc_heap);
     };
     // §20.5.3.4 defaults: `name` falls back to `"Error"` when
     // missing / `undefined`; `message` falls back to the empty
@@ -356,12 +356,12 @@ pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> Stri
     let name = match crate::object::get(*obj, gc_heap, "name") {
         Some(Value::Undefined) | None => "Error".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
-        Some(other) => other.display_string(),
+        Some(other) => other.display_string(gc_heap),
     };
     let message = match crate::object::get(*obj, gc_heap, "message") {
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(Value::Undefined) | None => String::new(),
-        Some(other) => other.display_string(),
+        Some(other) => other.display_string(gc_heap),
     };
     match (name.is_empty(), message.is_empty()) {
         (true, true) => String::new(),
@@ -575,7 +575,7 @@ impl ErrorClassRegistry {
                         reason: "Cannot convert a Symbol value to a string".to_string(),
                     });
                 }
-                Some(v) => Some(v.display_string()),
+                Some(v) => Some(v.display_string(ctx.heap())),
             };
             // §20.5.6.1.1 step 4 — install cause from
             // `options[1]` (or `options[2]` for AggregateError).
@@ -671,7 +671,7 @@ impl ErrorClassRegistry {
                         reason: "Cannot convert a Symbol value to a string".to_string(),
                     });
                 }
-                Some(v) => Some(v.display_string()),
+                Some(v) => Some(v.display_string(c.heap())),
             };
             let errors_arg = a.first().cloned().unwrap_or(Value::Undefined);
             let cause = read_options_cause(a.get(2), c.heap());

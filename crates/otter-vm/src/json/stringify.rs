@@ -103,7 +103,10 @@ impl StringifyOptions {
 }
 
 /// Convenience entry: serialises with no indent.
-pub fn stringify(value: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Option<String>, JsonError> {
+pub fn stringify(
+    value: &Value,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Option<String>, JsonError> {
     stringify_with_options(value, &StringifyOptions::default(), gc_heap)
 }
 
@@ -112,7 +115,7 @@ pub fn stringify(value: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Option<Str
 pub fn stringify_with_options(
     value: &Value,
     options: &StringifyOptions,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Option<String>, JsonError> {
     if !is_serialisable(value) {
         return Ok(None);
@@ -181,7 +184,7 @@ fn drive(
     stack: &mut Vec<Frame>,
     visit: &mut VisitSet,
     options: &StringifyOptions,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<(), JsonError> {
     loop {
         let depth = stack.len();
@@ -273,7 +276,7 @@ fn emit_value(
     stack: &mut Vec<Frame>,
     visit: &mut VisitSet,
     options: &StringifyOptions,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<(), JsonError> {
     match value {
         Value::Null => out.push_str("null"),
@@ -402,7 +405,7 @@ fn emit_value(
                 if i > 0 {
                     out.push(',');
                 }
-                let value = ta.get(i);
+                let value = ta.get(gc_heap, i)?;
                 emit_value(&value, out, stack, visit, options, gc_heap)?;
             }
             out.push(']');
@@ -533,7 +536,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         crate::object::set(obj, &mut heap, "self", Value::Object(obj));
-        let err = stringify(&Value::Object(obj), &heap).unwrap_err();
+        let err = stringify(&Value::Object(obj), &mut heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
     }
 }

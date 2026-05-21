@@ -165,10 +165,10 @@ fn request_constructor_native(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let input = crate::arg_string(args, 0);
-    let method = runtime_optional_arg_to_string(args, 1);
-    let body =
-        runtime_optional_arg_to_string(args, 2).map(|value| Blob::new(value.into_bytes(), ""));
+    let input = crate::arg_string(args, 0, ctx.heap());
+    let method = runtime_optional_arg_to_string(args, 1, ctx.heap());
+    let body = runtime_optional_arg_to_string(args, 2, ctx.heap())
+        .map(|value| Blob::new(value.into_bytes(), ""));
     let request = Request::new(&input, method.as_deref(), body)
         .map_err(|err| crate::type_error("Request", err.to_string()))?;
     request_object(ctx, request)
@@ -206,13 +206,13 @@ fn response_constructor_native(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let body =
-        runtime_optional_arg_to_string(args, 0).map(|value| Blob::new(value.into_bytes(), ""));
+    let body = runtime_optional_arg_to_string(args, 0, ctx.heap())
+        .map(|value| Blob::new(value.into_bytes(), ""));
     let status = match args.get(1) {
         Some(Value::Number(value)) => value.as_f64() as u16,
         _ => 200,
     };
-    let status_text = crate::arg_string(args, 2);
+    let status_text = crate::arg_string(args, 2, ctx.heap());
     let response = Response::new(status, status_text, body)
         .map_err(|err| crate::type_error("Response", err.to_string()))?;
     response_object(ctx, response)
@@ -223,7 +223,7 @@ fn response_clone_native(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, 
 }
 
 fn response_json_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let body = crate::arg_string(args, 0);
+    let body = crate::arg_string(args, 0, ctx.heap());
     let response = Response::new(
         200,
         "OK",

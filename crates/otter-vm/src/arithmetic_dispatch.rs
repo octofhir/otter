@@ -15,6 +15,10 @@
 //! - Inputs are already compiler-lowered through the required ToPrimitive
 //!   opcodes before reaching these helpers.
 //! - Mixed Number/BigInt arithmetic is rejected with `TypeMismatch`.
+//! - BigInt ops here operate on owned [`num_bigint::BigInt`] values
+//!   (already cloned out of the GC body by
+//!   [`abstract_ops::to_numeric_kind`]); the result is folded back
+//!   into a fresh [`bigint::BigIntValue`] handle at the call site.
 //!
 //! # See also
 //! - [`crate::number`]
@@ -24,17 +28,24 @@ use otter_bytecode::Op;
 
 use crate::{
     Frame, Interpreter, JsString, NumberValue, Value, VmError, abstract_ops, bigint, conversion,
-    number, read_register, write_register,
+    number, oom_to_vm, read_register, write_register,
 };
 
-type BigIntBinop = fn(
-    &bigint::BigIntValue,
-    &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError>;
+/// Signature of every BigInt binary op routed through this module.
+///
+/// Operates on borrowed [`num_bigint::BigInt`] payloads (extracted
+/// from the GC body by the caller via
+/// [`bigint::BigIntValue::clone_inner`] inside
+/// [`abstract_ops::to_numeric_kind`]). Returns an owned `BigInt`;
+/// the caller wraps it through [`bigint::BigIntValue::from_inner`].
+pub(crate) type BigIntBinop = fn(
+    &num_bigint::BigInt,
+    &num_bigint::BigInt,
+) -> Result<num_bigint::BigInt, bigint::ops::OpError>;
 
 impl Interpreter {
     pub(crate) fn run_numeric_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         lhs: u16,
@@ -43,11 +54,11 @@ impl Interpreter {
         bigint_op: BigIntBinop,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        run_numeric_values(frame, dst, lhs, rhs, op, bigint_op)
+        run_numeric_values(&mut self.gc_heap, frame, dst, lhs, rhs, op, bigint_op)
     }
 
     pub(crate) fn run_add_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         lhs: u16,
@@ -58,7 +69,7 @@ impl Interpreter {
     }
 
     fn run_add_values(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         lhs: Value,
@@ -74,14 +85,19 @@ impl Interpreter {
             let r_str = conversion::to_js_string_primitive(&rhs, &self.string_heap)?;
             Value::String(JsString::concat(&l_str, &r_str, &self.string_heap)?)
         } else {
-            let lk = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
-            let rk = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
+            let lk =
+                abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
+            let rk =
+                abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
             match (lk, rk) {
                 (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
                     Value::Number(number::add(a, b))
                 }
                 (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-                    Value::BigInt(bigint::ops::add(&a, &b))
+                    let sum = bigint::ops::add(&a, &b);
+                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
+                        .map_err(oom_to_vm)?;
+                    Value::BigInt(handle)
                 }
                 // §6.1.6.2 Numeric Type Conversion forbids mixing
                 // Number and BigInt operands without an explicit
@@ -106,7 +122,7 @@ impl Interpreter {
         op: Op,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        run_compare_values(frame, dst, lhs, rhs, op)
+        run_compare_values(&self.gc_heap, frame, dst, lhs, rhs, op)
     }
 
     pub(crate) fn run_ushr_regs(
@@ -117,8 +133,8 @@ impl Interpreter {
         rhs: u16,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        let lk = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
-        let rk = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
+        let lk = abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
+        let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
         let result = match (lk, rk) {
             (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
                 Value::Number(number::shr_logical(a, b))
@@ -131,32 +147,44 @@ impl Interpreter {
     }
 
     pub(crate) fn run_neg_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
         let v = read_register(frame, src)?.clone();
-        let value = match abstract_ops::to_numeric_kind(&v).ok_or(VmError::TypeMismatch)? {
-            abstract_ops::NumericKind::Num(n) => Value::Number(number::neg(n)),
-            abstract_ops::NumericKind::Big(b) => Value::BigInt(bigint::ops::neg(&b)),
-        };
+        let value =
+            match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+                abstract_ops::NumericKind::Num(n) => Value::Number(number::neg(n)),
+                abstract_ops::NumericKind::Big(b) => {
+                    let neg = bigint::ops::neg(&b);
+                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, neg)
+                        .map_err(oom_to_vm)?;
+                    Value::BigInt(handle)
+                }
+            };
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())
     }
 
     pub(crate) fn run_bitwise_not_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
         let v = read_register(frame, src)?.clone();
-        let value = match abstract_ops::to_numeric_kind(&v).ok_or(VmError::TypeMismatch)? {
-            abstract_ops::NumericKind::Num(n) => Value::Number(number::bitwise_not(n)),
-            abstract_ops::NumericKind::Big(b) => Value::BigInt(bigint::ops::bitwise_not(&b)),
-        };
+        let value =
+            match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
+                abstract_ops::NumericKind::Num(n) => Value::Number(number::bitwise_not(n)),
+                abstract_ops::NumericKind::Big(b) => {
+                    let notted = bigint::ops::bitwise_not(&b);
+                    let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, notted)
+                        .map_err(oom_to_vm)?;
+                    Value::BigInt(handle)
+                }
+            };
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())
@@ -171,7 +199,12 @@ impl Interpreter {
         negate: bool,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        let eq = lhs == rhs;
+        // §7.2.12 `IsStrictlyEqual`: the `Value::PartialEq` impl
+        // matches the spec for every primitive except BigInt-BigInt
+        // (which uses handle equality there), so route through
+        // `abstract_ops::same_value` for the spec-correct numeric
+        // BigInt comparison.
+        let eq = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::Boolean(eq ^ negate))?;
         frame.pc += 1;
         Ok(())
@@ -205,12 +238,12 @@ impl Interpreter {
         y: &Value,
     ) -> Result<bool, VmError> {
         if abstract_ops::is_primitive(x) && abstract_ops::is_primitive(y) {
-            return Ok(abstract_ops::is_loosely_equal(x, y));
+            return Ok(abstract_ops::is_loosely_equal(x, y, &self.gc_heap));
         }
         // Two non-primitive operands compare via IsStrictlyEqual,
         // which for objects is reference identity.
         if !abstract_ops::is_primitive(x) && !abstract_ops::is_primitive(y) {
-            return Ok(abstract_ops::same_value(x, y));
+            return Ok(abstract_ops::same_value(x, y, &self.gc_heap));
         }
         // §7.2.13 step 11-12 — Object × primitive: ToPrimitive the
         // object operand with the `default` hint, then recurse over
@@ -224,7 +257,11 @@ impl Interpreter {
                 self.evaluate_to_primitive(context, y, abstract_ops::ToPrimitiveHint::Default)?;
             (x.clone(), coerced)
         };
-        Ok(abstract_ops::is_loosely_equal(&lhs_p, &rhs_p))
+        Ok(abstract_ops::is_loosely_equal(
+            &lhs_p,
+            &rhs_p,
+            &self.gc_heap,
+        ))
     }
 
     pub(crate) fn run_same_value_regs(
@@ -235,7 +272,7 @@ impl Interpreter {
         rhs: u16,
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
-        let result = abstract_ops::same_value(&lhs, &rhs);
+        let result = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::Boolean(result))?;
         frame.pc += 1;
         Ok(())
@@ -254,6 +291,7 @@ fn binop_values(
 }
 
 fn run_numeric_values(
+    heap: &mut otter_gc::GcHeap,
     frame: &mut Frame,
     dst: u16,
     lhs: Value,
@@ -261,14 +299,16 @@ fn run_numeric_values(
     op: fn(NumberValue, NumberValue) -> NumberValue,
     bigint_op: BigIntBinop,
 ) -> Result<(), VmError> {
-    let lnum = abstract_ops::to_numeric_kind(&lhs).ok_or(VmError::TypeMismatch)?;
-    let rnum = abstract_ops::to_numeric_kind(&rhs).ok_or(VmError::TypeMismatch)?;
+    let lnum = abstract_ops::to_numeric_kind(&lhs, heap).ok_or(VmError::TypeMismatch)?;
+    let rnum = abstract_ops::to_numeric_kind(&rhs, heap).ok_or(VmError::TypeMismatch)?;
     let result = match (lnum, rnum) {
         (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
             Value::Number(op(a, b))
         }
         (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
-            Value::BigInt(bigint_op(&a, &b).map_err(bigint_to_vm_error)?)
+            let folded = bigint_op(&a, &b).map_err(bigint_to_vm_error)?;
+            let handle = bigint::BigIntValue::from_inner(heap, folded).map_err(oom_to_vm)?;
+            Value::BigInt(handle)
         }
         _ => return Err(VmError::TypeMismatch),
     };
@@ -278,6 +318,7 @@ fn run_numeric_values(
 }
 
 fn run_compare_values(
+    heap: &otter_gc::GcHeap,
     frame: &mut Frame,
     dst: u16,
     lhs: Value,
@@ -292,19 +333,19 @@ fn run_compare_values(
     }
     let truthy = match op {
         Op::LessThan => matches!(
-            abstract_ops::abstract_relational_comparison(&lhs, &rhs),
+            abstract_ops::abstract_relational_comparison(&lhs, &rhs, heap),
             abstract_ops::RelationalOutcome::LessThan
         ),
         Op::GreaterThan => matches!(
-            abstract_ops::abstract_relational_comparison(&rhs, &lhs),
+            abstract_ops::abstract_relational_comparison(&rhs, &lhs, heap),
             abstract_ops::RelationalOutcome::LessThan
         ),
         Op::LessEq => matches!(
-            abstract_ops::abstract_relational_comparison(&rhs, &lhs),
+            abstract_ops::abstract_relational_comparison(&rhs, &lhs, heap),
             abstract_ops::RelationalOutcome::NotLessThan
         ),
         Op::GreaterEq => matches!(
-            abstract_ops::abstract_relational_comparison(&lhs, &rhs),
+            abstract_ops::abstract_relational_comparison(&lhs, &rhs, heap),
             abstract_ops::RelationalOutcome::NotLessThan
         ),
         _ => unreachable!("run_compare_values called with non-relational op"),
@@ -315,37 +356,37 @@ fn run_compare_values(
 }
 
 pub(crate) fn bigint_sub_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    a: &num_bigint::BigInt,
+    b: &num_bigint::BigInt,
+) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
     Ok(bigint::ops::sub(a, b))
 }
 
 pub(crate) fn bigint_mul_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    a: &num_bigint::BigInt,
+    b: &num_bigint::BigInt,
+) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
     Ok(bigint::ops::mul(a, b))
 }
 
 pub(crate) fn bigint_and_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    a: &num_bigint::BigInt,
+    b: &num_bigint::BigInt,
+) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
     Ok(bigint::ops::bitwise_and(a, b))
 }
 
 pub(crate) fn bigint_or_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    a: &num_bigint::BigInt,
+    b: &num_bigint::BigInt,
+) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
     Ok(bigint::ops::bitwise_or(a, b))
 }
 
 pub(crate) fn bigint_xor_op(
-    a: &bigint::BigIntValue,
-    b: &bigint::BigIntValue,
-) -> Result<bigint::BigIntValue, bigint::ops::OpError> {
+    a: &num_bigint::BigInt,
+    b: &num_bigint::BigInt,
+) -> Result<num_bigint::BigInt, bigint::ops::OpError> {
     Ok(bigint::ops::bitwise_xor(a, b))
 }
 

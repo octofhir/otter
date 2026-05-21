@@ -153,19 +153,27 @@ impl TypedArrayKind {
     /// Decode `bytes_per_element()` bytes at `offset` into a
     /// JavaScript value per §6.2.10 `GetValueFromBuffer` (always
     /// little-endian for TypedArray indexed access).
-    #[must_use]
-    pub fn read(self, bytes: &[u8], offset: usize) -> Value {
+    ///
+    /// The BigInt-kind arms allocate a fresh body on `heap`; numeric
+    /// kinds short-circuit without touching the heap.
+    pub fn read(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        bytes: &[u8],
+        offset: usize,
+    ) -> Result<Value, otter_gc::OutOfMemory> {
         let bpe = self.bytes_per_element();
         if offset + bpe > bytes.len() {
             return match self {
                 Self::BigInt64 | Self::BigUint64 => {
-                    Value::BigInt(BigIntValue::from_inner(BigInt::from(0)))
+                    let handle = BigIntValue::from_inner(heap, BigInt::from(0))?;
+                    Ok(Value::BigInt(handle))
                 }
-                _ => Value::Number(NumberValue::from_i32(0)),
+                _ => Ok(Value::Number(NumberValue::from_i32(0))),
             };
         }
         let slice = &bytes[offset..offset + bpe];
-        match self {
+        Ok(match self {
             Self::Int8 => {
                 Value::Number(NumberValue::from_i32(i8::from_le_bytes([slice[0]]) as i32))
             }
@@ -201,22 +209,25 @@ impl TypedArrayKind {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slice);
                 let v = i64::from_le_bytes(buf);
-                Value::BigInt(BigIntValue::from_inner(BigInt::from(v)))
+                let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
+                Value::BigInt(handle)
             }
             Self::BigUint64 => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slice);
                 let v = u64::from_le_bytes(buf);
-                Value::BigInt(BigIntValue::from_inner(BigInt::from(v)))
+                let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
+                Value::BigInt(handle)
             }
-        }
+        })
     }
 
     /// Encode `value` into the kind's element type and write it at
     /// `offset` per §6.2.10 `SetValueFromBuffer`. Out-of-range
     /// offsets silently no-op (the caller has already bounds-checked
-    /// the index against `length`).
-    pub fn write(self, bytes: &mut [u8], offset: usize, value: &Value) {
+    /// the index against `length`). The BigInt-kind arms clone the
+    /// body payload out of `heap`; numeric kinds ignore the heap.
+    pub fn write(self, heap: &otter_gc::GcHeap, bytes: &mut [u8], offset: usize, value: &Value) {
         let bpe = self.bytes_per_element();
         if offset + bpe > bytes.len() {
             return;
@@ -259,11 +270,11 @@ impl TypedArrayKind {
                 bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
             }
             Self::BigInt64 => {
-                let n = value_to_bigint64(value);
+                let n = value_to_bigint64(value, heap);
                 bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
             }
             Self::BigUint64 => {
-                let n = value_to_biguint64(value);
+                let n = value_to_biguint64(value, heap);
                 bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
             }
         }
@@ -323,9 +334,9 @@ fn value_to_number(value: &Value) -> NumberValue {
 /// §6.1.6.2.4 `BigInt::toInt64` — wrap to signed 64-bit. Non-BigInt
 /// values fall through `ToBigInt` (here approximated by 0 for
 /// non-coercible inputs; the dispatcher rejects bad types upstream).
-fn value_to_bigint64(value: &Value) -> i64 {
+fn value_to_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
     let big = match value {
-        Value::BigInt(b) => b.as_inner().clone(),
+        Value::BigInt(b) => b.clone_inner(heap),
         Value::Boolean(true) => BigInt::from(1),
         Value::Boolean(false) => BigInt::from(0),
         _ => return 0,
@@ -344,9 +355,9 @@ fn value_to_bigint64(value: &Value) -> i64 {
 }
 
 /// §6.1.6.2.5 `BigInt::toUint64`.
-fn value_to_biguint64(value: &Value) -> u64 {
+fn value_to_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
     let big = match value {
-        Value::BigInt(b) => b.as_inner().clone(),
+        Value::BigInt(b) => b.clone_inner(heap),
         Value::Boolean(true) => BigInt::from(1),
         Value::Boolean(false) => BigInt::from(0),
         _ => return 0,
@@ -526,28 +537,31 @@ impl JsTypedArray {
     /// Read element `index`. Returns `Value::Undefined` for an
     /// out-of-range read or a detached buffer per §10.4.5.13
     /// `IntegerIndexedElementGet`.
-    #[must_use]
-    pub fn get(&self, index: usize) -> Value {
+    pub fn get(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        index: usize,
+    ) -> Result<Value, otter_gc::OutOfMemory> {
         if self.inner.buffer.is_detached() || index >= self.length() {
-            return Value::Undefined;
+            return Ok(Value::Undefined);
         }
         let bpe = self.inner.kind.bytes_per_element();
         let offset = self.inner.byte_offset + index * bpe;
         let bytes = self.inner.buffer.borrow_bytes();
-        self.inner.kind.read(&bytes, offset)
+        self.inner.kind.read(heap, &bytes, offset)
     }
 
     /// Write `value` at element `index`. Out-of-range indices and
     /// detached buffers silently drop the write per §10.4.5.14
     /// `IntegerIndexedElementSet`.
-    pub fn set(&self, index: usize, value: &Value) {
+    pub fn set(&self, heap: &otter_gc::GcHeap, index: usize, value: &Value) {
         if self.inner.buffer.is_detached() || index >= self.length() {
             return;
         }
         let bpe = self.inner.kind.bytes_per_element();
         let offset = self.inner.byte_offset + index * bpe;
         let mut bytes = self.inner.buffer.borrow_bytes_mut();
-        self.inner.kind.write(&mut bytes, offset, value);
+        self.inner.kind.write(heap, &mut bytes, offset, value);
     }
 
     /// Identity comparison.

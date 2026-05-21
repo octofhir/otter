@@ -178,7 +178,8 @@ fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, S
         // `toString` invocation here — the `Op::SymbolCall`
         // dispatcher has no `ExecutionContext`).
         Some(other) => {
-            let rendered = JsString::from_str(&other.display_string(), &interp.string_heap)?;
+            let rendered =
+                JsString::from_str(&other.display_string(&interp.gc_heap), &interp.string_heap)?;
             Some(rendered)
         }
     };
@@ -189,7 +190,7 @@ fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, S
 /// `Symbol.for(key)` — Spec §20.4.2.4. Coerces `key` to a string
 /// (spec uses `ToString`) and looks up / inserts in the registry.
 fn symbol_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
-    let key = key_argument(args, "for")?;
+    let key = key_argument(args, &interp.gc_heap, "for")?;
     let sym = interp.symbol_for_key(&key)?;
     Ok(Value::Symbol(sym))
 }
@@ -218,8 +219,11 @@ fn symbol_key_for(interp: &Interpreter, args: &[Value]) -> Result<Value, SymbolE
 /// Coerce the first argument of a registry call to a Rust string.
 /// Spec invokes ToString; foundation accepts strings and
 /// non-`Symbol` primitives directly.
-fn key_argument(args: &[Value], name: &'static str) -> Result<String, SymbolError> {
-    let _ = name;
+fn key_argument(
+    args: &[Value],
+    heap: &otter_gc::GcHeap,
+    name: &'static str,
+) -> Result<String, SymbolError> {
     match args.first() {
         None | Some(Value::Undefined) => Ok("undefined".to_string()),
         Some(Value::String(s)) => Ok(s.to_lossy_string()),
@@ -228,6 +232,6 @@ fn key_argument(args: &[Value], name: &'static str) -> Result<String, SymbolErro
             index: 0,
             reason: "key must not be a symbol",
         }),
-        Some(other) => Ok(other.display_string()),
+        Some(other) => Ok(other.display_string(heap)),
     }
 }

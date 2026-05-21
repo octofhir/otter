@@ -38,13 +38,14 @@ pub fn call(
     method: otter_bytecode::method_id::GlobalMethod,
     args: &[Value],
     heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::GlobalMethod as M;
     match method {
         // §19.2.5 / §21.1.2.13 — `parseInt` and `Number.parseInt`
         // are the same callable. Compiler emits `ParseInt` for both.
         M::ParseInt => {
-            let s = coerce_to_string(args.first());
+            let s = coerce_to_string(args.first(), gc_heap);
             let radix = match args.get(1) {
                 None | Some(Value::Undefined) => 0i32,
                 Some(Value::Number(n)) => match n.as_smi() {
@@ -58,6 +59,7 @@ pub fn call(
         // §19.2.4 / §21.1.2.12 — same callable for both names.
         M::ParseFloat => Ok(Value::Number(number::parse_float(&coerce_to_string(
             args.first(),
+            gc_heap,
         )))),
         // §19.2.3 — coerces, then defers to the strict predicate.
         M::IsNaN => {
@@ -93,28 +95,35 @@ pub fn call(
         M::NumberIsSafeInteger => Ok(Value::Boolean(number::is_safe_integer(
             &args.first().cloned().unwrap_or(Value::Undefined),
         ))),
-        M::EncodeURI => js_string(&uri_encode(&coerce_to_string(args.first()), false), heap),
-        M::EncodeURIComponent => {
-            js_string(&uri_encode(&coerce_to_string(args.first()), true), heap)
-        }
+        M::EncodeURI => js_string(
+            &uri_encode(&coerce_to_string(args.first(), gc_heap), false),
+            heap,
+        ),
+        M::EncodeURIComponent => js_string(
+            &uri_encode(&coerce_to_string(args.first(), gc_heap), true),
+            heap,
+        ),
         M::DecodeURI => {
-            let out = uri_decode(&coerce_to_string(args.first()), false)?;
+            let out = uri_decode(&coerce_to_string(args.first(), gc_heap), false)?;
             js_string(&out, heap)
         }
         M::DecodeURIComponent => {
-            let out = uri_decode(&coerce_to_string(args.first()), true)?;
+            let out = uri_decode(&coerce_to_string(args.first(), gc_heap), true)?;
             js_string(&out, heap)
         }
         // §B.2.1.1 `escape(string)` — legacy AnnexB encoder. Walks
         // the UTF-16 code units; preserves the spec's "static
         // unencoded" set, emits `%XX` for code points below 256,
         // and `%uXXXX` for the rest.
-        M::Escape => js_string(&legacy_escape(&coerce_to_utf16(args.first())), heap),
+        M::Escape => js_string(
+            &legacy_escape(&coerce_to_utf16(args.first(), gc_heap)),
+            heap,
+        ),
         // §B.2.1.2 `unescape(string)` — legacy AnnexB decoder.
         // Recognises `%XX` and `%uXXXX` sequences, copies other
         // code units unchanged.
         M::Unescape => {
-            let units = coerce_to_utf16(args.first());
+            let units = coerce_to_utf16(args.first(), gc_heap);
             let decoded = legacy_unescape(&units);
             Ok(Value::String(
                 JsString::from_utf16_units(&decoded, heap).map_err(|_| VmError::TypeMismatch)?,
@@ -126,11 +135,11 @@ pub fn call(
 /// Coerce an argument to a UTF-16 buffer. Mirrors `coerce_to_string`
 /// but preserves the spec's "string of code units" view that
 /// `escape` / `unescape` walk.
-fn coerce_to_utf16(arg: Option<&Value>) -> Vec<u16> {
+fn coerce_to_utf16(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> Vec<u16> {
     match arg {
         None | Some(Value::Undefined) => "undefined".encode_utf16().collect(),
         Some(Value::String(s)) => s.to_utf16_vec(),
-        Some(other) => other.display_string().encode_utf16().collect(),
+        Some(other) => other.display_string(heap).encode_utf16().collect(),
     }
 }
 
@@ -211,10 +220,10 @@ fn legacy_unescape(units: &[u16]) -> Vec<u16> {
     out
 }
 
-fn coerce_to_string(arg: Option<&Value>) -> String {
+fn coerce_to_string(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> String {
     match arg {
         None | Some(Value::Undefined) => "undefined".to_string(),
-        Some(other) => other.display_string(),
+        Some(other) => other.display_string(heap),
     }
 }
 

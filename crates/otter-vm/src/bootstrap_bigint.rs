@@ -159,19 +159,32 @@ fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         });
     }
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt")?;
-    bigint::dispatch::call(BigIntMethod::Construct, &coerced).map_err(|e| vm_to_native(e, "BigInt"))
+    bigint::dispatch::call(
+        ctx.interp_mut().gc_heap_mut(),
+        BigIntMethod::Construct,
+        &coerced,
+    )
+    .map_err(|e| vm_to_native(e, "BigInt"))
 }
 
 fn bigint_static_as_int_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asIntN")?;
-    bigint::dispatch::call(BigIntMethod::AsIntN, &coerced)
-        .map_err(|e| vm_to_native(e, "BigInt.asIntN"))
+    bigint::dispatch::call(
+        ctx.interp_mut().gc_heap_mut(),
+        BigIntMethod::AsIntN,
+        &coerced,
+    )
+    .map_err(|e| vm_to_native(e, "BigInt.asIntN"))
 }
 
 fn bigint_static_as_uint_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asUintN")?;
-    bigint::dispatch::call(BigIntMethod::AsUintN, &coerced)
-        .map_err(|e| vm_to_native(e, "BigInt.asUintN"))
+    bigint::dispatch::call(
+        ctx.interp_mut().gc_heap_mut(),
+        BigIntMethod::AsUintN,
+        &coerced,
+    )
+    .map_err(|e| vm_to_native(e, "BigInt.asUintN"))
 }
 
 /// §7.1.13 ToBigInt step 4 — Array operands flow through
@@ -189,16 +202,18 @@ fn coerce_bigint_call_args(
     for slot in out.iter_mut() {
         match slot {
             Value::Array(arr) => {
-                let parts: Vec<String> =
-                    crate::array::with_elements(*arr, ctx.heap(), |elements| {
+                let parts: Vec<String> = {
+                    let heap = ctx.heap();
+                    crate::array::with_elements(*arr, heap, |elements| {
                         elements
                             .iter()
                             .map(|v| match v {
                                 Value::Undefined | Value::Null | Value::Hole => String::new(),
-                                other => other.display_string(),
+                                other => other.display_string(heap),
                             })
                             .collect()
-                    });
+                    })
+                };
                 let joined = parts.join(",");
                 *slot = Value::String(
                     crate::string::JsString::from_str(&joined, &string_heap).map_err(|_| {
@@ -249,7 +264,7 @@ fn coerce_bigint_call_args(
 
 fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let b = match ctx.this_value() {
-        Value::BigInt(b) => b.clone(),
+        Value::BigInt(b) => *b,
         Value::Object(obj) => {
             crate::object::bigint_data(*obj, ctx.heap()).ok_or_else(|| NativeError::TypeError {
                 name: "BigInt.prototype.toString",
@@ -302,7 +317,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             trunc as u32
         }
     };
-    let rendered = b.as_inner().to_str_radix(radix);
+    let rendered = b.with_inner(ctx.heap(), |bi| bi.to_str_radix(radix));
     let string_heap = ctx.interp_mut().string_heap_clone();
     let s = crate::string::JsString::from_str(&rendered, &string_heap)
         .map_err(|_| oom("BigInt.prototype.toString"))?;
@@ -311,7 +326,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 
 fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
-        Value::BigInt(b) => Ok(Value::BigInt(b.clone())),
+        Value::BigInt(b) => Ok(Value::BigInt(*b)),
         Value::Object(obj) => crate::object::bigint_data(*obj, ctx.heap())
             .map(Value::BigInt)
             .ok_or_else(|| NativeError::TypeError {

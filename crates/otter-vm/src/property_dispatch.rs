@@ -137,7 +137,8 @@ impl Interpreter {
                 return Ok(Value::String(js));
             }
             Value::BigInt(b) => {
-                let js = JsString::from_str(&b.to_decimal_string(), &self.string_heap)?;
+                let js =
+                    JsString::from_str(&b.to_decimal_string(&self.gc_heap), &self.string_heap)?;
                 return Ok(Value::String(js));
             }
             _ => {}
@@ -242,7 +243,7 @@ impl Interpreter {
             Value::Boolean(b) => Some(if *b { "true" } else { "false" }.to_string()),
             Value::Null => Some("null".to_string()),
             Value::Undefined => Some("undefined".to_string()),
-            Value::BigInt(b) => Some(b.to_decimal_string()),
+            Value::BigInt(b) => Some(b.to_decimal_string(&self.gc_heap)),
             Value::Symbol(_) => None,
             _ => None,
         };
@@ -857,7 +858,7 @@ impl Interpreter {
                     value => value,
                 }
             }
-            Value::Temporal(t) => temporal::load_property(t, &self.gc_heap, name),
+            Value::Temporal(t) => temporal::load_property(t, &mut self.gc_heap, name),
             v @ Value::ArrayBuffer(_) => {
                 let (direct, is_shared) = if let Value::ArrayBuffer(b) = v {
                     (
@@ -1028,8 +1029,12 @@ impl Interpreter {
                         && n >= 0.0
                         && (n as usize) < t.length()
                     {
-                        let coerced = binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
-                        t.set(n as usize, &coerced);
+                        let coerced = binary::dispatch::coerce_element_for_store(
+                            &mut self.gc_heap,
+                            t.kind(),
+                            &value,
+                        )?;
+                        t.set(&self.gc_heap, n as usize, &coerced);
                     }
                 } else {
                     let t_clone = t.clone();
@@ -1349,7 +1354,8 @@ impl Interpreter {
                 let name = key.to_lossy_string();
                 if let Some(n) = canonical_numeric_index_string(&name) {
                     if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && (n as usize) < t.length() {
-                        t.get(n as usize)
+                        t.get(&mut self.gc_heap, n as usize)
+                            .map_err(crate::oom_to_vm)?
                     } else {
                         Value::Undefined
                     }
@@ -1564,7 +1570,7 @@ impl Interpreter {
                         None => Value::Undefined,
                     },
                     Value::TypedArray(t) => match idx {
-                        Some(idx) => t.get(idx),
+                        Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
                         None => Value::Undefined,
                     },
                     _ => return Err(VmError::TypeMismatch),
@@ -1824,8 +1830,12 @@ impl Interpreter {
             // <https://tc39.es/ecma262/#sec-integerindexedelementset>
             (Value::TypedArray(t), Value::Number(n)) => match n.as_smi() {
                 Some(v) if v >= 0 => {
-                    let coerced = binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
-                    t.set(v as usize, &coerced);
+                    let coerced = binary::dispatch::coerce_element_for_store(
+                        &mut self.gc_heap,
+                        t.kind(),
+                        &value,
+                    )?;
+                    t.set(&self.gc_heap, v as usize, &coerced);
                 }
                 _ => return Err(VmError::TypeMismatch),
             },
@@ -1844,8 +1854,12 @@ impl Interpreter {
                     {
                         // out-of-range / non-integer — silent no-op
                     } else {
-                        let coerced = binary::dispatch::coerce_element_for_store(t.kind(), &value)?;
-                        t.set(n as usize, &coerced);
+                        let coerced = binary::dispatch::coerce_element_for_store(
+                            &mut self.gc_heap,
+                            t.kind(),
+                            &value,
+                        )?;
+                        t.set(&self.gc_heap, n as usize, &coerced);
                     }
                 } else {
                     typed_array_set_expando(self, t, &name, value.clone())?;
@@ -3280,7 +3294,7 @@ impl Interpreter {
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(result) => {
-                    let ok = result.to_boolean();
+                    let ok = result.to_boolean(&self.gc_heap);
                     if !ok {
                         Self::failed_set_result(
                             strict,
@@ -3306,7 +3320,11 @@ impl Interpreter {
                         match &desc.kind {
                             object::DescriptorKind::Data { value: target_v }
                                 if !desc.writable()
-                                    && !abstract_ops::same_value(target_v, &value) =>
+                                    && !abstract_ops::same_value(
+                                        target_v,
+                                        &value,
+                                        &self.gc_heap,
+                                    ) =>
                             {
                                 return Err(VmError::TypeError {
                                         message:
@@ -3624,7 +3642,7 @@ impl Interpreter {
         let key = match &lhs {
             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
             Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
-            other => VmPropertyKey::OwnedString(other.display_string()),
+            other => VmPropertyKey::OwnedString(other.display_string(&self.gc_heap)),
         };
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -3787,7 +3805,7 @@ fn has_object_property(interpreter: &Interpreter, obj: JsObject, key: &Value) ->
             )
         }
         other => {
-            let key = other.display_string();
+            let key = other.display_string(&interpreter.gc_heap);
             !matches!(
                 crate::object::lookup(obj, &interpreter.gc_heap, &key),
                 object::PropertyLookup::Absent

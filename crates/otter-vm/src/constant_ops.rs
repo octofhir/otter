@@ -19,7 +19,7 @@ use crate::{ExecutionContext, Frame, Interpreter, Value, VmError, bigint, write_
 
 impl Interpreter {
     pub(crate) fn run_load_bigint_reg(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
         dst: u16,
@@ -28,7 +28,9 @@ impl Interpreter {
         let decimal = context
             .bigint_decimal_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
-        let value = bigint::BigIntValue::from_decimal(decimal).ok_or(VmError::InvalidOperand)?;
+        let value = bigint::BigIntValue::from_decimal(&mut self.gc_heap, decimal)
+            .ok_or(VmError::InvalidOperand)?
+            .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::BigInt(value))?;
         frame.pc += 1;
         Ok(())

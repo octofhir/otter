@@ -1,11 +1,13 @@
 //! BigInt arithmetic, comparison, and bitwise primitives.
 //!
-//! These mirror the [`crate::number`] arithmetic surface but
-//! operate on [`BigIntValue`] handles instead of `NumberValue`.
-//! The VM dispatcher routes `Op::Add` / `Op::BitwiseAnd` / etc.
-//! through the matching helper here when both operands are
-//! `Value::BigInt`; mixed-kind operands raise `TypeError` per
-//! spec at the dispatcher level.
+//! These mirror the [`crate::number`] arithmetic surface but operate
+//! on raw [`num_bigint::BigInt`] payloads borrowed from a
+//! [`crate::bigint::BigIntValue`] body via
+//! [`crate::bigint::BigIntValue::with_inner`]. Keeping the ops layer
+//! heap-free means the same helpers compose with the bytecode
+//! dispatcher (which owns `&GcHeap`) and ad-hoc paths in
+//! `arithmetic_dispatch.rs` that need to fold computed `BigInt`
+//! results back into fresh `BigIntValue` handles at the call site.
 //!
 //! # Contents
 //! - Arithmetic: [`add`], [`sub`], [`mul`], [`div`], [`rem`],
@@ -13,6 +15,7 @@
 //! - Bitwise: [`bitwise_and`], [`bitwise_or`], [`bitwise_xor`],
 //!   [`bitwise_not`], [`shl`], [`shr`].
 //! - Comparison: [`compare`], [`equals`].
+//! - Mixed: [`compare_to_f64`], [`equals_f64`].
 //! - [`OpError`] — failure modes the dispatcher converts to
 //!   `VmError`.
 //!
@@ -26,8 +29,6 @@ use std::cmp::Ordering;
 
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
-
-use super::BigIntValue;
 
 /// Failure modes for BigInt operations.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -48,114 +49,111 @@ pub enum OpError {
 
 /// `lhs + rhs`.
 #[must_use]
-pub fn add(lhs: &BigIntValue, rhs: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(lhs.as_inner() + rhs.as_inner())
+pub fn add(lhs: &BigInt, rhs: &BigInt) -> BigInt {
+    lhs + rhs
 }
 
 /// `lhs - rhs`.
 #[must_use]
-pub fn sub(lhs: &BigIntValue, rhs: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(lhs.as_inner() - rhs.as_inner())
+pub fn sub(lhs: &BigInt, rhs: &BigInt) -> BigInt {
+    lhs - rhs
 }
 
 /// `lhs * rhs`.
 #[must_use]
-pub fn mul(lhs: &BigIntValue, rhs: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(lhs.as_inner() * rhs.as_inner())
+pub fn mul(lhs: &BigInt, rhs: &BigInt) -> BigInt {
+    lhs * rhs
 }
 
 /// `lhs / rhs` — truncated toward zero (matches BigInt spec).
-pub fn div(lhs: &BigIntValue, rhs: &BigIntValue) -> Result<BigIntValue, OpError> {
-    if rhs.as_inner().is_zero() {
+pub fn div(lhs: &BigInt, rhs: &BigInt) -> Result<BigInt, OpError> {
+    if rhs.is_zero() {
         return Err(OpError::DivisionByZero);
     }
-    Ok(BigIntValue::from_inner(lhs.as_inner() / rhs.as_inner()))
+    Ok(lhs / rhs)
 }
 
 /// `lhs % rhs` — sign follows the dividend.
-pub fn rem(lhs: &BigIntValue, rhs: &BigIntValue) -> Result<BigIntValue, OpError> {
-    if rhs.as_inner().is_zero() {
+pub fn rem(lhs: &BigInt, rhs: &BigInt) -> Result<BigInt, OpError> {
+    if rhs.is_zero() {
         return Err(OpError::DivisionByZero);
     }
-    Ok(BigIntValue::from_inner(lhs.as_inner() % rhs.as_inner()))
+    Ok(lhs % rhs)
 }
 
 /// Unary `-`.
 #[must_use]
-pub fn neg(value: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(-value.as_inner())
+pub fn neg(value: &BigInt) -> BigInt {
+    -value
 }
 
 /// `base ** exponent` — exponent must fit `u32` and be
 /// non-negative per spec.
-pub fn pow(base: &BigIntValue, exponent: &BigIntValue) -> Result<BigIntValue, OpError> {
-    let exp = exponent.as_inner();
-    if exp.is_negative() {
+pub fn pow(base: &BigInt, exponent: &BigInt) -> Result<BigInt, OpError> {
+    if exponent.is_negative() {
         return Err(OpError::NegativeExponent);
     }
-    let exp_u32 = exp.to_u32().ok_or(OpError::ShiftOutOfRange)?;
-    Ok(BigIntValue::from_inner(base.as_inner().pow(exp_u32)))
+    let exp_u32 = exponent.to_u32().ok_or(OpError::ShiftOutOfRange)?;
+    Ok(base.pow(exp_u32))
 }
 
 /// `lhs & rhs`.
 #[must_use]
-pub fn bitwise_and(lhs: &BigIntValue, rhs: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(lhs.as_inner() & rhs.as_inner())
+pub fn bitwise_and(lhs: &BigInt, rhs: &BigInt) -> BigInt {
+    lhs & rhs
 }
 
 /// `lhs | rhs`.
 #[must_use]
-pub fn bitwise_or(lhs: &BigIntValue, rhs: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(lhs.as_inner() | rhs.as_inner())
+pub fn bitwise_or(lhs: &BigInt, rhs: &BigInt) -> BigInt {
+    lhs | rhs
 }
 
 /// `lhs ^ rhs`.
 #[must_use]
-pub fn bitwise_xor(lhs: &BigIntValue, rhs: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(lhs.as_inner() ^ rhs.as_inner())
+pub fn bitwise_xor(lhs: &BigInt, rhs: &BigInt) -> BigInt {
+    lhs ^ rhs
 }
 
 /// `~value`.
 #[must_use]
-pub fn bitwise_not(value: &BigIntValue) -> BigIntValue {
-    BigIntValue::from_inner(!value.as_inner())
+pub fn bitwise_not(value: &BigInt) -> BigInt {
+    !value
 }
 
 /// `lhs << rhs`. Negative shift counts shift right per spec.
-pub fn shl(lhs: &BigIntValue, rhs: &BigIntValue) -> Result<BigIntValue, OpError> {
-    let count = rhs.as_inner();
-    if count.is_negative() {
-        let abs = -count;
+pub fn shl(lhs: &BigInt, rhs: &BigInt) -> Result<BigInt, OpError> {
+    if rhs.is_negative() {
+        let abs = -rhs;
         let n = abs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
-        return Ok(BigIntValue::from_inner(lhs.as_inner() >> n));
+        return Ok(lhs >> n);
     }
-    let n = count.to_u32().ok_or(OpError::ShiftOutOfRange)?;
-    Ok(BigIntValue::from_inner(lhs.as_inner() << n))
+    let n = rhs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
+    Ok(lhs << n)
 }
 
 /// `lhs >> rhs` — arithmetic (sign-preserving) shift. There is
 /// no `>>>` for BigInt (spec rejects it as a `TypeError`); the
 /// dispatcher handles that at the call site.
-pub fn shr(lhs: &BigIntValue, rhs: &BigIntValue) -> Result<BigIntValue, OpError> {
-    let count = rhs.as_inner();
-    if count.is_negative() {
-        let abs = -count;
+pub fn shr(lhs: &BigInt, rhs: &BigInt) -> Result<BigInt, OpError> {
+    if rhs.is_negative() {
+        let abs = -rhs;
         let n = abs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
-        return Ok(BigIntValue::from_inner(lhs.as_inner() << n));
+        return Ok(lhs << n);
     }
-    let n = count.to_u32().ok_or(OpError::ShiftOutOfRange)?;
-    Ok(BigIntValue::from_inner(lhs.as_inner() >> n))
+    let n = rhs.to_u32().ok_or(OpError::ShiftOutOfRange)?;
+    Ok(lhs >> n)
 }
 
 /// Three-way comparison.
 #[must_use]
-pub fn compare(lhs: &BigIntValue, rhs: &BigIntValue) -> Ordering {
-    lhs.as_inner().cmp(rhs.as_inner())
+pub fn compare(lhs: &BigInt, rhs: &BigInt) -> Ordering {
+    lhs.cmp(rhs)
 }
 
 /// `lhs === rhs` for two BigInts (just numeric equality).
 #[must_use]
-pub fn equals(lhs: &BigIntValue, rhs: &BigIntValue) -> bool {
+pub fn equals(lhs: &BigInt, rhs: &BigInt) -> bool {
     lhs == rhs
 }
 
@@ -163,7 +161,7 @@ pub fn equals(lhs: &BigIntValue, rhs: &BigIntValue) -> bool {
 /// "less-than" rule. `f64::NAN` returns `None` (spec treats it as
 /// undefined / unordered).
 #[must_use]
-pub fn compare_to_f64(lhs: &BigIntValue, rhs: f64) -> Option<Ordering> {
+pub fn compare_to_f64(lhs: &BigInt, rhs: f64) -> Option<Ordering> {
     if rhs.is_nan() {
         return None;
     }
@@ -176,7 +174,7 @@ pub fn compare_to_f64(lhs: &BigIntValue, rhs: f64) -> Option<Ordering> {
     }
     let truncated = rhs.trunc();
     let rhs_int = BigInt::from(truncated as i128);
-    match lhs.as_inner().cmp(&rhs_int) {
+    match lhs.cmp(&rhs_int) {
         Ordering::Equal => {
             // BigInt vs non-integer Number: tie-break on the
             // fractional part of the original f64.
@@ -196,7 +194,7 @@ pub fn compare_to_f64(lhs: &BigIntValue, rhs: f64) -> Option<Ordering> {
 /// numerics compare equal to BigInts of the same magnitude;
 /// non-integer or NaN Numbers never equal a BigInt.
 #[must_use]
-pub fn equals_f64(lhs: &BigIntValue, rhs: f64) -> bool {
+pub fn equals_f64(lhs: &BigInt, rhs: f64) -> bool {
     matches!(compare_to_f64(lhs, rhs), Some(Ordering::Equal))
 }
 
@@ -204,16 +202,15 @@ pub fn equals_f64(lhs: &BigIntValue, rhs: f64) -> bool {
 mod tests {
     use super::*;
 
-    fn b(n: i64) -> BigIntValue {
-        BigIntValue::from_inner(BigInt::from(n))
+    fn b(n: i64) -> BigInt {
+        BigInt::from(n)
     }
 
     #[test]
     fn add_beyond_max_safe_integer() {
-        let a = BigIntValue::from_decimal("9007199254740993").unwrap();
-        let one = b(1);
-        let r = add(&a, &one);
-        assert_eq!(r.to_decimal_string(), "9007199254740994");
+        let a: BigInt = "9007199254740993".parse().unwrap();
+        let r = add(&a, &b(1));
+        assert_eq!(r.to_string(), "9007199254740994");
     }
 
     #[test]

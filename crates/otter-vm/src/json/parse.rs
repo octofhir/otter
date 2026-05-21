@@ -657,27 +657,54 @@ mod tests {
 
     #[test]
     fn parses_primitives() {
-        assert!(matches!(parse_str("null").unwrap(), Value::Null));
-        assert!(matches!(parse_str("true").unwrap(), Value::Boolean(true)));
-        assert!(matches!(parse_str("false").unwrap(), Value::Boolean(false)));
-        assert_eq!(parse_str("42").unwrap().display_string(), "42");
-        assert_eq!(parse_str("-3.14").unwrap().display_string(), "-3.14");
-        assert_eq!(parse_str("1e2").unwrap().display_string(), "100");
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        assert!(matches!(
+            parse_str_with_heap("null", &mut gc_heap).unwrap(),
+            Value::Null
+        ));
+        assert!(matches!(
+            parse_str_with_heap("true", &mut gc_heap).unwrap(),
+            Value::Boolean(true)
+        ));
+        assert!(matches!(
+            parse_str_with_heap("false", &mut gc_heap).unwrap(),
+            Value::Boolean(false)
+        ));
+        assert_eq!(
+            parse_str_with_heap("42", &mut gc_heap)
+                .unwrap()
+                .display_string(&gc_heap),
+            "42"
+        );
+        assert_eq!(
+            parse_str_with_heap("-3.14", &mut gc_heap)
+                .unwrap()
+                .display_string(&gc_heap),
+            "-3.14"
+        );
+        assert_eq!(
+            parse_str_with_heap("1e2", &mut gc_heap)
+                .unwrap()
+                .display_string(&gc_heap),
+            "100"
+        );
     }
 
     #[test]
     fn parses_strings_with_escapes() {
-        let v = parse_str("\"a\\nb\\\\c\\\"d\"").unwrap();
-        assert_eq!(v.display_string(), "a\nb\\c\"d");
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        let v = parse_str_with_heap("\"a\\nb\\\\c\\\"d\"", &mut gc_heap).unwrap();
+        assert_eq!(v.display_string(&gc_heap), "a\nb\\c\"d");
     }
 
     #[test]
     fn parses_unicode_escape_and_surrogate_pair() {
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         // U+0041 'A' encoded as A.
-        let v = parse_str("\"\\u0041\"").unwrap();
-        assert_eq!(v.display_string(), "A");
+        let v = parse_str_with_heap("\"\\u0041\"", &mut gc_heap).unwrap();
+        assert_eq!(v.display_string(&gc_heap), "A");
         // Surrogate pair → U+10000 '𐀀'.
-        let v = parse_str("\"\\uD800\\uDC00\"").unwrap();
+        let v = parse_str_with_heap("\"\\uD800\\uDC00\"", &mut gc_heap).unwrap();
         match v {
             Value::String(s) => assert_eq!(s.to_utf16_vec(), vec![0xD800, 0xDC00]),
             _ => panic!(),
@@ -693,7 +720,10 @@ mod tests {
             panic!()
         };
         assert_eq!(crate::array::len(arr, &gc_heap), 3);
-        assert_eq!(crate::array::get(arr, &gc_heap, 2).display_string(), "3");
+        assert_eq!(
+            crate::array::get(arr, &gc_heap, 2).display_string(&gc_heap),
+            "3"
+        );
     }
 
     #[test]
@@ -735,7 +765,7 @@ mod tests {
         assert_eq!(
             crate::object::get(o3, &gc_heap, "c")
                 .unwrap()
-                .display_string(),
+                .display_string(&gc_heap),
             "42"
         );
     }

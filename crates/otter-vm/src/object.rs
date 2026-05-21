@@ -1337,7 +1337,7 @@ pub fn set_bigint_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: BigInt
 /// Read the `[[BigIntData]]` internal slot for a BigInt wrapper.
 #[must_use]
 pub fn bigint_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<BigIntValue> {
-    heap.read_payload(obj, |body| body.bigint_data.clone())
+    heap.read_payload(obj, |body| body.bigint_data)
 }
 
 /// §21.4.1.6 TimeClip — every store into a `[[DateValue]]` internal
@@ -1794,16 +1794,23 @@ pub fn define_own_property_partial(
     let map_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
+    // §10.1.6.3 ValidateAndApplyPropertyDescriptor runs outside the
+    // mutable body borrow so the BigInt-BigInt SameValue arm can
+    // read both bodies through `heap`. Distinct GC handles holding
+    // the same numeric value must compare equal per spec.
+    let merged_for_existing = if let Some(offset) = existing_offset {
+        let existing = heap.read_payload(obj, |body| body.slots[offset as usize].clone());
+        match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
+            Some(merged) => Some(merged),
+            None => return false,
+        }
+    } else {
+        None
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            let existing = body.slots[offset as usize].clone();
-            match descriptor_core::validate_and_apply_partial(&existing, &descriptor) {
-                Some(merged) => {
-                    body.slots[offset as usize] = merged;
-                    true
-                }
-                None => false,
-            }
+            body.slots[offset as usize] = merged_for_existing.unwrap();
+            true
         } else {
             if !body.extensible {
                 return false;
@@ -1850,16 +1857,19 @@ pub(crate) fn define_own_property_partial_with_shape(
     let barrier_descriptor = completed.clone();
     let map_descriptor = completed.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
+    let merged_for_existing = if let Some(offset) = existing_offset {
+        let existing = heap.read_payload(obj, |body| body.slots[offset as usize].clone());
+        match descriptor_core::validate_and_apply_partial(&existing, &descriptor, heap) {
+            Some(merged) => Some(merged),
+            None => return false,
+        }
+    } else {
+        None
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            let existing = body.slots[offset as usize].clone();
-            match descriptor_core::validate_and_apply_partial(&existing, &descriptor) {
-                Some(merged) => {
-                    body.slots[offset as usize] = merged;
-                    true
-                }
-                None => false,
-            }
+            body.slots[offset as usize] = merged_for_existing.unwrap();
+            true
         } else {
             if !body.extensible {
                 return false;
@@ -1900,16 +1910,25 @@ pub fn define_own_symbol_property_partial(
 ) -> bool {
     let completed = descriptor.complete_for_new_property();
     let barrier_descriptor = completed.clone();
+    let existing_pos_and_slot = heap.read_payload(obj, |body| {
+        body.symbol_props
+            .iter()
+            .position(|(k, _)| k.ptr_eq(key))
+            .map(|pos| (pos, body.symbol_props[pos].1.clone()))
+    });
+    let merged_for_existing = if let Some((_, ref existing)) = existing_pos_and_slot {
+        match descriptor_core::validate_and_apply_partial(existing, &descriptor, heap) {
+            Some(merged) => Some(merged),
+            None => return false,
+        }
+    } else {
+        None
+    };
+    let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
     let success = heap.with_payload(obj, |body| {
-        if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
-            let existing = body.symbol_props[pos].1.clone();
-            match descriptor_core::validate_and_apply_partial(&existing, &descriptor) {
-                Some(merged) => {
-                    body.symbol_props[pos].1 = merged;
-                    true
-                }
-                None => false,
-            }
+        if let Some(pos) = existing_pos {
+            body.symbol_props[pos].1 = merged_for_existing.unwrap();
+            true
         } else {
             if !body.extensible {
                 return false;
@@ -1941,16 +1960,19 @@ pub fn define_own_property(
     let map_descriptor = descriptor.clone();
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     let dictionary_keys = dictionary_keys_for_shape_transition(heap, obj, existing_offset);
+    let merged_for_existing = if let Some(offset) = existing_offset {
+        let existing = heap.read_payload(obj, |body| body.slots[offset as usize].clone());
+        match descriptor_core::validate_and_apply(&existing, &descriptor, heap) {
+            Some(merged) => Some(merged),
+            None => return false,
+        }
+    } else {
+        None
+    };
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
-            let existing = body.slots[offset as usize].clone();
-            match descriptor_core::validate_and_apply(&existing, &descriptor) {
-                Some(merged) => {
-                    body.slots[offset as usize] = merged;
-                    true
-                }
-                None => false,
-            }
+            body.slots[offset as usize] = merged_for_existing.unwrap();
+            true
         } else {
             if !body.extensible {
                 return false;
@@ -1993,16 +2015,25 @@ pub fn define_own_symbol_property(
     descriptor: PropertyDescriptor,
 ) -> bool {
     let barrier_descriptor = descriptor.clone();
+    let existing_pos_and_slot = heap.read_payload(obj, |body| {
+        body.symbol_props
+            .iter()
+            .position(|(k, _)| k.ptr_eq(key))
+            .map(|pos| (pos, body.symbol_props[pos].1.clone()))
+    });
+    let merged_for_existing = if let Some((_, ref existing)) = existing_pos_and_slot {
+        match descriptor_core::validate_and_apply(existing, &descriptor, heap) {
+            Some(merged) => Some(merged),
+            None => return false,
+        }
+    } else {
+        None
+    };
+    let existing_pos = existing_pos_and_slot.as_ref().map(|(p, _)| *p);
     let success = heap.with_payload(obj, |body| {
-        if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
-            let existing = body.symbol_props[pos].1.clone();
-            match descriptor_core::validate_and_apply(&existing, &descriptor) {
-                Some(merged) => {
-                    body.symbol_props[pos].1 = merged;
-                    true
-                }
-                None => false,
-            }
+        if let Some(pos) = existing_pos {
+            body.symbol_props[pos].1 = merged_for_existing.unwrap();
+            true
         } else {
             if !body.extensible {
                 return false;
@@ -2023,8 +2054,9 @@ pub fn define_own_symbol_property(
 pub(crate) fn validate_descriptor_update(
     existing: &PropertyDescriptor,
     incoming: &PropertyDescriptor,
+    heap: &otter_gc::GcHeap,
 ) -> Option<PropertyDescriptor> {
-    descriptor_core::validate_descriptor_update(existing, incoming)
+    descriptor_core::validate_descriptor_update(existing, incoming, heap)
 }
 
 impl otter_gc::GcStore for PropertyDescriptor {

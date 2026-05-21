@@ -43,7 +43,7 @@
 //! - <https://tc39.es/ecma262/#sec-isconstructor>
 
 use crate::Value;
-use crate::bigint::{BigIntValue, ops as bigint_ops};
+use crate::bigint::ops as bigint_ops;
 use crate::execution_context::ExecutionContext;
 use crate::number::{self, NumberValue};
 
@@ -140,10 +140,10 @@ pub fn is_primitive(value: &Value) -> bool {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-samevalue>
 #[must_use]
-pub fn same_value(x: &Value, y: &Value) -> bool {
+pub fn same_value(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     match (x, y) {
         (Value::Number(a), Value::Number(b)) => same_value_numeric(*a, *b),
-        _ => same_value_non_numeric(x, y),
+        _ => same_value_non_numeric(x, y, heap),
     }
 }
 
@@ -156,10 +156,10 @@ pub fn same_value(x: &Value, y: &Value) -> bool {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-samevaluezero>
 #[must_use]
-pub fn same_value_zero(x: &Value, y: &Value) -> bool {
+pub fn same_value_zero(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     match (x, y) {
         (Value::Number(a), Value::Number(b)) => same_value_zero_numeric(*a, *b),
-        _ => same_value_non_numeric(x, y),
+        _ => same_value_non_numeric(x, y, heap),
     }
 }
 
@@ -167,21 +167,25 @@ pub fn same_value_zero(x: &Value, y: &Value) -> bool {
 /// short-circuits have been handled.
 ///
 /// Strings compare by code-unit content; symbols, objects, arrays,
-/// callables, and other heap-shared values compare by identity
-/// (matching the existing `Value::PartialEq` definitions).
+/// callables, and other heap-shared values compare by identity; the
+/// BigInt arm reads both bodies through `heap` and folds through
+/// [`crate::bigint::BigIntValue::numeric_eq`] (spec
+/// `SameValueNonNumber` for BigInt-BigInt is numeric equality).
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-samevaluenonnumeric>
 #[must_use]
-pub fn same_value_non_numeric(x: &Value, y: &Value) -> bool {
+pub fn same_value_non_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     match (x, y) {
         (Value::Number(_), _) | (_, Value::Number(_)) => false,
-        // `Value::PartialEq` already implements identity for every
-        // heap shape and content equality for strings; cross-kind
-        // pairs short-circuit there. The spec text for
-        // `SameValueNonNumber` reduces to that exact behaviour for
-        // Undefined, Null, Boolean, BigInt, String, Symbol, and
-        // every Object-typed variant.
+        // §7.2.13 step 2.b: BigInt-BigInt equality is numeric.
+        // `Value::PartialEq`'s BigInt arm uses handle-offset
+        // equality and is not spec-correct on its own; route here
+        // to `numeric_eq` which reads the bodies through `heap`.
+        (Value::BigInt(a), Value::BigInt(b)) => a.numeric_eq(*b, heap),
+        // For every other variant `Value::PartialEq` matches the
+        // spec's `SameValueNonNumber` reduction (identity for
+        // heap-shared shapes, content equality for strings).
         _ => x == y,
     }
 }
@@ -342,7 +346,7 @@ pub enum RelationalOutcome {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-islooselyequal>
 #[must_use]
-pub fn is_loosely_equal(x: &Value, y: &Value) -> bool {
+pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     // Step 1: same type → IsStrictlyEqual.
     let same_kind = matches!(
         (x, y),
@@ -355,7 +359,7 @@ pub fn is_loosely_equal(x: &Value, y: &Value) -> bool {
             | (Value::Symbol(_), Value::Symbol(_))
     );
     if same_kind {
-        return same_value_non_numeric_or_strict_numeric(x, y);
+        return same_value_non_numeric_or_strict_numeric(x, y, heap);
     }
 
     match (x, y) {
@@ -377,7 +381,7 @@ pub fn is_loosely_equal(x: &Value, y: &Value) -> bool {
         // function (avoids needing a fresh `Value`).
         (Value::Boolean(b), other) | (other, Value::Boolean(b)) => {
             let coerced = Value::Number(NumberValue::from_i32(if *b { 1 } else { 0 }));
-            is_loosely_equal(&coerced, other)
+            is_loosely_equal(&coerced, other, heap)
         }
 
         // Steps 12: BigInt x String. §7.1.14 StringToBigInt:
@@ -387,14 +391,14 @@ pub fn is_loosely_equal(x: &Value, y: &Value) -> bool {
         // collapses to `false`.
         (Value::BigInt(big), Value::String(s)) | (Value::String(s), Value::BigInt(big)) => {
             match string_to_big_int(&s.to_lossy_string()) {
-                Some(parsed) => big == &parsed,
+                Some(parsed) => big.with_inner(heap, |b| b == &parsed),
                 None => false,
             }
         }
 
         // Steps 13, 14: BigInt x Number.
         (Value::BigInt(big), Value::Number(num)) | (Value::Number(num), Value::BigInt(big)) => {
-            bigint_eq_number(big, *num)
+            big.with_inner(heap, |b| bigint_eq_number(b, *num))
         }
 
         _ => false,
@@ -405,10 +409,15 @@ pub fn is_loosely_equal(x: &Value, y: &Value) -> bool {
 /// determined by [`is_loosely_equal`] step 1.
 ///
 /// Numbers use `number::strict_equals` so `NaN !== NaN` and
-/// `+0 === -0`. Every other variant defers to `Value::PartialEq`.
-fn same_value_non_numeric_or_strict_numeric(x: &Value, y: &Value) -> bool {
+/// `+0 === -0`. BigInt-BigInt routes through `numeric_eq(heap)`
+/// (handle-offset equality is not spec-correct). Every other
+/// variant defers to `Value::PartialEq`.
+fn same_value_non_numeric_or_strict_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     if let (Value::Number(a), Value::Number(b)) = (x, y) {
         return number::strict_equals(*a, *b);
+    }
+    if let (Value::BigInt(a), Value::BigInt(b)) = (x, y) {
+        return a.numeric_eq(*b, heap);
     }
     x == y
 }
@@ -422,10 +431,10 @@ fn same_value_non_numeric_or_strict_numeric(x: &Value, y: &Value) -> bool {
 ///
 /// Returns `None` when `str` does not match the grammar — callers
 /// surface that as the spec's `undefined` outcome.
-pub fn string_to_big_int(text: &str) -> Option<BigIntValue> {
+pub fn string_to_big_int(text: &str) -> Option<num_bigint::BigInt> {
     let s = text.trim();
     if s.is_empty() {
-        return Some(BigIntValue::from_i32(0));
+        return Some(num_bigint::BigInt::from(0));
     }
     let (sign_negative, body) = match s.as_bytes().first() {
         Some(b'+') => (false, &s[1..]),
@@ -456,13 +465,12 @@ pub fn string_to_big_int(text: &str) -> Option<BigIntValue> {
     } else {
         num_bigint::BigInt::parse_bytes(body.as_bytes(), 10)?
     };
-    let parsed = if sign_negative { -parsed } else { parsed };
-    Some(BigIntValue::from_inner(parsed))
+    Some(if sign_negative { -parsed } else { parsed })
 }
 
 /// `bigint == number` — only true when `number` is finite and
 /// integer-valued and matches the bigint's exact decimal form.
-fn bigint_eq_number(big: &BigIntValue, num: NumberValue) -> bool {
+fn bigint_eq_number(big: &num_bigint::BigInt, num: NumberValue) -> bool {
     let f = num.as_f64();
     if !f.is_finite() {
         return false;
@@ -493,7 +501,11 @@ fn bigint_eq_number(big: &BigIntValue, num: NumberValue) -> bool {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-abstract-relational-comparison>
 #[must_use]
-pub fn abstract_relational_comparison(x: &Value, y: &Value) -> RelationalOutcome {
+pub fn abstract_relational_comparison(
+    x: &Value,
+    y: &Value,
+    heap: &otter_gc::GcHeap,
+) -> RelationalOutcome {
     // Step 1: both String → lexicographic.
     if let (Value::String(a), Value::String(b)) = (x, y) {
         return match a.compare_lex(b) {
@@ -504,7 +516,7 @@ pub fn abstract_relational_comparison(x: &Value, y: &Value) -> RelationalOutcome
     // Step 2 / 3: BigInt x String.
     if let (Value::BigInt(big), Value::String(s)) = (x, y) {
         return match string_to_big_int(&s.to_lossy_string()) {
-            Some(parsed) => match bigint_ops::compare(big, &parsed) {
+            Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(b, &parsed)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,
             },
@@ -513,7 +525,7 @@ pub fn abstract_relational_comparison(x: &Value, y: &Value) -> RelationalOutcome
     }
     if let (Value::String(s), Value::BigInt(big)) = (x, y) {
         return match string_to_big_int(&s.to_lossy_string()) {
-            Some(parsed) => match bigint_ops::compare(&parsed, big) {
+            Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(&parsed, b)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,
             },
@@ -522,8 +534,8 @@ pub fn abstract_relational_comparison(x: &Value, y: &Value) -> RelationalOutcome
     }
 
     // Numeric coercion path.
-    let lnum = to_numeric_for_compare(x);
-    let rnum = to_numeric_for_compare(y);
+    let lnum = to_numeric_for_compare(x, heap);
+    let rnum = to_numeric_for_compare(y, heap);
     match (lnum, rnum) {
         (Some(NumericKind::Num(a)), Some(NumericKind::Num(b))) => match number::compare(a, b) {
             number::NumericOrdering::Less => RelationalOutcome::LessThan,
@@ -565,8 +577,10 @@ pub enum NumericKind {
     /// Operand reduced to a Number (covers `Number`, `String`,
     /// `Boolean`, `null`, `undefined`).
     Num(NumberValue),
-    /// Operand reduced to a BigInt.
-    Big(BigIntValue),
+    /// Operand reduced to an owned [`num_bigint::BigInt`]. The body
+    /// is cloned out of the GC heap once so downstream comparisons
+    /// / arithmetic do not have to re-borrow the heap.
+    Big(num_bigint::BigInt),
 }
 
 /// §7.1.4 ToNumeric over an already-primitive Value. Mirrors
@@ -577,10 +591,10 @@ pub enum NumericKind {
 /// can surface a TypeError.
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-tonumeric>
-pub fn to_numeric_kind(value: &Value) -> Option<NumericKind> {
+pub fn to_numeric_kind(value: &Value, heap: &otter_gc::GcHeap) -> Option<NumericKind> {
     match value {
         Value::Number(n) => Some(NumericKind::Num(*n)),
-        Value::BigInt(b) => Some(NumericKind::Big(b.clone())),
+        Value::BigInt(b) => Some(NumericKind::Big(b.clone_inner(heap))),
         Value::String(s) => Some(NumericKind::Num(number::to_number_from_string(
             &s.to_lossy_string(),
         ))),
@@ -593,8 +607,8 @@ pub fn to_numeric_kind(value: &Value) -> Option<NumericKind> {
     }
 }
 
-fn to_numeric_for_compare(value: &Value) -> Option<NumericKind> {
-    to_numeric_kind(value)
+fn to_numeric_for_compare(value: &Value, heap: &otter_gc::GcHeap) -> Option<NumericKind> {
+    to_numeric_kind(value, heap)
 }
 
 #[cfg(test)]
@@ -612,38 +626,55 @@ mod tests {
         Value::String(JsString::from_str(v, &heap).expect("foundation heap fits the literal"))
     }
 
+    fn fresh_heap() -> otter_gc::GcHeap {
+        otter_gc::GcHeap::new().expect("gc heap")
+    }
+
     #[test]
     fn same_value_distinguishes_signed_zeros() {
-        assert!(!same_value(&n(0.0), &n(-0.0)));
-        assert!(same_value_zero(&n(0.0), &n(-0.0)));
+        let heap = fresh_heap();
+        assert!(!same_value(&n(0.0), &n(-0.0), &heap));
+        assert!(same_value_zero(&n(0.0), &n(-0.0), &heap));
     }
 
     #[test]
     fn nan_equal_under_both_helpers() {
+        let heap = fresh_heap();
         let nan = n(f64::NAN);
-        assert!(same_value(&nan, &nan));
-        assert!(same_value_zero(&nan, &nan));
+        assert!(same_value(&nan, &nan, &heap));
+        assert!(same_value_zero(&nan, &nan, &heap));
     }
 
     #[test]
     fn cross_kind_rejected() {
-        assert!(!same_value(&n(1.0), &Value::Boolean(true)));
-        assert!(!same_value_zero(&n(1.0), &Value::Boolean(true)));
-        assert!(!same_value(&Value::Null, &Value::Undefined));
+        let heap = fresh_heap();
+        assert!(!same_value(&n(1.0), &Value::Boolean(true), &heap));
+        assert!(!same_value_zero(&n(1.0), &Value::Boolean(true), &heap));
+        assert!(!same_value(&Value::Null, &Value::Undefined, &heap));
     }
 
     #[test]
     fn strings_compare_by_content() {
-        assert!(same_value(&s("hi"), &s("hi")));
-        assert!(!same_value(&s("hi"), &s("bye")));
+        let heap = fresh_heap();
+        assert!(same_value(&s("hi"), &s("hi"), &heap));
+        assert!(!same_value(&s("hi"), &s("bye"), &heap));
     }
 
     #[test]
     fn primitives_match() {
-        assert!(same_value(&Value::Undefined, &Value::Undefined));
-        assert!(same_value(&Value::Null, &Value::Null));
-        assert!(same_value(&Value::Boolean(true), &Value::Boolean(true)));
-        assert!(!same_value(&Value::Boolean(true), &Value::Boolean(false)));
+        let heap = fresh_heap();
+        assert!(same_value(&Value::Undefined, &Value::Undefined, &heap));
+        assert!(same_value(&Value::Null, &Value::Null, &heap));
+        assert!(same_value(
+            &Value::Boolean(true),
+            &Value::Boolean(true),
+            &heap
+        ));
+        assert!(!same_value(
+            &Value::Boolean(true),
+            &Value::Boolean(false),
+            &heap
+        ));
     }
 
     #[test]

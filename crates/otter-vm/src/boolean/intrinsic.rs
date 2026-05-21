@@ -122,7 +122,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 /// wraps the receiver object's `[[BooleanData]]` slot with the
 /// coerced value.
 fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let value = args.first().is_some_and(Value::to_boolean);
+    let value = args.first().is_some_and(|v| v.to_boolean(ctx.heap()));
     if ctx.is_construct_call() {
         let this = ctx.this_value().clone();
         if let Value::Object(obj) = this {

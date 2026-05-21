@@ -859,7 +859,7 @@ impl Interpreter {
                 SmallVec::with_capacity(bound_args.len() + args.len());
             combined.extend(bound_args);
             combined.extend(args);
-            if abstract_ops::same_value(&callee, &new_target) {
+            if abstract_ops::same_value(&callee, &new_target, &self.gc_heap) {
                 new_target = target.clone();
             }
             callee = target;
@@ -1403,7 +1403,7 @@ impl Interpreter {
                         SmallVec::with_capacity(bound_args.len() + effective_args.len());
                     combined.extend(bound_args);
                     combined.extend(effective_args);
-                    if abstract_ops::same_value(&current, &effective_new_target) {
+                    if abstract_ops::same_value(&current, &effective_new_target, &self.gc_heap) {
                         effective_new_target = next_target.clone();
                     }
                     current = next_target;

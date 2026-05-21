@@ -94,7 +94,7 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
             Ok(JsString::from_str(&text, args.string_heap)?)
         }
         Value::BigInt(b) => {
-            let text = b.to_decimal_string();
+            let text = b.to_decimal_string(&*args.gc_heap);
             Ok(JsString::from_str(&text, args.string_heap)?)
         }
         Value::Array(arr) => {
@@ -116,7 +116,7 @@ fn receiver_string(args: &IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError>
                                 "false".to_string()
                             }
                         }
-                        _ => v.display_string(),
+                        _ => v.display_string(gc),
                     })
                     .collect()
             });
@@ -165,7 +165,7 @@ fn arg_to_string(args: &IntrinsicArgs<'_>, index: u16) -> Result<JsString, Intri
             Ok(JsString::from_str(&text, args.string_heap)?)
         }
         Some(Value::BigInt(b)) => {
-            let text = b.to_decimal_string();
+            let text = b.to_decimal_string(&*args.gc_heap);
             Ok(JsString::from_str(&text, args.string_heap)?)
         }
         Some(Value::Object(obj)) => {
@@ -659,7 +659,7 @@ fn create_html(
         let raw = match args.args.first() {
             None | Some(Value::Undefined) => "undefined".to_string(),
             Some(Value::String(s)) => s.to_lossy_string(),
-            Some(other) => other.display_string(),
+            Some(other) => other.display_string(&*args.gc_heap),
         };
         let escaped = raw.replace('"', "&quot;");
         out.push(' ');
@@ -1245,7 +1245,7 @@ fn coerce_pattern_to_regexp(
             text.encode_utf16().collect()
         }
         Value::Number(n) => n.to_display_string().encode_utf16().collect(),
-        Value::BigInt(b) => b.to_decimal_string().encode_utf16().collect(),
+        Value::BigInt(b) => b.to_decimal_string(&*gc_heap).encode_utf16().collect(),
         Value::Object(obj) => {
             let gc = &*gc_heap;
             if let Some(s) = crate::object::string_data(*obj, gc) {
@@ -1532,7 +1532,7 @@ fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     let recv = receiver_string(args)?.to_lossy_string();
     let other = match args.args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
-        Some(other) => other.display_string(),
+        Some(other) => other.display_string(&*args.gc_heap),
         None => "undefined".to_string(),
     };
     let cmp = match recv.cmp(&other) {
@@ -1871,16 +1871,14 @@ fn native_string_replace_callable(
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string =
-                match raw {
-                    Value::String(s) => s,
-                    other => JsString::from_str(&other.display_string(), &string_heap).map_err(
-                        |err| NativeError::TypeError {
-                            name: if replace_all { "replaceAll" } else { "replace" },
-                            reason: err.to_string(),
-                        },
-                    )?,
-                };
+            let raw_string = match raw {
+                Value::String(s) => s,
+                other => JsString::from_str(&other.display_string(interp.gc_heap()), &string_heap)
+                    .map_err(|err| NativeError::TypeError {
+                        name: if replace_all { "replaceAll" } else { "replace" },
+                        reason: err.to_string(),
+                    })?,
+            };
             out.extend_from_slice(&raw_string.to_utf16_vec());
             if pos < recv_units.len() {
                 out.push(recv_units[pos]);
@@ -1909,16 +1907,14 @@ fn native_string_replace_callable(
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string =
-                match raw {
-                    Value::String(s) => s,
-                    other => JsString::from_str(&other.display_string(), &string_heap).map_err(
-                        |err| NativeError::TypeError {
-                            name: if replace_all { "replaceAll" } else { "replace" },
-                            reason: err.to_string(),
-                        },
-                    )?,
-                };
+            let raw_string = match raw {
+                Value::String(s) => s,
+                other => JsString::from_str(&other.display_string(interp.gc_heap()), &string_heap)
+                    .map_err(|err| NativeError::TypeError {
+                        name: if replace_all { "replaceAll" } else { "replace" },
+                        reason: err.to_string(),
+                    })?,
+            };
             out.extend_from_slice(&raw_string.to_utf16_vec());
             cursor += needle_len;
             if !replace_all {
@@ -2049,7 +2045,7 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        result.display_string()
+        result.display_string(&gc_heap)
     }
 
     #[test]
@@ -2153,7 +2149,9 @@ mod tests {
     }
 
     fn call_s(method: &str, recv: &str, args: &[A]) -> String {
-        call_v(method, recv, args).display_string()
+        let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
+        call_v_with_heap(method, recv, args, &heap, &mut gc_heap).display_string(&gc_heap)
     }
 
     #[test]
@@ -2290,7 +2288,7 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        assert_eq!(r.display_string(), "65536");
+        assert_eq!(r.display_string(&gc_heap), "65536");
         // Index 1 is the trailing surrogate alone.
         let r2 = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
@@ -2300,7 +2298,7 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        assert_eq!(r2.display_string(), "56320");
+        assert_eq!(r2.display_string(&gc_heap), "56320");
     }
 
     #[test]
@@ -2370,9 +2368,18 @@ mod tests {
         match v {
             Value::Array(a) => {
                 assert_eq!(crate::array::len(a, &gc_heap), 3);
-                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
-                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "b");
-                assert_eq!(crate::array::get(a, &gc_heap, 2).display_string(), "c");
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+                    "a"
+                );
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+                    "b"
+                );
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+                    "c"
+                );
             }
             _ => panic!("expected array"),
         }
@@ -2386,9 +2393,18 @@ mod tests {
         match v {
             Value::Array(a) => {
                 assert_eq!(crate::array::len(a, &gc_heap), 3);
-                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
-                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "");
-                assert_eq!(crate::array::get(a, &gc_heap, 2).display_string(), "b");
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+                    "a"
+                );
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+                    ""
+                );
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+                    "b"
+                );
             }
             _ => panic!("expected array"),
         }
@@ -2402,9 +2418,18 @@ mod tests {
         match v {
             Value::Array(a) => {
                 assert_eq!(crate::array::len(a, &gc_heap), 3);
-                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
-                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "b");
-                assert_eq!(crate::array::get(a, &gc_heap, 2).display_string(), "c");
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+                    "a"
+                );
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+                    "b"
+                );
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+                    "c"
+                );
             }
             _ => panic!("expected array"),
         }
@@ -2424,8 +2449,14 @@ mod tests {
         match v {
             Value::Array(a) => {
                 assert_eq!(crate::array::len(a, &gc_heap), 2);
-                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "a");
-                assert_eq!(crate::array::get(a, &gc_heap, 1).display_string(), "b");
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+                    "a"
+                );
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+                    "b"
+                );
             }
             _ => panic!("expected array"),
         }
@@ -2439,7 +2470,10 @@ mod tests {
         match v {
             Value::Array(a) => {
                 assert_eq!(crate::array::len(a, &gc_heap), 1);
-                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "abc");
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+                    "abc"
+                );
             }
             _ => panic!("expected array"),
         }
@@ -2454,7 +2488,10 @@ mod tests {
         match v {
             Value::Array(a) => {
                 assert_eq!(crate::array::len(a, &gc_heap), 1);
-                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "");
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+                    ""
+                );
             }
             _ => panic!("expected array"),
         }
@@ -2484,7 +2521,10 @@ mod tests {
         match r {
             Value::Array(a) => {
                 assert_eq!(crate::array::len(a, &gc_heap), 1);
-                assert_eq!(crate::array::get(a, &gc_heap, 0).display_string(), "abc");
+                assert_eq!(
+                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+                    "abc"
+                );
             }
             _ => panic!("expected array"),
         }

@@ -286,7 +286,7 @@ impl Interpreter {
                     crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
                 let done = crate::object::get(*record, &self.gc_heap, "done")
                     .unwrap_or(Value::Undefined)
-                    .to_boolean();
+                    .to_boolean(&self.gc_heap);
                 if done {
                     self.gc_heap
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
@@ -311,7 +311,7 @@ impl Interpreter {
                     crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
                 let done = crate::object::get(*record, &self.gc_heap, "done")
                     .unwrap_or(Value::Undefined)
-                    .to_boolean();
+                    .to_boolean(&self.gc_heap);
                 if done {
                     self.gc_heap
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
@@ -381,7 +381,7 @@ impl Interpreter {
                     Value::Undefined,
                     smallvec::smallvec![v.clone()],
                 )?;
-                if kept.to_boolean() {
+                if kept.to_boolean(&self.gc_heap) {
                     return Ok((v, false));
                 }
             },
@@ -980,7 +980,7 @@ impl Interpreter {
                     };
                     let done = crate::object::get(*record, &self.gc_heap, "done")
                         .unwrap_or(Value::Undefined)
-                        .to_boolean();
+                        .to_boolean(&self.gc_heap);
                     if done {
                         return Ok(out);
                     }
@@ -1319,7 +1319,7 @@ impl Interpreter {
                 crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::Undefined);
             let done_value =
                 crate::object::get(*obj, &self.gc_heap, "done").unwrap_or(Value::Undefined);
-            let done = done_value.to_boolean();
+            let done = done_value.to_boolean(&self.gc_heap);
             if done && let Value::Iterator(rc) = &state.iterator {
                 self.gc_heap
                     .with_payload(*rc, |state| *state = IteratorState::Exhausted);
@@ -1356,7 +1356,7 @@ impl Interpreter {
                 crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::Undefined);
             let done = crate::object::get(*obj, &self.gc_heap, "done")
                 .unwrap_or(Value::Undefined)
-                .to_boolean();
+                .to_boolean(&self.gc_heap);
             if done {
                 self.gc_heap
                     .with_payload(*iter_rc, |state| *state = IteratorState::Exhausted);
@@ -1440,7 +1440,7 @@ fn iterator_step_read(
             interp.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
         }
     };
-    if done_value.to_boolean() {
+    if done_value.to_boolean(interp.gc_heap()) {
         return Ok(None);
     }
     let value = match interp.ordinary_get_value(

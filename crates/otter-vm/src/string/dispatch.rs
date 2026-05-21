@@ -22,12 +22,13 @@ pub fn call(
     method: otter_bytecode::method_id::StringMethod,
     args: &[Value],
     heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::StringMethod as M;
     match method {
         // §22.1.1 String(value) — coerce via §7.1.17 ToString.
         M::Construct => {
-            let s = crate::conversion::string_constructor_js_string(args.first(), heap)?;
+            let s = crate::conversion::string_constructor_js_string(args.first(), heap, gc_heap)?;
             Ok(Value::String(s))
         }
         // §22.1.2.1 String.fromCharCode(...codeUnits).

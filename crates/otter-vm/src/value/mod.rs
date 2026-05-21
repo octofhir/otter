@@ -54,15 +54,17 @@ use crate::binary::{
     SharedArrayBufferBodyGc, SharedArrayBufferHandle, TypedArrayBodyGc, TypedArrayHandle,
 };
 use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
-use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
+use crate::collections::{
+    JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody,
+};
 use crate::generator::{GeneratorBody, JsGenerator};
+use crate::intl::{IntlBody, IntlHandle};
 use crate::native_function::NativeFunctionBody;
 use crate::object::{JsObject, ObjectBody};
 use crate::promise::{JsPromiseHandle, PurePromise, PurePromiseBody};
+use crate::proxy::{ProxyBodyGc, ProxyHandle};
 use crate::regexp::{JsRegExp, JsRegExpBody};
 use crate::string::{JsStringBody, JsStringHandle};
-use crate::intl::{IntlBody, IntlHandle};
-use crate::proxy::{ProxyBodyGc, ProxyHandle};
 use crate::symbol::{SymbolBody, SymbolHandle};
 use crate::temporal::{TemporalBody, TemporalHandle};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
@@ -881,8 +883,7 @@ impl Value {
     #[must_use]
     pub fn is_generator(self) -> bool {
         self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<GeneratorBody as otter_gc::SafeTraceable>::TYPE_TAG)
+            && self.read_gc_type_tag() == Some(<GeneratorBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// Iterator body.
@@ -890,8 +891,7 @@ impl Value {
     #[must_use]
     pub fn is_iterator(self) -> bool {
         self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<IteratorState as otter_gc::SafeTraceable>::TYPE_TAG)
+            && self.read_gc_type_tag() == Some(<IteratorState as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     // -----------------------------------------------------------------------
@@ -1155,8 +1155,7 @@ impl Value {
     #[must_use]
     pub fn is_big_int_gc(self) -> bool {
         top_tag(self.0) == TAG_PTR_OTHER
-            && self.read_gc_type_tag()
-                == Some(<BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG)
+            && self.read_gc_type_tag() == Some(<BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Symbol body handle.
@@ -1174,8 +1173,7 @@ impl Value {
     #[must_use]
     pub fn is_symbol_gc(self) -> bool {
         top_tag(self.0) == TAG_PTR_OTHER
-            && self.read_gc_type_tag()
-                == Some(<SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG)
+            && self.read_gc_type_tag() == Some(<SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Temporal body handle.
@@ -1193,8 +1191,7 @@ impl Value {
     #[must_use]
     pub fn is_temporal_gc(self) -> bool {
         self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<TemporalBody as otter_gc::SafeTraceable>::TYPE_TAG)
+            && self.read_gc_type_tag() == Some(<TemporalBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Intl body handle.
@@ -1212,8 +1209,7 @@ impl Value {
     #[must_use]
     pub fn is_intl_gc(self) -> bool {
         self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<IntlBody as otter_gc::SafeTraceable>::TYPE_TAG)
+            && self.read_gc_type_tag() == Some(<IntlBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed Proxy body handle.
@@ -1231,8 +1227,7 @@ impl Value {
     #[must_use]
     pub fn is_proxy_gc(self) -> bool {
         self.is_object_like()
-            && self.read_gc_type_tag()
-                == Some(<ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+            && self.read_gc_type_tag() == Some(<ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 
     /// GC-managed DataView body handle.
@@ -1337,9 +1332,7 @@ impl Value {
         }
         let tag = self.read_gc_type_tag()?;
         Some(match tag {
-            t if t == <ObjectBody as otter_gc::SafeTraceable>::TYPE_TAG => {
-                ObjectFamilyKind::Object
-            }
+            t if t == <ObjectBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Object,
             t if t == <ArrayBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Array,
             t if t == <MapBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Map,
             t if t == <SetBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Set,
@@ -1371,9 +1364,7 @@ impl Value {
                 ObjectFamilyKind::Temporal
             }
             t if t == <IntlBody as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Intl,
-            t if t == <ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => {
-                ObjectFamilyKind::Proxy
-            }
+            t if t == <ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => ObjectFamilyKind::Proxy,
             t if t == <DataViewBodyGc as otter_gc::SafeTraceable>::TYPE_TAG => {
                 ObjectFamilyKind::DataView
             }
@@ -1510,7 +1501,10 @@ mod tests {
         }
         let nan_a = Value::number_f64(f64::NAN);
         let nan_b = Value::number_f64(f64::from_bits(0x7FFC_0000_0000_0001));
-        assert_eq!(nan_a, nan_b, "all NaNs canonicalise to the same bit pattern");
+        assert_eq!(
+            nan_a, nan_b,
+            "all NaNs canonicalise to the same bit pattern"
+        );
         assert!(nan_a.is_number());
         assert!(nan_a.as_f64().unwrap().is_nan());
     }
@@ -1554,7 +1548,7 @@ mod tests {
 
     #[test]
     fn closure_round_trip_via_real_heap() {
-        use crate::{alloc_closure, alloc_upvalue, Value as LegacyValue};
+        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
         use otter_gc::GcHeap;
 
         let mut heap = GcHeap::new().expect("heap");
@@ -1594,7 +1588,7 @@ mod tests {
     #[test]
     fn family_kind_dispatch_separates_object_function_other() {
         use crate::object::alloc_object_with_roots;
-        use crate::{alloc_closure, alloc_upvalue, Value as LegacyValue};
+        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
 
@@ -1615,7 +1609,10 @@ mod tests {
         assert_eq!(vobj.other_family_kind(), None);
 
         // Function dispatch.
-        assert_eq!(vclo.function_family_kind(), Some(FunctionFamilyKind::Closure));
+        assert_eq!(
+            vclo.function_family_kind(),
+            Some(FunctionFamilyKind::Closure)
+        );
         assert_eq!(vclo.object_family_kind(), None);
         assert_eq!(vclo.other_family_kind(), None);
 
@@ -1737,7 +1734,10 @@ mod tests {
         assert_eq!(Value::number_i32(1).to_boolean_pure(), Some(true));
         assert_eq!(Value::number_i32(-1).to_boolean_pure(), Some(true));
         assert_eq!(Value::number_f64(1.5).to_boolean_pure(), Some(true));
-        assert_eq!(Value::number_f64(f64::INFINITY).to_boolean_pure(), Some(true));
+        assert_eq!(
+            Value::number_f64(f64::INFINITY).to_boolean_pure(),
+            Some(true)
+        );
 
         // Callables / object-like references are always truthy.
         assert_eq!(Value::function_id(0).to_boolean_pure(), Some(true));
@@ -1752,8 +1752,8 @@ mod tests {
 
     #[test]
     fn predicates_disambiguate_object_and_function_families() {
-        use crate::{alloc_closure, alloc_upvalue, Value as LegacyValue};
         use crate::object::alloc_object_with_roots;
+        use crate::{Value as LegacyValue, alloc_closure, alloc_upvalue};
         use otter_gc::GcHeap;
         use otter_gc::raw::RawGc;
 
@@ -1761,8 +1761,8 @@ mod tests {
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
         let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
-        let closure = alloc_closure(&mut heap, 1, vec![cell].into_boxed_slice(), None)
-            .expect("closure");
+        let closure =
+            alloc_closure(&mut heap, 1, vec![cell].into_boxed_slice(), None).expect("closure");
 
         let vo = Value::object(obj);
         let vc = Value::closure(closure);

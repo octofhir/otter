@@ -1704,12 +1704,12 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         Ok(Value::Boolean(crate::number::parse::is_safe_integer(&v)))
     }
     fn number_parse_int_native(
-        _ctx: &mut NativeCtx<'_>,
+        ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let s = match args.first() {
             Some(Value::String(s)) => s.to_lossy_string(),
-            Some(other) => other.display_string(),
+            Some(other) => other.display_string(ctx.heap()),
             None => {
                 return Ok(Value::Number(crate::number::NumberValue::from_f64(
                     f64::NAN,
@@ -1723,12 +1723,12 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         Ok(Value::Number(crate::number::parse::parse_int(&s, radix)))
     }
     fn number_parse_float_native(
-        _ctx: &mut NativeCtx<'_>,
+        ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let s = match args.first() {
             Some(Value::String(s)) => s.to_lossy_string(),
-            Some(other) => other.display_string(),
+            Some(other) => other.display_string(ctx.heap()),
             None => {
                 return Ok(Value::Number(crate::number::NumberValue::from_f64(
                     f64::NAN,
@@ -1787,6 +1787,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 otter_bytecode::method_id::GlobalMethod::EncodeURI,
                 args,
                 &heap,
+                ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "encodeURI",
@@ -1802,6 +1803,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
                 args,
                 &heap,
+                ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "encodeURIComponent",
@@ -1817,6 +1819,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 otter_bytecode::method_id::GlobalMethod::DecodeURI,
                 args,
                 &heap,
+                ctx.heap(),
             )
             .map_err(|err| match err {
                 crate::VmError::TypeError { message } => NativeError::TypeError {
@@ -1838,6 +1841,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
                 args,
                 &heap,
+                ctx.heap(),
             )
             .map_err(|err| match err {
                 crate::VmError::TypeError { message } => NativeError::TypeError {
@@ -1859,6 +1863,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 otter_bytecode::method_id::GlobalMethod::Escape,
                 args,
                 &heap,
+                ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "escape",
@@ -1871,6 +1876,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 otter_bytecode::method_id::GlobalMethod::Unescape,
                 args,
                 &heap,
+                ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "unescape",
@@ -2203,7 +2209,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                         Ok(Value::Object(obj))
                     }
                     Value::BigInt(bigint) => {
-                        let bigint = bigint.clone();
+                        let bigint = *bigint;
                         let interp = ctx.interp_mut();
                         let proto =
                             interp
@@ -3382,7 +3388,7 @@ fn iterator_proto_find(
                 name: "Iterator.prototype.find",
                 reason: e.to_string(),
             })?;
-        if kept.to_boolean() {
+        if kept.to_boolean(ctx.heap()) {
             return Ok(v);
         }
         idx += 1.0;
@@ -3555,7 +3561,7 @@ fn iterator_proto_throw(
     let arg = args.first().cloned().unwrap_or(Value::Undefined);
     Err(crate::NativeError::Thrown {
         name: "Iterator.prototype.throw",
-        message: arg.display_string(),
+        message: arg.display_string(ctx.heap()),
     })
 }
 
@@ -3599,7 +3605,7 @@ fn iterator_predicate_drain(
                 name,
                 reason: e.to_string(),
             })?;
-        if kept.to_boolean() == short_on_truthy {
+        if kept.to_boolean(ctx.heap()) == short_on_truthy {
             return Ok(Value::Boolean(short_on_truthy));
         }
         idx += 1.0;

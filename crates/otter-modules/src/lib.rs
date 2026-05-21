@@ -54,8 +54,13 @@ fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
     runtime_type_error(name, reason)
 }
 
-fn arg_string(args: &[Value], index: usize, _name: &'static str) -> Result<String, NativeError> {
-    Ok(runtime_arg_to_string(args, index))
+fn arg_string(
+    args: &[Value],
+    index: usize,
+    _name: &'static str,
+    heap: &otter_runtime::otter_gc::GcHeap,
+) -> Result<String, NativeError> {
+    Ok(runtime_arg_to_string(args, index, heap))
 }
 
 fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {
@@ -74,7 +79,10 @@ fn json_to_value(ctx: &mut NativeCtx<'_>, value: JsonValue) -> Result<Value, Nat
     }
 }
 
-fn value_to_json(value: &Value) -> Result<JsonValue, NativeError> {
+fn value_to_json(
+    value: &Value,
+    heap: &otter_runtime::otter_gc::GcHeap,
+) -> Result<JsonValue, NativeError> {
     match value {
         Value::Undefined | Value::Null => Ok(JsonValue::Null),
         Value::Boolean(value) => Ok(JsonValue::Bool(*value)),
@@ -84,7 +92,7 @@ fn value_to_json(value: &Value) -> Result<JsonValue, NativeError> {
         Value::String(value) => Ok(JsonValue::String(value.to_lossy_string())),
         other => Err(type_error(
             "json",
-            format!("cannot convert {} to JSON", other.display_string()),
+            format!("cannot convert {} to JSON", other.display_string(heap)),
         )),
     }
 }

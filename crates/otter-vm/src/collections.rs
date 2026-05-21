@@ -109,7 +109,7 @@ impl MapKey {
                 let normalised = if f == 0.0 { 0.0 } else { f };
                 MapKey::Number(normalised)
             }
-            Value::BigInt(b) => MapKey::BigInt(b.clone()),
+            Value::BigInt(b) => MapKey::BigInt(*b),
             Value::String(s) => MapKey::String(s.clone()),
             Value::Symbol(s) => MapKey::Symbol(s.clone()),
             Value::Object(_)
@@ -169,7 +169,7 @@ impl std::hash::Hash for MapKey {
                     f.to_bits().hash(state);
                 }
             }
-            MapKey::BigInt(b) => b.to_decimal_string().hash(state),
+            MapKey::BigInt(b) => b.handle().offset().hash(state),
             MapKey::String(s) => s.to_lossy_string().hash(state),
             MapKey::Symbol(s) => s.identity_addr().hash(state),
             MapKey::ObjectValue(_) => {

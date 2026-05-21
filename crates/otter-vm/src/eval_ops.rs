@@ -343,7 +343,7 @@ impl Interpreter {
             Value::Symbol(_) => Err(VmError::TypeError {
                 message: "Cannot convert a Symbol value to a string".to_string(),
             }),
-            other => Ok(other.display_string()),
+            other => Ok(other.display_string(&self.gc_heap)),
         }
     }
 

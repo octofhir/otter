@@ -90,7 +90,7 @@ impl Interpreter {
                             });
                         }
                         other => crate::string::JsString::from_str(
-                            &other.display_string(),
+                            &other.display_string(&self.gc_heap),
                             &self.string_heap,
                         )?,
                     };
@@ -122,7 +122,7 @@ impl Interpreter {
                                         Value::Undefined | Value::Null | Value::Hole => {
                                             String::new()
                                         }
-                                        other => other.display_string(),
+                                        other => other.display_string(&self.gc_heap),
                                     })
                                     .collect()
                             });
@@ -133,7 +133,7 @@ impl Interpreter {
                         )?);
                     }
                 }
-                let result = bigint::dispatch::call(method, &coerced)?;
+                let result = bigint::dispatch::call(&mut self.gc_heap, method, &coerced)?;
                 finish_static_call(frame, dst, result)
             }
             Op::ArrayBufferCall => unreachable!("ArrayBufferCall requires stack-rooted dispatch"),
@@ -152,7 +152,8 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
                     method_id::GlobalMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result = global_functions::call(method, &args, &self.string_heap)?;
+                let result =
+                    global_functions::call(method, &args, &self.string_heap, &self.gc_heap)?;
                 finish_static_call(frame, dst, result)
             }
             Op::SymbolCall => {
@@ -300,7 +301,7 @@ impl Interpreter {
                         });
                     }
                     other => crate::string::JsString::from_str(
-                        &other.display_string(),
+                        &other.display_string(&self.gc_heap),
                         &self.string_heap,
                     )?,
                 };
@@ -1200,7 +1201,8 @@ impl Interpreter {
                                     None
                                 } else {
                                     Some(crate::object::PropertyDescriptor::data(
-                                        t.get(n as usize),
+                                        t.get(&mut self.gc_heap, n as usize)
+                                            .map_err(crate::oom_to_vm)?,
                                         true,
                                         true,
                                         true,

@@ -104,11 +104,8 @@ mod tests {
     fn to_string_renders_descriptive_form() {
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let sym = JsSymbol::new(
-            &mut gc_heap,
-            Some(JsString::from_str("ok", &heap).unwrap()),
-        )
-        .unwrap();
+        let sym =
+            JsSymbol::new(&mut gc_heap, Some(JsString::from_str("ok", &heap).unwrap())).unwrap();
         let entry = lookup("toString").unwrap();
         let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &Value::Symbol(sym),
@@ -118,7 +115,7 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        assert_eq!(result.display_string(), "Symbol(ok)");
+        assert_eq!(result.display_string(&gc_heap), "Symbol(ok)");
     }
 
     #[test]
@@ -128,7 +125,7 @@ mod tests {
         let s = JsString::from_str("ok", &heap).unwrap();
         let sym = JsSymbol::new(&mut gc_heap, Some(s.clone())).unwrap();
         let value = load_property(&sym, "description");
-        assert_eq!(value.display_string(), "ok");
+        assert_eq!(value.display_string(&gc_heap), "ok");
         let no_desc = JsSymbol::new(&mut gc_heap, None).unwrap();
         assert!(matches!(
             load_property(&no_desc, "description"),

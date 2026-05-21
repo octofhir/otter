@@ -215,7 +215,7 @@ pub(crate) fn bound_define_own_property(
         Err(_) => return false,
     };
     let descriptor = match existing {
-        Some(existing) => match object::validate_descriptor_update(&existing, &descriptor) {
+        Some(existing) => match object::validate_descriptor_update(&existing, &descriptor, heap) {
             Some(merged) => merged,
             None => return false,
         },

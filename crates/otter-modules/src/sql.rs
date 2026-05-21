@@ -203,7 +203,7 @@ fn open_sql(
     args: &[Value],
     capabilities: &CapabilitySet,
 ) -> Result<Value, NativeError> {
-    let path = crate::arg_string(args, 0, "openSql")?;
+    let path = crate::arg_string(args, 0, "openSql", ctx.heap())?;
     let db = if path.is_empty() || path == ":memory:" {
         SqlDatabase::memory().map_err(|err| crate::type_error("openSql", err.to_string()))?
     } else {
@@ -243,8 +243,8 @@ fn rest_args(args: &[Value]) -> &[Value] {
 
 fn method_execute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = database_receiver(ctx, "SqlDatabase.execute")?;
-    let sql = crate::arg_string(args, 0, "SqlDatabase.execute")?;
-    let params = js_params(rest_args(args))?;
+    let sql = crate::arg_string(args, 0, "SqlDatabase.execute", ctx.heap())?;
+    let params = js_params(rest_args(args), ctx.heap())?;
     let result =
         runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.execute(&sql, &params))
             .map_err(|err| host_error("SqlDatabase.execute", err))?;
@@ -255,8 +255,8 @@ fn method_execute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 
 fn method_query(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = database_receiver(ctx, "SqlDatabase.query")?;
-    let sql = crate::arg_string(args, 0, "SqlDatabase.query")?;
-    let params = js_params(rest_args(args))?;
+    let sql = crate::arg_string(args, 0, "SqlDatabase.query", ctx.heap())?;
+    let params = js_params(rest_args(args), ctx.heap())?;
     let result =
         runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.query(&sql, &params))
             .map_err(|err| host_error("SqlDatabase.query", err))?;
@@ -266,8 +266,8 @@ fn method_query(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 fn method_query_one(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = database_receiver(ctx, "SqlDatabase.queryOne")?;
-    let sql = crate::arg_string(args, 0, "SqlDatabase.queryOne")?;
-    let params = js_params(rest_args(args))?;
+    let sql = crate::arg_string(args, 0, "SqlDatabase.queryOne", ctx.heap())?;
+    let params = js_params(rest_args(args), ctx.heap())?;
     let result =
         runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.query_one(&sql, &params))
             .map_err(|err| host_error("SqlDatabase.queryOne", err))?;
@@ -277,8 +277,14 @@ fn method_query_one(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     }
 }
 
-fn js_params(values: &[Value]) -> Result<Vec<JsonValue>, NativeError> {
-    values.iter().map(crate::value_to_json).collect()
+fn js_params(
+    values: &[Value],
+    heap: &otter_runtime::otter_gc::GcHeap,
+) -> Result<Vec<JsonValue>, NativeError> {
+    values
+        .iter()
+        .map(|v| crate::value_to_json(v, heap))
+        .collect()
 }
 
 fn json_rows_to_array(ctx: &mut NativeCtx<'_>, rows: Vec<JsonValue>) -> Result<Value, NativeError> {

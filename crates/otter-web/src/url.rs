@@ -136,8 +136,8 @@ pub static URL_CLASS_SPEC: ClassSpec = runtime_class(
 );
 
 fn url_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let input = crate::arg_string(args, 0);
-    let base = runtime_optional_arg_to_string(args, 1)
+    let input = crate::arg_string(args, 0, ctx.heap());
+    let base = runtime_optional_arg_to_string(args, 1, ctx.heap())
         .map(|value| WebUrl::parse(&value, None))
         .transpose()
         .map_err(|err| crate::type_error("URL", err.to_string()))?;

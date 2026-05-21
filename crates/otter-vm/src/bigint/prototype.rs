@@ -20,7 +20,7 @@ use crate::string::JsString;
 
 fn receiver_bigint(args: &IntrinsicArgs<'_>) -> Result<BigIntValue, IntrinsicError> {
     match args.receiver {
-        Value::BigInt(b) => Ok(b.clone()),
+        Value::BigInt(b) => Ok(*b),
         _ => Err(IntrinsicError::BadReceiver { expected: "bigint" }),
     }
 }
@@ -70,9 +70,9 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         }
     };
     let rendered = if radix == 10 {
-        recv.to_decimal_string()
+        recv.to_decimal_string(args.gc_heap)
     } else {
-        recv.as_inner().to_str_radix(radix)
+        recv.with_inner(args.gc_heap, |b| b.to_str_radix(radix))
     };
     Ok(Value::String(JsString::from_str(
         &rendered,

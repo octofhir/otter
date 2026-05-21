@@ -208,7 +208,7 @@ fn console_trace(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn console_assert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    if args.first().is_some_and(Value::to_boolean) {
+    if args.first().is_some_and(|v| v.to_boolean(ctx.heap())) {
         return Ok(Value::Undefined);
     }
 
@@ -236,12 +236,12 @@ fn format_args(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Vec<String> {
             {
                 let rendered = error_classes::render_error_to_string(value, heap);
                 if rendered.is_empty() {
-                    value.display_string()
+                    value.display_string(ctx.heap())
                 } else {
                     rendered
                 }
             }
-            _ => value.display_string(),
+            _ => value.display_string(ctx.heap()),
         })
         .collect()
 }

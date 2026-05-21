@@ -13,9 +13,10 @@
 //! - <https://tc39.es/ecma262/#sec-tobigint>
 
 use super::BigIntValue;
-use crate::{Value, VmError};
+use crate::{Value, VmError, oom_to_vm};
 use num_bigint::BigInt;
 use num_traits::Signed;
+use otter_gc::GcHeap;
 
 /// Dispatch `BigInt(...)` ([`BigIntMethod::Construct`]) /
 /// `BigInt.<method>(...)`. Routes the typed [`BigIntMethod`]
@@ -23,7 +24,9 @@ use num_traits::Signed;
 ///
 /// # Errors
 /// - [`VmError::TypeMismatch`] for wrong-shape arguments.
+/// - [`VmError::OutOfMemory`] when the body allocation fails.
 pub fn call(
+    heap: &mut GcHeap,
     method: otter_bytecode::method_id::BigIntMethod,
     args: &[Value],
 ) -> Result<Value, VmError> {
@@ -32,38 +35,38 @@ pub fn call(
         // §21.2.1 BigInt(value) — coerce `value` to a BigInt.
         M::Construct => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
-            Ok(Value::BigInt(to_bigint(&value)?))
+            let big = to_bigint(heap, &value)?;
+            let handle = BigIntValue::from_inner(heap, big).map_err(oom_to_vm)?;
+            Ok(Value::BigInt(handle))
         }
         // §21.2.2.1 BigInt.asIntN(bits, value).
         M::AsIntN => {
             let bits = expect_bits(args.first())?;
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-            let n = to_bigint(&value)?;
-            Ok(Value::BigInt(BigIntValue::from_inner(as_int_n(
-                bits,
-                n.as_inner(),
-            ))))
+            let n = to_bigint(heap, &value)?;
+            let clipped = as_int_n(bits, &n);
+            let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;
+            Ok(Value::BigInt(handle))
         }
         // §21.2.2.2 BigInt.asUintN(bits, value).
         M::AsUintN => {
             let bits = expect_bits(args.first())?;
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
-            let n = to_bigint(&value)?;
-            Ok(Value::BigInt(BigIntValue::from_inner(as_uint_n(
-                bits,
-                n.as_inner(),
-            ))))
+            let n = to_bigint(heap, &value)?;
+            let clipped = as_uint_n(bits, &n);
+            let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;
+            Ok(Value::BigInt(handle))
         }
     }
 }
 
 /// §7.1.13 ToBigInt — Number must be a safe integer; String parses
 /// as integer literal; Boolean → 0n / 1n; BigInt passes through.
-fn to_bigint(value: &Value) -> Result<BigIntValue, VmError> {
+fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
     match value {
-        Value::BigInt(b) => Ok(b.clone()),
-        Value::Boolean(true) => Ok(BigIntValue::from_i32(1)),
-        Value::Boolean(false) => Ok(BigIntValue::from_i32(0)),
+        Value::BigInt(b) => Ok(b.clone_inner(heap)),
+        Value::Boolean(true) => Ok(BigInt::from(1)),
+        Value::Boolean(false) => Ok(BigInt::from(0)),
         // §21.2.1.1 step 3.a — `Number → NumberToBigInt`. The spec
         // throws **RangeError** on non-integer / non-finite values
         // and otherwise produces the matching integer.
@@ -74,7 +77,7 @@ fn to_bigint(value: &Value) -> Result<BigIntValue, VmError> {
                     message: "The number is not a safe integer for BigInt".to_string(),
                 });
             }
-            Ok(BigIntValue::from_inner(BigInt::from(f as i128)))
+            Ok(BigInt::from(f as i128))
         }
         Value::String(s) => string_to_bigint(&s.to_lossy_string()),
         // §7.1.13 step 7 — Symbol → TypeError.
@@ -98,23 +101,25 @@ fn to_bigint(value: &Value) -> Result<BigIntValue, VmError> {
     }
 }
 
-fn string_to_bigint(text: &str) -> Result<BigIntValue, VmError> {
+fn string_to_bigint(text: &str) -> Result<BigInt, VmError> {
     let trimmed = text.trim();
     // §7.1.14.1 StringToBigInt — empty string is 0n, accept decimal
     // / `0x` / `0o` / `0b` prefixes with optional leading sign on
     // the decimal form. Otherwise spec §21.2.1.1 step 3.b raises
     // **SyntaxError** (mapped through `vm_to_native`).
     if trimmed.is_empty() {
-        return Ok(BigIntValue::from_i32(0));
+        return Ok(BigInt::from(0));
     }
-    BigIntValue::from_decimal(trimmed)
+    trimmed
+        .parse::<BigInt>()
+        .ok()
         .or_else(|| parse_radix_literal(trimmed))
         .ok_or_else(|| VmError::SyntaxError {
             message: format!("Cannot convert {trimmed:?} to a BigInt"),
         })
 }
 
-fn parse_radix_literal(input: &str) -> Option<BigIntValue> {
+fn parse_radix_literal(input: &str) -> Option<BigInt> {
     if input.len() < 3 {
         return None;
     }
@@ -128,7 +133,7 @@ fn parse_radix_literal(input: &str) -> Option<BigIntValue> {
     } else {
         return None;
     };
-    BigInt::parse_bytes(body.as_bytes(), radix).map(BigIntValue::from_inner)
+    BigInt::parse_bytes(body.as_bytes(), radix)
 }
 
 /// §7.1.22 `ToIndex(arg)` — used by `BigInt.asIntN` /

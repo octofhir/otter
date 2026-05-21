@@ -281,20 +281,32 @@ fn coerce_element_value(
 ) -> Result<Value, NativeError> {
     let primitive = to_primitive_number(ctx, value, method_name)?;
     if kind.is_bigint() {
+        let heap = ctx.interp_mut().gc_heap_mut();
+        let oom_to_err = |err: otter_gc::OutOfMemory| {
+            type_err(
+                method_name,
+                format!(
+                    "out of memory: requested {} bytes, heap limit {}",
+                    err.requested_bytes(),
+                    err.heap_limit_bytes(),
+                ),
+            )
+        };
         match primitive {
             Value::BigInt(b) => Ok(Value::BigInt(b)),
-            Value::Boolean(b) => Ok(Value::BigInt(BigIntValue::from_inner(
-                num_bigint::BigInt::from(i64::from(b)),
-            ))),
+            Value::Boolean(b) => {
+                let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
+                    .map_err(oom_to_err)?;
+                Ok(Value::BigInt(handle))
+            }
             Value::String(s) => {
                 let txt = s.to_lossy_string();
                 let trimmed = txt.trim();
-                let parsed = trimmed.parse::<num_bigint::BigInt>();
-                parsed
-                    .map(|b| Value::BigInt(BigIntValue::from_inner(b)))
-                    .map_err(|_| {
-                        type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
-                    })
+                let parsed = trimmed.parse::<num_bigint::BigInt>().map_err(|_| {
+                    type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
+                })?;
+                let handle = BigIntValue::from_inner(heap, parsed).map_err(oom_to_err)?;
+                Ok(Value::BigInt(handle))
             }
             Value::Number(_) => Err(type_err(
                 method_name,
@@ -369,7 +381,17 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
         args.get(1).unwrap_or(&Value::Undefined),
         "Atomics.load",
     )?;
-    Ok(ta.get(idx))
+    let heap = ctx.interp_mut().gc_heap_mut();
+    ta.get(heap, idx).map_err(|e| {
+        type_err(
+            "Atomics.load",
+            format!(
+                "out of memory: {} requested, limit {}",
+                e.requested_bytes(),
+                e.heap_limit_bytes()
+            ),
+        )
+    })
 }
 
 fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -390,7 +412,7 @@ fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         args.get(2).unwrap_or(&Value::Undefined),
         "Atomics.store",
     )?;
-    ta.set(idx, &value);
+    ta.set(ctx.interp_mut().gc_heap(), idx, &value);
     Ok(value)
 }
 
@@ -418,18 +440,30 @@ fn modify_op(
         args.get(2).unwrap_or(&Value::Undefined),
         method_name,
     )?;
-    let prev = ta.get(idx);
+    let heap = ctx.interp_mut().gc_heap_mut();
+    let oom_to_err = |err: otter_gc::OutOfMemory| {
+        type_err(
+            method_name,
+            format!(
+                "out of memory: requested {} bytes, heap limit {}",
+                err.requested_bytes(),
+                err.heap_limit_bytes(),
+            ),
+        )
+    };
+    let prev = ta.get(heap, idx).map_err(oom_to_err)?;
     if ta.kind().is_bigint() {
         let prev_b = match &prev {
-            Value::BigInt(b) => b.as_inner().clone(),
+            Value::BigInt(b) => b.clone_inner(heap),
             _ => num_bigint::BigInt::from(0),
         };
         let v_b = match &coerced {
-            Value::BigInt(b) => b.as_inner().clone(),
+            Value::BigInt(b) => b.clone_inner(heap),
             _ => num_bigint::BigInt::from(0),
         };
         let new_b = op_big(&prev_b, &v_b);
-        ta.set(idx, &Value::BigInt(BigIntValue::from_inner(new_b)));
+        let handle = BigIntValue::from_inner(heap, new_b).map_err(oom_to_err)?;
+        ta.set(heap, idx, &Value::BigInt(handle));
     } else {
         let prev_n = match &prev {
             Value::Number(n) => n.as_f64() as i64,
@@ -440,7 +474,11 @@ fn modify_op(
             _ => 0,
         };
         let new_n = op(prev_n, v_n);
-        ta.set(idx, &Value::Number(NumberValue::from_f64(new_n as f64)));
+        ta.set(
+            heap,
+            idx,
+            &Value::Number(NumberValue::from_f64(new_n as f64)),
+        );
     }
     Ok(prev)
 }
@@ -495,8 +533,18 @@ fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
         args.get(2).unwrap_or(&Value::Undefined),
         "Atomics.exchange",
     )?;
-    let prev = ta.get(idx);
-    ta.set(idx, &value);
+    let heap = ctx.interp_mut().gc_heap_mut();
+    let prev = ta.get(heap, idx).map_err(|e| {
+        type_err(
+            "Atomics.exchange",
+            format!(
+                "out of memory: requested {} bytes, heap limit {}",
+                e.requested_bytes(),
+                e.heap_limit_bytes(),
+            ),
+        )
+    })?;
+    ta.set(heap, idx, &value);
     Ok(prev)
 }
 
@@ -529,10 +577,21 @@ fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     // against the raw current value (e.g. an Int16 view stores
     // `123456789` as `-13035`, so expected `123456789` must compare
     // against `-13035`, not the original Number).
-    let expected_narrow = narrow_through_kind(ta.kind(), &expected);
-    let current = ta.get(idx);
-    if values_equal_strict(&current, &expected_narrow) {
-        ta.set(idx, &replacement);
+    let heap = ctx.interp_mut().gc_heap_mut();
+    let oom_to_err = |err: otter_gc::OutOfMemory| {
+        type_err(
+            "Atomics.compareExchange",
+            format!(
+                "out of memory: requested {} bytes, heap limit {}",
+                err.requested_bytes(),
+                err.heap_limit_bytes(),
+            ),
+        )
+    };
+    let expected_narrow = narrow_through_kind(heap, ta.kind(), &expected).map_err(oom_to_err)?;
+    let current = ta.get(heap, idx).map_err(oom_to_err)?;
+    if values_equal_strict(&current, &expected_narrow, heap) {
+        ta.set(heap, idx, &replacement);
     }
     Ok(current)
 }
@@ -541,10 +600,14 @@ fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 /// what the buffer would read back after a store. Used by
 /// `compareExchange` to spec-equate `expected` with `current` per
 /// §25.4.3.5.
-fn narrow_through_kind(kind: TypedArrayKind, value: &Value) -> Value {
+fn narrow_through_kind(
+    heap: &mut otter_gc::GcHeap,
+    kind: TypedArrayKind,
+    value: &Value,
+) -> Result<Value, otter_gc::OutOfMemory> {
     let mut scratch = [0u8; 8];
-    kind.write(&mut scratch, 0, value);
-    kind.read(&scratch, 0)
+    kind.write(heap, &mut scratch, 0, value);
+    kind.read(heap, &scratch, 0)
 }
 
 fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -653,8 +716,18 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
             }
         }
     };
-    let current = ta.get(idx);
-    let label = if !values_equal_strict(&current, &expected) {
+    let heap = ctx.interp_mut().gc_heap_mut();
+    let current = ta.get(heap, idx).map_err(|e| {
+        type_err(
+            method_name,
+            format!(
+                "out of memory: requested {} bytes, heap limit {}",
+                e.requested_bytes(),
+                e.heap_limit_bytes(),
+            ),
+        )
+    })?;
+    let label = if !values_equal_strict(&current, &expected, heap) {
         "not-equal"
     } else if is_async {
         // §25.4.3.14 — `waitAsync` does not block the calling
@@ -746,10 +819,10 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::Number(NumberValue::from_f64(woken as f64)))
 }
 
-fn values_equal_strict(a: &Value, b: &Value) -> bool {
+fn values_equal_strict(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
     match (a, b) {
         (Value::Number(x), Value::Number(y)) => crate::number::equals(*x, *y),
-        (Value::BigInt(x), Value::BigInt(y)) => x == y,
+        (Value::BigInt(x), Value::BigInt(y)) => x.numeric_eq(*y, heap),
         _ => false,
     }
 }

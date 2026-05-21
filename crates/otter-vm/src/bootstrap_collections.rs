@@ -1771,7 +1771,7 @@ fn set_record_has(
                     smallvec::smallvec![value.clone()],
                 )
                 .map_err(|err| vm_to_native(err, name))?;
-            Ok(result.to_boolean())
+            Ok(result.to_boolean(ctx.heap()))
         }
     }
 }
@@ -1868,7 +1868,7 @@ fn set_record_next_key(
             };
             let done = crate::object::get(record, ctx.heap(), "done")
                 .unwrap_or(Value::Undefined)
-                .to_boolean();
+                .to_boolean(ctx.heap());
             if done {
                 return Ok(None);
             }

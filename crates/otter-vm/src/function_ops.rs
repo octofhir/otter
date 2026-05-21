@@ -578,7 +578,7 @@ impl Interpreter {
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(v.clone());
             let result = self.run_callable_sync(context, &handler, target.clone(), args)?;
-            return Ok(result.to_boolean());
+            return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(target) {
             return Err(VmError::TypeError {
@@ -635,7 +635,7 @@ impl Interpreter {
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(v.clone());
             let result = self.run_callable_sync(context, &handler, target.clone(), args)?;
-            return Ok(result.to_boolean());
+            return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(target) {
             return Err(VmError::TypeError {
@@ -1039,7 +1039,8 @@ impl Interpreter {
                         } else {
                             descriptor
                         };
-                    match object::validate_descriptor_update(&existing, &descriptor) {
+                    match object::validate_descriptor_update(&existing, &descriptor, &self.gc_heap)
+                    {
                         Some(merged) => merged,
                         None => return Ok(false),
                     }

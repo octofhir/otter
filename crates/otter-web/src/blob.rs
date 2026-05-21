@@ -94,8 +94,8 @@ pub static BLOB_CLASS_SPEC: ClassSpec = runtime_class(
 );
 
 fn blob_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let text = crate::arg_string(args, 0);
-    let content_type = crate::arg_string(args, 1);
+    let text = crate::arg_string(args, 0, ctx.heap());
+    let content_type = crate::arg_string(args, 1, ctx.heap());
     blob_object(ctx, Blob::new(text.into_bytes(), content_type))
 }
 
@@ -125,7 +125,7 @@ fn blob_slice_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let blob = blob_snapshot(ctx, "Blob.prototype.slice")?;
     let start = arg_usize(args, 0).unwrap_or(0);
     let end = arg_usize(args, 1);
-    let content_type = runtime_optional_arg_to_string(args, 2);
+    let content_type = runtime_optional_arg_to_string(args, 2, ctx.heap());
     blob_object(ctx, blob.slice(start, end, content_type.as_deref()))
 }
 

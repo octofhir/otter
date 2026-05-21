@@ -18,6 +18,7 @@
 
 pub mod fs;
 
+pub use otter_runtime::otter_gc;
 use otter_runtime::{HostedModule, HostedModuleInstall, OtterBuilder, RuntimeBuilder};
 
 /// Active Node-compatible hosted modules in deterministic install order.
@@ -61,8 +62,9 @@ pub(crate) fn arg_string(
     args: &[otter_runtime::RuntimeValue],
     index: usize,
     _name: &'static str,
+    heap: &otter_gc::GcHeap,
 ) -> Result<String, otter_runtime::RuntimeNativeError> {
-    Ok(otter_runtime::runtime_arg_to_string(args, index))
+    Ok(otter_runtime::runtime_arg_to_string(args, index, heap))
 }
 
 pub(crate) fn string_value(

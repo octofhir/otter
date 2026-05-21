@@ -106,8 +106,12 @@ pub(crate) fn type_error(name: &'static str, reason: impl Into<String>) -> Nativ
     runtime_type_error(name, reason)
 }
 
-pub(crate) fn arg_string(args: &[Value], index: usize) -> String {
-    runtime_arg_to_string(args, index)
+pub(crate) fn arg_string(
+    args: &[Value],
+    index: usize,
+    heap: &otter_runtime::otter_gc::GcHeap,
+) -> String {
+    runtime_arg_to_string(args, index, heap)
 }
 
 pub(crate) fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeError> {

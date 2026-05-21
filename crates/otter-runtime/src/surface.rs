@@ -90,21 +90,29 @@ pub fn runtime_type_error(name: &'static str, reason: impl Into<String>) -> Runt
 
 /// Coerce one argument to a display string, treating missing/undefined as `""`.
 #[must_use]
-pub fn runtime_arg_to_string(args: &[RuntimeValue], index: usize) -> String {
+pub fn runtime_arg_to_string(
+    args: &[RuntimeValue],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+) -> String {
     match args.get(index) {
         Some(RuntimeValue::String(value)) => value.to_lossy_string(),
         Some(RuntimeValue::Undefined) | None => String::new(),
-        Some(value) => value.display_string(),
+        Some(value) => value.display_string(heap),
     }
 }
 
 /// Coerce one optional argument to a display string.
 #[must_use]
-pub fn runtime_optional_arg_to_string(args: &[RuntimeValue], index: usize) -> Option<String> {
+pub fn runtime_optional_arg_to_string(
+    args: &[RuntimeValue],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+) -> Option<String> {
     match args.get(index) {
         Some(RuntimeValue::String(value)) => Some(value.to_lossy_string()),
         Some(RuntimeValue::Undefined) | None => None,
-        Some(value) => Some(value.display_string()),
+        Some(value) => Some(value.display_string(heap)),
     }
 }
 

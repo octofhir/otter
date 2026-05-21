@@ -139,8 +139,8 @@ fn host_error(name: &'static str, err: RuntimeHostObjectError) -> NativeError {
 
 fn headers_append_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.append")?;
-    let name = crate::arg_string(args, 0);
-    let value = crate::arg_string(args, 1);
+    let name = crate::arg_string(args, 0, ctx.heap());
+    let value = crate::arg_string(args, 1, ctx.heap());
     let result = runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| {
         headers.append(&name, &value)
     })
@@ -151,7 +151,7 @@ fn headers_append_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 
 fn headers_delete_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.delete")?;
-    let name = crate::arg_string(args, 0);
+    let name = crate::arg_string(args, 0, ctx.heap());
     let result =
         runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| headers.delete(&name))
             .map_err(|err| host_error("Headers.prototype.delete", err))?;
@@ -161,7 +161,7 @@ fn headers_delete_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 
 fn headers_get_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.get")?;
-    let name = crate::arg_string(args, 0);
+    let name = crate::arg_string(args, 0, ctx.heap());
     let result = runtime_with_host_data::<Headers, _>(ctx, object, |headers| headers.get(&name))
         .map_err(|err| host_error("Headers.prototype.get", err))?;
     match result.map_err(|err| crate::type_error("Headers.prototype.get", err.to_string()))? {
@@ -172,7 +172,7 @@ fn headers_get_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn headers_has_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.has")?;
-    let name = crate::arg_string(args, 0);
+    let name = crate::arg_string(args, 0, ctx.heap());
     let result = runtime_with_host_data::<Headers, _>(ctx, object, |headers| headers.has(&name))
         .map_err(|err| host_error("Headers.prototype.has", err))?;
     Ok(Value::Boolean(result.map_err(|err| {
@@ -182,8 +182,8 @@ fn headers_has_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn headers_set_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let object = headers_receiver(ctx, "Headers.prototype.set")?;
-    let name = crate::arg_string(args, 0);
-    let value = crate::arg_string(args, 1);
+    let name = crate::arg_string(args, 0, ctx.heap());
+    let value = crate::arg_string(args, 1, ctx.heap());
     let result =
         runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| headers.set(&name, &value))
             .map_err(|err| host_error("Headers.prototype.set", err))?;

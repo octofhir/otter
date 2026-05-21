@@ -299,7 +299,7 @@ fn typed_array_from_values_with_roots(
         })?;
     let view = JsTypedArray::new(new_buf, kind, 0, values.len());
     for (i, value) in values.iter().enumerate() {
-        view.set(i, value);
+        view.set(gc_heap, i, value);
     }
     Ok(Value::TypedArray(view))
 }
@@ -377,8 +377,8 @@ fn construct_typed_array_with_roots(
             let len = src.length();
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
-                let v = src.get(i);
-                values.push(coerce_for_kind(kind, &v)?);
+                let v = src.get(gc_heap, i).map_err(oom_to_vm)?;
+                values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
@@ -387,7 +387,7 @@ fn construct_typed_array_with_roots(
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v = crate::array::get(*arr, gc_heap, i);
-                values.push(coerce_for_kind(kind, &v)?);
+                values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
@@ -407,7 +407,7 @@ fn construct_typed_array_with_roots(
             for i in 0..len {
                 let v =
                     crate::object::get(*obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
-                values.push(coerce_for_kind(kind, &v)?);
+                values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
@@ -430,8 +430,8 @@ fn from_static_with_roots(
             let len = src.length();
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
-                let v = src.get(i);
-                values.push(coerce_for_kind(kind, &v)?);
+                let v = src.get(gc_heap, i).map_err(oom_to_vm)?;
+                values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
@@ -440,22 +440,24 @@ fn from_static_with_roots(
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v = crate::array::get(arr, gc_heap, i);
-                values.push(coerce_for_kind(kind, &v)?);
+                values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
         Value::String(s) => {
             let text = s.to_lossy_string();
-            let chars: Vec<Value> = text
-                .chars()
-                .map(|c| {
-                    if kind.is_bigint() {
-                        Value::BigInt(crate::bigint::BigIntValue::from_i32(c as i32))
-                    } else {
-                        Value::Number(crate::number::NumberValue::from_i32(c as i32))
-                    }
-                })
-                .collect();
+            let mut chars: Vec<Value> = Vec::with_capacity(text.chars().count());
+            for c in text.chars() {
+                if kind.is_bigint() {
+                    let h = crate::bigint::BigIntValue::from_i32(gc_heap, c as i32)
+                        .map_err(oom_to_vm)?;
+                    chars.push(Value::BigInt(h));
+                } else {
+                    chars.push(Value::Number(crate::number::NumberValue::from_i32(
+                        c as i32,
+                    )));
+                }
+            }
             typed_array_from_values_with_roots(kind, &chars, gc_heap, external_visit)
         }
         Value::Object(obj) => {
@@ -465,7 +467,7 @@ fn from_static_with_roots(
             for i in 0..len {
                 let v =
                     crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
-                values.push(coerce_for_kind(kind, &v)?);
+                values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
@@ -481,25 +483,34 @@ fn of_static_with_roots(
 ) -> Result<Value, VmError> {
     let mut values: Vec<Value> = Vec::with_capacity(args.len());
     for v in args {
-        values.push(coerce_for_kind(kind, v)?);
+        values.push(coerce_for_kind(gc_heap, kind, v)?);
     }
     typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
 }
 
 /// §6.2.10 SetValueFromBuffer's element-type conversion gates: a
 /// BigInt array rejects Number inputs and vice versa per §10.4.5.14.
-fn coerce_for_kind(kind: TypedArrayKind, value: &Value) -> Result<Value, VmError> {
+fn coerce_for_kind(
+    gc_heap: &mut otter_gc::GcHeap,
+    kind: TypedArrayKind,
+    value: &Value,
+) -> Result<Value, VmError> {
     if kind.is_bigint() {
         match value {
             Value::BigInt(_) => Ok(value.clone()),
-            Value::Boolean(true) => Ok(Value::BigInt(crate::bigint::BigIntValue::from_i32(1))),
-            Value::Boolean(false) => Ok(Value::BigInt(crate::bigint::BigIntValue::from_i32(0))),
+            Value::Boolean(true) => Ok(Value::BigInt(
+                crate::bigint::BigIntValue::from_i32(gc_heap, 1).map_err(oom_to_vm)?,
+            )),
+            Value::Boolean(false) => Ok(Value::BigInt(
+                crate::bigint::BigIntValue::from_i32(gc_heap, 0).map_err(oom_to_vm)?,
+            )),
             // Spec rejects Number → BigInt array store with TypeError.
             Value::Number(_) => Err(VmError::TypeMismatch),
             Value::String(s) => {
                 let text = s.to_lossy_string();
-                match crate::bigint::BigIntValue::from_decimal(text.trim()) {
-                    Some(b) => Ok(Value::BigInt(b)),
+                match crate::bigint::BigIntValue::from_decimal(gc_heap, text.trim()) {
+                    Some(Ok(b)) => Ok(Value::BigInt(b)),
+                    Some(Err(e)) => Err(oom_to_vm(e)),
                     None => Err(VmError::TypeMismatch),
                 }
             }
@@ -518,15 +529,25 @@ fn coerce_for_kind(kind: TypedArrayKind, value: &Value) -> Result<Value, VmError
 /// for indexed access). Raises [`VmError::TypeMismatch`] on
 /// kind/value-type mismatch per §10.4.5.14
 /// `IntegerIndexedElementSet` step 6.
-pub fn coerce_element_for_store(kind: TypedArrayKind, value: &Value) -> Result<Value, VmError> {
-    coerce_for_kind(kind, value)
+pub fn coerce_element_for_store(
+    gc_heap: &mut otter_gc::GcHeap,
+    kind: TypedArrayKind,
+    value: &Value,
+) -> Result<Value, VmError> {
+    coerce_for_kind(gc_heap, kind, value)
 }
 
 /// Used by `Array.from` / spread paths — extract the underlying
 /// values of a TypedArray as plain `Value`s.
-#[must_use]
-pub fn snapshot_elements(t: &JsTypedArray) -> Vec<Value> {
-    (0..t.length()).map(|i| t.get(i)).collect()
+pub fn snapshot_elements(
+    t: &JsTypedArray,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<Vec<Value>, otter_gc::OutOfMemory> {
+    let mut out = Vec::with_capacity(t.length());
+    for i in 0..t.length() {
+        out.push(t.get(heap, i)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

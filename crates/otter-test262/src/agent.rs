@@ -152,7 +152,7 @@ fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, Nativ
         Value::Null => Ok("null".to_string()),
         Value::Boolean(b) => Ok(if *b { "true" } else { "false" }.to_string()),
         Value::Number(n) => Ok(format!("{}", n.as_f64())),
-        Value::BigInt(b) => Ok(b.as_inner().to_string()),
+        Value::BigInt(b) => Ok(b.to_decimal_string(ctx.heap())),
         _ => {
             // Fall through to `ToString` via the receiver's
             // `toString()` method. For the test262 surface this is

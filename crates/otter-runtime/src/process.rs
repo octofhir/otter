@@ -375,11 +375,19 @@ fn hrtime_call(start: Instant) -> NativeCall {
 }
 
 fn hrtime_bigint_call(start: Instant) -> NativeCall {
-    let call: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
+    let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
         let nanos = start.elapsed().as_nanos().min(i128::MAX as u128) as i128;
-        Ok(Value::BigInt(otter_vm::bigint::BigIntValue::from_i128(
-            nanos,
-        )))
+        let handle =
+            otter_vm::bigint::BigIntValue::from_i128(ctx.interp_mut().gc_heap_mut(), nanos)
+                .map_err(|e| otter_vm::NativeError::TypeError {
+                    name: "process.hrtime.bigint",
+                    reason: format!(
+                        "out of memory: {} bytes requested, limit {}",
+                        e.requested_bytes(),
+                        e.heap_limit_bytes(),
+                    ),
+                })?;
+        Ok(Value::BigInt(handle))
     });
     NativeCall::Dynamic(call)
 }

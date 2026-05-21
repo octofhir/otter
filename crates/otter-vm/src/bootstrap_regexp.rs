@@ -485,7 +485,7 @@ fn is_regexp_runtime(
     let matcher =
         crate::regexp_prototype::get_symbol_property_runtime(ctx, value, &match_sym, name)?;
     if !matches!(matcher, Value::Undefined) {
-        return Ok(matcher.to_boolean());
+        return Ok(matcher.to_boolean(ctx.heap()));
     }
     Ok(matches!(value, Value::RegExp(_)))
 }
@@ -840,7 +840,7 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
                     .map_err(map_err)?
             }
         };
-        if value.to_boolean() {
+        if value.to_boolean(interp.gc_heap()) {
             out.push(letter);
         }
     }
@@ -914,7 +914,7 @@ fn coerce_to_string(
     if let Value::String(s) = v {
         return Ok(s.clone());
     }
-    let s = v.display_string();
+    let s = v.display_string(ctx.heap());
     let string_heap = ctx.interp_mut().string_heap_clone();
     JsString::from_str(&s, &string_heap).map_err(|_| oom(name))
 }

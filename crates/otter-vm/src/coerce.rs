@@ -124,8 +124,8 @@ pub(crate) fn to_string_or_throw(
         Value::Null => Ok("null".to_string()),
         Value::Boolean(b) => Ok(if b { "true" } else { "false" }.to_string()),
         Value::Number(n) => Ok(n.to_display_string()),
-        Value::BigInt(b) => Ok(b.to_decimal_string()),
-        other => Ok(other.display_string()),
+        Value::BigInt(b) => Ok(b.to_decimal_string(&interp.gc_heap)),
+        other => Ok(other.display_string(&interp.gc_heap)),
     }
 }
 
@@ -170,7 +170,10 @@ pub(crate) fn to_number_for_number_ctor(
         });
     }
     if let Value::BigInt(b) = input {
-        let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
+        let f = b
+            .to_decimal_string(&interp.gc_heap)
+            .parse::<f64>()
+            .unwrap_or(f64::NAN);
         return Ok(NumberValue::from_f64(f));
     }
     let primitive = if abstract_ops::is_primitive(input) {
@@ -183,7 +186,10 @@ pub(crate) fn to_number_for_number_ctor(
             message: "Cannot convert a Symbol value to a number".to_string(),
         }),
         Value::BigInt(b) => {
-            let f = b.to_decimal_string().parse::<f64>().unwrap_or(f64::NAN);
+            let f = b
+                .to_decimal_string(&interp.gc_heap)
+                .parse::<f64>()
+                .unwrap_or(f64::NAN);
             Ok(NumberValue::from_f64(f))
         }
         other => Ok(NumberValue::from_f64(
@@ -214,12 +220,19 @@ pub(crate) fn to_big_int_or_throw(
     };
     match primitive {
         Value::BigInt(b) => Ok(b),
-        Value::Boolean(true) => Ok(BigIntValue::from_i32(1)),
-        Value::Boolean(false) => Ok(BigIntValue::from_i32(0)),
+        Value::Boolean(true) => {
+            BigIntValue::from_i32(&mut interp.gc_heap, 1).map_err(crate::oom_to_vm)
+        }
+        Value::Boolean(false) => {
+            BigIntValue::from_i32(&mut interp.gc_heap, 0).map_err(crate::oom_to_vm)
+        }
         Value::String(s) => {
-            abstract_ops::string_to_big_int(&s.to_lossy_string()).ok_or(VmError::SyntaxError {
-                message: format!("Cannot convert {:?} to a BigInt", s.to_lossy_string()),
-            })
+            let parsed = abstract_ops::string_to_big_int(&s.to_lossy_string()).ok_or(
+                VmError::SyntaxError {
+                    message: format!("Cannot convert {:?} to a BigInt", s.to_lossy_string()),
+                },
+            )?;
+            BigIntValue::from_inner(&mut interp.gc_heap, parsed).map_err(crate::oom_to_vm)
         }
         Value::Number(_) => Err(VmError::TypeError {
             message: "Cannot convert a Number to a BigInt".to_string(),

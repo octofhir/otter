@@ -1458,7 +1458,7 @@ fn static_resolve(
                 "constructor",
                 "Promise.resolve",
             )?;
-            if crate::abstract_ops::same_value(&value_constructor, &constructor) {
+            if crate::abstract_ops::same_value(&value_constructor, &constructor, interp.gc_heap()) {
                 return Ok(Value::Promise(*p));
             }
         } else {

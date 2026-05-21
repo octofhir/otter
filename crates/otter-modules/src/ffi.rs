@@ -211,7 +211,7 @@ fn open_library(
     args: &[Value],
     capabilities: &CapabilitySet,
 ) -> Result<Value, NativeError> {
-    let path = crate::arg_string(args, 0, "dlopen")?;
+    let path = crate::arg_string(args, 0, "dlopen", ctx.heap())?;
     if path.is_empty() {
         return Err(crate::type_error("dlopen", "library path is required"));
     }

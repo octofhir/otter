@@ -361,7 +361,7 @@ impl Interpreter {
                     Value::Boolean(true) => "true".to_string(),
                     Value::Boolean(false) => "false".to_string(),
                     Value::Number(n) => n.to_display_string(),
-                    Value::BigInt(b) => b.to_decimal_string(),
+                    Value::BigInt(b) => b.to_decimal_string(&self.gc_heap),
                     Value::Symbol(_) => {
                         return Err(VmError::TypeError {
                             message: "Cannot convert a Symbol value to a string".to_string(),
@@ -387,7 +387,7 @@ impl Interpreter {
                             Value::Boolean(false) => "false".to_string(),
                             Value::Null => "null".to_string(),
                             Value::Undefined => "undefined".to_string(),
-                            Value::BigInt(b) => b.to_decimal_string(),
+                            Value::BigInt(b) => b.to_decimal_string(&self.gc_heap),
                             Value::Symbol(_) => {
                                 return Err(VmError::TypeError {
                                     message: "Cannot convert a Symbol value to a string"
@@ -1074,7 +1074,7 @@ impl Interpreter {
                 let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
                 let raw_string = match raw {
                     Value::String(s) => s,
-                    other => JsString::from_str(&other.display_string(), &string_heap)
+                    other => JsString::from_str(&other.display_string(&self.gc_heap), &string_heap)
                         .map_err(|_| VmError::TypeMismatch)?,
                 };
                 out.extend_from_slice(&raw_string.to_utf16_vec());
@@ -1103,7 +1103,7 @@ impl Interpreter {
                 let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
                 let raw_string = match raw {
                     Value::String(s) => s,
-                    other => JsString::from_str(&other.display_string(), &string_heap)
+                    other => JsString::from_str(&other.display_string(&self.gc_heap), &string_heap)
                         .map_err(|_| VmError::TypeMismatch)?,
                 };
                 out.extend_from_slice(&raw_string.to_utf16_vec());
@@ -1328,7 +1328,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let kept =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if kept.to_boolean() {
+                    if kept.to_boolean(&self.gc_heap) {
                         out.push(crate::array::get(*arr, &self.gc_heap, i));
                     }
                 }
@@ -1413,7 +1413,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         found = elem;
                         break;
                     }
@@ -1433,7 +1433,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         idx = i as i32;
                         break;
                     }
@@ -1451,7 +1451,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if !hit.to_boolean() {
+                    if !hit.to_boolean(&self.gc_heap) {
                         all = false;
                         break;
                     }
@@ -1469,7 +1469,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         any = true;
                         break;
                     }
@@ -1587,7 +1587,13 @@ impl Interpreter {
         let ta_value = Value::TypedArray(t.clone());
         let kind = t.kind();
         let len = t.length();
-        let elements: Vec<Value> = (0..len).map(|i| t.get(i)).collect();
+        let elements: Vec<Value> = {
+            let mut tmp = Vec::with_capacity(len);
+            for i in 0..len {
+                tmp.push(t.get(&mut self.gc_heap, i).map_err(crate::oom_to_vm)?);
+            }
+            tmp
+        };
 
         let top_idx = stack.len() - 1;
         stack[top_idx].pc = stack[top_idx]
@@ -1613,7 +1619,11 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let mapped =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    let coerced = crate::binary::dispatch::coerce_element_for_store(kind, &mapped)?;
+                    let coerced = crate::binary::dispatch::coerce_element_for_store(
+                        &mut self.gc_heap,
+                        kind,
+                        &mapped,
+                    )?;
                     out.push(coerced);
                 }
                 self.typed_array_from_values_stack_rooted(stack, kind, &out, &[&ta_value, &callee])?
@@ -1625,8 +1635,8 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let kept =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if kept.to_boolean() {
-                        out.push(t.get(i));
+                    if kept.to_boolean(&self.gc_heap) {
+                        out.push(t.get(&mut self.gc_heap, i).map_err(crate::oom_to_vm)?);
                     }
                 }
                 self.typed_array_from_values_stack_rooted(stack, kind, &out, &[&ta_value, &callee])?
@@ -1638,7 +1648,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         found = value;
                         break;
                     }
@@ -1652,7 +1662,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         idx = i as i32;
                         break;
                     }
@@ -1667,7 +1677,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         found = value;
                         break;
                     }
@@ -1682,7 +1692,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         idx = i as i32;
                         break;
                     }
@@ -1696,7 +1706,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if !hit.to_boolean() {
+                    if !hit.to_boolean(&self.gc_heap) {
                         all = false;
                         break;
                     }
@@ -1710,7 +1720,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit =
                         self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
-                    if hit.to_boolean() {
+                    if hit.to_boolean(&self.gc_heap) {
                         any = true;
                         break;
                     }
@@ -1791,7 +1801,7 @@ impl Interpreter {
         })?;
         let view = crate::binary::typed_array::JsTypedArray::new(new_buf, kind, 0, values.len());
         for (i, value) in values.iter().enumerate() {
-            view.set(i, value);
+            view.set(&self.gc_heap, i, value);
         }
         Ok(Value::TypedArray(view))
     }

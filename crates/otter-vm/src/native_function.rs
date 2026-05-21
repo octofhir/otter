@@ -710,7 +710,7 @@ impl NativeFunction {
         };
         let descriptor = match existing {
             Some(existing) => {
-                match crate::object::validate_descriptor_update(&existing, &descriptor) {
+                match crate::object::validate_descriptor_update(&existing, &descriptor, heap) {
                     Some(merged) => merged,
                     None => return false,
                 }
@@ -1130,7 +1130,7 @@ mod tests {
         let r = call
             .invoke(&mut ctx, &[Value::Number(NumberValue::from_i32(7))])
             .unwrap();
-        assert_eq!(r.display_string(), "7");
+        assert_eq!(r.display_string(ctx.heap()), "7");
     }
 
     #[test]

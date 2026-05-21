@@ -719,7 +719,9 @@ fn native_get_own_property_descriptor_rooted(
                         None
                     } else {
                         Some(crate::object::PropertyDescriptor::data(
-                            target.get(n as usize),
+                            target
+                                .get(ctx.heap_mut(), n as usize)
+                                .map_err(crate::oom_to_vm)?,
                             true,
                             true,
                             true,
@@ -1056,10 +1058,14 @@ native_object_static!(native_group_by, GroupBy);
 /// read the property as a value (e.g.
 /// `Object.getOwnPropertyDescriptor(Object, "is").value`) and then
 /// invoke it through `.call` / `Reflect.apply` see the spec result.
-fn native_is(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_is(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let a = args.first().cloned().unwrap_or(Value::Undefined);
     let b = args.get(1).cloned().unwrap_or(Value::Undefined);
-    Ok(Value::Boolean(crate::abstract_ops::same_value(&a, &b)))
+    Ok(Value::Boolean(crate::abstract_ops::same_value(
+        &a,
+        &b,
+        ctx.heap(),
+    )))
 }
 
 /// §20.1.2.12 `Object.getPrototypeOf(O)` — `[[Prototype]]` of `O`
@@ -1203,7 +1209,7 @@ fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, va
         Value::Number(value) => crate::object::set_number_data(wrapper, heap, *value),
         Value::String(value) => crate::object::set_string_data(wrapper, heap, value.clone()),
         Value::Symbol(value) => crate::object::set_symbol_data(wrapper, heap, value.clone()),
-        Value::BigInt(value) => crate::object::set_bigint_data(wrapper, heap, value.clone()),
+        Value::BigInt(value) => crate::object::set_bigint_data(wrapper, heap, *value),
         _ => {}
     }
 }
@@ -1413,7 +1419,7 @@ fn native_prototype_is_prototype_of(
         if matches!(proto, Value::Null) {
             return Ok(Value::Boolean(false));
         }
-        if crate::abstract_ops::same_value(&this_value, &proto) {
+        if crate::abstract_ops::same_value(&this_value, &proto, ctx.heap()) {
             return Ok(Value::Boolean(true));
         }
         current = proto;
@@ -1522,7 +1528,7 @@ pub fn native_prototype_proto_set(
         let object_proto = ctx.cx.interp.object_prototype_object_opt();
         if object_proto == Some(obj) {
             let current = crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::Null);
-            if !crate::abstract_ops::same_value(&proto_value, &current) {
+            if !crate::abstract_ops::same_value(&proto_value, &current, ctx.heap()) {
                 return Err(NativeError::TypeError {
                     name: "set __proto__",
                     reason: "Immutable prototype object cannot have its prototype changed"
@@ -2245,10 +2251,11 @@ pub fn call(
                                 if let Some(value) = descriptor.value.clone() {
                                     let coerced =
                                         crate::binary::dispatch::coerce_element_for_store(
+                                            gc_heap,
                                             t.kind(),
                                             &value,
                                         )?;
-                                    t.set(n as usize, &coerced);
+                                    t.set(gc_heap, n as usize, &coerced);
                                 }
                             } else {
                                 let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
@@ -2911,10 +2918,10 @@ pub fn coerce_to_descriptor(
         });
     }
     if has_writable {
-        descriptor.writable = lookup_to_optional_bool(&writable);
+        descriptor.writable = lookup_to_optional_bool(&writable, gc_heap);
     }
-    descriptor.enumerable = lookup_to_optional_bool(&enumerable);
-    descriptor.configurable = lookup_to_optional_bool(&configurable);
+    descriptor.enumerable = lookup_to_optional_bool(&enumerable, gc_heap);
+    descriptor.configurable = lookup_to_optional_bool(&configurable, gc_heap);
     if has_get {
         descriptor.get = Some(lookup_to_optional_value(&getter)?.unwrap_or(Value::Undefined));
     }
@@ -3020,10 +3027,10 @@ fn descriptor_to_object_with_roots(
     Ok(result)
 }
 
-fn lookup_to_optional_bool(lookup: &PropertyLookup) -> Option<bool> {
+fn lookup_to_optional_bool(lookup: &PropertyLookup, heap: &otter_gc::GcHeap) -> Option<bool> {
     match lookup {
         PropertyLookup::Absent => None,
-        PropertyLookup::Data { value, .. } => Some(value.to_boolean()),
+        PropertyLookup::Data { value, .. } => Some(value.to_boolean(heap)),
         // An accessor on the descriptor object would fire its getter
         // per spec; we treat as absent in the slice.
         PropertyLookup::Accessor { .. } => None,

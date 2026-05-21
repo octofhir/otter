@@ -42,7 +42,10 @@ pub(crate) enum ObjectIntegrityLevel {
 /// Convert an already-primitive value to a [`VmPropertyKey`] per
 /// §7.1.19 step 2-3: Symbol values pass through unchanged; every
 /// other primitive coerces to a UTF-16 string spelling.
-fn primitive_to_property_key(value: Value) -> Result<VmPropertyKey<'static>, VmError> {
+fn primitive_to_property_key(
+    value: Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
         Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym)),
         Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
@@ -51,7 +54,7 @@ fn primitive_to_property_key(value: Value) -> Result<VmPropertyKey<'static>, VmE
         Value::Boolean(false) => Ok(VmPropertyKey::String("false")),
         Value::Null => Ok(VmPropertyKey::String("null")),
         Value::Undefined => Ok(VmPropertyKey::String("undefined")),
-        Value::BigInt(b) => Ok(VmPropertyKey::OwnedString(b.to_decimal_string())),
+        Value::BigInt(b) => Ok(VmPropertyKey::OwnedString(b.to_decimal_string(heap))),
         _ => Err(VmError::TypeMismatch),
     }
 }
@@ -114,10 +117,14 @@ fn normalize_accessor_slot(value: Option<Value>) -> Option<Value> {
     value.filter(|value| !matches!(value, Value::Undefined))
 }
 
-fn same_optional_value(left: &Option<Value>, right: &Option<Value>) -> bool {
+fn same_optional_value(
+    left: &Option<Value>,
+    right: &Option<Value>,
+    heap: &otter_gc::GcHeap,
+) -> bool {
     match (left, right) {
         (None, None) => true,
-        (Some(left), Some(right)) => abstract_ops::same_value(left, right),
+        (Some(left), Some(right)) => abstract_ops::same_value(left, right, heap),
         _ => false,
     }
 }
@@ -358,7 +365,7 @@ impl Interpreter {
             object::DescriptorKind::Data { value }
                 if !desc.configurable()
                     && !desc.writable()
-                    && !abstract_ops::same_value(trap_result, &value) =>
+                    && !abstract_ops::same_value(trap_result, &value, &self.gc_heap) =>
             {
                 return Err(VmError::TypeError {
                         message: "Proxy get trap returned incompatible value for non-writable non-configurable property".to_string(),
@@ -733,7 +740,7 @@ impl Interpreter {
                         }
                         if let Some(target_proto) = self
                             .proxy_get_prototype_invariant_target_proto(context, &proxy.target())?
-                            && !abstract_ops::same_value(&result, &target_proto)
+                            && !abstract_ops::same_value(&result, &target_proto, &self.gc_heap)
                         {
                             return Err(VmError::TypeError {
                                 message:
@@ -818,7 +825,7 @@ impl Interpreter {
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
                 match self.invoke_proxy_trap(context, proxy, "isExtensible", trap_args)? {
                     Some(result) => {
-                        let trap = result.to_boolean();
+                        let trap = result.to_boolean(&self.gc_heap);
                         let target_ext = self.is_extensible_value(context, &proxy.target())?;
                         if trap != target_ext {
                             return Err(VmError::TypeError {
@@ -875,7 +882,7 @@ impl Interpreter {
                 ];
                 match self.invoke_proxy_trap(context, proxy, "defineProperty", trap_args)? {
                     Some(result) => {
-                        let ok = result.to_boolean();
+                        let ok = result.to_boolean(&self.gc_heap);
                         if !ok {
                             return Ok(false);
                         }
@@ -948,7 +955,11 @@ impl Interpreter {
                                                 .to_string(),
                                     });
                                 }
-                                if !is_compatible_partial_descriptor(target_desc, &descriptor) {
+                                if !is_compatible_partial_descriptor(
+                                    target_desc,
+                                    &descriptor,
+                                    &self.gc_heap,
+                                ) {
                                     return Err(VmError::TypeError {
                                         message:
                                             "Proxy defineProperty trap returned incompatible descriptor"
@@ -974,7 +985,11 @@ impl Interpreter {
                 ),
                 _ => {
                     if let Some(current) = self.string_object_exotic_descriptor(*obj, key)? {
-                        return Ok(is_compatible_partial_descriptor(&current, &descriptor));
+                        return Ok(is_compatible_partial_descriptor(
+                            &current,
+                            &descriptor,
+                            &self.gc_heap,
+                        ));
                     }
                     let k = key
                         .string_name()
@@ -1056,7 +1071,8 @@ impl Interpreter {
                     );
                     let completed =
                         complete_partial_descriptor_against_current(&current, &descriptor);
-                    let Some(updated) = object::validate_descriptor_update(&current, &completed)
+                    let Some(updated) =
+                        object::validate_descriptor_update(&current, &completed, &self.gc_heap)
                     else {
                         return Ok(false);
                     };
@@ -1364,7 +1380,7 @@ impl Interpreter {
                         return Ok(false);
                     }
                     if let Some(value) = &descriptor.value
-                        && !abstract_ops::same_value(value, &current_value)
+                        && !abstract_ops::same_value(value, &current_value, &self.gc_heap)
                     {
                         return Ok(false);
                     }
@@ -1386,9 +1402,9 @@ impl Interpreter {
                 let setter = normalize_accessor_slot(descriptor.set.clone());
                 if !current.configurable()
                     && ((descriptor.get.is_some()
-                        && !same_optional_value(&getter, &current_getter))
+                        && !same_optional_value(&getter, &current_getter, &self.gc_heap))
                         || (descriptor.set.is_some()
-                            && !same_optional_value(&setter, &current_setter)))
+                            && !same_optional_value(&setter, &current_setter, &self.gc_heap)))
                 {
                     return Ok(false);
                 }
@@ -1528,7 +1544,7 @@ impl Interpreter {
                         return Ok(false);
                     }
                     if let Some(value) = &descriptor.value
-                        && !abstract_ops::same_value(value, &current_value)
+                        && !abstract_ops::same_value(value, &current_value, &self.gc_heap)
                     {
                         return Ok(false);
                     }
@@ -1550,9 +1566,9 @@ impl Interpreter {
                 let setter = normalize_accessor_slot(descriptor.set.clone());
                 if !current.configurable()
                     && ((descriptor.get.is_some()
-                        && !same_optional_value(&getter, &current_getter))
+                        && !same_optional_value(&getter, &current_getter, &self.gc_heap))
                         || (descriptor.set.is_some()
-                            && !same_optional_value(&setter, &current_setter)))
+                            && !same_optional_value(&setter, &current_setter, &self.gc_heap)))
                 {
                     return Ok(false);
                 }
@@ -1825,11 +1841,11 @@ impl Interpreter {
         let mut descriptor = object::PartialPropertyDescriptor::default();
         // §6.2.5.5 step 3 — enumerable.
         if let Some(v) = read_field(self, "enumerable")? {
-            descriptor.enumerable = Some(v.to_boolean());
+            descriptor.enumerable = Some(v.to_boolean(&self.gc_heap));
         }
         // step 4 — configurable.
         if let Some(v) = read_field(self, "configurable")? {
-            descriptor.configurable = Some(v.to_boolean());
+            descriptor.configurable = Some(v.to_boolean(&self.gc_heap));
         }
         // step 5 — value.
         if let Some(v) = read_field(self, "value")? {
@@ -1837,7 +1853,7 @@ impl Interpreter {
         }
         // step 6 — writable.
         if let Some(v) = read_field(self, "writable")? {
-            descriptor.writable = Some(v.to_boolean());
+            descriptor.writable = Some(v.to_boolean(&self.gc_heap));
         }
         // step 7 — get.
         if let Some(v) = read_field(self, "get")? {
@@ -1882,7 +1898,9 @@ impl Interpreter {
         if let Value::Symbol(sym) = primitive {
             return Ok(VmPropertyKey::Symbol(sym));
         }
-        Ok(VmPropertyKey::OwnedString(primitive.display_string()))
+        Ok(VmPropertyKey::OwnedString(
+            primitive.display_string(&self.gc_heap),
+        ))
     }
 
     /// §10.5.11 / §10.1.11 — value-level `[[OwnPropertyKeys]]`.
@@ -2257,7 +2275,7 @@ impl Interpreter {
                     smallvec::smallvec![proxy.target(), proto.clone()];
                 match self.invoke_proxy_trap(context, proxy, "setPrototypeOf", trap_args)? {
                     Some(result) => {
-                        let ok = result.to_boolean();
+                        let ok = result.to_boolean(&self.gc_heap);
                         if !ok {
                             return Ok(false);
                         }
@@ -2270,7 +2288,7 @@ impl Interpreter {
                         if !target_extensible {
                             let target_proto =
                                 self.ordinary_get_prototype_value(context, target_value, 0)?;
-                            if !abstract_ops::same_value(proto, &target_proto) {
+                            if !abstract_ops::same_value(proto, &target_proto, &self.gc_heap) {
                                 return Err(VmError::TypeError {
                                     message:
                                         "Proxy setPrototypeOf invariant violated: target is non-extensible and prototypes differ"
@@ -2293,9 +2311,13 @@ impl Interpreter {
                 // success only when the requested prototype is
                 // SameValue with its current [[Prototype]].
                 if self.object_prototype_object_opt() == Some(obj) {
-                    return Ok(abstract_ops::same_value(proto, &current_proto));
+                    return Ok(abstract_ops::same_value(
+                        proto,
+                        &current_proto,
+                        &self.gc_heap,
+                    ));
                 }
-                if abstract_ops::same_value(proto, &current_proto) {
+                if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
                     return Ok(true);
                 }
                 if !object::is_extensible(obj, &self.gc_heap) {
@@ -2314,6 +2336,7 @@ impl Interpreter {
                             if abstract_ops::same_value(
                                 &Value::Object(*candidate),
                                 &Value::Object(obj),
+                                &self.gc_heap,
                             ) {
                                 return Ok(false);
                             }
@@ -2341,13 +2364,13 @@ impl Interpreter {
             }
             Value::Array(arr) => {
                 let current_proto = self.get_prototype_for_op(target)?;
-                if abstract_ops::same_value(proto, &current_proto) {
+                if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
                     return Ok(true);
                 }
                 if !array::is_extensible(*arr, &self.gc_heap) {
                     return Ok(false);
                 }
-                if abstract_ops::same_value(proto, target) {
+                if abstract_ops::same_value(proto, target, &self.gc_heap) {
                     return Ok(false);
                 }
                 let proto_opt = match proto {
@@ -2382,7 +2405,7 @@ impl Interpreter {
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
                 match self.invoke_proxy_trap(context, proxy, "preventExtensions", trap_args)? {
                     Some(result) => {
-                        let ok = result.to_boolean();
+                        let ok = result.to_boolean(&self.gc_heap);
                         if ok && self.is_extensible_value(context, &proxy.target())? {
                             return Err(VmError::TypeError {
                                 message:
@@ -2584,7 +2607,7 @@ impl Interpreter {
             if matches!(current, Value::Null) {
                 return Ok(false);
             }
-            if abstract_ops::same_value(&current, target_proto) {
+            if abstract_ops::same_value(&current, target_proto, &self.gc_heap) {
                 return Ok(true);
             }
         }
@@ -3178,7 +3201,10 @@ impl Interpreter {
                         {
                             return Ok(VmGetOutcome::Value(Value::Undefined));
                         }
-                        return Ok(VmGetOutcome::Value(t.get(n as usize)));
+                        return Ok(VmGetOutcome::Value(
+                            t.get(&mut self.gc_heap, n as usize)
+                                .map_err(crate::oom_to_vm)?,
+                        ));
                     }
                     if let Some(bag) = t.expando()
                         && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
@@ -3232,7 +3258,7 @@ impl Interpreter {
                     smallvec::smallvec![proxy.target(), key_value];
                 match self.invoke_proxy_trap(context, &proxy, "has", trap_args)? {
                     Some(value) => {
-                        let result = value.to_boolean();
+                        let result = value.to_boolean(&self.gc_heap);
                         // §10.5.8 invariants — when the trap reports
                         // false, the target must not have the
                         // property as a non-configurable own property
@@ -3537,11 +3563,11 @@ impl Interpreter {
         value: Value,
     ) -> Result<VmPropertyKey<'static>, VmError> {
         if abstract_ops::is_primitive(&value) {
-            return primitive_to_property_key(value);
+            return primitive_to_property_key(value, &self.gc_heap);
         }
         let primitive =
             self.to_primitive_sync(context, value, abstract_ops::ToPrimitiveHint::String)?;
-        primitive_to_property_key(primitive)
+        primitive_to_property_key(primitive, &self.gc_heap)
     }
 
     /// §7.1.1 `ToPrimitive(value, hint)` — synchronous variant. See
@@ -3797,7 +3823,7 @@ impl Interpreter {
                     smallvec::smallvec![proxy.target(), key_value];
                 match self.invoke_proxy_trap(context, &proxy, "deleteProperty", trap_args)? {
                     Some(value) => {
-                        let result = value.to_boolean();
+                        let result = value.to_boolean(&self.gc_heap);
                         if !result {
                             return Ok(false);
                         }
@@ -3922,7 +3948,7 @@ impl Interpreter {
                 ];
                 match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                     Some(result) => {
-                        let ok = result.to_boolean();
+                        let ok = result.to_boolean(&self.gc_heap);
                         if !ok {
                             return Ok(false);
                         }
@@ -3945,7 +3971,11 @@ impl Interpreter {
                             match &desc.kind {
                                 object::DescriptorKind::Data { value: target_v }
                                     if !desc.writable()
-                                        && !abstract_ops::same_value(target_v, &value) =>
+                                        && !abstract_ops::same_value(
+                                            target_v,
+                                            &value,
+                                            &self.gc_heap,
+                                        ) =>
                                 {
                                     return Err(VmError::TypeError {
                                             message:
@@ -4072,6 +4102,7 @@ impl Interpreter {
 fn is_compatible_partial_descriptor(
     target_desc: &object::PropertyDescriptor,
     incoming: &object::PartialPropertyDescriptor,
+    heap: &otter_gc::GcHeap,
 ) -> bool {
     let target_is_data = target_desc.is_data();
     if !target_desc.configurable() {
@@ -4095,7 +4126,7 @@ fn is_compatible_partial_descriptor(
             }
             if let (Some(in_v), object::DescriptorKind::Data { value: ex_v }) =
                 (&incoming.value, &target_desc.kind)
-                && !abstract_ops::same_value(ex_v, in_v)
+                && !abstract_ops::same_value(ex_v, in_v, heap)
             {
                 return false;
             }
@@ -4113,7 +4144,7 @@ fn is_compatible_partial_descriptor(
                 } else {
                     Some(g.clone())
                 };
-                if !optional_value_eq_pair(ex_get, &normalised) {
+                if !optional_value_eq_pair(ex_get, &normalised, heap) {
                     return false;
                 }
             }
@@ -4123,7 +4154,7 @@ fn is_compatible_partial_descriptor(
                 } else {
                     Some(s.clone())
                 };
-                if !optional_value_eq_pair(ex_set, &normalised) {
+                if !optional_value_eq_pair(ex_set, &normalised, heap) {
                     return false;
                 }
             }
@@ -4132,10 +4163,10 @@ fn is_compatible_partial_descriptor(
     true
 }
 
-fn optional_value_eq_pair(a: &Option<Value>, b: &Option<Value>) -> bool {
+fn optional_value_eq_pair(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc::GcHeap) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(x), Some(y)) => abstract_ops::same_value(x, y),
+        (Some(x), Some(y)) => abstract_ops::same_value(x, y, heap),
         _ => false,
     }
 }

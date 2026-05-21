@@ -423,7 +423,7 @@ mod tests {
         let recv = Value::Number(NumberValue::Smi(255));
         let entry = lookup("toString").unwrap();
         let out = (entry.impl_fn)(&mut args(&recv, &[], &heap, &mut gc_heap)).unwrap();
-        assert_eq!(out.display_string(), "255");
+        assert_eq!(out.display_string(&gc_heap), "255");
     }
 
     #[test]
@@ -440,7 +440,7 @@ mod tests {
             &mut gc_heap,
         ))
         .unwrap();
-        assert_eq!(out.display_string(), "ff");
+        assert_eq!(out.display_string(&gc_heap), "ff");
     }
 
     #[test]
@@ -460,6 +460,6 @@ mod tests {
             &mut gc_heap,
         ))
         .unwrap();
-        assert_eq!(out.display_string(), "1.75");
+        assert_eq!(out.display_string(&gc_heap), "1.75");
     }
 }

@@ -289,7 +289,7 @@ fn impl_set_intersection(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     for v in this_values {
         let in_other = other_values
             .iter()
-            .any(|o| crate::abstract_ops::same_value_zero(o, &v));
+            .any(|o| crate::abstract_ops::same_value_zero(o, &v, &*args.gc_heap));
         if !in_other {
             continue;
         }
@@ -319,7 +319,7 @@ fn impl_set_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     for v in this_values {
         let in_other = other_values
             .iter()
-            .any(|o| crate::abstract_ops::same_value_zero(o, &v));
+            .any(|o| crate::abstract_ops::same_value_zero(o, &v, &*args.gc_heap));
         if in_other {
             continue;
         }
@@ -346,7 +346,7 @@ fn impl_set_symmetric_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, 
     for v in &this_values {
         let in_other = other_values
             .iter()
-            .any(|o| crate::abstract_ops::same_value_zero(o, v));
+            .any(|o| crate::abstract_ops::same_value_zero(o, v, &*args.gc_heap));
         if !in_other {
             args.set_add_rooted(&mut new_set, v.clone())?;
         }
@@ -354,7 +354,7 @@ fn impl_set_symmetric_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, 
     for v in other_values {
         let in_this = this_values
             .iter()
-            .any(|t| crate::abstract_ops::same_value_zero(t, &v));
+            .any(|t| crate::abstract_ops::same_value_zero(t, &v, &*args.gc_heap));
         if in_this {
             continue;
         }
@@ -377,7 +377,7 @@ fn impl_set_is_subset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let all_in_other = this_values.iter().all(|v| {
         other_values
             .iter()
-            .any(|o| crate::abstract_ops::same_value_zero(o, v))
+            .any(|o| crate::abstract_ops::same_value_zero(o, v, &*args.gc_heap))
     });
     Ok(Value::Boolean(all_in_other))
 }

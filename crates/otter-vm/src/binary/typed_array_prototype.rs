@@ -86,8 +86,22 @@ fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
     n.trunc() as i64
 }
 
-fn copy_view(t: &JsTypedArray) -> Vec<Value> {
-    (0..t.length()).map(|i| t.get(i)).collect()
+fn intrinsic_oom(err: otter_gc::OutOfMemory) -> IntrinsicError {
+    IntrinsicError::OutOfMemory {
+        requested_bytes: err.requested_bytes(),
+        heap_limit_bytes: err.heap_limit_bytes(),
+    }
+}
+
+fn copy_view(
+    t: &JsTypedArray,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<Vec<Value>, otter_gc::OutOfMemory> {
+    let mut out = Vec::with_capacity(t.length());
+    for i in 0..t.length() {
+        out.push(t.get(heap, i)?);
+    }
+    Ok(out)
 }
 
 fn build_subarray(t: &JsTypedArray, start: usize, len: usize) -> Value {
@@ -121,7 +135,7 @@ fn build_new_typed_array_rooted(
         })?;
     let view = JsTypedArray::new(buf, kind, 0, values.len());
     for (i, v) in values.iter().enumerate() {
-        view.set(i, v);
+        view.set(args.gc_heap, i, v);
     }
     Ok(Value::TypedArray(view))
 }
@@ -146,7 +160,8 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if resolved < 0 || resolved >= len {
         return Ok(Value::Undefined);
     }
-    Ok(t.get(resolved as usize))
+    t.get(args.gc_heap, resolved as usize)
+        .map_err(intrinsic_oom)
 }
 
 fn impl_subarray(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -216,7 +231,7 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = start.clamp(0, len) as usize;
     let e = end.clamp(start, len) as usize;
     for i in s..e {
-        t.set(i, &value);
+        t.set(args.gc_heap, i, &value);
     }
     Ok(Value::TypedArray(t))
 }
@@ -254,10 +269,10 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let mut i = 0usize;
         let mut j = len - 1;
         while i < j {
-            let a = t.get(i);
-            let b = t.get(j);
-            t.set(i, &b);
-            t.set(j, &a);
+            let a = t.get(args.gc_heap, i).map_err(intrinsic_oom)?;
+            let b = t.get(args.gc_heap, j).map_err(intrinsic_oom)?;
+            t.set(args.gc_heap, i, &b);
+            t.set(args.gc_heap, j, &a);
             i += 1;
             j -= 1;
         }
@@ -280,7 +295,7 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_strict(&t.get(i), &target) {
+        if values_equal_strict(&t.get(args.gc_heap, i).map_err(intrinsic_oom)?, &target) {
             return Ok(smi(i as i32));
         }
     }
@@ -303,7 +318,10 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     };
     let mut i = from;
     while i >= 0 {
-        if values_equal_strict(&t.get(i as usize), &target) {
+        if values_equal_strict(
+            &t.get(args.gc_heap, i as usize).map_err(intrinsic_oom)?,
+            &target,
+        ) {
             return Ok(smi(i as i32));
         }
         i -= 1;
@@ -323,7 +341,7 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_zero(&t.get(i), &target) {
+        if values_equal_zero(&t.get(args.gc_heap, i).map_err(intrinsic_oom)?, &target) {
             return Ok(Value::Boolean(true));
         }
     }
@@ -336,15 +354,16 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => ",".to_string(),
         Some(Value::String(s)) => s.to_lossy_string(),
-        Some(other) => other.display_string(),
+        Some(other) => other.display_string(args.gc_heap),
     };
-    join_into_string(&t, &separator, args.string_heap)
+    join_into_string(&t, &separator, args.string_heap, args.gc_heap)
 }
 
 fn join_into_string(
     t: &crate::binary::JsTypedArray,
     separator: &str,
     string_heap: &crate::string::StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, IntrinsicError> {
     let mut out = String::new();
     let len = t.length();
@@ -352,10 +371,10 @@ fn join_into_string(
         if i > 0 {
             out.push_str(separator);
         }
-        let v = t.get(i);
+        let v = t.get(gc_heap, i).map_err(intrinsic_oom)?;
         match &v {
             Value::Undefined | Value::Null => {}
-            other => out.push_str(&other.display_string()),
+            other => out.push_str(&other.display_string(gc_heap)),
         }
     }
     Ok(Value::String(JsString::from_str(&out, string_heap)?))
@@ -364,7 +383,7 @@ fn join_into_string(
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    join_into_string(&t, ",", args.string_heap)
+    join_into_string(&t, ",", args.string_heap, args.gc_heap)
 }
 
 fn impl_to_locale_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -386,14 +405,18 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let off = offset as usize;
     let source = args.args.first().cloned().unwrap_or(Value::Undefined);
     let kind = t.kind();
-    let coerce = |v: &Value| -> Result<Value, IntrinsicError> {
-        crate::binary::dispatch::coerce_element_for_store(kind, v).map_err(|_| {
+    fn coerce(
+        kind: TypedArrayKind,
+        v: &Value,
+        gc_heap: &mut otter_gc::GcHeap,
+    ) -> Result<Value, IntrinsicError> {
+        crate::binary::dispatch::coerce_element_for_store(gc_heap, kind, v).map_err(|_| {
             IntrinsicError::BadArgument {
                 index: 0,
                 reason: "element type mismatch",
             }
         })
-    };
+    }
     match source {
         Value::TypedArray(src) => {
             let src_len = src.length();
@@ -404,15 +427,20 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
             // Snapshot first to handle aliasing of the same buffer.
-            let snapshot: Vec<Value> = (0..src_len).map(|i| src.get(i)).collect();
+            let snapshot: Vec<Value> = {
+                let mut tmp = Vec::with_capacity(src_len);
+                for i in 0..src_len {
+                    tmp.push(src.get(args.gc_heap, i).map_err(intrinsic_oom)?);
+                }
+                tmp
+            };
             for (i, v) in snapshot.iter().enumerate() {
-                let coerced = coerce(v)?;
-                t.set(off + i, &coerced);
+                let coerced = coerce(kind, v, args.gc_heap)?;
+                t.set(args.gc_heap, off + i, &coerced);
             }
         }
         Value::Array(arr) => {
-            let heap = &*args.gc_heap;
-            let src_len = crate::array::len(arr, heap);
+            let src_len = crate::array::len(arr, args.gc_heap);
             if off + src_len > t.length() {
                 return Err(IntrinsicError::BadArgument {
                     index: 0,
@@ -420,17 +448,17 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
             for i in 0..src_len {
-                let v = crate::array::get(arr, heap, i);
-                let coerced = coerce(&v)?;
-                t.set(off + i, &coerced);
+                let v = crate::array::get(arr, args.gc_heap, i);
+                let coerced = coerce(kind, &v, args.gc_heap)?;
+                t.set(args.gc_heap, off + i, &coerced);
             }
         }
         Value::Object(obj) => {
             // §22.2.3.23.1 step 14 — array-like Object source: read
             // `length` then `[0..len)` indexed values, coerced to
             // the destination kind.
-            let heap = &*args.gc_heap;
-            let len_value = crate::object::get(obj, heap, "length").unwrap_or(Value::Undefined);
+            let len_value =
+                crate::object::get(obj, args.gc_heap, "length").unwrap_or(Value::Undefined);
             let len_n = crate::number::to_number_value(&len_value);
             let src_len = if len_n.is_nan() || len_n <= 0.0 {
                 0
@@ -445,9 +473,9 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
             for i in 0..src_len {
                 let key = i.to_string();
-                let v = crate::object::get(obj, heap, &key).unwrap_or(Value::Undefined);
-                let coerced = coerce(&v)?;
-                t.set(off + i, &coerced);
+                let v = crate::object::get(obj, args.gc_heap, &key).unwrap_or(Value::Undefined);
+                let coerced = coerce(kind, &v, args.gc_heap)?;
+                t.set(args.gc_heap, off + i, &coerced);
             }
         }
         // §22.2.3.23.1 step 14 — `ToObject(array)` for primitive
@@ -468,8 +496,8 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 let ch = char::from_u32(*unit as u32).unwrap_or('\u{FFFD}');
                 let s_one = ch.to_string();
                 let v = Value::String(JsString::from_str(&s_one, args.string_heap)?);
-                let coerced = coerce(&v)?;
-                t.set(off + i, &coerced);
+                let coerced = coerce(kind, &v, args.gc_heap)?;
+                t.set(args.gc_heap, off + i, &coerced);
             }
         }
         Value::Number(_)
@@ -497,7 +525,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    let mut snapshot = copy_view(&t);
+    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
     snapshot.reverse();
     build_new_typed_array_rooted(args, t.kind(), &snapshot)
 }
@@ -505,18 +533,18 @@ fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
 fn impl_to_sorted_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    let mut snapshot = copy_view(&t);
-    sort_default(&mut snapshot, t.kind().is_bigint());
+    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
+    sort_default(&mut snapshot, t.kind().is_bigint(), args.gc_heap);
     build_new_typed_array_rooted(args, t.kind(), &snapshot)
 }
 
 fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    let mut snapshot = copy_view(&t);
-    sort_default(&mut snapshot, t.kind().is_bigint());
+    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
+    sort_default(&mut snapshot, t.kind().is_bigint(), args.gc_heap);
     for (i, v) in snapshot.iter().enumerate() {
-        t.set(i, v);
+        t.set(args.gc_heap, i, v);
     }
     Ok(Value::TypedArray(t))
 }
@@ -534,7 +562,7 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         });
     }
     let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
-    let mut snapshot = copy_view(&t);
+    let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
     snapshot[resolved as usize] = value;
     build_new_typed_array_rooted(args, t.kind(), &snapshot)
 }
@@ -574,7 +602,8 @@ fn impl_keys(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_values(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t)?;
-    Ok(wrap_iterator(args, copy_view(&t))?)
+    let values = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
+    wrap_iterator(args, values).map_err(intrinsic_oom)
 }
 
 fn impl_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -583,10 +612,11 @@ fn impl_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let len = t.length();
     let mut pairs: Vec<Value> = Vec::with_capacity(len);
     for i in 0..len {
-        let pair = args.array_from_elements_rooted([smi(i as i32), t.get(i)], &[], &[&pairs])?;
+        let element = t.get(args.gc_heap, i).map_err(intrinsic_oom)?;
+        let pair = args.array_from_elements_rooted([smi(i as i32), element], &[], &[&pairs])?;
         pairs.push(Value::Array(pair));
     }
-    Ok(wrap_iterator(args, pairs)?)
+    wrap_iterator(args, pairs).map_err(intrinsic_oom)
 }
 
 // ---- comparison helpers -------------------------------------------------
@@ -615,10 +645,12 @@ fn values_equal_zero(a: &Value, b: &Value) -> bool {
 
 /// Default sort: numeric ascending for number kinds, BigInt
 /// ascending for BigInt kinds. Per §23.2.3.30 step 4.
-fn sort_default(values: &mut [Value], bigint_kind: bool) {
+fn sort_default(values: &mut [Value], bigint_kind: bool, heap: &otter_gc::GcHeap) {
     if bigint_kind {
         values.sort_by(|a, b| match (a, b) {
-            (Value::BigInt(x), Value::BigInt(y)) => x.as_inner().cmp(y.as_inner()),
+            (Value::BigInt(x), Value::BigInt(y)) => {
+                x.with_inner(heap, |xb| y.with_inner(heap, |yb| xb.cmp(yb)))
+            }
             _ => std::cmp::Ordering::Equal,
         });
     } else {
@@ -734,8 +766,8 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("gc heap");
         let buffer = JsArrayBuffer::new(4);
         let source = JsTypedArray::new(buffer, TypedArrayKind::Int16, 0, 2);
-        source.set(0, &smi(7));
-        source.set(1, &smi(11));
+        source.set(&gc_heap, 0, &smi(7));
+        source.set(&gc_heap, 1, &smi(11));
         let receiver = Value::TypedArray(source);
         let before = gc_heap.tracked_bytes();
 

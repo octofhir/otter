@@ -99,6 +99,7 @@ pub use otter_compiler::{
     CompiledExport, CompiledImport, CompiledImportKind, CompiledModule, CompiledModuleMetadata,
     CompiledSourceSpan, LiveBindingSlot,
 };
+pub use otter_gc;
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use otter_vm::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
 pub use promise_registry::{HostSettleOutcome, PromiseId};
@@ -426,9 +427,13 @@ pub struct ExecutionResult {
 impl ExecutionResult {
     /// Build from an interpreter completion value.
     #[must_use]
-    fn from_vm_value(completion: otter_vm::Value, duration: Duration) -> Self {
+    fn from_vm_value(
+        completion: otter_vm::Value,
+        duration: Duration,
+        heap: &otter_gc::GcHeap,
+    ) -> Self {
         Self {
-            completion: completion.display_string(),
+            completion: completion.display_string(heap),
             exit_code: 0,
             duration,
         }
@@ -2110,8 +2115,10 @@ impl Runtime {
             }
             (Ok(v), Ok(())) => v,
         };
-        Ok(ExecutionResult::from_vm_value(value, start.elapsed())
-            .with_exit_code(process::exit_code(&self.interp)))
+        Ok(
+            ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap())
+                .with_exit_code(process::exit_code(&self.interp)),
+        )
     }
 
     /// Drain the microtask queue manually. Embedders that want to
@@ -2285,8 +2292,10 @@ impl Runtime {
             (Ok(v), Ok(())) => v,
         };
         self.module_records.mark_evaluated();
-        Ok(ExecutionResult::from_vm_value(value, start.elapsed())
-            .with_exit_code(process::exit_code(&self.interp)))
+        Ok(
+            ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap())
+                .with_exit_code(process::exit_code(&self.interp)),
+        )
     }
 
     fn module_loader_for_entry(&self, entry_path: &Path) -> module_loader::ModuleLoader {
@@ -3024,16 +3033,16 @@ fn diagnostic_from_thrown_value(
             return Diagnostic::new(
                 DiagnosticKind::Type,
                 DiagnosticCode::Uncaught,
-                primitive.display_string(),
+                primitive.display_string(heap),
             );
         }
     };
 
     let name = otter_vm::object::get(obj, heap, "name")
-        .map(|v| v.display_string())
+        .map(|v| v.display_string(heap))
         .unwrap_or_else(|| "Error".to_string());
     let message = otter_vm::object::get(obj, heap, "message")
-        .map(|v| v.display_string())
+        .map(|v| v.display_string(heap))
         .unwrap_or_default();
     let full = if message.is_empty() {
         name.clone()

@@ -1221,6 +1221,17 @@ pub fn read_upvalue(heap: &otter_gc::GcHeap, cell: UpvalueCell) -> Value {
     heap.read_payload(cell, |body| body.value.clone())
 }
 
+/// Map an [`otter_gc::OutOfMemory`] from a GC body allocation into the
+/// runtime-shaped [`VmError::OutOfMemory`]. Used by every value-model
+/// helper that surfaces an allocation failure to the dispatcher.
+#[must_use]
+pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
+    VmError::OutOfMemory {
+        requested_bytes: err.requested_bytes(),
+        heap_limit_bytes: err.heap_limit_bytes(),
+    }
+}
+
 /// Write `value` into `cell`, firing the generational write
 /// barrier so the scavenger sees any newly-established
 /// old → young pointer.
@@ -1368,6 +1379,9 @@ impl Value {
             Value::Symbol(symbol) => {
                 symbol.trace_value_slots(visitor);
             }
+            Value::BigInt(big) => {
+                big.trace_value_slots(visitor);
+            }
             _ => {}
         }
     }
@@ -1379,9 +1393,12 @@ impl Value {
     }
 
     /// Render the value as a debug-style string suitable for CLI
-    /// preview output (e.g., `otter -p '"abc"'`).
+    /// preview output (e.g., `otter -p '"abc"'`). The BigInt arm
+    /// reads the body through `heap` to render its decimal form;
+    /// every other primitive short-circuits without touching the
+    /// heap.
     #[must_use]
-    pub fn display_string(&self) -> String {
+    pub fn display_string(&self, heap: &otter_gc::GcHeap) -> String {
         match self {
             Value::Undefined | Value::Hole => "undefined".to_string(),
             Value::Null => "null".to_string(),
@@ -1389,7 +1406,7 @@ impl Value {
             Value::Number(n) => n.to_display_string(),
             // BigInt rendering matches `BigInt.prototype.toString`:
             // decimal digits, no `n` suffix.
-            Value::BigInt(b) => b.to_decimal_string(),
+            Value::BigInt(b) => b.to_decimal_string(heap),
             Value::String(s) => s.to_lossy_string(),
             Value::Symbol(s) => s.descriptive_string(),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
@@ -1435,9 +1452,11 @@ impl Value {
     }
 
     /// Spec [`ToBoolean`](https://tc39.es/ecma262/#sec-toboolean)
-    /// for the foundation subset.
+    /// for the foundation subset. The BigInt arm reads the body
+    /// through `heap` to obtain its sign; every other primitive
+    /// short-circuits without touching the heap.
     #[must_use]
-    pub fn to_boolean(&self) -> bool {
+    pub fn to_boolean(&self, heap: &otter_gc::GcHeap) -> bool {
         match self {
             Value::Undefined | Value::Null | Value::Hole => false,
             Value::Boolean(b) => *b,
@@ -1449,7 +1468,7 @@ impl Value {
                 }
             }
             // Spec ToBoolean(BigInt): false iff zero.
-            Value::BigInt(b) => !b.as_inner().sign().eq(&num_bigint::Sign::NoSign),
+            Value::BigInt(b) => !b.is_zero(heap),
             Value::String(s) => !s.is_empty(),
             // Symbol is always truthy per ECMA-262 §7.1.2; same for
             // every object-shaped reference type.
@@ -1641,8 +1660,13 @@ impl PartialEq for Value {
             (Value::Number(a), Value::Number(b)) => number::equals(*a, *b),
             // Strict equality across Number / BigInt is always
             // `false` per spec; the wildcard arm below handles
-            // the cross-kind case.
-            (Value::BigInt(a), Value::BigInt(b)) => a == b,
+            // the cross-kind case. This arm compares by
+            // **handle offset** (identity) — `PartialEq` cannot
+            // consult the GC heap. Spec `===` / `SameValue` for
+            // BigInt-BigInt is numeric equality, served by
+            // `abstract_ops::same_value` (which routes through
+            // `BigIntValue::numeric_eq`).
+            (Value::BigInt(a), Value::BigInt(b)) => a.ptr_eq(*b),
             (Value::String(a), Value::String(b)) => a.equals(b),
             // Symbol identity is ptr_eq on the inner Rc — distinct
             // `Symbol("x")` calls compare unequal even with matching
@@ -2915,7 +2939,7 @@ impl Interpreter {
                     &[&this_value],
                     slice_roots,
                 )?;
-                object::set_bigint_data(obj, &mut self.gc_heap, value.clone());
+                object::set_bigint_data(obj, &mut self.gc_heap, *value);
                 obj
             }
             _ => return Ok(this_value),
@@ -2982,7 +3006,7 @@ impl Interpreter {
                     &[&this_value],
                     slice_roots,
                 )?;
-                object::set_bigint_data(obj, &mut self.gc_heap, value.clone());
+                object::set_bigint_data(obj, &mut self.gc_heap, *value);
                 obj
             }
             _ => return Ok(this_value),
@@ -4542,7 +4566,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    let truthy = read_register(frame, src)?.to_boolean();
+                    let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::Boolean(!truthy))?;
                     frame.pc += 1;
                     continue;
@@ -4555,7 +4579,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    let truthy = read_register(frame, src)?.to_boolean();
+                    let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
                     write_register(frame, dst, Value::Boolean(truthy))?;
                     frame.pc += 1;
                     continue;
@@ -5106,7 +5130,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    if read_register(frame, cond)?.to_boolean() {
+                    if read_register(frame, cond)?.to_boolean(&self.gc_heap) {
                         apply_branch(frame, offset, &self.interrupt)?;
                     } else {
                         frame.pc += 1;
@@ -5121,7 +5145,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    if !read_register(frame, cond)?.to_boolean() {
+                    if !read_register(frame, cond)?.to_boolean(&self.gc_heap) {
                         apply_branch(frame, offset, &self.interrupt)?;
                     } else {
                         frame.pc += 1;

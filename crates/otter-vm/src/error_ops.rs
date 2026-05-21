@@ -498,5 +498,5 @@ pub(crate) fn render_thrown_value(value: &Value, gc_heap: &otter_gc::GcHeap) -> 
             }
         }
     }
-    value.display_string()
+    value.display_string(gc_heap)
 }

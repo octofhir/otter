@@ -41,6 +41,7 @@ pub mod bigint;
 pub mod binary;
 pub mod boolean;
 mod call_ops;
+pub mod closure;
 mod coerce;
 mod collection_ops;
 pub mod collections;
@@ -159,6 +160,9 @@ use executable::ExecutableFunction;
 use operand_decode::{apply_branch, register_operand};
 
 pub use array::JsArray;
+pub use closure::{
+    JS_CLOSURE_BODY_TYPE_TAG, JsClosure, JsClosureBody, alloc_closure, alloc_closure_with_roots,
+};
 pub use collections::{CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet, MapKey};
 pub use console::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use dynamic_import::{DynamicImportLoader, DynamicImportLoaderHandle, DynamicImportRegistry};

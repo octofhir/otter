@@ -628,6 +628,151 @@ impl Value {
     }
 
     // -----------------------------------------------------------------------
+    // Per-type predicates (object-family). Each consults the body's
+    // `GcHeader::type_tag` so a `Value::array` never reports itself as
+    // a `Value::map` and vice versa.
+    // -----------------------------------------------------------------------
+
+    /// Ordinary object body (`ObjectBody` type tag).
+    #[inline]
+    #[must_use]
+    pub fn is_object(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<ObjectBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Array body.
+    #[inline]
+    #[must_use]
+    pub fn is_array(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<ArrayBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Map body.
+    #[inline]
+    #[must_use]
+    pub fn is_map(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<MapBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Set body.
+    #[inline]
+    #[must_use]
+    pub fn is_set(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<SetBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// WeakMap body.
+    #[inline]
+    #[must_use]
+    pub fn is_weak_map(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<WeakMapBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// WeakSet body.
+    #[inline]
+    #[must_use]
+    pub fn is_weak_set(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<WeakSetBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// WeakRef body.
+    #[inline]
+    #[must_use]
+    pub fn is_weak_ref(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<WeakRefBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// FinalizationRegistry body.
+    #[inline]
+    #[must_use]
+    pub fn is_finalization_registry(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<FinalizationRegistryBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Promise body.
+    #[inline]
+    #[must_use]
+    pub fn is_promise(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<PurePromiseBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// RegExp body.
+    #[inline]
+    #[must_use]
+    pub fn is_regexp(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag() == Some(<JsRegExpBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Generator body.
+    #[inline]
+    #[must_use]
+    pub fn is_generator(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<GeneratorBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Iterator body.
+    #[inline]
+    #[must_use]
+    pub fn is_iterator(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<IteratorState as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-type predicates (function-family).
+    // -----------------------------------------------------------------------
+
+    /// Closure body.
+    #[inline]
+    #[must_use]
+    pub fn is_closure(self) -> bool {
+        top_tag(self.0) == TAG_PTR_FUNCTION
+            && self.read_gc_type_tag() == Some(JS_CLOSURE_BODY_TYPE_TAG)
+    }
+
+    /// Bound function body.
+    #[inline]
+    #[must_use]
+    pub fn is_bound_function(self) -> bool {
+        top_tag(self.0) == TAG_PTR_FUNCTION
+            && self.read_gc_type_tag()
+                == Some(<BoundFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Native function body.
+    #[inline]
+    #[must_use]
+    pub fn is_native_function(self) -> bool {
+        top_tag(self.0) == TAG_PTR_FUNCTION
+            && self.read_gc_type_tag()
+                == Some(<NativeFunctionBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// Class-constructor wrapper body.
+    #[inline]
+    #[must_use]
+    pub fn is_class_constructor(self) -> bool {
+        top_tag(self.0) == TAG_PTR_FUNCTION
+            && self.read_gc_type_tag()
+                == Some(<ClassConstructorBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    // -----------------------------------------------------------------------
     // Accessors
     // -----------------------------------------------------------------------
 
@@ -891,12 +1036,62 @@ mod tests {
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
         let v = Value::object(obj);
         assert!(v.is_object_like());
+        assert!(v.is_object());
+        assert!(!v.is_array());
+        assert!(!v.is_map());
+        assert!(!v.is_promise());
+        assert!(!v.is_closure());
         assert_eq!(v.as_object(), Some(obj));
-        // Object body type-tag must reject array / map / set casts.
         assert_eq!(v.as_array(), None);
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
         assert_eq!(v.as_closure(), None);
+    }
+
+    #[test]
+    fn predicates_disambiguate_object_and_function_families() {
+        use crate::{alloc_closure, alloc_upvalue, Value as LegacyValue};
+        use crate::object::alloc_object_with_roots;
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
+        let closure = alloc_closure(&mut heap, 1, vec![cell].into_boxed_slice(), None)
+            .expect("closure");
+
+        let vo = Value::object(obj);
+        let vc = Value::closure(closure);
+        let vfid = Value::function_id(7);
+
+        // Object positive / negative.
+        assert!(vo.is_object());
+        assert!(!vo.is_closure());
+        assert!(!vo.is_function_id());
+        assert!(!vo.is_callable());
+
+        // Closure positive / negative.
+        assert!(vc.is_callable());
+        assert!(vc.is_closure());
+        assert!(!vc.is_function_id());
+        assert!(!vc.is_bound_function());
+        assert!(!vc.is_native_function());
+        assert!(!vc.is_class_constructor());
+        assert!(!vc.is_object());
+
+        // FunctionId positive / negative.
+        assert!(vfid.is_callable());
+        assert!(vfid.is_function_id());
+        assert!(!vfid.is_closure());
+        assert!(!vfid.is_object_like());
+
+        // Immediates report no object-family / callable membership.
+        assert!(!Value::null().is_object());
+        assert!(!Value::undefined().is_object_like());
+        assert!(!Value::boolean(true).is_callable());
+        assert!(!Value::number_i32(0).is_object());
     }
 
     #[test]

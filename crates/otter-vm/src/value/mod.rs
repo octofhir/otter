@@ -49,7 +49,10 @@ pub mod tag;
 
 use crate::array::{ArrayBody, JsArray};
 use crate::bigint::{BigIntBody, BigIntHandle};
-use crate::binary::{DataViewBodyGc, DataViewHandle, TypedArrayBodyGc, TypedArrayHandle};
+use crate::binary::{
+    DataViewBodyGc, DataViewHandle, LocalArrayBufferBodyGc, LocalArrayBufferHandle,
+    SharedArrayBufferBodyGc, SharedArrayBufferHandle, TypedArrayBodyGc, TypedArrayHandle,
+};
 use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
 use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
 use crate::generator::{GeneratorBody, JsGenerator};
@@ -452,6 +455,24 @@ impl Value {
     #[must_use]
     pub fn typed_array_gc(t: TypedArrayHandle) -> Self {
         Self::from_object_gc(t.raw())
+    }
+
+    /// GC-managed non-shared `ArrayBuffer` body handle. Migration
+    /// target for the legacy `BufferStorage::Local(Rc<LocalBody>)`
+    /// case.
+    #[inline]
+    #[must_use]
+    pub fn local_array_buffer_gc(b: LocalArrayBufferHandle) -> Self {
+        Self::from_object_gc(b.raw())
+    }
+
+    /// GC-managed `SharedArrayBuffer` body handle. The body wraps an
+    /// `Arc<SharedBody>` (cross-thread bytes stay outside the GC
+    /// cage); the GC body's Rust drop releases the refcount.
+    #[inline]
+    #[must_use]
+    pub fn shared_array_buffer_gc(b: SharedArrayBufferHandle) -> Self {
+        Self::from_object_gc(b.raw())
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1213,6 +1234,51 @@ impl Value {
         self.is_object_like()
             && self.read_gc_type_tag()
                 == Some(<TypedArrayBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// GC-managed non-shared `ArrayBuffer` body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_local_array_buffer_gc(self) -> Option<LocalArrayBufferHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<LocalArrayBufferBodyGc>()
+    }
+
+    /// `true` when the value is a GC-managed Local ArrayBuffer body.
+    #[inline]
+    #[must_use]
+    pub fn is_local_array_buffer_gc(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<LocalArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// GC-managed `SharedArrayBuffer` body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_shared_array_buffer_gc(self) -> Option<SharedArrayBufferHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<SharedArrayBufferBodyGc>()
+    }
+
+    /// `true` when the value is a GC-managed Shared ArrayBuffer body.
+    #[inline]
+    #[must_use]
+    pub fn is_shared_array_buffer_gc(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<SharedArrayBufferBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// `true` when the value is either Local or Shared ArrayBuffer.
+    #[inline]
+    #[must_use]
+    pub fn is_array_buffer_gc(self) -> bool {
+        self.is_local_array_buffer_gc() || self.is_shared_array_buffer_gc()
     }
 }
 

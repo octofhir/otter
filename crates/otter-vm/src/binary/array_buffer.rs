@@ -53,6 +53,105 @@ fn allocate_shared_id() -> u64 {
     NEXT_SHARED_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
+/// [`LocalArrayBufferBodyGc`].
+pub const LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG: u8 = 0x2c;
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
+/// [`SharedArrayBufferBodyGc`].
+pub const SHARED_ARRAY_BUFFER_BODY_TYPE_TAG: u8 = 0x2d;
+
+/// GC-managed migration target for [`LocalBody`].
+///
+/// Diverges from the legacy body in three ways:
+/// - `bytes` is a plain `Vec<u8>` rather than `RefCell<Vec<u8>>` —
+///   mutators flip through [`otter_gc::GcHeap::with_payload`].
+/// - `detached` is a plain `bool` rather than `Cell<bool>`.
+/// - `external` is a plain `Option<ExternalMemory>` rather than
+///   `RefCell<Option<ExternalMemory>>`.
+///
+/// All three changes honour `feedback_no_cell_refcell_leak`. The
+/// `SafeTraceable` impl is a no-op because the body holds no GC
+/// references.
+#[derive(Debug)]
+pub struct LocalArrayBufferBodyGc {
+    /// Raw bytes. Empty when detached.
+    pub bytes: Vec<u8>,
+    /// `true` after detach / transfer; once set, stays set per spec.
+    pub detached: bool,
+    /// `Some(n)` for a resizable buffer; `None` for a fixed-length
+    /// buffer.
+    pub max_byte_length: Option<usize>,
+    /// GC-budget reservation for the off-heap byte storage.
+    pub external: Option<otter_gc::ExternalMemory>,
+}
+
+impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
+    const TYPE_TAG: u8 = LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {}
+}
+
+/// 4-byte compressed GC handle to a [`LocalArrayBufferBodyGc`].
+/// `Copy`.
+pub type LocalArrayBufferHandle = otter_gc::Gc<LocalArrayBufferBodyGc>;
+
+/// Allocate a Local `ArrayBuffer` body on the GC heap.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_local_array_buffer(
+    heap: &mut otter_gc::GcHeap,
+    bytes: Vec<u8>,
+    max_byte_length: Option<usize>,
+    external: Option<otter_gc::ExternalMemory>,
+) -> Result<LocalArrayBufferHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(LocalArrayBufferBodyGc {
+        bytes,
+        detached: false,
+        max_byte_length,
+        external,
+    })
+}
+
+/// GC-managed migration target for the [`SharedBody`] case.
+///
+/// SharedArrayBuffer storage is genuinely cross-thread (Atomics +
+/// `Mutex<Vec<u8>>`) so the bytes cannot move into the
+/// single-mutator GC cage. The GC body therefore owns the
+/// `Arc<SharedBody>` as plain Rust data; the body's Rust drop
+/// releases the refcount. The trace impl is a no-op (no GC slots).
+#[derive(Debug)]
+pub struct SharedArrayBufferBodyGc {
+    /// Underlying shared backing store. The `Arc` is the
+    /// cross-thread refcount that survives the GC body's lifetime;
+    /// every clone of the wrapper bumps it.
+    pub inner: Arc<SharedBody>,
+}
+
+impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
+    const TYPE_TAG: u8 = SHARED_ARRAY_BUFFER_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {}
+}
+
+/// 4-byte compressed GC handle to a [`SharedArrayBufferBodyGc`].
+/// `Copy`.
+pub type SharedArrayBufferHandle = otter_gc::Gc<SharedArrayBufferBodyGc>;
+
+/// Allocate a Shared `ArrayBuffer` body on the GC heap.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_shared_array_buffer(
+    heap: &mut otter_gc::GcHeap,
+    inner: Arc<SharedBody>,
+) -> Result<SharedArrayBufferHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(SharedArrayBufferBodyGc { inner })
+}
+
 /// Cheap-to-clone `ArrayBuffer` / `SharedArrayBuffer` handle.
 #[derive(Debug, Clone)]
 pub struct JsArrayBuffer {

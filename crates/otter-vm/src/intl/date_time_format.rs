@@ -57,11 +57,11 @@ pub fn resolve(
     }
 }
 
-fn require_date_time<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a DateTimeFormatPayload, IntrinsicError> {
+fn require_date_time(
+    args: &IntrinsicArgs<'_>,
+) -> Result<DateTimeFormatPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::DateTimeFormat(d) => Ok(d),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.DateTimeFormat",
@@ -76,11 +76,11 @@ fn require_date_time<'a>(
 fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_date_time(args)?;
     let formatted = match args.args.first() {
-        Some(Value::Number(n)) => format_epoch_ms(n.as_f64() as i64, payload),
+        Some(Value::Number(n)) => format_epoch_ms(n.as_f64() as i64, &payload),
         Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::PlainDateTime(pdt) => format_pdt(pdt, payload),
-            TemporalPayload::PlainDate(pd) => format_pd(pd, payload),
-            TemporalPayload::Instant(inst) => format_epoch_ms(inst.epoch_milliseconds(), payload),
+            TemporalPayload::PlainDateTime(pdt) => format_pdt(pdt, &payload),
+            TemporalPayload::PlainDate(pd) => format_pd(pd, &payload),
+            TemporalPayload::Instant(inst) => format_epoch_ms(inst.epoch_milliseconds(), &payload),
             _ => {
                 return Err(IntrinsicError::BadArgument {
                     index: 0,
@@ -94,7 +94,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            format_epoch_ms(now, payload)
+            format_epoch_ms(now, &payload)
         }
         _ => {
             return Err(IntrinsicError::BadArgument {

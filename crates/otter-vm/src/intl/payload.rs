@@ -14,8 +14,6 @@
 //! # See also
 //! - <https://tc39.es/ecma402/>
 
-use std::rc::Rc;
-
 use icu_collator::options::{CaseLevel, Strength};
 
 /// Resolved option bag for `Intl.Collator`.
@@ -278,35 +276,80 @@ pub fn alloc_intl(
 }
 
 /// Heap handle for [`crate::Value::Intl`].
-#[derive(Debug, Clone)]
+///
+/// Backed by a GC body ([`IntlBody`]) — the legacy `Rc<IntlPayload>`
+/// storage has been retired. The wrapper carries a cached
+/// [`IntlKind`] discriminator so prototype routing and `typeof`
+/// display can avoid a heap read; the full payload still lives in
+/// the GC body.
+#[derive(Debug, Clone, Copy)]
 pub struct JsIntl {
-    inner: Rc<IntlPayload>,
+    inner: IntlHandle,
+    kind: IntlKind,
 }
 
 impl JsIntl {
-    /// Wrap a payload in a fresh handle.
-    #[must_use]
-    pub fn new(payload: IntlPayload) -> Self {
-        Self {
-            inner: Rc::new(payload),
-        }
+    /// Allocate a fresh handle wrapping `payload` on the GC heap.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn new(
+        heap: &mut otter_gc::GcHeap,
+        payload: IntlPayload,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let kind = payload.kind();
+        Ok(Self {
+            inner: alloc_intl(heap, payload)?,
+            kind,
+        })
     }
 
-    /// Borrow the payload.
+    /// Run `f` against the payload borrowed from the GC body.
+    ///
+    /// The closure receives `&IntlPayload`; the borrow does not
+    /// escape so the call is sound against the single-mutator
+    /// otter-gc contract.
+    #[inline]
     #[must_use]
-    pub fn payload(&self) -> &IntlPayload {
-        &self.inner
+    pub fn with_payload<F, R>(self, heap: &otter_gc::GcHeap, f: F) -> R
+    where
+        F: FnOnce(&IntlPayload) -> R,
+    {
+        heap.read_payload(self.inner, |body| f(&body.payload))
     }
 
-    /// Tag for prototype routing.
+    /// Clone the payload out of the GC body. Used by call sites that
+    /// need to return the payload across a borrow boundary (e.g. the
+    /// per-variant `require_X` helpers). `IntlPayload` variants hold
+    /// small Clone-able settings + ICU objects; cost is acceptable
+    /// for non-hot Intl call sites.
+    #[inline]
     #[must_use]
-    pub fn kind(&self) -> IntlKind {
-        self.inner.kind()
+    pub fn payload_clone(self, heap: &otter_gc::GcHeap) -> IntlPayload {
+        heap.read_payload(self.inner, |body| body.payload.clone())
     }
 
-    /// Identity comparison via `Rc::ptr_eq`.
+    /// Tag for prototype routing. Read from the wrapper-side cache
+    /// without a heap touch.
+    #[inline]
     #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+    pub fn kind(self) -> IntlKind {
+        self.kind
+    }
+
+    /// Raw GC handle — used by tracing and write barriers.
+    #[doc(hidden)]
+    #[inline]
+    #[must_use]
+    pub fn handle(self) -> IntlHandle {
+        self.inner
+    }
+
+    /// Identity comparison — `===` follows compressed-offset equality.
+    #[inline]
+    #[must_use]
+    pub fn ptr_eq(self, other: Self) -> bool {
+        self.inner == other.inner
     }
 }

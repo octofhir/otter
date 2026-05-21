@@ -1410,6 +1410,8 @@ impl Value {
             // (e.g. `Date.prototype.toString`) format the slot
             // themselves with heap access.
             Value::Intl(i) => format!("[object Intl.{}]", i.kind().class_name()),
+            // `i.kind()` is now wrapper-cached so this works without
+            // heap access.
             Value::ArrayBuffer(b) => {
                 if b.is_shared() {
                     "[object SharedArrayBuffer]".to_string()
@@ -1668,7 +1670,7 @@ impl PartialEq for Value {
             (Value::WeakRef(a), Value::WeakRef(b)) => a == b,
             (Value::FinalizationRegistry(a), Value::FinalizationRegistry(b)) => a == b,
             (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(b),
-            (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(b),
+            (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(*b),
             (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(b),
             (Value::DataView(a), Value::DataView(b)) => a.ptr_eq(b),
             (Value::TypedArray(a), Value::TypedArray(b)) => a.ptr_eq(b),

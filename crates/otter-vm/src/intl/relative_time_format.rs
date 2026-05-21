@@ -30,11 +30,9 @@ pub fn resolve(
     }
 }
 
-fn require_payload<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a RelativeTimeFormatPayload, IntrinsicError> {
+fn require_payload(args: &IntrinsicArgs<'_>) -> Result<RelativeTimeFormatPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::RelativeTimeFormat(p) => Ok(p),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.RelativeTimeFormat",
@@ -119,7 +117,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             });
         }
     };
-    let rendered = render_format(value, &unit, payload);
+    let rendered = render_format(value, &unit, &payload);
     Ok(Value::String(crate::string::JsString::from_str(
         &rendered,
         args.string_heap,

@@ -27,11 +27,9 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> L
     }
 }
 
-fn require_payload<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a ListFormatPayload, IntrinsicError> {
+fn require_payload(args: &IntrinsicArgs<'_>) -> Result<ListFormatPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::ListFormat(p) => Ok(p),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.ListFormat",
@@ -106,7 +104,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let heap = &*args.gc_heap;
     let items = collect_items(args.args.first(), heap)?;
-    let rendered = join(&items, payload);
+    let rendered = join(&items, &payload);
     Ok(Value::String(crate::string::JsString::from_str(
         &rendered,
         args.string_heap,

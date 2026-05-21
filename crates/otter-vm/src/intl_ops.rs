@@ -32,8 +32,8 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let locale = read_register(frame, locale_reg)?.clone();
         let options = read_register(frame, options_reg)?.clone();
-        let value =
-            intl::construct(class, &locale, &options, &self.gc_heap).map_err(intl_to_vm_error)?;
+        let value = intl::construct(class, &locale, &options, &mut self.gc_heap)
+            .map_err(intl_to_vm_error)?;
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())

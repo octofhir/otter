@@ -29,11 +29,9 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> D
     }
 }
 
-fn require_payload<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a DisplayNamesPayload, IntrinsicError> {
+fn require_payload(args: &IntrinsicArgs<'_>) -> Result<DisplayNamesPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::DisplayNames(p) => Ok(p),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.DisplayNames",

@@ -38,11 +38,9 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> C
     }
 }
 
-fn require_collator<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a CollatorPayload, IntrinsicError> {
+fn require_collator(args: &IntrinsicArgs<'_>) -> Result<CollatorPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::Collator(c) => Ok(c),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.Collator",
@@ -68,7 +66,7 @@ fn impl_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(Value::Boolean(b)) => if *b { "true" } else { "false" }.to_string(),
         _ => return Ok(Value::Number(NumberValue::from_i32(0))),
     };
-    let n = compare_with_payload(&x, &y, payload);
+    let n = compare_with_payload(&x, &y, &payload);
     Ok(Value::Number(NumberValue::from_i32(n)))
 }
 

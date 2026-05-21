@@ -91,11 +91,9 @@ pub fn resolve(
     })
 }
 
-fn require_number_format<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a NumberFormatPayload, IntrinsicError> {
+fn require_number_format(args: &IntrinsicArgs<'_>) -> Result<NumberFormatPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::NumberFormat(n) => Ok(n),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.NumberFormat",
@@ -122,7 +120,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(Value::Null) => 0.0,
         _ => f64::NAN,
     };
-    let rendered = format_number(n, payload);
+    let rendered = format_number(n, &payload);
     js_string(&rendered, args.string_heap).map_err(intl_to_intrinsic)
 }
 

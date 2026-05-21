@@ -27,11 +27,9 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> S
     }
 }
 
-fn require_payload<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a SegmenterPayload, IntrinsicError> {
+fn require_payload(args: &IntrinsicArgs<'_>) -> Result<SegmenterPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::Segmenter(p) => Ok(p),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.Segmenter",
@@ -198,10 +196,16 @@ mod tests {
     fn segment_uses_intrinsic_rooted_young_allocation() {
         let strings = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let receiver = Value::Intl(JsIntl::new(IntlPayload::Segmenter(SegmenterPayload {
-            locale: "en-US".to_string(),
-            granularity: "word".to_string(),
-        })));
+        let receiver = Value::Intl(
+            JsIntl::new(
+                &mut gc_heap,
+                IntlPayload::Segmenter(SegmenterPayload {
+                    locale: "en-US".to_string(),
+                    granularity: "word".to_string(),
+                }),
+            )
+            .expect("intl"),
+        );
         let input = Value::String(JsString::from_str("alpha beta", &strings).expect("input"));
         let args = [input];
         let before = gc_heap.stats().new_allocated_bytes;

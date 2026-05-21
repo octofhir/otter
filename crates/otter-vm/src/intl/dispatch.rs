@@ -89,7 +89,7 @@ pub fn construct(
     class: &str,
     locale: &Value,
     options: &Value,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, IntlError> {
     let kind = IntlKind::from_class_name(class)
         .ok_or_else(|| IntlError::UnknownClass(class.to_string()))?;
@@ -115,5 +115,10 @@ pub fn construct(
         }
         IntlKind::Segmenter => IntlPayload::Segmenter(segmenter::resolve(locale, options, gc_heap)),
     };
-    Ok(Value::Intl(JsIntl::new(payload)))
+    Ok(Value::Intl(JsIntl::new(gc_heap, payload).map_err(
+        |_| IntlError::OutOfMemory {
+            requested_bytes: 0,
+            heap_limit_bytes: 0,
+        },
+    )?))
 }

@@ -51,11 +51,9 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> P
     }
 }
 
-fn require_payload<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a PluralRulesPayload, IntrinsicError> {
+fn require_payload(args: &IntrinsicArgs<'_>) -> Result<PluralRulesPayload, IntrinsicError> {
     match args.receiver {
-        Value::Intl(intl) => match intl.payload() {
+        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
             IntlPayload::PluralRules(p) => Ok(p),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Intl.PluralRules",

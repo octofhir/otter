@@ -121,9 +121,8 @@ pub fn runtime_string_value(
     ctx: &mut RuntimeNativeCtx<'_>,
     value: &str,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
-    let heap = ctx.interp_mut().string_heap_clone();
     Ok(RuntimeValue::String(
-        RuntimeJsString::from_str(value, &heap)
+        RuntimeJsString::from_str(value, ctx.heap())
             .map_err(|err| runtime_type_error("string", err.to_string()))?,
     ))
 }

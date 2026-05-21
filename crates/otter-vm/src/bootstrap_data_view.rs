@@ -111,9 +111,8 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     object::define_own_property(
@@ -134,7 +133,6 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 /// Install `DataView.prototype[@@toStringTag] = "DataView"`.
 pub fn install_data_view_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -144,7 +142,7 @@ pub fn install_data_view_well_knowns_post_bootstrap(
         return Ok(());
     };
     let descriptor = ctor
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data {
@@ -155,7 +153,7 @@ pub fn install_data_view_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let tag = crate::string::JsString::from_str("DataView", string_heap)
+    let tag = crate::string::JsString::from_str("DataView", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
@@ -322,15 +320,11 @@ fn dispatch_method(
     } else {
         args.iter().cloned().collect()
     };
-    let (string_heap, allocation_roots) = {
-        let interp = ctx.interp_mut();
-        (interp.string_heap_clone(), interp.collect_runtime_roots())
-    };
+    let allocation_roots = ctx.collect_native_roots();
     let gc_heap = ctx.heap_mut();
     let mut intrinsic_args = IntrinsicArgs {
         receiver: &receiver,
         args: &small_args,
-        string_heap: &string_heap,
         gc_heap,
         allocation_roots: allocation_roots.as_slice(),
     };

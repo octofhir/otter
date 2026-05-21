@@ -70,16 +70,11 @@ pub enum IntlError {
     },
 }
 
-impl From<crate::string::StringError> for IntlError {
-    fn from(err: crate::string::StringError) -> Self {
-        match err {
-            crate::string::StringError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => Self::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            },
+impl From<otter_gc::OutOfMemory> for IntlError {
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
         }
     }
 }

@@ -27,7 +27,6 @@ use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
 use crate::object::JsObject;
-use crate::string::StringHeap;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{
     alloc_temporal_value, js_string_value, make_temporal, optional_object_arg, read_i64_field,
@@ -38,13 +37,11 @@ use crate::temporal::payload::{JsTemporal, TemporalPayload};
 /// Dispatch `Temporal.Duration.<method>(args...)` via the typed
 /// [`TemporalMethod`].
 pub fn dispatch_static(
-    string_heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
     use otter_bytecode::method_id::TemporalMethod as M;
-    let _ = string_heap;
     match method {
         M::From => from(args, gc_heap),
         M::Compare => compare(args, gc_heap),

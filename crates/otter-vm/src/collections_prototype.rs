@@ -758,11 +758,9 @@ fn make_native_iter_value(
 mod tests {
     use super::*;
     use crate::number::NumberValue;
-    use crate::string::StringHeap;
 
     #[test]
     fn map_set_uses_intrinsic_rooted_reservation() {
-        let strings = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let map = collections::alloc_map(&mut gc_heap).expect("map");
         let receiver = Value::Map(map);
@@ -775,7 +773,6 @@ mod tests {
         let result = impl_map_set(&mut IntrinsicArgs {
             receiver: &receiver,
             args: &args,
-            string_heap: &strings,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
@@ -791,7 +788,6 @@ mod tests {
 
     #[test]
     fn set_add_uses_intrinsic_rooted_reservation() {
-        let strings = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let set = collections::alloc_set(&mut gc_heap).expect("set");
         let receiver = Value::Set(set);
@@ -801,7 +797,6 @@ mod tests {
         let result = impl_set_add(&mut IntrinsicArgs {
             receiver: &receiver,
             args: &args,
-            string_heap: &strings,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })

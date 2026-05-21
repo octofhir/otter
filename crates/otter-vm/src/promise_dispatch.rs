@@ -41,7 +41,7 @@ use crate::promise::{
     JsPromise, JsPromiseHandle, PromiseCapability, PromiseSettleJobs, PromiseState,
     PromiseThenOutcome,
 };
-use crate::string::{JsString, StringHeap};
+use crate::string::JsString;
 use crate::{Frame, Interpreter, NativeCtx, Value};
 use otter_gc::raw::{RawGc, SlotVisitor};
 use smallvec::{SmallVec, smallvec};
@@ -1200,19 +1200,16 @@ fn call_capability_reject(
     call_capability_function(interp, cap, &cap.reject, reason)
 }
 
-fn native_error_rejection_value(err: NativeError) -> Value {
+fn native_error_rejection_value(err: NativeError, heap: &otter_gc::GcHeap) -> Value {
     if let NativeError::Thrown { message, .. } = err {
         return Value::String(
-            crate::JsString::from_str(&message, &crate::StringHeap::default()).unwrap_or_else(
-                |_| {
-                    crate::JsString::from_str("", &crate::StringHeap::default())
-                        .expect("empty string allocates")
-                },
-            ),
+            crate::JsString::from_str(&message, heap).unwrap_or_else(|_| {
+                crate::JsString::from_str("", heap).expect("empty string allocates")
+            }),
         );
     }
     let vm_error = crate::native_to_vm_error(err);
-    crate::error_ops::vm_err_to_value(&vm_error)
+    crate::error_ops::vm_err_to_value(&vm_error, heap)
 }
 
 fn native_error_rejection_value_preserving_throw(
@@ -1224,7 +1221,7 @@ fn native_error_rejection_value_preserving_throw(
     {
         return value;
     }
-    native_error_rejection_value(err)
+    native_error_rejection_value(err, interp.gc_heap())
 }
 
 fn reject_capability_error(
@@ -1548,11 +1545,14 @@ fn static_try_generic(
             call_capability_resolve(interp, &cap, value)?;
         }
         Err(crate::VmError::Uncaught { value }) => {
-            let reason = crate::error_ops::vm_err_to_value(&crate::VmError::Uncaught { value });
+            let reason = crate::error_ops::vm_err_to_value(
+                &crate::VmError::Uncaught { value },
+                interp.gc_heap(),
+            );
             call_capability_reject(interp, &cap, reason)?;
         }
         Err(other) => {
-            let reason = crate::error_ops::vm_err_to_value(&other);
+            let reason = crate::error_ops::vm_err_to_value(&other, interp.gc_heap());
             call_capability_reject(interp, &cap, reason)?;
         }
     }
@@ -1603,8 +1603,7 @@ fn static_all_keyed_generic(
             },
         );
     }
-    let string_heap = interp.string_heap_clone();
-    let all_keys = match interp.own_property_keys_value(&exec, &promises, &string_heap) {
+    let all_keys = match interp.own_property_keys_value(&exec, &promises) {
         Ok(keys) => keys,
         Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(name, err)),
     };
@@ -1693,7 +1692,6 @@ fn static_all_keyed_generic(
                 variant,
                 true,
                 i,
-                &string_heap,
                 &[
                     &cap.promise,
                     &cap.resolve,
@@ -1716,7 +1714,6 @@ fn static_all_keyed_generic(
                     variant,
                     false,
                     i,
-                    &string_heap,
                     &[
                         &cap.promise,
                         &cap.resolve,
@@ -1793,12 +1790,10 @@ fn keyed_element_function(
     variant: KeyedVariant,
     fulfilled: bool,
     index: usize,
-    string_heap: &std::sync::Arc<StringHeap>,
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, NativeError> {
     let name = variant.name();
-    let heap = string_heap.clone();
     let trace_slots = {
         let slots = slots.clone();
         let cap = cap.clone();
@@ -1821,7 +1816,7 @@ fn keyed_element_function(
             let payload = args.first().cloned().unwrap_or(Value::Undefined);
             let value = match variant {
                 KeyedVariant::All => payload,
-                KeyedVariant::AllSettled => build_settled_record(fulfilled, payload, &heap, ctx)?,
+                KeyedVariant::AllSettled => build_settled_record(fulfilled, payload, ctx)?,
             };
             if slots.fill(ctx.heap_mut(), index, value) {
                 resolve_keyed_slots_native(ctx, &cap, &slots, name)?;
@@ -2181,7 +2176,7 @@ fn static_all_settled_generic(
     };
     let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
     interp.push_iteration_anchor(next_method.clone());
-    let heap = interp.string_heap_clone();
+    let _heap = interp.gc_heap_mut();
     let outcome = (|| -> Result<Value, NativeError> {
         let slots = PromiseSlots::new(
             interp,
@@ -2241,7 +2236,6 @@ fn static_all_settled_generic(
             let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
             let on_fulfill = {
                 let slots = slots.clone();
-                let heap = heap.clone();
                 let cap = cap.clone();
                 let promise_root = cap.promise.clone();
                 let resolve_root = cap.resolve.clone();
@@ -2274,7 +2268,7 @@ fn static_all_settled_generic(
                     &[args],
                     move |ctx, args, _captures| {
                         let v = args.first().cloned().unwrap_or(Value::Undefined);
-                        let record = build_settled_record(true, v, &heap, ctx)?;
+                        let record = build_settled_record(true, v, ctx)?;
                         if slots.fill(ctx.heap_mut(), i, record) {
                             let collected = slots.collect_values(ctx.heap());
                             let arr = ctx.array_from_elements_with_roots(
@@ -2291,7 +2285,6 @@ fn static_all_settled_generic(
             };
             let on_reject = {
                 let slots = slots.clone();
-                let heap = heap.clone();
                 let cap = cap.clone();
                 let promise_root = cap.promise.clone();
                 let resolve_root = cap.resolve.clone();
@@ -2325,7 +2318,7 @@ fn static_all_settled_generic(
                     &[args],
                     move |ctx, args, _captures| {
                         let r = args.first().cloned().unwrap_or(Value::Undefined);
-                        let record = build_settled_record(false, r, &heap, ctx)?;
+                        let record = build_settled_record(false, r, ctx)?;
                         if slots.fill(ctx.heap_mut(), i, record) {
                             let collected = slots.collect_values(ctx.heap());
                             let arr = ctx.array_from_elements_with_roots(
@@ -2380,12 +2373,11 @@ fn static_all_settled_generic(
 fn build_settled_record(
     fulfilled: bool,
     payload: Value,
-    heap: &std::sync::Arc<crate::string::StringHeap>,
     ctx: &mut NativeCtx<'_>,
 ) -> Result<Value, NativeError> {
     let status_text = if fulfilled { "fulfilled" } else { "rejected" };
     let status =
-        crate::JsString::from_str(status_text, heap).map_err(|e| NativeError::TypeError {
+        crate::JsString::from_str(status_text, ctx.heap()).map_err(|e| NativeError::TypeError {
             name: "Promise",
             reason: format!("string allocation failed: {e}"),
         })?;
@@ -2410,10 +2402,9 @@ fn build_settled_record(
 fn make_aggregate_error_runtime_rooted(
     interp: &mut Interpreter,
     registry: &ErrorClassRegistry,
-    string_heap: &StringHeap,
     errors: Vec<Value>,
 ) -> Result<Value, NativeError> {
-    let message = aggregate_error_message(string_heap)?;
+    let message = aggregate_error_message(interp.gc_heap())?;
     let obj = interp
         .alloc_runtime_rooted_object_with_roots(&[&message], &[&errors])
         .map_err(|_| oom_native("Promise.any"))?;
@@ -2456,10 +2447,9 @@ fn make_aggregate_error_runtime_rooted(
 fn make_aggregate_error_native_rooted(
     ctx: &mut NativeCtx<'_>,
     registry: &ErrorClassRegistry,
-    string_heap: &StringHeap,
     errors: Vec<Value>,
 ) -> Result<Value, NativeError> {
-    let message = aggregate_error_message(string_heap)?;
+    let message = aggregate_error_message(ctx.heap())?;
     let obj = ctx
         .alloc_object_with_roots(&[&message], &[&errors])
         .map_err(|_| oom_native("Promise.any"))?;
@@ -2488,9 +2478,9 @@ fn make_aggregate_error_native_rooted(
     Ok(Value::Object(obj))
 }
 
-fn aggregate_error_message(string_heap: &StringHeap) -> Result<Value, NativeError> {
+fn aggregate_error_message(heap: &otter_gc::GcHeap) -> Result<Value, NativeError> {
     Ok(Value::String(
-        JsString::from_str("All promises were rejected", string_heap).map_err(|e| {
+        JsString::from_str("All promises were rejected", heap).map_err(|e| {
             NativeError::TypeError {
                 name: "Promise",
                 reason: format!("string allocation failed: {e}"),
@@ -2547,7 +2537,7 @@ fn static_any_generic(
     };
     let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
     interp.push_iteration_anchor(next_method.clone());
-    let heap = interp.string_heap_clone();
+    let _heap = interp.gc_heap_mut();
     let registry = interp.error_classes_clone();
     let outcome = (|| -> Result<Value, NativeError> {
         let errors = PromiseSlots::new(
@@ -2608,7 +2598,6 @@ fn static_any_generic(
             let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
             let on_reject = {
                 let errors = errors.clone();
-                let heap = heap.clone();
                 let registry = registry.clone();
                 let cap = cap.clone();
                 let promise_root = cap.promise.clone();
@@ -2644,9 +2633,8 @@ fn static_any_generic(
                         let reason = args.first().cloned().unwrap_or(Value::Undefined);
                         if errors.fill(ctx.heap_mut(), i, reason) {
                             let collected = errors.collect_values(ctx.heap());
-                            let agg = make_aggregate_error_native_rooted(
-                                ctx, &registry, &heap, collected,
-                            )?;
+                            let agg =
+                                make_aggregate_error_native_rooted(ctx, &registry, collected)?;
                             let interp = ctx.interp_mut();
                             call_capability_reject(interp, &cap, agg)?;
                         }
@@ -2664,7 +2652,7 @@ fn static_any_generic(
         }
         if errors.finish_iteration() {
             let collected = errors.collect_values(interp.gc_heap());
-            let agg = make_aggregate_error_runtime_rooted(interp, &registry, &heap, collected)?;
+            let agg = make_aggregate_error_runtime_rooted(interp, &registry, collected)?;
             call_capability_reject(interp, &cap, agg)?;
         }
         Ok(cap.promise.clone())
@@ -3162,11 +3150,10 @@ mod tests {
     fn aggregate_error_runtime_builder_uses_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let registry = interp.error_classes_clone();
-        let strings = interp.string_heap_clone();
         let errors = vec![Value::Number(NumberValue::from_i32(1))];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
-        let result = make_aggregate_error_runtime_rooted(&mut interp, &registry, &strings, errors)
+        let result = make_aggregate_error_runtime_rooted(&mut interp, &registry, errors)
             .expect("aggregate error");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
@@ -3187,13 +3174,12 @@ mod tests {
     fn aggregate_error_native_builder_uses_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let registry = interp.error_classes_clone();
-        let strings = interp.string_heap_clone();
         let errors = vec![Value::Number(NumberValue::from_i32(2))];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = {
             let mut ctx = NativeCtx::new(&mut interp);
-            make_aggregate_error_native_rooted(&mut ctx, &registry, &strings, errors)
+            make_aggregate_error_native_rooted(&mut ctx, &registry, errors)
                 .expect("aggregate error")
         };
 

@@ -30,8 +30,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::string::StringError;
-
 /// Cooperative cancellation flag.
 ///
 /// Cheap, cloneable, `Send + Sync`. The interpreter polls this flag
@@ -236,20 +234,6 @@ impl std::fmt::Display for VmError {
 
 impl std::error::Error for VmError {}
 
-impl From<StringError> for VmError {
-    fn from(err: StringError) -> Self {
-        match err {
-            StringError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => VmError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            },
-        }
-    }
-}
-
 impl From<otter_gc::OutOfMemory> for VmError {
     fn from(err: otter_gc::OutOfMemory) -> Self {
         VmError::OutOfMemory {
@@ -334,7 +318,7 @@ mod tests {
 
     #[test]
     fn oom_errors_convert_to_vm_error() {
-        let err = StringError::OutOfMemory {
+        let err = otter_gc::OutOfMemory::HeapCapExceeded {
             requested_bytes: 64,
             heap_limit_bytes: 32,
         };

@@ -40,8 +40,7 @@ impl Interpreter {
 
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        let heap = self.string_heap.clone();
-        let result = reflect::call(self, context, method, &args, &heap)?;
+        let result = reflect::call(self, context, method, &args)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)
     }

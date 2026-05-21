@@ -188,18 +188,9 @@ pub(crate) fn array_like_present_entries(
                     .into_iter()
                     .enumerate()
                     .map(|(i, u)| {
-                        let s = crate::string::JsString::from_utf16_units(
-                            &[u],
-                            // Reuse a thread-local empty heap is not
-                            // available without context; fall back to
-                            // constructing a fresh `StringHeap`. The
-                            // callback path materialises these on the
-                            // fly so the leak surface is bounded by
-                            // the receiver's length.
-                            &crate::string::StringHeap::default(),
-                        )
-                        .map(Value::String)
-                        .unwrap_or(Value::Undefined);
+                        let s = crate::string::JsString::from_utf16_units(&[u], heap)
+                            .map(Value::String)
+                            .unwrap_or(Value::Undefined);
                         (i, s)
                     })
                     .collect(),
@@ -647,15 +638,12 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 .collect()
         });
         let joined = parts.join(&separator);
-        return Ok(Value::String(JsString::from_str(
-            &joined,
-            args.string_heap,
-        )?));
+        return Ok(Value::String(JsString::from_str(&joined, args.gc_heap)?));
     }
     if let Value::Object(obj) = args.receiver {
         let len = read_array_like_length(*obj, heap);
         if len == 0 {
-            return Ok(Value::String(JsString::from_str("", args.string_heap)?));
+            return Ok(Value::String(JsString::from_str("", args.gc_heap)?));
         }
         // Materialise present indices into a sparse lookup; absent
         // slots produce empty-string parts so the final `join` keeps
@@ -675,10 +663,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             };
         }
         let joined = parts.join(&separator);
-        return Ok(Value::String(JsString::from_str(
-            &joined,
-            args.string_heap,
-        )?));
+        return Ok(Value::String(JsString::from_str(&joined, args.gc_heap)?));
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -1836,10 +1821,7 @@ fn native_array_method(
         }
         out
     };
-    let (string_heap, allocation_roots) = {
-        let interp = ctx.interp_mut();
-        (interp.string_heap_clone(), interp.collect_runtime_roots())
-    };
+    let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Array.prototype method".to_string(),
@@ -1847,7 +1829,6 @@ fn native_array_method(
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
         args: &coerced_args,
-        string_heap: &string_heap,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),
     })
@@ -2136,7 +2117,6 @@ fn native_flat_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::string::StringHeap;
 
     fn make_arr(gc_heap: &mut otter_gc::GcHeap, values: &[i32]) -> Value {
         let arr = crate::array::from_elements_old_for_fixture(
@@ -2150,12 +2130,10 @@ mod tests {
     }
 
     fn call(method: &str, recv: Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
-        let heap = StringHeap::default();
         let entry = lookup(method).unwrap();
         (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args,
-            string_heap: &heap,
             gc_heap,
             allocation_roots: &[],
         })

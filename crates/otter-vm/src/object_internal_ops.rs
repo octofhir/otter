@@ -208,7 +208,7 @@ impl Interpreter {
 
     pub(crate) fn vm_property_key_to_value(&self, key: &VmPropertyKey) -> Result<Value, VmError> {
         if let Some(key) = key.string_name() {
-            Ok(Value::String(JsString::from_str(key, &self.string_heap)?))
+            Ok(Value::String(JsString::from_str(key, &self.gc_heap)?))
         } else if let VmPropertyKey::Symbol(sym) = key {
             Ok(Value::Symbol(sym.clone()))
         } else {
@@ -257,7 +257,7 @@ impl Interpreter {
         };
         Ok(Some(Value::String(JsString::from_utf16_units(
             &[unit],
-            &self.string_heap,
+            &self.gc_heap,
         )?)))
     }
 
@@ -269,7 +269,7 @@ impl Interpreter {
         let Some(value) = object::string_data(obj, &self.gc_heap) else {
             return Ok(None);
         };
-        string::exotic::descriptor_for_key(&value, key, &self.string_heap)
+        string::exotic::descriptor_for_key(&value, key, &self.gc_heap)
     }
 
     fn target_is_non_extensible_object(&self, target: &Value) -> bool {
@@ -394,7 +394,7 @@ impl Interpreter {
                 Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::Null))
             }
             Some(Value::NativeFunction(ctor)) => {
-                match ctor.own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype") {
+                match ctor.own_property_descriptor(&self.gc_heap, "prototype") {
                     Ok(Some(descriptor)) => Ok(descriptor_value(&descriptor)),
                     _ => Ok(Value::Null),
                 }
@@ -527,9 +527,7 @@ impl Interpreter {
                     None
                 })
             }
-            Value::String(value) => {
-                string::exotic::descriptor_for_key(&value, key, &self.string_heap)
-            }
+            Value::String(value) => string::exotic::descriptor_for_key(&value, key, &self.gc_heap),
             Value::Array(arr) => {
                 // §10.4.2 — own symbol-keyed properties live in a
                 // dedicated side table; surface their data
@@ -682,12 +680,7 @@ impl Interpreter {
                 let Some(key) = key.string_name() else {
                     return Ok(None);
                 };
-                function_metadata::bound_own_property_descriptor(
-                    &bound,
-                    &self.gc_heap,
-                    &self.string_heap,
-                    key,
-                )
+                function_metadata::bound_own_property_descriptor(&bound, &self.gc_heap, key)
             }
             Value::NativeFunction(native) => Ok(match key {
                 VmPropertyKey::Symbol(sym) => {
@@ -697,7 +690,7 @@ impl Interpreter {
                     let key = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    native.own_property_descriptor(&self.gc_heap, &self.string_heap, key)?
+                    native.own_property_descriptor(&self.gc_heap, key)?
                 }
             }),
             _ => Ok(None),
@@ -1028,7 +1021,6 @@ impl Interpreter {
                         .expect("non-symbol key has string spelling");
                     native.define_own_property(
                         &mut self.gc_heap,
-                        &self.string_heap,
                         k,
                         descriptor.complete_for_new_property(),
                     )
@@ -1221,8 +1213,7 @@ impl Interpreter {
         target: &Value,
         level: ObjectIntegrityLevel,
     ) -> Result<bool, VmError> {
-        let string_heap = self.string_heap.clone();
-        let keys = self.own_property_keys_value(context, target, &string_heap)?;
+        let keys = self.own_property_keys_value(context, target)?;
         if !self.prevent_extensions_value(context, target)? {
             return Ok(false);
         }
@@ -1275,8 +1266,7 @@ impl Interpreter {
         if self.is_extensible_value(context, target)? {
             return Ok(false);
         }
-        let string_heap = self.string_heap.clone();
-        let keys = self.own_property_keys_value(context, target, &string_heap)?;
+        let keys = self.own_property_keys_value(context, target)?;
         for key_value in &keys {
             let key = property_key_value_to_vm_key(key_value)?;
             let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
@@ -1737,7 +1727,7 @@ impl Interpreter {
                     message: "Symbol.toPrimitive method is not callable".to_string(),
                 });
             }
-            let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
+            let hint_str = JsString::from_str(hint.as_token(), &self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(Value::String(hint_str));
             let result = self.run_callable_sync(context, &exotic, input.clone(), args)?;
@@ -1941,7 +1931,6 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         target: &Value,
-        string_heap: &string::StringHeap,
     ) -> Result<Vec<Value>, VmError> {
         match target {
             Value::Proxy(proxy) => {
@@ -1957,13 +1946,9 @@ impl Interpreter {
                     Some(trap_result) => {
                         let trap_keys =
                             self.create_list_from_array_like_property_keys(context, trap_result)?;
-                        self.validate_proxy_own_keys(context, proxy, trap_keys, string_heap)
+                        self.validate_proxy_own_keys(context, proxy, trap_keys)
                     }
-                    None => self.own_property_keys_value(
-                        context,
-                        &proxy.target(&self.gc_heap),
-                        string_heap,
-                    ),
+                    None => self.own_property_keys_value(context, &proxy.target(&self.gc_heap)),
                 }
             }
             Value::Object(obj) => {
@@ -1974,7 +1959,8 @@ impl Interpreter {
                     for idx in 0..value.len() {
                         let key = idx.to_string();
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                            string::JsString::from_str(&key, &self.gc_heap)
+                                .map_err(VmError::from)?,
                         ));
                     }
                 }
@@ -2005,21 +1991,25 @@ impl Interpreter {
                     for index in indexed {
                         let key = index.to_string();
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                            string::JsString::from_str(&key, &self.gc_heap)
+                                .map_err(VmError::from)?,
                         ));
                     }
                     keys.push(Value::String(
-                        string::JsString::from_str("length", string_heap).map_err(VmError::from)?,
+                        string::JsString::from_str("length", &self.gc_heap)
+                            .map_err(VmError::from)?,
                     ));
                     for key in non_index_strings {
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                            string::JsString::from_str(&key, &self.gc_heap)
+                                .map_err(VmError::from)?,
                         ));
                     }
                 } else {
                     for key in ordinary_strings {
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                            string::JsString::from_str(&key, &self.gc_heap)
+                                .map_err(VmError::from)?,
                         ));
                     }
                 }
@@ -2056,15 +2046,17 @@ impl Interpreter {
                     Vec::with_capacity(indices.len() + string_keys.len() + 2);
                 for idx in indices {
                     let key = idx.to_string();
-                    let s = string::JsString::from_str(&key, string_heap).map_err(VmError::from)?;
+                    let s =
+                        string::JsString::from_str(&key, &self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 // §10.4.2 Array exotic objects always expose `length`.
                 keys.push(Value::String(
-                    string::JsString::from_str("length", string_heap).map_err(VmError::from)?,
+                    string::JsString::from_str("length", &self.gc_heap).map_err(VmError::from)?,
                 ));
                 for key in string_keys {
-                    let s = string::JsString::from_str(&key, string_heap).map_err(VmError::from)?;
+                    let s =
+                        string::JsString::from_str(&key, &self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 // §10.4.2 — own symbol-keyed properties follow the
@@ -2083,7 +2075,7 @@ impl Interpreter {
                 let names = self.ordinary_function_own_property_keys(context, *function_id);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2092,7 +2084,7 @@ impl Interpreter {
                 let names = native.own_property_keys(&self.gc_heap);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2101,7 +2093,7 @@ impl Interpreter {
                 let names = function_metadata::bound_own_property_keys(bound, &self.gc_heap);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2110,7 +2102,7 @@ impl Interpreter {
                 let names = self.class_constructor_own_property_keys(Some(context), *class)?;
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, string_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2118,7 +2110,8 @@ impl Interpreter {
             Value::RegExp(regexp) => {
                 let mut keys = Vec::new();
                 keys.push(Value::String(
-                    string::JsString::from_str("lastIndex", string_heap).map_err(VmError::from)?,
+                    string::JsString::from_str("lastIndex", &self.gc_heap)
+                        .map_err(VmError::from)?,
                 ));
                 if let Some(expando) = regexp.expando(&self.gc_heap) {
                     let (strings, symbols): (Vec<String>, Vec<Value>) =
@@ -2130,7 +2123,8 @@ impl Interpreter {
                         });
                     for key in strings {
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, string_heap).map_err(VmError::from)?,
+                            string::JsString::from_str(&key, &self.gc_heap)
+                                .map_err(VmError::from)?,
                         ));
                     }
                     keys.extend(symbols);
@@ -2205,7 +2199,6 @@ impl Interpreter {
         context: &ExecutionContext,
         proxy: &proxy::JsProxy,
         trap_result: Vec<Value>,
-        string_heap: &string::StringHeap,
     ) -> Result<Vec<Value>, VmError> {
         // Step 9 — reject duplicates.
         for i in 0..trap_result.len() {
@@ -2219,7 +2212,7 @@ impl Interpreter {
         }
         let target_value = proxy.target(&self.gc_heap);
         let extensible_target = self.is_extensible_value(context, &target_value)?;
-        let target_keys = self.own_property_keys_value(context, &target_value, string_heap)?;
+        let target_keys = self.own_property_keys_value(context, &target_value)?;
         let mut target_configurable: Vec<Value> = Vec::new();
         let mut target_nonconfigurable: Vec<Value> = Vec::new();
         for key in &target_keys {
@@ -2530,7 +2523,7 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => {
                 let desc = native
-                    .own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype")
+                    .own_property_descriptor(&self.gc_heap, "prototype")
                     .map_err(VmError::from)?;
                 let value = match desc {
                     Some(object::PropertyDescriptor {
@@ -2615,7 +2608,7 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => {
                 let desc = native
-                    .own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype")
+                    .own_property_descriptor(&self.gc_heap, "prototype")
                     .map_err(VmError::from)?;
                 let value = match desc {
                     Some(object::PropertyDescriptor {
@@ -2914,11 +2907,7 @@ impl Interpreter {
                         let key = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
-                        match native.own_property_descriptor(
-                            &self.gc_heap,
-                            &self.string_heap,
-                            key,
-                        )? {
+                        match native.own_property_descriptor(&self.gc_heap, key)? {
                             Some(object::PropertyDescriptor {
                                 kind: object::DescriptorKind::Data { value },
                                 ..
@@ -2962,7 +2951,6 @@ impl Interpreter {
                         match function_metadata::bound_own_property_descriptor(
                             &bound,
                             &self.gc_heap,
-                            &self.string_heap,
                             key,
                         )? {
                             Some(desc) => match &desc.kind {
@@ -3066,7 +3054,7 @@ impl Interpreter {
                         let key = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
-                        regexp_prototype::load_property(&re, &self.gc_heap, key, &self.string_heap)
+                        regexp_prototype::load_property(&re, &self.gc_heap, key)
                     }
                 };
                 match direct {
@@ -3196,8 +3184,7 @@ impl Interpreter {
                         && (n as usize) < s.len() as usize
                     {
                         let unit = s.char_code_at(n as u32).unwrap_or(0);
-                        let unit_str =
-                            crate::JsString::from_utf16_units(&[unit], &self.string_heap)?;
+                        let unit_str = crate::JsString::from_utf16_units(&[unit], &self.gc_heap)?;
                         return Ok(VmGetOutcome::Value(Value::String(unit_str)));
                     }
                     if name == "length" {
@@ -3534,10 +3521,8 @@ impl Interpreter {
             // key set (enumerable + non-enumerable) for Proxy targets,
             // validated against §10.5.11 invariants.
             M::GetOwnPropertyNames => {
-                let string_heap = self.string_heap.clone();
                 let target_clone = target.clone();
-                let trap_keys =
-                    self.own_property_keys_value(context, &target_clone, &string_heap)?;
+                let trap_keys = self.own_property_keys_value(context, &target_clone)?;
                 let values: Vec<Value> = trap_keys
                     .into_iter()
                     .filter(|v| matches!(v, Value::String(_)))
@@ -3558,10 +3543,8 @@ impl Interpreter {
                 Ok(Some(Value::Array(array)))
             }
             M::GetOwnPropertySymbols => {
-                let string_heap = self.string_heap.clone();
                 let target_clone = target.clone();
-                let trap_keys =
-                    self.own_property_keys_value(context, &target_clone, &string_heap)?;
+                let trap_keys = self.own_property_keys_value(context, &target_clone)?;
                 let values: Vec<Value> = trap_keys
                     .into_iter()
                     .filter(|v| matches!(v, Value::Symbol(_)))
@@ -3653,7 +3636,7 @@ impl Interpreter {
         if let Some(callee) = to_prim
             && self.is_callable_runtime(&callee)
         {
-            let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
+            let hint_str = JsString::from_str(hint.as_token(), &self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(Value::String(hint_str));
             let result = self.run_callable_sync(context, &callee, value.clone(), args)?;
@@ -3755,8 +3738,7 @@ impl Interpreter {
             }
             Value::Array(arr) => {
                 let target = Value::Array(arr);
-                let string_heap = self.string_heap_clone();
-                let own_keys = self.own_property_keys_value(context, &target, &string_heap)?;
+                let own_keys = self.own_property_keys_value(context, &target)?;
                 let mut out = Vec::new();
                 for key_value in own_keys {
                     let Value::String(name) = key_value else {
@@ -3834,14 +3816,13 @@ impl Interpreter {
         let mut current = target;
         let mut visited = BTreeSet::new();
         let mut out = Vec::new();
-        let string_heap = self.string_heap_clone();
 
         for hops in 0..object::PROTO_CHAIN_HARD_CAP {
             if matches!(current, Value::Null) {
                 break;
             }
 
-            let keys = self.own_property_keys_value(context, &current, &string_heap)?;
+            let keys = self.own_property_keys_value(context, &current)?;
             for key in &keys {
                 let Value::String(name) = key else {
                     continue;

@@ -66,9 +66,8 @@ fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     object::define_own_property(
@@ -131,9 +130,8 @@ fn install_finalization_registry(
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     object::define_own_property(
@@ -155,7 +153,6 @@ fn install_finalization_registry(
 /// well-known table exists.
 pub fn install_weak_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -166,10 +163,10 @@ pub fn install_weak_well_knowns_post_bootstrap(
         ("WeakRef", "WeakRef"),
         ("FinalizationRegistry", "FinalizationRegistry"),
     ] {
-        let Some(prototype) = ctor_prototype(global, heap, string_heap, ctor_name) else {
+        let Some(prototype) = ctor_prototype(global, heap, ctor_name) else {
             continue;
         };
-        let tag = crate::string::JsString::from_str(tag_value, string_heap)
+        let tag = crate::string::JsString::from_str(tag_value, heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
         object::define_own_symbol_property_partial(
             prototype,
@@ -295,17 +292,12 @@ fn link_object_prototype(heap: &mut otter_gc::GcHeap, prototype: JsObject, globa
     }
 }
 
-fn ctor_prototype(
-    global: JsObject,
-    heap: &otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
-    ctor_name: &str,
-) -> Option<JsObject> {
+fn ctor_prototype(global: JsObject, heap: &otter_gc::GcHeap, ctor_name: &str) -> Option<JsObject> {
     let Some(Value::NativeFunction(f)) = object::get(global, heap, ctor_name) else {
         return None;
     };
     let descriptor = f
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .ok()
         .flatten()?;
     match descriptor.kind {

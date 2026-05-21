@@ -44,7 +44,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::object::{DescriptorKind, JsObject, PropertyDescriptor};
-use crate::string::{JsString, StringError, StringHeap};
+use crate::string::JsString;
 use crate::{NativeCtx, Value};
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
@@ -606,15 +606,24 @@ impl NativeFunction {
     pub(crate) fn own_property_descriptor(
         &self,
         heap: &otter_gc::GcHeap,
-        string_heap: &StringHeap,
         key: &str,
-    ) -> Result<Option<PropertyDescriptor>, StringError> {
-        heap.read_payload(self.inner, |body| {
+    ) -> Result<Option<PropertyDescriptor>, otter_gc::OutOfMemory> {
+        // Read property metadata under a shared payload borrow, then
+        // build the descriptor outside the borrow so the heap remains
+        // mutable for `native_builtin_descriptor`'s string alloc.
+        enum Slot {
+            Builtin,
+            Deleted,
+            Overridden(PropertyDescriptor),
+            Expando(Option<PropertyDescriptor>),
+        }
+        let body_inner = self.inner;
+        let slot = heap.read_payload(body_inner, |body| {
             let property = match key {
                 "name" => &body.name_property,
                 "length" => &body.length_property,
                 _ => {
-                    return Ok(crate::object::get_own_descriptor(
+                    return Slot::Expando(crate::object::get_own_descriptor(
                         body.own_properties,
                         heap,
                         key,
@@ -622,13 +631,25 @@ impl NativeFunction {
                 }
             };
             match property {
-                NativeOwnProperty::Builtin => {
-                    native_builtin_descriptor(body, string_heap, key).map(Some)
-                }
-                NativeOwnProperty::Deleted => Ok(None),
-                NativeOwnProperty::Overridden(desc) => Ok(Some(desc.clone())),
+                NativeOwnProperty::Builtin => Slot::Builtin,
+                NativeOwnProperty::Deleted => Slot::Deleted,
+                NativeOwnProperty::Overridden(desc) => Slot::Overridden(desc.clone()),
             }
-        })
+        });
+        match slot {
+            Slot::Builtin => {
+                let body_snapshot: NativeFunctionBodySnapshot =
+                    heap.read_payload(body_inner, |body| NativeFunctionBodySnapshot {
+                        name: body.name,
+                        length: body.length,
+                        metadata: body.metadata,
+                    });
+                native_builtin_descriptor(&body_snapshot, heap, key).map(Some)
+            }
+            Slot::Deleted => Ok(None),
+            Slot::Overridden(d) => Ok(Some(d)),
+            Slot::Expando(o) => Ok(o),
+        }
     }
 
     /// Return an own symbol-keyed property descriptor stored on the
@@ -700,11 +721,10 @@ impl NativeFunction {
     pub(crate) fn define_own_property(
         &self,
         heap: &mut otter_gc::GcHeap,
-        string_heap: &StringHeap,
         key: &str,
         descriptor: PropertyDescriptor,
     ) -> bool {
-        let existing = match self.own_property_descriptor(heap, string_heap, key) {
+        let existing = match self.own_property_descriptor(heap, key) {
             Ok(existing) => existing,
             Err(_) => return false,
         };
@@ -1019,13 +1039,19 @@ where
     )?))
 }
 
+struct NativeFunctionBodySnapshot {
+    name: &'static str,
+    length: u8,
+    metadata: NativeFunctionMetadata,
+}
+
 fn native_builtin_descriptor(
-    body: &NativeFunctionBody,
-    string_heap: &StringHeap,
+    body: &NativeFunctionBodySnapshot,
+    heap: &otter_gc::GcHeap,
     key: &str,
-) -> Result<PropertyDescriptor, StringError> {
+) -> Result<PropertyDescriptor, otter_gc::OutOfMemory> {
     let value = match key {
-        "name" => Value::String(JsString::from_str(body.name, string_heap)?),
+        "name" => Value::String(JsString::from_str(body.name, heap)?),
         "length" => Value::Number(crate::number::NumberValue::from_i32(body.length as i32)),
         _ => Value::Undefined,
     };

@@ -96,12 +96,11 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
 
     // §27.2.3.1 — `Promise.prototype` own data property:
     // non-writable, non-enumerable, non-configurable.
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
 
@@ -177,7 +176,6 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 /// - <https://tc39.es/ecma262/#sec-get-promise-@@species>
 pub fn install_promise_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -212,7 +210,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
     }
 
     let descriptor = ctor
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data {
@@ -223,7 +221,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let tag = crate::string::JsString::from_str("Promise", string_heap)
+    let tag = crate::string::JsString::from_str("Promise", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
@@ -298,7 +296,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         // route it through the captured native `reject`. The
         // resolve / reject natives are idempotent once the
         // promise is settled.
-        let reason = vm_err_to_value(&err);
+        let reason = vm_err_to_value(&err, ctx.heap());
         let _ = ctx.interp_mut().run_callable_sync(
             &context,
             &reject,
@@ -438,7 +436,6 @@ fn define_ctor_method(
         roots.as_slice(),
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     let attrs = Attr::builtin_function();
     let desc = PropertyDescriptor::data(
         Value::NativeFunction(func),
@@ -446,7 +443,7 @@ fn define_ctor_method(
         attrs.enumerable,
         attrs.configurable,
     );
-    if !ctor.define_own_property(heap, &string_heap, name, desc) {
+    if !ctor.define_own_property(heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
     }
     Ok(())
@@ -459,13 +456,10 @@ fn oom(name: &'static str) -> NativeError {
     }
 }
 
-fn vm_err_to_value(err: &VmError) -> Value {
+fn vm_err_to_value(err: &VmError, heap: &otter_gc::GcHeap) -> Value {
     Value::String(
-        crate::JsString::from_str(&err.to_string(), &crate::StringHeap::default()).unwrap_or_else(
-            |_| {
-                crate::JsString::from_str("", &crate::StringHeap::default())
-                    .expect("empty string allocates")
-            },
-        ),
+        crate::JsString::from_str(&err.to_string(), heap).unwrap_or_else(|_| {
+            crate::JsString::from_str("", heap).expect("empty string allocates")
+        }),
     )
 }

@@ -29,14 +29,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::number::NumberValue;
 use crate::object::{self, DescriptorKind, JsObject, PropertyDescriptor};
-use crate::string::{JsString, StringHeap};
+use crate::string::JsString;
 use crate::{BoundFunction, BoundFunctionMetadataProperty, ExecutionContext, Value, VmError};
 
 /// Read-only inputs needed to resolve callable metadata.
 pub(crate) struct FunctionMetadataContext<'a> {
     context: &'a ExecutionContext,
     gc_heap: &'a otter_gc::GcHeap,
-    string_heap: &'a StringHeap,
     function_user_props: &'a HashMap<u32, JsObject>,
     function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
 }
@@ -55,14 +54,12 @@ impl<'a> FunctionMetadataContext<'a> {
     pub(crate) fn new(
         context: &'a ExecutionContext,
         gc_heap: &'a otter_gc::GcHeap,
-        string_heap: &'a StringHeap,
         function_user_props: &'a HashMap<u32, JsObject>,
         function_deleted_metadata: &'a HashSet<(u32, &'static str)>,
     ) -> Self {
         Self {
             context,
             gc_heap,
-            string_heap,
             function_user_props,
             function_deleted_metadata,
         }
@@ -94,7 +91,6 @@ pub(crate) fn ordinary_function_intrinsic_property(
 pub(crate) fn bound_own_property_descriptor(
     bound: &BoundFunction,
     gc_heap: &otter_gc::GcHeap,
-    string_heap: &StringHeap,
     key: &str,
 ) -> Result<Option<PropertyDescriptor>, VmError> {
     gc_heap.read_payload(bound.inner, |body| {
@@ -111,7 +107,7 @@ pub(crate) fn bound_own_property_descriptor(
         };
         match property {
             BoundFunctionMetadataProperty::Builtin => {
-                bound_builtin_descriptor(body, string_heap, key).map(Some)
+                bound_builtin_descriptor(body, gc_heap, key).map(Some)
             }
             BoundFunctionMetadataProperty::Deleted => Ok(None),
             BoundFunctionMetadataProperty::Overridden(desc) => Ok(Some(desc.clone())),
@@ -206,11 +202,10 @@ pub(crate) fn bound_has_own_property(
 pub(crate) fn bound_define_own_property(
     bound: &BoundFunction,
     heap: &mut otter_gc::GcHeap,
-    string_heap: &StringHeap,
     key: &str,
     descriptor: PropertyDescriptor,
 ) -> bool {
-    let existing = match bound_own_property_descriptor(bound, heap, string_heap, key) {
+    let existing = match bound_own_property_descriptor(bound, heap, key) {
         Ok(existing) => existing,
         Err(_) => return false,
     };
@@ -287,7 +282,7 @@ pub(crate) fn bound_create_metadata(
     let target_name = callable_name(ctx, target)?;
     let target_len = callable_length(ctx, target)?;
     Ok(bound_create_metadata_from_values(
-        &Value::String(JsString::from_str(&target_name, ctx.string_heap)?),
+        &Value::String(JsString::from_str(&target_name, ctx.gc_heap)?),
         &Value::Number(number_from_length_value(target_len)),
         bound_arg_count,
     ))
@@ -323,7 +318,7 @@ fn callable_metadata_value(
 ) -> Result<Option<Value>, VmError> {
     match key {
         "name" => callable_name(ctx, callee).and_then(|name| {
-            JsString::from_str(&name, ctx.string_heap)
+            JsString::from_str(&name, ctx.gc_heap)
                 .map(Value::String)
                 .map(Some)
                 .map_err(VmError::from)
@@ -357,7 +352,7 @@ fn callable_name(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<St
             Ok(function.name.clone())
         }
         Value::NativeFunction(native) => {
-            match native.own_property_descriptor(ctx.gc_heap, ctx.string_heap, "name")? {
+            match native.own_property_descriptor(ctx.gc_heap, "name")? {
                 Some(desc) => Ok(match descriptor_value(&desc) {
                     Value::String(s) => s.to_lossy_string(),
                     _ => String::new(),
@@ -366,7 +361,7 @@ fn callable_name(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<St
             }
         }
         Value::BoundFunction(bound) => {
-            match bound_own_property_descriptor(bound, ctx.gc_heap, ctx.string_heap, "name")? {
+            match bound_own_property_descriptor(bound, ctx.gc_heap, "name")? {
                 Some(desc) => Ok(match descriptor_value(&desc) {
                     Value::String(s) => s.to_lossy_string(),
                     _ => String::new(),
@@ -408,7 +403,7 @@ fn callable_length(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<
             Ok(f64::from(function.param_count))
         }
         Value::NativeFunction(native) => {
-            match native.own_property_descriptor(ctx.gc_heap, ctx.string_heap, "length")? {
+            match native.own_property_descriptor(ctx.gc_heap, "length")? {
                 Some(desc) => Ok(match descriptor_value(&desc) {
                     Value::Number(n) => to_integer_or_infinity(n.as_f64()),
                     _ => 0.0,
@@ -417,7 +412,7 @@ fn callable_length(ctx: &FunctionMetadataContext<'_>, callee: &Value) -> Result<
             }
         }
         Value::BoundFunction(bound) => {
-            match bound_own_property_descriptor(bound, ctx.gc_heap, ctx.string_heap, "length")? {
+            match bound_own_property_descriptor(bound, ctx.gc_heap, "length")? {
                 Some(desc) => Ok(match descriptor_value(&desc) {
                     Value::Number(n) => to_integer_or_infinity(n.as_f64()),
                     _ => 0.0,
@@ -469,11 +464,11 @@ pub(crate) fn ordinary_function_metadata_key(key: &str) -> Option<&'static str> 
 
 fn bound_builtin_descriptor(
     body: &crate::BoundFunctionBody,
-    string_heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
     key: &str,
 ) -> Result<PropertyDescriptor, VmError> {
     let value = match key {
-        "name" => Value::String(JsString::from_str(&body.builtin_name, string_heap)?),
+        "name" => Value::String(JsString::from_str(&body.builtin_name, gc_heap)?),
         "length" => Value::Number(body.builtin_length),
         _ => Value::Undefined,
     };

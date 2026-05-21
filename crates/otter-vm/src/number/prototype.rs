@@ -107,14 +107,11 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     if radix == 10 {
         return Ok(Value::String(super::ecma::number_to_string(
             recv.as_f64(),
-            args.string_heap,
+            args.gc_heap,
         )?));
     }
     let rendered = super::dragon4::number_to_string_radix(recv.as_f64(), radix);
-    Ok(Value::String(JsString::from_str(
-        &rendered,
-        args.string_heap,
-    )?))
+    Ok(Value::String(JsString::from_str(&rendered, args.gc_heap)?))
 }
 
 /// `Number.prototype.toFixed(digits = 0)`.
@@ -134,7 +131,7 @@ fn impl_to_fixed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let rendered = super::ecma_fixed::number_to_fixed(recv.as_f64(), digits);
     Ok(Value::String(JsString::from_latin1(
         rendered.as_bytes(),
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 
@@ -152,7 +149,7 @@ fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     if !value.is_finite() {
         return Ok(Value::String(super::ecma::number_to_string(
             value,
-            args.string_heap,
+            args.gc_heap,
         )?));
     }
     // §21.1.3.2 step 2: `f = undefined ? undefined :
@@ -174,7 +171,7 @@ fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     let rendered = super::ecma_fixed::number_to_exponential(value, digits);
     Ok(Value::String(JsString::from_latin1(
         rendered.as_bytes(),
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 
@@ -189,7 +186,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     if matches!(args.args.first(), None | Some(Value::Undefined)) {
         return Ok(Value::String(super::ecma::number_to_string(
             value,
-            args.string_heap,
+            args.gc_heap,
         )?));
     }
     // §21.1.3.5 step 3: `p = ToIntegerOrInfinity(precision)`. We
@@ -202,7 +199,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     if !value.is_finite() {
         return Ok(Value::String(super::ecma::number_to_string(
             value,
-            args.string_heap,
+            args.gc_heap,
         )?));
     }
     // §21.1.3.5 step 5: out-of-range raises `RangeError`.
@@ -216,7 +213,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let rendered = super::ecma_fixed::number_to_precision(value, Some(precision));
     Ok(Value::String(JsString::from_latin1(
         rendered.as_bytes(),
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 
@@ -341,10 +338,7 @@ fn native_number_method(
         } else {
             args.iter().cloned().collect()
         };
-    let (string_heap, allocation_roots) = {
-        let interp = ctx.interp_mut();
-        (interp.string_heap_clone(), interp.collect_runtime_roots())
-    };
+    let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Number.prototype method".to_string(),
@@ -352,7 +346,6 @@ fn native_number_method(
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
         args: &coerced,
-        string_heap: &string_heap,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),
     })
@@ -399,18 +392,15 @@ fn native_value_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::string::StringHeap;
 
     fn args<'a>(
         recv: &'a Value,
         args: &'a [Value],
-        heap: &'a StringHeap,
         gc_heap: &'a mut otter_gc::GcHeap,
     ) -> IntrinsicArgs<'a> {
         IntrinsicArgs {
             receiver: recv,
             args,
-            string_heap: heap,
             gc_heap,
             allocation_roots: &[],
         }
@@ -418,48 +408,32 @@ mod tests {
 
     #[test]
     fn to_string_default_radix_is_10() {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::Number(NumberValue::Smi(255));
         let entry = lookup("toString").unwrap();
-        let out = (entry.impl_fn)(&mut args(&recv, &[], &heap, &mut gc_heap)).unwrap();
+        let out = (entry.impl_fn)(&mut args(&recv, &[], &mut gc_heap)).unwrap();
         assert_eq!(out.display_string(&gc_heap), "255");
     }
 
     #[test]
     fn to_string_hex_radix() {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let recv = Value::Number(NumberValue::Smi(255));
         let radix = Value::Number(NumberValue::Smi(16));
         let entry = lookup("toString").unwrap();
-        let out = (entry.impl_fn)(&mut args(
-            &recv,
-            std::slice::from_ref(&radix),
-            &heap,
-            &mut gc_heap,
-        ))
-        .unwrap();
+        let out =
+            (entry.impl_fn)(&mut args(&recv, std::slice::from_ref(&radix), &mut gc_heap)).unwrap();
         assert_eq!(out.display_string(&gc_heap), "ff");
     }
 
     #[test]
     fn to_fixed_two_decimals() {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        // 3.5 / 2.0 = 1.75 — pick a value that doesn't trip the
-        // `approx_constant` lint while still proving fixed-decimal
-        // formatting end-to-end.
         let recv = Value::Number(NumberValue::Double(1.75));
         let two = Value::Number(NumberValue::Smi(2));
         let entry = lookup("toFixed").unwrap();
-        let out = (entry.impl_fn)(&mut args(
-            &recv,
-            std::slice::from_ref(&two),
-            &heap,
-            &mut gc_heap,
-        ))
-        .unwrap();
+        let out =
+            (entry.impl_fn)(&mut args(&recv, std::slice::from_ref(&two), &mut gc_heap)).unwrap();
         assert_eq!(out.display_string(&gc_heap), "1.75");
     }
 }

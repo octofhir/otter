@@ -111,9 +111,8 @@ fn install_array_buffer(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let ctor_root = Value::NativeFunction(ctor);
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     // §25.1.3.1 ArrayBuffer.isView(arg).
@@ -128,7 +127,6 @@ fn install_array_buffer(
     let attrs = Attr::builtin_function();
     let _ = ctor.define_own_property(
         heap,
-        &string_heap,
         "isView",
         PropertyDescriptor::data(
             Value::NativeFunction(is_view_fn),
@@ -224,9 +222,8 @@ fn install_shared_array_buffer(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let ctor_root = Value::NativeFunction(ctor);
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     object::define_own_property(
@@ -295,7 +292,6 @@ fn sab_growable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 /// Install `SharedArrayBuffer.prototype[@@toStringTag] = "SharedArrayBuffer"`.
 pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -305,7 +301,7 @@ pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
         return Ok(());
     };
     let descriptor = ctor
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data {
@@ -316,7 +312,7 @@ pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let tag = crate::string::JsString::from_str("SharedArrayBuffer", string_heap)
+    let tag = crate::string::JsString::from_str("SharedArrayBuffer", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
@@ -336,7 +332,6 @@ pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
 /// Install `ArrayBuffer.prototype[@@toStringTag] = "ArrayBuffer"`.
 pub fn install_array_buffer_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -346,7 +341,7 @@ pub fn install_array_buffer_well_knowns_post_bootstrap(
         return Ok(());
     };
     let descriptor = ctor
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data {
@@ -357,7 +352,7 @@ pub fn install_array_buffer_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let tag = crate::string::JsString::from_str("ArrayBuffer", string_heap)
+    let tag = crate::string::JsString::from_str("ArrayBuffer", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
@@ -456,15 +451,11 @@ fn dispatch_method(
         })?;
     let receiver = ctx.this_value().clone();
     let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    let (string_heap, allocation_roots) = {
-        let interp = ctx.interp_mut();
-        (interp.string_heap_clone(), interp.collect_runtime_roots())
-    };
+    let allocation_roots = ctx.collect_native_roots();
     let gc_heap = ctx.heap_mut();
     let mut intrinsic_args = IntrinsicArgs {
         receiver: &receiver,
         args: &small_args,
-        string_heap: &string_heap,
         gc_heap,
         allocation_roots: allocation_roots.as_slice(),
     };

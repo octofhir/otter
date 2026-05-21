@@ -349,9 +349,8 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
         None => Ok(Value::Null),
         Some(s) => {
             let (interp, _exec) = ctx.interp_mut_and_context();
-            let heap = interp.string_heap();
-            let js =
-                JsString::from_str(&s, heap).map_err(|e| type_err(format!("string alloc: {e}")))?;
+            let js = JsString::from_str(&s, interp.gc_heap())
+                .map_err(|e| type_err(format!("string alloc: {e}")))?;
             Ok(Value::String(js))
         }
     }

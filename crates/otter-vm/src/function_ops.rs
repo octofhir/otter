@@ -362,7 +362,6 @@ impl Interpreter {
                 let ctx = function_metadata::FunctionMetadataContext::new(
                     context,
                     &self.gc_heap,
-                    &self.string_heap,
                     &self.function_user_props,
                     &self.function_deleted_metadata,
                 );
@@ -399,12 +398,11 @@ impl Interpreter {
                 let ctx = function_metadata::FunctionMetadataContext::new(
                     context,
                     &self.gc_heap,
-                    &self.string_heap,
                     &self.function_user_props,
                     &self.function_deleted_metadata,
                 );
                 let display = function_metadata::callable_to_string(&ctx, &this_value);
-                let s = JsString::from_str(&display, &self.string_heap)
+                let s = JsString::from_str(&display, self.gc_heap_mut())
                     .map_err(|_| VmError::TypeMismatch)?;
                 Ok(Value::String(s))
             }
@@ -730,18 +728,13 @@ impl Interpreter {
                 }
             }
             Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, key)? {
+                match native.own_property_descriptor(&self.gc_heap, key)? {
                     Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
                     None => Ok(BindMetadataGet::Value(Value::Undefined)),
                 }
             }
             Value::BoundFunction(bound) => {
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &self.gc_heap,
-                    &self.string_heap,
-                    key,
-                )? {
+                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, key)? {
                     Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
                     None => Ok(BindMetadataGet::Value(Value::Undefined)),
                 }
@@ -985,7 +978,6 @@ impl Interpreter {
         let ctx = function_metadata::FunctionMetadataContext::new(
             context,
             &self.gc_heap,
-            &self.string_heap,
             &self.function_user_props,
             &self.function_deleted_metadata,
         );
@@ -1211,9 +1203,8 @@ impl Interpreter {
                 // through the shared internal-method implementation
                 // so Arrays, string wrappers, functions, and Proxies
                 // agree with `Reflect.ownKeys`.
-                let string_heap = self.string_heap.clone();
                 let values: Vec<Value> = self
-                    .own_property_keys_value(context, &target, &string_heap)?
+                    .own_property_keys_value(context, &target)?
                     .into_iter()
                     .filter(|v| matches!(v, Value::String(_)))
                     .collect();
@@ -1229,8 +1220,7 @@ impl Interpreter {
                 // ownKeys path so trap invariants apply, then filter
                 // to enumerable strings per §20.1.2.17 Object.keys.
                 if matches!(target, Value::Proxy(_)) {
-                    let string_heap = self.string_heap.clone();
-                    let trap_keys = self.own_property_keys_value(context, &target, &string_heap)?;
+                    let trap_keys = self.own_property_keys_value(context, &target)?;
                     let mut values: Vec<Value> = Vec::with_capacity(trap_keys.len());
                     for key in trap_keys {
                         let Value::String(_) = &key else { continue };
@@ -1273,7 +1263,7 @@ impl Interpreter {
                 let mut values = Vec::with_capacity(keys.len());
                 for key in keys {
                     values.push(Value::String(
-                        JsString::from_str(&key, &self.string_heap)
+                        JsString::from_str(&key, self.gc_heap_mut())
                             .map_err(|_| VmError::TypeMismatch)?,
                     ));
                 }
@@ -1361,7 +1351,6 @@ impl Interpreter {
                         function_metadata::bound_define_own_property(
                             bound,
                             &mut self.gc_heap,
-                            &self.string_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                             completed,
@@ -1394,7 +1383,6 @@ impl Interpreter {
                         function_metadata::bound_own_property_descriptor(
                             bound,
                             &self.gc_heap,
-                            &self.string_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                         )?
@@ -1608,7 +1596,6 @@ impl Interpreter {
             let ctx = function_metadata::FunctionMetadataContext::new(
                 context,
                 &self.gc_heap,
-                &self.string_heap,
                 &self.function_user_props,
                 &self.function_deleted_metadata,
             );
@@ -1759,7 +1746,7 @@ impl Interpreter {
             Some(function) if function.is_async_generator => "AsyncGenerator",
             _ => "Generator",
         };
-        let tag = JsString::from_str(tag_name, &self.string_heap)?;
+        let tag = JsString::from_str(tag_name, self.gc_heap_mut())?;
         let tag_sym = self
             .well_known_symbols()
             .get(symbol::WellKnown::ToStringTag);

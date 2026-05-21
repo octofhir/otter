@@ -33,7 +33,7 @@ use crate::native_function::NativeCall;
 use crate::object::{
     DescriptorKind, JsObject, PartialPropertyDescriptor, PropertyDescriptor, PropertyLookup,
 };
-use crate::string::{JsString, StringHeap};
+use crate::string::JsString;
 use crate::symbol::JsSymbol;
 use crate::value_kind::is_object_like_value;
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -160,9 +160,8 @@ fn native_call(
     {
         return Ok(result);
     }
-    let string_heap = ctx.cx.interp.string_heap_clone();
-    call(method, args, &string_heap, ctx.heap_mut())
-        .map_err(|err| object_native_error(method.name(), err))
+
+    call(method, args, ctx.heap_mut()).map_err(|err| object_native_error(method.name(), err))
 }
 
 fn native_rooted_call(
@@ -331,11 +330,7 @@ fn native_keys_rooted(
             return Err(VmError::InvalidOperand);
         };
         let values = if matches!(target, Value::Proxy(_)) {
-            let string_heap = ctx.cx.interp.string_heap_clone();
-            let trap_keys =
-                ctx.cx
-                    .interp
-                    .own_property_keys_value(context, &target, &string_heap)?;
+            let trap_keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
             let mut values = Vec::with_capacity(trap_keys.len());
             for key in trap_keys {
                 let Value::String(_) = &key else { continue };
@@ -365,10 +360,10 @@ fn native_keys_rooted(
                 ctx.cx
                     .interp
                     .enumerable_own_string_keys_for_value(context, target.clone(), 0)?;
-            let string_heap = ctx.cx.interp.string_heap_clone();
+
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
-                values.push(string_value(&key, &string_heap)?);
+                values.push(string_value(&key, ctx.heap())?);
             }
             values
         };
@@ -391,10 +386,10 @@ fn native_keys_rooted(
         }
         _ => return Err(VmError::TypeMismatch),
     };
-    let string_heap = ctx.cx.interp.string_heap_clone();
+
     let mut names = Vec::with_capacity(owned.len());
     for key in owned {
-        names.push(string_value(&key, &string_heap)?);
+        names.push(string_value(&key, ctx.heap())?);
     }
     Ok(Value::Array(ctx.array_from_elements_with_roots(
         names,
@@ -423,11 +418,11 @@ fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
             .map(|(key, value)| (key.to_string(), value))
             .collect()
     });
-    let string_heap = ctx.cx.interp.string_heap_clone();
+
     let target_root = Value::Object(target);
     let mut pairs = Vec::with_capacity(raw.len());
     for (key, value) in raw {
-        let key_value = string_value(&key, &string_heap)?;
+        let key_value = string_value(&key, ctx.heap())?;
         let pair = ctx.array_from_elements_with_roots(
             [key_value, value],
             &[&target_root],
@@ -593,11 +588,7 @@ fn set_from_entries_key_heap(
 /// context-less `object_statics::call` path. Accepts Array pairs,
 /// ordinary Objects with indexed keys, and String / String-wrapper
 /// entries.
-fn read_entry_pair_heap(
-    entry: &Value,
-    heap: &otter_gc::GcHeap,
-    string_heap: &StringHeap,
-) -> Result<(Value, Value), VmError> {
+fn read_entry_pair_heap(entry: &Value, heap: &otter_gc::GcHeap) -> Result<(Value, Value), VmError> {
     match entry {
         Value::Array(pair) => Ok((
             crate::array::get(*pair, heap, 0),
@@ -607,12 +598,12 @@ fn read_entry_pair_heap(
             if let Some(s) = crate::object::string_data(*obj, heap) {
                 let units = s.to_utf16_vec();
                 let zero = units.first().copied().map_or(Value::Undefined, |u| {
-                    crate::string::JsString::from_utf16_units(&[u], string_heap)
+                    crate::string::JsString::from_utf16_units(&[u], heap)
                         .map(Value::String)
                         .unwrap_or(Value::Undefined)
                 });
                 let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                    crate::string::JsString::from_utf16_units(&[u], string_heap)
+                    crate::string::JsString::from_utf16_units(&[u], heap)
                         .map(Value::String)
                         .unwrap_or(Value::Undefined)
                 });
@@ -625,12 +616,12 @@ fn read_entry_pair_heap(
         Value::String(s) => {
             let units = s.to_utf16_vec();
             let zero = units.first().copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(&[u], string_heap)
+                crate::string::JsString::from_utf16_units(&[u], heap)
                     .map(Value::String)
                     .unwrap_or(Value::Undefined)
             });
             let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(&[u], string_heap)
+                crate::string::JsString::from_utf16_units(&[u], heap)
                     .map(Value::String)
                     .unwrap_or(Value::Undefined)
             });
@@ -694,11 +685,7 @@ fn native_get_own_property_descriptor_rooted(
             }
         },
         Some(Value::NativeFunction(native)) => match &key {
-            PropertyKey::String(key) => native.own_property_descriptor(
-                ctx.heap(),
-                &ctx.cx.interp.string_heap_clone(),
-                key,
-            )?,
+            PropertyKey::String(key) => native.own_property_descriptor(ctx.heap(), key)?,
             PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
         },
         // §10.4.5.1 IntegerIndexedExoticObject [[GetOwnProperty]] —
@@ -797,11 +784,8 @@ fn native_get_own_property_descriptors_rooted(
         return Err(VmError::InvalidOperand);
     };
     let result_root = Value::Object(result);
-    let string_heap = ctx.cx.interp.string_heap_clone();
-    let keys = ctx
-        .cx
-        .interp
-        .own_property_keys_value(context, &target, &string_heap)?;
+
+    let keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
     for key in keys {
         let key_for_descriptor = match &key {
             Value::String(s) => Value::String(s.clone()),
@@ -843,7 +827,6 @@ fn native_get_own_property_names_rooted(
     context: Option<&crate::ExecutionContext>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    let string_heap = ctx.cx.interp.string_heap_clone();
     let values: Vec<Value> = match args.first() {
         Some(target)
             if matches!(
@@ -863,7 +846,7 @@ fn native_get_own_property_names_rooted(
             let target = target.clone();
             ctx.cx
                 .interp
-                .own_property_keys_value(context, &target, &string_heap)?
+                .own_property_keys_value(context, &target)?
                 .into_iter()
                 .filter(|v| matches!(v, Value::String(_)))
                 .collect()
@@ -874,7 +857,7 @@ fn native_get_own_property_names_rooted(
                 .interp
                 .class_constructor_own_property_keys(context, *class)?;
             keys.into_iter()
-                .map(|key| string_value(&key, &string_heap))
+                .map(|key| string_value(&key, ctx.heap()))
                 .collect::<Result<Vec<_>, _>>()?
         }
         Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
@@ -882,7 +865,7 @@ fn native_get_own_property_names_rooted(
             let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
             keys.push("length".to_string());
             keys.into_iter()
-                .map(|key| string_value(&key, &string_heap))
+                .map(|key| string_value(&key, ctx.heap()))
                 .collect::<Result<Vec<_>, _>>()?
         }
         _ => return Err(VmError::TypeMismatch),
@@ -933,11 +916,8 @@ fn native_get_own_property_symbols_rooted(
             return Err(VmError::InvalidOperand);
         };
         let target = target.clone();
-        let string_heap = ctx.cx.interp.string_heap_clone();
-        let trap_keys = ctx
-            .cx
-            .interp
-            .own_property_keys_value(context, &target, &string_heap)?;
+
+        let trap_keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
         let values: Vec<Value> = trap_keys
             .into_iter()
             .filter(|v| matches!(v, Value::Symbol(_)))
@@ -1159,9 +1139,9 @@ fn native_prototype_to_string(
         None => builtin_tag,
     };
     let display = format!("[object {tag}]");
-    let string_heap = ctx.cx.interp.string_heap_clone();
+
     Ok(Value::String(
-        JsString::from_str(&display, &string_heap).map_err(|_| NativeError::TypeError {
+        JsString::from_str(&display, ctx.heap()).map_err(|_| NativeError::TypeError {
             name: "toString",
             reason: "out of memory while allocating string".to_string(),
         })?,
@@ -1363,7 +1343,7 @@ fn native_prototype_property_is_enumerable(
                 .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
             let desc = match key {
                 PropertyKey::String(key) => native
-                    .own_property_descriptor(ctx.heap(), &ctx.cx.interp.string_heap_clone(), &key)
+                    .own_property_descriptor(ctx.heap(), &key)
                     .map_err(|err| object_native_error("propertyIsEnumerable", err.into()))?,
                 PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), &sym),
             };
@@ -2011,7 +1991,7 @@ fn native_function_has_own(
 ) -> bool {
     match expect_property_key(key) {
         Ok(PropertyKey::String(key)) => native
-            .own_property_descriptor(gc_heap, &StringHeap::default(), &key)
+            .own_property_descriptor(gc_heap, &key)
             .ok()
             .flatten()
             .is_some(),
@@ -2049,7 +2029,6 @@ fn bound_function_has_own(
 pub fn call(
     method: otter_bytecode::method_id::ObjectMethod,
     args: &[Value],
-    string_heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ObjectMethod as M;
@@ -2146,7 +2125,6 @@ pub fn call(
                     let ok = match &key {
                         PropertyKey::String(key) => native.define_own_property(
                             gc_heap,
-                            string_heap,
                             key,
                             descriptor.complete_for_new_property(),
                         ),
@@ -2331,9 +2309,7 @@ pub fn call(
                     PropertyKey::String(string_key) => {
                         if let Some(value) = crate::object::string_data(*target, gc_heap)
                             && let Some(desc) = crate::string::exotic::descriptor_for_name(
-                                &value,
-                                string_key,
-                                string_heap,
+                                &value, string_key, gc_heap,
                             )?
                         {
                             return Ok(Value::Object(descriptor_to_object_with_roots(
@@ -2401,7 +2377,7 @@ pub fn call(
                     let PropertyKey::String(key) = &key else {
                         return Ok(Value::Undefined);
                     };
-                    match native.own_property_descriptor(gc_heap, string_heap, key)? {
+                    match native.own_property_descriptor(gc_heap, key)? {
                         Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
                             &desc,
                             gc_heap,
@@ -2414,7 +2390,7 @@ pub fn call(
                 Some(Value::String(value)) => {
                     let desc = match &key {
                         PropertyKey::String(key) => {
-                            crate::string::exotic::descriptor_for_name(value, key, string_heap)?
+                            crate::string::exotic::descriptor_for_name(value, key, gc_heap)?
                         }
                         PropertyKey::Symbol(_) => None,
                     };
@@ -2653,7 +2629,7 @@ pub fn call(
             };
             let mut names = Vec::with_capacity(owned.len());
             for k in owned {
-                names.push(string_value(&k, string_heap)?);
+                names.push(string_value(&k, gc_heap)?);
             }
             Ok(Value::Array(rooted_array_from_elements(
                 gc_heap,
@@ -2689,7 +2665,7 @@ pub fn call(
             });
             let mut pairs: Vec<Value> = Vec::with_capacity(raw.len());
             for (k, v) in raw {
-                let key = string_value(&k, string_heap)?;
+                let key = string_value(&k, gc_heap)?;
                 let pair: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![key, v];
                 let target_root = Value::Object(target);
                 pairs.push(Value::Array(rooted_array_from_elements(
@@ -2755,7 +2731,7 @@ pub fn call(
                     let snapshot: Vec<Value> =
                         crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
                     for entry in snapshot {
-                        let (key, value) = read_entry_pair_heap(&entry, gc_heap, string_heap)?;
+                        let (key, value) = read_entry_pair_heap(&entry, gc_heap)?;
                         set_from_entries_key_heap(result, &key, value, gc_heap)?;
                     }
                 }
@@ -2826,7 +2802,7 @@ pub fn call(
             };
             let mut names: Vec<Value> = Vec::with_capacity(owned.len());
             for k in owned {
-                names.push(string_value(&k, string_heap)?);
+                names.push(string_value(&k, gc_heap)?);
             }
             Ok(Value::Array(rooted_array_from_elements(
                 gc_heap,
@@ -2869,7 +2845,7 @@ pub fn call(
     }
 }
 
-fn string_value(s: &str, heap: &StringHeap) -> Result<Value, VmError> {
+fn string_value(s: &str, heap: &otter_gc::GcHeap) -> Result<Value, VmError> {
     Ok(Value::String(
         JsString::from_str(s, heap).map_err(|_| VmError::TypeMismatch)?,
     ))

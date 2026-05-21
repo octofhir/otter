@@ -32,11 +32,9 @@ use crate::{NativeCtx, NativeError, Value, VmError};
 /// Install `Date.prototype[@@toPrimitive]` per §21.4.4.45.
 pub fn install_date_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
-    let _ = string_heap;
     let Some(Value::Object(date_ctor)) = object::get(global, heap, "Date") else {
         return Ok(());
     };

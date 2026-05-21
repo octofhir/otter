@@ -40,7 +40,6 @@ pub(crate) struct FunctionKindPrototypes {
 impl FunctionKindPrototypes {
     pub(crate) fn build_post_bootstrap(
         heap: &mut otter_gc::GcHeap,
-        string_heap: &crate::string::StringHeap,
         shape_root: object::ShapeHandle,
         function_proto: JsObject,
         well_known: &crate::symbol::WellKnownSymbols,
@@ -57,7 +56,7 @@ impl FunctionKindPrototypes {
             };
             object::set_prototype(proto, heap, Some(function_proto));
             let tag_string =
-                JsString::from_str(tag, string_heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
+                JsString::from_str(tag, heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
             object::define_own_symbol_property_partial(
                 proto,
                 heap,
@@ -148,7 +147,6 @@ impl Interpreter {
         let shape_root = self.shape_runtime.root();
         self.function_kind_prototypes = FunctionKindPrototypes::build_post_bootstrap(
             &mut self.gc_heap,
-            &self.string_heap,
             shape_root,
             function_proto,
             &self.well_known_symbols,

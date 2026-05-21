@@ -9,7 +9,6 @@
 //! - <https://tc39.es/proposal-temporal/#sec-temporal-now-object>
 
 use crate::Value;
-use crate::string::StringHeap;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::alloc_temporal_value;
 use crate::temporal::payload::TemporalPayload;
@@ -17,13 +16,11 @@ use crate::temporal::payload::TemporalPayload;
 /// Dispatch `Temporal.Now.<method>(args...)` via the typed
 /// [`TemporalMethod`].
 pub fn dispatch(
-    string_heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
     use otter_bytecode::method_id::TemporalMethod as M;
-    let _ = string_heap;
     let _ = args;
     match method {
         M::NowInstant => instant(gc_heap),

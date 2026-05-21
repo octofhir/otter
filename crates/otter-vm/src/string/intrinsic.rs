@@ -101,8 +101,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     crate::object::set_string_data(
         prototype,
         heap,
-        crate::string::JsString::from_str("", &crate::string::StringHeap::default())
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
 
     let prototype_root = Value::Object(prototype);
@@ -139,7 +138,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     // §22.1.2 — `String.name` is `"String"`, non-writable,
     // non-enumerable, configurable.
     let string_name_value = Value::String(
-        crate::JsString::from_str("String", &crate::string::StringHeap::default())
+        crate::JsString::from_str("String", &otter_gc::GcHeap::new().expect("heap"))
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let _ = object::define_own_property(
@@ -232,11 +231,10 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 /// - [`NativeError::Thrown`] — `ToPrimitive` raised an uncaught JS
 ///   exception (rethrown without wrapping).
 fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let string_heap = ctx.interp_mut().string_heap_clone();
     let raw = match args.first() {
         Some(value) => value.clone(),
         None => {
-            let empty = crate::string::JsString::from_str("", &string_heap).map_err(|_| {
+            let empty = crate::string::JsString::from_str("", ctx.heap()).map_err(|_| {
                 NativeError::TypeError {
                     name: "String",
                     reason: "string allocation failed".to_string(),
@@ -276,7 +274,6 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     let value = crate::string::dispatch::call(
         otter_bytecode::method_id::StringMethod::Construct,
         std::slice::from_ref(&primitive),
-        &string_heap,
         ctx.heap(),
     )
     .map_err(|err| NativeError::TypeError {

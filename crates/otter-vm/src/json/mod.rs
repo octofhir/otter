@@ -154,20 +154,6 @@ pub enum JsonError {
     },
 }
 
-impl From<crate::string::StringError> for JsonError {
-    fn from(err: crate::string::StringError) -> Self {
-        match err {
-            crate::string::StringError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => Self::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            },
-        }
-    }
-}
-
 impl From<otter_gc::OutOfMemory> for JsonError {
     fn from(err: otter_gc::OutOfMemory) -> Self {
         Self::OutOfMemory {
@@ -192,13 +178,12 @@ impl From<ParseError> for JsonError {
 pub fn call(
     method: otter_bytecode::method_id::JsonMethod,
     args: &[Value],
-    string_heap: &crate::string::StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, JsonError> {
     use otter_bytecode::method_id::JsonMethod;
     match method {
-        JsonMethod::Stringify => json_stringify(args, string_heap, gc_heap),
-        JsonMethod::Parse => json_parse(args, string_heap, gc_heap),
+        JsonMethod::Stringify => json_stringify(args, gc_heap),
+        JsonMethod::Parse => json_parse(args, gc_heap),
     }
 }
 
@@ -207,14 +192,13 @@ pub fn call(
 pub(crate) fn call_with_roots(
     method: otter_bytecode::method_id::JsonMethod,
     args: &[Value],
-    string_heap: &crate::string::StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, JsonError> {
     use otter_bytecode::method_id::JsonMethod;
     match method {
-        JsonMethod::Stringify => json_stringify(args, string_heap, gc_heap),
-        JsonMethod::Parse => json_parse_with_roots(args, string_heap, gc_heap, external_visit),
+        JsonMethod::Stringify => json_stringify(args, gc_heap),
+        JsonMethod::Parse => json_parse_with_roots(args, gc_heap, external_visit),
     }
 }
 
@@ -231,7 +215,6 @@ fn coerce_json_parse_args(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
-    let string_heap = ctx.interp_mut().string_heap_clone();
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     if let Some(slot) = out.first_mut() {
         let s = match slot {
@@ -244,7 +227,7 @@ fn coerce_json_parse_args(
             }
             ref primitive if crate::abstract_ops::is_primitive(primitive) => {
                 let text = primitive.display_string(ctx.heap());
-                JsString::from_str(&text, &string_heap).map_err(|_| NativeError::TypeError {
+                JsString::from_str(&text, ctx.heap()).map_err(|_| NativeError::TypeError {
                     name: "parse",
                     reason: "out of memory".to_string(),
                 })?
@@ -275,7 +258,7 @@ fn coerce_json_parse_args(
                     }
                     other => {
                         let text = other.display_string(ctx.heap());
-                        JsString::from_str(&text, &string_heap).map_err(|_| {
+                        JsString::from_str(&text, ctx.heap()).map_err(|_| {
                             NativeError::TypeError {
                                 name: "parse",
                                 reason: "out of memory".to_string(),
@@ -299,7 +282,6 @@ fn native_json_call(
     method: otter_bytecode::method_id::JsonMethod,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let string_heap = ctx.interp_mut().string_heap.clone();
     let runtime_roots = ctx.collect_native_roots();
     let this_value = ctx.this_value().clone();
     let new_target = ctx.new_target().cloned();
@@ -313,38 +295,25 @@ fn native_json_call(
             &[args],
         );
     };
-    call_with_roots(
-        method,
-        args,
-        &string_heap,
-        ctx.heap_mut(),
-        &mut external_visit,
-    )
-    .map_err(|err| NativeError::TypeError {
-        name: method.name(),
-        reason: err.to_string(),
+    call_with_roots(method, args, ctx.heap_mut(), &mut external_visit).map_err(|err| {
+        NativeError::TypeError {
+            name: method.name(),
+            reason: err.to_string(),
+        }
     })
 }
 
-fn json_stringify(
-    args: &[Value],
-    heap: &crate::string::StringHeap,
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, JsonError> {
+fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     let space = args.get(2).cloned().unwrap_or(Value::Undefined);
     let opts = StringifyOptions::from_space_with_heap(&space, Some(gc_heap))?;
     match stringify_with_options(&value, &opts, gc_heap)? {
-        Some(text) => Ok(Value::String(JsString::from_str(&text, heap)?)),
+        Some(text) => Ok(Value::String(JsString::from_str(&text, gc_heap)?)),
         None => Ok(Value::Undefined),
     }
 }
 
-fn json_parse(
-    args: &[Value],
-    heap: &crate::string::StringHeap,
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, JsonError> {
+fn json_parse(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
     let text = match args.first() {
         Some(Value::String(s)) => s.to_lossy_string(),
         _ => {
@@ -355,13 +324,12 @@ fn json_parse(
             });
         }
     };
-    let value = parse(&text, heap, gc_heap)?;
+    let value = parse(&text, gc_heap)?;
     Ok(value)
 }
 
 fn json_parse_with_roots(
     args: &[Value],
-    heap: &crate::string::StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, JsonError> {
@@ -375,7 +343,7 @@ fn json_parse_with_roots(
             });
         }
     };
-    let value = parse::parse_with_roots(&text, heap, gc_heap, external_visit)?;
+    let value = parse::parse_with_roots(&text, gc_heap, external_visit)?;
     Ok(value)
 }
 
@@ -383,7 +351,6 @@ fn json_parse_with_roots(
 mod tests {
     use super::*;
     use crate::number::NumberValue;
-    use crate::string::StringHeap;
 
     fn n(v: i32) -> Value {
         Value::Number(NumberValue::from_i32(v))
@@ -441,8 +408,7 @@ mod tests {
     #[test]
     fn stringify_uses_source_bytes_for_unmutated_parsed_array() {
         let mut heap = make_heap();
-        let sheap = StringHeap::default();
-        let parsed = parse("[1,2,3,4]", &sheap, &mut heap).unwrap();
+        let parsed = parse("[1,2,3,4]", &mut heap).unwrap();
         // Re-stringify should reproduce the input verbatim.
         let s = stringify(&parsed, &mut heap).unwrap().unwrap();
         assert_eq!(s, "[1,2,3,4]");
@@ -451,8 +417,7 @@ mod tests {
     #[test]
     fn stringify_observably_equivalent_when_fast_path_disqualified() {
         let mut heap = make_heap();
-        let sheap = StringHeap::default();
-        let Value::Array(arr) = parse("[1,2,3]", &sheap, &mut heap).unwrap() else {
+        let Value::Array(arr) = parse("[1,2,3]", &mut heap).unwrap() else {
             panic!("parsed value should be an array")
         };
         // Mutating the array invalidates source_bytes; stringify must
@@ -465,8 +430,7 @@ mod tests {
     #[test]
     fn stringify_pretty_disables_source_bytes_fast_path() {
         let mut heap = make_heap();
-        let sheap = StringHeap::default();
-        let parsed = parse("[1,2,3]", &sheap, &mut heap).unwrap();
+        let parsed = parse("[1,2,3]", &mut heap).unwrap();
         let opts = StringifyOptions::from_space(&Value::Number(NumberValue::from_i32(2))).unwrap();
         let s = stringify_with_options(&parsed, &opts, &mut heap)
             .unwrap()
@@ -479,8 +443,7 @@ mod tests {
     #[test]
     fn parse_round_trip() {
         let mut heap = make_heap();
-        let sheap = StringHeap::default();
-        let v = parse("{\"x\":[1,2,3]}", &sheap, &mut heap).unwrap();
+        let v = parse("{\"x\":[1,2,3]}", &mut heap).unwrap();
         if let Value::Object(o) = v {
             if let Some(Value::Array(arr)) = crate::object::get(o, &heap, "x") {
                 assert_eq!(crate::array::len(arr, &heap), 3);
@@ -521,8 +484,7 @@ mod tests {
 
         // Parse with byte position.
         let mut gc_heap = make_heap();
-        let sheap = StringHeap::default();
-        let err = parse("[1, 2,]", &sheap, &mut gc_heap).unwrap_err();
+        let err = parse("[1, 2,]", &mut gc_heap).unwrap_err();
         assert_eq!(err.position, 6);
         assert_eq!(err.message, "trailing comma");
     }

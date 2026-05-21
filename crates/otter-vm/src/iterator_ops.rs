@@ -31,10 +31,7 @@ use crate::{
     step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
 
-fn string_iterator_values(
-    s: &JsString,
-    string_heap: &crate::StringHeap,
-) -> Result<Vec<Value>, VmError> {
+fn string_iterator_values(s: &JsString, heap: &otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
     let mut out = Vec::new();
     let mut index = 0;
     while let Some(unit) = s.char_code_at(index) {
@@ -47,7 +44,7 @@ fn string_iterator_values(
             smallvec::smallvec![unit]
         };
         let advance = units.len() as u32;
-        let value = JsString::from_utf16_units(&units, string_heap)?;
+        let value = JsString::from_utf16_units(&units, heap)?;
         out.push(Value::String(value));
         index += advance;
     }
@@ -187,7 +184,7 @@ impl Interpreter {
             Value::Iterator(rc) => *rc,
             _ => return Err(VmError::TypeMismatch),
         };
-        let (value, done) = step_iterator(iter, &self.string_heap, &mut self.gc_heap)?;
+        let (value, done) = step_iterator(iter, &mut self.gc_heap)?;
         write_register(frame, value_dst, value)?;
         write_register(frame, done_dst, Value::Boolean(done))?;
         frame.pc += 1;
@@ -210,7 +207,7 @@ impl Interpreter {
         context: &ExecutionContext,
         iter: &IteratorHandle,
     ) -> Result<(Value, bool), VmError> {
-        match step_iterator(*iter, &self.string_heap, &mut self.gc_heap) {
+        match step_iterator(*iter, &mut self.gc_heap) {
             Ok((value, done)) => Ok((value, done)),
             Err(_) => self.iterator_next_full_slow(context, iter),
         }
@@ -948,7 +945,7 @@ impl Interpreter {
                 return Ok(elements);
             }
             Value::String(s) => {
-                return string_iterator_values(s, &self.string_heap);
+                return string_iterator_values(s, &self.gc_heap);
             }
             Value::Set(s) => return Ok(crate::collections::set_values(*s, &self.gc_heap)),
             Value::Map(m) => {

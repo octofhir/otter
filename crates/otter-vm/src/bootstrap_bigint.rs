@@ -76,9 +76,8 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     let ctor_roots = vec![global_root.clone(), Value::Object(prototype)];
@@ -109,7 +108,6 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 /// Install `BigInt.prototype[@@toStringTag] = "BigInt"`.
 pub fn install_bigint_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -119,7 +117,7 @@ pub fn install_bigint_well_knowns_post_bootstrap(
         return Ok(());
     };
     let descriptor = ctor
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data {
@@ -130,7 +128,7 @@ pub fn install_bigint_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let tag = crate::string::JsString::from_str("BigInt", string_heap)
+    let tag = crate::string::JsString::from_str("BigInt", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
@@ -197,7 +195,6 @@ fn coerce_bigint_call_args(
     args: &[Value],
     name: &'static str,
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
-    let string_heap = ctx.interp_mut().string_heap_clone();
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     for slot in out.iter_mut() {
         match slot {
@@ -216,7 +213,7 @@ fn coerce_bigint_call_args(
                 };
                 let joined = parts.join(",");
                 *slot = Value::String(
-                    crate::string::JsString::from_str(&joined, &string_heap).map_err(|_| {
+                    crate::string::JsString::from_str(&joined, ctx.heap()).map_err(|_| {
                         NativeError::TypeError {
                             name,
                             reason: "out of memory".to_string(),
@@ -318,8 +315,8 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
         }
     };
     let rendered = b.with_inner(ctx.heap(), |bi| bi.to_str_radix(radix));
-    let string_heap = ctx.interp_mut().string_heap_clone();
-    let s = crate::string::JsString::from_str(&rendered, &string_heap)
+
+    let s = crate::string::JsString::from_str(&rendered, ctx.heap())
         .map_err(|_| oom("BigInt.prototype.toString"))?;
     Ok(Value::String(s))
 }
@@ -364,7 +361,6 @@ fn define_static(
         roots.as_slice(),
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     let attrs = Attr::builtin_function();
     let desc = PropertyDescriptor::data(
         Value::NativeFunction(func),
@@ -372,7 +368,7 @@ fn define_static(
         attrs.enumerable,
         attrs.configurable,
     );
-    if !ctor.define_own_property(heap, &string_heap, name, desc) {
+    if !ctor.define_own_property(heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
     }
     Ok(())

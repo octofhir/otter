@@ -103,7 +103,6 @@ impl crate::intrinsic_install::BuiltinIntrinsic for WeakSetIntrinsic {
 /// - <https://tc39.es/ecma262/#sec-set.prototype-@@tostringtag>
 pub fn install_collection_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -123,7 +122,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
         };
         // §24.*.3.* — @@toStringTag = ctor_name, non-writable,
         // non-enumerable, configurable.
-        let tag = crate::string::JsString::from_str(ctor_name, string_heap)
+        let tag = crate::string::JsString::from_str(ctor_name, heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
         object::define_own_symbol_property_partial(
             prototype,
@@ -221,9 +220,8 @@ fn ctor_prototype(global: JsObject, heap: &otter_gc::GcHeap, ctor_name: &str) ->
     let Value::NativeFunction(f) = ctor else {
         return None;
     };
-    let string_heap = crate::string::StringHeap::default();
     let descriptor = f
-        .own_property_descriptor(heap, &string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .ok()
         .flatten()?;
     match descriptor.kind {
@@ -269,12 +267,11 @@ fn install_collection(
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
 
     // §24.1.2.1 / §24.2.2.1 — `prototype` own data property:
     // non-writable, non-enumerable, non-configurable.
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
 
@@ -300,7 +297,7 @@ fn install_collection(
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let desc = PropertyDescriptor::data(Value::NativeFunction(group_by_fn), true, false, true);
-        if !ctor.define_own_property(heap, &string_heap, "groupBy", desc) {
+        if !ctor.define_own_property(heap, "groupBy", desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("groupBy"));
         }
     }
@@ -724,7 +721,7 @@ fn apply_collection_new_target_prototype(
             constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
         }),
         Value::NativeFunction(native) => native
-            .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+            .own_property_descriptor(ctx.heap_mut(), "prototype")
             .map_err(|err| NativeError::TypeError {
                 name: kind.name(),
                 reason: err.to_string(),

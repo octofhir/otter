@@ -160,7 +160,7 @@ fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
         index: 0,
         reason: "Invalid Date",
     })?;
-    Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
+    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
 }
 
 /// §21.4.4.41 — `toJSON()`. Returns `toISOString()` for finite
@@ -168,7 +168,7 @@ fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let time = receiver_time(args)?;
     match to_iso_string(time) {
-        Some(s) => Ok(Value::String(JsString::from_str(&s, args.string_heap)?)),
+        Some(s) => Ok(Value::String(JsString::from_str(&s, args.gc_heap)?)),
         None => Ok(Value::Null),
     }
 }
@@ -179,7 +179,7 @@ fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let time = receiver_time(args)?;
     let s = to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
-    Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
+    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
 }
 
 /// §21.4.4.27 / §21.4.4.43 / §21.4.4.40 — `toDateString` /
@@ -193,7 +193,7 @@ fn impl_to_date_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         Some(bd) => format!("{:04}-{:02}-{:02}", bd.year, bd.month + 1, bd.day),
         None => "Invalid Date".to_string(),
     };
-    Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
+    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
 }
 
 fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -205,7 +205,7 @@ fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         ),
         None => "Invalid Date".to_string(),
     };
-    Ok(Value::String(JsString::from_str(&s, args.string_heap)?))
+    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
 }
 
 /// Helper for `setX`-family methods. Reads each `args.args[idx]` as
@@ -482,10 +482,7 @@ fn native_date_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
-    let (string_heap, allocation_roots) = {
-        let interp = ctx.interp_mut();
-        (interp.string_heap_clone(), interp.collect_runtime_roots())
-    };
+    let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Date.prototype method".to_string(),
@@ -493,7 +490,6 @@ fn native_date_method(
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
         args,
-        string_heap: &string_heap,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),
     })

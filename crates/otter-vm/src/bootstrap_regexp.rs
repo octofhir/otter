@@ -73,9 +73,8 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
 
@@ -114,7 +113,6 @@ fn install_regexp_legacy_accessors(
     ctor: crate::native_function::NativeFunction,
 ) -> Result<(), JsSurfaceError> {
     use crate::native_function::NativeFunction;
-    let string_heap = crate::string::StringHeap::default();
     let ctor_value = Value::NativeFunction(ctor);
 
     fn install_get_only(
@@ -135,8 +133,7 @@ fn install_regexp_legacy_accessors(
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let desc =
             PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
-        let string_heap = crate::string::StringHeap::default();
-        if !ctor.define_own_property(heap, &string_heap, name, desc) {
+        if !ctor.define_own_property(heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
         Ok(())
@@ -174,13 +171,12 @@ fn install_regexp_legacy_accessors(
             false,
             true,
         );
-        let string_heap = crate::string::StringHeap::default();
-        if !ctor.define_own_property(heap, &string_heap, name, desc) {
+        if !ctor.define_own_property(heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
         Ok(())
     }
-    let _ = (string_heap, ctor_value);
+    let _ = &ctor_value;
 
     // input / $_ — only get/set pair per §B.2.4.1.
     install_get_set(heap, ctor, "input", "get input", "set input")?;
@@ -224,8 +220,7 @@ fn legacy_accessor_getter(
             reason: "Method called on incompatible receiver".to_string(),
         });
     }
-    let heap = ctx.interp_mut().string_heap_clone();
-    Ok(Value::String(JsString::from_str("", &heap).map_err(
+    Ok(Value::String(JsString::from_str("", ctx.heap()).map_err(
         |_| NativeError::TypeError {
             name: "RegExp legacy accessor",
             reason: "out of memory".to_string(),
@@ -270,7 +265,6 @@ fn values_strict_equal(a: &Value, b: &Value) -> bool {
 /// now — only `@@toStringTag` is landed here.
 pub fn install_regexp_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -280,7 +274,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         return Ok(());
     };
     let descriptor = ctor
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data {
@@ -405,7 +399,6 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             ..Default::default()
         },
     );
-    let _ = string_heap;
     Ok(())
 }
 
@@ -542,8 +535,8 @@ fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let re = receiver_regexp(ctx, "RegExp.prototype.exec")?;
     let text = args.first().cloned().unwrap_or(Value::Undefined);
     let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.exec")?;
-    let string_heap = ctx.interp_mut().string_heap_clone();
-    crate::regexp_prototype::exec_once_native(&re, &text_str, &string_heap, ctx, &[args])
+
+    crate::regexp_prototype::exec_once_native(&re, &text_str, ctx, &[args])
         .map_err(|e| intrinsic_to_native(e, "RegExp.prototype.exec"))
 }
 
@@ -641,9 +634,9 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
     let source = re.source(ctx.heap());
     let flags = re.flags(ctx.heap()).to_js_string();
     let rendered = format!("/{source}/{flags}");
-    let string_heap = ctx.interp_mut().string_heap_clone();
-    let s = JsString::from_str(&rendered, &string_heap)
-        .map_err(|_| oom("RegExp.prototype.toString"))?;
+
+    let s =
+        JsString::from_str(&rendered, ctx.heap()).map_err(|_| oom("RegExp.prototype.toString"))?;
     Ok(Value::String(s))
 }
 
@@ -722,7 +715,7 @@ fn install_accessor(
 /// unescaped `/` / line terminators escaped.
 fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
-    let string_heap = ctx.interp_mut().string_heap_clone();
+
     let raw = match &receiver {
         Value::RegExp(re) => re.source(ctx.heap()),
         Value::Object(obj) => {
@@ -742,7 +735,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
                 });
             }
             return Ok(Value::String(
-                JsString::from_str("(?:)", &string_heap).map_err(|_| oom("source"))?,
+                JsString::from_str("(?:)", ctx.heap()).map_err(|_| oom("source"))?,
             ));
         }
         _ => {
@@ -754,7 +747,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
     };
     let escaped = crate::regexp_prototype::escape_regexp_pattern(&raw);
     Ok(Value::String(
-        JsString::from_str(&escaped, &string_heap).map_err(|_| oom("source"))?,
+        JsString::from_str(&escaped, ctx.heap()).map_err(|_| oom("source"))?,
     ))
 }
 
@@ -844,9 +837,9 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
             out.push(letter);
         }
     }
-    let string_heap = ctx.interp_mut().string_heap_clone();
+
     Ok(Value::String(
-        JsString::from_str(&out, &string_heap).map_err(|_| oom("flags"))?,
+        JsString::from_str(&out, ctx.heap()).map_err(|_| oom("flags"))?,
     ))
 }
 
@@ -915,8 +908,8 @@ fn coerce_to_string(
         return Ok(s.clone());
     }
     let s = v.display_string(ctx.heap());
-    let string_heap = ctx.interp_mut().string_heap_clone();
-    JsString::from_str(&s, &string_heap).map_err(|_| oom(name))
+
+    JsString::from_str(&s, ctx.heap()).map_err(|_| oom(name))
 }
 
 fn oom(name: &'static str) -> NativeError {

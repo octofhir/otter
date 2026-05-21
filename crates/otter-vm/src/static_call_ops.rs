@@ -91,13 +91,13 @@ impl Interpreter {
                         }
                         other => crate::string::JsString::from_str(
                             &other.display_string(&self.gc_heap),
-                            &self.string_heap,
+                            self.gc_heap_mut(),
                         )?,
                     };
                     *slot = Value::String(s);
                 }
-                let result = json::call(method, &coerced, &self.string_heap, &mut self.gc_heap)
-                    .map_err(json_to_vm_error)?;
+                let result =
+                    json::call(method, &coerced, &mut self.gc_heap).map_err(json_to_vm_error)?;
                 finish_static_call(frame, dst, result)
             }
             Op::DateCall => unreachable!("DateCall requires stack-rooted dispatch"),
@@ -129,7 +129,7 @@ impl Interpreter {
                         let joined = parts.join(",");
                         *slot = Value::String(crate::string::JsString::from_str(
                             &joined,
-                            &self.string_heap,
+                            self.gc_heap_mut(),
                         )?);
                     }
                 }
@@ -152,8 +152,7 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
                     method_id::GlobalMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result =
-                    global_functions::call(method, &args, &self.string_heap, &self.gc_heap)?;
+                let result = global_functions::call(method, &args, &self.gc_heap)?;
                 finish_static_call(frame, dst, result)
             }
             Op::SymbolCall => {
@@ -185,14 +184,8 @@ impl Interpreter {
                     .ok_or(VmError::InvalidOperand)?;
                 let method = method_id::TemporalMethod::from_u32(method_idx)
                     .ok_or(VmError::InvalidOperand)?;
-                let result = temporal::call_static(
-                    &self.string_heap,
-                    &mut self.gc_heap,
-                    class,
-                    method,
-                    &args,
-                )
-                .map_err(temporal_to_vm_error)?;
+                let result = temporal::call_static(&mut self.gc_heap, class, method, &args)
+                    .map_err(temporal_to_vm_error)?;
                 finish_static_call(frame, dst, result)
             }
             _ => Err(VmError::InvalidOperand),
@@ -302,7 +295,7 @@ impl Interpreter {
                     }
                     other => crate::string::JsString::from_str(
                         &other.display_string(&self.gc_heap),
-                        &self.string_heap,
+                        self.gc_heap_mut(),
                     )?,
                 };
                 *slot = Value::String(s);
@@ -320,14 +313,8 @@ impl Interpreter {
                 arg.trace_value_slots(visitor);
             }
         };
-        let result = json::call_with_roots(
-            method,
-            &args,
-            &self.string_heap,
-            &mut self.gc_heap,
-            &mut external_visit,
-        )
-        .map_err(json_to_vm_error)?;
+        let result = json::call_with_roots(method, &args, &mut self.gc_heap, &mut external_visit)
+            .map_err(json_to_vm_error)?;
         finish_static_call(&mut stack[top_idx], dst, result)
     }
 
@@ -583,7 +570,7 @@ impl Interpreter {
                             other
                                 .string_name()
                                 .expect("non-symbol key has string spelling"),
-                            &self.string_heap,
+                            self.gc_heap_mut(),
                         )?),
                     };
                     let mut rewritten: SmallVec<[Value; 4]> = args.iter().cloned().collect();
@@ -608,12 +595,7 @@ impl Interpreter {
                     {
                         result
                     } else {
-                        object_statics::call(
-                            method,
-                            &rewritten,
-                            &self.string_heap,
-                            &mut self.gc_heap,
-                        )?
+                        object_statics::call(method, &rewritten, &mut self.gc_heap)?
                     };
                     return finish_static_call(&mut stack[top_idx], dst, result);
                 }
@@ -633,7 +615,7 @@ impl Interpreter {
         {
             result
         } else {
-            object_statics::call(method, &args, &self.string_heap, &mut self.gc_heap)?
+            object_statics::call(method, &args, &mut self.gc_heap)?
         };
         finish_static_call(&mut stack[top_idx], dst, result)
     }
@@ -870,7 +852,7 @@ impl Interpreter {
                         let mut buf = [0u16; 2];
                         let units = ch.encode_utf16(&mut buf);
                         let unit_string =
-                            crate::string::JsString::from_utf16_units(units, &self.string_heap)
+                            crate::string::JsString::from_utf16_units(units, self.gc_heap_mut())
                                 .map_err(|_| VmError::TypeMismatch)?;
                         assign_set_string(
                             self,
@@ -982,7 +964,7 @@ impl Interpreter {
                         units
                             .into_iter()
                             .map(|u| {
-                                crate::string::JsString::from_utf16_units(&[u], &self.string_heap)
+                                crate::string::JsString::from_utf16_units(&[u], self.gc_heap_mut())
                                     .map(Value::String)
                                     .unwrap_or(Value::Undefined)
                             })
@@ -1023,7 +1005,7 @@ impl Interpreter {
                             .map(|(i, u)| {
                                 let v = crate::string::JsString::from_utf16_units(
                                     &[u],
-                                    &self.string_heap,
+                                    self.gc_heap_mut(),
                                 )
                                 .map(Value::String)
                                 .unwrap_or(Value::Undefined);
@@ -1170,11 +1152,7 @@ impl Interpreter {
                             let key = key
                                 .string_name()
                                 .expect("non-symbol property key has string spelling");
-                            native.own_property_descriptor(
-                                self.gc_heap(),
-                                &self.string_heap,
-                                key,
-                            )?
+                            native.own_property_descriptor(self.gc_heap(), key)?
                         }
                     },
                     // §10.4.5.1 IntegerIndexedExoticObject
@@ -1276,9 +1254,11 @@ impl Interpreter {
                         let result_root = Value::Object(result);
                         for (i, u) in units.iter().enumerate() {
                             let key = i.to_string();
-                            let unit =
-                                crate::string::JsString::from_utf16_units(&[*u], &self.string_heap)
-                                    .map_err(|_| VmError::TypeMismatch)?;
+                            let unit = crate::string::JsString::from_utf16_units(
+                                &[*u],
+                                self.gc_heap_mut(),
+                            )
+                            .map_err(|_| VmError::TypeMismatch)?;
                             let desc = crate::object::PropertyDescriptor::data(
                                 Value::String(unit),
                                 false,
@@ -1316,9 +1296,7 @@ impl Interpreter {
                         // expando bags on the same reflective path.
                         let target_value = target.clone();
                         let result_root = Value::Object(result);
-                        let string_heap = self.string_heap.clone();
-                        let keys =
-                            self.own_property_keys_value(context, &target_value, &string_heap)?;
+                        let keys = self.own_property_keys_value(context, &target_value)?;
                         for key in keys {
                             let vm_key = match &key {
                                 Value::String(s) => {
@@ -1381,16 +1359,14 @@ impl Interpreter {
                         keys.push("length".to_string());
                         keys
                     }
-                    Some(target) if own_property_names_uses_internal_methods(target) => {
-                        let string_heap = self.string_heap_clone();
-                        self.own_property_keys_value(context, target, &string_heap)?
-                            .into_iter()
-                            .filter_map(|key| match key {
-                                Value::String(name) => Some(name.to_lossy_string()),
-                                _ => None,
-                            })
-                            .collect()
-                    }
+                    Some(target) if own_property_names_uses_internal_methods(target) => self
+                        .own_property_keys_value(context, target)?
+                        .into_iter()
+                        .filter_map(|key| match key {
+                            Value::String(name) => Some(name.to_lossy_string()),
+                            _ => None,
+                        })
+                        .collect(),
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
                             message: "Object.getOwnPropertyNames called on null or undefined"
@@ -1420,13 +1396,11 @@ impl Interpreter {
                         | Value::BigInt(_)
                         | Value::String(_),
                     ) => Vec::new(),
-                    Some(target) if own_property_names_uses_internal_methods(target) => {
-                        let string_heap = self.string_heap_clone();
-                        self.own_property_keys_value(context, target, &string_heap)?
-                            .into_iter()
-                            .filter(|key| matches!(key, Value::Symbol(_)))
-                            .collect()
-                    }
+                    Some(target) if own_property_names_uses_internal_methods(target) => self
+                        .own_property_keys_value(context, target)?
+                        .into_iter()
+                        .filter(|key| matches!(key, Value::Symbol(_)))
+                        .collect(),
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
                             message: "Object.getOwnPropertySymbols called on null or undefined"
@@ -1788,8 +1762,7 @@ fn own_enumerable_keys_for_define(
         | Value::BoundFunction(_)
         | Value::RegExp(_)
         | Value::Proxy(_) => {
-            let string_heap = interp.string_heap_clone();
-            let keys = interp.own_property_keys_value(context, props, &string_heap)?;
+            let keys = interp.own_property_keys_value(context, props)?;
             let mut out = Vec::new();
             for key in keys {
                 let vm_key = value_to_static_property_key(&key)?;
@@ -1876,7 +1849,7 @@ fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
 
 fn stack_static_string_value(s: &str, interp: &Interpreter) -> Result<Value, VmError> {
     Ok(Value::String(
-        JsString::from_str(s, &interp.string_heap).map_err(|_| VmError::TypeMismatch)?,
+        JsString::from_str(s, interp.gc_heap()).map_err(|_| VmError::TypeMismatch)?,
     ))
 }
 
@@ -1977,8 +1950,7 @@ fn enumerable_own_string_entries(
     target: &Value,
     args: &[Value],
 ) -> Result<Vec<(String, Value)>, VmError> {
-    let string_heap = interp.string_heap_clone();
-    let keys = interp.own_property_keys_value(context, target, &string_heap)?;
+    let keys = interp.own_property_keys_value(context, target)?;
     let mut entries = Vec::new();
     for key_value in &keys {
         let Value::String(name) = key_value else {
@@ -2045,8 +2017,7 @@ fn assign_copy_source_keys(
     source: &Value,
     args: &[Value],
 ) -> Result<(), VmError> {
-    let string_heap = interp.string_heap_clone();
-    let keys = interp.own_property_keys_value(context, source, &string_heap)?;
+    let keys = interp.own_property_keys_value(context, source)?;
     for key_value in &keys {
         let key = match key_value {
             Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),

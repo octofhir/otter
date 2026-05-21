@@ -28,9 +28,7 @@ use crate::{
     ToPrimitiveStage, Value, VmError, VmGetOutcome, VmPropertyKey, abstract_ops, number, object,
     object_prototype_intercept,
     operand_decode::{const_operand, register_operand},
-    ordinary_method_for, read_register,
-    string::StringHeap,
-    symbol, write_register,
+    ordinary_method_for, read_register, symbol, write_register,
 };
 
 pub(crate) fn to_number_primitive(value: &Value) -> Result<NumberValue, VmError> {
@@ -88,12 +86,13 @@ pub(crate) fn to_string_primitive(
 
 pub(crate) fn to_js_string_primitive(
     value: &Value,
-    string_heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
     match value {
         Value::String(s) => Ok(s.clone()),
-        Value::Number(n) => number::ecma::number_to_string(n.as_f64(), string_heap)
-            .map_err(|_| VmError::TypeMismatch),
+        Value::Number(n) => {
+            number::ecma::number_to_string(n.as_f64(), gc_heap).map_err(|_| VmError::TypeMismatch)
+        }
         // BigInt arm cannot fire here without a GcHeap; the caller is
         // expected to coerce BigInt through
         // `to_string_primitive(..., heap)` upstream of this helper.
@@ -103,22 +102,22 @@ pub(crate) fn to_js_string_primitive(
 
 pub(crate) fn string_constructor_js_string(
     value: Option<&Value>,
-    string_heap: &StringHeap,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
     match value {
-        Some(Value::Symbol(s)) => JsString::from_str(&s.descriptive_string(), string_heap)
-            .map_err(|_| VmError::TypeMismatch),
-        Some(value) => match to_js_string_primitive(value, string_heap) {
+        Some(Value::Symbol(s)) => {
+            JsString::from_str(&s.descriptive_string(), gc_heap).map_err(|_| VmError::TypeMismatch)
+        }
+        Some(value) => match to_js_string_primitive(value, gc_heap) {
             Ok(value) => Ok(value),
             Err(VmError::TypeMismatch) => {
                 let rendered = to_string_primitive(value, gc_heap)
                     .unwrap_or_else(|_| value.display_string(gc_heap));
-                JsString::from_str(&rendered, string_heap).map_err(|_| VmError::TypeMismatch)
+                JsString::from_str(&rendered, gc_heap).map_err(|_| VmError::TypeMismatch)
             }
             Err(err) => Err(err),
         },
-        None => JsString::empty(string_heap).map_err(|_| VmError::TypeMismatch),
+        None => JsString::empty(gc_heap).map_err(|_| VmError::TypeMismatch),
     }
 }
 
@@ -174,7 +173,7 @@ impl Interpreter {
         if !self.is_callable_runtime(&callee) {
             return Ok(None);
         }
-        let hint = JsString::from_str("number", &self.string_heap)?;
+        let hint = JsString::from_str("number", self.gc_heap_mut())?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
         args.push(Value::String(hint));
         stack[top_idx].pc = stack[top_idx]
@@ -558,7 +557,7 @@ impl Interpreter {
                             stage = ToPrimitiveStage::OrdinaryFirst;
                         }
                         Some(callee) if self.is_callable_runtime(&callee) => {
-                            let hint_str = JsString::from_str(hint.as_token(), &self.string_heap)?;
+                            let hint_str = JsString::from_str(hint.as_token(), &self.gc_heap)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                             args.push(Value::String(hint_str));
                             // §7.1.1 step 5.d. The resume guard
@@ -629,7 +628,6 @@ impl Interpreter {
                             o,
                             method,
                             &no_args,
-                            &self.string_heap,
                             &self.gc_heap,
                             self.function_prototype_object().ok(),
                         )? && abstract_ops::is_primitive(&v)
@@ -684,7 +682,6 @@ impl Interpreter {
                             o,
                             method,
                             &no_args,
-                            &self.string_heap,
                             &self.gc_heap,
                             self.function_prototype_object().ok(),
                         )? && abstract_ops::is_primitive(&v)

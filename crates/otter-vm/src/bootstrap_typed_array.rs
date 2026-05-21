@@ -162,9 +162,8 @@ pub(crate) fn install_typed_array_entry(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let ctor_root = Value::NativeFunction(ctor);
-    let string_heap = crate::string::StringHeap::default();
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     // §23.2.6.1: each concrete TypedArray constructor inherits from
@@ -179,7 +178,7 @@ pub(crate) fn install_typed_array_entry(
         false,
         false,
     );
-    let _ = ctor.define_own_property(heap, &string_heap, "BYTES_PER_ELEMENT", bpe_desc);
+    let _ = ctor.define_own_property(heap, "BYTES_PER_ELEMENT", bpe_desc);
 
     // §23.2.2.1 / §23.2.2.2 — per-kind `from` / `of` static methods.
     // Installed as own properties so reflective access
@@ -200,7 +199,6 @@ pub(crate) fn install_typed_array_entry(
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let _ = ctor.define_own_property(
             heap,
-            &string_heap,
             "from",
             PropertyDescriptor::data(Value::NativeFunction(from_native), true, false, true),
         );
@@ -214,7 +212,6 @@ pub(crate) fn install_typed_array_entry(
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let _ = ctor.define_own_property(
             heap,
-            &string_heap,
             "of",
             PropertyDescriptor::data(Value::NativeFunction(of_native), true, false, true),
         );
@@ -909,9 +906,9 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
         Value::TypedArray(t) => t.kind().name(),
         _ => return Ok(Value::Undefined),
     };
-    let string_heap = ctx.cx.interp.string_heap_clone();
+
     Ok(Value::String(
-        crate::string::JsString::from_str(kind_name, &string_heap).map_err(|_| {
+        crate::string::JsString::from_str(kind_name, ctx.heap()).map_err(|_| {
             NativeError::TypeError {
                 name: "TypedArray.prototype[@@toStringTag]",
                 reason: "out of memory".to_string(),
@@ -965,11 +962,10 @@ fn ensure_abstract_typed_array_constructor(
         &[&global_root, &abstract_proto_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let string_heap = crate::string::StringHeap::default();
     // §23.2.2.3 %TypedArray%.prototype is non-writable,
     // non-enumerable, non-configurable.
     let proto_desc = PropertyDescriptor::data(Value::Object(abstract_proto), false, false, false);
-    if !ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     // §23.2.3.2 %TypedArray%.prototype.constructor — writable,
@@ -1339,15 +1335,11 @@ fn ta_proto_dispatch(
         })?;
     let receiver = ctx.this_value().clone();
     let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    let (string_heap, allocation_roots) = {
-        let interp = ctx.interp_mut();
-        (interp.string_heap_clone(), interp.collect_runtime_roots())
-    };
+    let allocation_roots = ctx.collect_native_roots();
     let gc_heap = ctx.heap_mut();
     let mut intrinsic_args = IntrinsicArgs {
         receiver: &receiver,
         args: &small_args,
-        string_heap: &string_heap,
         gc_heap,
         allocation_roots: allocation_roots.as_slice(),
     };

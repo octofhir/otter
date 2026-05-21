@@ -101,7 +101,7 @@ impl Interpreter {
             self.alloc_stack_rooted_object_with_extra_roots(stack, &[message_value, &proto_value])?;
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         if let Some(text) = message {
-            let s = JsString::from_str(&text, &self.string_heap)?;
+            let s = JsString::from_str(&text, self.gc_heap_mut())?;
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
             // [[Writable]]: true, [[Enumerable]]: false,
             // [[Configurable]]: true }`. Ordinary `set` would install
@@ -260,7 +260,7 @@ impl Interpreter {
             };
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }
-        if is_oom && let Ok(message_str) = JsString::from_str(message, &self.string_heap) {
+        if is_oom && let Ok(message_str) = JsString::from_str(message, self.gc_heap_mut()) {
             crate::object::set(
                 obj,
                 &mut self.gc_heap,
@@ -403,16 +403,13 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
 /// reason for promise reactions. Foundation: a plain string is
 /// fine; once the full Error hierarchy is in we'll synthesize a
 /// real `TypeError` / `RangeError` instance.
-pub(crate) fn vm_err_to_value(err: &VmError) -> Value {
+pub(crate) fn vm_err_to_value(err: &VmError, heap: &otter_gc::GcHeap) -> Value {
     Value::String(
-        crate::JsString::from_str(&err.to_string(), &crate::StringHeap::default()).unwrap_or_else(
-            |_| {
-                // Allocator failure here is exceptional; substitute
-                // an empty string rather than panicking.
-                crate::JsString::from_str("", &crate::StringHeap::default())
-                    .expect("empty string allocates")
-            },
-        ),
+        crate::JsString::from_str(&err.to_string(), heap).unwrap_or_else(|_| {
+            // Allocator failure here is exceptional; substitute
+            // an empty string rather than panicking.
+            crate::JsString::from_str("", heap).expect("empty string allocates")
+        }),
     )
 }
 

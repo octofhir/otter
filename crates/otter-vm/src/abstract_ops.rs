@@ -617,15 +617,14 @@ fn to_numeric_for_compare(value: &Value, heap: &otter_gc::GcHeap) -> Option<Nume
 mod tests {
     use super::*;
     use crate::number::NumberValue;
-    use crate::string::{JsString, StringHeap};
+    use crate::string::JsString;
 
     fn n(v: f64) -> Value {
         Value::Number(NumberValue::Double(v))
     }
 
-    fn s(v: &str) -> Value {
-        let heap = StringHeap::default();
-        Value::String(JsString::from_str(v, &heap).expect("foundation heap fits the literal"))
+    fn s(v: &str, heap: &otter_gc::GcHeap) -> Value {
+        Value::String(JsString::from_str(v, heap).expect("foundation heap fits the literal"))
     }
 
     fn fresh_heap() -> otter_gc::GcHeap {
@@ -658,8 +657,8 @@ mod tests {
     #[test]
     fn strings_compare_by_content() {
         let heap = fresh_heap();
-        assert!(same_value(&s("hi"), &s("hi"), &heap));
-        assert!(!same_value(&s("hi"), &s("bye"), &heap));
+        assert!(same_value(&s("hi", &heap), &s("hi", &heap), &heap));
+        assert!(!same_value(&s("hi", &heap), &s("bye", &heap), &heap));
     }
 
     #[test]

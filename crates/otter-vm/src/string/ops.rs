@@ -27,7 +27,7 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let tag = read_register(frame, src)?.typeof_string_with_heap(&self.gc_heap);
-        let s = JsString::from_str(tag, &self.string_heap)?;
+        let s = JsString::from_str(tag, &self.gc_heap)?;
         write_register(frame, dst, Value::String(s))?;
         frame.pc += 1;
         Ok(())
@@ -52,8 +52,8 @@ impl Interpreter {
             _ => return Err(VmError::TypeMismatch),
         };
         let result = match recv_s.char_code_at(idx) {
-            Some(unit) => JsString::from_utf16_units(&[unit], &self.string_heap)?,
-            None => JsString::empty(&self.string_heap)?,
+            Some(unit) => JsString::from_utf16_units(&[unit], &self.gc_heap)?,
+            None => JsString::empty(&self.gc_heap)?,
         };
         write_register(frame, dst, Value::String(result))?;
         frame.pc += 1;

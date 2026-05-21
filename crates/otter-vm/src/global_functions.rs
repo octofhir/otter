@@ -25,7 +25,7 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-number-constructor>
 
 use crate::number;
-use crate::string::{JsString, StringHeap};
+use crate::string::JsString;
 use crate::{Value, VmError};
 
 /// Dispatch `<method>(args...)`. Routes the typed
@@ -37,7 +37,6 @@ use crate::{Value, VmError};
 pub fn call(
     method: otter_bytecode::method_id::GlobalMethod,
     args: &[Value],
-    heap: &StringHeap,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::GlobalMethod as M;
@@ -97,19 +96,19 @@ pub fn call(
         ))),
         M::EncodeURI => js_string(
             &uri_encode(&coerce_to_string(args.first(), gc_heap), false),
-            heap,
+            gc_heap,
         ),
         M::EncodeURIComponent => js_string(
             &uri_encode(&coerce_to_string(args.first(), gc_heap), true),
-            heap,
+            gc_heap,
         ),
         M::DecodeURI => {
             let out = uri_decode(&coerce_to_string(args.first(), gc_heap), false)?;
-            js_string(&out, heap)
+            js_string(&out, gc_heap)
         }
         M::DecodeURIComponent => {
             let out = uri_decode(&coerce_to_string(args.first(), gc_heap), true)?;
-            js_string(&out, heap)
+            js_string(&out, gc_heap)
         }
         // §B.2.1.1 `escape(string)` — legacy AnnexB encoder. Walks
         // the UTF-16 code units; preserves the spec's "static
@@ -117,7 +116,7 @@ pub fn call(
         // and `%uXXXX` for the rest.
         M::Escape => js_string(
             &legacy_escape(&coerce_to_utf16(args.first(), gc_heap)),
-            heap,
+            gc_heap,
         ),
         // §B.2.1.2 `unescape(string)` — legacy AnnexB decoder.
         // Recognises `%XX` and `%uXXXX` sequences, copies other
@@ -126,7 +125,7 @@ pub fn call(
             let units = coerce_to_utf16(args.first(), gc_heap);
             let decoded = legacy_unescape(&units);
             Ok(Value::String(
-                JsString::from_utf16_units(&decoded, heap).map_err(|_| VmError::TypeMismatch)?,
+                JsString::from_utf16_units(&decoded, gc_heap).map_err(|_| VmError::TypeMismatch)?,
             ))
         }
     }
@@ -227,7 +226,7 @@ fn coerce_to_string(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> String {
     }
 }
 
-fn js_string(s: &str, heap: &StringHeap) -> Result<Value, VmError> {
+fn js_string(s: &str, heap: &otter_gc::GcHeap) -> Result<Value, VmError> {
     Ok(Value::String(
         JsString::from_str(s, heap).map_err(|_| VmError::TypeMismatch)?,
     ))

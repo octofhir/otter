@@ -98,7 +98,7 @@ pub(crate) fn native_new_target_prototype(
             Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
             Value::Object(obj) => object::get(obj, ctx.heap(), "prototype"),
             Value::NativeFunction(native) => native
-                .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+                .own_property_descriptor(ctx.heap_mut(), "prototype")
                 .map_err(|err| NativeError::TypeError {
                     name,
                     reason: err.to_string(),
@@ -664,8 +664,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let revocable_desc =
         PropertyDescriptor::data(Value::NativeFunction(revocable), true, false, true);
-    let string_heap = crate::string::StringHeap::default();
-    if !proxy_ctor.define_own_property(heap, &string_heap, "revocable", revocable_desc) {
+    if !proxy_ctor.define_own_property(heap, "revocable", revocable_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("revocable"));
     }
     define_global(global, heap, "Proxy", Value::NativeFunction(proxy_ctor));
@@ -718,8 +717,9 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                                 reason: other.to_string(),
                             },
                         })?;
-                    let string_heap = ctx.interp_mut().string_heap_clone();
-                    let rendered = crate::string::JsString::from_str(&coerced, &string_heap)
+
+                    let _string_heap = ctx.heap_mut();
+                    let rendered = crate::string::JsString::from_str(&coerced, ctx.heap())
                         .map_err(|_| NativeError::TypeError {
                             name: "Symbol",
                             reason: "out of memory".to_string(),
@@ -785,14 +785,12 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         let key = ctx.interp_mut().symbol_registry().key_for(sym);
         match key {
             Some(key) => {
-                let string_heap = ctx.interp_mut().string_heap_clone();
-                let value =
-                    crate::string::JsString::from_str(&key, &string_heap).map_err(|_| {
-                        NativeError::TypeError {
-                            name: "Symbol.keyFor",
-                            reason: "out of memory".to_string(),
-                        }
-                    })?;
+                let value = crate::string::JsString::from_str(&key, ctx.heap()).map_err(|_| {
+                    NativeError::TypeError {
+                        name: "Symbol.keyFor",
+                        reason: "out of memory".to_string(),
+                    }
+                })?;
                 Ok(Value::String(value))
             }
             None => Ok(Value::Undefined),
@@ -820,12 +818,13 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 });
             }
         };
-        let string_heap = ctx.interp_mut().string_heap_clone();
-        let s = crate::string::JsString::from_str(&sym.descriptive_string(), &string_heap)
-            .map_err(|_| NativeError::TypeError {
+
+        let s = crate::string::JsString::from_str(&sym.descriptive_string(), ctx.heap()).map_err(
+            |_| NativeError::TypeError {
                 name: "Symbol.prototype.toString",
                 reason: "out of memory".to_string(),
-            })?;
+            },
+        )?;
         Ok(Value::String(s))
     }
 
@@ -962,8 +961,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
     // Install Symbol.prototype as an own property on the constructor.
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
-    let string_heap = crate::string::StringHeap::default();
-    if !symbol_ctor.define_own_property(heap, &string_heap, "prototype", proto_desc) {
+    if !symbol_ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
     // Well-known symbol own properties (`Symbol.iterator`,
@@ -998,10 +996,10 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         PropertyDescriptor::data(Value::NativeFunction(symbol_for_fn), true, false, true);
     let key_for_desc =
         PropertyDescriptor::data(Value::NativeFunction(symbol_key_for_fn), true, false, true);
-    if !symbol_ctor.define_own_property(heap, &string_heap, "for", for_desc) {
+    if !symbol_ctor.define_own_property(heap, "for", for_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("for"));
     }
-    if !symbol_ctor.define_own_property(heap, &string_heap, "keyFor", key_for_desc) {
+    if !symbol_ctor.define_own_property(heap, "keyFor", key_for_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("keyFor"));
     }
     // Install Symbol.prototype.constructor → Symbol.
@@ -1031,7 +1029,6 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
 /// - <https://tc39.es/ecma262/#sec-symbol.prototype-@@toprimitive>
 pub fn install_symbol_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
@@ -1085,14 +1082,14 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     for (name, tag) in well_known_pairs {
         let sym = well_known.get(*tag);
         let desc = PropertyDescriptor::data(Value::Symbol(sym), false, false, false);
-        if !symbol_ctor.define_own_property(heap, string_heap, name, desc) {
+        if !symbol_ctor.define_own_property(heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("well-known symbol"));
         }
     }
 
     // Symbol.prototype[@@toPrimitive] — ECMA-262 §20.4.3.5.
     let proto_desc = symbol_ctor
-        .own_property_descriptor(heap, string_heap, "prototype")
+        .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match proto_desc.and_then(|d| match d.kind {
         crate::object::DescriptorKind::Data {
@@ -1132,7 +1129,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     let to_string_tag_sym = well_known.get(WellKnown::ToStringTag);
     let object_proto = object::get(global, heap, "Object").and_then(|v| match v {
         Value::NativeFunction(ctor) => ctor
-            .own_property_descriptor(heap, string_heap, "prototype")
+            .own_property_descriptor(heap, "prototype")
             .ok()
             .flatten()
             .and_then(|d| match d.kind {
@@ -1152,7 +1149,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
             if let Some(proto) = object_proto {
                 object::set_prototype(ns, heap, Some(proto));
             }
-            let tag = crate::string::JsString::from_str(ns_name, string_heap)
+            let tag = crate::string::JsString::from_str(ns_name, heap)
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
             object::define_own_symbol_property_partial(
                 ns,
@@ -1169,7 +1166,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         }
     }
     // §20.4.3.5 — install `Symbol.prototype[@@toStringTag] = "Symbol"`.
-    let symbol_tag = crate::string::JsString::from_str("Symbol", string_heap)
+    let symbol_tag = crate::string::JsString::from_str("Symbol", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
@@ -1185,39 +1182,18 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     );
     // §24.* — install collection `@@iterator` / `@@toStringTag`.
     crate::bootstrap_collections::install_collection_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
+        heap, global, well_known,
     )?;
     // §27.2.5.5 — install `Promise.prototype[@@toStringTag]`.
-    crate::bootstrap_promise::install_promise_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
-    )?;
+    crate::bootstrap_promise::install_promise_well_knowns_post_bootstrap(heap, global, well_known)?;
     // §26.1.4.4 / §26.2.4.5 — `WeakRef.prototype[@@toStringTag]`
     // + `FinalizationRegistry.prototype[@@toStringTag]`.
-    crate::bootstrap_weak_refs::install_weak_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
-    )?;
+    crate::bootstrap_weak_refs::install_weak_well_knowns_post_bootstrap(heap, global, well_known)?;
     // §21.2.5 — `BigInt.prototype[@@toStringTag]`.
-    crate::bootstrap_bigint::install_bigint_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
-    )?;
+    crate::bootstrap_bigint::install_bigint_well_knowns_post_bootstrap(heap, global, well_known)?;
     // §25.3.5 — `DataView.prototype[@@toStringTag]`.
     crate::bootstrap_data_view::install_data_view_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
+        heap, global, well_known,
     )?;
     // §23.2.4 — `%TypedArray%.prototype[@@iterator]` plus per-kind
     // `<T>.prototype[@@toStringTag]`.
@@ -1226,36 +1202,20 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     )?;
     // §27.1.2 — `Iterator.prototype[@@iterator]` (returns this) and
     // `[@@toStringTag] = "Iterator"`.
-    install_iterator_well_knowns_post_bootstrap(heap, string_heap, global, well_known)?;
+    install_iterator_well_knowns_post_bootstrap(heap, global, well_known)?;
     // §25.1.5 — `ArrayBuffer.prototype[@@toStringTag]`.
     crate::bootstrap_array_buffer::install_array_buffer_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
+        heap, global, well_known,
     )?;
     // §21.4.4.45 — `Date.prototype[@@toPrimitive]`.
-    crate::date::well_known::install_date_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
-    )?;
+    crate::date::well_known::install_date_well_knowns_post_bootstrap(heap, global, well_known)?;
     // §22.1.3.34 — `String.prototype[@@iterator]`.
     crate::install_string_iterator_post_bootstrap(heap, global, well_known)?;
     // §22.2.6.{8,10} — `RegExp.prototype[@@match]` / `[@@search]`.
-    crate::bootstrap_regexp::install_regexp_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
-    )?;
+    crate::bootstrap_regexp::install_regexp_well_knowns_post_bootstrap(heap, global, well_known)?;
     // §25.2.5 — `SharedArrayBuffer.prototype[@@toStringTag]`.
     crate::bootstrap_array_buffer::install_shared_array_buffer_well_knowns_post_bootstrap(
-        heap,
-        string_heap,
-        global,
-        well_known,
+        heap, global, well_known,
     )?;
     // Default `get <Ctor>[@@species]` returning `this` for every
     // subclassing-aware constructor that the spec lists in the
@@ -1276,7 +1236,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         "ArrayBuffer",
         "SharedArrayBuffer",
     ] {
-        install_constructor_species_accessor(heap, string_heap, global, well_known, ctor_name)?;
+        install_constructor_species_accessor(heap, global, well_known, ctor_name)?;
     }
     Ok(())
 }
@@ -1291,7 +1251,6 @@ pub fn install_symbol_well_knowns_post_bootstrap(
 /// - <https://tc39.es/ecma262/#sec-symbol.species>
 fn install_constructor_species_accessor(
     heap: &mut otter_gc::GcHeap,
-    _string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
     ctor_name: &'static str,
@@ -1463,7 +1422,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
             }),
             Value::NativeFunction(native) => native
-                .own_property_descriptor(ctx.heap(), ctx.cx.interp.string_heap(), "prototype")
+                .own_property_descriptor(ctx.heap_mut(), "prototype")
                 .map_err(|err| NativeError::TypeError {
                     name: "Array",
                     reason: err.to_string(),
@@ -1642,7 +1601,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // §21.1.2 — `Number.name` is `"Number"`, non-writable,
     // non-enumerable, configurable.
     let number_name_value = Value::String(
-        crate::string::JsString::from_str("Number", &crate::string::StringHeap::default())
+        crate::string::JsString::from_str("Number", heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let _ = object::define_own_property(
@@ -1793,11 +1752,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             ctx: &mut NativeCtx<'_>,
             args: &[Value],
         ) -> Result<Value, NativeError> {
-            let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::EncodeURI,
                 args,
-                &heap,
                 ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
@@ -1809,11 +1766,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             ctx: &mut NativeCtx<'_>,
             args: &[Value],
         ) -> Result<Value, NativeError> {
-            let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
                 args,
-                &heap,
                 ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
@@ -1825,11 +1780,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             ctx: &mut NativeCtx<'_>,
             args: &[Value],
         ) -> Result<Value, NativeError> {
-            let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::DecodeURI,
                 args,
-                &heap,
                 ctx.heap(),
             )
             .map_err(|err| match err {
@@ -1847,11 +1800,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             ctx: &mut NativeCtx<'_>,
             args: &[Value],
         ) -> Result<Value, NativeError> {
-            let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
                 args,
-                &heap,
                 ctx.heap(),
             )
             .map_err(|err| match err {
@@ -1869,11 +1820,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         // §B.2.1.1 / §B.2.1.2 — AnnexB legacy `escape` / `unescape`
         // globals. Same dispatcher path as the URI quartet above.
         fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::Escape,
                 args,
-                &heap,
                 ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
@@ -1882,11 +1831,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             })
         }
         fn global_unescape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            let heap = ctx.interp_mut().string_heap_clone();
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::Unescape,
                 args,
-                &heap,
                 ctx.heap(),
             )
             .map_err(|err| NativeError::TypeError {
@@ -2055,7 +2002,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     );
     let _ = object::define_own_property(function, heap, "length", length);
     let name_value = Value::String(
-        crate::string::JsString::from_str("Function", &crate::string::StringHeap::default())
+        crate::string::JsString::from_str("Function", heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let name = PropertyDescriptor::data(name_value, false, false, true);
@@ -2071,8 +2018,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     );
     let _ = object::define_own_property(prototype, heap, "length", prototype_length);
     let prototype_name_value = Value::String(
-        crate::string::JsString::from_str("", &crate::string::StringHeap::default())
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let prototype_name = PropertyDescriptor::data(prototype_name_value, false, false, true);
     let _ = object::define_own_property(prototype, heap, "name", prototype_name);
@@ -2263,9 +2209,8 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     if !object::define_own_property(object, heap, "length", length_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("length"));
     }
-    let bootstrap_string_heap = crate::StringHeap::default();
-    let name_value = crate::JsString::from_latin1(b"Object", &bootstrap_string_heap)
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let name_value =
+        crate::JsString::from_latin1(b"Object", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
     let name_desc = PropertyDescriptor::data(Value::String(name_value), false, false, true);
     if !object::define_own_property(object, heap, "name", name_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("name"));
@@ -2385,9 +2330,9 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         // §21.4.2.2 — `Date()` without `new` returns the current
         // time rendered as an ISO string.
         let text = crate::date::to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
-        let string_heap = ctx.interp_mut().string_heap_clone();
+
         let value =
-            JsString::from_str(&text, &string_heap).map_err(|err| NativeError::TypeError {
+            JsString::from_str(&text, ctx.heap()).map_err(|err| NativeError::TypeError {
                 name: "Date",
                 reason: err.to_string(),
             })?;
@@ -2628,8 +2573,8 @@ fn iterator_ctor_call(
     let proto = match &new_target {
         Value::NativeFunction(nf) => {
             let heap = ctx.heap();
-            let string_heap = ctx.cx.interp.string_heap_clone();
-            nf.own_property_descriptor(heap, &string_heap, "prototype")
+
+            nf.own_property_descriptor(heap, "prototype")
                 .ok()
                 .flatten()
                 .and_then(|d| match d.kind {
@@ -2673,10 +2618,9 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         // helpers below.
         let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
         let proto_value = Value::Object(proto);
-        let string_heap = crate::string::StringHeap::default();
         let prototype_desc =
             crate::object::PropertyDescriptor::data(proto_value.clone(), false, false, false);
-        if !ctor.define_own_property(heap, &string_heap, "prototype", prototype_desc) {
+        if !ctor.define_own_property(heap, "prototype", prototype_desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
         }
         // §27.1.2 — `Iterator.prototype.constructor = %Iterator%`,
@@ -2699,7 +2643,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
             false,
             true,
         );
-        let _ = iterator_ctor.define_own_property(heap, &string_heap, "from", from_desc);
+        let _ = iterator_ctor.define_own_property(heap, "from", from_desc);
         let prototype = proto;
         // §27.1.2 %IteratorPrototype% — install the iterator-helpers
         // proposal methods on the prototype carried by the
@@ -2771,14 +2715,13 @@ fn iterator_proto_symbol_iterator(
 /// `@@toStringTag` on TypedArray prototypes.
 pub fn install_iterator_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
     let prototype = match object::get(global, heap, "Iterator") {
         Some(Value::NativeFunction(ctor)) => ctor
-            .own_property_descriptor(heap, string_heap, "prototype")
+            .own_property_descriptor(heap, "prototype")
             .ok()
             .flatten()
             .and_then(|d| match d.kind {
@@ -2819,7 +2762,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
         },
     );
     let tag_sym = well_known.get(WellKnown::ToStringTag);
-    let tag = crate::string::JsString::from_str("Iterator", string_heap)
+    let tag = crate::string::JsString::from_str("Iterator", heap)
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::define_own_symbol_property_partial(
         prototype,
@@ -2861,7 +2804,6 @@ pub struct BuiltinIteratorPrototypes {
 /// per-kind prototype.
 pub fn build_builtin_iterator_prototypes_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
-    string_heap: &crate::string::StringHeap,
     shape_root: object::ShapeHandle,
     parent: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
@@ -2878,7 +2820,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
                 .map_err(|_| JsSurfaceError::OutOfMemory)?
         };
         object::set_prototype(proto, heap, Some(parent));
-        let tag_string = crate::string::JsString::from_str(tag, string_heap)
+        let tag_string = crate::string::JsString::from_str(tag, heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
         object::define_own_symbol_property_partial(
             proto,

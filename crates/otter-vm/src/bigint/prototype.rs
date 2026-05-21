@@ -74,10 +74,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     } else {
         recv.with_inner(args.gc_heap, |b| b.to_str_radix(radix))
     };
-    Ok(Value::String(JsString::from_str(
-        &rendered,
-        args.string_heap,
-    )?))
+    Ok(Value::String(JsString::from_str(&rendered, args.gc_heap)?))
 }
 
 /// §21.2.3.5 `BigInt.prototype.valueOf()` — returns the receiver.

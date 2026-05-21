@@ -363,13 +363,12 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(Value::String(s)) => s.to_lossy_string(),
         Some(other) => other.display_string(args.gc_heap),
     };
-    join_into_string(&t, &separator, args.string_heap, args.gc_heap)
+    join_into_string(&t, &separator, args.gc_heap)
 }
 
 fn join_into_string(
     t: &crate::binary::JsTypedArray,
     separator: &str,
-    string_heap: &crate::string::StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, IntrinsicError> {
     let mut out = String::new();
@@ -384,13 +383,13 @@ fn join_into_string(
             other => out.push_str(&other.display_string(gc_heap)),
         }
     }
-    Ok(Value::String(JsString::from_str(&out, string_heap)?))
+    Ok(Value::String(JsString::from_str(&out, gc_heap)?))
 }
 
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t, &*args.gc_heap)?;
-    join_into_string(&t, ",", args.string_heap, args.gc_heap)
+    join_into_string(&t, ",", args.gc_heap)
 }
 
 fn impl_to_locale_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -502,7 +501,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             for (i, unit) in units.iter().enumerate() {
                 let ch = char::from_u32(*unit as u32).unwrap_or('\u{FFFD}');
                 let s_one = ch.to_string();
-                let v = Value::String(JsString::from_str(&s_one, args.string_heap)?);
+                let v = Value::String(JsString::from_str(&s_one, args.gc_heap)?);
                 let coerced = coerce(kind, &v, args.gc_heap)?;
                 t.set(args.gc_heap, off + i, &coerced);
             }
@@ -740,11 +739,9 @@ pub fn load_property(t: &JsTypedArray, heap: &otter_gc::GcHeap, name: &str) -> V
 mod tests {
     use super::super::array_buffer::JsArrayBuffer;
     use super::*;
-    use crate::string::StringHeap;
 
     #[test]
     fn typed_array_entries_uses_intrinsic_rooted_young_allocation() {
-        let strings = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let buffer = JsArrayBuffer::new(&mut gc_heap, 2).expect("array buffer");
         let view = JsTypedArray::new(&mut gc_heap, buffer, TypedArrayKind::Int8, 0, 2)
@@ -755,7 +752,6 @@ mod tests {
         let result = impl_entries(&mut IntrinsicArgs {
             receiver: &receiver,
             args: &[],
-            string_heap: &strings,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
@@ -771,7 +767,6 @@ mod tests {
 
     #[test]
     fn typed_array_slice_uses_intrinsic_rooted_backing_store_reservation() {
-        let strings = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("gc heap");
         let buffer = JsArrayBuffer::new(&mut gc_heap, 4).expect("array buffer");
         let source = JsTypedArray::new(&mut gc_heap, buffer, TypedArrayKind::Int16, 0, 2)
@@ -784,7 +779,6 @@ mod tests {
         let result = impl_slice(&mut IntrinsicArgs {
             receiver: &receiver,
             args: &[],
-            string_heap: &strings,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })

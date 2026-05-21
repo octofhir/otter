@@ -15,7 +15,7 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use otter_vm::string::{JsString, StringHeap};
+use otter_vm::string::JsString;
 use otter_vm::swar::{find_byte, rfind_byte};
 
 fn make_clean(len: usize, marker_at: Option<usize>) -> Vec<u8> {
@@ -31,7 +31,7 @@ fn scalar_find_byte(bytes: &[u8], c: u8, from: usize) -> Option<usize> {
 }
 
 fn bench_string_search(c: &mut Criterion) {
-    let heap = StringHeap::default();
+    let heap = otter_gc::GcHeap::new().expect("gc heap");
 
     let buf_late = make_clean(1024, Some(1000));
     let needle_5 = b"NEEDL";

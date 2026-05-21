@@ -35,7 +35,7 @@ fn receiver_symbol<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsSymbol, Intr
 /// `"Symbol(<desc>)"`, with no description rendered as `"Symbol()"`.
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
-    let s = JsString::from_str(&sym.descriptive_string(), args.string_heap)?;
+    let s = JsString::from_str(&sym.descriptive_string(), args.gc_heap)?;
     Ok(Value::String(s))
 }
 
@@ -98,19 +98,16 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::string::StringHeap;
 
     #[test]
     fn to_string_renders_descriptive_form() {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let sym =
-            JsSymbol::new(&mut gc_heap, Some(JsString::from_str("ok", &heap).unwrap())).unwrap();
+        let desc = JsString::from_str("ok", &gc_heap).unwrap();
+        let sym = JsSymbol::new(&mut gc_heap, Some(desc)).unwrap();
         let entry = lookup("toString").unwrap();
         let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &Value::Symbol(sym),
             args: &[],
-            string_heap: &heap,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
@@ -120,9 +117,8 @@ mod tests {
 
     #[test]
     fn description_accessor() {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let s = JsString::from_str("ok", &heap).unwrap();
+        let s = JsString::from_str("ok", &gc_heap).unwrap();
         let sym = JsSymbol::new(&mut gc_heap, Some(s.clone())).unwrap();
         let value = load_property(&sym, "description");
         assert_eq!(value.display_string(&gc_heap), "ok");

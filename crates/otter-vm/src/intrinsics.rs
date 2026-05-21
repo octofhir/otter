@@ -41,7 +41,6 @@ use crate::array::{self, JsArray};
 use crate::binary::JsArrayBuffer;
 use crate::collections::{self, CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet};
 use crate::object::{self, JsObject};
-use crate::string::StringHeap;
 use crate::{IteratorHandle, IteratorState, Value};
 use otter_gc::raw::RawGc;
 
@@ -157,12 +156,10 @@ pub struct IntrinsicArgs<'a> {
     pub receiver: &'a Value,
     /// Argument values in declaration order.
     pub args: &'a [Value],
-    /// String heap for any allocation an intrinsic performs.
-    pub string_heap: &'a StringHeap,
-    /// GC heap for object allocations the intrinsic must perform.
-    /// The intrinsic entry receives `&mut IntrinsicArgs`, so helper
-    /// implementations borrow this directly without interior
-    /// mutability or thread-local heap lookup.
+    /// GC heap for object and string allocations the intrinsic must
+    /// perform. The intrinsic entry receives `&mut IntrinsicArgs`,
+    /// so helper implementations borrow this directly without
+    /// interior mutability.
     pub gc_heap: &'a mut otter_gc::GcHeap,
     /// External roots supplied by the caller when the intrinsic is
     /// invoked from a native/runtime path that has no visible VM
@@ -554,20 +551,6 @@ pub enum IntrinsicError {
     },
 }
 
-impl From<crate::string::StringError> for IntrinsicError {
-    fn from(err: crate::string::StringError) -> Self {
-        match err {
-            crate::string::StringError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => Self::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            },
-        }
-    }
-}
-
 impl From<otter_gc::OutOfMemory> for IntrinsicError {
     fn from(err: otter_gc::OutOfMemory) -> Self {
         Self::OutOfMemory {
@@ -619,7 +602,7 @@ macro_rules! intrinsics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::string::{JsString, StringHeap};
+    use crate::string::JsString;
 
     fn impl_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let recv = match args.receiver {
@@ -629,7 +612,7 @@ mod tests {
         let n = recv.len();
         Ok(Value::String(JsString::from_str(
             &n.to_string(),
-            args.string_heap,
+            args.gc_heap,
         )?))
     }
 
@@ -647,7 +630,7 @@ mod tests {
                 });
             }
         };
-        let out = JsString::concat(recv, arg0, args.string_heap)?;
+        let out = JsString::concat(recv, arg0, args.gc_heap)?;
         Ok(Value::String(out))
     }
 
@@ -667,17 +650,15 @@ mod tests {
 
     #[test]
     fn intrinsic_runs_with_string_receiver() {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::String(JsString::from_str("ab", &heap).unwrap());
-        let arg = Value::String(JsString::from_str("cd", &heap).unwrap());
+        let recv = Value::String(JsString::from_str("ab", &gc_heap).unwrap());
+        let arg = Value::String(JsString::from_str("cd", &gc_heap).unwrap());
         let entry = STRING_TABLE
             .lookup(IntrinsicReceiver::String, "concatWith")
             .unwrap();
         let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
             args: &[arg],
-            string_heap: &heap,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
@@ -687,7 +668,6 @@ mod tests {
 
     #[test]
     fn intrinsic_rejects_bad_receiver() {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = STRING_TABLE
             .lookup(IntrinsicReceiver::String, "length")
@@ -695,7 +675,6 @@ mod tests {
         let err = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &Value::Undefined,
             args: &[],
-            string_heap: &heap,
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })

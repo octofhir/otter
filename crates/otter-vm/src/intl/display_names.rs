@@ -149,7 +149,7 @@ fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if let Some(name) = lookup_name(&payload.kind, &code) {
         return Ok(Value::String(crate::string::JsString::from_str(
             name,
-            args.string_heap,
+            args.gc_heap,
         )?));
     }
     if payload.fallback == "none" {
@@ -157,16 +157,16 @@ fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
     Ok(Value::String(crate::string::JsString::from_str(
         &code,
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
-    let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
-    let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
-    let fallback = js_string(&payload.fallback, args.string_heap).map_err(intl_to_intrinsic)?;
+    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
+    let kind = js_string(&payload.kind, args.gc_heap).map_err(intl_to_intrinsic)?;
+    let style = js_string(&payload.style, args.gc_heap).map_err(intl_to_intrinsic)?;
+    let fallback = js_string(&payload.fallback, args.gc_heap).map_err(intl_to_intrinsic)?;
     let obj = args.alloc_object_rooted(&[&locale, &kind, &style, &fallback], &[])?;
     let heap = &mut *args.gc_heap;
     crate::object::set(obj, heap, "locale", locale);

@@ -42,7 +42,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     } else {
         "false"
     };
-    Ok(Value::String(JsString::from_str(s, args.string_heap)?))
+    Ok(Value::String(JsString::from_str(s, args.gc_heap)?))
 }
 
 /// §20.3.3.3 Boolean.prototype.valueOf — returns the receiver.
@@ -93,10 +93,7 @@ fn native_boolean_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = ctx.this_value().clone();
-    let (string_heap, allocation_roots) = {
-        let interp = ctx.interp_mut();
-        (interp.string_heap_clone(), interp.collect_runtime_roots())
-    };
+    let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Boolean.prototype method".to_string(),
@@ -104,7 +101,6 @@ fn native_boolean_method(
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
         args,
-        string_heap: &string_heap,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),
     })

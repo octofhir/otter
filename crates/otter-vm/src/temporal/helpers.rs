@@ -219,5 +219,5 @@ pub fn temporal_err(err: temporal_rs::TemporalError) -> IntrinsicError {
 
 /// Build a `Value::String` from a Rust string via the active heap.
 pub fn js_string_value(value: String, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::String(JsString::from_str(&value, args.string_heap)?))
+    Ok(Value::String(JsString::from_str(&value, args.gc_heap)?))
 }

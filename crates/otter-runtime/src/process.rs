@@ -52,7 +52,7 @@ pub(crate) fn install_global(
     let argv_values = process_argv
         .iter()
         .map(|arg| {
-            JsString::from_str(arg, &interp.string_heap_clone())
+            JsString::from_str(arg, interp.gc_heap())
                 .map(otter_vm::Value::String)
                 .map_err(string_oom_to_error)
         })
@@ -156,7 +156,7 @@ pub(crate) fn install_global(
         ) {
             continue;
         }
-        let value = JsString::from_str(&value, &interp.string_heap_clone())
+        let value = JsString::from_str(&value, interp.gc_heap())
             .map(otter_vm::Value::String)
             .map_err(string_oom_to_error)?;
         otter_vm::object::set(env, interp.gc_heap_mut(), &name, value);
@@ -253,15 +253,14 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
 
 fn string_value(interp: &mut Interpreter, value: &str) -> Result<otter_vm::Value, OtterError> {
     Ok(otter_vm::Value::String(
-        JsString::from_str(value, &interp.string_heap_clone()).map_err(string_oom_to_error)?,
+        JsString::from_str(value, interp.gc_heap()).map_err(string_oom_to_error)?,
     ))
 }
 
 fn cwd_call(cwd: String) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
-        let heap = ctx.interp_mut().string_heap_clone();
         Ok(otter_vm::Value::String(
-            JsString::from_str(&cwd, &heap).map_err(|err| NativeError::TypeError {
+            JsString::from_str(&cwd, ctx.heap()).map_err(|err| NativeError::TypeError {
                 name: "process.cwd",
                 reason: err.to_string(),
             })?,

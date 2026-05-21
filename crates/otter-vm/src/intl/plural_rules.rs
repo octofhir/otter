@@ -76,15 +76,15 @@ fn impl_select(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     };
     Ok(Value::String(crate::string::JsString::from_str(
         plural_category_en(n, &payload.kind),
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 
 /// §15.5.5 — `Intl.PluralRules.prototype.resolvedOptions()`.
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
-    let kind = js_string(&payload.kind, args.string_heap).map_err(intl_to_intrinsic)?;
+    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
+    let kind = js_string(&payload.kind, args.gc_heap).map_err(intl_to_intrinsic)?;
     let mid = payload.minimum_integer_digits as i32;
     let mfd = payload.minimum_fraction_digits as i32;
     let xfd = payload.maximum_fraction_digits as i32;

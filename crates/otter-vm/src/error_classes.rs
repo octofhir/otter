@@ -45,7 +45,7 @@ use crate::gc_trace::GcRootVisitor;
 use crate::native_function::NativeFunction;
 use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
-use crate::string::{JsString, StringError, StringHeap};
+use crate::string::JsString;
 use crate::{NativeCtx, NativeError};
 use otter_gc::raw::RawGc;
 
@@ -168,8 +168,8 @@ impl ClassEntry {
     }
 }
 
-fn oom() -> StringError {
-    StringError::OutOfMemory {
+fn oom() -> otter_gc::OutOfMemory {
+    otter_gc::OutOfMemory::HeapCapExceeded {
         requested_bytes: 0,
         heap_limit_bytes: 0,
     }
@@ -184,7 +184,7 @@ fn trace_value_roots(roots: &[&Value], visitor: &mut dyn FnMut(*mut otter_gc::ra
 fn alloc_registry_object(
     gc_heap: &mut otter_gc::GcHeap,
     roots: &[&Value],
-) -> Result<JsObject, StringError> {
+) -> Result<JsObject, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
     };
@@ -197,7 +197,7 @@ fn native_static_with_roots(
     length: u8,
     call: crate::native_function::NativeFastFn,
     roots: &[&Value],
-) -> Result<NativeFunction, StringError> {
+) -> Result<NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
     };
@@ -211,7 +211,7 @@ fn native_constructor_static_with_roots(
     length: u8,
     call: crate::native_function::NativeFastFn,
     roots: &[&Value],
-) -> Result<NativeFunction, StringError> {
+) -> Result<NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
     };
@@ -417,7 +417,7 @@ impl ErrorClassRegistry {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-error-objects>
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
-    pub fn new(heap: &StringHeap, gc_heap: &mut otter_gc::GcHeap) -> Result<Self, StringError> {
+    pub fn new(gc_heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         let error_proto = alloc_registry_object(gc_heap, &[])?;
         let error_proto_root = Value::Object(error_proto);
         // §20.5.3.{4,5} — `Error.prototype.name = "Error"` and
@@ -426,8 +426,8 @@ impl ErrorClassRegistry {
         // configurable: true }`. The plain `set` path leaves
         // `enumerable: true` which fails every `name`/`message`
         // descriptor test in `built-ins/{Error,NativeErrors}/prototype/*`.
-        let error_name = JsString::from_str("Error", heap)?;
-        let empty = JsString::from_str("", heap)?;
+        let error_name = JsString::from_str("Error", gc_heap)?;
+        let empty = JsString::from_str("", gc_heap)?;
         let _ = object::define_own_property(
             error_proto,
             gc_heap,
@@ -458,7 +458,7 @@ impl ErrorClassRegistry {
                     reason: "receiver must be an Object".to_string(),
                 });
             };
-            let string_heap = ctx.interp_mut().string_heap_clone();
+
             let context =
                 ctx.execution_context()
                     .cloned()
@@ -479,12 +479,11 @@ impl ErrorClassRegistry {
                     },
                 },
             )?;
-            let s = JsString::from_str(&display, &string_heap).map_err(|err| {
-                NativeError::TypeError {
+            let s =
+                JsString::from_str(&display, ctx.heap()).map_err(|err| NativeError::TypeError {
                     name: "Error.prototype.toString",
                     reason: err.to_string(),
-                }
-            })?;
+                })?;
             Ok(Value::String(s))
         }
         let to_string_native = native_static_with_roots(
@@ -525,10 +524,9 @@ impl ErrorClassRegistry {
             ctor: JsObject,
             name: &str,
             length: i32,
-            heap: &StringHeap,
             gc_heap: &mut otter_gc::GcHeap,
-        ) -> Result<(), StringError> {
-            let name_str = JsString::from_str(name, heap)?;
+        ) -> Result<(), otter_gc::OutOfMemory> {
+            let name_str = JsString::from_str(name, gc_heap)?;
             let _ = object::define_own_property(
                 ctor,
                 gc_heap,
@@ -769,7 +767,7 @@ impl ErrorClassRegistry {
             &[&error_proto_root, &error_ctor_root],
         )?;
         object::set_constructor_native(error_ctor, gc_heap, Value::NativeFunction(error_call));
-        install_ctor_metadata(error_ctor, "Error", 1, heap, gc_heap)?;
+        install_ctor_metadata(error_ctor, "Error", 1, gc_heap)?;
         entries.push((
             ErrorKind::Error,
             ClassEntry {
@@ -798,14 +796,14 @@ impl ErrorClassRegistry {
             object::set_prototype(proto, gc_heap, Some(error_proto));
             // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
             // share the same descriptor shape as `Error.prototype`'s.
-            let class_name = JsString::from_str(kind.class_name(), heap)?;
+            let class_name = JsString::from_str(kind.class_name(), gc_heap)?;
             let _ = object::define_own_property(
                 proto,
                 gc_heap,
                 "name",
                 PropertyDescriptor::data(Value::String(class_name), true, false, true),
             );
-            let empty = JsString::from_str("", heap)?;
+            let empty = JsString::from_str("", gc_heap)?;
             let _ = object::define_own_property(
                 proto,
                 gc_heap,
@@ -861,7 +859,7 @@ impl ErrorClassRegistry {
                 root_refs.as_slice(),
             )?;
             object::set_constructor_native(ctor, gc_heap, Value::NativeFunction(native));
-            install_ctor_metadata(ctor, kind.class_name(), length, heap, gc_heap)?;
+            install_ctor_metadata(ctor, kind.class_name(), length, gc_heap)?;
             entries.push((
                 kind,
                 ClassEntry {
@@ -1005,7 +1003,7 @@ impl ErrorClassRegistry {
         message: Option<&str>,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
-    ) -> Result<JsObject, StringError> {
+    ) -> Result<JsObject, otter_gc::OutOfMemory> {
         let proto = self.prototype(kind);
         let proto_value = Value::Object(proto);
         let mut roots = Vec::with_capacity(value_roots.len() + 1);
@@ -1013,14 +1011,13 @@ impl ErrorClassRegistry {
         roots.extend_from_slice(value_roots);
         let obj = ctx
             .alloc_object_with_roots(roots.as_slice(), slice_roots)
-            .map_err(|_| StringError::OutOfMemory {
+            .map_err(|_| otter_gc::OutOfMemory::HeapCapExceeded {
                 requested_bytes: 0,
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
         if let Some(text) = message {
-            let heap = ctx.interp_mut().string_heap_clone();
-            let s = JsString::from_str(text, &heap)?;
+            let s = JsString::from_str(text, ctx.heap())?;
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
             // [[Writable]]: true, [[Enumerable]]: false,
             // [[Configurable]]: true }`. Going through ordinary
@@ -1053,7 +1050,7 @@ impl ErrorClassRegistry {
         message: Option<&str>,
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
-    ) -> Result<JsObject, StringError> {
+    ) -> Result<JsObject, otter_gc::OutOfMemory> {
         let mut object_slice_roots = Vec::with_capacity(slice_roots.len() + 1);
         object_slice_roots.push(errors);
         object_slice_roots.extend_from_slice(slice_roots);
@@ -1074,12 +1071,12 @@ impl ErrorClassRegistry {
                 array_roots.as_slice(),
                 slice_roots,
             )
-            .map_err(|_| StringError::OutOfMemory {
+            .map_err(|_| otter_gc::OutOfMemory::HeapCapExceeded {
                 requested_bytes: 0,
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;
         ctx.set_property(obj, "errors", Value::Array(arr))
-            .map_err(|_| StringError::OutOfMemory {
+            .map_err(|_| otter_gc::OutOfMemory::HeapCapExceeded {
                 requested_bytes: 0,
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;

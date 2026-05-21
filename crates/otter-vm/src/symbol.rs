@@ -45,7 +45,7 @@ use std::cell::RefCell;
 
 use otter_gc::raw::SlotVisitor;
 
-use crate::string::{JsString, StringError, StringHeap};
+use crate::string::JsString;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolBody`].
 pub const SYMBOL_BODY_TYPE_TAG: u8 = 0x26;
@@ -399,13 +399,10 @@ impl WellKnownSymbols {
     /// # Errors
     /// Returns the first [`WellKnownInitError`] encountered while
     /// interning a description string or allocating a body.
-    pub fn new(
-        string_heap: &StringHeap,
-        gc_heap: &mut otter_gc::GcHeap,
-    ) -> Result<Self, WellKnownInitError> {
+    pub fn new(gc_heap: &mut otter_gc::GcHeap) -> Result<Self, WellKnownInitError> {
         let mut entries = Vec::with_capacity(WellKnown::all().len());
         for tag in WellKnown::all() {
-            let desc = JsString::from_str(tag.description_text(), string_heap)?;
+            let desc = JsString::from_str(tag.description_text(), gc_heap)?;
             entries.push(JsSymbol::well_known(gc_heap, *tag, desc)?);
         }
         Ok(Self { entries })
@@ -429,14 +426,12 @@ impl WellKnownSymbols {
 }
 
 /// Init-time failure for [`WellKnownSymbols::new`]. Folds
-/// [`StringError`] and [`otter_gc::OutOfMemory`] so the per-realm
-/// bootstrap can surface either with one error type.
+/// [`otter_gc::OutOfMemory`] sources from description interning and
+/// GC body allocation so the per-realm bootstrap can surface either
+/// with one error type.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum WellKnownInitError {
-    /// Interning a description string failed.
-    #[error(transparent)]
-    String(#[from] StringError),
     /// GC body allocation failed.
     #[error(transparent)]
     OutOfMemory(#[from] otter_gc::OutOfMemory),
@@ -472,18 +467,17 @@ impl SymbolRegistry {
     /// stays live as long as the registry retains it.
     ///
     /// # Errors
-    /// Surfaces [`StringError`] from description interning and
-    /// [`otter_gc::OutOfMemory`] from body allocation.
+    /// Surfaces [`otter_gc::OutOfMemory`] from description interning
+    /// and body allocation.
     pub fn for_key(
         &self,
         gc_heap: &mut otter_gc::GcHeap,
-        string_heap: &StringHeap,
         key: &str,
     ) -> Result<JsSymbol, SymbolRegistryError> {
         if let Some(sym) = self.lookup(key) {
             return Ok(sym);
         }
-        let desc = JsString::from_str(key, string_heap)?;
+        let desc = JsString::from_str(key, gc_heap)?;
         let sym = JsSymbol::registered(gc_heap, desc)?;
         self.entries
             .borrow_mut()
@@ -526,10 +520,7 @@ impl SymbolRegistry {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SymbolRegistryError {
-    /// Interning the key as a description string failed.
-    #[error(transparent)]
-    String(#[from] StringError),
-    /// GC body allocation failed.
+    /// GC body allocation failed (description interning or body).
     #[error(transparent)]
     OutOfMemory(#[from] otter_gc::OutOfMemory),
 }
@@ -554,20 +545,18 @@ mod tests {
 
     #[test]
     fn registry_dedupes_by_key() {
-        let string_heap = StringHeap::default();
         let mut gc = fresh_gc_heap();
         let reg = SymbolRegistry::new();
-        let a = reg.for_key(&mut gc, &string_heap, "k").unwrap();
-        let b = reg.for_key(&mut gc, &string_heap, "k").unwrap();
+        let a = reg.for_key(&mut gc, "k").unwrap();
+        let b = reg.for_key(&mut gc, "k").unwrap();
         assert!(a.ptr_eq(&b));
         assert_eq!(reg.key_for(&a).as_deref(), Some("k"));
     }
 
     #[test]
     fn well_known_table_returns_stable_singletons() {
-        let string_heap = StringHeap::default();
         let mut gc = fresh_gc_heap();
-        let table = WellKnownSymbols::new(&string_heap, &mut gc).unwrap();
+        let table = WellKnownSymbols::new(&mut gc).unwrap();
         let a = table.get(WellKnown::Iterator);
         let b = table.get(WellKnown::Iterator);
         assert!(a.ptr_eq(&b));
@@ -578,13 +567,9 @@ mod tests {
 
     #[test]
     fn descriptive_string_format() {
-        let string_heap = StringHeap::default();
         let mut gc = fresh_gc_heap();
-        let s = JsSymbol::new(
-            &mut gc,
-            Some(JsString::from_str("x", &string_heap).unwrap()),
-        )
-        .unwrap();
+        let desc = JsString::from_str("x", &gc).unwrap();
+        let s = JsSymbol::new(&mut gc, Some(desc)).unwrap();
         assert_eq!(s.descriptive_string(), "Symbol(x)");
         let none = JsSymbol::new(&mut gc, None).unwrap();
         assert_eq!(none.descriptive_string(), "Symbol()");
@@ -592,10 +577,9 @@ mod tests {
 
     #[test]
     fn key_for_returns_none_for_well_known() {
-        let string_heap = StringHeap::default();
         let mut gc = fresh_gc_heap();
         let reg = SymbolRegistry::new();
-        let table = WellKnownSymbols::new(&string_heap, &mut gc).unwrap();
+        let table = WellKnownSymbols::new(&mut gc).unwrap();
         let iter = table.get(WellKnown::Iterator);
         assert!(reg.key_for(&iter).is_none());
     }

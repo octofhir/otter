@@ -1073,19 +1073,10 @@ fn gc_oom_to_error(oom: otter_gc::OutOfMemory) -> OtterError {
     }
 }
 
-fn string_oom_to_error(err: otter_vm::StringError) -> OtterError {
-    match err {
-        otter_vm::StringError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => OtterError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        _ => OtterError::Internal {
-            code: DiagnosticCode::StringAlloc.as_str().to_string(),
-            message: err.to_string(),
-        },
+fn string_oom_to_error(err: otter_gc::OutOfMemory) -> OtterError {
+    OtterError::OutOfMemory {
+        requested_bytes: err.requested_bytes(),
+        heap_limit_bytes: err.heap_limit_bytes(),
     }
 }
 
@@ -1486,7 +1477,6 @@ impl Runtime {
         &mut self,
         message: String,
     ) -> Result<otter_vm::Value, OtterError> {
-        let heap = self.interp.string_heap_clone();
         let proto = self
             .interp
             .error_classes_for_trace()
@@ -1497,9 +1487,11 @@ impl Runtime {
             .alloc_host_object_with_roots(&[&proto_root], &[])?;
         otter_vm::object::set_prototype(obj, self.interp.gc_heap_mut(), Some(proto));
         let message_str =
-            otter_vm::JsString::from_str(&message, &heap).map_err(|err| OtterError::Internal {
-                code: DiagnosticCode::StringAlloc.as_str().to_string(),
-                message: err.to_string(),
+            otter_vm::JsString::from_str(&message, self.interp.gc_heap()).map_err(|err| {
+                OtterError::Internal {
+                    code: DiagnosticCode::StringAlloc.as_str().to_string(),
+                    message: err.to_string(),
+                }
             })?;
         otter_vm::object::set(
             obj,
@@ -1883,8 +1875,7 @@ impl Runtime {
     }
 
     fn alloc_string(&mut self, s: &str) -> Result<otter_vm::JsString, OtterError> {
-        let heap = self.interp.string_heap_clone();
-        otter_vm::JsString::from_str(s, &heap).map_err(|err| OtterError::Internal {
+        otter_vm::JsString::from_str(s, self.interp.gc_heap()).map_err(|err| OtterError::Internal {
             code: DiagnosticCode::StringAlloc.as_str().to_string(),
             message: err.to_string(),
         })
@@ -2971,8 +2962,7 @@ fn alloc_dynamic_import_meta(
         .map_err(|e| {
             DynLoadError::Diagnostic(format!("dynamic import: alloc import_meta failed: {e}"))
         })?;
-    let string_heap = interp.string_heap_clone();
-    let url_string = otter_vm::JsString::from_str(url, &string_heap).map_err(|err| {
+    let url_string = otter_vm::JsString::from_str(url, interp.gc_heap()).map_err(|err| {
         DynLoadError::Diagnostic(format!(
             "dynamic import: alloc import_meta.url failed: {err}"
         ))

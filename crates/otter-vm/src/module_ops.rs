@@ -60,7 +60,7 @@ impl Interpreter {
         };
         let resolved = resolve_relative_url(Some(&frame.module_url), &specifier);
         let resolved_str =
-            JsString::from_str(&resolved, &self.string_heap).map_err(|_| VmError::TypeMismatch)?;
+            JsString::from_str(&resolved, &self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
         write_register(frame, dst, Value::String(resolved_str))?;
         frame.pc += 1;
         Ok(())

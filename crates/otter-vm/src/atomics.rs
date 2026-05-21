@@ -751,8 +751,8 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
             WaitOutcome::TimedOut => "timed-out",
         }
     };
-    let string_heap = ctx.cx.interp.string_heap.clone();
-    let label_str = JsString::from_str(label, &string_heap)
+    let string_heap = ctx.cx.interp.gc_heap_mut();
+    let label_str = JsString::from_str(label, string_heap)
         .map_err(|e| type_err(method_name, format!("string allocation failed: {e}")))?;
     if is_async {
         let label_value = Value::String(label_str);

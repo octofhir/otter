@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn options_string_truncated_to_ten_bytes() {
-        let heap = crate::string::StringHeap::default();
+        let heap = otter_gc::GcHeap::new().expect("heap");
         let s = crate::string::JsString::from_str("xxxxxxxxxxYYYY", &heap).unwrap();
         let opts = StringifyOptions::from_space(&Value::String(s)).unwrap();
         assert_eq!(opts.indent.len(), 10);

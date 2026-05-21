@@ -142,8 +142,6 @@ pub use run_control::{
     VmError,
 };
 
-use std::sync::Arc;
-
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
 use smallvec::SmallVec;
 
@@ -185,7 +183,7 @@ pub use promise::{
     PromiseState, PromiseThenOutcome, PurePromise, ReactionKind,
 };
 pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
-pub use string::{JsString, MAX_ROPE_DEPTH, StringError, StringHeap, StringRepr};
+pub use string::{JsString, MAX_ROPE_DEPTH, StringRepr};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 pub use timers::{TimerCallbacks, TimerEntry, TimerScheduler, TimerSchedulerHandle};
@@ -1388,7 +1386,7 @@ impl Value {
 
     /// Convenience: shared empty-string constant. Allocates only on
     /// first call per heap.
-    pub fn empty_string(heap: &StringHeap) -> Result<Self, StringError> {
+    pub fn empty_string(heap: &otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self::String(JsString::empty(heap)?))
     }
 
@@ -1632,7 +1630,7 @@ impl Value {
     ///
     /// # Errors
     /// See [`JsString::from_str`].
-    pub fn from_str(s: &str, heap: &StringHeap) -> Result<Self, StringError> {
+    pub fn from_str(s: &str, heap: &otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self::String(JsString::from_str(s, heap)?))
     }
 }
@@ -1709,7 +1707,6 @@ impl Eq for Value {}
 /// (foundation plan §"Interpreter requirements").
 pub struct Interpreter {
     interrupt: InterruptFlag,
-    string_heap: Arc<StringHeap>,
     /// Per-isolate GC heap. Owned here so allocator-bearing
     /// opcodes (e.g. `Op::MakeClosure`'s upvalue alloc since
     /// task 76) reach it through `&mut self`. The `Runtime`
@@ -1972,15 +1969,13 @@ impl Interpreter {
     #[must_use]
     pub fn with_string_heap_cap(cap_bytes: u64) -> Self {
         let startup_timer = StartupPhaseTimer::from_env();
-        let string_heap = Arc::new(StringHeap::with_cap(cap_bytes));
-        startup_timer.mark("vm_string_heap");
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
             .expect("GcHeap construction never fails on the default cage");
         startup_timer.mark("vm_gc_heap");
-        let well_known_symbols = WellKnownSymbols::new(&string_heap, &mut gc_heap)
+        let well_known_symbols = WellKnownSymbols::new(&mut gc_heap)
             .expect("well-known symbol descriptions + bodies fit within any positive cap");
         startup_timer.mark("vm_well_known_symbols");
-        let error_classes = ErrorClassRegistry::new(&string_heap, &mut gc_heap)
+        let error_classes = ErrorClassRegistry::new(&mut gc_heap)
             .expect("error class prototypes fit within any positive cap");
         startup_timer.mark("vm_error_classes");
         let global_this = bootstrap::build_global_this(&mut gc_heap)
@@ -1993,7 +1988,6 @@ impl Interpreter {
         // `WellKnownSymbols` exists.
         bootstrap::install_symbol_well_knowns_post_bootstrap(
             &mut gc_heap,
-            &string_heap,
             global_this,
             &well_known_symbols,
         )
@@ -2042,7 +2036,6 @@ impl Interpreter {
         startup_timer.mark("vm_shape_runtime");
         let mut interp = Self {
             interrupt: InterruptFlag::new(),
-            string_heap,
             gc_heap,
             shape_runtime,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
@@ -2093,7 +2086,6 @@ impl Interpreter {
             let shape_root = interp.shape_runtime.root();
             let protos = bootstrap::build_builtin_iterator_prototypes_post_bootstrap(
                 &mut interp.gc_heap,
-                &interp.string_heap,
                 shape_root,
                 iter_proto,
                 &interp.well_known_symbols,
@@ -2690,8 +2682,7 @@ impl Interpreter {
         &mut self,
         key: &str,
     ) -> Result<JsSymbol, crate::symbol::SymbolRegistryError> {
-        self.symbol_registry
-            .for_key(&mut self.gc_heap, &self.string_heap, key)
+        self.symbol_registry.for_key(&mut self.gc_heap, key)
     }
 
     /// Register or overwrite a module's `module_env` object so
@@ -2806,22 +2797,6 @@ impl Interpreter {
         self.interrupt.clone()
     }
 
-    /// Borrow the string heap accountant. Tests use this to assert
-    /// counter behavior on rejected allocations.
-    #[must_use]
-    pub fn string_heap(&self) -> &StringHeap {
-        &self.string_heap
-    }
-
-    /// Clone-out the string heap handle. Used by native closures
-    /// (e.g. `Promise.allSettled`) that need to allocate strings
-    /// from a deferred microtask without re-borrowing the
-    /// interpreter.
-    #[must_use]
-    pub fn string_heap_clone(&self) -> Arc<StringHeap> {
-        self.string_heap.clone()
-    }
-
     /// Clone-out the error-class registry. Used by native closures
     /// (e.g. `Promise.any`) that need to build error instances from
     /// a deferred microtask.
@@ -2862,7 +2837,7 @@ impl Interpreter {
             Value::Object(ctor) => object::get(*ctor, &self.gc_heap, "prototype"),
             Value::NativeFunction(native) => {
                 let desc = native
-                    .own_property_descriptor(&self.gc_heap, &self.string_heap, "prototype")
+                    .own_property_descriptor(&self.gc_heap, "prototype")
                     .map_err(|_| VmError::InvalidOperand)?;
                 desc.and_then(|d| match d.kind {
                     object::DescriptorKind::Data { value } => Some(value),
@@ -3711,7 +3686,7 @@ impl Interpreter {
                     }
                     Err(vm_err) => {
                         if result_capability.is_some() {
-                            let reason = vm_err_to_value(&vm_err);
+                            let reason = vm_err_to_value(&vm_err, &self.gc_heap);
                             self.settle_microtask_capability(
                                 context,
                                 result_capability,
@@ -3752,7 +3727,7 @@ impl Interpreter {
                         let reason = self
                             .pending_uncaught_throw
                             .take()
-                            .unwrap_or_else(|| vm_err_to_value(&vm_err));
+                            .unwrap_or_else(|| vm_err_to_value(&vm_err, &self.gc_heap));
                         self.settle_microtask_capability(context, result_capability, Err(reason));
                         Ok(())
                     } else {
@@ -3841,7 +3816,7 @@ impl Interpreter {
                     let reason = self
                         .pending_uncaught_throw
                         .take()
-                        .unwrap_or_else(|| vm_err_to_value(&error));
+                        .unwrap_or_else(|| vm_err_to_value(&error, &self.gc_heap));
                     self.settle_microtask_capability(context, result_capability, Err(reason));
                     Ok(())
                 } else {
@@ -4527,7 +4502,7 @@ impl Interpreter {
                     let units = context
                         .string_constant_units(idx)
                         .ok_or(VmError::InvalidOperand)?;
-                    let s = JsString::from_utf16_units(units, &self.string_heap)?;
+                    let s = JsString::from_utf16_units(units, self.gc_heap_mut())?;
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::String(s))?;
                     frame.pc += 1;
@@ -5750,7 +5725,6 @@ fn object_prototype_intercept(
     obj: &object::JsObject,
     name: &str,
     args: &SmallVec<[Value; 8]>,
-    string_heap: &string::StringHeap,
     gc_heap: &otter_gc::GcHeap,
     function_prototype: Option<object::JsObject>,
 ) -> Result<Option<Value>, VmError> {
@@ -5807,7 +5781,7 @@ fn object_prototype_intercept(
             } else {
                 "[object Object]".to_string()
             };
-            let s = JsString::from_str(&display, string_heap).map_err(|_| VmError::TypeMismatch)?;
+            let s = JsString::from_str(&display, gc_heap).map_err(|_| VmError::TypeMismatch)?;
             Ok(Some(Value::String(s)))
         }
         // §20.1.3.7 Object.prototype.valueOf() — returns the receiver.
@@ -5855,15 +5829,12 @@ fn native_function_object_prototype_intercept(
     name: &str,
     args: &SmallVec<[Value; 8]>,
     gc_heap: &otter_gc::GcHeap,
-    string_heap: &StringHeap,
 ) -> Result<Option<Value>, VmError> {
     match name {
         "hasOwnProperty" => {
             let key = property_key_from_arg(args.first())?;
             Ok(Some(Value::Boolean(
-                native
-                    .own_property_descriptor(gc_heap, string_heap, &key)?
-                    .is_some(),
+                native.own_property_descriptor(gc_heap, &key)?.is_some(),
             )))
         }
         "propertyIsEnumerable" => {
@@ -6185,7 +6156,6 @@ fn take_drop_count(arg: Option<&Value>) -> Result<u64, VmError> {
 /// produced `done: true`"; §7.4.2 step 6).
 fn step_iterator(
     iter: IteratorHandle,
-    string_heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<(Value, bool), VmError> {
     enum FastIteratorSnapshot {
@@ -6292,9 +6262,9 @@ fn step_iterator(
                     && matches!(next_unit, Some(low) if (0xDC00..=0xDFFF).contains(&low));
                 let (s, advance) = if is_pair {
                     let pair = [unit, next_unit.unwrap()];
-                    (JsString::from_utf16_units(&pair, string_heap)?, 2)
+                    (JsString::from_utf16_units(&pair, gc_heap)?, 2)
                 } else {
-                    (JsString::from_utf16_units(&[unit], string_heap)?, 1)
+                    (JsString::from_utf16_units(&[unit], gc_heap)?, 1)
                 };
                 gc_heap.with_payload(iter, |state| {
                     if let IteratorState::String { index, .. } = state {
@@ -7007,7 +6977,7 @@ mod tests {
         let context = ExecutionContext::from_module(module);
         let mut interp = Interpreter::new();
         let target = Value::Function { function_id: 1 };
-        let arg = Value::String(JsString::from_str("rooted-arg", &interp.string_heap).unwrap());
+        let arg = Value::String(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
         let args = [arg.clone()];
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -7092,7 +7062,7 @@ mod tests {
         let context = ExecutionContext::from_module(outer.clone());
         let mut interp = Interpreter::new();
         interp.set_eval_hook(Some(std::rc::Rc::new(move |_, _| Ok(compiled.clone()))));
-        let arg = Value::String(JsString::from_str("", &interp.string_heap).unwrap());
+        let arg = Value::String(JsString::from_str("", interp.gc_heap_mut()).unwrap());
         let args = [arg];
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&outer.functions[0]);
@@ -7119,7 +7089,7 @@ mod tests {
             panic!("new Function should return a native wrapper");
         };
         let desc = native
-            .own_property_descriptor(interp.gc_heap(), &interp.string_heap, "prototype")
+            .own_property_descriptor(interp.gc_heap_mut(), "prototype")
             .unwrap()
             .expect("prototype descriptor");
         let Value::Object(proto) = descriptor_value(&desc) else {
@@ -7802,7 +7772,7 @@ mod tests {
         let module = module_with(Vec::new(), 3);
         let mut interp = Interpreter::new();
         let input = Value::String(
-            JsString::from_str("{\"items\":[1,{\"nested\":2}]}", &interp.string_heap).unwrap(),
+            JsString::from_str("{\"items\":[1,{\"nested\":2}]}", interp.gc_heap_mut()).unwrap(),
         );
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -8070,7 +8040,7 @@ mod tests {
             )
             .expect("boxed this");
         let primitive_string =
-            Value::String(crate::JsString::from_str("abc", &interp.string_heap).unwrap());
+            Value::String(crate::JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
         let property_base = interp
             .object_for_primitive_property_base_stack_rooted(&stack, &primitive_string)
             .expect("property base")
@@ -9197,7 +9167,7 @@ mod tests {
     fn object_from_entries_uses_stack_rooted_result_allocation() {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
-        let key = Value::String(JsString::from_str("answer", &interp.string_heap).unwrap());
+        let key = Value::String(JsString::from_str("answer", interp.gc_heap_mut()).unwrap());
         let pair = array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             vec![key, Value::Number(NumberValue::Smi(9))],
@@ -9305,7 +9275,7 @@ mod tests {
     fn object_function_descriptor_uses_stack_rooted_result_allocation() {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
-        let key = Value::String(JsString::from_str("name", &interp.string_heap).unwrap());
+        let key = Value::String(JsString::from_str("name", interp.gc_heap_mut()).unwrap());
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -9344,7 +9314,7 @@ mod tests {
     fn object_define_property_function_bag_uses_stack_rooted_allocation() {
         let module = module_with(vec![], 6);
         let mut interp = Interpreter::new();
-        let key = Value::String(JsString::from_str("custom", &interp.string_heap).unwrap());
+        let key = Value::String(JsString::from_str("custom", interp.gc_heap_mut()).unwrap());
         let desc = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("descriptor");
         object::set(
             desc,
@@ -9817,7 +9787,7 @@ mod tests {
         // bound_this is a marker string — if `LoadThis` returns it,
         // the lexical override is working.
         let mut interp = Interpreter::new();
-        let bound = JsString::from_str("outer", interp.string_heap()).unwrap();
+        let bound = JsString::from_str("outer", interp.gc_heap_mut()).unwrap();
         let closure_handle = crate::closure::alloc_closure(
             interp.gc_heap_mut(),
             1,

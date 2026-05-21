@@ -57,7 +57,6 @@ pub fn call(
     context: &ExecutionContext,
     method: otter_bytecode::method_id::ReflectMethod,
     args: &[Value],
-    string_heap: &crate::string::StringHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ReflectMethod as M;
     match method {
@@ -225,7 +224,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
         M::OwnKeys => {
             let target = expect_object_value(args.first())?;
-            let keys = interp.own_property_keys_value(context, &target, string_heap)?;
+            let keys = interp.own_property_keys_value(context, &target)?;
             Ok(Value::Array(
                 interp.alloc_runtime_rooted_array_from_values(keys, &[&target], &[])?,
             ))
@@ -641,8 +640,7 @@ fn invoke(
         name: "Reflect",
         reason: "no active execution context".to_string(),
     })?;
-    let string_heap = interp.string_heap_clone();
-    call(interp, &context, method, args, &string_heap).map_err(vm_to_native)
+    call(interp, &context, method, args).map_err(vm_to_native)
 }
 
 fn vm_to_native(err: VmError) -> NativeError {
@@ -755,8 +753,8 @@ mod tests {
             Value::Number(crate::NumberValue::from_i32(42)),
         );
         let context = empty_context();
-        let strings = interp.string_heap_clone();
-        let key = Value::String(crate::JsString::from_str("answer", &strings).expect("key"));
+        let key =
+            Value::String(crate::JsString::from_str("answer", interp.gc_heap()).expect("key"));
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = call(
@@ -764,7 +762,6 @@ mod tests {
             &context,
             ReflectMethod::GetOwnPropertyDescriptor,
             &[Value::Object(target), key],
-            &strings,
         )
         .expect("descriptor");
 
@@ -783,7 +780,6 @@ mod tests {
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("target");
         crate::object::set(target, interp.gc_heap_mut(), "a", Value::Boolean(true));
         let context = empty_context();
-        let strings = interp.string_heap_clone();
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = call(
@@ -791,7 +787,6 @@ mod tests {
             &context,
             ReflectMethod::OwnKeys,
             &[Value::Object(target)],
-            &strings,
         )
         .expect("ownKeys");
 

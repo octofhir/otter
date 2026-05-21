@@ -723,8 +723,7 @@ mod tests {
         object::set(proto, &mut heap, "y", Value::Null);
         let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
-        let string_heap = crate::StringHeap::with_cap(1024);
-        let key_string = JsString::from_str("x", &string_heap).expect("string");
+        let key_string = JsString::from_str("x", &heap).expect("string");
         let ic = HasPropertyIc::install_candidate(receiver, &heap, &key_string).expect("has ic");
 
         assert!(object::delete(proto, &mut heap, "y"));

@@ -97,7 +97,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
 fn js_string_value(s: &str, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(crate::string::JsString::from_str(
         s,
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 

@@ -31,7 +31,7 @@
 use super::digit_pair::DIGIT_PAIRS;
 use super::integer_fast;
 use super::schubfach::schubfach_finite;
-use crate::string::{JsString, StringError, StringHeap};
+use crate::string::JsString;
 
 /// Stack-buffer length sufficient for any `Number::ToString` output.
 ///
@@ -61,7 +61,10 @@ pub fn f64_to_ecma_string_buf(x: f64, out: &mut [u8; ECMA_BUF_LEN]) -> usize {
 /// # Errors
 /// Returns [`StringError::OutOfMemory`] if `heap` cannot accommodate
 /// the resulting string.
-pub fn number_to_string(x: f64, heap: &StringHeap) -> Result<JsString, StringError> {
+pub fn number_to_string(
+    x: f64,
+    heap: &otter_gc::GcHeap,
+) -> Result<JsString, otter_gc::OutOfMemory> {
     let mut buf = [0u8; ECMA_BUF_LEN];
     let len = f64_to_ecma_string_buf(x, &mut buf);
     // Output is ASCII; route directly into the Latin-1 `Thin`

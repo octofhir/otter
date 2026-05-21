@@ -1371,7 +1371,6 @@ fn weak_set_capacity_bytes(capacity: usize) -> usize {
 mod tests {
     use super::*;
     use crate::number::NumberValue;
-    use crate::string::StringHeap;
 
     fn n(i: i32) -> Value {
         Value::Number(NumberValue::from_i32(i))
@@ -1565,23 +1564,10 @@ mod tests {
 
     #[test]
     fn map_string_keys() {
-        let string_heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let m = alloc_map(&mut gc_heap).unwrap();
-        map_set(
-            m,
-            &mut gc_heap,
-            Value::String(JsString::from_str("k", &string_heap).unwrap()),
-            n(1),
-        )
-        .unwrap();
-        assert_eq!(
-            map_get(
-                m,
-                &gc_heap,
-                &Value::String(JsString::from_str("k", &string_heap).unwrap())
-            ),
-            Some(n(1)),
-        );
+        let key = Value::String(JsString::from_str("k", &gc_heap).unwrap());
+        map_set(m, &mut gc_heap, key.clone(), n(1)).unwrap();
+        assert_eq!(map_get(m, &gc_heap, &key), Some(n(1)),);
     }
 }

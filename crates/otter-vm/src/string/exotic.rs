@@ -22,24 +22,24 @@
 //! - [`crate::object_internal_ops`]
 
 use crate::object::PropertyDescriptor;
-use crate::string::{JsString, StringHeap};
+use crate::string::JsString;
 use crate::{NumberValue, Value, VmError, VmPropertyKey};
 
 pub(crate) fn descriptor_for_key(
     value: &JsString,
     key: &VmPropertyKey,
-    string_heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Option<PropertyDescriptor>, VmError> {
     let Some(key) = key.string_name() else {
         return Ok(None);
     };
-    descriptor_for_name(value, key, string_heap)
+    descriptor_for_name(value, key, gc_heap)
 }
 
 pub(crate) fn descriptor_for_name(
     value: &JsString,
     key: &str,
-    string_heap: &StringHeap,
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Option<PropertyDescriptor>, VmError> {
     if key == "length" {
         return Ok(Some(PropertyDescriptor::data(
@@ -56,7 +56,7 @@ pub(crate) fn descriptor_for_name(
         return Ok(None);
     };
     Ok(Some(PropertyDescriptor::data(
-        Value::String(JsString::from_utf16_units(&[unit], string_heap)?),
+        Value::String(JsString::from_utf16_units(&[unit], gc_heap)?),
         false,
         true,
         false,

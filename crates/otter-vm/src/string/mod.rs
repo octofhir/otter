@@ -8,12 +8,11 @@
 //!   flat copy — so `s += piece` loops stay O(n);
 //! - slices produce `Sliced` views (over flat parents) without
 //!   flattening; slicing a `Cons` flattens once;
-//! - `Thin` variant is reserved for the future Latin-1 / WTF-16
-//!   hybrid (not constructed yet; tag occupies the enum discriminant
-//!   so it cannot be repurposed casually);
-//! - heap accounting goes through a fallible `alloc_string` helper
-//!   that checks the runtime cap **before** mutation and returns
-//!   `OutOfMemory` if the allocation would exceed it.
+//! - `Thin` variant carries Latin-1 storage so ASCII-only callers
+//!   avoid the `&str → Vec<u16> → Arc<[u16]>` widening round-trip;
+//! - heap accounting flows through the shared GC heap
+//!   (`otter_gc::GcHeap`) — there is no separate string-heap
+//!   accountant any more (Phase A of the `JsString` migration).
 //!
 //! Ropes are flattened with an **iterative DFS** over an explicit
 //! stack — recursion is forbidden by the foundation plan.
@@ -21,8 +20,6 @@
 //! # Contents
 //! - [`JsString`] — the public string handle (cheap to clone).
 //! - [`StringRepr`] — internal representation enum.
-//! - [`StringHeap`] — bytes-tracking heap accountant.
-//! - [`StringError`] — fallible allocation outcome.
 //! - [`MAX_ROPE_DEPTH`] — pinned at 64 (panicking flatten cap).
 //!
 //! # Invariants
@@ -30,8 +27,6 @@
 //! - `equals()` compares code units; surrogates round-trip.
 //! - `slice(parent, start, len)` over a `Sliced` parent collapses
 //!   into a single `Sliced` view (no `Sliced(Sliced(...))` chain).
-//! - The string subsystem allocates **only** `Arc<[u16]>`; no
-//!   `String` or `Vec<u8>` heap allocation.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
@@ -57,9 +52,8 @@ pub mod prototype;
 pub mod statics;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use otter_gc::{GcHeap, OutOfMemory};
 
 pub use gc_body::{
     JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle, JsStringId,
@@ -67,15 +61,6 @@ pub use gc_body::{
     alloc_latin1_string_body_with_roots, concat_string_bodies, equals_string_bodies,
     flatten_string_body, hash_latin1, hash_utf16, slice_string_body, to_utf16_vec,
 };
-
-/// Per-variant header overhead used by the heap accountant. The
-/// numbers are conservative estimates; real Rust layout may be
-/// smaller. They exist so the heap counter tracks something
-/// meaningful for `Cons` / `Sliced` nodes that would otherwise look
-/// "free" relative to flat strings.
-const FLAT_HEADER_BYTES: u64 = 24;
-const CONS_HEADER_BYTES: u64 = 32;
-const SLICED_HEADER_BYTES: u64 = 32;
 
 /// Maximum depth of an unflattened cons rope.
 ///
@@ -85,108 +70,6 @@ const SLICED_HEADER_BYTES: u64 = 32;
 /// node is built, so the depth can never exceed [`MAX_ROPE_DEPTH`]
 /// in steady state.
 pub const MAX_ROPE_DEPTH: usize = 64;
-
-/// Outcome of a fallible string allocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub enum StringError {
-    /// The allocation would have exceeded the configured heap cap.
-    OutOfMemory {
-        /// Bytes the allocation requested.
-        requested_bytes: u64,
-        /// Configured heap limit (`0` means "disabled").
-        heap_limit_bytes: u64,
-    },
-}
-
-impl std::fmt::Display for StringError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StringError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => write!(
-                f,
-                "out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StringError {}
-
-/// Tracks live string heap bytes against an optional cap.
-///
-/// `Default` produces a "no-cap" heap (cap = 0 disables the check).
-/// The accountant is `Send + Sync` so an `InterruptHandle`-style
-/// shared counter is straightforward when foundation slices wire it
-/// to the runtime.
-#[derive(Debug, Default)]
-pub struct StringHeap {
-    used: AtomicU64,
-    cap: AtomicU64,
-}
-
-impl StringHeap {
-    /// Construct a heap with an explicit cap (`0` disables).
-    #[must_use]
-    pub fn with_cap(cap_bytes: u64) -> Self {
-        Self {
-            used: AtomicU64::new(0),
-            cap: AtomicU64::new(cap_bytes),
-        }
-    }
-
-    /// Currently tracked live bytes.
-    #[must_use]
-    pub fn used(&self) -> u64 {
-        self.used.load(Ordering::Relaxed)
-    }
-
-    /// Configured cap (`0` = unlimited).
-    #[must_use]
-    pub fn cap(&self) -> u64 {
-        self.cap.load(Ordering::Relaxed)
-    }
-
-    /// Reserve `bytes`; returns [`StringError::OutOfMemory`] when
-    /// the cap would be exceeded. Never mutates the counter on
-    /// failure (foundation plan §"Heap caps are hard").
-    pub fn reserve(&self, bytes: u64) -> Result<(), StringError> {
-        let cap = self.cap.load(Ordering::Relaxed);
-        if cap == 0 {
-            self.used.fetch_add(bytes, Ordering::Relaxed);
-            return Ok(());
-        }
-        // CAS-loop so the check + mutation is atomic relative to
-        // other concurrent allocations (single-threaded VM today,
-        // but the heap is `Sync` so we keep the property).
-        let mut current = self.used.load(Ordering::Relaxed);
-        loop {
-            let new = current.saturating_add(bytes);
-            if new > cap {
-                return Err(StringError::OutOfMemory {
-                    requested_bytes: bytes,
-                    heap_limit_bytes: cap,
-                });
-            }
-            match self.used.compare_exchange_weak(
-                current,
-                new,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    /// Release `bytes` previously reserved.
-    pub fn release(&self, bytes: u64) {
-        self.used.fetch_sub(bytes, Ordering::Relaxed);
-    }
-}
 
 /// Internal representation of a [`JsString`].
 ///
@@ -237,11 +120,11 @@ impl JsString {
     /// Construct a flat string from in-memory WTF-16 code units.
     ///
     /// # Errors
-    /// Returns [`StringError::OutOfMemory`] if `heap` cannot
-    /// accommodate the allocation.
-    pub fn from_utf16_units(units: &[u16], heap: &StringHeap) -> Result<Self, StringError> {
-        let bytes = FLAT_HEADER_BYTES + (units.len() as u64) * 2;
-        heap.reserve(bytes)?;
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim. The Arc-backed
+    /// body cannot fail today; the result type is preserved so
+    /// callers compile unchanged when Phase B flips storage to a
+    /// GC body.
+    pub fn from_utf16_units(units: &[u16], _heap: &GcHeap) -> Result<Self, OutOfMemory> {
         Ok(Self {
             repr: Arc::new(StringRepr::Flat(units.into())),
         })
@@ -252,7 +135,7 @@ impl JsString {
     ///
     /// # Errors
     /// See [`Self::from_utf16_units`].
-    pub fn from_str(s: &str, heap: &StringHeap) -> Result<Self, StringError> {
+    pub fn from_str(s: &str, heap: &GcHeap) -> Result<Self, OutOfMemory> {
         let units: Vec<u16> = s.encode_utf16().collect();
         Self::from_utf16_units(&units, heap)
     }
@@ -268,22 +151,18 @@ impl JsString {
     /// callers preserve the spec semantics for code-unit access).
     ///
     /// # Errors
-    /// Returns [`StringError::OutOfMemory`] if `heap` cannot
-    /// accommodate the allocation.
-    pub fn from_latin1(bytes: &[u8], heap: &StringHeap) -> Result<Self, StringError> {
-        let alloc = FLAT_HEADER_BYTES + bytes.len() as u64;
-        heap.reserve(alloc)?;
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn from_latin1(bytes: &[u8], _heap: &GcHeap) -> Result<Self, OutOfMemory> {
         Ok(Self {
             repr: Arc::new(StringRepr::Thin(bytes.into())),
         })
     }
 
-    /// Empty string convenience constructor (no allocation
-    /// accounting beyond the header).
+    /// Empty string convenience constructor.
     ///
     /// # Errors
     /// See [`Self::from_utf16_units`].
-    pub fn empty(heap: &StringHeap) -> Result<Self, StringError> {
+    pub fn empty(heap: &GcHeap) -> Result<Self, OutOfMemory> {
         Self::from_utf16_units(&[], heap)
     }
 
@@ -326,14 +205,8 @@ impl JsString {
     /// is flattened first.
     ///
     /// # Errors
-    /// Returns [`StringError::OutOfMemory`] if the heap cannot
-    /// accommodate the rope-node header overhead, or the eager
-    /// flatten if one is required.
-    pub fn concat(
-        left: &JsString,
-        right: &JsString,
-        heap: &StringHeap,
-    ) -> Result<Self, StringError> {
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn concat(left: &JsString, right: &JsString, heap: &GcHeap) -> Result<Self, OutOfMemory> {
         if right.is_empty() {
             return Ok(left.clone());
         }
@@ -358,7 +231,6 @@ impl JsString {
         };
 
         let final_depth = l.depth().max(r.depth()).saturating_add(1);
-        heap.reserve(CONS_HEADER_BYTES)?;
         Ok(Self {
             repr: Arc::new(StringRepr::Cons {
                 left: Arc::new(l),
@@ -378,7 +250,7 @@ impl JsString {
     ///
     /// # Errors
     /// See [`Self::flatten`].
-    pub fn slice(&self, start: u32, length: u32, heap: &StringHeap) -> Result<Self, StringError> {
+    pub fn slice(&self, start: u32, length: u32, heap: &GcHeap) -> Result<Self, OutOfMemory> {
         let total = self.len();
         let start = start.min(total);
         let length = length.min(total.saturating_sub(start));
@@ -386,30 +258,24 @@ impl JsString {
             return Self::empty(heap);
         }
         match &*self.repr {
-            StringRepr::Flat(units) => {
-                heap.reserve(SLICED_HEADER_BYTES)?;
-                Ok(Self {
-                    repr: Arc::new(StringRepr::Sliced {
-                        parent: units.clone(),
-                        start,
-                        len: length,
-                    }),
-                })
-            }
+            StringRepr::Flat(units) => Ok(Self {
+                repr: Arc::new(StringRepr::Sliced {
+                    parent: units.clone(),
+                    start,
+                    len: length,
+                }),
+            }),
             StringRepr::Sliced {
                 parent,
                 start: outer_start,
                 ..
-            } => {
-                heap.reserve(SLICED_HEADER_BYTES)?;
-                Ok(Self {
-                    repr: Arc::new(StringRepr::Sliced {
-                        parent: parent.clone(),
-                        start: outer_start + start,
-                        len: length,
-                    }),
-                })
-            }
+            } => Ok(Self {
+                repr: Arc::new(StringRepr::Sliced {
+                    parent: parent.clone(),
+                    start: outer_start + start,
+                    len: length,
+                }),
+            }),
             StringRepr::Cons { .. } => {
                 let flat = self.flatten(heap)?;
                 flat.slice(start, length, heap)
@@ -420,8 +286,6 @@ impl JsString {
                 // 1-byte-per-code-unit advantage on the slice path.
                 let s = start as usize;
                 let e = s + (length as usize);
-                let alloc = FLAT_HEADER_BYTES + (length as u64);
-                heap.reserve(alloc)?;
                 Ok(Self {
                     repr: Arc::new(StringRepr::Thin(bytes[s..e].into())),
                 })
@@ -433,9 +297,8 @@ impl JsString {
     /// length; iterative DFS — no recursion.
     ///
     /// # Errors
-    /// Returns [`StringError::OutOfMemory`] if the destination
-    /// allocation would exceed the heap cap.
-    pub fn flatten(&self, heap: &StringHeap) -> Result<Self, StringError> {
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn flatten(&self, heap: &GcHeap) -> Result<Self, OutOfMemory> {
         if let StringRepr::Flat(_) = &*self.repr {
             return Ok(self.clone());
         }
@@ -569,15 +432,10 @@ impl JsString {
     /// a fresh `Flat` repr.
     ///
     /// # Errors
-    /// Surfaces [`StringError::OutOfMemory`] when the string-heap
-    /// cap would be exceeded.
-    pub fn from_gc_handle(
-        heap: &otter_gc::GcHeap,
-        handle: JsStringHandle,
-        string_heap: &StringHeap,
-    ) -> Result<Self, StringError> {
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn from_gc_handle(heap: &GcHeap, handle: JsStringHandle) -> Result<Self, OutOfMemory> {
         let units = gc_body::to_utf16_vec(heap, handle);
-        Self::from_utf16_units(&units, string_heap)
+        Self::from_utf16_units(&units, heap)
     }
 
     /// Code-unit at `index`, or `None` for out-of-range.
@@ -1056,33 +914,32 @@ impl<'a> Iterator for CodeUnits<'a> {
 mod tests {
     use super::*;
 
-    fn h() -> StringHeap {
-        StringHeap::default()
+    fn h() -> GcHeap {
+        GcHeap::new().expect("gc heap")
     }
 
     #[test]
     fn from_str_roundtrip() {
-        let s = JsString::from_str("abc", &h()).unwrap();
+        let heap = h();
+        let s = JsString::from_str("abc", &heap).unwrap();
         assert_eq!(s.len(), 3);
         assert_eq!(s.to_lossy_string(), "abc");
     }
 
     #[test]
     fn to_gc_handle_round_trips_through_real_heap() {
-        let heap = h();
-        let mut gc = otter_gc::GcHeap::new().expect("gc heap");
-        let original = JsString::from_str("hello world", &heap).unwrap();
+        let mut gc = GcHeap::new().expect("gc heap");
+        let original = JsString::from_str("hello world", &gc).unwrap();
         let handle = original.to_gc_handle(&mut gc).expect("to_gc_handle");
-        let back = JsString::from_gc_handle(&gc, handle, &heap).expect("from_gc_handle");
+        let back = JsString::from_gc_handle(&gc, handle).expect("from_gc_handle");
         assert_eq!(back.len(), original.len());
         assert_eq!(back.to_lossy_string(), original.to_lossy_string());
     }
 
     #[test]
     fn to_gc_handle_preserves_latin1_payload() {
-        let heap = h();
-        let mut gc = otter_gc::GcHeap::new().expect("gc heap");
-        let original = JsString::from_latin1(b"latin", &heap).unwrap();
+        let mut gc = GcHeap::new().expect("gc heap");
+        let original = JsString::from_latin1(b"latin", &gc).unwrap();
         let handle = original.to_gc_handle(&mut gc).expect("to_gc_handle");
         gc.read_payload(handle, |body| {
             assert!(matches!(body.repr, JsStringBodyRepr::Latin1(_)));
@@ -1092,11 +949,10 @@ mod tests {
 
     #[test]
     fn to_gc_handle_flattens_cons() {
-        let heap = h();
-        let mut gc = otter_gc::GcHeap::new().expect("gc heap");
-        let left = JsString::from_str("foo", &heap).unwrap();
-        let right = JsString::from_str("bar", &heap).unwrap();
-        let cons = JsString::concat(&left, &right, &heap).unwrap();
+        let mut gc = GcHeap::new().expect("gc heap");
+        let left = JsString::from_str("foo", &gc).unwrap();
+        let right = JsString::from_str("bar", &gc).unwrap();
+        let cons = JsString::concat(&left, &right, &gc).unwrap();
         let handle = cons.to_gc_handle(&mut gc).expect("to_gc_handle");
         gc.read_payload(handle, |body| {
             // Cons collapses through to_utf16_vec then alloc_flat.
@@ -1148,19 +1004,20 @@ mod tests {
 
     #[test]
     fn equality_on_flat() {
-        let a = JsString::from_str("abc", &h()).unwrap();
-        let b = JsString::from_str("abc", &h()).unwrap();
-        let c = JsString::from_str("abd", &h()).unwrap();
+        let heap = h();
+        let a = JsString::from_str("abc", &heap).unwrap();
+        let b = JsString::from_str("abc", &heap).unwrap();
+        let c = JsString::from_str("abd", &heap).unwrap();
         assert!(a.equals(&b));
         assert!(!a.equals(&c));
     }
 
     #[test]
     fn concat_produces_cons_not_flat() {
-        let h = h();
-        let a = JsString::from_str("a", &h).unwrap();
-        let b = JsString::from_str("b", &h).unwrap();
-        let ab = JsString::concat(&a, &b, &h).unwrap();
+        let heap = h();
+        let a = JsString::from_str("a", &heap).unwrap();
+        let b = JsString::from_str("b", &heap).unwrap();
+        let ab = JsString::concat(&a, &b, &heap).unwrap();
         assert!(matches!(*ab.repr, StringRepr::Cons { .. }));
         assert_eq!(ab.len(), 2);
         assert_eq!(ab.to_lossy_string(), "ab");
@@ -1169,11 +1026,11 @@ mod tests {
     #[test]
     fn concat_loop_is_linear() {
         // Build s += "abcd" 1000 times. Each step is O(1) cons work.
-        let h = h();
-        let mut s = JsString::empty(&h).unwrap();
-        let piece = JsString::from_str("abcd", &h).unwrap();
+        let heap = h();
+        let mut s = JsString::empty(&heap).unwrap();
+        let piece = JsString::from_str("abcd", &heap).unwrap();
         for _ in 0..1_000 {
-            s = JsString::concat(&s, &piece, &h).unwrap();
+            s = JsString::concat(&s, &piece, &heap).unwrap();
         }
         assert_eq!(s.len(), 4_000);
         assert_eq!(s.to_lossy_string().len(), 4_000);
@@ -1181,9 +1038,9 @@ mod tests {
 
     #[test]
     fn slice_returns_view_for_flat_parent() {
-        let h = h();
-        let s = JsString::from_str("abcdef", &h).unwrap();
-        let sliced = s.slice(1, 3, &h).unwrap();
+        let heap = h();
+        let s = JsString::from_str("abcdef", &heap).unwrap();
+        let sliced = s.slice(1, 3, &heap).unwrap();
         assert_eq!(sliced.len(), 3);
         assert_eq!(sliced.to_lossy_string(), "bcd");
         assert!(matches!(*sliced.repr, StringRepr::Sliced { .. }));
@@ -1191,10 +1048,10 @@ mod tests {
 
     #[test]
     fn slice_of_slice_collapses() {
-        let h = h();
-        let s = JsString::from_str("abcdef", &h).unwrap();
-        let outer = s.slice(1, 5, &h).unwrap(); // "bcdef"
-        let inner = outer.slice(1, 2, &h).unwrap(); // "cd"
+        let heap = h();
+        let s = JsString::from_str("abcdef", &heap).unwrap();
+        let outer = s.slice(1, 5, &heap).unwrap(); // "bcdef"
+        let inner = outer.slice(1, 2, &heap).unwrap(); // "cd"
         assert_eq!(inner.to_lossy_string(), "cd");
         match &*inner.repr {
             StringRepr::Sliced { start, len, .. } => {
@@ -1207,20 +1064,20 @@ mod tests {
 
     #[test]
     fn slice_of_cons_flattens() {
-        let h = h();
-        let a = JsString::from_str("ab", &h).unwrap();
-        let b = JsString::from_str("cd", &h).unwrap();
-        let cons = JsString::concat(&a, &b, &h).unwrap();
-        let sliced = cons.slice(1, 2, &h).unwrap();
+        let heap = h();
+        let a = JsString::from_str("ab", &heap).unwrap();
+        let b = JsString::from_str("cd", &heap).unwrap();
+        let cons = JsString::concat(&a, &b, &heap).unwrap();
+        let sliced = cons.slice(1, 2, &heap).unwrap();
         assert_eq!(sliced.to_lossy_string(), "bc");
     }
 
     #[test]
     fn char_code_at_walks_rope() {
-        let h = h();
-        let a = JsString::from_str("ab", &h).unwrap();
-        let b = JsString::from_str("cd", &h).unwrap();
-        let cons = JsString::concat(&a, &b, &h).unwrap();
+        let heap = h();
+        let a = JsString::from_str("ab", &heap).unwrap();
+        let b = JsString::from_str("cd", &heap).unwrap();
+        let cons = JsString::concat(&a, &b, &heap).unwrap();
         assert_eq!(cons.char_code_at(0), Some(b'a' as u16));
         assert_eq!(cons.char_code_at(2), Some(b'c' as u16));
         assert_eq!(cons.char_code_at(4), None);
@@ -1229,10 +1086,10 @@ mod tests {
     #[test]
     fn surrogate_round_trip() {
         // Construct from a lone surrogate pair manually.
-        let h = h();
+        let heap = h();
         // U+10000 — '𐀀' encoded as a surrogate pair 0xD800 0xDC00.
         let units: [u16; 2] = [0xD800, 0xDC00];
-        let s = JsString::from_utf16_units(&units, &h).unwrap();
+        let s = JsString::from_utf16_units(&units, &heap).unwrap();
         assert_eq!(s.len(), 2);
         assert_eq!(s.char_code_at(0), Some(0xD800));
         assert_eq!(s.char_code_at(1), Some(0xDC00));
@@ -1241,41 +1098,26 @@ mod tests {
 
     #[test]
     fn flatten_is_iterative_on_deep_rope() {
-        let h = h();
+        let heap = h();
         // Build a left-leaning rope of depth ~MAX_ROPE_DEPTH; concat
         // auto-flattens when deeper. Verify length matches.
-        let leaf = JsString::from_str("ab", &h).unwrap();
+        let leaf = JsString::from_str("ab", &heap).unwrap();
         let mut acc = leaf.clone();
         for _ in 0..(MAX_ROPE_DEPTH * 2) {
-            acc = JsString::concat(&acc, &leaf, &h).unwrap();
+            acc = JsString::concat(&acc, &leaf, &heap).unwrap();
         }
         let len = acc.len();
-        let flat = acc.flatten(&h).unwrap();
+        let flat = acc.flatten(&heap).unwrap();
         assert_eq!(flat.len(), len);
     }
 
     #[test]
-    fn out_of_memory_does_not_mutate_counter() {
-        // Allocate a 4 KiB-cap heap and request a 100-KiB string.
-        let h = StringHeap::with_cap(4 * 1024);
-        let big_text: String = "a".repeat(100 * 1024);
-        let before = h.used();
-        let err = JsString::from_str(&big_text, &h).unwrap_err();
-        assert!(matches!(err, StringError::OutOfMemory { .. }));
-        assert_eq!(
-            h.used(),
-            before,
-            "heap counter must not advance on rejected alloc"
-        );
-    }
-
-    #[test]
     fn empty_concat_is_identity() {
-        let h = h();
-        let a = JsString::from_str("abc", &h).unwrap();
-        let empty = JsString::empty(&h).unwrap();
-        let r1 = JsString::concat(&a, &empty, &h).unwrap();
-        let r2 = JsString::concat(&empty, &a, &h).unwrap();
+        let heap = h();
+        let a = JsString::from_str("abc", &heap).unwrap();
+        let empty = JsString::empty(&heap).unwrap();
+        let r1 = JsString::concat(&a, &empty, &heap).unwrap();
+        let r2 = JsString::concat(&empty, &a, &heap).unwrap();
         assert_eq!(r1.to_lossy_string(), "abc");
         assert_eq!(r2.to_lossy_string(), "abc");
     }

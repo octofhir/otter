@@ -60,20 +60,6 @@ pub enum SymbolError {
     },
 }
 
-impl From<crate::string::StringError> for SymbolError {
-    fn from(err: crate::string::StringError) -> Self {
-        match err {
-            crate::string::StringError::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            } => Self::OutOfMemory {
-                requested_bytes,
-                heap_limit_bytes,
-            },
-        }
-    }
-}
-
 impl From<otter_gc::OutOfMemory> for SymbolError {
     fn from(err: otter_gc::OutOfMemory) -> Self {
         Self::OutOfMemory {
@@ -86,7 +72,6 @@ impl From<otter_gc::OutOfMemory> for SymbolError {
 impl From<crate::symbol::SymbolRegistryError> for SymbolError {
     fn from(err: crate::symbol::SymbolRegistryError) -> Self {
         match err {
-            crate::symbol::SymbolRegistryError::String(e) => e.into(),
             crate::symbol::SymbolRegistryError::OutOfMemory(e) => e.into(),
         }
     }
@@ -114,8 +99,7 @@ pub fn load_static(interp: &Interpreter, name: &str) -> Result<Value, SymbolErro
             }
         }
         Some(Value::NativeFunction(native)) => {
-            if let Ok(Some(desc)) =
-                native.own_property_descriptor(&interp.gc_heap, &interp.string_heap, name)
+            if let Ok(Some(desc)) = native.own_property_descriptor(&interp.gc_heap, name)
                 && let crate::object::DescriptorKind::Data { value } = desc.kind
             {
                 return Ok(value);
@@ -179,7 +163,7 @@ fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, S
         // dispatcher has no `ExecutionContext`).
         Some(other) => {
             let rendered =
-                JsString::from_str(&other.display_string(&interp.gc_heap), &interp.string_heap)?;
+                JsString::from_str(&other.display_string(&interp.gc_heap), interp.gc_heap_mut())?;
             Some(rendered)
         }
     };
@@ -209,7 +193,7 @@ fn symbol_key_for(interp: &Interpreter, args: &[Value]) -> Result<Value, SymbolE
     };
     match interp.symbol_registry().key_for(sym) {
         Some(key) => {
-            let s = JsString::from_str(&key, &interp.string_heap)?;
+            let s = JsString::from_str(&key, interp.gc_heap())?;
             Ok(Value::String(s))
         }
         None => Ok(Value::Undefined),

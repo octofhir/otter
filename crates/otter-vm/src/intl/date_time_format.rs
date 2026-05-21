@@ -101,7 +101,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             });
         }
     };
-    js_string(&formatted, args.string_heap).map_err(intl_to_intrinsic)
+    js_string(&formatted, args.gc_heap).map_err(intl_to_intrinsic)
 }
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -144,10 +144,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     } else {
         None
     };
-    let calendar = Value::String(crate::string::JsString::from_str(
-        "iso8601",
-        args.string_heap,
-    )?);
+    let calendar = Value::String(crate::string::JsString::from_str("iso8601", args.gc_heap)?);
     let mut value_roots = vec![&locale_value, &calendar];
     if let Some(v) = &yr {
         value_roots.push(v);
@@ -196,7 +193,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
 fn js_string_value(s: &str, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(crate::string::JsString::from_str(
         s,
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 

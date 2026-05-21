@@ -120,7 +120,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let rendered = render_format(value, &unit, &payload);
     Ok(Value::String(crate::string::JsString::from_str(
         &rendered,
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 
@@ -130,10 +130,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// full ICU integration.
 fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = impl_format(args)?;
-    let literal = Value::String(crate::string::JsString::from_str(
-        "literal",
-        args.string_heap,
-    )?);
+    let literal = Value::String(crate::string::JsString::from_str("literal", args.gc_heap)?);
     let part = args.alloc_object_rooted(&[&literal, &s], &[])?;
     {
         let heap = &mut *args.gc_heap;
@@ -149,9 +146,9 @@ fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsic
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.string_heap).map_err(intl_to_intrinsic)?;
-    let style = js_string(&payload.style, args.string_heap).map_err(intl_to_intrinsic)?;
-    let numeric = js_string(&payload.numeric, args.string_heap).map_err(intl_to_intrinsic)?;
+    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
+    let style = js_string(&payload.style, args.gc_heap).map_err(intl_to_intrinsic)?;
+    let numeric = js_string(&payload.numeric, args.gc_heap).map_err(intl_to_intrinsic)?;
     let obj = args.alloc_object_rooted(&[&locale, &style, &numeric], &[])?;
     let heap = &mut *args.gc_heap;
     crate::object::set(obj, heap, "locale", locale);

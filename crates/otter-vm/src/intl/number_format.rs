@@ -121,7 +121,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         _ => f64::NAN,
     };
     let rendered = format_number(n, &payload);
-    js_string(&rendered, args.string_heap).map_err(intl_to_intrinsic)
+    js_string(&rendered, args.gc_heap).map_err(intl_to_intrinsic)
 }
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -165,7 +165,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
 fn js_string_value(s: &str, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(crate::string::JsString::from_str(
         s,
-        args.string_heap,
+        args.gc_heap,
     )?))
 }
 

@@ -200,7 +200,6 @@ impl Interpreter {
         let metadata_ctx = function_metadata::FunctionMetadataContext::new(
             &function_context,
             &self.gc_heap,
-            &self.string_heap,
             &self.function_user_props,
             &self.function_deleted_metadata,
         );
@@ -304,18 +303,12 @@ impl Interpreter {
 
         if let Value::NativeFunction(native) = &wrapper {
             let name = object::PropertyDescriptor::data(name_value, false, false, true);
-            let _ = native.define_own_property(&mut self.gc_heap, &self.string_heap, "name", name);
+            let _ = native.define_own_property(&mut self.gc_heap, "name", name);
             let length = object::PropertyDescriptor::data(length_value, false, false, true);
-            let _ =
-                native.define_own_property(&mut self.gc_heap, &self.string_heap, "length", length);
+            let _ = native.define_own_property(&mut self.gc_heap, "length", length);
             let prototype =
                 object::PropertyDescriptor::data(prototype_value.clone(), true, false, false);
-            let _ = native.define_own_property(
-                &mut self.gc_heap,
-                &self.string_heap,
-                "prototype",
-                prototype,
-            );
+            let _ = native.define_own_property(&mut self.gc_heap, "prototype", prototype);
             if let Value::Object(proto) = prototype_value {
                 let constructor =
                     object::PropertyDescriptor::data(wrapper.clone(), true, false, true);

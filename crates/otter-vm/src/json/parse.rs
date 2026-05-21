@@ -26,7 +26,7 @@ use otter_gc::heap::RootSlotVisitor;
 
 use crate::Value;
 use crate::number::NumberValue;
-use crate::string::{JsString, StringHeap};
+use crate::string::JsString;
 
 use super::MAX_NESTING_DEPTH;
 
@@ -72,30 +72,24 @@ enum Builder {
     },
 }
 
-/// Strict `JSON.parse`. The `heap` is needed only to allocate
-/// resulting `JsString` values; `gc_heap` is needed to allocate
-/// `JsObject`s for parsed JSON objects.
-pub fn parse(
-    text: &str,
-    heap: &StringHeap,
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, ParseError> {
+/// Strict `JSON.parse`. `gc_heap` allocates both `JsString` values
+/// and `JsObject`s for parsed JSON objects.
+pub fn parse(text: &str, gc_heap: &mut otter_gc::GcHeap) -> Result<Value, ParseError> {
     let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-    parse_with_roots(text, heap, gc_heap, &mut external_visit)
+    parse_with_roots(text, gc_heap, &mut external_visit)
 }
 
 /// Strict `JSON.parse` with an explicit GC root visitor for caller-owned
 /// runtime/native/frame roots.
 pub(crate) fn parse_with_roots(
     text: &str,
-    heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
     let bytes = text.as_bytes();
     let mut cursor = Cursor { bytes, pos: 0 };
     cursor.skip_ws();
-    let value = read_value(&mut cursor, heap, gc_heap, external_visit)?;
+    let value = read_value(&mut cursor, gc_heap, external_visit)?;
     cursor.skip_ws();
     if cursor.pos != bytes.len() {
         return Err(ParseError::at(cursor.pos, "unexpected trailing content"));
@@ -142,16 +136,15 @@ impl Cursor<'_> {
 /// (primitive or compound); compound builders live on `stack`.
 fn read_value(
     cursor: &mut Cursor<'_>,
-    heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
     let mut stack: Vec<Builder> = Vec::with_capacity(8);
-    let result = read_step(cursor, &mut stack, heap, gc_heap, external_visit)?;
+    let result = read_step(cursor, &mut stack, gc_heap, external_visit)?;
     let mut current = result;
     while stack.last().is_some() {
         cursor.skip_ws();
-        current = continue_container(cursor, &mut stack, current, heap, gc_heap, external_visit)?;
+        current = continue_container(cursor, &mut stack, current, gc_heap, external_visit)?;
     }
     Ok(current)
 }
@@ -162,7 +155,6 @@ fn read_value(
 fn read_step(
     cursor: &mut Cursor<'_>,
     stack: &mut Vec<Builder>,
-    heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
@@ -190,7 +182,7 @@ fn read_step(
                 return finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit);
             }
             // Otherwise read the first key.
-            let key = read_object_key(cursor)?;
+            let key = read_object_key(cursor, gc_heap)?;
             if let Some(Builder::Object { pending_key, .. }) = stack.last_mut() {
                 *pending_key = Some(key);
             }
@@ -198,7 +190,7 @@ fn read_step(
             cursor.expect(b':', "':' after object key")?;
             cursor.skip_ws();
             // Recurse into the value.
-            read_step(cursor, stack, heap, gc_heap, external_visit)
+            read_step(cursor, stack, gc_heap, external_visit)
         }
         b'[' => {
             let array_start = cursor.pos;
@@ -218,9 +210,9 @@ fn read_step(
                 let bytes = cursor.bytes;
                 return finish_builder(frame, stack, bytes, gc_heap, cursor.pos, external_visit);
             }
-            read_step(cursor, stack, heap, gc_heap, external_visit)
+            read_step(cursor, stack, gc_heap, external_visit)
         }
-        b'"' => Ok(Value::String(read_string(cursor, heap)?)),
+        b'"' => Ok(Value::String(read_string(cursor, gc_heap)?)),
         b't' => {
             consume_keyword(cursor, b"true")?;
             Ok(Value::Boolean(true))
@@ -247,7 +239,6 @@ fn continue_container(
     cursor: &mut Cursor<'_>,
     stack: &mut Vec<Builder>,
     just_read: Value,
-    heap: &StringHeap,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, ParseError> {
@@ -268,7 +259,7 @@ fn continue_container(
                     if matches!(cursor.peek(), Some(b']')) {
                         return Err(ParseError::at(cursor.pos, "trailing comma"));
                     }
-                    read_step(cursor, stack, heap, gc_heap, external_visit)
+                    read_step(cursor, stack, gc_heap, external_visit)
                 }
                 Some(b']') => {
                     cursor.pos += 1;
@@ -301,14 +292,14 @@ fn continue_container(
                     if matches!(cursor.peek(), Some(b'}')) {
                         return Err(ParseError::at(cursor.pos, "trailing comma"));
                     }
-                    let key = read_object_key(cursor)?;
+                    let key = read_object_key(cursor, gc_heap)?;
                     if let Some(Builder::Object { pending_key, .. }) = stack.last_mut() {
                         *pending_key = Some(key);
                     }
                     cursor.skip_ws();
                     cursor.expect(b':', "':' after object key")?;
                     cursor.skip_ws();
-                    read_step(cursor, stack, heap, gc_heap, external_visit)
+                    read_step(cursor, stack, gc_heap, external_visit)
                 }
                 Some(b'}') => {
                     cursor.pos += 1;
@@ -408,15 +399,14 @@ fn consume_keyword(cursor: &mut Cursor<'_>, keyword: &[u8]) -> Result<(), ParseE
     Ok(())
 }
 
-fn read_object_key(cursor: &mut Cursor<'_>) -> Result<String, ParseError> {
+fn read_object_key(cursor: &mut Cursor<'_>, heap: &otter_gc::GcHeap) -> Result<String, ParseError> {
     if cursor.peek() != Some(b'"') {
         return Err(ParseError::at(
             cursor.pos,
             "expected '\"' starting object key",
         ));
     }
-    let heap = StringHeap::default();
-    let s = read_string(cursor, &heap)?;
+    let s = read_string(cursor, heap)?;
     Ok(s.to_lossy_string())
 }
 
@@ -501,7 +491,7 @@ fn read_number(cursor: &mut Cursor<'_>) -> Result<NumberValue, ParseError> {
 /// pairs fall back to a WTF-16 builder.
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-json.parse> §25.5.1
-fn read_string(cursor: &mut Cursor<'_>, heap: &StringHeap) -> Result<JsString, ParseError> {
+fn read_string(cursor: &mut Cursor<'_>, heap: &otter_gc::GcHeap) -> Result<JsString, ParseError> {
     debug_assert_eq!(cursor.peek(), Some(b'"'));
     cursor.pos += 1;
     let start = cursor.pos;
@@ -532,7 +522,7 @@ fn read_string(cursor: &mut Cursor<'_>, heap: &StringHeap) -> Result<JsString, P
 fn read_string_with_escapes(
     cursor: &mut Cursor<'_>,
     plain_start: usize,
-    heap: &StringHeap,
+    heap: &otter_gc::GcHeap,
 ) -> Result<JsString, ParseError> {
     // Lift the plain prefix into a UTF-16 buffer. Bytes between
     // `plain_start` and `cursor.pos` are guaranteed ASCII (we'd
@@ -645,14 +635,12 @@ mod tests {
     use super::*;
 
     fn parse_str(s: &str) -> Result<Value, ParseError> {
-        let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        parse(s, &heap, &mut gc_heap)
+        parse(s, &mut gc_heap)
     }
 
     fn parse_str_with_heap(s: &str, gc_heap: &mut otter_gc::GcHeap) -> Result<Value, ParseError> {
-        let heap = StringHeap::default();
-        parse(s, &heap, gc_heap)
+        parse(s, gc_heap)
     }
 
     #[test]

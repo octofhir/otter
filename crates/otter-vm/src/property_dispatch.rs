@@ -125,20 +125,20 @@ impl Interpreter {
             Value::String(_) | Value::Symbol(_) | Value::Number(_) => return Ok(value),
             Value::Boolean(b) => {
                 let s = if *b { "true" } else { "false" };
-                let js = JsString::from_str(s, &self.string_heap)?;
+                let js = JsString::from_str(s, self.gc_heap_mut())?;
                 return Ok(Value::String(js));
             }
             Value::Null => {
-                let js = JsString::from_str("null", &self.string_heap)?;
+                let js = JsString::from_str("null", self.gc_heap_mut())?;
                 return Ok(Value::String(js));
             }
             Value::Undefined | Value::Hole => {
-                let js = JsString::from_str("undefined", &self.string_heap)?;
+                let js = JsString::from_str("undefined", self.gc_heap_mut())?;
                 return Ok(Value::String(js));
             }
             Value::BigInt(b) => {
                 let js =
-                    JsString::from_str(&b.to_decimal_string(&self.gc_heap), &self.string_heap)?;
+                    JsString::from_str(&b.to_decimal_string(&self.gc_heap), self.gc_heap_mut())?;
                 return Ok(Value::String(js));
             }
             _ => {}
@@ -147,15 +147,15 @@ impl Interpreter {
         match key {
             VmPropertyKey::Symbol(sym) => Ok(Value::Symbol(sym)),
             VmPropertyKey::Atom(atom) => {
-                let s = JsString::from_str(atom.name(), &self.string_heap)?;
+                let s = JsString::from_str(atom.name(), self.gc_heap_mut())?;
                 Ok(Value::String(s))
             }
             VmPropertyKey::String(s) => {
-                let s = JsString::from_str(s, &self.string_heap)?;
+                let s = JsString::from_str(s, self.gc_heap_mut())?;
                 Ok(Value::String(s))
             }
             VmPropertyKey::OwnedString(s) => {
-                let s = JsString::from_str(&s, &self.string_heap)?;
+                let s = JsString::from_str(&s, self.gc_heap_mut())?;
                 Ok(Value::String(s))
             }
         }
@@ -172,7 +172,7 @@ impl Interpreter {
             Some(index) => match string.char_code_at(index) {
                 Some(unit) => Ok(Value::String(JsString::from_utf16_units(
                     &[unit],
-                    &self.string_heap,
+                    &self.gc_heap,
                 )?)),
                 None => Ok(Value::Undefined),
             },
@@ -296,7 +296,7 @@ impl Interpreter {
             Value::NativeFunction(native) => {
                 if let Some(name) = key_name.as_deref() {
                     native
-                        .own_property_descriptor(&self.gc_heap, &self.string_heap, name)
+                        .own_property_descriptor(&self.gc_heap, name)
                         .ok()
                         .flatten()
                         .is_some()
@@ -311,15 +311,10 @@ impl Interpreter {
             }
             Value::BoundFunction(bound) => {
                 if let Some(name) = key_name.as_deref() {
-                    function_metadata::bound_own_property_descriptor(
-                        bound,
-                        &self.gc_heap,
-                        &self.string_heap,
-                        name,
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some()
+                    function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)
+                        .ok()
+                        .flatten()
+                        .is_some()
                         || matches!(name, "call" | "apply" | "bind" | "toString")
                 } else {
                     false
@@ -673,7 +668,6 @@ impl Interpreter {
                                         let ctx = function_metadata::FunctionMetadataContext::new(
                                             context,
                                             &self.gc_heap,
-                                            &self.string_heap,
                                             &self.function_user_props,
                                             &self.function_deleted_metadata,
                                         );
@@ -725,7 +719,7 @@ impl Interpreter {
                 self.function_property_get_stack_rooted(context, stack, fid, name)?
             }
             Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, name)? {
+                match native.own_property_descriptor(&self.gc_heap, name)? {
                     Some(desc) => match &desc.kind {
                         object::DescriptorKind::Data { value } => value.clone(),
                         // §10.1.8.1 OrdinaryGet step 7 — accessor
@@ -747,26 +741,27 @@ impl Interpreter {
                         .unwrap_or(Value::Undefined),
                 }
             }
-            Value::BoundFunction(bound) => match function_metadata::bound_own_property_descriptor(
-                bound,
-                &self.gc_heap,
-                &self.string_heap,
-                name,
-            )? {
-                Some(desc) => match &desc.kind {
-                    object::DescriptorKind::Data { value } => value.clone(),
-                    object::DescriptorKind::Accessor { getter, .. } => match getter {
-                        Some(g) if abstract_ops::is_callable(g) => {
-                            self.run_callable_sync(context, g, receiver.clone(), SmallVec::new())?
-                        }
-                        _ => Value::Undefined,
+            Value::BoundFunction(bound) => {
+                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)?
+                {
+                    Some(desc) => match &desc.kind {
+                        object::DescriptorKind::Data { value } => value.clone(),
+                        object::DescriptorKind::Accessor { getter, .. } => match getter {
+                            Some(g) if abstract_ops::is_callable(g) => self.run_callable_sync(
+                                context,
+                                g,
+                                receiver.clone(),
+                                SmallVec::new(),
+                            )?,
+                            _ => Value::Undefined,
+                        },
                     },
-                },
-                None => self
-                    .load_function_prototype_method(name)
-                    .or_else(|| self.load_object_prototype_method(name))
-                    .unwrap_or(Value::Undefined),
-            },
+                    None => self
+                        .load_function_prototype_method(name)
+                        .or_else(|| self.load_object_prototype_method(name))
+                        .unwrap_or(Value::Undefined),
+                }
+            }
             v @ Value::RegExp(_) => {
                 let r = if let Value::RegExp(r) = v {
                     *r
@@ -783,8 +778,7 @@ impl Interpreter {
                 {
                     value
                 } else {
-                    let direct =
-                        regexp_prototype::load_property(&r, &self.gc_heap, name, &self.string_heap);
+                    let direct = regexp_prototype::load_property(&r, &self.gc_heap, name);
                     match direct {
                         Value::Undefined => {
                             self.load_from_constructor_prototype(context, "RegExp", v, name)?
@@ -1101,7 +1095,7 @@ impl Interpreter {
                 }
             }
             Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, name)? {
+                match native.own_property_descriptor(&self.gc_heap, name)? {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -1117,12 +1111,7 @@ impl Interpreter {
                             function_metadata::ordinary_function_metadata_key(name).is_none();
                         let desc =
                             object::PropertyDescriptor::data(value.clone(), true, enumerable, true);
-                        if !native.define_own_property(
-                            &mut self.gc_heap,
-                            &self.string_heap,
-                            name,
-                            desc,
-                        ) {
+                        if !native.define_own_property(&mut self.gc_heap, name, desc) {
                             Self::failed_set_result(
                                 strict,
                                 format!(
@@ -1135,36 +1124,36 @@ impl Interpreter {
                     }
                 }
             }
-            Value::BoundFunction(bound) => match function_metadata::bound_own_property_descriptor(
-                bound,
-                &self.gc_heap,
-                &self.string_heap,
-                name,
-            )? {
-                Some(desc) if !desc.writable() => {
-                    Self::failed_set_result(
-                        strict,
-                        format!("Cannot assign to read-only property '{name}' of bound function"),
-                    )?;
-                    None
-                }
-                _ => {
-                    let desc = object::PropertyDescriptor::data(value.clone(), true, true, true);
-                    if !function_metadata::bound_define_own_property(
-                        bound,
-                        &mut self.gc_heap,
-                        &self.string_heap,
-                        name,
-                        desc,
-                    ) {
+            Value::BoundFunction(bound) => {
+                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)?
+                {
+                    Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
-                            format!("Cannot define property '{name}' on bound function"),
+                            format!(
+                                "Cannot assign to read-only property '{name}' of bound function"
+                            ),
                         )?;
+                        None
                     }
-                    None
+                    _ => {
+                        let desc =
+                            object::PropertyDescriptor::data(value.clone(), true, true, true);
+                        if !function_metadata::bound_define_own_property(
+                            bound,
+                            &mut self.gc_heap,
+                            name,
+                            desc,
+                        ) {
+                            Self::failed_set_result(
+                                strict,
+                                format!("Cannot define property '{name}' on bound function"),
+                            )?;
+                        }
+                        None
+                    }
                 }
-            },
+            }
             Value::Promise(p) => {
                 let bag = if let Some(bag) = p.expando(&self.gc_heap) {
                     bag
@@ -1274,11 +1263,7 @@ impl Interpreter {
                 }
             }
             (Value::NativeFunction(native), Value::String(key)) => {
-                match native.own_property_descriptor(
-                    &self.gc_heap,
-                    &self.string_heap,
-                    &key.to_lossy_string(),
-                )? {
+                match native.own_property_descriptor(&self.gc_heap, &key.to_lossy_string())? {
                     Some(desc) => descriptor_value(&desc),
                     None => Value::Undefined,
                 }
@@ -1287,7 +1272,6 @@ impl Interpreter {
                 match function_metadata::bound_own_property_descriptor(
                     bound,
                     &self.gc_heap,
-                    &self.string_heap,
                     &key.to_lossy_string(),
                 )? {
                     Some(desc) => descriptor_value(&desc),
@@ -1441,8 +1425,7 @@ impl Interpreter {
                 {
                     value
                 } else {
-                    let direct =
-                        regexp_prototype::load_property(r, &self.gc_heap, &name, &self.string_heap);
+                    let direct = regexp_prototype::load_property(r, &self.gc_heap, &name);
                     match direct {
                         Value::Undefined => {
                             self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
@@ -1590,9 +1573,9 @@ impl Interpreter {
                         Some(idx) => match s.char_code_at(idx as u32) {
                             Some(unit) => Value::String(crate::JsString::from_utf16_units(
                                 &[unit],
-                                &self.string_heap,
+                                &self.gc_heap,
                             )?),
-                            None => Value::String(crate::JsString::empty(&self.string_heap)?),
+                            None => Value::String(crate::JsString::empty(self.gc_heap_mut())?),
                         },
                         None => Value::Undefined,
                     },
@@ -1694,7 +1677,7 @@ impl Interpreter {
             // the same descriptor path as `f.name = ...`.
             (Value::NativeFunction(native), Value::String(key)) => {
                 let key = key.to_lossy_string();
-                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, &key)? {
+                match native.own_property_descriptor(&self.gc_heap, &key)? {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -1711,12 +1694,7 @@ impl Interpreter {
                             false,
                             true,
                         );
-                        if !native.define_own_property(
-                            &mut self.gc_heap,
-                            &self.string_heap,
-                            &key,
-                            desc,
-                        ) {
+                        if !native.define_own_property(&mut self.gc_heap, &key, desc) {
                             Self::failed_set_result(
                                 strict,
                                 format!(
@@ -1730,12 +1708,8 @@ impl Interpreter {
             }
             (Value::BoundFunction(bound), Value::String(key)) => {
                 let key = key.to_lossy_string();
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &self.gc_heap,
-                    &self.string_heap,
-                    &key,
-                )? {
+                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, &key)?
+                {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -1754,7 +1728,6 @@ impl Interpreter {
                         if !function_metadata::bound_define_own_property(
                             bound,
                             &mut self.gc_heap,
-                            &self.string_heap,
                             &key,
                             desc,
                         ) {
@@ -2305,12 +2278,7 @@ impl Interpreter {
             return Ok(true);
         }
         if let Value::BoundFunction(bound) = &receiver {
-            match function_metadata::bound_own_property_descriptor(
-                bound,
-                &self.gc_heap,
-                &self.string_heap,
-                name,
-            )? {
+            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
@@ -2391,7 +2359,7 @@ impl Interpreter {
                     object::PropertyLookup::Absent
                 ),
                 Value::NativeFunction(native) => native
-                    .own_property_descriptor(&self.gc_heap, &self.string_heap, name)?
+                    .own_property_descriptor(&self.gc_heap, name)?
                     .is_some(),
                 _ => false,
             };
@@ -2544,12 +2512,7 @@ impl Interpreter {
         }
 
         if let (Value::BoundFunction(bound), Some(key)) = (&receiver, key.string_name()) {
-            match function_metadata::bound_own_property_descriptor(
-                bound,
-                &self.gc_heap,
-                &self.string_heap,
-                key,
-            )? {
+            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, key)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
@@ -2912,7 +2875,7 @@ impl Interpreter {
             let proxy = *p;
             let key_arg = match &key {
                 ComputedPropertyKey::String(key) => {
-                    Value::String(JsString::from_str(key, &self.string_heap)?)
+                    Value::String(JsString::from_str(key, &self.gc_heap)?)
                 }
                 ComputedPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
             };
@@ -3000,12 +2963,7 @@ impl Interpreter {
             return Ok(true);
         }
         if let (Value::BoundFunction(bound), ComputedPropertyKey::String(key)) = (&receiver, &key) {
-            match function_metadata::bound_own_property_descriptor(
-                bound,
-                &self.gc_heap,
-                &self.string_heap,
-                key,
-            )? {
+            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, key)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { setter, .. },
                     ..
@@ -3333,7 +3291,7 @@ impl Interpreter {
                     message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
                 });
             }
-            let key_str = JsString::from_str(name, &self.string_heap)?;
+            let key_str = JsString::from_str(name, self.gc_heap_mut())?;
             let key_vm = VmPropertyKey::atom(atomized_key);
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
@@ -3454,12 +3412,7 @@ impl Interpreter {
             return Ok(true);
         }
         if let Value::BoundFunction(bound) = &receiver {
-            match function_metadata::bound_own_property_descriptor(
-                bound,
-                &self.gc_heap,
-                &self.string_heap,
-                name,
-            )? {
+            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { setter, .. },
                     ..

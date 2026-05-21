@@ -184,7 +184,7 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         });
     }
     let value =
-        crate::binary::dispatch::data_view_call(DataViewMethod::Construct, args, ctx.heap())
+        crate::binary::dispatch::data_view_call(DataViewMethod::Construct, args, ctx.heap_mut())
             .map_err(|e| vm_to_native(e, "DataView"))?;
     // §10.1.13 GetPrototypeFromConstructor — derived `super()`
     // construction forwards `new.target`, so the allocated exotic
@@ -364,26 +364,26 @@ fn install_accessor(
 
 fn dv_get_buffer(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.buffer")?;
-    Ok(Value::ArrayBuffer(view.buffer()))
+    Ok(Value::ArrayBuffer(view.buffer(ctx.heap())))
 }
 
 fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteLength")?;
-    if view.buffer().is_detached(ctx.heap()) {
+    if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
         return Ok(Value::Number(crate::number::NumberValue::from_i32(0)));
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(
-        view.byte_length() as i32,
+        view.byte_length(ctx.heap()) as i32,
     )))
 }
 
 fn dv_get_byte_offset(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteOffset")?;
-    if view.buffer().is_detached(ctx.heap()) {
+    if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
         return Ok(Value::Number(crate::number::NumberValue::from_i32(0)));
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(
-        view.byte_offset() as i32,
+        view.byte_offset(ctx.heap()) as i32,
     )))
 }
 
@@ -392,7 +392,7 @@ fn receiver_dv(
     name: &'static str,
 ) -> Result<crate::binary::data_view::JsDataView, NativeError> {
     match ctx.this_value() {
-        Value::DataView(v) => Ok(v.clone()),
+        Value::DataView(v) => Ok(*v),
         _ => Err(NativeError::TypeError {
             name,
             reason: "this is not a DataView".to_string(),

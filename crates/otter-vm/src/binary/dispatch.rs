@@ -210,7 +210,7 @@ pub fn shared_array_buffer_call_with_roots(
 pub fn data_view_call(
     method: otter_bytecode::method_id::DataViewMethod,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::DataViewMethod as M;
     match method {
@@ -240,11 +240,9 @@ pub fn data_view_call(
                     n
                 }
             };
-            Ok(Value::DataView(JsDataView::new(
-                buffer,
-                byte_offset,
-                byte_length,
-            )))
+            let view =
+                JsDataView::new(gc_heap, buffer, byte_offset, byte_length).map_err(oom_to_vm)?;
+            Ok(Value::DataView(view))
         }
     }
 }

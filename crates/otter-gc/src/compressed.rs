@@ -342,6 +342,26 @@ impl RawGc {
     pub const unsafe fn cast<T: ?Sized>(self) -> Gc<T> {
         unsafe { Gc::from_offset(self.0) }
     }
+
+    /// Read the underlying object's [`crate::header::GcHeader::type_tag`].
+    ///
+    /// Returns `None` for the null offset. Safe in callers because
+    /// every non-null `RawGc` was issued by a successful
+    /// `Cage::alloc_page` and the cage stays mapped for the lifetime
+    /// of the runtime, so the header read is sound by construction.
+    #[inline]
+    #[must_use]
+    pub fn header_type_tag(self) -> Option<u8> {
+        if self.0 == 0 {
+            return None;
+        }
+        let header = self.as_header_ptr();
+        // SAFETY: `self` originates from a successful GC allocation;
+        // the cage remains live for the runtime's lifetime, so
+        // `header` points at an initialised `GcHeader`. Reading the
+        // `type_tag` byte is a plain load with no aliasing concerns.
+        Some(unsafe { (*header).type_tag() })
+    }
 }
 
 impl std::fmt::Debug for RawGc {

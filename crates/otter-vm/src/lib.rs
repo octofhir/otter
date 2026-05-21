@@ -117,6 +117,12 @@ pub mod symbol_prototype;
 pub mod temporal;
 pub mod timers;
 mod value_kind;
+// New 8-byte tagged `Value` foundation (Phase 1.1).
+// Lives alongside the legacy enum during cut-over; once every call site
+// migrates to the accessor surface in [`value::Value`], the enum below
+// disappears and `pub use value::Value as Value` becomes the canonical
+// export. See `docs/architecture-refactor-plan-2026-05.md` §Phase 1.
+pub mod value;
 pub mod weak_refs;
 
 #[cfg(test)]
@@ -181,6 +187,14 @@ pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 pub use timers::{TimerCallbacks, TimerEntry, TimerScheduler, TimerSchedulerHandle};
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
+// Phase 1.1 — eight-byte tagged value. Lives next to the legacy enum
+// during cut-over; re-exported under a distinct name so call sites
+// can opt in incrementally without breaking the workspace. Once every
+// register/call-site/property-slot migrates to the accessor surface
+// in [`value::Value`], the legacy enum below disappears and
+// `pub use value::Value as Value` becomes the canonical export.
+pub use value::{Value as TaggedValue, ValueKind as TaggedValueKind};
+
 pub use runtime_budget::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
 pub use runtime_cx::{NativeCallInfo, NativeCtx};
 
@@ -207,12 +221,19 @@ static_assertions::assert_not_impl_any!(crate::runtime_cx::NativeCtx<'static>: S
 // `RuntimeCx<'rt>` holds `&'rt mut Interpreter`, and `Interpreter`
 // is `!Send + !Sync` per the assertion above.
 
-/// Foundation runtime value.
+/// Legacy 30-variant enum value model.
 ///
-/// Slice 09 introduced `String`; slice 11 adds `Number` and
-/// `Boolean`. Later slices add `Null`, `Object`, etc. The foundation
-/// `Value` is intentionally **not** `Copy` — `JsString` owns an
-/// `Arc` payload.
+/// **This is the migration target.** The 8-byte tagged replacement
+/// lives at [`crate::value::Value`] and is currently re-exported as
+/// `TaggedValue` so call sites can adopt it incrementally. Once every
+/// `Rc`/`Arc`-backed variant payload (Closure / JsString / JsSymbol /
+/// BigInt / JsArrayBuffer / JsDataView / JsTypedArray / JsTemporal /
+/// JsIntl) has been migrated to a `Gc<…>` body, this enum is deleted
+/// and `pub use crate::value::Value;` becomes the canonical export.
+///
+/// See `docs/value-cutover-plan.md` for the ordered migration list and
+/// `docs/architecture-refactor-plan-2026-05.md` §Phase 1 for the
+/// design.
 #[derive(Debug, Clone)]
 pub enum Value {
     /// JS `undefined`.

@@ -1,61 +1,38 @@
-//! GC-managed closure body — replaces the inline `Rc<[UpvalueCell]> +
-//! Option<Box<Value>>` payload of the legacy `Value::Closure` variant.
+//! GC body for closure values.
 //!
-//! A closure on the JS heap is exactly three things:
+//! A closure carries three things:
 //!
 //! - the bytecode function id it executes,
 //! - the captured upvalue spine (one [`crate::UpvalueCell`] per
-//!   captured binding, in declaration order — see
-//!   ECMA-262 §15.2.5 / `Op::MakeClosure`),
-//! - an optional bound `this` (arrow closures lexically capture
-//!   their receiver; non-arrow closures take `this` from the call
-//!   site).
-//!
-//! This module wraps those fields in a single GC body so the value
-//! handle is a 4-byte compressed offset rather than the legacy
-//! inline enum payload that carried an atomic-refcounted slice plus
-//! a heap-boxed `Value`.
+//!   binding, in declaration order),
+//! - an optional bound `this` (arrow closures capture their receiver
+//!   lexically; non-arrow closures take `this` from the call site).
 //!
 //! # Contents
 //!
-//! - [`JsClosureBody`] — fixed-size GC body holding `function_id`,
-//!   an owned upvalue slice, and `bound_this`.
+//! - [`JsClosureBody`] — GC body holding `function_id`, the upvalue
+//!   slice, and `bound_this`.
 //! - [`JsClosure`] — 4-byte `Gc<JsClosureBody>` handle.
-//! - [`alloc_closure`] / [`alloc_closure_with_roots`] — allocation
-//!   helpers that surface pending roots across allocation-triggered
-//!   GC.
+//! - [`alloc_closure`] / [`alloc_closure_with_roots`] — allocators.
 //! - [`JS_CLOSURE_BODY_TYPE_TAG`] — reserved
 //!   [`otter_gc::Traceable::TYPE_TAG`].
 //!
 //! # Invariants
 //!
-//! - The upvalue array is allocated once at closure creation
+//! - Upvalue slice is built once at closure creation
 //!   ([`Op::MakeClosure`](otter_bytecode::Op::MakeClosure)) and never
-//!   resized; mutation flows through
-//!   [`crate::store_upvalue`] / [`crate::read_upvalue`] on the
-//!   individual cells.
-//! - `bound_this == None` means "take `this` from the call site"
-//!   (non-arrow closures); `Some(value)` overrides any caller-supplied
-//!   receiver (arrow closures).
-//! - The trace impl walks every upvalue handle as a `*mut RawGc` slot
-//!   plus the `bound_this` value slots.
-//! - The body is `Box<[UpvalueCell]>` (Rust-owned slice of 4-byte GC
-//!   handles), not a separate GC array. This keeps closure layout
-//!   uniform with [`crate::BoundFunctionBody`] and avoids a second
-//!   allocation per closure.
+//!   resized; per-cell mutation flows through
+//!   [`crate::store_upvalue`] / [`crate::read_upvalue`].
+//! - `bound_this == None` → take `this` from the call site (non-arrow).
+//!   `Some(value)` → override any caller-supplied receiver (arrow).
+//! - Trace walks every upvalue handle plus the `bound_this` value
+//!   slots.
 //!
 //! # Spec
 //!
 //! - ECMA-262 §15.2.5 — closure environment construction.
 //! - ECMA-262 §13.3.6 — `[[Call]]` for ordinary functions / closures.
 //! - ECMA-262 §10.2.1.1 — `[[ThisMode]]` for arrow functions.
-//!
-//! # See also
-//!
-//! - [`crate::value::Value::from_function_gc`] — the eight-byte
-//!   tagged value constructor that packs a [`JsClosure`] handle.
-//! - [`crate::UpvalueCellBody`] — the captured-binding cell.
-//! - `docs/value-cutover-plan.md` step 1.
 
 use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
@@ -67,21 +44,17 @@ use crate::{UpvalueCell, Value};
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`JsClosureBody`].
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
 
-/// GC-allocated payload backing every closure value.
-///
-/// See module docs for the field contract.
+/// GC body backing every closure value.
 #[derive(Debug)]
 pub struct JsClosureBody {
-    /// Index into [`otter_bytecode::BytecodeModule::functions`] —
-    /// the body this closure executes when called.
+    /// Index into [`otter_bytecode::BytecodeModule::functions`].
     pub function_id: u32,
-    /// Captured upvalue spine in declaration order. Built once by
-    /// `Op::MakeClosure`; immutable thereafter (the cells themselves
-    /// are mutable, but the slice is not).
+    /// Captured upvalue spine in declaration order. Per-cell mutation
+    /// flows through [`crate::store_upvalue`] /
+    /// [`crate::read_upvalue`]; the slice itself never resizes.
     pub upvalues: Box<[UpvalueCell]>,
-    /// `Some(this)` for arrow closures — wins over any caller-supplied
-    /// receiver. `None` for non-arrow closures, which take `this`
-    /// from the call site.
+    /// Arrow closures: `Some(this)` overrides the caller's receiver.
+    /// Non-arrow closures: `None` (take `this` from the call site).
     pub bound_this: Option<Value>,
 }
 
@@ -99,25 +72,19 @@ impl otter_gc::SafeTraceable for JsClosureBody {
     }
 }
 
-/// Compressed handle to a [`JsClosureBody`].
-///
-/// `#[repr(transparent)]` over [`otter_gc::Gc<JsClosureBody>`]
-/// (4 bytes, `Copy`). Identity comparison is offset equality —
-/// `c1 == c2` iff they refer to the same body cell, matching JS
-/// `===` semantics for closure values.
+/// 4-byte compressed `Gc<JsClosureBody>` handle. `Copy`. Identity is
+/// offset equality — `c1 == c2` iff they refer to the same body cell
+/// (`===` for closure values). Packs into [`crate::Value`] under
+/// `TAG_PTR_FUNCTION`.
 pub type JsClosure = otter_gc::Gc<JsClosureBody>;
 
-/// Allocate a closure body.
-///
-/// Routes through [`GcHeap::alloc_old`] so the body lives in
-/// old-space (the same policy [`crate::alloc_upvalue`] uses today —
-/// closure bodies hold `UpvalueCell` slots whose scavenger support
-/// arrives in Phase 2).
+/// Allocate a closure body in old-space (consistent with
+/// [`crate::alloc_upvalue`]; the scavenger does not yet rewrite
+/// embedded `UpvalueCell` slots).
 ///
 /// # Errors
 ///
-/// Surfaces [`OutOfMemory`] verbatim; runtime callers translate it
-/// into `VmError::OutOfMemory`.
+/// Surfaces [`OutOfMemory`] verbatim.
 pub fn alloc_closure(
     heap: &mut GcHeap,
     function_id: u32,

@@ -61,18 +61,10 @@ pub const LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG: u8 = 0x2c;
 /// [`SharedArrayBufferBodyGc`].
 pub const SHARED_ARRAY_BUFFER_BODY_TYPE_TAG: u8 = 0x2d;
 
-/// GC-managed migration target for [`LocalBody`].
+/// GC body for non-shared `ArrayBuffer` per ECMA-262 §25.1.
 ///
-/// Diverges from the legacy body in three ways:
-/// - `bytes` is a plain `Vec<u8>` rather than `RefCell<Vec<u8>>` —
-///   mutators flip through [`otter_gc::GcHeap::with_payload`].
-/// - `detached` is a plain `bool` rather than `Cell<bool>`.
-/// - `external` is a plain `Option<ExternalMemory>` rather than
-///   `RefCell<Option<ExternalMemory>>`.
-///
-/// All three changes honour `feedback_no_cell_refcell_leak`. The
-/// `SafeTraceable` impl is a no-op because the body holds no GC
-/// references.
+/// Mutators flip every field through [`otter_gc::GcHeap::with_payload`]
+/// (no interior mutability in GC bodies).
 #[derive(Debug)]
 pub struct LocalArrayBufferBodyGc {
     /// Raw bytes. Empty when detached.
@@ -89,11 +81,13 @@ pub struct LocalArrayBufferBodyGc {
 impl otter_gc::SafeTraceable for LocalArrayBufferBodyGc {
     const TYPE_TAG: u8 = LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {}
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        // No outgoing GC slots — `Vec<u8>` is plain data.
+    }
 }
 
 /// 4-byte compressed GC handle to a [`LocalArrayBufferBodyGc`].
-/// `Copy`.
+/// `Copy`. Packs into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type LocalArrayBufferHandle = otter_gc::Gc<LocalArrayBufferBodyGc>;
 
 /// Allocate a Local `ArrayBuffer` body on the GC heap.
@@ -115,29 +109,27 @@ pub fn alloc_local_array_buffer(
     })
 }
 
-/// GC-managed migration target for the [`SharedBody`] case.
+/// GC body for `SharedArrayBuffer` per ECMA-262 §25.2.
 ///
-/// SharedArrayBuffer storage is genuinely cross-thread (Atomics +
-/// `Mutex<Vec<u8>>`) so the bytes cannot move into the
-/// single-mutator GC cage. The GC body therefore owns the
-/// `Arc<SharedBody>` as plain Rust data; the body's Rust drop
-/// releases the refcount. The trace impl is a no-op (no GC slots).
+/// The bytes stay outside the GC cage because Atomics ops cross
+/// host threads (`Mutex<Vec<u8>>`). The body owns the
+/// `Arc<SharedBody>` as plain Rust data.
 #[derive(Debug)]
 pub struct SharedArrayBufferBodyGc {
-    /// Underlying shared backing store. The `Arc` is the
-    /// cross-thread refcount that survives the GC body's lifetime;
-    /// every clone of the wrapper bumps it.
+    /// Shared backing store. `Arc` survives the GC body's lifetime.
     pub inner: Arc<SharedBody>,
 }
 
 impl otter_gc::SafeTraceable for SharedArrayBufferBodyGc {
     const TYPE_TAG: u8 = SHARED_ARRAY_BUFFER_BODY_TYPE_TAG;
 
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {}
+    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        // Bytes live behind an `Arc` outside the cage.
+    }
 }
 
 /// 4-byte compressed GC handle to a [`SharedArrayBufferBodyGc`].
-/// `Copy`.
+/// `Copy`. Packs into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type SharedArrayBufferHandle = otter_gc::Gc<SharedArrayBufferBodyGc>;
 
 /// Allocate a Shared `ArrayBuffer` body on the GC heap.

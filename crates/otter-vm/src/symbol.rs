@@ -40,23 +40,11 @@ use otter_gc::raw::SlotVisitor;
 
 use crate::string::{JsString, StringError, StringHeap};
 
-/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for the GC-managed
-/// migration target of [`SymbolBody`].
-///
-/// Once the wrapper migrates from `Rc<SymbolBody>` to
-/// `Gc<SymbolBody>`, [`SymbolHandle`] becomes the canonical
-/// identity carrier and the legacy `Rc`-based [`JsSymbol`] retires.
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`SymbolBody`].
 pub const SYMBOL_BODY_TYPE_TAG: u8 = 0x26;
 
-/// 4-byte compressed GC handle to a [`SymbolBody`]. `Copy`.
-///
-/// The legacy wrapper [`JsSymbol`] still routes through
-/// `Rc<SymbolBody>` to keep existing callers compileable while the
-/// migration is staged. New code that needs an identity-bearing
-/// symbol reference packed inside an eight-byte tagged
-/// [`crate::value::Value`] uses this handle through
-/// [`crate::value::Value::symbol_gc`] /
-/// [`crate::value::Value::as_symbol_gc`].
+/// 4-byte compressed GC handle to a [`SymbolBody`]. `Copy`. Packs
+/// into [`crate::value::Value`] under `TAG_PTR_OTHER`.
 pub type SymbolHandle = otter_gc::Gc<SymbolBody>;
 
 /// Allocate a `SymbolBody` on the GC heap.
@@ -80,14 +68,6 @@ pub fn alloc_symbol(
 /// One `Symbol` body — the shared identity bearer. Cloning a
 /// [`JsSymbol`] keeps the same `Rc`, so `ptr_eq` is the truth-bearer
 /// for `===`.
-///
-/// Implements [`otter_gc::SafeTraceable`] so the body can live on the
-/// GC heap via [`SymbolHandle`] alongside the legacy `Rc`-shared
-/// form during the value-model migration. The trace impl is
-/// currently a no-op because `description: Option<JsString>` still
-/// holds an `Arc<StringRepr>` rather than a GC handle; once the
-/// `JsString` wrapper migrates onto the GC heap, this trace will
-/// need to walk the inner `Gc` slot.
 #[derive(Debug)]
 pub struct SymbolBody {
     /// Optional human-readable description, exposed through
@@ -112,12 +92,10 @@ pub struct SymbolBody {
 impl otter_gc::SafeTraceable for SymbolBody {
     const TYPE_TAG: u8 = SYMBOL_BODY_TYPE_TAG;
 
-    /// `description` is still `Arc<StringRepr>` rather than a GC
-    /// handle, so this trace currently yields no slots. Once
-    /// `JsString` migrates to a `Gc<JsStringBody>` storage, this
-    /// must surface the inner handle so the marker visits string
-    /// bodies reachable from live symbols.
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
+        // `description` is an `Arc<StringRepr>` outside the cage; the
+        // GC has no slot to follow.
+    }
 }
 
 /// Heap handle for [`Value::Symbol`].

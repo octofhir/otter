@@ -1,17 +1,10 @@
 //! GC-managed body for [`crate::Value::BigInt`].
 //!
-//! `BigIntBody` is the migration target for the legacy
-//! `BigIntValue { inner: Rc<num_bigint::BigInt> }`. The body holds the
-//! same `num_bigint::BigInt` payload on the GC heap rather than
-//! through an `Rc`, so a tagged `Value(u64)` can store the BigInt as a
-//! 32-bit compressed offset under `TAG_PTR_OTHER`.
-//!
 //! # Contents
 //!
-//! - [`BigIntBody`] — owns the `BigInt` payload directly. `Traceable`
-//!   trace impl is a no-op (no outgoing GC slots).
+//! - [`BigIntBody`] — owns a [`num_bigint::BigInt`] payload directly.
 //! - [`BigIntHandle`] — 4-byte `Gc<BigIntBody>` handle, `Copy`.
-//! - [`alloc_big_int`] — allocator helper routed through
+//! - [`alloc_big_int`] — allocator routed through
 //!   [`otter_gc::GcHeap::alloc_old`].
 //! - [`BIG_INT_BODY_TYPE_TAG`] — reserved
 //!   [`otter_gc::Traceable::TYPE_TAG`].
@@ -19,20 +12,13 @@
 //! # Invariants
 //!
 //! - The `num_bigint::BigInt` payload is `Drop`-managed by the GC
-//!   body's Rust drop — no external refcount.
-//! - `Gc::offset == 0` is reserved (null); never points at a valid
-//!   `BigIntBody`.
-//! - The trace impl emits no slot visits because `BigInt` carries no
-//!   GC handles.
+//!   body's Rust drop.
+//! - `Gc::offset == 0` is reserved as null.
+//! - Trace impl is empty: `BigInt` holds no GC references.
 //!
 //! # Spec
 //!
-//! - ECMA-262 §6.1.6.2 The BigInt Type.
-//!
-//! # See also
-//!
-//! - [`crate::value::Value::big_int_gc`] — tagged-value constructor.
-//! - `docs/value-cutover-plan.md` step 4.
+//! - ECMA-262 §6.1.6.2 — The BigInt Type.
 
 use num_bigint::BigInt;
 
@@ -46,10 +32,7 @@ pub const BIG_INT_BODY_TYPE_TAG: u8 = 0x25;
 /// GC-allocated payload backing every `Value::BigInt`.
 #[derive(Debug, Clone)]
 pub struct BigIntBody {
-    /// Underlying arbitrary-precision integer. `num_bigint::BigInt`
-    /// is `Send`/`Sync` and `Drop`-managed; storing it inline in a
-    /// GC body means the body's Rust drop frees the digit limbs
-    /// when the cell is swept.
+    /// Underlying arbitrary-precision integer.
     pub inner: BigInt,
 }
 
@@ -65,15 +48,13 @@ pub type BigIntHandle = otter_gc::Gc<BigIntBody>;
 
 /// Allocate a BigInt body on the GC heap.
 ///
-/// Routes through [`GcHeap::alloc_old`]: bigint bodies hold a Rust
-/// `num_bigint::BigInt` (a `Vec<BigDigit>` indirection) and gain no
-/// benefit from young-space allocation since the payload is already
-/// out-of-line.
+/// Routes through [`GcHeap::alloc_old`]; the `Vec<BigDigit>` limb
+/// storage is already out-of-line so young-space allocation gives no
+/// locality benefit.
 ///
 /// # Errors
 ///
-/// Surfaces [`OutOfMemory`] verbatim; runtime callers translate it
-/// into `VmError::OutOfMemory`.
+/// Surfaces [`OutOfMemory`] verbatim.
 pub fn alloc_big_int(heap: &mut GcHeap, value: BigInt) -> Result<BigIntHandle, OutOfMemory> {
     heap.alloc_old(BigIntBody { inner: value })
 }

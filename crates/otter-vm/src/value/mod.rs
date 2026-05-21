@@ -126,19 +126,19 @@ pub enum ObjectFamilyKind {
     Generator,
     /// RegExp body.
     RegExp,
-    /// Temporal body (GC-managed migration target).
+    /// Temporal body.
     Temporal,
-    /// Intl body (GC-managed migration target).
+    /// Intl body.
     Intl,
-    /// Proxy body (GC-managed migration target).
+    /// Proxy body.
     Proxy,
-    /// DataView body (GC-managed migration target).
+    /// DataView body.
     DataView,
-    /// TypedArray body (GC-managed migration target).
+    /// TypedArray body.
     TypedArray,
-    /// Non-shared `ArrayBuffer` body (GC-managed migration target).
+    /// Non-shared `ArrayBuffer` body.
     LocalArrayBuffer,
-    /// `SharedArrayBuffer` body (GC-managed migration target).
+    /// `SharedArrayBuffer` body.
     SharedArrayBuffer,
     /// Tag matched `TAG_PTR_OBJECT` but the body type tag is not
     /// one of the families above. Indicates a future body kind or
@@ -460,94 +460,72 @@ impl Value {
         Self::from_object_gc(p.raw())
     }
 
-    /// GC-managed string body handle. This is the migration-target
-    /// constructor — the legacy `Arc<StringRepr>`-backed `JsString`
-    /// wrapper still flows through `Value::from_string_gc` today, but
-    /// once the wrapper itself moves to `Gc<JsStringBody>`,
-    /// `Value::string` will replace this entry point.
-    ///
-    /// See `docs/value-cutover-plan.md` step 2.
+    /// String value. Packs the [`JsStringHandle`] under `TAG_PTR_STRING`.
     #[inline]
     #[must_use]
     pub fn string_gc(s: JsStringHandle) -> Self {
         Self(pack(TAG_PTR_STRING, s.offset() as u64))
     }
 
-    /// GC-managed BigInt body handle. Migration target for the
-    /// legacy `BigIntValue { inner: Rc<BigInt> }` wrapper.
-    /// See `docs/value-cutover-plan.md` step 4.
+    /// BigInt value. Packs the [`BigIntHandle`] under `TAG_PTR_OTHER`.
     #[inline]
     #[must_use]
     pub fn big_int_gc(b: BigIntHandle) -> Self {
         Self(pack(TAG_PTR_OTHER, b.offset() as u64))
     }
 
-    /// GC-managed Symbol body handle. Migration target for the
-    /// legacy `JsSymbol { body: Rc<SymbolBody> }` wrapper.
-    /// See `docs/value-cutover-plan.md` step 3.
+    /// Symbol value. Packs the [`SymbolHandle`] under `TAG_PTR_OTHER`.
     #[inline]
     #[must_use]
     pub fn symbol_gc(s: SymbolHandle) -> Self {
         Self(pack(TAG_PTR_OTHER, s.offset() as u64))
     }
 
-    /// GC-managed Temporal body handle. Migration target for the
-    /// legacy `JsTemporal { inner: Rc<TemporalPayload> }` wrapper.
-    /// Packs under `TAG_PTR_OBJECT` because `Temporal.*` instances
-    /// are object-shaped per ECMA-262 / Temporal proposal §8.
+    /// `Temporal.*` value. Object-shaped per Temporal proposal §8.
     #[inline]
     #[must_use]
     pub fn temporal_gc(t: TemporalHandle) -> Self {
         Self::from_object_gc(t.raw())
     }
 
-    /// GC-managed Intl body handle. Migration target for the
-    /// legacy `JsIntl { inner: Rc<IntlPayload> }` wrapper.
-    /// Packs under `TAG_PTR_OBJECT` because `Intl.*` instances are
-    /// object-shaped per ECMA-402.
+    /// `Intl.*` value. Object-shaped per ECMA-402.
     #[inline]
     #[must_use]
     pub fn intl_gc(i: IntlHandle) -> Self {
         Self::from_object_gc(i.raw())
     }
 
-    /// GC-managed Proxy body handle. Migration target for the
-    /// legacy `JsProxy { inner: Rc<ProxyBody> }` wrapper.
-    /// See `docs/value-cutover-plan.md` step 5.
+    /// `Proxy` value per ECMA-262 §28.2.
     #[inline]
     #[must_use]
     pub fn proxy_gc(p: ProxyHandle) -> Self {
         Self::from_object_gc(p.raw())
     }
 
-    /// GC-managed DataView body handle. Migration target for the
-    /// legacy `JsDataView { inner: Rc<DataViewBody> }` wrapper.
+    /// `DataView` value per ECMA-262 §25.3.
     #[inline]
     #[must_use]
     pub fn data_view_gc(v: DataViewHandle) -> Self {
         Self::from_object_gc(v.raw())
     }
 
-    /// GC-managed TypedArray body handle. Migration target for the
-    /// legacy `JsTypedArray { inner: Rc<TypedArrayBody> }` wrapper.
+    /// `TypedArray` value per ECMA-262 §23.2.
     #[inline]
     #[must_use]
     pub fn typed_array_gc(t: TypedArrayHandle) -> Self {
         Self::from_object_gc(t.raw())
     }
 
-    /// GC-managed non-shared `ArrayBuffer` body handle. Migration
-    /// target for the legacy `BufferStorage::Local(Rc<LocalBody>)`
-    /// case.
+    /// Non-shared `ArrayBuffer` value per ECMA-262 §25.1.
     #[inline]
     #[must_use]
     pub fn local_array_buffer_gc(b: LocalArrayBufferHandle) -> Self {
         Self::from_object_gc(b.raw())
     }
 
-    /// GC-managed `SharedArrayBuffer` body handle. The body wraps an
-    /// `Arc<SharedBody>` (cross-thread bytes stay outside the GC
-    /// cage); the GC body's Rust drop releases the refcount.
+    /// `SharedArrayBuffer` value per ECMA-262 §25.2. The body owns
+    /// an `Arc<SharedBody>` so the cross-thread bytes stay outside
+    /// the single-mutator GC cage.
     #[inline]
     #[must_use]
     pub fn shared_array_buffer_gc(b: SharedArrayBufferHandle) -> Self {
@@ -1039,18 +1017,10 @@ impl Value {
     // Spec coercions that need no heap access.
     // -----------------------------------------------------------------------
 
-    /// ECMA-262 §13.5.3 `typeof` for the part of the value model that
-    /// is decidable without a heap read.
-    ///
-    /// Callable wrappers (closure / bound / native / class) return
-    /// `Some("function")` directly. Ordinary object-like references
-    /// return `Some("object")` *unless* the body is callable — i.e.
-    /// an ordinary `JsObject` carrying a native `[[Call]]` slot
-    /// reports `"function"` per §7.2.3 IsCallable. That callable-
-    /// object check requires reading object internal slots, so the
-    /// accessor returns [`None`] there and the caller hops to the
-    /// heap-aware path. Same for string / symbol / bigint: those
-    /// still need heap-side migration (see `to_boolean_pure`).
+    /// ECMA-262 §13.5.3 `typeof` for cases decidable without a heap
+    /// read. Returns `None` for ordinary `JsObject` (a native
+    /// `[[Call]]` slot would surface as `"function"` per §7.2.3
+    /// IsCallable) and `TAG_PTR_OTHER` (Symbol vs BigInt body tag).
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-typeof-operator>
@@ -1095,14 +1065,10 @@ impl Value {
         }
     }
 
-    /// ECMA-262 §7.1.2 ToBoolean for the part of the value model that
-    /// is decidable without a heap read.
-    ///
-    /// Cases that need a heap to consult the payload (string emptiness,
-    /// BigInt zero check) return [`None`] so the caller can hop to the
-    /// legacy heap-aware coercion path. Once the string / bigint /
-    /// symbol primitives migrate off `Rc`/`Arc` into GC bodies, this
-    /// helper resolves them inline and the heap-aware path retires.
+    /// ECMA-262 §7.1.2 ToBoolean for cases decidable without a heap
+    /// read. Returns `None` for `TAG_PTR_STRING` (length probe needed)
+    /// and `TAG_PTR_OTHER` (BigInt zero / Symbol always-true) — the
+    /// caller threads a heap and inspects the body.
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-toboolean>
@@ -1121,15 +1087,10 @@ impl Value {
                 NumberValue::Double(d) => !(d.is_nan() || d == 0.0),
             });
         }
-        // Callables, object-like references, function-id immediates:
-        // always truthy per ECMA-262 §7.1.2 step 6/7.
+        // §7.1.2 steps 6/7 — callables and ordinary objects are truthy.
         if self.is_callable() || self.is_object_like() {
             return Some(true);
         }
-        // TAG_PTR_STRING / TAG_PTR_OTHER (symbol, bigint) require a
-        // heap-aware coercion until those primitives migrate to a GC
-        // body whose payload (length / zero) is readable through the
-        // tagged value directly.
         None
     }
 
@@ -1189,10 +1150,7 @@ impl Value {
         self.as_raw_gc()?.checked_cast::<BigIntBody>()
     }
 
-    /// `true` when the value is a GC-managed BigInt body. (The
-    /// legacy `Rc`-backed `BigIntValue` payload does not register
-    /// here; once the wrapper migrates, every BigInt value uses
-    /// this predicate.)
+    /// `true` when the value points at a [`BigIntBody`].
     #[inline]
     #[must_use]
     pub fn is_big_int_gc(self) -> bool {

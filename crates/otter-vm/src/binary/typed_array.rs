@@ -363,19 +363,13 @@ fn value_to_biguint64(value: &Value) -> u64 {
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`TypedArrayBodyGc`].
 pub const TYPED_ARRAY_BODY_TYPE_TAG: u8 = 0x2b;
 
-/// GC-managed migration target for [`TypedArrayBody`].
+/// GC body for `Value::TypedArray` per ECMA-262 §23.2.
 ///
-/// Diverges from the legacy body in one way: `expando` is a plain
-/// `Option<JsObject>` rather than `Cell<Option<JsObject>>`. Lazy
-/// creation flips it through [`otter_gc::GcHeap::with_payload`],
-/// honouring the project-wide rule against `Cell`/`RefCell` inside
-/// GC bodies. The trace impl walks `expando` when present so the
-/// marker reaches non-element own properties; once the backing
-/// `JsArrayBuffer` migrates onto a GC body, the trace must also
-/// yield the buffer handle.
+/// Mutators flip `expando` through [`otter_gc::GcHeap::with_payload`]
+/// (no interior mutability in GC bodies).
 #[derive(Debug)]
 pub struct TypedArrayBodyGc {
-    /// Backing buffer (still `Rc`/`Arc`-based).
+    /// Backing buffer.
     pub buffer: JsArrayBuffer,
     /// Element-type kind.
     pub kind: TypedArrayKind,
@@ -401,6 +395,7 @@ impl otter_gc::SafeTraceable for TypedArrayBodyGc {
 }
 
 /// 4-byte compressed GC handle to a [`TypedArrayBodyGc`]. `Copy`.
+/// Packs into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type TypedArrayHandle = otter_gc::Gc<TypedArrayBodyGc>;
 
 /// Allocate a TypedArray body on the GC heap.

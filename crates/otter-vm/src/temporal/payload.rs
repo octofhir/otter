@@ -105,24 +105,23 @@ impl TemporalKind {
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`TemporalBody`].
 pub const TEMPORAL_BODY_TYPE_TAG: u8 = 0x27;
 
-/// GC-managed body for [`crate::Value::Temporal`] — migration target
-/// for the legacy `JsTemporal { inner: Rc<TemporalPayload> }` wrapper.
+/// GC body holding a Temporal value's [`TemporalPayload`].
 #[derive(Debug, Clone)]
 pub struct TemporalBody {
-    /// The variant-typed Temporal payload (Instant / Duration /
-    /// PlainDate / PlainTime / PlainDateTime).
+    /// Variant-typed Temporal payload.
     pub payload: TemporalPayload,
 }
 
 impl otter_gc::SafeTraceable for TemporalBody {
     const TYPE_TAG: u8 = TEMPORAL_BODY_TYPE_TAG;
 
-    /// No outgoing GC slots — every Temporal variant wraps
-    /// `temporal_rs::*` plain numeric data with no GC references.
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
+        // `temporal_rs::*` records hold no GC references.
+    }
 }
 
-/// 4-byte compressed GC handle to a [`TemporalBody`]. `Copy`.
+/// 4-byte compressed GC handle to a [`TemporalBody`]. `Copy`. Packs
+/// into [`crate::Value`] under `TAG_PTR_OBJECT`.
 pub type TemporalHandle = otter_gc::Gc<TemporalBody>;
 
 /// Allocate a Temporal body on the GC heap.

@@ -32,21 +32,16 @@ use otter_gc::raw::SlotVisitor;
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ProxyBodyGc`].
 pub const PROXY_BODY_TYPE_TAG: u8 = 0x29;
 
-/// GC-managed migration target for [`ProxyBody`].
+/// GC body for [`crate::Value::Proxy`].
 ///
-/// Diverges from the legacy `ProxyBody` in two ways:
-/// - The `revoked` flag is a plain `bool` rather than `Cell<bool>`;
-///   mutators flip it through [`otter_gc::GcHeap::with_payload`],
-///   honouring the project-wide rule that GC bodies must not embed
-///   `Cell`/`RefCell` (see `feedback_no_cell_refcell_leak`).
-/// - `target` / `handler` live as direct [`Value`] fields, traced
-///   by the [`otter_gc::SafeTraceable`] impl below.
+/// Mutators flip `revoked` through [`otter_gc::GcHeap::with_payload`]
+/// (no interior mutability in GC bodies).
 #[derive(Debug)]
 pub struct ProxyBodyGc {
-    /// Target value every trap-less operation falls through to.
-    /// Spec accepts any object, including callables.
+    /// Target value trap-less operations fall through to. ECMA-262
+    /// §28.2 accepts any object, including callables.
     pub target: Value,
-    /// Handler object trap properties live on.
+    /// Handler object — trap properties live here.
     pub handler: Value,
     /// `true` once `Proxy.revocable().revoke()` has fired.
     pub revoked: bool,
@@ -66,8 +61,8 @@ pub type ProxyHandle = otter_gc::Gc<ProxyBodyGc>;
 
 /// Allocate a Proxy body on the GC heap.
 ///
-/// The body lives in old-space because proxies hold `Value` slots
-/// that the scavenger does not yet rewrite.
+/// Lives in old-space because the scavenger does not yet rewrite
+/// embedded `Value` slots.
 ///
 /// # Errors
 ///

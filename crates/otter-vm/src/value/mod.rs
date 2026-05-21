@@ -55,6 +55,7 @@ use crate::native_function::NativeFunctionBody;
 use crate::object::{JsObject, ObjectBody};
 use crate::promise::{JsPromiseHandle, PurePromise, PurePromiseBody};
 use crate::regexp::{JsRegExp, JsRegExpBody};
+use crate::string::{JsStringBody, JsStringHandle};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
 use crate::{
     BoundFunction, BoundFunctionBody, ClassConstructor, ClassConstructorBody, IteratorHandle,
@@ -369,6 +370,19 @@ impl Value {
     #[must_use]
     pub fn promise(p: JsPromiseHandle) -> Self {
         Self::from_object_gc(p.raw())
+    }
+
+    /// GC-managed string body handle. This is the migration-target
+    /// constructor — the legacy `Arc<StringRepr>`-backed `JsString`
+    /// wrapper still flows through `Value::from_string_gc` today, but
+    /// once the wrapper itself moves to `Gc<JsStringBody>`,
+    /// `Value::string` will replace this entry point.
+    ///
+    /// See `docs/value-cutover-plan.md` step 2.
+    #[inline]
+    #[must_use]
+    pub fn string_gc(s: JsStringHandle) -> Self {
+        Self(pack(TAG_PTR_STRING, s.offset() as u64))
     }
 
     /// Recover a closure handle when this value carries one.
@@ -985,6 +999,16 @@ impl Value {
         let gc = self.as_raw_gc()?.checked_cast::<PurePromiseBody>()?;
         Some(JsPromiseHandle::from_pure(PurePromise::from_gc(gc)))
     }
+
+    /// GC-managed string body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_string_gc(self) -> Option<JsStringHandle> {
+        if top_tag(self.0) != TAG_PTR_STRING {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<JsStringBody>()
+    }
 }
 
 /// Default to `undefined`.
@@ -1144,6 +1168,29 @@ mod tests {
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
         assert_eq!(v.as_closure(), None);
+    }
+
+    #[test]
+    fn string_gc_round_trip_via_real_heap() {
+        use crate::string::{JsStringId, alloc_flat_string_body_with_roots};
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let units = [b'a' as u16, b'b' as u16, b'c' as u16];
+        let body =
+            alloc_flat_string_body_with_roots(&mut heap, JsStringId::new(1), &units, &mut roots)
+                .expect("string");
+        let v = Value::string_gc(body);
+        assert!(v.is_string());
+        assert_eq!(v.kind(), ValueKind::PtrString);
+        assert_eq!(v.as_string_gc(), Some(body));
+        // String must not collapse into object-family or callable-family.
+        assert_eq!(v.as_object(), None);
+        assert_eq!(v.as_closure(), None);
+        // Typeof reads purely from the tag.
+        assert_eq!(v.typeof_pure(), Some("string"));
     }
 
     #[test]

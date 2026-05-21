@@ -856,6 +856,62 @@ impl Value {
     // Spec coercions that need no heap access.
     // -----------------------------------------------------------------------
 
+    /// ECMA-262 §13.5.3 `typeof` for the part of the value model that
+    /// is decidable without a heap read.
+    ///
+    /// Callable wrappers (closure / bound / native / class) return
+    /// `Some("function")` directly. Ordinary object-like references
+    /// return `Some("object")` *unless* the body is callable — i.e.
+    /// an ordinary `JsObject` carrying a native `[[Call]]` slot
+    /// reports `"function"` per §7.2.3 IsCallable. That callable-
+    /// object check requires reading object internal slots, so the
+    /// accessor returns [`None`] there and the caller hops to the
+    /// heap-aware path. Same for string / symbol / bigint: those
+    /// still need heap-side migration (see `to_boolean_pure`).
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-typeof-operator>
+    #[inline]
+    #[must_use]
+    pub fn typeof_pure(self) -> Option<&'static str> {
+        if self.is_undefined() || self.is_hole() {
+            return Some("undefined");
+        }
+        if self.is_null() {
+            return Some("object");
+        }
+        if self.is_boolean() {
+            return Some("boolean");
+        }
+        if self.is_number() {
+            return Some("number");
+        }
+        if self.is_callable() {
+            return Some("function");
+        }
+        // Object-family pointer: typeof is "object" for the body kinds
+        // we control (array / map / set / promise / regexp / iterator /
+        // generator / weak* / finalization registry / typed views /
+        // temporal / intl) — none of those declare a hidden callable
+        // slot today. Plain `JsObject` may carry a `[[Call]]` slot and
+        // must surface as "function"; signal `None` for that case so
+        // the caller hops to `typeof_with_heap`.
+        match self.kind() {
+            ValueKind::PtrObject => {
+                if self.is_object() {
+                    // Plain object — caller must check `[[Call]]`.
+                    None
+                } else {
+                    Some("object")
+                }
+            }
+            // String / Other still need heap-side primitives.
+            ValueKind::PtrString => Some("string"),
+            ValueKind::PtrOther => None,
+            _ => None,
+        }
+    }
+
     /// ECMA-262 §7.1.2 ToBoolean for the part of the value model that
     /// is decidable without a heap read.
     ///
@@ -1088,6 +1144,24 @@ mod tests {
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
         assert_eq!(v.as_closure(), None);
+    }
+
+    #[test]
+    fn typeof_pure_returns_spec_strings_for_decidable_kinds() {
+        assert_eq!(Value::undefined().typeof_pure(), Some("undefined"));
+        assert_eq!(Value::hole().typeof_pure(), Some("undefined"));
+        assert_eq!(Value::null().typeof_pure(), Some("object"));
+        assert_eq!(Value::boolean(true).typeof_pure(), Some("boolean"));
+        assert_eq!(Value::number_i32(0).typeof_pure(), Some("number"));
+        assert_eq!(Value::number_f64(f64::NAN).typeof_pure(), Some("number"));
+        assert_eq!(Value::function_id(0).typeof_pure(), Some("function"));
+
+        let raw = otter_gc::raw::RawGc(1);
+        assert_eq!(Value::from_function_gc(raw).typeof_pure(), Some("function"));
+        // String is reachable purely from the tag.
+        assert_eq!(Value::from_string_gc(raw).typeof_pure(), Some("string"));
+        // Other (symbol / bigint) needs heap-side primitives.
+        assert_eq!(Value::from_other_gc(raw).typeof_pure(), None);
     }
 
     #[test]

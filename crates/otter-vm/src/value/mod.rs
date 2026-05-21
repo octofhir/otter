@@ -48,6 +48,7 @@
 pub mod tag;
 
 use crate::array::{ArrayBody, JsArray};
+use crate::bigint::{BigIntBody, BigIntHandle};
 use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
 use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
 use crate::generator::{GeneratorBody, JsGenerator};
@@ -383,6 +384,15 @@ impl Value {
     #[must_use]
     pub fn string_gc(s: JsStringHandle) -> Self {
         Self(pack(TAG_PTR_STRING, s.offset() as u64))
+    }
+
+    /// GC-managed BigInt body handle. Migration target for the
+    /// legacy `BigIntValue { inner: Rc<BigInt> }` wrapper.
+    /// See `docs/value-cutover-plan.md` step 4.
+    #[inline]
+    #[must_use]
+    pub fn big_int_gc(b: BigIntHandle) -> Self {
+        Self(pack(TAG_PTR_OTHER, b.offset() as u64))
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1009,6 +1019,28 @@ impl Value {
         }
         self.as_raw_gc()?.checked_cast::<JsStringBody>()
     }
+
+    /// GC-managed BigInt body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_big_int_gc(self) -> Option<BigIntHandle> {
+        if top_tag(self.0) != TAG_PTR_OTHER {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<BigIntBody>()
+    }
+
+    /// `true` when the value is a GC-managed BigInt body. (The
+    /// legacy `Rc`-backed `BigIntValue` payload does not register
+    /// here; once the wrapper migrates, every BigInt value uses
+    /// this predicate.)
+    #[inline]
+    #[must_use]
+    pub fn is_big_int_gc(self) -> bool {
+        top_tag(self.0) == TAG_PTR_OTHER
+            && self.read_gc_type_tag()
+                == Some(<BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
 }
 
 /// Default to `undefined`.
@@ -1168,6 +1200,28 @@ mod tests {
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
         assert_eq!(v.as_closure(), None);
+    }
+
+    #[test]
+    fn big_int_gc_round_trip_via_real_heap() {
+        use crate::bigint::alloc_big_int;
+        use num_bigint::BigInt;
+        use otter_gc::GcHeap;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let payload = BigInt::from(2_i128.pow(70));
+        let handle = alloc_big_int(&mut heap, payload.clone()).expect("alloc");
+        let v = Value::big_int_gc(handle);
+        assert!(v.is_other_primitive());
+        assert!(v.is_big_int_gc());
+        assert_eq!(v.kind(), ValueKind::PtrOther);
+        assert_eq!(v.as_big_int_gc(), Some(handle));
+        // Not a string, not callable, not object-like.
+        assert_eq!(v.as_string_gc(), None);
+        assert!(!v.is_callable());
+        assert!(!v.is_object_like());
+        // Payload survives round-trip.
+        heap.read_payload(handle, |body| assert_eq!(body.inner, payload));
     }
 
     #[test]

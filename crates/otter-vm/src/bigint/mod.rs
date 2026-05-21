@@ -33,8 +33,11 @@ use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 
 pub mod dispatch;
+pub mod gc_body;
 pub mod ops;
 pub mod prototype;
+
+pub use gc_body::{BIG_INT_BODY_TYPE_TAG, BigIntBody, BigIntHandle, alloc_big_int};
 
 /// Heap-shared arbitrary-precision integer. Cheap to clone.
 #[derive(Debug, Clone)]

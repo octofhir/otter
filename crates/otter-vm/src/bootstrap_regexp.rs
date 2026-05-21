@@ -557,6 +557,12 @@ fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 /// who call through `Function.prototype.call` / property reads.
 fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let re = receiver_regexp(ctx, "RegExp.prototype.compile")?;
+    if re.prototype_override(ctx.heap()).is_some() {
+        return Err(NativeError::TypeError {
+            name: "RegExp.prototype.compile",
+            reason: "cannot compile a RegExp subclass instance".to_string(),
+        });
+    }
     let pattern_raw = args.first().cloned().unwrap_or(Value::Undefined);
     let flags_raw = args.get(1).cloned().unwrap_or(Value::Undefined);
     let (pattern_units, flags_str) = match pattern_raw {
@@ -571,47 +577,63 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             let heap = ctx.heap();
             (other.pattern_utf16(heap), other.flags(heap).to_js_string())
         }
-        Value::Undefined => (
-            Vec::<u16>::new(),
-            value_to_text(&flags_raw, "RegExp.prototype.compile")?,
-        ),
-        ref other => {
-            let pattern_str = value_to_text(other, "RegExp.prototype.compile")?;
-            let pattern_units: Vec<u16> = pattern_str.encode_utf16().collect();
-            let flags_text = value_to_text(&flags_raw, "RegExp.prototype.compile")?;
-            (pattern_units, flags_text)
+        Value::Undefined => {
+            let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
+            (Vec::<u16>::new(), flags_text)
+        }
+        other => {
+            let pattern = crate::regexp_prototype::coerce_to_jsstring_runtime(
+                ctx,
+                &other,
+                "RegExp.prototype.compile",
+            )?;
+            let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
+            (pattern.to_utf16_vec(), flags_text)
         }
     };
+    let old_last_index = re.last_index_value(ctx.heap());
     re.reinitialize(ctx.heap_mut(), &pattern_units, &flags_str)
-        .map_err(|err| NativeError::TypeError {
+        .map_err(regexp_error_to_syntax_error)?;
+    if !re.last_index_writable(ctx.heap()) {
+        re.set_last_index_value(ctx.heap_mut(), old_last_index);
+        return Err(NativeError::TypeError {
             name: "RegExp.prototype.compile",
-            reason: match err {
-                crate::regexp::RegExpError::InvalidPattern { message } => {
-                    format!("invalid regular expression: {message}")
-                }
-                _ => "invalid regular expression flag".to_string(),
-            },
-        })?;
+            reason: "Cannot assign to read only property 'lastIndex'".to_string(),
+        });
+    }
     Ok(Value::RegExp(re))
 }
 
-fn value_to_text(value: &Value, name: &'static str) -> Result<String, NativeError> {
-    Ok(match value {
-        Value::String(s) => s.to_lossy_string(),
-        Value::Undefined => "undefined".to_string(),
-        Value::Null => "null".to_string(),
-        Value::Boolean(true) => "true".to_string(),
-        Value::Boolean(false) => "false".to_string(),
-        Value::Number(n) => n.to_display_string(),
-        Value::BigInt(b) => b.to_decimal_string(),
-        Value::Symbol(_) => {
-            return Err(NativeError::TypeError {
-                name,
-                reason: "cannot convert a Symbol to a string".to_string(),
-            });
-        }
-        other => other.display_string(),
-    })
+fn compile_flags_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
+    if matches!(value, Value::Undefined) {
+        return Ok(String::new());
+    }
+    Ok(
+        crate::regexp_prototype::coerce_to_jsstring_runtime(
+            ctx,
+            value,
+            "RegExp.prototype.compile",
+        )?
+        .to_lossy_string(),
+    )
+}
+
+fn regexp_error_to_syntax_error(err: crate::regexp::RegExpError) -> NativeError {
+    NativeError::SyntaxError {
+        name: "RegExp.prototype.compile",
+        reason: match err {
+            crate::regexp::RegExpError::InvalidPattern { message } => {
+                format!("invalid regular expression: {message}")
+            }
+            crate::regexp::RegExpError::InvalidFlag { flag } => {
+                format!("invalid regular expression flag `{flag}`")
+            }
+            crate::regexp::RegExpError::DuplicateFlag { flag } => {
+                format!("duplicate regular expression flag `{flag}`")
+            }
+            crate::regexp::RegExpError::OutOfMemory => "out of memory".to_string(),
+        },
+    }
 }
 
 fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

@@ -1942,3 +1942,31 @@ Delta: +18 passing tests. Focused checks:
 
 - `built-ins/RegExp/from-regexp-like`: 6 pass / 0 fail
 - `built-ins/RegExp/call_with`: 3 pass / 0 fail
+
+### RegExp.prototype.compile
+
+Command:
+
+```sh
+target/debug/otter-test262 run \
+  --filter built-ins/RegExp \
+  --timeout 5000 \
+  --output test262_results/loop/regexp-after-compile-fix.json
+```
+
+Before:
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1962 | 1127 | 140 | 689 | 6 | 0 | 0 | 88.53% |
+
+After routing `RegExp.prototype.compile` through the native runtime
+method path instead of the no-context intrinsic fast path:
+
+| total | passed | failed | skipped | timeout | OOM | crash | pass rate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1962 | 1138 | 129 | 689 | 6 | 0 | 0 | 89.40% |
+
+Delta: +11 passing tests. Focused check:
+
+- `annexB/built-ins/RegExp/prototype/compile`: 21 pass / 0 fail / 2 skip

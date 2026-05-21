@@ -326,6 +326,16 @@ impl JsRegExp {
         self.inner.raw()
     }
 
+    /// Reinterpret a body handle as the public [`JsRegExp`] wrapper.
+    /// Used by [`crate::value::Value::as_regexp`] after a
+    /// `GcHeader::type_tag` check has confirmed the body is a
+    /// [`JsRegExpBody`].
+    #[inline]
+    #[must_use]
+    pub fn from_gc(inner: otter_gc::Gc<JsRegExpBody>) -> Self {
+        Self { inner }
+    }
+
     /// Run the compiled engine from a UTF-16 offset and collect
     /// owned matches. Bounded by [`REGEX_BACKTRACK_BUDGET`] so
     /// pathological ReDoS patterns abort with no matches instead of

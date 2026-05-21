@@ -50,8 +50,11 @@ pub mod tag;
 use crate::array::{ArrayBody, JsArray};
 use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
 use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
+use crate::generator::{GeneratorBody, JsGenerator};
 use crate::native_function::NativeFunctionBody;
 use crate::object::{JsObject, ObjectBody};
+use crate::promise::{JsPromiseHandle, PurePromise, PurePromiseBody};
+use crate::regexp::{JsRegExp, JsRegExpBody};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
 use crate::{
     BoundFunction, BoundFunctionBody, ClassConstructor, ClassConstructorBody, IteratorHandle,
@@ -341,6 +344,31 @@ impl Value {
     #[must_use]
     pub fn iterator(i: IteratorHandle) -> Self {
         Self::from_object_gc(i.raw())
+    }
+
+    /// Generator handle.
+    #[inline]
+    #[must_use]
+    pub fn generator(g: JsGenerator) -> Self {
+        Self::from_object_gc(g.raw())
+    }
+
+    /// Compiled RegExp handle.
+    #[inline]
+    #[must_use]
+    pub fn regexp(r: JsRegExp) -> Self {
+        Self::from_object_gc(r.raw())
+    }
+
+    /// Promise handle. Foundation slice only routes through
+    /// [`PurePromise`]; host-bridged promise representations
+    /// (`PromiseRepr::*`) plug in through the same `TAG_PTR_OBJECT`
+    /// payload because [`PurePromiseBody`] is the only spec body
+    /// today.
+    #[inline]
+    #[must_use]
+    pub fn promise(p: JsPromiseHandle) -> Self {
+        Self::from_object_gc(p.raw())
     }
 
     /// Recover a closure handle when this value carries one.
@@ -677,6 +705,42 @@ impl Value {
     #[must_use]
     pub fn read_gc_type_tag(self) -> Option<u8> {
         self.as_raw_gc()?.header_type_tag()
+    }
+
+    /// Generator handle.
+    #[inline]
+    #[must_use]
+    pub fn as_generator(self) -> Option<JsGenerator> {
+        if !self.is_object_like() {
+            return None;
+        }
+        let gc = self.as_raw_gc()?.checked_cast::<GeneratorBody>()?;
+        Some(JsGenerator::from_gc(gc))
+    }
+
+    /// Compiled RegExp handle.
+    #[inline]
+    #[must_use]
+    pub fn as_regexp(self) -> Option<JsRegExp> {
+        if !self.is_object_like() {
+            return None;
+        }
+        let gc = self.as_raw_gc()?.checked_cast::<JsRegExpBody>()?;
+        Some(JsRegExp::from_gc(gc))
+    }
+
+    /// Promise handle. Today this maps directly through
+    /// [`PurePromise`] (the only `PromiseRepr` body) — once host-
+    /// bridged promise representations land, this accessor selects
+    /// the right inner repr by body type tag.
+    #[inline]
+    #[must_use]
+    pub fn as_promise(self) -> Option<JsPromiseHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        let gc = self.as_raw_gc()?.checked_cast::<PurePromiseBody>()?;
+        Some(JsPromiseHandle::from_pure(PurePromise::from_gc(gc)))
     }
 }
 

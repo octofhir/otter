@@ -424,6 +424,16 @@ impl PurePromise {
         self.inner.raw()
     }
 
+    /// Reinterpret a body handle as the public [`PurePromise`]
+    /// wrapper. Used by [`crate::value::Value::as_promise`] after a
+    /// `GcHeader::type_tag` check has confirmed the body is a
+    /// [`PurePromiseBody`].
+    #[inline]
+    #[must_use]
+    pub fn from_gc(inner: otter_gc::Gc<PurePromiseBody>) -> Self {
+        Self { inner }
+    }
+
     /// Stable identity token.
     #[must_use]
     pub fn identity_addr(&self) -> *const () {

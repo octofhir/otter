@@ -512,6 +512,74 @@ impl JsString {
         CodeUnits::new(self).collect()
     }
 
+    /// Materialise this wrapper into a GC-managed string body.
+    ///
+    /// `Flat` and `Thin` variants map onto the matching
+    /// [`JsStringBodyRepr`] payload directly; `Sliced` collapses
+    /// into a fresh flat body containing the sliced range; `Cons`
+    /// flattens the rope first. Caller supplies the GC heap; the
+    /// returned [`JsStringHandle`] is a 4-byte `Copy` handle
+    /// suitable for the tagged-value [`crate::Value::string_gc`]
+    /// surface.
+    ///
+    /// # Errors
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn to_gc_handle(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+    ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+        let mut empty = |_v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
+        match &*self.repr {
+            StringRepr::Flat(units) => gc_body::alloc_flat_string_body_with_roots(
+                heap,
+                JsStringId::new(0),
+                units,
+                &mut empty,
+            ),
+            StringRepr::Thin(bytes) => gc_body::alloc_latin1_string_body_with_roots(
+                heap,
+                JsStringId::new(0),
+                bytes,
+                &mut empty,
+            ),
+            StringRepr::Sliced { parent, start, len } => {
+                let s = *start as usize;
+                let e = s + (*len as usize);
+                gc_body::alloc_flat_string_body_with_roots(
+                    heap,
+                    JsStringId::new(0),
+                    &parent[s..e],
+                    &mut empty,
+                )
+            }
+            StringRepr::Cons { .. } => {
+                let units = self.to_utf16_vec();
+                gc_body::alloc_flat_string_body_with_roots(
+                    heap,
+                    JsStringId::new(0),
+                    &units,
+                    &mut empty,
+                )
+            }
+        }
+    }
+
+    /// Construct a legacy Arc-backed wrapper from a GC-managed
+    /// string body. Materialises the body's UTF-16 units once into
+    /// a fresh `Flat` repr.
+    ///
+    /// # Errors
+    /// Surfaces [`StringError::OutOfMemory`] when the string-heap
+    /// cap would be exceeded.
+    pub fn from_gc_handle(
+        heap: &otter_gc::GcHeap,
+        handle: JsStringHandle,
+        string_heap: &StringHeap,
+    ) -> Result<Self, StringError> {
+        let units = gc_body::to_utf16_vec(heap, handle);
+        Self::from_utf16_units(&units, string_heap)
+    }
+
     /// Code-unit at `index`, or `None` for out-of-range.
     #[must_use]
     pub fn char_code_at(&self, index: u32) -> Option<u16> {
@@ -997,6 +1065,44 @@ mod tests {
         let s = JsString::from_str("abc", &h()).unwrap();
         assert_eq!(s.len(), 3);
         assert_eq!(s.to_lossy_string(), "abc");
+    }
+
+    #[test]
+    fn to_gc_handle_round_trips_through_real_heap() {
+        let heap = h();
+        let mut gc = otter_gc::GcHeap::new().expect("gc heap");
+        let original = JsString::from_str("hello world", &heap).unwrap();
+        let handle = original.to_gc_handle(&mut gc).expect("to_gc_handle");
+        let back = JsString::from_gc_handle(&gc, handle, &heap).expect("from_gc_handle");
+        assert_eq!(back.len(), original.len());
+        assert_eq!(back.to_lossy_string(), original.to_lossy_string());
+    }
+
+    #[test]
+    fn to_gc_handle_preserves_latin1_payload() {
+        let heap = h();
+        let mut gc = otter_gc::GcHeap::new().expect("gc heap");
+        let original = JsString::from_latin1(b"latin", &heap).unwrap();
+        let handle = original.to_gc_handle(&mut gc).expect("to_gc_handle");
+        gc.read_payload(handle, |body| {
+            assert!(matches!(body.repr, JsStringBodyRepr::Latin1(_)));
+            assert_eq!(body.len(), 5);
+        });
+    }
+
+    #[test]
+    fn to_gc_handle_flattens_cons() {
+        let heap = h();
+        let mut gc = otter_gc::GcHeap::new().expect("gc heap");
+        let left = JsString::from_str("foo", &heap).unwrap();
+        let right = JsString::from_str("bar", &heap).unwrap();
+        let cons = JsString::concat(&left, &right, &heap).unwrap();
+        let handle = cons.to_gc_handle(&mut gc).expect("to_gc_handle");
+        gc.read_payload(handle, |body| {
+            // Cons collapses through to_utf16_vec then alloc_flat.
+            assert!(matches!(body.repr, JsStringBodyRepr::Flat(_)));
+            assert_eq!(body.len(), 6);
+        });
     }
 
     #[test]

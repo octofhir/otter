@@ -490,8 +490,8 @@ impl JsTypedArray {
 
     /// Backing buffer.
     #[must_use]
-    pub fn buffer(&self) -> &JsArrayBuffer {
-        &self.inner.buffer
+    pub fn buffer(&self) -> JsArrayBuffer {
+        self.inner.buffer
     }
 
     /// Element kind.
@@ -500,19 +500,27 @@ impl JsTypedArray {
         self.inner.kind
     }
 
-    /// Byte offset into the backing buffer.
+    /// Byte offset into the backing buffer. `0` when the backing
+    /// buffer is detached per §10.4.5.10 `IntegerIndexedObjectByteOffset`.
     #[must_use]
-    pub fn byte_offset(&self) -> usize {
-        if self.inner.buffer.is_detached() {
+    pub fn byte_offset(&self, heap: &otter_gc::GcHeap) -> usize {
+        if self.inner.buffer.is_detached(heap) {
             return 0;
         }
         self.inner.byte_offset
     }
 
+    /// Construction-time byte offset, ignoring detached state. Used
+    /// by internal paths that already gate on `is_detached`.
+    #[must_use]
+    pub fn raw_byte_offset(&self) -> usize {
+        self.inner.byte_offset
+    }
+
     /// Element count. `0` when the backing buffer is detached.
     #[must_use]
-    pub fn length(&self) -> usize {
-        if self.inner.buffer.is_detached() {
+    pub fn length(&self, heap: &otter_gc::GcHeap) -> usize {
+        if self.inner.buffer.is_detached(heap) {
             return 0;
         }
         // Honour buffer shrinkage for resizable backing buffers: the
@@ -522,16 +530,23 @@ impl JsTypedArray {
         let bytes_available = self
             .inner
             .buffer
-            .byte_length()
+            .byte_length(heap)
             .saturating_sub(self.inner.byte_offset);
         let max_elems = bytes_available / bpe;
         self.inner.length.min(max_elems)
     }
 
+    /// Construction-time element count, ignoring detached state and
+    /// buffer shrinkage.
+    #[must_use]
+    pub fn raw_length(&self) -> usize {
+        self.inner.length
+    }
+
     /// Byte length (`length * bytes_per_element`).
     #[must_use]
-    pub fn byte_length(&self) -> usize {
-        self.length() * self.inner.kind.bytes_per_element()
+    pub fn byte_length(&self, heap: &otter_gc::GcHeap) -> usize {
+        self.length(heap) * self.inner.kind.bytes_per_element()
     }
 
     /// Read element `index`. Returns `Value::Undefined` for an
@@ -542,26 +557,44 @@ impl JsTypedArray {
         heap: &mut otter_gc::GcHeap,
         index: usize,
     ) -> Result<Value, otter_gc::OutOfMemory> {
-        if self.inner.buffer.is_detached() || index >= self.length() {
+        if self.inner.buffer.is_detached(heap) || index >= self.length(heap) {
             return Ok(Value::Undefined);
         }
         let bpe = self.inner.kind.bytes_per_element();
         let offset = self.inner.byte_offset + index * bpe;
-        let bytes = self.inner.buffer.borrow_bytes();
-        self.inner.kind.read(heap, &bytes, offset)
+        let snapshot: Option<Vec<u8>> = self.inner.buffer.with_bytes(heap, |bytes| {
+            if offset + bpe <= bytes.len() {
+                Some(bytes[offset..offset + bpe].to_vec())
+            } else {
+                None
+            }
+        });
+        match snapshot {
+            Some(b) => self.inner.kind.read(heap, &b, 0),
+            None => Ok(Value::Undefined),
+        }
     }
 
     /// Write `value` at element `index`. Out-of-range indices and
     /// detached buffers silently drop the write per §10.4.5.14
     /// `IntegerIndexedElementSet`.
-    pub fn set(&self, heap: &otter_gc::GcHeap, index: usize, value: &Value) {
-        if self.inner.buffer.is_detached() || index >= self.length() {
+    pub fn set(&self, heap: &mut otter_gc::GcHeap, index: usize, value: &Value) {
+        if self.inner.buffer.is_detached(heap) || index >= self.length(heap) {
             return;
         }
         let bpe = self.inner.kind.bytes_per_element();
         let offset = self.inner.byte_offset + index * bpe;
-        let mut bytes = self.inner.buffer.borrow_bytes_mut();
-        self.inner.kind.write(heap, &mut bytes, offset, value);
+        let kind = self.inner.kind;
+        // Convert the Value to a raw byte snapshot first (BigInt
+        // writes only need read access to the source body), then
+        // commit under exclusive heap access.
+        let mut staging = vec![0u8; bpe];
+        kind.write(heap, &mut staging, 0, value);
+        self.inner.buffer.with_bytes_mut(heap, |bytes| {
+            if offset + bpe <= bytes.len() {
+                bytes[offset..offset + bpe].copy_from_slice(&staging);
+            }
+        });
     }
 
     /// Identity comparison.

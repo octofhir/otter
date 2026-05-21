@@ -1,23 +1,20 @@
 //! JavaScript `ArrayBuffer` and `SharedArrayBuffer` (ECMA-262 §25.1
 //! / §25.2).
 //!
-//! Storage split since slice 19b:
-//!
-//! - **ArrayBuffer (non-shared)** uses `Rc<LocalBody>` so the
-//!   single-isolate fast path keeps `RefCell<Vec<u8>>` semantics
-//!   for cheap shared mutation through the same handle.
-//! - **SharedArrayBuffer** uses `Arc<SharedBody>` with a real
-//!   `Mutex<Vec<u8>>`. The `Arc` survives cross-thread `Clone`,
-//!   the `Mutex` synchronises racing reads/writes, and a
-//!   process-unique `id: u64` keys the global Atomics wait
-//!   registry in [`crate::atomics_wait`].
+//! Storage lives on the GC heap. The Local path stores the byte
+//! buffer inline in [`LocalArrayBufferBodyGc`]; mutators flip every
+//! field through [`otter_gc::GcHeap::with_payload`]. The Shared path
+//! wraps an `Arc<SharedBody>` (cross-thread, `Mutex<Vec<u8>>`-guarded)
+//! inside [`SharedArrayBufferBodyGc`] so the same buffer can hop
+//! across isolates while staying accounted by each one's GC budget.
 //!
 //! # Contents
-//! - [`JsArrayBuffer`] — cheap-to-clone handle.
-//! - [`BufferStorage`] — `Local` / `Shared` discriminator.
-//! - [`LocalBody`] / [`SharedBody`] — internal storage.
-//! - [`BytesRef`] / [`BytesRefMut`] — unified borrow guard so
-//!   prototype methods do not need to branch on storage.
+//! - [`JsArrayBuffer`] — `Copy`/`Eq`/`Hash` handle. Variant tag in
+//!   [`BufferStorage`] selects between Local and Shared GC bodies.
+//! - [`LocalArrayBufferBodyGc`] / [`SharedArrayBufferBodyGc`] — GC
+//!   bodies.
+//! - [`SharedBody`] — cross-thread substrate behind `Arc`. Keeps a
+//!   process-unique id used by [`crate::atomics_wait`].
 //!
 //! # Invariants
 //! - `Local`: when `detached == true`, the byte buffer is empty.
@@ -32,17 +29,16 @@
 //! - [`SharedBody::id`] is monotonically allocated from a static
 //!   `AtomicU64` and stays stable for the buffer's lifetime; the
 //!   Atomics wait registry keys on `(id, byte_index)`.
+//! - No `Rc` / `Arc` / `Cell` / `RefCell` inside GC bodies. Mutators
+//!   flip fields via `heap.with_payload`.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-arraybuffer-objects>
 //! - <https://tc39.es/ecma262/#sec-sharedarraybuffer-objects>
 //! - <https://tc39.es/ecma262/#sec-isdetachedbuffer>
 
-use std::cell::{Cell, Ref, RefCell, RefMut};
-use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 /// Process-wide monotonic id allocator for `SharedArrayBuffer`. The
 /// id is the registry key used by [`crate::atomics_wait`] to map
@@ -144,8 +140,10 @@ pub fn alloc_shared_array_buffer(
     heap.alloc_old(SharedArrayBufferBodyGc { inner })
 }
 
-/// Cheap-to-clone `ArrayBuffer` / `SharedArrayBuffer` handle.
-#[derive(Debug, Clone)]
+/// Cheap-to-copy `ArrayBuffer` / `SharedArrayBuffer` handle.
+///
+/// Backed by a tagged pair of 4-byte GC handles; `Copy`/`Eq`/`Hash`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct JsArrayBuffer {
     storage: BufferStorage,
 }
@@ -153,37 +151,17 @@ pub struct JsArrayBuffer {
 /// Storage discriminator. `Local` is the single-isolate
 /// `ArrayBuffer` path; `Shared` is the cross-thread
 /// `SharedArrayBuffer` path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum BufferStorage {
-    /// Non-shared backing — `Rc<LocalBody>` keeps the existing
-    /// `RefCell<Vec<u8>>` semantics so single-isolate paths pay
-    /// no synchronisation cost.
-    Local(Rc<LocalBody>),
-    /// Cross-thread backing — `Arc<SharedBody>` with a real
-    /// `Mutex<Vec<u8>>` and a process-unique id.
-    Shared(Arc<SharedBody>),
+    /// Non-shared backing — GC body holds the inline `Vec<u8>`.
+    Local(LocalArrayBufferHandle),
+    /// Cross-thread backing — GC body wraps `Arc<SharedBody>` with a
+    /// real `Mutex<Vec<u8>>` and a process-unique id.
+    Shared(SharedArrayBufferHandle),
 }
 
-/// Storage for a non-shared `ArrayBuffer`.
-#[derive(Debug)]
-pub struct LocalBody {
-    /// Raw bytes. Empty when detached.
-    bytes: RefCell<Vec<u8>>,
-    /// `true` after detach / transfer; once set, stays set per
-    /// spec.
-    detached: Cell<bool>,
-    /// `Some(n)` for a resizable buffer; `None` for a
-    /// fixed-length buffer. When set, [`Self::bytes`] never grows
-    /// beyond `n`.
-    max_byte_length: Option<usize>,
-    /// GC-budget reservation for the off-heap byte storage. Older
-    /// fixture-only constructors leave this empty; active runtime
-    /// constructors install a token so backing stores participate in
-    /// heap pressure.
-    external: RefCell<Option<otter_gc::ExternalMemory>>,
-}
-
-/// Storage for a `SharedArrayBuffer`.
+/// Storage for a `SharedArrayBuffer`. Lives behind `Arc` so the
+/// substrate can ship across host threads.
 #[derive(Debug)]
 pub struct SharedBody {
     /// Process-unique id. Stable for the buffer's lifetime; used
@@ -210,106 +188,27 @@ impl SharedBody {
     }
 }
 
-/// Read-only byte borrow that abstracts over the storage shape.
-/// `Deref<Target = Vec<u8>>` so callers can keep their existing
-/// `.len()` / indexing patterns regardless of variant.
-pub enum BytesRef<'a> {
-    /// `Ref<'_, Vec<u8>>` against a non-shared buffer.
-    Local(Ref<'a, Vec<u8>>),
-    /// Locked guard against a shared buffer.
-    Shared(MutexGuard<'a, Vec<u8>>),
-}
-
-impl Deref for BytesRef<'_> {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Vec<u8> {
-        match self {
-            BytesRef::Local(r) => r,
-            BytesRef::Shared(g) => g,
-        }
-    }
-}
-
-/// Mutable counterpart of [`BytesRef`]. `DerefMut<Target =
-/// Vec<u8>>` so prototype methods that mutate the byte vector
-/// (`fill` / `set` / `copy_from_slice`) keep working unchanged.
-pub enum BytesRefMut<'a> {
-    /// `RefMut<'_, Vec<u8>>` against a non-shared buffer.
-    Local(RefMut<'a, Vec<u8>>),
-    /// Locked guard against a shared buffer.
-    Shared(MutexGuard<'a, Vec<u8>>),
-}
-
-impl Deref for BytesRefMut<'_> {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Vec<u8> {
-        match self {
-            BytesRefMut::Local(r) => r,
-            BytesRefMut::Shared(g) => g,
-        }
-    }
-}
-
-impl DerefMut for BytesRefMut<'_> {
-    fn deref_mut(&mut self) -> &mut Vec<u8> {
-        match self {
-            BytesRefMut::Local(r) => r,
-            BytesRefMut::Shared(g) => g,
-        }
-    }
-}
-
 impl JsArrayBuffer {
-    fn local(body: LocalBody) -> Self {
+    fn wrap_local(handle: LocalArrayBufferHandle) -> Self {
         Self {
-            storage: BufferStorage::Local(Rc::new(body)),
+            storage: BufferStorage::Local(handle),
         }
     }
 
-    fn shared(body: SharedBody) -> Self {
+    fn wrap_shared(handle: SharedArrayBufferHandle) -> Self {
         Self {
-            storage: BufferStorage::Shared(Arc::new(body)),
+            storage: BufferStorage::Shared(handle),
         }
     }
 
-    /// Allocate a fresh fixed-length buffer of `len` zero bytes.
-    /// `len` must already be a valid `usize` (the dispatcher honours
-    /// §25.1.2.1 ToIndex on the user-facing argument).
-    ///
-    /// Returns the empty buffer when `len` exceeds practical limits
-    /// — the [`JsArrayBuffer::try_new`] entry point preserves the
-    /// fallible shape for ctors that need to surface a RangeError.
-    /// This infallible constructor is kept for callers that know
-    /// the length is bounded.
-    #[must_use]
-    pub fn new(len: usize) -> Self {
-        Self::try_new(len).unwrap_or_else(|| {
-            Self::local(LocalBody {
-                bytes: RefCell::new(Vec::new()),
-                detached: Cell::new(true),
-                max_byte_length: None,
-                external: RefCell::new(None),
-            })
-        })
-    }
-
-    /// Fallible variant of [`Self::new`]. Uses `Vec::try_reserve`
-    /// so the dispatcher can surface a `RangeError` for the spec
-    /// §25.1.2.1 step 5 too-big case (and, in practice, for any
-    /// allocation that exceeds the process memory budget).
-    #[must_use]
-    pub fn try_new(len: usize) -> Option<Self> {
-        let mut bytes: Vec<u8> = Vec::new();
-        bytes.try_reserve_exact(len).ok()?;
-        bytes.resize(len, 0u8);
-        Some(Self::local(LocalBody {
-            bytes: RefCell::new(bytes),
-            detached: Cell::new(false),
-            max_byte_length: None,
-            external: RefCell::new(None),
-        }))
+    /// Allocate a fresh fixed-length buffer of `len` zero bytes
+    /// (ECMA-262 §25.1.2.1). No external-memory accounting; intended
+    /// for fixtures and infallible host-only callers that already
+    /// bound `len`.
+    pub fn new(heap: &mut otter_gc::GcHeap, len: usize) -> Result<Self, otter_gc::OutOfMemory> {
+        let bytes = vec![0u8; len];
+        let handle = alloc_local_array_buffer(heap, bytes, None, None)?;
+        Ok(Self::wrap_local(handle))
     }
 
     /// Fallible fixed-length allocation that accounts the backing
@@ -326,27 +225,8 @@ impl JsArrayBuffer {
             return Ok(None);
         }
         bytes.resize(len, 0u8);
-        Ok(Some(Self::local(LocalBody {
-            bytes: RefCell::new(bytes),
-            detached: Cell::new(false),
-            max_byte_length: None,
-            external: RefCell::new(Some(external)),
-        })))
-    }
-
-    /// Allocate a resizable buffer with initial length `len` and the
-    /// given upper bound. Capacity is reserved up-front so subsequent
-    /// `resize` calls never reallocate.
-    #[must_use]
-    pub fn new_resizable(len: usize, max_byte_length: usize) -> Self {
-        let mut bytes = Vec::with_capacity(max_byte_length);
-        bytes.resize(len, 0u8);
-        Self::local(LocalBody {
-            bytes: RefCell::new(bytes),
-            detached: Cell::new(false),
-            max_byte_length: Some(max_byte_length),
-            external: RefCell::new(None),
-        })
+        let handle = alloc_local_array_buffer(heap, bytes, None, Some(external))?;
+        Ok(Some(Self::wrap_local(handle)))
     }
 
     /// Accounted resizable allocation. The reservation covers
@@ -365,81 +245,21 @@ impl JsArrayBuffer {
             return Ok(None);
         }
         bytes.resize(len, 0u8);
-        Ok(Some(Self::local(LocalBody {
-            bytes: RefCell::new(bytes),
-            detached: Cell::new(false),
-            max_byte_length: Some(max_byte_length),
-            external: RefCell::new(Some(external)),
-        })))
-    }
-
-    /// Wrap an existing byte vector. Used by [`JsArrayBuffer::slice`]
-    /// and `transfer` / `transferToFixedLength`.
-    #[must_use]
-    pub fn from_bytes(bytes: Vec<u8>) -> Self {
-        Self::local(LocalBody {
-            bytes: RefCell::new(bytes),
-            detached: Cell::new(false),
-            max_byte_length: None,
-            external: RefCell::new(None),
-        })
+        let handle = alloc_local_array_buffer(heap, bytes, Some(max_byte_length), Some(external))?;
+        Ok(Some(Self::wrap_local(handle)))
     }
 
     /// Wrap an existing byte vector and account its current length as
-    /// external memory.
+    /// external memory. Used by [`JsArrayBuffer::slice`] and
+    /// `transfer` / `transferToFixedLength`.
     pub fn from_bytes_with_roots(
         bytes: Vec<u8>,
         heap: &mut otter_gc::GcHeap,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
         let external = heap.reserve_external_with_roots(bytes.len() as u64, external_visit)?;
-        Ok(Self::local(LocalBody {
-            bytes: RefCell::new(bytes),
-            detached: Cell::new(false),
-            max_byte_length: None,
-            external: RefCell::new(Some(external)),
-        }))
-    }
-
-    /// Allocate a fixed-length `SharedArrayBuffer`. Cannot be
-    /// detached. The backing store is an `Arc<SharedBody>` with a
-    /// real mutex, so the same buffer can be passed across host
-    /// threads once the `$262.agent.*` worker harness lands in
-    /// slice 19c.
-    ///
-    /// Returns a synthetic detached buffer when the allocation
-    /// fails; [`Self::try_new_shared`] preserves the fallible
-    /// shape for callers that need to surface a `RangeError`.
-    #[must_use]
-    pub fn new_shared(len: usize) -> Self {
-        Self::try_new_shared(len).unwrap_or_else(|| {
-            // Empty allocation; effectively a zero-length shared
-            // buffer. SAB cannot transition into a detached state
-            // per §25.2.4.1, so we expose a usable zero-length
-            // buffer instead of a synthetic detached one.
-            Self::shared(SharedBody {
-                id: allocate_shared_id(),
-                bytes: Mutex::new(Vec::new()),
-                max_byte_length: None,
-                _external: None,
-            })
-        })
-    }
-
-    /// Fallible variant of [`Self::new_shared`]. Uses
-    /// `Vec::try_reserve_exact` so the dispatcher can surface a
-    /// `RangeError` when `len` exceeds the process memory budget.
-    #[must_use]
-    pub fn try_new_shared(len: usize) -> Option<Self> {
-        let mut bytes: Vec<u8> = Vec::new();
-        bytes.try_reserve_exact(len).ok()?;
-        bytes.resize(len, 0u8);
-        Some(Self::shared(SharedBody {
-            id: allocate_shared_id(),
-            bytes: Mutex::new(bytes),
-            max_byte_length: None,
-            _external: None,
-        }))
+        let handle = alloc_local_array_buffer(heap, bytes, None, Some(external))?;
+        Ok(Self::wrap_local(handle))
     }
 
     /// Accounted fixed-length shared allocation. Release is tied to the
@@ -455,26 +275,14 @@ impl JsArrayBuffer {
             return Ok(None);
         }
         bytes.resize(len, 0u8);
-        Ok(Some(Self::shared(SharedBody {
+        let arc = Arc::new(SharedBody {
             id: allocate_shared_id(),
             bytes: Mutex::new(bytes),
             max_byte_length: None,
             _external: Some(external),
-        })))
-    }
-
-    /// Allocate a growable shared buffer per §25.2.5 — `length`
-    /// floats up to `max_byte_length` via [`Self::grow`].
-    #[must_use]
-    pub fn new_shared_growable(len: usize, max_byte_length: usize) -> Self {
-        let mut bytes = Vec::with_capacity(max_byte_length);
-        bytes.resize(len, 0u8);
-        Self::shared(SharedBody {
-            id: allocate_shared_id(),
-            bytes: Mutex::new(bytes),
-            max_byte_length: Some(max_byte_length),
-            _external: None,
-        })
+        });
+        let handle = alloc_shared_array_buffer(heap, arc)?;
+        Ok(Some(Self::wrap_shared(handle)))
     }
 
     /// Accounted growable shared allocation. The reservation covers
@@ -492,53 +300,67 @@ impl JsArrayBuffer {
             return Ok(None);
         }
         bytes.resize(len, 0u8);
-        Ok(Some(Self::shared(SharedBody {
+        let arc = Arc::new(SharedBody {
             id: allocate_shared_id(),
             bytes: Mutex::new(bytes),
             max_byte_length: Some(max_byte_length),
             _external: Some(external),
-        })))
+        });
+        let handle = alloc_shared_array_buffer(heap, arc)?;
+        Ok(Some(Self::wrap_shared(handle)))
     }
 
     /// Accounted external byte count for focused tests.
     #[cfg(test)]
     #[must_use]
-    pub fn shared_external_bytes_for_test(&self) -> Option<u64> {
-        let BufferStorage::Shared(body) = &self.storage else {
+    pub fn shared_external_bytes_for_test(self, heap: &otter_gc::GcHeap) -> Option<u64> {
+        let BufferStorage::Shared(h) = self.storage else {
             return None;
         };
-        body._external
-            .as_ref()
-            .map(otter_gc::SharedExternalMemory::bytes)
+        heap.read_payload(h, |body| {
+            body.inner
+                ._external
+                .as_ref()
+                .map(otter_gc::SharedExternalMemory::bytes)
+        })
     }
 
-    /// `true` for a `SharedArrayBuffer`.
+    /// `true` for a `SharedArrayBuffer`. Variant check; no heap
+    /// access required.
     #[must_use]
-    pub fn is_shared(&self) -> bool {
+    pub fn is_shared(self) -> bool {
         matches!(self.storage, BufferStorage::Shared(_))
     }
 
     /// `true` for a growable `SharedArrayBuffer` (the SAB
-    /// equivalent of resizable).
+    /// equivalent of resizable). Reads the Shared body once.
     #[must_use]
-    pub fn is_growable(&self) -> bool {
-        matches!(&self.storage, BufferStorage::Shared(s) if s.max_byte_length.is_some())
+    pub fn is_growable(self, heap: &otter_gc::GcHeap) -> bool {
+        match self.storage {
+            BufferStorage::Shared(h) => {
+                heap.read_payload(h, |body| body.inner.max_byte_length.is_some())
+            }
+            BufferStorage::Local(_) => false,
+        }
     }
 
     /// §25.2.5.4 — `SharedArrayBuffer.prototype.grow(newByteLength)`.
     /// Growing only; `new_len < current_len` returns `false`.
-    pub fn grow(&self, new_len: usize) -> bool {
-        let BufferStorage::Shared(body) = &self.storage else {
+    pub fn grow(self, heap: &otter_gc::GcHeap, new_len: usize) -> bool {
+        let BufferStorage::Shared(h) = self.storage else {
             return false;
         };
-        let max = match body.max_byte_length {
+        // Clone Arc out of the GC body so the mutex lock is held
+        // without crossing the heap borrow.
+        let arc = heap.read_payload(h, |body| body.inner.clone());
+        let max = match arc.max_byte_length {
             Some(m) => m,
             None => return false,
         };
         if new_len > max {
             return false;
         }
-        let Ok(mut bytes) = body.bytes.lock() else {
+        let Ok(mut bytes) = arc.bytes.lock() else {
             return false;
         };
         if new_len < bytes.len() {
@@ -550,16 +372,15 @@ impl JsArrayBuffer {
 
     /// Current byte length. `0` for a detached buffer.
     #[must_use]
-    pub fn byte_length(&self) -> usize {
-        match &self.storage {
-            BufferStorage::Local(body) => {
-                if body.detached.get() {
-                    0
-                } else {
-                    body.bytes.borrow().len()
-                }
+    pub fn byte_length(self, heap: &otter_gc::GcHeap) -> usize {
+        match self.storage {
+            BufferStorage::Local(h) => {
+                heap.read_payload(h, |body| if body.detached { 0 } else { body.bytes.len() })
             }
-            BufferStorage::Shared(body) => body.bytes.lock().map(|g| g.len()).unwrap_or(0),
+            BufferStorage::Shared(h) => {
+                let arc = heap.read_payload(h, |body| body.inner.clone());
+                arc.bytes.lock().map(|g| g.len()).unwrap_or(0)
+            }
         }
     }
 
@@ -567,27 +388,28 @@ impl JsArrayBuffer {
     /// equals [`Self::byte_length`] for a fixed-length buffer
     /// per §25.1.4.6 `get ArrayBuffer.prototype.maxByteLength`.
     #[must_use]
-    pub fn max_byte_length(&self) -> usize {
-        match &self.storage {
-            BufferStorage::Local(body) => {
-                if body.detached.get() {
+    pub fn max_byte_length(self, heap: &otter_gc::GcHeap) -> usize {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| {
+                if body.detached {
                     return 0;
                 }
-                body.max_byte_length
-                    .unwrap_or_else(|| body.bytes.borrow().len())
+                body.max_byte_length.unwrap_or(body.bytes.len())
+            }),
+            BufferStorage::Shared(h) => {
+                let arc = heap.read_payload(h, |body| body.inner.clone());
+                arc.max_byte_length
+                    .unwrap_or_else(|| arc.bytes.lock().map(|g| g.len()).unwrap_or(0))
             }
-            BufferStorage::Shared(body) => body
-                .max_byte_length
-                .unwrap_or_else(|| body.bytes.lock().map(|g| g.len()).unwrap_or(0)),
         }
     }
 
     /// `true` when the buffer was constructed with a `maxByteLength`
     /// argument (§25.1.4.7 `get ArrayBuffer.prototype.resizable`).
     #[must_use]
-    pub fn is_resizable(&self) -> bool {
-        match &self.storage {
-            BufferStorage::Local(body) => body.max_byte_length.is_some(),
+    pub fn is_resizable(self, heap: &otter_gc::GcHeap) -> bool {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| body.max_byte_length.is_some()),
             BufferStorage::Shared(_) => false,
         }
     }
@@ -596,33 +418,43 @@ impl JsArrayBuffer {
     /// `IsDetachedBuffer`). `SharedArrayBuffer` is never detached
     /// per §25.2.4.1.
     #[must_use]
-    pub fn is_detached(&self) -> bool {
-        match &self.storage {
-            BufferStorage::Local(body) => body.detached.get(),
+    pub fn is_detached(self, heap: &otter_gc::GcHeap) -> bool {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| body.detached),
             BufferStorage::Shared(_) => false,
         }
     }
 
-    /// Borrow the bytes read-only. Callers must check
-    /// [`Self::is_detached`] first.
-    #[must_use]
-    pub fn borrow_bytes(&self) -> BytesRef<'_> {
-        match &self.storage {
-            BufferStorage::Local(body) => BytesRef::Local(body.bytes.borrow()),
-            BufferStorage::Shared(body) => {
-                BytesRef::Shared(body.bytes.lock().expect("SharedArrayBuffer mutex poisoned"))
+    /// Closure-style read over the byte buffer. Callers must check
+    /// [`Self::is_detached`] first; a detached buffer yields an
+    /// empty slice. The closure runs under the heap borrow — never
+    /// retain the slice past its scope.
+    pub fn with_bytes<F, R>(self, heap: &otter_gc::GcHeap, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        match self.storage {
+            BufferStorage::Local(h) => heap.read_payload(h, |body| f(&body.bytes)),
+            BufferStorage::Shared(h) => {
+                let arc = heap.read_payload(h, |body| body.inner.clone());
+                let guard = arc.bytes.lock().expect("SharedArrayBuffer mutex poisoned");
+                f(&guard[..])
             }
         }
     }
 
-    /// Borrow the bytes mutably. Callers must check
-    /// [`Self::is_detached`] first.
-    #[must_use]
-    pub fn borrow_bytes_mut(&self) -> BytesRefMut<'_> {
-        match &self.storage {
-            BufferStorage::Local(body) => BytesRefMut::Local(body.bytes.borrow_mut()),
-            BufferStorage::Shared(body) => {
-                BytesRefMut::Shared(body.bytes.lock().expect("SharedArrayBuffer mutex poisoned"))
+    /// Closure-style mutable read over the byte buffer. Callers must
+    /// check [`Self::is_detached`] first.
+    pub fn with_bytes_mut<F, R>(self, heap: &mut otter_gc::GcHeap, f: F) -> R
+    where
+        F: FnOnce(&mut Vec<u8>) -> R,
+    {
+        match self.storage {
+            BufferStorage::Local(h) => heap.with_payload(h, |body| f(&mut body.bytes)),
+            BufferStorage::Shared(h) => {
+                let arc = heap.read_payload(h, |body| body.inner.clone());
+                let mut guard = arc.bytes.lock().expect("SharedArrayBuffer mutex poisoned");
+                f(&mut guard)
             }
         }
     }
@@ -630,78 +462,84 @@ impl JsArrayBuffer {
     /// Detach the buffer. Idempotent; subsequent calls are no-ops.
     /// `SharedArrayBuffer` rejects detach per §25.2.4.1 step 2 —
     /// the call is a no-op there.
-    pub fn detach(&self) {
-        let BufferStorage::Local(body) = &self.storage else {
+    pub fn detach(self, heap: &mut otter_gc::GcHeap) {
+        let BufferStorage::Local(h) = self.storage else {
             return;
         };
-        if !body.detached.replace(true) {
-            body.bytes.borrow_mut().clear();
-            let _ = body.external.borrow_mut().take();
-        }
+        heap.with_payload(h, |body| {
+            if !body.detached {
+                body.detached = true;
+                body.bytes.clear();
+                let _ = body.external.take();
+            }
+        });
     }
 
     /// Resize a resizable buffer. Returns `false` when the buffer is
     /// fixed-length, detached, or `new_len` exceeds the recorded
     /// `maxByteLength`. Length growth zero-fills new bytes per
     /// §25.1.4.4 step 8.
-    pub fn resize(&self, new_len: usize) -> bool {
-        let BufferStorage::Local(body) = &self.storage else {
+    pub fn resize(self, heap: &mut otter_gc::GcHeap, new_len: usize) -> bool {
+        let BufferStorage::Local(h) = self.storage else {
             return false;
         };
-        if body.detached.get() {
-            return false;
-        }
-        let max = match body.max_byte_length {
-            Some(m) => m,
-            None => return false,
+        heap.with_payload(h, |body| {
+            if body.detached {
+                return false;
+            }
+            let max = match body.max_byte_length {
+                Some(m) => m,
+                None => return false,
+            };
+            if new_len > max {
+                return false;
+            }
+            body.bytes.resize(new_len, 0u8);
+            true
+        })
+    }
+
+    /// Identity comparison. Compares the GC handle offset within the
+    /// owning isolate; two wrappers of the same Local body / same
+    /// Shared body compare equal because every per-isolate clone
+    /// goes through the same handle.
+    #[must_use]
+    pub fn ptr_eq(self, other: Self) -> bool {
+        self.storage == other.storage
+    }
+
+    /// Backing-pointer for cycle / identity sets. Encodes the
+    /// variant tag in the low bit so Local and Shared handles with
+    /// the same offset stay distinct.
+    #[must_use]
+    pub fn identity_addr(self) -> *const () {
+        let (tag, offset) = match self.storage {
+            BufferStorage::Local(h) => (0u64, h.offset() as u64),
+            BufferStorage::Shared(h) => (1u64, h.offset() as u64),
         };
-        if new_len > max {
-            return false;
-        }
-        let mut bytes = body.bytes.borrow_mut();
-        bytes.resize(new_len, 0u8);
-        true
-    }
-
-    /// Identity comparison.
-    #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        match (&self.storage, &other.storage) {
-            (BufferStorage::Local(a), BufferStorage::Local(b)) => Rc::ptr_eq(a, b),
-            (BufferStorage::Shared(a), BufferStorage::Shared(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        }
-    }
-
-    /// Backing-pointer for cycle / identity sets.
-    #[must_use]
-    pub fn identity_addr(&self) -> *const () {
-        match &self.storage {
-            BufferStorage::Local(body) => Rc::as_ptr(body).cast(),
-            BufferStorage::Shared(body) => Arc::as_ptr(body).cast(),
-        }
+        ((offset << 1) | tag) as usize as *const ()
     }
 
     /// Process-unique id for `SharedArrayBuffer`. `None` for a
     /// non-shared buffer. Used as the registry key for the
     /// `Atomics.wait` / `Atomics.notify` parking layer.
     #[must_use]
-    pub fn shared_id(&self) -> Option<u64> {
-        match &self.storage {
+    pub fn shared_id(self, heap: &otter_gc::GcHeap) -> Option<u64> {
+        match self.storage {
             BufferStorage::Local(_) => None,
-            BufferStorage::Shared(body) => Some(body.id),
+            BufferStorage::Shared(h) => Some(heap.read_payload(h, |body| body.inner.id)),
         }
     }
 
-    /// Borrow the `Arc<SharedBody>` for cross-thread transfer.
+    /// Clone the `Arc<SharedBody>` for cross-thread transfer.
     /// Returns `None` for a non-shared buffer. Slice 19c
     /// (`$262.agent.broadcast`) consumes this when shipping the
     /// SAB across the worker channel.
     #[must_use]
-    pub fn as_shared_arc(&self) -> Option<&Arc<SharedBody>> {
-        match &self.storage {
+    pub fn as_shared_arc(self, heap: &otter_gc::GcHeap) -> Option<Arc<SharedBody>> {
+        match self.storage {
             BufferStorage::Local(_) => None,
-            BufferStorage::Shared(body) => Some(body),
+            BufferStorage::Shared(h) => Some(heap.read_payload(h, |body| body.inner.clone())),
         }
     }
 
@@ -709,20 +547,37 @@ impl JsArrayBuffer {
     /// Used by the cross-thread message receiver path to reconstruct
     /// the JS-facing handle on the destination isolate without
     /// reallocating the byte storage.
-    #[must_use]
-    pub fn from_shared_arc(body: Arc<SharedBody>) -> Self {
-        Self {
-            storage: BufferStorage::Shared(body),
-        }
+    ///
+    /// Allocates a fresh per-isolate GC handle that owns the
+    /// incoming `Arc`. Subsequent reads / writes go through this
+    /// handle; the underlying `SharedBody` (and its `Mutex`) stays
+    /// shared across isolates.
+    pub fn from_shared_arc(
+        heap: &mut otter_gc::GcHeap,
+        body: Arc<SharedBody>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let handle = alloc_shared_array_buffer(heap, body)?;
+        Ok(Self::wrap_shared(handle))
     }
-}
 
-impl PartialEq for JsArrayBuffer {
-    fn eq(&self, other: &Self) -> bool {
-        // ECMAScript `===` on ArrayBuffer values follows reference
-        // identity per the object-equality wildcard arm in
-        // [`crate::Value::PartialEq`]; this implementation is
-        // consistent.
-        self.ptr_eq(other)
+    /// Access the storage discriminator without exposing the inner
+    /// handles. Useful for `match` over the family.
+    #[must_use]
+    pub fn storage(self) -> BufferStorage {
+        self.storage
+    }
+
+    /// Visit the embedded GC handle slot during root tracing.
+    pub fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        match self.storage {
+            BufferStorage::Local(h) => {
+                let p = &h as *const LocalArrayBufferHandle as *mut otter_gc::raw::RawGc;
+                visitor(p);
+            }
+            BufferStorage::Shared(h) => {
+                let p = &h as *const SharedArrayBufferHandle as *mut otter_gc::raw::RawGc;
+                visitor(p);
+            }
+        }
     }
 }

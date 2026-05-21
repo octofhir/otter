@@ -97,8 +97,8 @@ impl JsDataView {
 
     /// Backing buffer.
     #[must_use]
-    pub fn buffer(&self) -> &JsArrayBuffer {
-        &self.inner.buffer
+    pub fn buffer(&self) -> JsArrayBuffer {
+        self.inner.buffer
     }
 
     /// Byte offset into the backing buffer.

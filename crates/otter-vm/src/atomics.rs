@@ -175,13 +175,14 @@ fn validate_atomic_access(
     method_name: &'static str,
 ) -> Result<usize, NativeError> {
     let idx = coerce_to_index(ctx, request_index, method_name)?;
-    if idx >= ta.length() {
+    let len = ta.length(ctx.heap());
+    if idx >= len {
         return Err(range_err(
             method_name,
             format!(
                 "index {idx} is out of range for {} of length {}",
                 ta.kind().name(),
-                ta.length()
+                len
             ),
         ));
     }
@@ -412,7 +413,7 @@ fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         args.get(2).unwrap_or(&Value::Undefined),
         "Atomics.store",
     )?;
-    ta.set(ctx.interp_mut().gc_heap(), idx, &value);
+    ta.set(ctx.interp_mut().gc_heap_mut(), idx, &value);
     Ok(value)
 }
 
@@ -681,7 +682,7 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     }
     let buf_id = ta
         .buffer()
-        .shared_id()
+        .shared_id(ctx.heap())
         .expect("is_shared() guards shared_id");
     let idx = validate_atomic_access(
         ctx,
@@ -812,7 +813,7 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             }
         }
     };
-    let woken = match ta.buffer().shared_id() {
+    let woken = match ta.buffer().shared_id(ctx.heap()) {
         Some(buf_id) => atomics_wait::notify_waiters(buf_id, idx, count),
         None => 0,
     };

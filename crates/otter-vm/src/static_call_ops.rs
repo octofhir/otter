@@ -141,7 +141,7 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method = method_id::DataViewMethod::from_u32(method_idx)
                     .ok_or(VmError::InvalidOperand)?;
-                let result = binary::dispatch::data_view_call(method, &args)?;
+                let result = binary::dispatch::data_view_call(method, &args, &self.gc_heap)?;
                 finish_static_call(frame, dst, result)
             }
             Op::TypedArrayCall => unreachable!("TypedArrayCall requires stack-rooted dispatch"),
@@ -1192,11 +1192,11 @@ impl Interpreter {
                             if let Some(n) =
                                 crate::property_dispatch::canonical_numeric_index_string(k)
                             {
-                                if t.buffer().is_detached()
+                                if t.buffer().is_detached(&self.gc_heap)
                                     || !n.is_finite()
                                     || n.fract() != 0.0
                                     || n < 0.0
-                                    || (n as usize) >= t.length()
+                                    || (n as usize) >= t.length(&self.gc_heap)
                                 {
                                     None
                                 } else {

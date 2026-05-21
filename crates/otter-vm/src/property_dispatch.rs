@@ -357,13 +357,13 @@ impl Interpreter {
             // expando bag.
             Value::TypedArray(t) => {
                 if let Some(n) = canonical_numeric_index_string(name) {
-                    if t.buffer().is_detached() {
+                    if t.buffer().is_detached(&self.gc_heap) {
                         true
                     } else {
                         !(n.is_finite()
                             && n.fract() == 0.0
                             && n >= 0.0
-                            && (n as usize) < t.length())
+                            && (n as usize) < t.length(&self.gc_heap))
                     }
                 } else if let Some(bag) = t.expando() {
                     crate::object::delete(bag, &mut self.gc_heap, name)
@@ -480,13 +480,13 @@ impl Interpreter {
                 let name = s.to_lossy_string();
                 match canonical_numeric_index_string(&name) {
                     Some(n) => {
-                        if t.buffer().is_detached() {
+                        if t.buffer().is_detached(&self.gc_heap) {
                             true
                         } else {
                             !(n.is_finite()
                                 && n.fract() == 0.0
                                 && n >= 0.0
-                                && (n as usize) < t.length())
+                                && (n as usize) < t.length(&self.gc_heap))
                         }
                     }
                     None => {
@@ -499,8 +499,8 @@ impl Interpreter {
                 }
             }
             (Value::TypedArray(t), Value::Number(n)) => {
-                t.buffer().is_detached()
-                    || !matches!(n.as_smi(), Some(v) if v >= 0 && (v as usize) < t.length())
+                t.buffer().is_detached(&self.gc_heap)
+                    || !matches!(n.as_smi(), Some(v) if v >= 0 && (v as usize) < t.length(&self.gc_heap))
             }
             (Value::TypedArray(t), Value::Symbol(sym)) => {
                 if let Some(bag) = t.expando() {
@@ -862,7 +862,7 @@ impl Interpreter {
             v @ Value::ArrayBuffer(_) => {
                 let (direct, is_shared) = if let Value::ArrayBuffer(b) = v {
                     (
-                        binary::array_buffer_prototype::load_property(b, name),
+                        binary::array_buffer_prototype::load_property(*b, &self.gc_heap, name),
                         b.is_shared(),
                     )
                 } else {
@@ -882,7 +882,7 @@ impl Interpreter {
             }
             v @ Value::DataView(_) => {
                 let direct = if let Value::DataView(dv) = v {
-                    binary::data_view_prototype::load_property(dv, name)
+                    binary::data_view_prototype::load_property(dv, &self.gc_heap, name)
                 } else {
                     Value::Undefined
                 };
@@ -909,7 +909,8 @@ impl Interpreter {
                 {
                     value
                 } else {
-                    let direct = binary::typed_array_prototype::load_property(t, name);
+                    let direct =
+                        binary::typed_array_prototype::load_property(t, &self.gc_heap, name);
                     match direct {
                         Value::Undefined => {
                             let kind_name = t.kind().name();
@@ -1023,18 +1024,18 @@ impl Interpreter {
             }
             Value::TypedArray(t) => {
                 if let Some(n) = canonical_numeric_index_string(name) {
-                    if !t.buffer().is_detached()
+                    if !t.buffer().is_detached(&self.gc_heap)
                         && n.is_finite()
                         && n.fract() == 0.0
                         && n >= 0.0
-                        && (n as usize) < t.length()
+                        && (n as usize) < t.length(&self.gc_heap)
                     {
                         let coerced = binary::dispatch::coerce_element_for_store(
                             &mut self.gc_heap,
                             t.kind(),
                             &value,
                         )?;
-                        t.set(&self.gc_heap, n as usize, &coerced);
+                        t.set(&mut self.gc_heap, n as usize, &coerced);
                     }
                 } else {
                     let t_clone = t.clone();
@@ -1353,7 +1354,11 @@ impl Interpreter {
             (Value::TypedArray(t), Value::String(key)) => {
                 let name = key.to_lossy_string();
                 if let Some(n) = canonical_numeric_index_string(&name) {
-                    if n.is_finite() && n.fract() == 0.0 && n >= 0.0 && (n as usize) < t.length() {
+                    if n.is_finite()
+                        && n.fract() == 0.0
+                        && n >= 0.0
+                        && (n as usize) < t.length(&self.gc_heap)
+                    {
                         t.get(&mut self.gc_heap, n as usize)
                             .map_err(crate::oom_to_vm)?
                     } else {
@@ -1372,7 +1377,8 @@ impl Interpreter {
                         found = true;
                     }
                     if !found {
-                        let direct = binary::typed_array_prototype::load_property(t, &name);
+                        let direct =
+                            binary::typed_array_prototype::load_property(t, &self.gc_heap, &name);
                         value = match direct {
                             Value::Undefined => {
                                 let kind_name = t.kind().name();
@@ -1835,7 +1841,7 @@ impl Interpreter {
                         t.kind(),
                         &value,
                     )?;
-                    t.set(&self.gc_heap, v as usize, &coerced);
+                    t.set(&mut self.gc_heap, v as usize, &coerced);
                 }
                 _ => return Err(VmError::TypeMismatch),
             },
@@ -1846,11 +1852,11 @@ impl Interpreter {
             (Value::TypedArray(t), Value::String(key)) => {
                 let name = key.to_lossy_string();
                 if let Some(n) = canonical_numeric_index_string(&name) {
-                    if t.buffer().is_detached()
+                    if t.buffer().is_detached(&self.gc_heap)
                         || !n.is_finite()
                         || n.fract() != 0.0
                         || n < 0.0
-                        || (n as usize) >= t.length()
+                        || (n as usize) >= t.length(&self.gc_heap)
                     {
                         // out-of-range / non-integer — silent no-op
                     } else {
@@ -1859,7 +1865,7 @@ impl Interpreter {
                             t.kind(),
                             &value,
                         )?;
-                        t.set(&self.gc_heap, n as usize, &coerced);
+                        t.set(&mut self.gc_heap, n as usize, &coerced);
                     }
                 } else {
                     typed_array_set_expando(self, t, &name, value.clone())?;

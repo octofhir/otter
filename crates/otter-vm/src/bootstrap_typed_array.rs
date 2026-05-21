@@ -484,8 +484,9 @@ fn ta_callback_snapshot(
     t: &crate::binary::typed_array::JsTypedArray,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<Vec<Value>, otter_gc::OutOfMemory> {
-    let mut out = Vec::with_capacity(t.length());
-    for i in 0..t.length() {
+    let len = t.length(heap);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
         out.push(t.get(heap, i)?);
     }
     Ok(out)
@@ -811,7 +812,7 @@ fn ta_build_result(
     })?;
     let view = crate::binary::typed_array::JsTypedArray::new(new_buf, kind, 0, values.len());
     for (i, v) in values.iter().enumerate() {
-        view.set(ctx.heap(), i, v);
+        view.set(ctx.heap_mut(), i, v);
     }
     Ok(Value::TypedArray(view))
 }
@@ -821,7 +822,7 @@ fn ta_build_result(
 /// non-TypedArray receivers.
 fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
-        Value::TypedArray(t) => Ok(Value::ArrayBuffer(t.buffer().clone())),
+        Value::TypedArray(t) => Ok(Value::ArrayBuffer(t.buffer())),
         _ => Err(NativeError::TypeError {
             name: "TypedArray.prototype.buffer",
             reason: "this is not a TypedArray".to_string(),
@@ -833,7 +834,8 @@ fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
         Value::TypedArray(t) => {
-            let n = t.byte_length();
+            let t = t.clone();
+            let n = t.byte_length(ctx.heap());
             Ok(Value::Number(crate::number::NumberValue::from_f64(
                 n as f64,
             )))
@@ -849,7 +851,8 @@ fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
         Value::TypedArray(t) => {
-            let n = t.byte_offset();
+            let t = t.clone();
+            let n = t.byte_offset(ctx.heap());
             Ok(Value::Number(crate::number::NumberValue::from_f64(
                 n as f64,
             )))
@@ -865,7 +868,8 @@ fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
         Value::TypedArray(t) => {
-            let n = t.length();
+            let t = t.clone();
+            let n = t.length(ctx.heap());
             Ok(Value::Number(crate::number::NumberValue::from_f64(
                 n as f64,
             )))

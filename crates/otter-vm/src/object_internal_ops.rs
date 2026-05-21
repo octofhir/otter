@@ -3226,11 +3226,11 @@ impl Interpreter {
                 if let Some(name) = key.string_name() {
                     if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
                     {
-                        if t.buffer().is_detached()
+                        if t.buffer().is_detached(&self.gc_heap)
                             || !n.is_finite()
                             || n.fract() != 0.0
                             || n < 0.0
-                            || (n as usize) >= t.length()
+                            || (n as usize) >= t.length(&self.gc_heap)
                         {
                             return Ok(VmGetOutcome::Value(Value::Undefined));
                         }

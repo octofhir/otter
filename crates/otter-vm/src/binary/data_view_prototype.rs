@@ -33,8 +33,8 @@ fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsDataView, IntrinsicError> {
 
 /// §25.3.1.1 step 5 — every read / write must guard the backing
 /// buffer's detached state.
-fn check_not_detached(view: &JsDataView) -> Result<(), IntrinsicError> {
-    if view.buffer().is_detached() {
+fn check_not_detached(view: &JsDataView, heap: &otter_gc::GcHeap) -> Result<(), IntrinsicError> {
+    if view.buffer().is_detached(heap) {
         return Err(IntrinsicError::BadReceiver {
             expected: "non-detached dataview",
         });
@@ -54,6 +54,7 @@ fn read_byte_offset(args: &IntrinsicArgs<'_>) -> Result<usize, IntrinsicError> {
 
 fn ensure_within(
     view: &JsDataView,
+    _heap: &otter_gc::GcHeap,
     offset: usize,
     byte_count: usize,
 ) -> Result<(), IntrinsicError> {
@@ -76,14 +77,15 @@ where
     F: FnOnce(&[u8], bool, &mut otter_gc::GcHeap) -> Result<Value, IntrinsicError>,
 {
     let view = receiver(args)?;
-    check_not_detached(&view)?;
+    check_not_detached(&view, &*args.gc_heap)?;
     let offset = read_byte_offset(args)?;
-    ensure_within(&view, offset, byte_count)?;
+    ensure_within(&view, &*args.gc_heap, offset, byte_count)?;
     let little_endian = to_little_endian_flag(args.args.get(le_arg), &*args.gc_heap);
-    let buf = view.buffer().borrow_bytes();
     let abs_offset = view.byte_offset() + offset;
-    let slice = &buf[abs_offset..abs_offset + byte_count];
-    f(slice, little_endian, args.gc_heap)
+    let snapshot: Vec<u8> = view.buffer().with_bytes(&*args.gc_heap, |b| {
+        b[abs_offset..abs_offset + byte_count].to_vec()
+    });
+    f(&snapshot, little_endian, args.gc_heap)
 }
 
 fn dv_oom(err: otter_gc::OutOfMemory) -> IntrinsicError {
@@ -102,20 +104,20 @@ where
     F: FnOnce(&mut [u8], &Value, bool, &otter_gc::GcHeap),
 {
     let view = receiver(args)?;
-    check_not_detached(&view)?;
+    check_not_detached(&view, &*args.gc_heap)?;
     let offset = read_byte_offset(args)?;
-    ensure_within(&view, offset, byte_count)?;
+    ensure_within(&view, &*args.gc_heap, offset, byte_count)?;
     let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
     let little_endian = to_little_endian_flag(args.args.get(2), &*args.gc_heap);
-    let heap: &otter_gc::GcHeap = &*args.gc_heap;
-    let mut buf = view.buffer().borrow_bytes_mut();
+    // Encode the value into a small scratch buffer first so the
+    // BigInt read path (which only needs `&heap`) doesn't fight the
+    // mutable buffer borrow opened by `with_bytes_mut`.
+    let mut staging = vec![0u8; byte_count];
+    f(&mut staging, &value, little_endian, &*args.gc_heap);
     let abs_offset = view.byte_offset() + offset;
-    f(
-        &mut buf[abs_offset..abs_offset + byte_count],
-        &value,
-        little_endian,
-        heap,
-    );
+    view.buffer().with_bytes_mut(args.gc_heap, |buf| {
+        buf[abs_offset..abs_offset + byte_count].copy_from_slice(&staging);
+    });
     Ok(Value::Undefined)
 }
 
@@ -401,15 +403,15 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
 /// `byteOffset`. Routed through `Op::LoadProperty` (see §25.3.4.1
 /// — accessor properties exposed at runtime).
 #[must_use]
-pub fn load_property(view: &JsDataView, name: &str) -> Value {
-    if view.buffer().is_detached() {
+pub fn load_property(view: &JsDataView, heap: &otter_gc::GcHeap, name: &str) -> Value {
+    if view.buffer().is_detached(heap) {
         return match name {
-            "buffer" => Value::ArrayBuffer(view.buffer().clone()),
+            "buffer" => Value::ArrayBuffer(view.buffer()),
             _ => smi(0),
         };
     }
     match name {
-        "buffer" => Value::ArrayBuffer(view.buffer().clone()),
+        "buffer" => Value::ArrayBuffer(view.buffer()),
         "byteLength" => smi(view.byte_length() as i32),
         "byteOffset" => smi(view.byte_offset() as i32),
         _ => Value::Undefined,

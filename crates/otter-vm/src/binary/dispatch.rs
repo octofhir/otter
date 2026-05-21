@@ -210,18 +210,19 @@ pub fn shared_array_buffer_call_with_roots(
 pub fn data_view_call(
     method: otter_bytecode::method_id::DataViewMethod,
     args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::DataViewMethod as M;
     match method {
         M::Construct => {
             let buffer = match args.first() {
-                Some(Value::ArrayBuffer(b)) => b.clone(),
+                Some(Value::ArrayBuffer(b)) => *b,
                 _ => return Err(VmError::TypeMismatch),
             };
-            if buffer.is_detached() {
+            if buffer.is_detached(gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
-            let buffer_byte_length = buffer.byte_length();
+            let buffer_byte_length = buffer.byte_length(gc_heap);
             let byte_offset = match args.get(1) {
                 None | Some(Value::Undefined) => 0u64,
                 Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
@@ -333,7 +334,8 @@ fn construct_typed_array_with_roots(
             new_zeroed_typed_array_with_roots(kind, 0, gc_heap, external_visit)
         }
         Some(Value::ArrayBuffer(buf)) => {
-            if buf.is_detached() {
+            let buf = *buf;
+            if buf.is_detached(gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
             let byte_offset = match args.get(1) {
@@ -343,7 +345,7 @@ fn construct_typed_array_with_roots(
             if !byte_offset.is_multiple_of(bpe) {
                 return Err(VmError::TypeMismatch);
             }
-            let buf_len = buf.byte_length();
+            let buf_len = buf.byte_length(gc_heap);
             if byte_offset > buf_len {
                 return Err(VmError::TypeMismatch);
             }
@@ -364,17 +366,17 @@ fn construct_typed_array_with_roots(
                 }
             };
             Ok(Value::TypedArray(JsTypedArray::new(
-                buf.clone(),
+                buf,
                 kind,
                 byte_offset,
                 length,
             )))
         }
         Some(Value::TypedArray(src)) => {
-            if src.buffer().is_detached() {
+            if src.buffer().is_detached(gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
-            let len = src.length();
+            let len = src.length(gc_heap);
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v = src.get(gc_heap, i).map_err(oom_to_vm)?;
@@ -424,10 +426,10 @@ fn from_static_with_roots(
     let source = args.first().cloned().unwrap_or(Value::Undefined);
     match source {
         Value::TypedArray(src) => {
-            if src.buffer().is_detached() {
+            if src.buffer().is_detached(gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
-            let len = src.length();
+            let len = src.length(gc_heap);
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v = src.get(gc_heap, i).map_err(oom_to_vm)?;
@@ -543,8 +545,9 @@ pub fn snapshot_elements(
     t: &JsTypedArray,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<Vec<Value>, otter_gc::OutOfMemory> {
-    let mut out = Vec::with_capacity(t.length());
-    for i in 0..t.length() {
+    let len = t.length(heap);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
         out.push(t.get(heap, i)?);
     }
     Ok(out)
@@ -572,9 +575,18 @@ mod tests {
         .expect("array buffer");
 
         assert!(matches!(value, Value::ArrayBuffer(_)));
-        assert_eq!(heap.tracked_bytes() - before, 64);
+        // `tracked_bytes` is heap-allocated payload + external
+        // reservations; the GC body adds its own header/payload
+        // overhead on top of the 64-byte backing store.
+        let after = heap.tracked_bytes();
+        assert!(after - before >= 64);
         drop(value);
-        assert_eq!(heap.tracked_bytes(), before);
+        // The backing store stays accounted until the GC body that
+        // owns the `ExternalMemory` token is collected. After full
+        // GC, the external reservation is released even if the
+        // body's own heap page is retained.
+        heap.collect_full(&mut |_| {});
+        assert!(heap.tracked_bytes() <= after - 64);
     }
 
     #[test]
@@ -594,9 +606,11 @@ mod tests {
         .expect("typed array");
 
         assert!(matches!(value, Value::TypedArray(_)));
-        assert_eq!(heap.tracked_bytes() - before, 8);
+        let after = heap.tracked_bytes();
+        assert!(after - before >= 8);
         drop(value);
-        assert_eq!(heap.tracked_bytes(), before);
+        heap.collect_full(&mut |_| {});
+        assert!(heap.tracked_bytes() <= after - 8);
     }
 
     #[test]
@@ -622,10 +636,14 @@ mod tests {
             panic!("expected array buffer");
         };
         assert!(buffer.is_shared());
-        assert_eq!(buffer.shared_external_bytes_for_test(), Some(64));
-        assert_eq!(heap.tracked_bytes(), 64);
-        drop(buffer);
-        assert_eq!(heap.tracked_bytes(), 0);
+        assert_eq!(buffer.shared_external_bytes_for_test(&heap), Some(64));
+        let after = heap.tracked_bytes();
+        assert!(after >= 64);
+        // `buffer` is a `Copy` GC handle; the body it points at is
+        // unreachable from any root, so a full GC collects it and
+        // releases the external reservation.
+        heap.collect_full(&mut |_| {});
+        assert!(heap.tracked_bytes() <= after - 64);
     }
 
     #[test]
@@ -657,10 +675,11 @@ mod tests {
             panic!("expected array buffer");
         };
         assert!(buffer.is_shared());
-        assert!(buffer.is_growable());
-        assert_eq!(buffer.shared_external_bytes_for_test(), Some(128));
-        assert_eq!(heap.tracked_bytes() - before, 128);
-        drop(buffer);
-        assert_eq!(heap.tracked_bytes(), before);
+        assert!(buffer.is_growable(&heap));
+        assert_eq!(buffer.shared_external_bytes_for_test(&heap), Some(128));
+        let after = heap.tracked_bytes();
+        assert!(after - before >= 128);
+        heap.collect_full(&mut |_| {});
+        assert!(heap.tracked_bytes() <= after - 128);
     }
 }

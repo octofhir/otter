@@ -710,11 +710,11 @@ fn native_get_own_property_descriptor_rooted(
         Some(Value::TypedArray(target)) => match &key {
             PropertyKey::String(k) => {
                 if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(k) {
-                    if target.buffer().is_detached()
+                    if target.buffer().is_detached(ctx.heap())
                         || !n.is_finite()
                         || n.fract() != 0.0
                         || n < 0.0
-                        || (n as usize) >= target.length()
+                        || (n as usize) >= target.length(ctx.heap())
                     {
                         None
                     } else {
@@ -2231,11 +2231,11 @@ pub fn call(
                             if let Some(n) =
                                 crate::property_dispatch::canonical_numeric_index_string(k)
                             {
-                                if t.buffer().is_detached()
+                                if t.buffer().is_detached(gc_heap)
                                     || !n.is_finite()
                                     || n.fract() != 0.0
                                     || n < 0.0
-                                    || (n as usize) >= t.length()
+                                    || (n as usize) >= t.length(gc_heap)
                                     || descriptor.configurable == Some(false)
                                     || descriptor.enumerable == Some(false)
                                     || descriptor.writable == Some(false)

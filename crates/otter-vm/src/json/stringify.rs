@@ -401,7 +401,8 @@ fn emit_value(
                 });
             }
             out.push('[');
-            for i in 0..ta.length() {
+            let len = ta.length(gc_heap);
+            for i in 0..len {
                 if i > 0 {
                     out.push(',');
                 }

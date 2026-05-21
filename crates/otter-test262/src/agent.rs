@@ -217,12 +217,12 @@ fn run_agent_source(source: String) {
 // $262.agent.broadcast(sab, num?)
 // =====================================================================
 
-fn agent_broadcast(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let sab_value = args.first().unwrap_or(&Value::Undefined);
     let Value::ArrayBuffer(buf) = sab_value else {
         return Err(type_err("first argument must be a SharedArrayBuffer"));
     };
-    let Some(shared) = buf.as_shared_arc() else {
+    let Some(shared) = buf.as_shared_arc(ctx.heap()) else {
         return Err(type_err("first argument must be a SharedArrayBuffer"));
     };
     let num = match args.get(1) {
@@ -230,10 +230,7 @@ fn agent_broadcast(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         Some(Value::Number(n)) => Some(n.as_f64()),
         _ => return Err(type_err("second argument must be a Number or omitted")),
     };
-    let msg = BroadcastMessage {
-        sab: Arc::clone(shared),
-        num,
-    };
+    let msg = BroadcastMessage { sab: shared, num };
     // Capture sender list under lock then drop the lock before
     // sending so a slow recv does not stall other broadcasts.
     let senders: Vec<mpsc::Sender<BroadcastMessage>> = {
@@ -287,7 +284,9 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let exec = exec.ok_or_else(|| type_err("missing execution context"))?;
 
     // Rewrap the shared buffer on this agent's heap.
-    let sab_value = Value::ArrayBuffer(JsArrayBuffer::from_shared_arc(msg.sab));
+    let sab_handle = JsArrayBuffer::from_shared_arc(interp.gc_heap_mut(), msg.sab)
+        .map_err(|_| type_err("out of memory while wrapping SharedArrayBuffer"))?;
+    let sab_value = Value::ArrayBuffer(sab_handle);
 
     let num_value = match msg.num {
         Some(n) => Value::Number(NumberValue::from_f64(n)),

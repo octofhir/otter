@@ -289,7 +289,7 @@ fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 
 fn sab_growable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get SharedArrayBuffer.prototype.growable")?;
-    Ok(Value::Boolean(b.is_shared() && b.is_resizable()))
+    Ok(Value::Boolean(b.is_shared() && b.is_growable(ctx.heap())))
 }
 
 /// Install `SharedArrayBuffer.prototype[@@toStringTag] = "SharedArrayBuffer"`.
@@ -500,27 +500,29 @@ fn install_accessor(
 
 fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.byteLength")?;
-    if b.is_detached() {
+    if b.is_detached(ctx.heap()) {
         return Ok(Value::Number(NumberValue::from_i32(0)));
     }
-    Ok(Value::Number(NumberValue::from_i32(b.byte_length() as i32)))
+    Ok(Value::Number(NumberValue::from_i32(
+        b.byte_length(ctx.heap()) as i32,
+    )))
 }
 
 fn ab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.maxByteLength")?;
     Ok(Value::Number(NumberValue::from_i32(
-        b.max_byte_length() as i32
+        b.max_byte_length(ctx.heap()) as i32,
     )))
 }
 
 fn ab_resizable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.resizable")?;
-    Ok(Value::Boolean(b.is_resizable()))
+    Ok(Value::Boolean(b.is_resizable(ctx.heap())))
 }
 
 fn ab_detached(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.detached")?;
-    Ok(Value::Boolean(b.is_detached()))
+    Ok(Value::Boolean(b.is_detached(ctx.heap())))
 }
 
 fn receiver_ab(
@@ -528,7 +530,7 @@ fn receiver_ab(
     name: &'static str,
 ) -> Result<crate::binary::array_buffer::JsArrayBuffer, NativeError> {
     match ctx.this_value() {
-        Value::ArrayBuffer(b) => Ok(b.clone()),
+        Value::ArrayBuffer(b) => Ok(*b),
         _ => Err(NativeError::TypeError {
             name,
             reason: "this is not an ArrayBuffer".to_string(),

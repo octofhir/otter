@@ -1586,7 +1586,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let ta_value = Value::TypedArray(t.clone());
         let kind = t.kind();
-        let len = t.length();
+        let len = t.length(&self.gc_heap);
         let elements: Vec<Value> = {
             let mut tmp = Vec::with_capacity(len);
             for i in 0..len {
@@ -1801,7 +1801,7 @@ impl Interpreter {
         })?;
         let view = crate::binary::typed_array::JsTypedArray::new(new_buf, kind, 0, values.len());
         for (i, value) in values.iter().enumerate() {
-            view.set(&self.gc_heap, i, value);
+            view.set(&mut self.gc_heap, i, value);
         }
         Ok(Value::TypedArray(view))
     }

@@ -1382,6 +1382,9 @@ impl Value {
             Value::BigInt(big) => {
                 big.trace_value_slots(visitor);
             }
+            Value::ArrayBuffer(buf) => {
+                buf.trace_value_slots(visitor);
+            }
             _ => {}
         }
     }
@@ -1701,7 +1704,7 @@ impl PartialEq for Value {
             (Value::FinalizationRegistry(a), Value::FinalizationRegistry(b)) => a == b,
             (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(*b),
             (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(*b),
-            (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(b),
+            (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(*b),
             (Value::DataView(a), Value::DataView(b)) => a.ptr_eq(b),
             (Value::TypedArray(a), Value::TypedArray(b)) => a.ptr_eq(b),
             (Value::Generator(a), Value::Generator(b)) => a.ptr_eq(b),

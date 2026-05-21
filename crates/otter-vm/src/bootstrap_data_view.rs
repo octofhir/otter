@@ -183,8 +183,9 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    let value = crate::binary::dispatch::data_view_call(DataViewMethod::Construct, args)
-        .map_err(|e| vm_to_native(e, "DataView"))?;
+    let value =
+        crate::binary::dispatch::data_view_call(DataViewMethod::Construct, args, ctx.heap())
+            .map_err(|e| vm_to_native(e, "DataView"))?;
     // §10.1.13 GetPrototypeFromConstructor — derived `super()`
     // construction forwards `new.target`, so the allocated exotic
     // receives `Subclass.prototype` as its observable [[Prototype]].
@@ -363,12 +364,12 @@ fn install_accessor(
 
 fn dv_get_buffer(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.buffer")?;
-    Ok(Value::ArrayBuffer(view.buffer().clone()))
+    Ok(Value::ArrayBuffer(view.buffer()))
 }
 
 fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteLength")?;
-    if view.buffer().is_detached() {
+    if view.buffer().is_detached(ctx.heap()) {
         return Ok(Value::Number(crate::number::NumberValue::from_i32(0)));
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(
@@ -378,7 +379,7 @@ fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
 
 fn dv_get_byte_offset(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteOffset")?;
-    if view.buffer().is_detached() {
+    if view.buffer().is_detached(ctx.heap()) {
         return Ok(Value::Number(crate::number::NumberValue::from_i32(0)));
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(

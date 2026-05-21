@@ -36,11 +36,58 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use otter_gc::raw::SlotVisitor;
+
 use crate::string::{JsString, StringError, StringHeap};
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for the GC-managed
+/// migration target of [`SymbolBody`].
+///
+/// Once the wrapper migrates from `Rc<SymbolBody>` to
+/// `Gc<SymbolBody>`, [`SymbolHandle`] becomes the canonical
+/// identity carrier and the legacy `Rc`-based [`JsSymbol`] retires.
+pub const SYMBOL_BODY_TYPE_TAG: u8 = 0x26;
+
+/// 4-byte compressed GC handle to a [`SymbolBody`]. `Copy`.
+///
+/// The legacy wrapper [`JsSymbol`] still routes through
+/// `Rc<SymbolBody>` to keep existing callers compileable while the
+/// migration is staged. New code that needs an identity-bearing
+/// symbol reference packed inside an eight-byte tagged
+/// [`crate::value::Value`] uses this handle through
+/// [`crate::value::Value::symbol_gc`] /
+/// [`crate::value::Value::as_symbol_gc`].
+pub type SymbolHandle = otter_gc::Gc<SymbolBody>;
+
+/// Allocate a `SymbolBody` on the GC heap.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_symbol(
+    heap: &mut otter_gc::GcHeap,
+    description: Option<JsString>,
+    well_known: Option<WellKnown>,
+    registered: bool,
+) -> Result<SymbolHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(SymbolBody {
+        description,
+        well_known,
+        registered,
+    })
+}
 
 /// One `Symbol` body — the shared identity bearer. Cloning a
 /// [`JsSymbol`] keeps the same `Rc`, so `ptr_eq` is the truth-bearer
 /// for `===`.
+///
+/// Implements [`otter_gc::SafeTraceable`] so the body can live on the
+/// GC heap via [`SymbolHandle`] alongside the legacy `Rc`-shared
+/// form during the value-model migration. The trace impl is
+/// currently a no-op because `description: Option<JsString>` still
+/// holds an `Arc<StringRepr>` rather than a GC handle; once the
+/// `JsString` wrapper migrates onto the GC heap, this trace will
+/// need to walk the inner `Gc` slot.
 #[derive(Debug)]
 pub struct SymbolBody {
     /// Optional human-readable description, exposed through
@@ -60,6 +107,17 @@ pub struct SymbolBody {
     /// symbols are shared through the global registry and cannot be
     /// used as WeakMap / WeakSet keys.
     pub registered: bool,
+}
+
+impl otter_gc::SafeTraceable for SymbolBody {
+    const TYPE_TAG: u8 = SYMBOL_BODY_TYPE_TAG;
+
+    /// `description` is still `Arc<StringRepr>` rather than a GC
+    /// handle, so this trace currently yields no slots. Once
+    /// `JsString` migrates to a `Gc<JsStringBody>` storage, this
+    /// must surface the inner handle so the marker visits string
+    /// bodies reachable from live symbols.
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 /// Heap handle for [`Value::Symbol`].

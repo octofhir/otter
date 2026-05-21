@@ -57,6 +57,7 @@ use crate::object::{JsObject, ObjectBody};
 use crate::promise::{JsPromiseHandle, PurePromise, PurePromiseBody};
 use crate::regexp::{JsRegExp, JsRegExpBody};
 use crate::string::{JsStringBody, JsStringHandle};
+use crate::symbol::{SymbolBody, SymbolHandle};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
 use crate::{
     BoundFunction, BoundFunctionBody, ClassConstructor, ClassConstructorBody, IteratorHandle,
@@ -393,6 +394,15 @@ impl Value {
     #[must_use]
     pub fn big_int_gc(b: BigIntHandle) -> Self {
         Self(pack(TAG_PTR_OTHER, b.offset() as u64))
+    }
+
+    /// GC-managed Symbol body handle. Migration target for the
+    /// legacy `JsSymbol { body: Rc<SymbolBody> }` wrapper.
+    /// See `docs/value-cutover-plan.md` step 3.
+    #[inline]
+    #[must_use]
+    pub fn symbol_gc(s: SymbolHandle) -> Self {
+        Self(pack(TAG_PTR_OTHER, s.offset() as u64))
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1041,6 +1051,25 @@ impl Value {
             && self.read_gc_type_tag()
                 == Some(<BigIntBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
+
+    /// GC-managed Symbol body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_symbol_gc(self) -> Option<SymbolHandle> {
+        if top_tag(self.0) != TAG_PTR_OTHER {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<SymbolBody>()
+    }
+
+    /// `true` when the value is a GC-managed Symbol body.
+    #[inline]
+    #[must_use]
+    pub fn is_symbol_gc(self) -> bool {
+        top_tag(self.0) == TAG_PTR_OTHER
+            && self.read_gc_type_tag()
+                == Some(<SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
 }
 
 /// Default to `undefined`.
@@ -1200,6 +1229,35 @@ mod tests {
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
         assert_eq!(v.as_closure(), None);
+    }
+
+    #[test]
+    fn symbol_gc_round_trip_via_real_heap_and_disambiguates_from_bigint() {
+        use crate::bigint::alloc_big_int;
+        use crate::symbol::{WellKnown, alloc_symbol};
+        use num_bigint::BigInt;
+        use otter_gc::GcHeap;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let sym = alloc_symbol(&mut heap, None, Some(WellKnown::Iterator), false).expect("sym");
+        let big = alloc_big_int(&mut heap, BigInt::from(7)).expect("big");
+
+        let vsym = Value::symbol_gc(sym);
+        let vbig = Value::big_int_gc(big);
+
+        // Both share TAG_PTR_OTHER but disambiguate via GcHeader::type_tag.
+        assert!(vsym.is_other_primitive());
+        assert!(vbig.is_other_primitive());
+        assert!(vsym.is_symbol_gc());
+        assert!(!vsym.is_big_int_gc());
+        assert!(vbig.is_big_int_gc());
+        assert!(!vbig.is_symbol_gc());
+
+        // Each accessor recovers its own body and rejects the foreign one.
+        assert_eq!(vsym.as_symbol_gc(), Some(sym));
+        assert_eq!(vsym.as_big_int_gc(), None);
+        assert_eq!(vbig.as_big_int_gc(), Some(big));
+        assert_eq!(vbig.as_symbol_gc(), None);
     }
 
     #[test]

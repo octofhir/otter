@@ -597,23 +597,34 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         }
         let target = proxy_target_arg(args)?;
         let handler = proxy_handler_arg(args)?;
-        Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
+        let proxy = crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
+            NativeError::TypeError {
+                name: "Proxy",
+                reason: "out of memory while allocating proxy".to_string(),
+            }
+        })?;
+        Ok(Value::Proxy(proxy))
     }
 
     fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let target = proxy_target_arg(args)?;
         let handler = proxy_handler_arg(args)?;
-        let proxy = crate::proxy::JsProxy::new(target, handler);
-        let proxy_value = Value::Proxy(proxy.clone());
+        let proxy = crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
+            NativeError::TypeError {
+                name: "Proxy.revocable",
+                reason: "out of memory while allocating proxy".to_string(),
+            }
+        })?;
+        let proxy_value = Value::Proxy(proxy);
         let revoke = ctx
             .native_value_with_captures(
                 "revoke",
                 smallvec::smallvec![proxy_value.clone()],
                 &[],
                 &[args],
-                move |_, _, captures| {
+                move |ctx, _, captures| {
                     if let Some(Value::Proxy(proxy)) = captures.first() {
-                        proxy.revoke();
+                        proxy.revoke(ctx.heap_mut());
                     }
                     Ok(Value::Undefined)
                 },
@@ -628,7 +639,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 name: "Proxy.revocable",
                 reason: "out of memory while creating result object".to_string(),
             })?;
-        object::set(obj, ctx.heap_mut(), "proxy", Value::Proxy(proxy));
+        object::set(obj, ctx.heap_mut(), "proxy", proxy_value);
         object::set(obj, ctx.heap_mut(), "revoke", revoke);
         Ok(Value::Object(obj))
     }

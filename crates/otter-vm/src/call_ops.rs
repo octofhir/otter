@@ -625,7 +625,7 @@ impl Interpreter {
         // trap when present; otherwise call through to the
         // target as a function.
         if let Value::Proxy(p) = &current {
-            let proxy = p.clone();
+            let proxy = *p;
             let argv_array = self.alloc_stack_rooted_array_from_values(
                 stack,
                 effective_args.iter().cloned(),
@@ -633,7 +633,7 @@ impl Interpreter {
                 effective_args.as_slice(),
             )?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(),
+                proxy.target(&self.gc_heap),
                 effective_this.clone(),
                 Value::Array(argv_array),
             ];
@@ -641,9 +641,9 @@ impl Interpreter {
                 Some(v) => v,
                 None => {
                     // Fall through to the target's [[Call]] —
-                    // `proxy.target()` returns the original Value,
+                    // `proxy.target(&self.gc_heap)` returns the original Value,
                     // which may be a callable directly.
-                    let underlying = proxy.target();
+                    let underlying = proxy.target(&self.gc_heap);
                     self.run_callable_sync(context, &underlying, effective_this, effective_args)?
                 }
             };
@@ -869,15 +869,18 @@ impl Interpreter {
         // routes through the `construct` trap when present;
         // otherwise delegates to the target.
         if let Value::Proxy(p) = &callee {
-            let proxy = p.clone();
+            let proxy = *p;
             let argv_array = self.alloc_stack_rooted_array_from_values(
                 stack,
                 args.iter().cloned(),
                 &[&callee, &new_target],
                 args.as_slice(),
             )?;
-            let trap_args: SmallVec<[Value; 8]> =
-                smallvec::smallvec![proxy.target(), Value::Array(argv_array), new_target.clone(),];
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                proxy.target(&self.gc_heap),
+                Value::Array(argv_array),
+                new_target.clone(),
+            ];
             let result = match self.invoke_proxy_trap(context, &proxy, "construct", trap_args)? {
                 Some(v) => {
                     // §10.5.13 step 9 — trap result must be an Object;
@@ -894,7 +897,12 @@ impl Interpreter {
                     // target via `run_construct_sync`, which honours
                     // bound/proxy/native paths and re-checks the
                     // constructor-return invariants.
-                    self.run_construct_sync(context, &proxy.target(), new_target.clone(), args)?
+                    self.run_construct_sync(
+                        context,
+                        &proxy.target(&self.gc_heap),
+                        new_target.clone(),
+                        args,
+                    )?
                 }
             };
             let top_idx = stack.len() - 1;
@@ -1238,14 +1246,14 @@ impl Interpreter {
                 // surrounding loop. §10.5.1 revocation check.
                 // <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-call-thisargument-argumentslist>
                 Value::Proxy(ref proxy) => {
-                    if proxy.is_revoked() {
+                    if proxy.is_revoked(&self.gc_heap) {
                         return Err(VmError::TypeError {
                             message: "Cannot perform 'apply' on a proxy that has been revoked"
                                 .to_string(),
                         });
                     }
                     hops += 1;
-                    let handler = proxy.handler();
+                    let handler = proxy.handler(&self.gc_heap);
                     let trap_key = VmPropertyKey::String("apply");
                     let trap_value = match self.ordinary_get_value(
                         context,
@@ -1270,14 +1278,14 @@ impl Interpreter {
                                 &[effective_args.as_slice()],
                             )?;
                             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                                proxy.target(),
+                                proxy.target(&self.gc_heap),
                                 effective_this.clone(),
                                 Value::Array(argv_array),
                             ];
                             return self.run_callable_sync(context, &trap, handler, trap_args);
                         }
                         Value::Undefined | Value::Null => {
-                            current = proxy.target();
+                            current = proxy.target(&self.gc_heap);
                         }
                         _ => {
                             return Err(VmError::TypeError {
@@ -1414,14 +1422,14 @@ impl Interpreter {
                 // may be another Proxy, hence the loop.
                 // <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-construct-argumentslist-newtarget>
                 Value::Proxy(proxy) => {
-                    if proxy.is_revoked() {
+                    if proxy.is_revoked(&self.gc_heap) {
                         return Err(VmError::TypeError {
                             message: "Cannot perform 'construct' on a proxy that has been revoked"
                                 .to_string(),
                         });
                     }
                     hops += 1;
-                    let handler = proxy.handler();
+                    let handler = proxy.handler(&self.gc_heap);
                     let trap_key = VmPropertyKey::String("construct");
                     let trap_value = match self.ordinary_get_value(
                         context,
@@ -1440,7 +1448,7 @@ impl Interpreter {
                     };
                     match trap_value {
                         trap if self.is_callable_runtime(&trap) => {
-                            let target_value = proxy.target();
+                            let target_value = proxy.target(&self.gc_heap);
                             let argv_array = self.alloc_runtime_rooted_array_from_values(
                                 effective_args.iter().cloned(),
                                 &[
@@ -1467,7 +1475,7 @@ impl Interpreter {
                             return Ok(result);
                         }
                         Value::Undefined | Value::Null => {
-                            current = proxy.target();
+                            current = proxy.target(&self.gc_heap);
                         }
                         _ => {
                             return Err(VmError::TypeError {

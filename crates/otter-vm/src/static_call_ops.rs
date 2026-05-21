@@ -1646,13 +1646,17 @@ impl Interpreter {
             M::Construct => {
                 let target = coerce_proxy_target(args.first())?;
                 let handler = coerce_proxy_target(args.get(1))?;
-                Ok(Value::Proxy(crate::proxy::JsProxy::new(target, handler)))
+                let proxy = crate::proxy::JsProxy::new(&mut self.gc_heap, target, handler)
+                    .map_err(crate::oom_to_vm)?;
+                Ok(Value::Proxy(proxy))
             }
             M::Revocable => {
                 let target = coerce_proxy_target(args.first())?;
                 let handler = coerce_proxy_target(args.get(1))?;
-                let proxy = crate::proxy::JsProxy::new(target.clone(), handler.clone());
-                let proxy_value = Value::Proxy(proxy.clone());
+                let proxy =
+                    crate::proxy::JsProxy::new(&mut self.gc_heap, target.clone(), handler.clone())
+                        .map_err(crate::oom_to_vm)?;
+                let proxy_value = Value::Proxy(proxy);
                 let target_root = target;
                 let handler_root = handler;
                 let roots = self.collect_allocation_roots(stack);
@@ -1671,9 +1675,9 @@ impl Interpreter {
                     "revoke",
                     smallvec::smallvec![proxy_value.clone()],
                     &mut external_visit,
-                    move |_, _, captures| {
+                    move |ctx, _, captures| {
                         if let Some(Value::Proxy(proxy)) = captures.first() {
-                            proxy.revoke();
+                            proxy.revoke(ctx.heap_mut());
                         }
                         Ok(Value::Undefined)
                     },
@@ -1683,7 +1687,7 @@ impl Interpreter {
                     &[&proxy_value, &revoke],
                     args,
                 )?;
-                self.set_property(obj, "proxy", Value::Proxy(proxy))?;
+                self.set_property(obj, "proxy", proxy_value)?;
                 self.set_property(obj, "revoke", revoke)?;
                 Ok(Value::Object(obj))
             }

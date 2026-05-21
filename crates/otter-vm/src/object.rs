@@ -166,7 +166,7 @@ impl ObjectPrototype {
             Self::Null => None,
             Self::Object(obj) => Some(Value::Object(*obj)),
             Self::Value(value) => Some(value.clone()),
-            Self::Proxy(proxy) => Some(Value::Proxy(proxy.clone())),
+            Self::Proxy(proxy) => Some(Value::Proxy(*proxy)),
         }
     }
 }
@@ -1662,7 +1662,7 @@ fn prototype_same(a: &ObjectPrototype, b: &ObjectPrototype) -> bool {
     match (a, b) {
         (ObjectPrototype::Null, ObjectPrototype::Null) => true,
         (ObjectPrototype::Object(x), ObjectPrototype::Object(y)) => x == y,
-        (ObjectPrototype::Proxy(x), ObjectPrototype::Proxy(y)) => x.ptr_eq(y),
+        (ObjectPrototype::Proxy(x), ObjectPrototype::Proxy(y)) => x.ptr_eq(*y),
         (ObjectPrototype::Value(x), ObjectPrototype::Value(y)) => same_prototype_value(x, y),
         _ => false,
     }

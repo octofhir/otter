@@ -1705,7 +1705,7 @@ impl PartialEq for Value {
             (Value::DataView(a), Value::DataView(b)) => a.ptr_eq(b),
             (Value::TypedArray(a), Value::TypedArray(b)) => a.ptr_eq(b),
             (Value::Generator(a), Value::Generator(b)) => a.ptr_eq(b),
-            (Value::Proxy(a), Value::Proxy(b)) => a.ptr_eq(b),
+            (Value::Proxy(a), Value::Proxy(b)) => a.ptr_eq(*b),
             _ => false,
         }
     }
@@ -9412,10 +9412,14 @@ mod tests {
             Value::Number(NumberValue::Smi(42)),
         );
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(
-            Value::Object(target),
-            Value::Object(handler),
-        ));
+        let proxy = Value::Proxy(
+            crate::proxy::JsProxy::new(
+                interp.gc_heap_mut(),
+                Value::Object(target),
+                Value::Object(handler),
+            )
+            .unwrap(),
+        );
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -9465,7 +9469,10 @@ mod tests {
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, Value::Object(handler)));
+        let proxy = Value::Proxy(
+            crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::Object(handler))
+                .unwrap(),
+        );
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -9540,10 +9547,14 @@ mod tests {
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_proxy_arg).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(
-            Value::Function { function_id: 1 },
-            Value::Object(handler),
-        ));
+        let proxy = Value::Proxy(
+            crate::proxy::JsProxy::new(
+                interp.gc_heap_mut(),
+                Value::Function { function_id: 1 },
+                Value::Object(handler),
+            )
+            .unwrap(),
+        );
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -9587,7 +9598,10 @@ mod tests {
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(target, Value::Object(handler)));
+        let proxy = Value::Proxy(
+            crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::Object(handler))
+                .unwrap(),
+        );
         let args: SmallVec<[Value; 8]> = smallvec::smallvec![
             Value::Number(NumberValue::Smi(3)),
             Value::Number(NumberValue::Smi(5)),
@@ -9699,10 +9713,14 @@ mod tests {
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_argv_array).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
-        let proxy = Value::Proxy(crate::proxy::JsProxy::new(
-            Value::Function { function_id: 1 },
-            Value::Object(handler),
-        ));
+        let proxy = Value::Proxy(
+            crate::proxy::JsProxy::new(
+                interp.gc_heap_mut(),
+                Value::Function { function_id: 1 },
+                Value::Object(handler),
+            )
+            .unwrap(),
+        );
         let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::Number(NumberValue::Smi(13))];
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;

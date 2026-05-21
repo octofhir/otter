@@ -295,7 +295,7 @@ pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc
         // non-constructor here; the per-trap revocation guard
         // produces the spec-required TypeError on actual call.
         Value::Proxy(proxy) => {
-            !proxy.is_revoked() && is_constructor(&proxy.target(), context, heap)
+            !proxy.is_revoked(heap) && is_constructor(&proxy.target(heap), context, heap)
         }
         _ => false,
     }

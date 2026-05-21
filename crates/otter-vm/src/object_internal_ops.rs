@@ -180,10 +180,10 @@ impl Interpreter {
         trap: &str,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Option<Value>, VmError> {
-        if proxy.is_revoked() {
+        if proxy.is_revoked(&self.gc_heap) {
             return Err(VmError::TypeMismatch);
         }
-        let handler = proxy.handler();
+        let handler = proxy.handler(&self.gc_heap);
         let trap_key = VmPropertyKey::String(trap);
         let trap_value = match self.ordinary_get_value(
             context,
@@ -459,7 +459,7 @@ impl Interpreter {
             Value::Proxy(proxy) => {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(), key_value];
+                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
                 match self.invoke_proxy_trap(
                     context,
                     &proxy,
@@ -470,13 +470,13 @@ impl Interpreter {
                         let target_desc = self
                             .ordinary_get_own_property_descriptor_value_with_roots(
                                 context,
-                                proxy.target(),
+                                proxy.target(&self.gc_heap),
                                 key,
                                 hops + 1,
                                 allocation_roots,
                             )?;
                         self.validate_proxy_get_own_property_descriptor(
-                            &proxy.target(),
+                            &proxy.target(&self.gc_heap),
                             target_desc.as_ref(),
                             None,
                         )?;
@@ -489,13 +489,13 @@ impl Interpreter {
                         let target_desc = self
                             .ordinary_get_own_property_descriptor_value_with_roots(
                                 context,
-                                proxy.target(),
+                                proxy.target(&self.gc_heap),
                                 key,
                                 hops + 1,
                                 allocation_roots,
                             )?;
                         self.validate_proxy_get_own_property_descriptor(
-                            &proxy.target(),
+                            &proxy.target(&self.gc_heap),
                             target_desc.as_ref(),
                             Some(&desc),
                         )?;
@@ -508,7 +508,7 @@ impl Interpreter {
                     }),
                     None => self.ordinary_get_own_property_descriptor_value_with_roots(
                         context,
-                        proxy.target(),
+                        proxy.target(&self.gc_heap),
                         key,
                         hops + 1,
                         allocation_roots,
@@ -729,7 +729,8 @@ impl Interpreter {
         }
         match value {
             Value::Proxy(proxy) => {
-                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&self.gc_heap)];
                 match self.invoke_proxy_trap(context, &proxy, "getPrototypeOf", trap_args)? {
                     Some(result) => {
                         if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
@@ -739,7 +740,10 @@ impl Interpreter {
                             });
                         }
                         if let Some(target_proto) = self
-                            .proxy_get_prototype_invariant_target_proto(context, &proxy.target())?
+                            .proxy_get_prototype_invariant_target_proto(
+                                context,
+                                &proxy.target(&self.gc_heap),
+                            )?
                             && !abstract_ops::same_value(&result, &target_proto, &self.gc_heap)
                         {
                             return Err(VmError::TypeError {
@@ -750,7 +754,11 @@ impl Interpreter {
                         }
                         Ok(result)
                     }
-                    None => self.ordinary_get_prototype_value(context, proxy.target(), hops + 1),
+                    None => self.ordinary_get_prototype_value(
+                        context,
+                        proxy.target(&self.gc_heap),
+                        hops + 1,
+                    ),
                 }
             }
             Value::Object(_)
@@ -816,17 +824,19 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         match value {
             Value::Proxy(proxy) => {
-                if proxy.is_revoked() {
+                if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
                         message: "Cannot perform 'isExtensible' on a proxy that has been revoked"
                             .to_string(),
                     });
                 }
-                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&self.gc_heap)];
                 match self.invoke_proxy_trap(context, proxy, "isExtensible", trap_args)? {
                     Some(result) => {
                         let trap = result.to_boolean(&self.gc_heap);
-                        let target_ext = self.is_extensible_value(context, &proxy.target())?;
+                        let target_ext =
+                            self.is_extensible_value(context, &proxy.target(&self.gc_heap))?;
                         if trap != target_ext {
                             return Err(VmError::TypeError {
                                 message:
@@ -836,7 +846,7 @@ impl Interpreter {
                         }
                         Ok(trap)
                     }
-                    None => self.is_extensible_value(context, &proxy.target()),
+                    None => self.is_extensible_value(context, &proxy.target(&self.gc_heap)),
                 }
             }
             Value::Object(obj) => Ok(object::is_extensible(*obj, &self.gc_heap)),
@@ -865,14 +875,14 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         match target {
             Value::Proxy(proxy) => {
-                if proxy.is_revoked() {
+                if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
                         message: "Cannot perform 'defineProperty' on a proxy that has been revoked"
                             .to_string(),
                     });
                 }
                 let key_value = self.vm_property_key_to_value(key)?;
-                let target_value = proxy.target();
+                let target_value = proxy.target(&self.gc_heap);
                 let descriptor_object =
                     self.partial_descriptor_to_object(&descriptor, &[&key_value, &target_value])?;
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
@@ -972,7 +982,12 @@ impl Interpreter {
                     }
                     None => {
                         // Trap missing — fall through to target.
-                        self.define_own_property_value(context, &proxy.target(), key, descriptor)
+                        self.define_own_property_value(
+                            context,
+                            &proxy.target(&self.gc_heap),
+                            key,
+                            descriptor,
+                        )
                     }
                 }
             }
@@ -1920,20 +1935,25 @@ impl Interpreter {
     ) -> Result<Vec<Value>, VmError> {
         match target {
             Value::Proxy(proxy) => {
-                if proxy.is_revoked() {
+                if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
                         message: "Cannot perform 'ownKeys' on a proxy that has been revoked"
                             .to_string(),
                     });
                 }
-                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&self.gc_heap)];
                 match self.invoke_proxy_trap(context, proxy, "ownKeys", trap_args)? {
                     Some(trap_result) => {
                         let trap_keys =
                             self.create_list_from_array_like_property_keys(context, trap_result)?;
                         self.validate_proxy_own_keys(context, proxy, trap_keys, string_heap)
                     }
-                    None => self.own_property_keys_value(context, &proxy.target(), string_heap),
+                    None => self.own_property_keys_value(
+                        context,
+                        &proxy.target(&self.gc_heap),
+                        string_heap,
+                    ),
                 }
             }
             Value::Object(obj) => {
@@ -2183,7 +2203,7 @@ impl Interpreter {
                 }
             }
         }
-        let target_value = proxy.target();
+        let target_value = proxy.target(&self.gc_heap);
         let extensible_target = self.is_extensible_value(context, &target_value)?;
         let target_keys = self.own_property_keys_value(context, &target_value, string_heap)?;
         let mut target_configurable: Vec<Value> = Vec::new();
@@ -2265,14 +2285,14 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         match target {
             Value::Proxy(proxy) => {
-                if proxy.is_revoked() {
+                if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
                         message: "Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
                             .to_string(),
                     });
                 }
                 let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(), proto.clone()];
+                    smallvec::smallvec![proxy.target(&self.gc_heap), proto.clone()];
                 match self.invoke_proxy_trap(context, proxy, "setPrototypeOf", trap_args)? {
                     Some(result) => {
                         let ok = result.to_boolean(&self.gc_heap);
@@ -2283,7 +2303,7 @@ impl Interpreter {
                         // success and the target is non-extensible,
                         // the requested prototype must equal the
                         // target's current prototype.
-                        let target_value = proxy.target();
+                        let target_value = proxy.target(&self.gc_heap);
                         let target_extensible = self.is_extensible_value(context, &target_value)?;
                         if !target_extensible {
                             let target_proto =
@@ -2298,7 +2318,11 @@ impl Interpreter {
                         }
                         Ok(true)
                     }
-                    None => self.set_prototype_value_proxy_aware(context, &proxy.target(), proto),
+                    None => self.set_prototype_value_proxy_aware(
+                        context,
+                        &proxy.target(&self.gc_heap),
+                        proto,
+                    ),
                 }
             }
             Value::Object(obj) => {
@@ -2395,18 +2419,19 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         match value {
             Value::Proxy(proxy) => {
-                if proxy.is_revoked() {
+                if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
                         message:
                             "Cannot perform 'preventExtensions' on a proxy that has been revoked"
                                 .to_string(),
                     });
                 }
-                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&self.gc_heap)];
                 match self.invoke_proxy_trap(context, proxy, "preventExtensions", trap_args)? {
                     Some(result) => {
                         let ok = result.to_boolean(&self.gc_heap);
-                        if ok && self.is_extensible_value(context, &proxy.target())? {
+                        if ok && self.is_extensible_value(context, &proxy.target(&self.gc_heap))? {
                             return Err(VmError::TypeError {
                                 message:
                                     "Proxy preventExtensions trap succeeded but target is still extensible"
@@ -2415,7 +2440,7 @@ impl Interpreter {
                         }
                         Ok(ok)
                     }
-                    None => self.prevent_extensions_value(context, &proxy.target()),
+                    None => self.prevent_extensions_value(context, &proxy.target(&self.gc_heap)),
                 }
             }
             Value::Object(obj) => {
@@ -2651,15 +2676,23 @@ impl Interpreter {
             Value::Proxy(proxy) => {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(), key_value, receiver.clone()];
+                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value, receiver.clone()];
                 match self.invoke_proxy_trap(context, &proxy, "get", trap_args)? {
                     Some(value) => {
-                        self.validate_proxy_get_invariants(&proxy.target(), key, &value)?;
+                        self.validate_proxy_get_invariants(
+                            &proxy.target(&self.gc_heap),
+                            key,
+                            &value,
+                        )?;
                         Ok(VmGetOutcome::Value(value))
                     }
-                    None => {
-                        self.ordinary_get_value(context, proxy.target(), receiver, key, hops + 1)
-                    }
+                    None => self.ordinary_get_value(
+                        context,
+                        proxy.target(&self.gc_heap),
+                        receiver,
+                        key,
+                        hops + 1,
+                    ),
                 }
             }
             Value::Array(arr) => {
@@ -3255,7 +3288,7 @@ impl Interpreter {
             Value::Proxy(proxy) => {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(), key_value];
+                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
                 match self.invoke_proxy_trap(context, &proxy, "has", trap_args)? {
                     Some(value) => {
                         let result = value.to_boolean(&self.gc_heap);
@@ -3265,7 +3298,7 @@ impl Interpreter {
                         // or be non-extensible while the property
                         // exists.
                         if !result {
-                            let target_value = proxy.target();
+                            let target_value = proxy.target(&self.gc_heap);
                             let target_desc = self
                                 .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                     context,
@@ -3297,7 +3330,7 @@ impl Interpreter {
                         Ok(result)
                     }
                     None => {
-                        self.ordinary_has_property_value(context, proxy.target(), key, hops + 1)
+                        self.ordinary_has_property_value(context, proxy.target(&self.gc_heap), key, hops + 1)
                     }
                 }
             }
@@ -3634,7 +3667,8 @@ impl Interpreter {
         }
         match target {
             Value::Proxy(proxy) => {
-                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target()];
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&self.gc_heap)];
                 let keys = match self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)? {
                     Some(Value::Array(arr)) => {
                         crate::array::with_elements(arr, &self.gc_heap, |elements| {
@@ -3644,7 +3678,7 @@ impl Interpreter {
                     Some(Value::Undefined) | Some(Value::Null) | None => {
                         return self.enumerable_own_string_keys_for_value(
                             context,
-                            proxy.target(),
+                            proxy.target(&self.gc_heap),
                             hops + 1,
                         );
                     }
@@ -3660,7 +3694,7 @@ impl Interpreter {
                         continue;
                     };
                     let name = name.to_lossy_string();
-                    let proxy_root = Value::Proxy(proxy.clone());
+                    let proxy_root = Value::Proxy(proxy);
                     let slice_roots: [&[Value]; 1] = [keys.as_slice()];
                     let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
@@ -3820,7 +3854,7 @@ impl Interpreter {
             Value::Proxy(proxy) => {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(), key_value];
+                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
                 match self.invoke_proxy_trap(context, &proxy, "deleteProperty", trap_args)? {
                     Some(value) => {
                         let result = value.to_boolean(&self.gc_heap);
@@ -3832,7 +3866,7 @@ impl Interpreter {
                         // non-configurable own property at `P`, and
                         // configurable properties may only disappear
                         // from an extensible target.
-                        let target_value = proxy.target();
+                        let target_value = proxy.target(&self.gc_heap);
                         let target_desc = self
                             .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                 context,
@@ -3862,7 +3896,12 @@ impl Interpreter {
                         }
                         Ok(true)
                     }
-                    None => self.ordinary_delete_value(context, proxy.target(), key, hops + 1),
+                    None => self.ordinary_delete_value(
+                        context,
+                        proxy.target(&self.gc_heap),
+                        key,
+                        hops + 1,
+                    ),
                 }
             }
             Value::Object(obj) => {
@@ -3933,7 +3972,7 @@ impl Interpreter {
         }
         match target {
             Value::Proxy(proxy) => {
-                if proxy.is_revoked() {
+                if proxy.is_revoked(&self.gc_heap) {
                     return Err(VmError::TypeError {
                         message: "Cannot perform 'set' on a proxy that has been revoked"
                             .to_string(),
@@ -3941,7 +3980,7 @@ impl Interpreter {
                 }
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    proxy.target(),
+                    proxy.target(&self.gc_heap),
                     key_value,
                     value.clone(),
                     receiver.clone(),
@@ -3955,7 +3994,7 @@ impl Interpreter {
                         // §10.5.9 invariants — when the trap reports
                         // success, verify the target descriptor admits
                         // the new value.
-                        let target_value = proxy.target();
+                        let target_value = proxy.target(&self.gc_heap);
                         let target_desc = self
                             .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                 context,
@@ -3997,7 +4036,7 @@ impl Interpreter {
                     }
                     None => self.ordinary_set_data_value(
                         context,
-                        proxy.target(),
+                        proxy.target(&self.gc_heap),
                         key,
                         value,
                         receiver,

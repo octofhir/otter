@@ -2748,7 +2748,7 @@ impl Interpreter {
                 Value::Proxy(proxy) => {
                     let key_value = self.vm_property_key_to_value(&key)?;
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                        proxy.target(),
+                        proxy.target(&self.gc_heap),
                         key_value,
                         value.clone(),
                         receiver.clone()
@@ -2759,7 +2759,7 @@ impl Interpreter {
                     match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                         Some(_) => {}
                         None => {
-                            let Value::Object(target) = proxy.target() else {
+                            let Value::Object(target) = proxy.target(&self.gc_heap) else {
                                 return Err(VmError::TypeMismatch);
                             };
                             match &key {
@@ -2862,7 +2862,7 @@ impl Interpreter {
             _ => return Ok(false),
         };
         if let Value::Proxy(p) = &receiver {
-            let proxy = p.clone();
+            let proxy = *p;
             let key_arg = match &key {
                 ComputedPropertyKey::String(key) => {
                     Value::String(JsString::from_str(key, &self.string_heap)?)
@@ -2870,17 +2870,17 @@ impl Interpreter {
                 ComputedPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
             };
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(),
+                proxy.target(&self.gc_heap),
                 key_arg,
                 value.clone(),
-                Value::Proxy(proxy.clone()),
+                Value::Proxy(proxy),
             ];
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(_) => {}
                 None => {
-                    let target_value = proxy.target();
+                    let target_value = proxy.target(&self.gc_heap);
                     let Value::Object(target) = target_value else {
                         let vm_key = match &key {
                             ComputedPropertyKey::String(key) => {
@@ -2893,7 +2893,7 @@ impl Interpreter {
                             target_value,
                             &vm_key,
                             value,
-                            Value::Proxy(proxy.clone()),
+                            Value::Proxy(proxy),
                             0,
                         )? {
                             Self::failed_set_result(strict, "Cannot assign to property")?;
@@ -2938,7 +2938,7 @@ impl Interpreter {
                                     stack,
                                     context,
                                     &setter,
-                                    Value::Proxy(proxy.clone()),
+                                    Value::Proxy(proxy),
                                     args,
                                     scratch_reg,
                                 )?;
@@ -3276,8 +3276,8 @@ impl Interpreter {
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
         // when present; otherwise delegate to the target.
         if let Value::Proxy(p) = &receiver {
-            let proxy = p.clone();
-            if proxy.is_revoked() {
+            let proxy = *p;
+            if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
                     message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
                 });
@@ -3285,10 +3285,10 @@ impl Interpreter {
             let key_str = JsString::from_str(name, &self.string_heap)?;
             let key_vm = VmPropertyKey::atom(atomized_key);
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                proxy.target(),
+                proxy.target(&self.gc_heap),
                 Value::String(key_str),
                 value.clone(),
-                Value::Proxy(proxy.clone()),
+                Value::Proxy(proxy),
             ];
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -3305,7 +3305,7 @@ impl Interpreter {
                     // §10.5.9 step 13–14 invariants — when trap reports
                     // success, ensure target descriptor admits the
                     // value.
-                    let target_value = proxy.target();
+                    let target_value = proxy.target(&self.gc_heap);
                     let target_desc = self
                         .ordinary_get_own_property_descriptor_value_stack_rooted(
                             context,
@@ -3344,14 +3344,14 @@ impl Interpreter {
                     }
                 }
                 None => {
-                    let target_value = proxy.target();
+                    let target_value = proxy.target(&self.gc_heap);
                     let Value::Object(target) = target_value else {
                         if !self.ordinary_set_data_value(
                             context,
                             target_value,
                             &key_vm,
                             value,
-                            Value::Proxy(proxy.clone()),
+                            Value::Proxy(proxy),
                             0,
                         )? {
                             Self::failed_set_result(
@@ -3385,7 +3385,7 @@ impl Interpreter {
                                     stack,
                                     context,
                                     &setter,
-                                    Value::Proxy(proxy.clone()),
+                                    Value::Proxy(proxy),
                                     args,
                                     scratch_reg,
                                 )?;

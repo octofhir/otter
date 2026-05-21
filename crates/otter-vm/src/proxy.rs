@@ -23,9 +23,6 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-proxy-objects>
 
-use std::cell::Cell;
-use std::rc::Rc;
-
 use crate::Value;
 use otter_gc::raw::SlotVisitor;
 
@@ -79,84 +76,105 @@ pub fn alloc_proxy(
     })
 }
 
-/// Cheap-to-clone Proxy handle.
-#[derive(Debug, Clone)]
+/// Cheap-to-copy Proxy wrapper carrying a [`ProxyHandle`].
+///
+/// ECMA-262 §28.2 Proxy state lives in the GC body. All reader /
+/// mutator entry points thread the heap explicitly — no off-heap
+/// cache, no `Cell` / `RefCell`.
+#[derive(Debug, Clone, Copy)]
 pub struct JsProxy {
-    inner: Rc<ProxyBody>,
-}
-
-/// Internal storage for a Proxy.
-#[derive(Debug)]
-pub struct ProxyBody {
-    /// Target value every trap-less operation falls through to.
-    /// Spec accepts any object, including callables — Foundation
-    /// stores the original [`Value`] so trap fallback can re-call
-    /// the underlying function directly.
-    target: Value,
-    /// Handler object trap properties live on.
-    handler: Value,
-    /// `true` once `Proxy.revocable().revoke()` has fired.
-    revoked: Cell<bool>,
+    handle: ProxyHandle,
 }
 
 impl JsProxy {
     /// Construct a proxy over `target` with `handler`.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] from the underlying
+    /// `alloc_proxy` call.
+    pub fn new(
+        heap: &mut otter_gc::GcHeap,
+        target: Value,
+        handler: Value,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self {
+            handle: alloc_proxy(heap, target, handler)?,
+        })
+    }
+
+    /// Wrap an existing GC handle (e.g. after a downcast from
+    /// [`crate::Value`]).
     #[must_use]
-    pub fn new(target: Value, handler: Value) -> Self {
-        Self {
-            inner: Rc::new(ProxyBody {
-                target,
-                handler,
-                revoked: Cell::new(false),
-            }),
-        }
+    pub fn from_handle(handle: ProxyHandle) -> Self {
+        Self { handle }
+    }
+
+    /// Raw GC handle.
+    #[must_use]
+    pub fn handle(self) -> ProxyHandle {
+        self.handle
     }
 
     /// Target value.
     #[must_use]
-    pub fn target(&self) -> Value {
-        self.inner.target.clone()
+    pub fn target(self, heap: &otter_gc::GcHeap) -> Value {
+        heap.read_payload(self.handle, |body| body.target.clone())
     }
 
     /// Handler object.
     #[must_use]
-    pub fn handler(&self) -> Value {
-        self.inner.handler.clone()
+    pub fn handler(self, heap: &otter_gc::GcHeap) -> Value {
+        heap.read_payload(self.handle, |body| body.handler.clone())
     }
 
     /// `true` once revoked.
     #[must_use]
-    pub fn is_revoked(&self) -> bool {
-        self.inner.revoked.get()
+    pub fn is_revoked(self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.handle, |body| body.revoked)
     }
 
     /// Revoke the proxy. Idempotent; subsequent calls are no-ops.
-    pub fn revoke(&self) {
-        self.inner.revoked.set(true);
+    /// Spec §28.2.2.1 RevokeProxy step 4 clears target/handler to
+    /// `null` so trap dispatch can detect revocation without an
+    /// extra heap read.
+    pub fn revoke(self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.handle, |body| {
+            body.revoked = true;
+            body.target = Value::Null;
+            body.handler = Value::Null;
+        });
     }
 
-    /// Identity comparison.
+    /// Identity comparison via the underlying handle offset.
     #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+    pub fn ptr_eq(self, other: Self) -> bool {
+        self.handle.offset() == other.handle.offset()
     }
 
-    /// `Rc` data-pointer for cycle / identity sets.
+    /// Stable identity address for cycle / identity sets.
     #[must_use]
-    pub fn identity_addr(&self) -> *const () {
-        Rc::as_ptr(&self.inner).cast()
+    pub fn identity_addr(self) -> *const () {
+        self.handle.offset() as usize as *const ()
     }
 
-    /// Trace GC handles reachable from the proxy's target and
-    /// handler slots.
+    /// Trace the embedded GC handle slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        self.inner.target.trace_value_slots(visitor);
-        self.inner.handler.trace_value_slots(visitor);
+        let p = &self.handle as *const ProxyHandle as *mut otter_gc::raw::RawGc;
+        visitor(p);
     }
 }
 
 impl PartialEq for JsProxy {
     fn eq(&self, other: &Self) -> bool {
-        self.ptr_eq(other)
+        self.ptr_eq(*other)
+    }
+}
+
+impl Eq for JsProxy {}
+
+impl std::hash::Hash for JsProxy {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.handle.offset().hash(state);
     }
 }

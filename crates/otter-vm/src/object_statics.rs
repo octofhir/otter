@@ -1866,7 +1866,7 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
         Value::Object(obj) if object_has_error_data(ctx, *obj) => "Error",
         // §7.2.2 IsArray walks `[[ProxyTarget]]` recursively so a
         // proxy whose target is an Array reports `[object Array]`.
-        Value::Proxy(_) => return proxy_builtin_tag(ctx.this_value()),
+        Value::Proxy(_) => return proxy_builtin_tag(ctx.this_value(), ctx.heap()),
         Value::Object(_) => "Object",
     }
     .to_string()
@@ -1875,7 +1875,7 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
 /// §7.2.2 IsArray + §7.2.4 IsCallable for a Proxy target. Walks the
 /// `[[ProxyTarget]]` chain until reaching a non-proxy value and
 /// returns the builtin tag of that underlying value.
-fn proxy_builtin_tag(value: &Value) -> String {
+fn proxy_builtin_tag(value: &Value, heap: &otter_gc::GcHeap) -> String {
     let mut current = value.clone();
     let mut hops = 0_usize;
     loop {
@@ -1885,10 +1885,10 @@ fn proxy_builtin_tag(value: &Value) -> String {
         hops += 1;
         match current {
             Value::Proxy(p) => {
-                if p.is_revoked() {
+                if p.is_revoked(heap) {
                     return "Object".to_string();
                 }
-                current = p.target();
+                current = p.target(heap);
             }
             Value::Array(_) => return "Array".to_string(),
             Value::Function { .. } | Value::Closure { .. } => return "Function".to_string(),

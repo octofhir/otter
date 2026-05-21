@@ -138,7 +138,7 @@ fn validate_integer_typed_array(
     method_name: &'static str,
 ) -> Result<JsTypedArray, NativeError> {
     let ta = match value {
-        Value::TypedArray(t) => t.clone(),
+        Value::TypedArray(t) => *t,
         _ => {
             return Err(type_err(
                 method_name,
@@ -674,14 +674,14 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     let ta =
         validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), true, method_name)?;
     // §25.4.3.13 Atomics.wait — buffer must be a SharedArrayBuffer.
-    if !ta.buffer().is_shared() {
+    if !ta.buffer(ctx.heap()).is_shared() {
         return Err(type_err(
             method_name,
             "expected a SharedArrayBuffer-backed TypedArray".to_string(),
         ));
     }
     let buf_id = ta
-        .buffer()
+        .buffer(ctx.heap())
         .shared_id(ctx.heap())
         .expect("is_shared() guards shared_id");
     let idx = validate_atomic_access(
@@ -813,7 +813,7 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             }
         }
     };
-    let woken = match ta.buffer().shared_id(ctx.heap()) {
+    let woken = match ta.buffer(ctx.heap()).shared_id(ctx.heap()) {
         Some(buf_id) => atomics_wait::notify_waiters(buf_id, idx, count),
         None => 0,
     };

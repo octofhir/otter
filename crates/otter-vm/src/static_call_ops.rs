@@ -1182,7 +1182,7 @@ impl Interpreter {
                     // strings produce a data descriptor for in-range
                     // elements; everything else returns no descriptor.
                     Some(Value::TypedArray(t)) => match &key {
-                        VmPropertyKey::Symbol(sym) => t.expando().and_then(|bag| {
+                        VmPropertyKey::Symbol(sym) => t.expando(&self.gc_heap).and_then(|bag| {
                             crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), sym)
                         }),
                         _ => {
@@ -1192,7 +1192,7 @@ impl Interpreter {
                             if let Some(n) =
                                 crate::property_dispatch::canonical_numeric_index_string(k)
                             {
-                                if t.buffer().is_detached(&self.gc_heap)
+                                if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                                     || !n.is_finite()
                                     || n.fract() != 0.0
                                     || n < 0.0
@@ -1208,7 +1208,7 @@ impl Interpreter {
                                         true,
                                     ))
                                 }
-                            } else if let Some(bag) = t.expando() {
+                            } else if let Some(bag) = t.expando(&self.gc_heap) {
                                 crate::object::get_own_descriptor(bag, self.gc_heap(), k)
                             } else {
                                 None

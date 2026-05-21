@@ -357,7 +357,7 @@ impl Interpreter {
             // expando bag.
             Value::TypedArray(t) => {
                 if let Some(n) = canonical_numeric_index_string(name) {
-                    if t.buffer().is_detached(&self.gc_heap) {
+                    if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
                         true
                     } else {
                         !(n.is_finite()
@@ -365,7 +365,7 @@ impl Interpreter {
                             && n >= 0.0
                             && (n as usize) < t.length(&self.gc_heap))
                     }
-                } else if let Some(bag) = t.expando() {
+                } else if let Some(bag) = t.expando(&self.gc_heap) {
                     crate::object::delete(bag, &mut self.gc_heap, name)
                 } else {
                     true
@@ -480,7 +480,7 @@ impl Interpreter {
                 let name = s.to_lossy_string();
                 match canonical_numeric_index_string(&name) {
                     Some(n) => {
-                        if t.buffer().is_detached(&self.gc_heap) {
+                        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
                             true
                         } else {
                             !(n.is_finite()
@@ -490,7 +490,7 @@ impl Interpreter {
                         }
                     }
                     None => {
-                        if let Some(bag) = t.expando() {
+                        if let Some(bag) = t.expando(&self.gc_heap) {
                             crate::object::delete(bag, &mut self.gc_heap, &name)
                         } else {
                             true
@@ -499,11 +499,11 @@ impl Interpreter {
                 }
             }
             (Value::TypedArray(t), Value::Number(n)) => {
-                t.buffer().is_detached(&self.gc_heap)
+                t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                     || !matches!(n.as_smi(), Some(v) if v >= 0 && (v as usize) < t.length(&self.gc_heap))
             }
             (Value::TypedArray(t), Value::Symbol(sym)) => {
-                if let Some(bag) = t.expando() {
+                if let Some(bag) = t.expando(&self.gc_heap) {
                     crate::object::delete_symbol(bag, &mut self.gc_heap, &sym)
                 } else {
                     true
@@ -904,7 +904,7 @@ impl Interpreter {
                 // properties (`typedArr.foo = 1`,
                 // `typedArr.constructor = X`) win over inherited
                 // defaults.
-                if let Some(bag) = t.expando()
+                if let Some(bag) = t.expando(&self.gc_heap)
                     && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
                 {
                     value
@@ -1024,7 +1024,7 @@ impl Interpreter {
             }
             Value::TypedArray(t) => {
                 if let Some(n) = canonical_numeric_index_string(name) {
-                    if !t.buffer().is_detached(&self.gc_heap)
+                    if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                         && n.is_finite()
                         && n.fract() == 0.0
                         && n >= 0.0
@@ -1038,7 +1038,7 @@ impl Interpreter {
                         t.set(&mut self.gc_heap, n as usize, &coerced);
                     }
                 } else {
-                    let t_clone = t.clone();
+                    let t_clone = *t;
                     typed_array_set_expando(self, &t_clone, name, value.clone())?;
                 }
                 None
@@ -1370,7 +1370,7 @@ impl Interpreter {
                     // expando bag first, then the prototype chain.
                     let mut value = Value::Undefined;
                     let mut found = false;
-                    if let Some(bag) = t.expando()
+                    if let Some(bag) = t.expando(&self.gc_heap)
                         && let Some(v) = crate::object::get(bag, &self.gc_heap, &name)
                     {
                         value = v;
@@ -1852,7 +1852,7 @@ impl Interpreter {
             (Value::TypedArray(t), Value::String(key)) => {
                 let name = key.to_lossy_string();
                 if let Some(n) = canonical_numeric_index_string(&name) {
-                    if t.buffer().is_detached(&self.gc_heap)
+                    if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                         || !n.is_finite()
                         || n.fract() != 0.0
                         || n < 0.0
@@ -3908,15 +3908,15 @@ pub(crate) fn typed_array_ensure_expando_pub(
     heap: &mut otter_gc::GcHeap,
     t: &crate::binary::typed_array::JsTypedArray,
 ) -> Result<JsObject, VmError> {
-    if let Some(existing) = t.expando() {
+    if let Some(existing) = t.expando(heap) {
         return Ok(existing);
     }
-    let ta_root = Value::TypedArray(t.clone());
+    let ta_root = Value::TypedArray(*t);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         ta_root.trace_value_slots(visitor);
     };
     let bag = crate::object::alloc_object_with_roots(heap, &mut external_visit)?;
-    t.set_expando(bag);
+    t.set_expando(heap, bag);
     Ok(bag)
 }
 

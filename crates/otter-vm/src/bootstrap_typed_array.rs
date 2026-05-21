@@ -472,7 +472,7 @@ fn ta_callback_receiver(
     method: &'static str,
 ) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
     match ctx.this_value() {
-        Value::TypedArray(t) => Ok(t.clone()),
+        Value::TypedArray(t) => Ok(*t),
         _ => Err(NativeError::TypeError {
             name: method,
             reason: "this is not a TypedArray".to_string(),
@@ -548,7 +548,7 @@ fn ta_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.forEach")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.forEach")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -561,7 +561,7 @@ fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.map")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.map")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     let kind = t.kind();
@@ -583,7 +583,7 @@ fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.filter")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.filter")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     let mut out: Vec<Value> = Vec::new();
@@ -600,7 +600,7 @@ fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.find")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.find")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -616,7 +616,7 @@ fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findIndex")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findIndex")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -634,7 +634,7 @@ fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLast")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findLast")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for i in (0..elements.len()).rev() {
@@ -651,7 +651,7 @@ fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLastIndex")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findLastIndex")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for i in (0..elements.len()).rev() {
@@ -670,7 +670,7 @@ fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.every")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.every")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -686,7 +686,7 @@ fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.some")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.some")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -728,7 +728,7 @@ fn ta_proto_reduce_dir(
             reason: "reduce of empty array with no initial value".to_string(),
         });
     }
-    let ta_value = Value::TypedArray(t.clone());
+    let ta_value = Value::TypedArray(t);
     let exec_ctx = ctx
         .execution_context()
         .cloned()
@@ -810,7 +810,21 @@ fn ta_build_result(
         name: method,
         reason: format!("TypedArray allocation of {byte_len} bytes exceeds the available heap"),
     })?;
-    let view = crate::binary::typed_array::JsTypedArray::new(new_buf, kind, 0, values.len());
+    let view = crate::binary::typed_array::JsTypedArray::new(
+        ctx.heap_mut(),
+        new_buf,
+        kind,
+        0,
+        values.len(),
+    )
+    .map_err(|err| NativeError::RangeError {
+        name: method,
+        reason: format!(
+            "TypedArray allocation failed: requested {} bytes, heap limit {}",
+            err.requested_bytes(),
+            err.heap_limit_bytes(),
+        ),
+    })?;
     for (i, v) in values.iter().enumerate() {
         view.set(ctx.heap_mut(), i, v);
     }
@@ -822,7 +836,10 @@ fn ta_build_result(
 /// non-TypedArray receivers.
 fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
-        Value::TypedArray(t) => Ok(Value::ArrayBuffer(t.buffer())),
+        Value::TypedArray(t) => {
+            let t = *t;
+            Ok(Value::ArrayBuffer(t.buffer(ctx.heap())))
+        }
         _ => Err(NativeError::TypeError {
             name: "TypedArray.prototype.buffer",
             reason: "this is not a TypedArray".to_string(),
@@ -834,7 +851,7 @@ fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
         Value::TypedArray(t) => {
-            let t = t.clone();
+            let t = *t;
             let n = t.byte_length(ctx.heap());
             Ok(Value::Number(crate::number::NumberValue::from_f64(
                 n as f64,
@@ -851,7 +868,7 @@ fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
         Value::TypedArray(t) => {
-            let t = t.clone();
+            let t = *t;
             let n = t.byte_offset(ctx.heap());
             Ok(Value::Number(crate::number::NumberValue::from_f64(
                 n as f64,
@@ -868,7 +885,7 @@ fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
         Value::TypedArray(t) => {
-            let t = t.clone();
+            let t = *t;
             let n = t.length(ctx.heap());
             Ok(Value::Number(crate::number::NumberValue::from_f64(
                 n as f64,

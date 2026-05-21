@@ -24,7 +24,7 @@ use super::{number_value, smi};
 
 fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsTypedArray, IntrinsicError> {
     match args.receiver {
-        Value::TypedArray(t) => Ok(t.clone()),
+        Value::TypedArray(t) => Ok(*t),
         _ => Err(IntrinsicError::BadReceiver {
             expected: "typedarray",
         }),
@@ -32,7 +32,7 @@ fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsTypedArray, IntrinsicError> {
 }
 
 fn check_not_detached(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), IntrinsicError> {
-    if t.buffer().is_detached(heap) {
+    if t.buffer(heap).is_detached(heap) {
         return Err(IntrinsicError::BadReceiver {
             expected: "non-detached typedarray",
         });
@@ -105,14 +105,18 @@ fn copy_view(
     Ok(out)
 }
 
-fn build_subarray(t: &JsTypedArray, heap: &otter_gc::GcHeap, start: usize, len: usize) -> Value {
+fn build_subarray(
+    t: &JsTypedArray,
+    heap: &mut otter_gc::GcHeap,
+    start: usize,
+    len: usize,
+) -> Result<Value, IntrinsicError> {
     let bpe = t.kind().bytes_per_element();
-    Value::TypedArray(JsTypedArray::new(
-        t.buffer(),
-        t.kind(),
-        t.byte_offset(heap) + start * bpe,
-        len,
-    ))
+    let buffer = t.buffer(heap);
+    let byte_offset = t.byte_offset(heap) + start * bpe;
+    let view =
+        JsTypedArray::new(heap, buffer, t.kind(), byte_offset, len).map_err(intrinsic_oom)?;
+    Ok(Value::TypedArray(view))
 }
 
 fn build_new_typed_array_rooted(
@@ -134,7 +138,8 @@ fn build_new_typed_array_rooted(
             index: 0,
             reason: "allocation failed",
         })?;
-    let view = JsTypedArray::new(buf, kind, 0, values.len());
+    let view =
+        JsTypedArray::new(args.gc_heap, buf, kind, 0, values.len()).map_err(intrinsic_oom)?;
     for (i, v) in values.iter().enumerate() {
         view.set(args.gc_heap, i, v);
     }
@@ -173,7 +178,7 @@ fn impl_subarray(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let final_start = start.clamp(0, len) as usize;
     let final_end = end.clamp(start, len) as usize;
     let new_len = final_end.saturating_sub(final_start);
-    Ok(build_subarray(&t, &*args.gc_heap, final_start, new_len))
+    build_subarray(&t, args.gc_heap, final_start, new_len)
 }
 
 fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -198,17 +203,15 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             })?;
     {
         let abs_offset = t.byte_offset(&*args.gc_heap) + final_start * bpe;
-        let snapshot: Vec<u8> = t.buffer().with_bytes(&*args.gc_heap, |b| {
+        let buffer = t.buffer(&*args.gc_heap);
+        let snapshot: Vec<u8> = buffer.with_bytes(&*args.gc_heap, |b| {
             b[abs_offset..abs_offset + new_len * bpe].to_vec()
         });
         new_buf.with_bytes_mut(args.gc_heap, |dst| dst.copy_from_slice(&snapshot));
     }
-    Ok(Value::TypedArray(JsTypedArray::new(
-        new_buf,
-        t.kind(),
-        0,
-        new_len,
-    )))
+    let view =
+        JsTypedArray::new(args.gc_heap, new_buf, t.kind(), 0, new_len).map_err(intrinsic_oom)?;
+    Ok(Value::TypedArray(view))
 }
 
 fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -258,10 +261,11 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let src_off = t.byte_offset(&*args.gc_heap) + from as usize * bpe;
     let dst_off = t.byte_offset(&*args.gc_heap) + to as usize * bpe;
     let byte_count = count * bpe;
-    t.buffer().with_bytes_mut(args.gc_heap, |buf| {
+    let buffer = t.buffer(&*args.gc_heap);
+    buffer.with_bytes_mut(args.gc_heap, |buf| {
         buf.copy_within(src_off..src_off + byte_count, dst_off);
     });
-    Ok(Value::TypedArray(t.clone()))
+    Ok(Value::TypedArray(t))
 }
 
 fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -720,7 +724,7 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
 #[must_use]
 pub fn load_property(t: &JsTypedArray, heap: &otter_gc::GcHeap, name: &str) -> Value {
     match name {
-        "buffer" => Value::ArrayBuffer(t.buffer()),
+        "buffer" => Value::ArrayBuffer(t.buffer(heap)),
         "byteLength" => smi(t.byte_length(heap) as i32),
         "byteOffset" => smi(t.byte_offset(heap) as i32),
         "length" => smi(t.length(heap) as i32),
@@ -743,7 +747,9 @@ mod tests {
         let strings = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let buffer = JsArrayBuffer::new(&mut gc_heap, 2).expect("array buffer");
-        let receiver = Value::TypedArray(JsTypedArray::new(buffer, TypedArrayKind::Int8, 0, 2));
+        let view = JsTypedArray::new(&mut gc_heap, buffer, TypedArrayKind::Int8, 0, 2)
+            .expect("typed array");
+        let receiver = Value::TypedArray(view);
         let before = gc_heap.stats().new_allocated_bytes;
 
         let result = impl_entries(&mut IntrinsicArgs {
@@ -768,7 +774,8 @@ mod tests {
         let strings = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("gc heap");
         let buffer = JsArrayBuffer::new(&mut gc_heap, 4).expect("array buffer");
-        let source = JsTypedArray::new(buffer, TypedArrayKind::Int16, 0, 2);
+        let source = JsTypedArray::new(&mut gc_heap, buffer, TypedArrayKind::Int16, 0, 2)
+            .expect("typed array");
         source.set(&mut gc_heap, 0, &smi(7));
         source.set(&mut gc_heap, 1, &smi(11));
         let receiver = Value::TypedArray(source);

@@ -296,7 +296,7 @@ fn typed_array_from_values_with_roots(
                 "TypedArray allocation of {byte_len} bytes exceeds the available heap"
             ),
         })?;
-    let view = JsTypedArray::new(new_buf, kind, 0, values.len());
+    let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, values.len()).map_err(oom_to_vm)?;
     for (i, value) in values.iter().enumerate() {
         view.set(gc_heap, i, value);
     }
@@ -317,7 +317,8 @@ fn new_zeroed_typed_array_with_roots(
                 "TypedArray allocation of {byte_len} bytes exceeds the available heap"
             ),
         })?;
-    Ok(Value::TypedArray(JsTypedArray::new(new_buf, kind, 0, len)))
+    let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, len).map_err(oom_to_vm)?;
+    Ok(Value::TypedArray(view))
 }
 
 fn construct_typed_array_with_roots(
@@ -363,15 +364,12 @@ fn construct_typed_array_with_roots(
                     n
                 }
             };
-            Ok(Value::TypedArray(JsTypedArray::new(
-                buf,
-                kind,
-                byte_offset,
-                length,
-            )))
+            let view =
+                JsTypedArray::new(gc_heap, buf, kind, byte_offset, length).map_err(oom_to_vm)?;
+            Ok(Value::TypedArray(view))
         }
         Some(Value::TypedArray(src)) => {
-            if src.buffer().is_detached(gc_heap) {
+            if src.buffer(gc_heap).is_detached(gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
             let len = src.length(gc_heap);
@@ -424,7 +422,7 @@ fn from_static_with_roots(
     let source = args.first().cloned().unwrap_or(Value::Undefined);
     match source {
         Value::TypedArray(src) => {
-            if src.buffer().is_detached(gc_heap) {
+            if src.buffer(gc_heap).is_detached(gc_heap) {
                 return Err(VmError::TypeMismatch);
             }
             let len = src.length(gc_heap);

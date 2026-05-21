@@ -710,7 +710,7 @@ fn native_get_own_property_descriptor_rooted(
         Some(Value::TypedArray(target)) => match &key {
             PropertyKey::String(k) => {
                 if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(k) {
-                    if target.buffer().is_detached(ctx.heap())
+                    if target.buffer(ctx.heap()).is_detached(ctx.heap())
                         || !n.is_finite()
                         || n.fract() != 0.0
                         || n < 0.0
@@ -727,14 +727,14 @@ fn native_get_own_property_descriptor_rooted(
                             true,
                         ))
                     }
-                } else if let Some(bag) = target.expando() {
+                } else if let Some(bag) = target.expando(ctx.heap()) {
                     crate::object::get_own_descriptor(bag, ctx.heap(), k)
                 } else {
                     None
                 }
             }
             PropertyKey::Symbol(sym) => target
-                .expando()
+                .expando(ctx.heap())
                 .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, ctx.heap(), sym)),
         },
         // §20.1.2.7 — primitive operands are coerced via ToObject;
@@ -2225,13 +2225,13 @@ pub fn call(
                 // everything else falls through to OrdinaryDefine
                 // against the lazy expando bag.
                 Some(Value::TypedArray(t)) => {
-                    let t = t.clone();
+                    let t = *t;
                     match &key {
                         PropertyKey::String(k) => {
                             if let Some(n) =
                                 crate::property_dispatch::canonical_numeric_index_string(k)
                             {
-                                if t.buffer().is_detached(gc_heap)
+                                if t.buffer(gc_heap).is_detached(gc_heap)
                                     || !n.is_finite()
                                     || n.fract() != 0.0
                                     || n < 0.0

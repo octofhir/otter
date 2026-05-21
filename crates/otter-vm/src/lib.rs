@@ -1388,6 +1388,9 @@ impl Value {
             Value::DataView(view) => {
                 view.trace_value_slots(visitor);
             }
+            Value::TypedArray(ta) => {
+                ta.trace_value_slots(visitor);
+            }
             _ => {}
         }
     }
@@ -1709,7 +1712,7 @@ impl PartialEq for Value {
             (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(*b),
             (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(*b),
             (Value::DataView(a), Value::DataView(b)) => a.ptr_eq(*b),
-            (Value::TypedArray(a), Value::TypedArray(b)) => a.ptr_eq(b),
+            (Value::TypedArray(a), Value::TypedArray(b)) => a.ptr_eq(*b),
             (Value::Generator(a), Value::Generator(b)) => a.ptr_eq(b),
             (Value::Proxy(a), Value::Proxy(b)) => a.ptr_eq(*b),
             _ => false,

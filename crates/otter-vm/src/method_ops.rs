@@ -1584,7 +1584,7 @@ impl Interpreter {
         args: &SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<bool, VmError> {
-        let ta_value = Value::TypedArray(t.clone());
+        let ta_value = Value::TypedArray(*t);
         let kind = t.kind();
         let len = t.length(&self.gc_heap);
         let elements: Vec<Value> = {
@@ -1799,7 +1799,14 @@ impl Interpreter {
                 "TypedArray allocation of {byte_len} bytes exceeds the available heap"
             ),
         })?;
-        let view = crate::binary::typed_array::JsTypedArray::new(new_buf, kind, 0, values.len());
+        let view = crate::binary::typed_array::JsTypedArray::new(
+            &mut self.gc_heap,
+            new_buf,
+            kind,
+            0,
+            values.len(),
+        )
+        .map_err(crate::oom_to_vm)?;
         for (i, value) in values.iter().enumerate() {
             view.set(&mut self.gc_heap, i, value);
         }

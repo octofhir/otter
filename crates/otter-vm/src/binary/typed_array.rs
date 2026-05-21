@@ -20,8 +20,6 @@
 //! - <https://tc39.es/ecma262/#sec-getvaluefrombuffer>
 //! - <https://tc39.es/ecma262/#sec-setvaluefrombuffer>
 
-use std::rc::Rc;
-
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
@@ -396,6 +394,9 @@ impl otter_gc::SafeTraceable for TypedArrayBodyGc {
     const TYPE_TAG: u8 = TYPED_ARRAY_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        // Forward to the buffer's GC handle so the backing ArrayBuffer
+        // body survives the cycle.
+        self.buffer.trace_value_slots(visitor);
         if let Some(expando) = &self.expando
             && !expando.is_null()
         {
@@ -430,139 +431,141 @@ pub fn alloc_typed_array(
     })
 }
 
-/// Cheap-to-clone TypedArray view.
-#[derive(Debug, Clone)]
+/// Cheap-to-copy TypedArray view.
+///
+/// Backed by a 4-byte compressed GC handle; `Copy + Eq + Hash`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct JsTypedArray {
-    inner: Rc<TypedArrayBody>,
-}
-
-/// Internal storage for a TypedArray view.
-#[derive(Debug)]
-pub struct TypedArrayBody {
-    /// Backing buffer.
-    buffer: JsArrayBuffer,
-    /// Element-type kind.
-    kind: TypedArrayKind,
-    /// Byte offset into the backing buffer at construction time.
-    byte_offset: usize,
-    /// Element count at construction time. The view is
-    /// fixed-length: even if the backing buffer is resizable the
-    /// view's element count is captured here.
-    length: usize,
-    /// Lazy expando bag for non-canonical-numeric own properties
-    /// — created on first non-element write (e.g.
-    /// `typedArr.constructor = X`, `typedArr.foo = 1`). Element
-    /// indices stay routed through the buffer storage.
-    expando: std::cell::Cell<Option<crate::object::JsObject>>,
+    handle: TypedArrayHandle,
+    /// Element kind is fixed at construction; cached here so hot
+    /// paths (`kind()`, `bytes_per_element`) stay heap-free.
+    cached_kind: TypedArrayKind,
 }
 
 impl JsTypedArray {
     /// Build a view at `byte_offset` over `length` elements of `kind`.
     /// Caller must already have validated alignment and bounds.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
     pub fn new(
+        heap: &mut otter_gc::GcHeap,
         buffer: JsArrayBuffer,
         kind: TypedArrayKind,
         byte_offset: usize,
         length: usize,
-    ) -> Self {
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let handle = alloc_typed_array(heap, buffer, kind, byte_offset, length)?;
+        Ok(Self {
+            handle,
+            cached_kind: kind,
+        })
+    }
+
+    /// Rewrap an existing handle. Caller must have read the kind out
+    /// of the body separately (or know it by construction).
+    #[must_use]
+    pub fn from_handle(handle: TypedArrayHandle, kind: TypedArrayKind) -> Self {
         Self {
-            inner: Rc::new(TypedArrayBody {
-                buffer,
-                kind,
-                byte_offset,
-                length,
-                expando: std::cell::Cell::new(None),
-            }),
+            handle,
+            cached_kind: kind,
         }
+    }
+
+    /// Underlying GC handle.
+    #[must_use]
+    pub fn handle(self) -> TypedArrayHandle {
+        self.handle
     }
 
     /// Read the lazy expando bag, if one has been created.
     #[must_use]
-    pub fn expando(&self) -> Option<crate::object::JsObject> {
-        self.inner.expando.get()
+    pub fn expando(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.handle, |body| body.expando)
     }
 
     /// Install / replace the lazy expando bag.
-    pub fn set_expando(&self, expando: crate::object::JsObject) {
-        self.inner.expando.set(Some(expando));
+    pub fn set_expando(self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
+        heap.with_payload(self.handle, |body| body.expando = Some(expando));
     }
 
     /// Backing buffer.
     #[must_use]
-    pub fn buffer(&self) -> JsArrayBuffer {
-        self.inner.buffer
+    pub fn buffer(self, heap: &otter_gc::GcHeap) -> JsArrayBuffer {
+        heap.read_payload(self.handle, |body| body.buffer)
     }
 
-    /// Element kind.
+    /// Element kind. Cached on the wrapper for heap-free access.
     #[must_use]
-    pub fn kind(&self) -> TypedArrayKind {
-        self.inner.kind
+    pub fn kind(self) -> TypedArrayKind {
+        self.cached_kind
     }
 
     /// Byte offset into the backing buffer. `0` when the backing
     /// buffer is detached per §10.4.5.10 `IntegerIndexedObjectByteOffset`.
     #[must_use]
-    pub fn byte_offset(&self, heap: &otter_gc::GcHeap) -> usize {
-        if self.inner.buffer.is_detached(heap) {
+    pub fn byte_offset(self, heap: &otter_gc::GcHeap) -> usize {
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        if buffer.is_detached(heap) {
             return 0;
         }
-        self.inner.byte_offset
+        off
     }
 
     /// Construction-time byte offset, ignoring detached state. Used
     /// by internal paths that already gate on `is_detached`.
     #[must_use]
-    pub fn raw_byte_offset(&self) -> usize {
-        self.inner.byte_offset
+    pub fn raw_byte_offset(self, heap: &otter_gc::GcHeap) -> usize {
+        heap.read_payload(self.handle, |body| body.byte_offset)
     }
 
     /// Element count. `0` when the backing buffer is detached.
     #[must_use]
-    pub fn length(&self, heap: &otter_gc::GcHeap) -> usize {
-        if self.inner.buffer.is_detached(heap) {
+    pub fn length(self, heap: &otter_gc::GcHeap) -> usize {
+        let (buffer, off, len) = heap.read_payload(self.handle, |body| {
+            (body.buffer, body.byte_offset, body.length)
+        });
+        if buffer.is_detached(heap) {
             return 0;
         }
         // Honour buffer shrinkage for resizable backing buffers: the
         // effective length clamps to whatever the backing buffer
         // currently holds at our offset.
-        let bpe = self.inner.kind.bytes_per_element();
-        let bytes_available = self
-            .inner
-            .buffer
-            .byte_length(heap)
-            .saturating_sub(self.inner.byte_offset);
+        let bpe = self.cached_kind.bytes_per_element();
+        let bytes_available = buffer.byte_length(heap).saturating_sub(off);
         let max_elems = bytes_available / bpe;
-        self.inner.length.min(max_elems)
+        len.min(max_elems)
     }
 
     /// Construction-time element count, ignoring detached state and
     /// buffer shrinkage.
     #[must_use]
-    pub fn raw_length(&self) -> usize {
-        self.inner.length
+    pub fn raw_length(self, heap: &otter_gc::GcHeap) -> usize {
+        heap.read_payload(self.handle, |body| body.length)
     }
 
     /// Byte length (`length * bytes_per_element`).
     #[must_use]
-    pub fn byte_length(&self, heap: &otter_gc::GcHeap) -> usize {
-        self.length(heap) * self.inner.kind.bytes_per_element()
+    pub fn byte_length(self, heap: &otter_gc::GcHeap) -> usize {
+        self.length(heap) * self.cached_kind.bytes_per_element()
     }
 
     /// Read element `index`. Returns `Value::Undefined` for an
     /// out-of-range read or a detached buffer per §10.4.5.13
     /// `IntegerIndexedElementGet`.
     pub fn get(
-        &self,
+        self,
         heap: &mut otter_gc::GcHeap,
         index: usize,
     ) -> Result<Value, otter_gc::OutOfMemory> {
-        if self.inner.buffer.is_detached(heap) || index >= self.length(heap) {
+        if self.buffer(heap).is_detached(heap) || index >= self.length(heap) {
             return Ok(Value::Undefined);
         }
-        let bpe = self.inner.kind.bytes_per_element();
-        let offset = self.inner.byte_offset + index * bpe;
-        let snapshot: Option<Vec<u8>> = self.inner.buffer.with_bytes(heap, |bytes| {
+        let bpe = self.cached_kind.bytes_per_element();
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        let offset = off + index * bpe;
+        let snapshot: Option<Vec<u8>> = buffer.with_bytes(heap, |bytes| {
             if offset + bpe <= bytes.len() {
                 Some(bytes[offset..offset + bpe].to_vec())
             } else {
@@ -570,7 +573,7 @@ impl JsTypedArray {
             }
         });
         match snapshot {
-            Some(b) => self.inner.kind.read(heap, &b, 0),
+            Some(b) => self.cached_kind.read(heap, &b, 0),
             None => Ok(Value::Undefined),
         }
     }
@@ -578,40 +581,41 @@ impl JsTypedArray {
     /// Write `value` at element `index`. Out-of-range indices and
     /// detached buffers silently drop the write per §10.4.5.14
     /// `IntegerIndexedElementSet`.
-    pub fn set(&self, heap: &mut otter_gc::GcHeap, index: usize, value: &Value) {
-        if self.inner.buffer.is_detached(heap) || index >= self.length(heap) {
+    pub fn set(self, heap: &mut otter_gc::GcHeap, index: usize, value: &Value) {
+        if self.buffer(heap).is_detached(heap) || index >= self.length(heap) {
             return;
         }
-        let bpe = self.inner.kind.bytes_per_element();
-        let offset = self.inner.byte_offset + index * bpe;
-        let kind = self.inner.kind;
+        let bpe = self.cached_kind.bytes_per_element();
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        let offset = off + index * bpe;
+        let kind = self.cached_kind;
         // Convert the Value to a raw byte snapshot first (BigInt
         // writes only need read access to the source body), then
         // commit under exclusive heap access.
         let mut staging = vec![0u8; bpe];
         kind.write(heap, &mut staging, 0, value);
-        self.inner.buffer.with_bytes_mut(heap, |bytes| {
+        buffer.with_bytes_mut(heap, |bytes| {
             if offset + bpe <= bytes.len() {
                 bytes[offset..offset + bpe].copy_from_slice(&staging);
             }
         });
     }
 
-    /// Identity comparison.
+    /// Identity comparison via GC handle offset.
     #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+    pub fn ptr_eq(self, other: Self) -> bool {
+        self.handle == other.handle
     }
 
-    /// `Rc` data-pointer for cycle / identity sets.
+    /// Backing-pointer for cycle / identity sets.
     #[must_use]
-    pub fn identity_addr(&self) -> *const () {
-        Rc::as_ptr(&self.inner).cast()
+    pub fn identity_addr(self) -> *const () {
+        self.handle.offset() as usize as *const ()
     }
-}
 
-impl PartialEq for JsTypedArray {
-    fn eq(&self, other: &Self) -> bool {
-        self.ptr_eq(other)
+    /// Visit the embedded GC handle slot during root tracing.
+    pub fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        let p = &self.handle as *const TypedArrayHandle as *mut otter_gc::raw::RawGc;
+        visitor(p);
     }
 }

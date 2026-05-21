@@ -3226,7 +3226,7 @@ impl Interpreter {
                 if let Some(name) = key.string_name() {
                     if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
                     {
-                        if t.buffer().is_detached(&self.gc_heap)
+                        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                             || !n.is_finite()
                             || n.fract() != 0.0
                             || n < 0.0
@@ -3239,19 +3239,19 @@ impl Interpreter {
                                 .map_err(crate::oom_to_vm)?,
                         ));
                     }
-                    if let Some(bag) = t.expando()
+                    if let Some(bag) = t.expando(&self.gc_heap)
                         && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
                     {
                         return Ok(VmGetOutcome::Value(v));
                     }
                 }
                 if let VmPropertyKey::Symbol(sym) = key
-                    && let Some(bag) = t.expando()
+                    && let Some(bag) = t.expando(&self.gc_heap)
                     && let Some(v) = crate::object::get_symbol(bag, &self.gc_heap, sym)
                 {
                     return Ok(VmGetOutcome::Value(v));
                 }
-                let this_value = Value::TypedArray(t.clone());
+                let this_value = Value::TypedArray(t);
                 let proto = self.get_prototype_for_op(&this_value)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
                     return Ok(VmGetOutcome::Value(Value::Undefined));

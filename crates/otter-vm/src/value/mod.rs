@@ -47,7 +47,7 @@
 
 pub mod tag;
 
-use crate::NumberValue;
+use crate::{JsClosure, NumberValue};
 
 use tag::*;
 
@@ -238,6 +238,29 @@ impl Value {
     #[must_use]
     pub fn from_other_gc(raw: otter_gc::raw::RawGc) -> Self {
         Self(pack(TAG_PTR_OTHER, raw.0 as u64))
+    }
+
+    /// Build a closure value. Packs the [`JsClosure`] handle under
+    /// `TAG_PTR_FUNCTION`. Disambiguation back to a closure happens
+    /// through [`crate::closure::JS_CLOSURE_BODY_TYPE_TAG`] on the
+    /// GC header.
+    #[inline]
+    #[must_use]
+    pub fn closure(c: JsClosure) -> Self {
+        Self::from_function_gc(c.raw())
+    }
+
+    /// Recover a closure handle when this value carries one.
+    ///
+    /// Returns `None` for any other callable family (bytecode
+    /// function id, bound, native, class constructor wrapper).
+    #[inline]
+    #[must_use]
+    pub fn as_closure(self) -> Option<JsClosure> {
+        if top_tag(self.0) != TAG_PTR_FUNCTION {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<crate::JsClosureBody>()
     }
 
     // -----------------------------------------------------------------------
@@ -555,6 +578,29 @@ mod tests {
 
         let o = Value::from_other_gc(raw);
         assert!(o.is_other_primitive());
+    }
+
+    #[test]
+    fn closure_round_trip_via_real_heap() {
+        use crate::{alloc_closure, alloc_upvalue, Value as LegacyValue};
+        use otter_gc::GcHeap;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
+        let upvalues = vec![cell].into_boxed_slice();
+        let closure = alloc_closure(&mut heap, 99, upvalues, None).expect("alloc");
+        let v = Value::closure(closure);
+        assert!(v.is_callable());
+        assert!(!v.is_function_id());
+        assert_eq!(v.as_closure(), Some(closure));
+        assert_eq!(v.kind(), ValueKind::PtrFunction);
+    }
+
+    #[test]
+    fn as_closure_rejects_non_closure_function_id() {
+        let v = Value::function_id(0);
+        assert_eq!(v.as_closure(), None);
+        assert!(v.is_callable());
     }
 
     #[test]

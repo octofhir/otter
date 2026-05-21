@@ -362,6 +362,33 @@ impl RawGc {
         // `type_tag` byte is a plain load with no aliasing concerns.
         Some(unsafe { (*header).type_tag() })
     }
+
+    /// Type-tag-checked downcast to `Gc<T>`.
+    ///
+    /// Returns `Some(Gc<T>)` iff the body header's
+    /// [`crate::header::GcHeader::type_tag`] matches
+    /// [`crate::trace::SafeTraceable::TYPE_TAG`]. Returns `None` for
+    /// the null offset or any tag mismatch. This is the safe accessor
+    /// `forbid(unsafe_code)` crates use when downcasting `RawGc`.
+    #[inline]
+    #[must_use]
+    pub fn checked_cast<T: crate::trace::SafeTraceable>(self) -> Option<Gc<T>> {
+        if self.0 == 0 {
+            return None;
+        }
+        let header = self.as_header_ptr();
+        // SAFETY: `self` originates from a successful GC allocation
+        // (see `header_type_tag`). The tag check below gates the
+        // `from_offset` reinterpret on byte-for-byte compatibility
+        // with `T`.
+        let tag = unsafe { (*header).type_tag() };
+        if tag != <T as crate::trace::SafeTraceable>::TYPE_TAG {
+            return None;
+        }
+        // SAFETY: type-tag matches the trait's reserved value, so
+        // this cell holds a `T` payload.
+        Some(unsafe { Gc::from_offset(self.0) })
+    }
 }
 
 impl std::fmt::Debug for RawGc {

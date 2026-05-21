@@ -47,6 +47,11 @@
 
 pub mod tag;
 
+use crate::array::{ArrayBody, JsArray};
+use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
+use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
+use crate::object::{JsObject, ObjectBody};
+use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
 use crate::{JsClosure, NumberValue};
 
 use tag::*;
@@ -250,6 +255,62 @@ impl Value {
         Self::from_function_gc(c.raw())
     }
 
+    /// Ordinary object value.
+    #[inline]
+    #[must_use]
+    pub fn object(o: JsObject) -> Self {
+        Self::from_object_gc(o.raw())
+    }
+
+    /// Array value.
+    #[inline]
+    #[must_use]
+    pub fn array(a: JsArray) -> Self {
+        Self::from_object_gc(a.raw())
+    }
+
+    /// Map value.
+    #[inline]
+    #[must_use]
+    pub fn map(m: JsMap) -> Self {
+        Self::from_object_gc(m.raw())
+    }
+
+    /// Set value.
+    #[inline]
+    #[must_use]
+    pub fn set(s: JsSet) -> Self {
+        Self::from_object_gc(s.raw())
+    }
+
+    /// WeakMap value.
+    #[inline]
+    #[must_use]
+    pub fn weak_map(m: JsWeakMap) -> Self {
+        Self::from_object_gc(m.raw())
+    }
+
+    /// WeakSet value.
+    #[inline]
+    #[must_use]
+    pub fn weak_set(s: JsWeakSet) -> Self {
+        Self::from_object_gc(s.raw())
+    }
+
+    /// WeakRef value.
+    #[inline]
+    #[must_use]
+    pub fn weak_ref(w: JsWeakRef) -> Self {
+        Self::from_object_gc(w.raw())
+    }
+
+    /// FinalizationRegistry value.
+    #[inline]
+    #[must_use]
+    pub fn finalization_registry(r: JsFinalizationRegistry) -> Self {
+        Self::from_object_gc(r.raw())
+    }
+
     /// Recover a closure handle when this value carries one.
     ///
     /// Returns `None` for any other callable family (bytecode
@@ -260,7 +321,91 @@ impl Value {
         if top_tag(self.0) != TAG_PTR_FUNCTION {
             return None;
         }
-        self.as_raw_gc()?.checked_cast::<crate::JsClosureBody>()
+        let raw = self.as_raw_gc()?;
+        if raw.header_type_tag()? != JS_CLOSURE_BODY_TYPE_TAG {
+            return None;
+        }
+        raw.checked_cast::<JsClosureBody>()
+    }
+
+    /// Ordinary object handle.
+    #[inline]
+    #[must_use]
+    pub fn as_object(self) -> Option<JsObject> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<ObjectBody>()
+    }
+
+    /// Array handle.
+    #[inline]
+    #[must_use]
+    pub fn as_array(self) -> Option<JsArray> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<ArrayBody>()
+    }
+
+    /// Map handle.
+    #[inline]
+    #[must_use]
+    pub fn as_map(self) -> Option<JsMap> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<MapBody>()
+    }
+
+    /// Set handle.
+    #[inline]
+    #[must_use]
+    pub fn as_set(self) -> Option<JsSet> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<SetBody>()
+    }
+
+    /// WeakMap handle.
+    #[inline]
+    #[must_use]
+    pub fn as_weak_map(self) -> Option<JsWeakMap> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<WeakMapBody>()
+    }
+
+    /// WeakSet handle.
+    #[inline]
+    #[must_use]
+    pub fn as_weak_set(self) -> Option<JsWeakSet> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<WeakSetBody>()
+    }
+
+    /// WeakRef handle.
+    #[inline]
+    #[must_use]
+    pub fn as_weak_ref(self) -> Option<JsWeakRef> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<WeakRefBody>()
+    }
+
+    /// FinalizationRegistry handle.
+    #[inline]
+    #[must_use]
+    pub fn as_finalization_registry(self) -> Option<JsFinalizationRegistry> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<FinalizationRegistryBody>()
     }
 
     // -----------------------------------------------------------------------
@@ -594,6 +739,25 @@ mod tests {
         assert!(!v.is_function_id());
         assert_eq!(v.as_closure(), Some(closure));
         assert_eq!(v.kind(), ValueKind::PtrFunction);
+    }
+
+    #[test]
+    fn object_round_trip_via_real_heap() {
+        use crate::object::alloc_object_with_roots;
+        use otter_gc::GcHeap;
+        use otter_gc::raw::RawGc;
+
+        let mut heap = GcHeap::new().expect("heap");
+        let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
+        let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
+        let v = Value::object(obj);
+        assert!(v.is_object_like());
+        assert_eq!(v.as_object(), Some(obj));
+        // Object body type-tag must reject array / map / set casts.
+        assert_eq!(v.as_array(), None);
+        assert_eq!(v.as_map(), None);
+        assert_eq!(v.as_set(), None);
+        assert_eq!(v.as_closure(), None);
     }
 
     #[test]

@@ -852,6 +852,48 @@ impl Value {
         self.as_raw_gc()?.header_type_tag()
     }
 
+    // -----------------------------------------------------------------------
+    // Spec coercions that need no heap access.
+    // -----------------------------------------------------------------------
+
+    /// ECMA-262 §7.1.2 ToBoolean for the part of the value model that
+    /// is decidable without a heap read.
+    ///
+    /// Cases that need a heap to consult the payload (string emptiness,
+    /// BigInt zero check) return [`None`] so the caller can hop to the
+    /// legacy heap-aware coercion path. Once the string / bigint /
+    /// symbol primitives migrate off `Rc`/`Arc` into GC bodies, this
+    /// helper resolves them inline and the heap-aware path retires.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-toboolean>
+    #[inline]
+    #[must_use]
+    pub fn to_boolean_pure(self) -> Option<bool> {
+        if self.is_undefined() || self.is_null() || self.is_hole() {
+            return Some(false);
+        }
+        if let Some(b) = self.as_boolean() {
+            return Some(b);
+        }
+        if let Some(n) = self.as_number() {
+            return Some(match n {
+                NumberValue::Smi(i) => i != 0,
+                NumberValue::Double(d) => !(d.is_nan() || d == 0.0),
+            });
+        }
+        // Callables, object-like references, function-id immediates:
+        // always truthy per ECMA-262 §7.1.2 step 6/7.
+        if self.is_callable() || self.is_object_like() {
+            return Some(true);
+        }
+        // TAG_PTR_STRING / TAG_PTR_OTHER (symbol, bigint) require a
+        // heap-aware coercion until those primitives migrate to a GC
+        // body whose payload (length / zero) is readable through the
+        // tagged value directly.
+        None
+    }
+
     /// Generator handle.
     #[inline]
     #[must_use]
@@ -1046,6 +1088,36 @@ mod tests {
         assert_eq!(v.as_map(), None);
         assert_eq!(v.as_set(), None);
         assert_eq!(v.as_closure(), None);
+    }
+
+    #[test]
+    fn to_boolean_pure_covers_immediates_numbers_and_pointers() {
+        // Falsy immediates.
+        assert_eq!(Value::undefined().to_boolean_pure(), Some(false));
+        assert_eq!(Value::null().to_boolean_pure(), Some(false));
+        assert_eq!(Value::hole().to_boolean_pure(), Some(false));
+        assert_eq!(Value::boolean(false).to_boolean_pure(), Some(false));
+        assert_eq!(Value::number_i32(0).to_boolean_pure(), Some(false));
+        assert_eq!(Value::number_f64(0.0).to_boolean_pure(), Some(false));
+        assert_eq!(Value::number_f64(-0.0).to_boolean_pure(), Some(false));
+        assert_eq!(Value::number_f64(f64::NAN).to_boolean_pure(), Some(false));
+
+        // Truthy immediates and numbers.
+        assert_eq!(Value::boolean(true).to_boolean_pure(), Some(true));
+        assert_eq!(Value::number_i32(1).to_boolean_pure(), Some(true));
+        assert_eq!(Value::number_i32(-1).to_boolean_pure(), Some(true));
+        assert_eq!(Value::number_f64(1.5).to_boolean_pure(), Some(true));
+        assert_eq!(Value::number_f64(f64::INFINITY).to_boolean_pure(), Some(true));
+
+        // Callables / object-like references are always truthy.
+        assert_eq!(Value::function_id(0).to_boolean_pure(), Some(true));
+        let raw = otter_gc::raw::RawGc(1);
+        assert_eq!(Value::from_object_gc(raw).to_boolean_pure(), Some(true));
+        assert_eq!(Value::from_function_gc(raw).to_boolean_pure(), Some(true));
+
+        // String / Other still need heap awareness.
+        assert_eq!(Value::from_string_gc(raw).to_boolean_pure(), None);
+        assert_eq!(Value::from_other_gc(raw).to_boolean_pure(), None);
     }
 
     #[test]

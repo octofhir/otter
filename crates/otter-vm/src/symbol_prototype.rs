@@ -58,6 +58,8 @@ fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 /// other names fall back to `Value::Undefined` per the spec's
 /// `[[Get]]` semantics for primitives without ordinary properties.
 ///
+/// Reads come from the wrapper-side description cache; no heap touch.
+///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-symbol.prototype.description>
 #[must_use]
@@ -102,7 +104,11 @@ mod tests {
     fn to_string_renders_descriptive_form() {
         let heap = StringHeap::default();
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let sym = JsSymbol::new(Some(JsString::from_str("ok", &heap).unwrap()));
+        let sym = JsSymbol::new(
+            &mut gc_heap,
+            Some(JsString::from_str("ok", &heap).unwrap()),
+        )
+        .unwrap();
         let entry = lookup("toString").unwrap();
         let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &Value::Symbol(sym),
@@ -118,11 +124,12 @@ mod tests {
     #[test]
     fn description_accessor() {
         let heap = StringHeap::default();
+        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let s = JsString::from_str("ok", &heap).unwrap();
-        let sym = JsSymbol::new(Some(s.clone()));
+        let sym = JsSymbol::new(&mut gc_heap, Some(s.clone())).unwrap();
         let value = load_property(&sym, "description");
         assert_eq!(value.display_string(), "ok");
-        let no_desc = JsSymbol::new(None);
+        let no_desc = JsSymbol::new(&mut gc_heap, None).unwrap();
         assert!(matches!(
             load_property(&no_desc, "description"),
             Value::Undefined

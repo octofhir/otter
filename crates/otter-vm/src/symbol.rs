@@ -2,14 +2,18 @@
 //! optional description.
 //!
 //! Two `Symbol(desc)` calls always produce **distinct** values even
-//! when the description matches, modelled here by `Rc<SymbolBody>`
-//! identity (`Rc::ptr_eq`). The shared global registry that backs
-//! `Symbol.for(key)` / `Symbol.keyFor(sym)` lives on the
-//! [`crate::Interpreter`] so symbols stay scoped to one VM instance.
+//! when the description matches; identity is the per-symbol GC body
+//! ([`SymbolBody`]) reachable through a [`SymbolHandle`]. The shared
+//! global registry that backs `Symbol.for(key)` / `Symbol.keyFor(sym)`
+//! lives on the [`crate::Interpreter`] so symbols stay scoped to one
+//! VM instance.
 //!
 //! # Contents
-//! - [`JsSymbol`] — heap handle wrapping `Rc<SymbolBody>`. `Clone`
-//!   yields the same identity.
+//! - [`SymbolBody`] — GC-allocated identity bearer + canonical
+//!   description / well-known tag / registry flag.
+//! - [`JsSymbol`] — heap handle wrapping [`SymbolHandle`]
+//!   (`Gc<SymbolBody>`) plus a cached copy of the per-symbol
+//!   descriptor fields so reads stay heap-free.
 //! - [`WellKnown`] — enum of every well-known symbol named by the
 //!   spec (§6.1.5.1). Each tag maps to a stable singleton `JsSymbol`
 //!   in the per-interpreter [`WellKnownSymbols`] table.
@@ -26,6 +30,10 @@
 //! - The registry's keys are arbitrary user strings ("foo", "@k",
 //!   …); descriptions on registered symbols are forced to match the
 //!   key per §20.4.2.4 step 9.
+//! - Every live `JsSymbol` reachable from a root (registry, well-known
+//!   table, value-model slot) must be visited by
+//!   [`crate::gc_trace::GcTrace`] so the embedded `SymbolHandle`
+//!   stays live across collections.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-symbol-objects>
@@ -34,7 +42,6 @@
 //! - <https://tc39.es/ecma262/#sec-symbol.keyfor>
 
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use otter_gc::raw::SlotVisitor;
 
@@ -65,9 +72,10 @@ pub fn alloc_symbol(
     })
 }
 
-/// One `Symbol` body — the shared identity bearer. Cloning a
-/// [`JsSymbol`] keeps the same `Rc`, so `ptr_eq` is the truth-bearer
-/// for `===`.
+/// One `Symbol` body — the GC-allocated identity bearer plus the
+/// per-symbol descriptor fields. Allocation is always through
+/// [`alloc_symbol`]; cloning a [`JsSymbol`] copies the handle but
+/// keeps the same body, so `ptr_eq` is the truth-bearer for `===`.
 #[derive(Debug)]
 pub struct SymbolBody {
     /// Optional human-readable description, exposed through
@@ -79,7 +87,7 @@ pub struct SymbolBody {
     /// belongs to. `None` for ordinary `Symbol(...)` calls and
     /// registry entries; `Some` for the singletons populated by
     /// [`WellKnownSymbols::new`]. The tag is informational —
-    /// identity is still `Rc::ptr_eq` — but it lets the runtime
+    /// identity is still handle equality — but it lets the runtime
     /// fast-path well-known checks (e.g. `Symbol.iterator`,
     /// `Symbol.toPrimitive`) without walking a comparison table.
     pub well_known: Option<WellKnown>,
@@ -93,19 +101,28 @@ impl otter_gc::SafeTraceable for SymbolBody {
     const TYPE_TAG: u8 = SYMBOL_BODY_TYPE_TAG;
 
     fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
-        // `description` is an `Arc<StringRepr>` outside the cage; the
-        // GC has no slot to follow.
+        // `description` is `JsString` — an `Arc<StringRepr>` outside
+        // the cage today; no GC slot to follow. Once `JsString`
+        // migrates to a GC body the description handle slot is
+        // emitted here.
     }
 }
 
 /// Heap handle for [`Value::Symbol`].
 ///
-/// `Clone` shares `Rc<SymbolBody>` — strict-equal symbols are the
-/// same handle. The struct is `Send`/`Sync`-free to match the rest
-/// of the foundation's single-threaded runtime model.
+/// Backed by a GC body ([`SymbolBody`]) reached through a 4-byte
+/// compressed [`SymbolHandle`]. The wrapper carries cached copies of
+/// the descriptor fields so `description()`, `well_known_tag()`,
+/// `is_registered()`, and `descriptive_string()` stay heap-free —
+/// matches the JsIntl / JsTemporal cache pattern in
+/// `docs/value-cutover-plan.md`. Cloning copies the cache and the
+/// handle (a 4-byte offset), preserving identity.
 #[derive(Debug, Clone)]
 pub struct JsSymbol {
-    body: Rc<SymbolBody>,
+    inner: SymbolHandle,
+    description: Option<JsString>,
+    well_known: Option<WellKnown>,
+    registered: bool,
 }
 
 impl JsSymbol {
@@ -113,63 +130,117 @@ impl JsSymbol {
     /// description. Two calls with the same description always
     /// produce distinct symbols, per ECMA-262 §20.4.1.1.
     ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim from the body
+    /// allocation.
+    ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-symbol-description>
-    #[must_use]
-    pub fn new(description: Option<JsString>) -> Self {
-        Self {
-            body: Rc::new(SymbolBody {
-                description,
-                well_known: None,
-                registered: false,
-            }),
-        }
+    pub fn new(
+        heap: &mut otter_gc::GcHeap,
+        description: Option<JsString>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let inner = alloc_symbol(heap, description.clone(), None, false)?;
+        Ok(Self {
+            inner,
+            description,
+            well_known: None,
+            registered: false,
+        })
     }
 
     /// Construct a well-known symbol singleton. Used by
     /// [`WellKnownSymbols::new`] only — user code reaches these
     /// through `Symbol.<name>` static accessors.
-    #[must_use]
-    pub fn well_known(tag: WellKnown, description: JsString) -> Self {
-        Self {
-            body: Rc::new(SymbolBody {
-                description: Some(description),
-                well_known: Some(tag),
-                registered: false,
-            }),
-        }
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn well_known(
+        heap: &mut otter_gc::GcHeap,
+        tag: WellKnown,
+        description: JsString,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let inner = alloc_symbol(heap, Some(description.clone()), Some(tag), false)?;
+        Ok(Self {
+            inner,
+            description: Some(description),
+            well_known: Some(tag),
+            registered: false,
+        })
+    }
+
+    /// Construct a registered symbol — `Symbol.for` step 4. The
+    /// description is forced to match the registry key per §20.4.2.4
+    /// step 9.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn registered(
+        heap: &mut otter_gc::GcHeap,
+        description: JsString,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let inner = alloc_symbol(heap, Some(description.clone()), None, true)?;
+        Ok(Self {
+            inner,
+            description: Some(description),
+            well_known: None,
+            registered: true,
+        })
     }
 
     /// Whether this symbol came from `Symbol.for`.
     #[must_use]
     pub fn is_registered(&self) -> bool {
-        self.body.registered
+        self.registered
     }
 
-    /// Borrow the description, if any.
+    /// Borrow the description, if any. Reads the wrapper-side cache;
+    /// no heap touch.
     #[must_use]
     pub fn description(&self) -> Option<&JsString> {
-        self.body.description.as_ref()
+        self.description.as_ref()
     }
 
-    /// Returns the well-known tag, if this symbol is one.
+    /// Returns the well-known tag, if this symbol is one. Reads the
+    /// wrapper-side cache.
     #[must_use]
     pub fn well_known_tag(&self) -> Option<WellKnown> {
-        self.body.well_known
+        self.well_known
     }
 
-    /// Identity comparison — strict `===` for symbols.
+    /// Identity comparison — strict `===` for symbols. Follows
+    /// compressed-offset equality on the GC handle.
     #[must_use]
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.body, &other.body)
+        self.inner == other.inner
     }
 
-    /// Raw `Rc`-data pointer for use as a hash / map key in the
-    /// per-object symbol-property store. Anchor a [`JsSymbol`]
-    /// handle for the lifetime of the pointer.
+    /// Stable identity token for hashing the symbol as a map key.
+    /// Returns the underlying GC handle's compressed offset cast to
+    /// `usize`; two clones of the same symbol return the same value.
     #[must_use]
-    pub fn identity_addr(&self) -> *const SymbolBody {
-        Rc::as_ptr(&self.body)
+    pub fn identity_addr(&self) -> usize {
+        self.inner.offset() as usize
+    }
+
+    /// Raw GC handle — used by tracing and write barriers.
+    #[doc(hidden)]
+    #[inline]
+    #[must_use]
+    pub fn handle(&self) -> SymbolHandle {
+        self.inner
+    }
+
+    /// Visit the embedded GC handle so the scavenger can rewrite the
+    /// compressed offset in place if the body moves. Called from
+    /// [`crate::Value::trace_value_slots`] and from
+    /// [`crate::gc_trace::GcTrace`] adapters for the registry / table.
+    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        let p = &self.inner as *const SymbolHandle as *mut otter_gc::raw::RawGc;
+        visitor(p);
     }
 
     /// Render the symbol per `Symbol.prototype.toString` —
@@ -180,7 +251,7 @@ impl JsSymbol {
     /// - <https://tc39.es/ecma262/#sec-symboldescriptivestring>
     #[must_use]
     pub fn descriptive_string(&self) -> String {
-        match &self.body.description {
+        match &self.description {
             Some(s) => format!("Symbol({})", s.to_lossy_string()),
             None => "Symbol()".to_string(),
         }
@@ -322,16 +393,20 @@ pub struct WellKnownSymbols {
 
 impl WellKnownSymbols {
     /// Allocate every well-known symbol with its spec-mandated
-    /// description text.
+    /// description text. Each entry's [`SymbolBody`] lives on the GC
+    /// heap; root tracing keeps them alive across collections.
     ///
     /// # Errors
-    /// Returns the first [`StringError`] encountered while interning
-    /// description strings (only on heap-cap exhaustion).
-    pub fn new(heap: &StringHeap) -> Result<Self, StringError> {
+    /// Returns the first [`WellKnownInitError`] encountered while
+    /// interning a description string or allocating a body.
+    pub fn new(
+        string_heap: &StringHeap,
+        gc_heap: &mut otter_gc::GcHeap,
+    ) -> Result<Self, WellKnownInitError> {
         let mut entries = Vec::with_capacity(WellKnown::all().len());
         for tag in WellKnown::all() {
-            let desc = JsString::from_str(tag.description_text(), heap)?;
-            entries.push(JsSymbol::well_known(*tag, desc));
+            let desc = JsString::from_str(tag.description_text(), string_heap)?;
+            entries.push(JsSymbol::well_known(gc_heap, *tag, desc)?);
         }
         Ok(Self { entries })
     }
@@ -346,6 +421,25 @@ impl WellKnownSymbols {
             .cloned()
             .expect("well-known table populated by new()")
     }
+
+    /// Iterate the singletons for root tracing.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &JsSymbol> {
+        self.entries.iter()
+    }
+}
+
+/// Init-time failure for [`WellKnownSymbols::new`]. Folds
+/// [`StringError`] and [`otter_gc::OutOfMemory`] so the per-realm
+/// bootstrap can surface either with one error type.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WellKnownInitError {
+    /// Interning a description string failed.
+    #[error(transparent)]
+    String(#[from] StringError),
+    /// GC body allocation failed.
+    #[error(transparent)]
+    OutOfMemory(#[from] otter_gc::OutOfMemory),
 }
 
 /// Global symbol registry backing `Symbol.for(key)` /
@@ -373,19 +467,24 @@ impl SymbolRegistry {
 
     /// Spec §20.4.2.4 `Symbol.for(key)`: return the registered symbol
     /// for `key`, or create + register a new one with description
-    /// equal to `key`.
-    pub fn for_key(&self, key: &str, heap: &StringHeap) -> Result<JsSymbol, StringError> {
+    /// equal to `key`. The freshly allocated symbol's body lives on
+    /// the GC heap; root tracing visits registry entries so the body
+    /// stays live as long as the registry retains it.
+    ///
+    /// # Errors
+    /// Surfaces [`StringError`] from description interning and
+    /// [`otter_gc::OutOfMemory`] from body allocation.
+    pub fn for_key(
+        &self,
+        gc_heap: &mut otter_gc::GcHeap,
+        string_heap: &StringHeap,
+        key: &str,
+    ) -> Result<JsSymbol, SymbolRegistryError> {
         if let Some(sym) = self.lookup(key) {
             return Ok(sym);
         }
-        let desc = JsString::from_str(key, heap)?;
-        let sym = JsSymbol {
-            body: Rc::new(SymbolBody {
-                description: Some(desc),
-                well_known: None,
-                registered: true,
-            }),
-        };
+        let desc = JsString::from_str(key, string_heap)?;
+        let sym = JsSymbol::registered(gc_heap, desc)?;
         self.entries
             .borrow_mut()
             .push((key.to_string(), sym.clone()));
@@ -412,16 +511,42 @@ impl SymbolRegistry {
             .find(|(k, _)| k == key)
             .map(|(_, s)| s.clone())
     }
+
+    /// Run `f` against each registered symbol. Used by
+    /// [`crate::gc_trace::GcTrace`] to keep registry entries live
+    /// across collections.
+    pub(crate) fn for_each_entry(&self, mut f: impl FnMut(&JsSymbol)) {
+        for (_, sym) in self.entries.borrow().iter() {
+            f(sym);
+        }
+    }
+}
+
+/// Failure modes returned by [`SymbolRegistry::for_key`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SymbolRegistryError {
+    /// Interning the key as a description string failed.
+    #[error(transparent)]
+    String(#[from] StringError),
+    /// GC body allocation failed.
+    #[error(transparent)]
+    OutOfMemory(#[from] otter_gc::OutOfMemory),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fresh_gc_heap() -> otter_gc::GcHeap {
+        otter_gc::GcHeap::new().expect("gc heap")
+    }
+
     #[test]
     fn fresh_symbols_have_distinct_identity() {
-        let a = JsSymbol::new(None);
-        let b = JsSymbol::new(None);
+        let mut gc = fresh_gc_heap();
+        let a = JsSymbol::new(&mut gc, None).unwrap();
+        let b = JsSymbol::new(&mut gc, None).unwrap();
         assert!(!a.ptr_eq(&b));
         let c = a.clone();
         assert!(a.ptr_eq(&c));
@@ -429,18 +554,20 @@ mod tests {
 
     #[test]
     fn registry_dedupes_by_key() {
-        let heap = StringHeap::default();
+        let string_heap = StringHeap::default();
+        let mut gc = fresh_gc_heap();
         let reg = SymbolRegistry::new();
-        let a = reg.for_key("k", &heap).unwrap();
-        let b = reg.for_key("k", &heap).unwrap();
+        let a = reg.for_key(&mut gc, &string_heap, "k").unwrap();
+        let b = reg.for_key(&mut gc, &string_heap, "k").unwrap();
         assert!(a.ptr_eq(&b));
         assert_eq!(reg.key_for(&a).as_deref(), Some("k"));
     }
 
     #[test]
     fn well_known_table_returns_stable_singletons() {
-        let heap = StringHeap::default();
-        let table = WellKnownSymbols::new(&heap).unwrap();
+        let string_heap = StringHeap::default();
+        let mut gc = fresh_gc_heap();
+        let table = WellKnownSymbols::new(&string_heap, &mut gc).unwrap();
         let a = table.get(WellKnown::Iterator);
         let b = table.get(WellKnown::Iterator);
         assert!(a.ptr_eq(&b));
@@ -451,19 +578,24 @@ mod tests {
 
     #[test]
     fn descriptive_string_format() {
-        let s = JsSymbol::new(Some(
-            JsString::from_str("x", &StringHeap::default()).unwrap(),
-        ));
+        let string_heap = StringHeap::default();
+        let mut gc = fresh_gc_heap();
+        let s = JsSymbol::new(
+            &mut gc,
+            Some(JsString::from_str("x", &string_heap).unwrap()),
+        )
+        .unwrap();
         assert_eq!(s.descriptive_string(), "Symbol(x)");
-        let none = JsSymbol::new(None);
+        let none = JsSymbol::new(&mut gc, None).unwrap();
         assert_eq!(none.descriptive_string(), "Symbol()");
     }
 
     #[test]
     fn key_for_returns_none_for_well_known() {
-        let heap = StringHeap::default();
+        let string_heap = StringHeap::default();
+        let mut gc = fresh_gc_heap();
         let reg = SymbolRegistry::new();
-        let table = WellKnownSymbols::new(&heap).unwrap();
+        let table = WellKnownSymbols::new(&string_heap, &mut gc).unwrap();
         let iter = table.get(WellKnown::Iterator);
         assert!(reg.key_for(&iter).is_none());
     }

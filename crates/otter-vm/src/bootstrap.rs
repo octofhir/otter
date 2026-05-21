@@ -716,7 +716,12 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     Some(rendered)
                 }
             };
-        Ok(Value::Symbol(crate::symbol::JsSymbol::new(description)))
+        let sym = crate::symbol::JsSymbol::new(ctx.interp_mut().gc_heap_mut(), description)
+            .map_err(|_| NativeError::TypeError {
+                name: "Symbol",
+                reason: "out of memory".to_string(),
+            })?;
+        Ok(Value::Symbol(sym))
     }
 
     fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -749,11 +754,9 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     })?
             }
         };
-        let string_heap = ctx.interp_mut().string_heap_clone();
         let sym = ctx
             .interp_mut()
-            .symbol_registry()
-            .for_key(&key, &string_heap)
+            .symbol_for_key(&key)
             .map_err(|_| NativeError::TypeError {
                 name: "Symbol.for",
                 reason: "out of memory".to_string(),

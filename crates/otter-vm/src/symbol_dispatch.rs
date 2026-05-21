@@ -74,6 +74,24 @@ impl From<crate::string::StringError> for SymbolError {
     }
 }
 
+impl From<otter_gc::OutOfMemory> for SymbolError {
+    fn from(err: otter_gc::OutOfMemory) -> Self {
+        Self::OutOfMemory {
+            requested_bytes: err.requested_bytes(),
+            heap_limit_bytes: err.heap_limit_bytes(),
+        }
+    }
+}
+
+impl From<crate::symbol::SymbolRegistryError> for SymbolError {
+    fn from(err: crate::symbol::SymbolRegistryError) -> Self {
+        match err {
+            crate::symbol::SymbolRegistryError::String(e) => e.into(),
+            crate::symbol::SymbolRegistryError::OutOfMemory(e) => e.into(),
+        }
+    }
+}
+
 /// `Symbol.<name>` static read.
 ///
 /// # Algorithm
@@ -124,7 +142,7 @@ pub const CONSTRUCTOR_SENTINEL: &str = "";
 /// `Symbol.<method>(args...)`. Routes the typed
 /// [`SymbolMethod`] emitted by the compiler.
 pub fn call(
-    interp: &Interpreter,
+    interp: &mut Interpreter,
     method: otter_bytecode::method_id::SymbolMethod,
     args: &[Value],
 ) -> Result<Value, SymbolError> {
@@ -142,7 +160,7 @@ pub fn call(
 /// `new Symbol(desc)`). Returns a fresh primitive symbol; spec
 /// rejects the `new` form (TypeError) but the foundation has no
 /// dedicated path for that today.
-fn construct_symbol(interp: &Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
+fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
     let description = match args.first() {
         None | Some(Value::Undefined) => None,
         Some(Value::String(s)) => Some(s.clone()),
@@ -164,16 +182,15 @@ fn construct_symbol(interp: &Interpreter, args: &[Value]) -> Result<Value, Symbo
             Some(rendered)
         }
     };
-    Ok(Value::Symbol(JsSymbol::new(description)))
+    let sym = JsSymbol::new(&mut interp.gc_heap, description)?;
+    Ok(Value::Symbol(sym))
 }
 
 /// `Symbol.for(key)` — Spec §20.4.2.4. Coerces `key` to a string
 /// (spec uses `ToString`) and looks up / inserts in the registry.
-fn symbol_for(interp: &Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
+fn symbol_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
     let key = key_argument(args, "for")?;
-    let sym = interp
-        .symbol_registry()
-        .for_key(&key, &interp.string_heap)?;
+    let sym = interp.symbol_for_key(&key)?;
     Ok(Value::Symbol(sym))
 }
 

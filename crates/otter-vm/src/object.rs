@@ -3286,7 +3286,7 @@ mod tests {
     fn delete_symbol_missing_key_succeeds() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        let sym = JsSymbol::new(None);
+        let sym = JsSymbol::new(&mut heap, None).unwrap();
         assert!(delete_symbol(o, &mut heap, &sym));
     }
 }

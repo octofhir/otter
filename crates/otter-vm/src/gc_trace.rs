@@ -263,19 +263,28 @@ impl GcTrace for DynamicImportRegistry {
 }
 
 impl GcTrace for JsSymbol {
-    /// Leaf primitive: symbol bodies hold descriptions but no GC
-    /// children.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Emit the storage address of the embedded `SymbolHandle` so the
+    /// scavenger can rewrite the compressed offset if the body moves.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_value_slots(visitor);
+    }
 }
 
 impl GcTrace for WellKnownSymbols {
-    /// Leaf primitive collection.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Visit each well-known singleton so its body stays live.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        for sym in self.entries() {
+            sym.trace_gc_roots(visitor);
+        }
+    }
 }
 
 impl GcTrace for SymbolRegistry {
-    /// Registry stores leaf symbols; descriptions are not GC values.
-    fn trace_gc_roots(&self, _visitor: &mut GcRootVisitor<'_>) {}
+    /// Visit every registered symbol so `Symbol.for(k)` survivors stay
+    /// live across collections.
+    fn trace_gc_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.for_each_entry(|sym| sym.trace_gc_roots(visitor));
+    }
 }
 
 impl GcTrace for ErrorClassRegistry {

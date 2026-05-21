@@ -56,6 +56,28 @@ Companion to `docs/architecture-refactor-plan-2026-05.md` §Phase 1.
   path. `temporal::call_static` is `&mut GcHeap`; `load_property`
   takes `&GcHeap`. `Value::trace_value_slots` visits the embedded
   `TemporalHandle` slot via `JsTemporal::trace_value_slots`.
+- **JsSymbol wrapper migration complete.**
+  `JsSymbol { body: Rc<SymbolBody> }` is gone; the wrapper now holds
+  `SymbolHandle` plus a cached `description` / `well_known_tag` /
+  `registered` triple so the hot accessors (`description()`,
+  `well_known_tag()`, `is_registered()`, `descriptive_string()`,
+  `identity_addr()`) stay heap-free. `JsSymbol::new` /
+  `JsSymbol::well_known` / `JsSymbol::registered` allocate via
+  `alloc_symbol(heap, …)` and surface `OutOfMemory`.
+  `WellKnownSymbols::new(string_heap, &mut gc_heap)` surfaces a folded
+  `WellKnownInitError`; init order in `Interpreter::with_string_heap_cap`
+  now constructs `GcHeap` before the well-known table.
+  `SymbolRegistry::for_key(&mut gc_heap, &string_heap, key)` allocates
+  the registered body and returns `SymbolRegistryError`. Single
+  `Interpreter::symbol_for_key(&mut self, key)` helper splits the
+  registry / heap borrows for native call sites.
+  `Op::SymbolCall` dispatch now takes `&mut Interpreter` so
+  `construct_symbol` can allocate. `GcTrace` impls for `JsSymbol`,
+  `WellKnownSymbols`, `SymbolRegistry` walk every embedded handle so
+  registry / table singletons survive collection.
+  `Value::trace_value_slots` gains the `Value::Symbol` arm via
+  `JsSymbol::trace_value_slots`. `MapKey::Symbol` hashing routes
+  through `identity_addr() -> usize` (the handle's compressed offset).
 
 ### Type tag map (current)
 
@@ -103,10 +125,10 @@ Ordered by call-site count, smallest first:
 | Wrapper           | Inner today                                     | Sites (~) | GC body ready | Notes |
 |-------------------|-------------------------------------------------|-----------|---------------|-------|
 | `JsIntl`          | done — `f9939ac3`                               | —         | —             | template |
-| `JsTemporal`      | done — this commit                              | —         | —             | dispatch + load_property + helpers `&mut GcHeap` plumbed |
+| `JsTemporal`      | done — `23d7e85c`                               | —         | —             | dispatch + load_property + helpers `&mut GcHeap` plumbed |
+| `JsSymbol`        | done — this commit                              | —         | —             | WellKnownSymbols/SymbolRegistry `&mut GcHeap`; root scan walks registry + table; SymbolCall dispatch `&mut Interpreter` |
 | `JsProxy`         | `Rc<ProxyBody>` + `Cell<bool> revoked`           | ~80       | `ProxyBodyGc` | `.target() / .handler() / .is_revoked() / .revoke()` all gain heap params; revoke becomes `with_payload` mutation |
 | `BigIntValue`     | `Rc<num_bigint::BigInt>`                        | ~71       | `BigIntBody`   | `.as_inner() -> &BigInt` consumers need closure-style read or owned clone |
-| `JsSymbol`        | `Rc<SymbolBody>`                                | ~15       | `SymbolBody`   | `WellKnownSymbols::new` + `SymbolRegistry::for_key` need `&mut GcHeap`; root scan must walk registry entries |
 | `JsDataView`      | `Rc<DataViewBody>`                              | TBD       | `DataViewBodyGc` | thin wrapper; few read sites |
 | `JsTypedArray`    | `Rc<TypedArrayBody>` + `Cell<expando>`          | TBD       | `TypedArrayBodyGc` | expando lazy-init becomes `with_payload` |
 | `JsArrayBuffer`   | `BufferStorage::{Local(Rc), Shared(Arc)}`       | TBD       | two bodies   | shared keeps `Arc<SharedBody>` (cross-thread); local moves bytes into GC body |
@@ -146,23 +168,18 @@ Ordered by call-site count, smallest first:
 
 Recommended order:
 
-1. **`JsSymbol`** — needs `WellKnownSymbols::new(heap)` and
-   `SymbolRegistry::for_key(heap)` to take mutable heap, and the
-   root-scan to walk registry entries (otherwise registered
-   symbols get collected). Touches the interpreter init path —
-   higher risk than Temporal/Intl.
-2. **`BigIntValue`** — `.as_inner()` returns `&BigInt` from ~71
+1. **`BigIntValue`** — `.as_inner()` returns `&BigInt` from ~71
    sites; need to introduce a `with_inner<F, R>` closure helper
    and convert each call site. `BigInt::clone()` is too expensive
    for hot arithmetic, so `with_inner` is the only viable path.
-3. **`JsDataView` / `JsTypedArray` / `JsArrayBuffer`** — all
+2. **`JsDataView` / `JsTypedArray` / `JsArrayBuffer`** — all
    interrelated. ArrayBuffer migrates first (Local body to GC,
    Shared keeps Arc inside a GC body). DataView + TypedArray then
    migrate to hold the new buffer handles.
-4. **`JsProxy`** — `.target() / .handler() / .is_revoked() /
+3. **`JsProxy`** — `.target() / .handler() / .is_revoked() /
    .revoke()` × 80 sites. Revoke becomes `&mut GcHeap` via
    `with_payload`. Touches `object_internal_ops.rs` extensively.
-5. **`JsString`** — biggest scope (~580 sites). Cons / sliced /
+4. **`JsString`** — biggest scope (~580 sites). Cons / sliced /
    thin string reprs all need GC bodies; rope concatenation must
    re-enter the GC heap; the string heap accountant must thread
    through GC alloc. Plan for a separate session series.

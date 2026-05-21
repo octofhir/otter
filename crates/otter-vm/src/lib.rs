@@ -1365,6 +1365,9 @@ impl Value {
             Value::Temporal(temporal) => {
                 temporal.trace_value_slots(visitor);
             }
+            Value::Symbol(symbol) => {
+                symbol.trace_value_slots(visitor);
+            }
             _ => {}
         }
     }
@@ -1956,12 +1959,12 @@ impl Interpreter {
         let startup_timer = StartupPhaseTimer::from_env();
         let string_heap = Arc::new(StringHeap::with_cap(cap_bytes));
         startup_timer.mark("vm_string_heap");
-        let well_known_symbols = WellKnownSymbols::new(&string_heap)
-            .expect("well-known symbol descriptions fit within any positive cap");
-        startup_timer.mark("vm_well_known_symbols");
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(cap_bytes)
             .expect("GcHeap construction never fails on the default cage");
         startup_timer.mark("vm_gc_heap");
+        let well_known_symbols = WellKnownSymbols::new(&string_heap, &mut gc_heap)
+            .expect("well-known symbol descriptions + bodies fit within any positive cap");
+        startup_timer.mark("vm_well_known_symbols");
         let error_classes = ErrorClassRegistry::new(&string_heap, &mut gc_heap)
             .expect("error class prototypes fit within any positive cap");
         startup_timer.mark("vm_error_classes");
@@ -2659,6 +2662,21 @@ impl Interpreter {
     #[must_use]
     pub fn symbol_registry(&self) -> &SymbolRegistry {
         &self.symbol_registry
+    }
+
+    /// Look up or register a symbol for `key`. Splits borrows over the
+    /// registry, the GC heap, and the string heap so callers do not
+    /// need to juggle them manually.
+    ///
+    /// # Errors
+    /// Surfaces [`crate::symbol::SymbolRegistryError`] (string or GC
+    /// out-of-memory).
+    pub fn symbol_for_key(
+        &mut self,
+        key: &str,
+    ) -> Result<JsSymbol, crate::symbol::SymbolRegistryError> {
+        self.symbol_registry
+            .for_key(&mut self.gc_heap, &self.string_heap, key)
     }
 
     /// Register or overwrite a module's `module_env` object so

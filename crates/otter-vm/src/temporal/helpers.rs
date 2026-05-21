@@ -88,19 +88,47 @@ pub fn read_string_field(obj: &JsObject, name: &str, gc_heap: &otter_gc::GcHeap)
     }
 }
 
-/// Build a `Value::Temporal` from a payload.
-#[must_use]
-pub fn make_temporal(payload: TemporalPayload) -> Value {
-    Value::Temporal(JsTemporal::new(payload))
+/// Build a `Value::Temporal` from a payload, allocating the backing
+/// GC body via [`IntrinsicArgs::gc_heap`].
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] via [`IntrinsicError::OutOfMemory`].
+pub fn make_temporal(
+    args: &mut IntrinsicArgs<'_>,
+    payload: TemporalPayload,
+) -> Result<Value, IntrinsicError> {
+    let handle = JsTemporal::new(args.gc_heap, payload)?;
+    Ok(Value::Temporal(handle))
+}
+
+/// `make_temporal` variant for the static-dispatch path
+/// ([`crate::temporal::dispatch::call`]) which surfaces
+/// [`crate::temporal::dispatch::TemporalError`] rather than
+/// [`IntrinsicError`].
+///
+/// # Errors
+///
+/// Maps [`otter_gc::OutOfMemory`] onto
+/// [`crate::temporal::dispatch::TemporalError::OutOfMemory`].
+pub fn alloc_temporal_value(
+    heap: &mut otter_gc::GcHeap,
+    payload: TemporalPayload,
+) -> Result<Value, crate::temporal::dispatch::TemporalError> {
+    let handle = JsTemporal::new(heap, payload).map_err(|e| {
+        crate::temporal::dispatch::TemporalError::OutOfMemory {
+            requested_bytes: e.requested_bytes(),
+            heap_limit_bytes: e.heap_limit_bytes(),
+        }
+    })?;
+    Ok(Value::Temporal(handle))
 }
 
 /// Extract a [`temporal_rs::Instant`] from the receiver, or raise
 /// [`IntrinsicError::BadReceiver`] for the wrong kind.
-pub fn require_instant<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a temporal_rs::Instant, IntrinsicError> {
+pub fn require_instant(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Instant, IntrinsicError> {
     match args.receiver {
-        Value::Temporal(t) => match t.payload() {
+        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
             TemporalPayload::Instant(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.Instant",
@@ -113,11 +141,9 @@ pub fn require_instant<'a>(
 }
 
 /// Extract a [`temporal_rs::Duration`] from the receiver.
-pub fn require_duration<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a temporal_rs::Duration, IntrinsicError> {
+pub fn require_duration(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Duration, IntrinsicError> {
     match args.receiver {
-        Value::Temporal(t) => match t.payload() {
+        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.Duration",
@@ -130,11 +156,11 @@ pub fn require_duration<'a>(
 }
 
 /// Extract a [`temporal_rs::PlainDate`] from the receiver.
-pub fn require_plain_date<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a temporal_rs::PlainDate, IntrinsicError> {
+pub fn require_plain_date(
+    args: &IntrinsicArgs<'_>,
+) -> Result<temporal_rs::PlainDate, IntrinsicError> {
     match args.receiver {
-        Value::Temporal(t) => match t.payload() {
+        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDate(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.PlainDate",
@@ -147,11 +173,11 @@ pub fn require_plain_date<'a>(
 }
 
 /// Extract a [`temporal_rs::PlainTime`] from the receiver.
-pub fn require_plain_time<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a temporal_rs::PlainTime, IntrinsicError> {
+pub fn require_plain_time(
+    args: &IntrinsicArgs<'_>,
+) -> Result<temporal_rs::PlainTime, IntrinsicError> {
     match args.receiver {
-        Value::Temporal(t) => match t.payload() {
+        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainTime(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.PlainTime",
@@ -164,11 +190,11 @@ pub fn require_plain_time<'a>(
 }
 
 /// Extract a [`temporal_rs::PlainDateTime`] from the receiver.
-pub fn require_plain_date_time<'a>(
-    args: &'a IntrinsicArgs<'_>,
-) -> Result<&'a temporal_rs::PlainDateTime, IntrinsicError> {
+pub fn require_plain_date_time(
+    args: &IntrinsicArgs<'_>,
+) -> Result<temporal_rs::PlainDateTime, IntrinsicError> {
     match args.receiver {
-        Value::Temporal(t) => match t.payload() {
+        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDateTime(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.PlainDateTime",

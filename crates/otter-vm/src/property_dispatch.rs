@@ -857,7 +857,7 @@ impl Interpreter {
                     value => value,
                 }
             }
-            Value::Temporal(t) => temporal::load_property(t, name),
+            Value::Temporal(t) => temporal::load_property(t, &self.gc_heap, name),
             v @ Value::ArrayBuffer(_) => {
                 let (direct, is_shared) = if let Value::ArrayBuffer(b) = v {
                     (

@@ -93,22 +93,22 @@ impl From<crate::string::StringError> for TemporalError {
 /// - <https://tc39.es/proposal-temporal/#sec-temporal-instant-objects>
 pub fn call(
     string_heap: &crate::string::StringHeap,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
     class: otter_bytecode::method_id::TemporalClassId,
     method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
     use otter_bytecode::method_id::TemporalClassId as C;
     if matches!(class, C::Now) {
-        return now::dispatch(string_heap, method, args);
+        return now::dispatch(string_heap, gc_heap, method, args);
     }
     match class {
         C::Now => unreachable!("handled above"),
-        C::Instant => instant::dispatch_static(string_heap, method, args),
+        C::Instant => instant::dispatch_static(string_heap, gc_heap, method, args),
         C::Duration => duration::dispatch_static(string_heap, gc_heap, method, args),
-        C::PlainDate => plain_date::dispatch_static(string_heap, method, args),
-        C::PlainTime => plain_time::dispatch_static(string_heap, method, args),
-        C::PlainDateTime => plain_date_time::dispatch_static(string_heap, method, args),
+        C::PlainDate => plain_date::dispatch_static(string_heap, gc_heap, method, args),
+        C::PlainTime => plain_time::dispatch_static(string_heap, gc_heap, method, args),
+        C::PlainDateTime => plain_date_time::dispatch_static(string_heap, gc_heap, method, args),
     }
 }
 

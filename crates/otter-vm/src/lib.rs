@@ -1362,6 +1362,9 @@ impl Value {
             Value::Proxy(proxy) => {
                 proxy.trace_value_slots(visitor);
             }
+            Value::Temporal(temporal) => {
+                temporal.trace_value_slots(visitor);
+            }
             _ => {}
         }
     }
@@ -1669,7 +1672,7 @@ impl PartialEq for Value {
             (Value::WeakSet(a), Value::WeakSet(b)) => a == b,
             (Value::WeakRef(a), Value::WeakRef(b)) => a == b,
             (Value::FinalizationRegistry(a), Value::FinalizationRegistry(b)) => a == b,
-            (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(b),
+            (Value::Temporal(a), Value::Temporal(b)) => a.ptr_eq(*b),
             (Value::Intl(a), Value::Intl(b)) => a.ptr_eq(*b),
             (Value::ArrayBuffer(a), Value::ArrayBuffer(b)) => a.ptr_eq(b),
             (Value::DataView(a), Value::DataView(b)) => a.ptr_eq(b),

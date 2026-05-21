@@ -184,9 +184,14 @@ impl Interpreter {
                     .ok_or(VmError::InvalidOperand)?;
                 let method = method_id::TemporalMethod::from_u32(method_idx)
                     .ok_or(VmError::InvalidOperand)?;
-                let result =
-                    temporal::call_static(&self.string_heap, &self.gc_heap, class, method, &args)
-                        .map_err(temporal_to_vm_error)?;
+                let result = temporal::call_static(
+                    &self.string_heap,
+                    &mut self.gc_heap,
+                    class,
+                    method,
+                    &args,
+                )
+                .map_err(temporal_to_vm_error)?;
                 finish_static_call(frame, dst, result)
             }
             _ => Err(VmError::InvalidOperand),

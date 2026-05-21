@@ -22,22 +22,25 @@ use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, Intrin
 use crate::number::NumberValue;
 use crate::string::StringHeap;
 use crate::temporal::dispatch::TemporalError;
-use crate::temporal::helpers::{js_string_value, make_temporal, require_instant, temporal_err};
+use crate::temporal::helpers::{
+    alloc_temporal_value, js_string_value, make_temporal, require_instant, temporal_err,
+};
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 
 /// Dispatch `Temporal.Instant.<method>(args...)` via the typed
 /// [`TemporalMethod`].
 pub fn dispatch_static(
     string_heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
     method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
     use otter_bytecode::method_id::TemporalMethod as M;
     let _ = string_heap;
     match method {
-        M::From => from(args),
-        M::FromEpochMilliseconds => from_epoch_milliseconds(args),
-        M::Compare => compare(args),
+        M::From => from(args, gc_heap),
+        M::FromEpochMilliseconds => from_epoch_milliseconds(args, gc_heap),
+        M::Compare => compare(args, gc_heap),
         other => Err(TemporalError::UnknownMember {
             class: "Instant".to_string(),
             method: other.name().to_string(),
@@ -46,13 +49,16 @@ pub fn dispatch_static(
 }
 
 /// Spec §8.2.1 `Temporal.Instant.from`.
-fn from(args: &[Value]) -> Result<Value, TemporalError> {
-    let inst = parse_instant_arg(args, 0, "from")?;
-    Ok(make_temporal(TemporalPayload::Instant(inst)))
+fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
+    let inst = parse_instant_arg(args, gc_heap, 0, "from")?;
+    alloc_temporal_value(gc_heap, TemporalPayload::Instant(inst))
 }
 
 /// Spec §8.2.3 `Temporal.Instant.fromEpochMilliseconds(ms)`.
-fn from_epoch_milliseconds(args: &[Value]) -> Result<Value, TemporalError> {
+fn from_epoch_milliseconds(
+    args: &[Value],
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, TemporalError> {
     let ms = match args.first() {
         Some(Value::Number(n)) => n.as_f64() as i64,
         _ => {
@@ -70,13 +76,13 @@ fn from_epoch_milliseconds(args: &[Value]) -> Result<Value, TemporalError> {
             method: "fromEpochMilliseconds",
             message: e.to_string(),
         })?;
-    Ok(make_temporal(TemporalPayload::Instant(inst)))
+    alloc_temporal_value(gc_heap, TemporalPayload::Instant(inst))
 }
 
 /// Spec §8.2.4 `Temporal.Instant.compare(a, b)`.
-fn compare(args: &[Value]) -> Result<Value, TemporalError> {
-    let a = parse_instant_arg(args, 0, "compare")?;
-    let b = parse_instant_arg(args, 1, "compare")?;
+fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalError> {
+    let a = parse_instant_arg(args, gc_heap, 0, "compare")?;
+    let b = parse_instant_arg(args, gc_heap, 1, "compare")?;
     let cmp = a.as_i128().cmp(&b.as_i128());
     let n = match cmp {
         std::cmp::Ordering::Less => -1,
@@ -88,12 +94,13 @@ fn compare(args: &[Value]) -> Result<Value, TemporalError> {
 
 fn parse_instant_arg(
     args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
     index: u16,
     method: &'static str,
 ) -> Result<temporal_rs::Instant, TemporalError> {
     match args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Instant(v) => Ok(*v),
+        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+            TemporalPayload::Instant(v) => Ok(v),
             _ => Err(TemporalError::BadArgument {
                 class: "Instant",
                 method,
@@ -118,9 +125,10 @@ fn parse_instant_arg(
 
 /// Property reads on a `Temporal.Instant` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
-    let TemporalPayload::Instant(inst) = temporal.payload() else {
-        return Value::Undefined;
+pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+    let inst = match temporal.payload_clone(gc_heap) {
+        TemporalPayload::Instant(v) => v,
+        _ => return Value::Undefined,
     };
     match name {
         "epochMilliseconds" => {
@@ -151,21 +159,21 @@ fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let dur = arg_as_duration(args, 0)?;
     let result = inst.add(&dur).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::Instant(result)))
+    make_temporal(args, TemporalPayload::Instant(result))
 }
 
 fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let dur = arg_as_duration(args, 0)?;
     let result = inst.subtract(&dur).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::Instant(result)))
+    make_temporal(args, TemporalPayload::Instant(result))
 }
 
 fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let other = match args.args.first() {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Instant(v) => *v,
+        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+            TemporalPayload::Instant(v) => v,
             _ => {
                 return Err(IntrinsicError::BadArgument {
                     index: 0,
@@ -192,8 +200,8 @@ fn arg_as_duration(
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
     match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Duration(d) => Ok(*d),
+        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+            TemporalPayload::Duration(d) => Ok(d),
             _ => Err(IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration",

@@ -146,9 +146,10 @@ fn impl_to_temporal_instant(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intri
             reason: "Temporal.Instant out of range",
         }
     })?;
-    Ok(crate::temporal::helpers::make_temporal(
+    crate::temporal::helpers::make_temporal(
+        args,
         crate::temporal::payload::TemporalPayload::Instant(inst),
-    ))
+    )
 }
 
 /// §21.4.4.36 — `toISOString()`. Throws RangeError on Invalid Date

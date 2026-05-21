@@ -11,20 +11,23 @@ use crate::number::NumberValue;
 use crate::string::StringHeap;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
-use crate::temporal::helpers::{js_string_value, make_temporal, require_plain_time, temporal_err};
+use crate::temporal::helpers::{
+    alloc_temporal_value, js_string_value, make_temporal, require_plain_time, temporal_err,
+};
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 
 /// Dispatch `Temporal.PlainTime.<method>(args...)` via the typed
 /// [`TemporalMethod`].
 pub fn dispatch_static(
     string_heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
     method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
     use otter_bytecode::method_id::TemporalMethod as M;
     let _ = string_heap;
     match method {
-        M::From => from(args),
+        M::From => from(args, gc_heap),
         other => Err(TemporalError::UnknownMember {
             class: "PlainTime".to_string(),
             method: other.name().to_string(),
@@ -32,10 +35,10 @@ pub fn dispatch_static(
     }
 }
 
-fn from(args: &[Value]) -> Result<Value, TemporalError> {
+fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
     let pt = match args.first() {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::PlainTime(v) => *v,
+        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+            TemporalPayload::PlainTime(v) => v,
             _ => {
                 return Err(TemporalError::BadArgument {
                     class: "PlainTime",
@@ -60,14 +63,15 @@ fn from(args: &[Value]) -> Result<Value, TemporalError> {
             });
         }
     };
-    Ok(make_temporal(TemporalPayload::PlainTime(pt)))
+    alloc_temporal_value(gc_heap, TemporalPayload::PlainTime(pt))
 }
 
 /// Property reads on a `Temporal.PlainTime` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
-    let TemporalPayload::PlainTime(pt) = temporal.payload() else {
-        return Value::Undefined;
+pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+    let pt = match temporal.payload_clone(gc_heap) {
+        TemporalPayload::PlainTime(v) => v,
+        _ => return Value::Undefined,
     };
     match name {
         "hour" => Value::Number(NumberValue::from_i32(pt.hour() as i32)),
@@ -94,14 +98,14 @@ fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pt = require_plain_time(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pt.add(&dur).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::PlainTime(result)))
+    make_temporal(args, TemporalPayload::PlainTime(result))
 }
 
 fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pt = require_plain_time(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pt.subtract(&dur).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::PlainTime(result)))
+    make_temporal(args, TemporalPayload::PlainTime(result))
 }
 
 fn duration_arg(
@@ -109,8 +113,8 @@ fn duration_arg(
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
     match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Duration(d) => Ok(*d),
+        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+            TemporalPayload::Duration(d) => Ok(d),
             _ => Err(IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration",

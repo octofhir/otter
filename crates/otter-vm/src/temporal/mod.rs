@@ -71,12 +71,12 @@ pub fn lookup_prototype(receiver: &Value, name: &str) -> Option<&'static Intrins
 /// [`Value::Undefined`] for unknown names; the dispatcher uses this
 /// from `Op::LoadProperty`.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
+pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     match temporal.kind() {
-        TemporalKind::Instant => instant::load_property(temporal, name),
-        TemporalKind::Duration => duration::load_property(temporal, name),
-        TemporalKind::PlainDate => plain_date::load_property(temporal, name),
-        TemporalKind::PlainTime => plain_time::load_property(temporal, name),
-        TemporalKind::PlainDateTime => plain_date_time::load_property(temporal, name),
+        TemporalKind::Instant => instant::load_property(temporal, gc_heap, name),
+        TemporalKind::Duration => duration::load_property(temporal, gc_heap, name),
+        TemporalKind::PlainDate => plain_date::load_property(temporal, gc_heap, name),
+        TemporalKind::PlainTime => plain_time::load_property(temporal, gc_heap, name),
+        TemporalKind::PlainDateTime => plain_date_time::load_property(temporal, gc_heap, name),
     }
 }

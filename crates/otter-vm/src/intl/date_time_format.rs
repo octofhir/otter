@@ -77,9 +77,9 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_date_time(args)?;
     let formatted = match args.args.first() {
         Some(Value::Number(n)) => format_epoch_ms(n.as_f64() as i64, &payload),
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::PlainDateTime(pdt) => format_pdt(pdt, &payload),
-            TemporalPayload::PlainDate(pd) => format_pd(pd, &payload),
+        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+            TemporalPayload::PlainDateTime(pdt) => format_pdt(&pdt, &payload),
+            TemporalPayload::PlainDate(pd) => format_pd(&pd, &payload),
             TemporalPayload::Instant(inst) => format_epoch_ms(inst.epoch_milliseconds(), &payload),
             _ => {
                 return Err(IntrinsicError::BadArgument {

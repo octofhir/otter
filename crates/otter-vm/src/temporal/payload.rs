@@ -1,24 +1,23 @@
 //! Heap payload for `Value::Temporal`.
 //!
 //! All `Temporal.*` values share one [`Value`](crate::Value) variant
-//! that wraps an `Rc<TemporalPayload>`. Each variant of the payload
-//! corresponds to one ECMA-262 / Temporal proposal type.
+//! that wraps a [`TemporalHandle`] (compressed `Gc<TemporalBody>`).
+//! Each variant of the payload corresponds to one ECMA-262 / Temporal
+//! proposal type.
 //!
-//! The payload is immutable from JS's perspective — every method
-//! that produces a new value (e.g. `add`, `subtract`, `with`) returns
-//! a fresh [`JsTemporal`] handle. Cloning a handle is `Rc::clone`.
+//! The payload is immutable from JS's perspective — every method that
+//! produces a new value (e.g. `add`, `subtract`, `with`) allocates a
+//! fresh [`JsTemporal`] handle.
 //!
 //! # Contents
-//! - [`TemporalPayload`] — sum type over the seven shipped Temporal
-//!   value kinds.
+//! - [`TemporalPayload`] — sum type over the shipped Temporal value
+//!   kinds.
 //! - [`TemporalKind`] — light tag used by the dispatcher to route
 //!   prototype lookups without inspecting the payload bytes.
 //! - [`JsTemporal`] — heap handle.
 //!
 //! # See also
 //! - <https://tc39.es/proposal-temporal/>
-
-use std::rc::Rc;
 
 use otter_gc::raw::SlotVisitor;
 
@@ -136,36 +135,89 @@ pub fn alloc_temporal(
     heap.alloc_old(TemporalBody { payload })
 }
 
-/// Heap-shared handle for [`crate::Value::Temporal`].
-#[derive(Debug, Clone)]
+/// Heap handle for [`crate::Value::Temporal`].
+///
+/// Backed by a GC body ([`TemporalBody`]). The wrapper caches the
+/// lightweight [`TemporalKind`] discriminator so prototype routing and
+/// `typeof`-style display avoid a heap touch; the full payload lives
+/// in the GC body.
+#[derive(Debug, Clone, Copy)]
 pub struct JsTemporal {
-    inner: Rc<TemporalPayload>,
+    inner: TemporalHandle,
+    kind: TemporalKind,
 }
 
 impl JsTemporal {
-    /// Wrap a payload in a fresh handle.
-    #[must_use]
-    pub fn new(payload: TemporalPayload) -> Self {
-        Self {
-            inner: Rc::new(payload),
-        }
+    /// Allocate a fresh handle wrapping `payload` on the GC heap.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    pub fn new(
+        heap: &mut otter_gc::GcHeap,
+        payload: TemporalPayload,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        let kind = payload.kind();
+        Ok(Self {
+            inner: alloc_temporal(heap, payload)?,
+            kind,
+        })
     }
 
-    /// Borrow the payload.
+    /// Run `f` against the payload borrowed from the GC body.
+    ///
+    /// The closure receives `&TemporalPayload`; the borrow does not
+    /// escape, so the call is sound under the single-mutator otter-gc
+    /// contract.
+    #[inline]
     #[must_use]
-    pub fn payload(&self) -> &TemporalPayload {
-        &self.inner
+    pub fn with_payload<F, R>(self, heap: &otter_gc::GcHeap, f: F) -> R
+    where
+        F: FnOnce(&TemporalPayload) -> R,
+    {
+        heap.read_payload(self.inner, |body| f(&body.payload))
     }
 
-    /// Tag for prototype routing.
+    /// Clone the payload out of the GC body. Used by helpers that
+    /// need to return the payload across a borrow boundary
+    /// (`require_instant`, `require_duration`, …). `temporal_rs`
+    /// value types are small `Clone` records — `Instant` / `Duration`
+    /// / `PlainTime` are `Copy`; `PlainDate` / `PlainDateTime` clone
+    /// a calendar tag.
+    #[inline]
     #[must_use]
-    pub fn kind(&self) -> TemporalKind {
-        self.inner.kind()
+    pub fn payload_clone(self, heap: &otter_gc::GcHeap) -> TemporalPayload {
+        heap.read_payload(self.inner, |body| body.payload.clone())
     }
 
-    /// Identity comparison via `Rc::ptr_eq`.
+    /// Tag for prototype routing. Read from the wrapper-side cache
+    /// without a heap touch.
+    #[inline]
     #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.inner, &other.inner)
+    pub fn kind(self) -> TemporalKind {
+        self.kind
+    }
+
+    /// Raw GC handle — used by tracing and write barriers.
+    #[doc(hidden)]
+    #[inline]
+    #[must_use]
+    pub fn handle(self) -> TemporalHandle {
+        self.inner
+    }
+
+    /// Identity comparison — `===` follows compressed-offset equality.
+    #[inline]
+    #[must_use]
+    pub fn ptr_eq(self, other: Self) -> bool {
+        self.inner == other.inner
+    }
+
+    /// Visit the embedded GC handle so the scavenger can rewrite the
+    /// compressed offset in place if the body moves. Called from
+    /// [`crate::Value::trace_value_slots`].
+    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        let p = &self.inner as *const TemporalHandle as *mut otter_gc::raw::RawGc;
+        visitor(p);
     }
 }

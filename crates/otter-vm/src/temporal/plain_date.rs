@@ -14,21 +14,24 @@ use crate::number::NumberValue;
 use crate::string::StringHeap;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
-use crate::temporal::helpers::{js_string_value, make_temporal, require_plain_date, temporal_err};
+use crate::temporal::helpers::{
+    alloc_temporal_value, js_string_value, make_temporal, require_plain_date, temporal_err,
+};
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 
 /// Dispatch `Temporal.PlainDate.<method>(args...)` via the typed
 /// [`TemporalMethod`].
 pub fn dispatch_static(
     string_heap: &StringHeap,
+    gc_heap: &mut otter_gc::GcHeap,
     method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
     use otter_bytecode::method_id::TemporalMethod as M;
     let _ = string_heap;
     match method {
-        M::From => from(args),
-        M::Compare => compare(args),
+        M::From => from(args, gc_heap),
+        M::Compare => compare(args, gc_heap),
         other => Err(TemporalError::UnknownMember {
             class: "PlainDate".to_string(),
             method: other.name().to_string(),
@@ -36,14 +39,14 @@ pub fn dispatch_static(
     }
 }
 
-fn from(args: &[Value]) -> Result<Value, TemporalError> {
-    let pd = parse_arg(args, 0, "from")?;
-    Ok(make_temporal(TemporalPayload::PlainDate(pd)))
+fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
+    let pd = parse_arg(args, gc_heap, 0, "from")?;
+    alloc_temporal_value(gc_heap, TemporalPayload::PlainDate(pd))
 }
 
-fn compare(args: &[Value]) -> Result<Value, TemporalError> {
-    let a = parse_arg(args, 0, "compare")?;
-    let b = parse_arg(args, 1, "compare")?;
+fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalError> {
+    let a = parse_arg(args, gc_heap, 0, "compare")?;
+    let b = parse_arg(args, gc_heap, 1, "compare")?;
     let cmp = a.compare_iso(&b);
     let n = match cmp {
         std::cmp::Ordering::Less => -1,
@@ -55,12 +58,13 @@ fn compare(args: &[Value]) -> Result<Value, TemporalError> {
 
 fn parse_arg(
     args: &[Value],
+    gc_heap: &otter_gc::GcHeap,
     index: u16,
     method: &'static str,
 ) -> Result<temporal_rs::PlainDate, TemporalError> {
     match args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::PlainDate(v) => Ok(v.clone()),
+        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+            TemporalPayload::PlainDate(v) => Ok(v),
             _ => Err(TemporalError::BadArgument {
                 class: "PlainDate",
                 method,
@@ -85,9 +89,10 @@ fn parse_arg(
 
 /// Property reads on a `Temporal.PlainDate` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
-    let TemporalPayload::PlainDate(pd) = temporal.payload() else {
-        return Value::Undefined;
+pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+    let pd = match temporal.payload_clone(gc_heap) {
+        TemporalPayload::PlainDate(v) => v,
+        _ => return Value::Undefined,
     };
     match name {
         "year" => Value::Number(NumberValue::from_i32(pd.year())),
@@ -115,21 +120,21 @@ fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pd.add(&dur, None).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::PlainDate(result)))
+    make_temporal(args, TemporalPayload::PlainDate(result))
 }
 
 fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let dur = duration_arg(args, 0)?;
     let result = pd.subtract(&dur, None).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::PlainDate(result)))
+    make_temporal(args, TemporalPayload::PlainDate(result))
 }
 
 fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let other = match args.args.first() {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::PlainDate(v) => v.clone(),
+        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+            TemporalPayload::PlainDate(v) => v,
             _ => {
                 return Err(IntrinsicError::BadArgument {
                     index: 0,
@@ -156,8 +161,8 @@ fn duration_arg(
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
     match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Duration(d) => Ok(*d),
+        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+            TemporalPayload::Duration(d) => Ok(d),
             _ => Err(IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration",

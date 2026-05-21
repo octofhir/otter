@@ -30,8 +30,8 @@ use crate::object::JsObject;
 use crate::string::StringHeap;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{
-    js_string_value, make_temporal, optional_object_arg, read_i64_field, read_string_field,
-    require_duration, temporal_err,
+    alloc_temporal_value, js_string_value, make_temporal, optional_object_arg, read_i64_field,
+    read_string_field, require_duration, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 
@@ -39,7 +39,7 @@ use crate::temporal::payload::{JsTemporal, TemporalPayload};
 /// [`TemporalMethod`].
 pub fn dispatch_static(
     string_heap: &StringHeap,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
     method: otter_bytecode::method_id::TemporalMethod,
     args: &[Value],
 ) -> Result<Value, TemporalError> {
@@ -56,7 +56,7 @@ pub fn dispatch_static(
 }
 
 /// Spec §7.2.1 `Temporal.Duration.from`.
-fn from(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalError> {
+fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
     let dur = match args.first() {
         Some(Value::String(s)) => temporal_rs::Duration::from_utf8(s.to_lossy_string().as_bytes())
             .map_err(|e| TemporalError::Engine {
@@ -71,8 +71,8 @@ fn from(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalErr
                 message: e.to_string(),
             })?
         }
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Duration(d) => *d,
+        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+            TemporalPayload::Duration(d) => d,
             _ => {
                 return Err(TemporalError::BadArgument {
                     class: "Duration",
@@ -91,7 +91,7 @@ fn from(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalErr
             });
         }
     };
-    Ok(make_temporal(TemporalPayload::Duration(dur)))
+    alloc_temporal_value(gc_heap, TemporalPayload::Duration(dur))
 }
 
 /// Spec §7.2.2 `Temporal.Duration.compare(a, b, options?)`. The
@@ -119,8 +119,8 @@ fn expect_duration(
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Duration, TemporalError> {
     match args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Duration(d) => Ok(*d),
+        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+            TemporalPayload::Duration(d) => Ok(d),
             _ => Err(TemporalError::BadArgument {
                 class: "Duration",
                 method: "compare",
@@ -210,9 +210,10 @@ fn optional_field(
 
 /// Property reads on a `Temporal.Duration` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, name: &str) -> Value {
-    let TemporalPayload::Duration(d) = temporal.payload() else {
-        return Value::Undefined;
+pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+    let d = match temporal.payload_clone(gc_heap) {
+        TemporalPayload::Duration(v) => v,
+        _ => return Value::Undefined,
     };
     match name {
         "years" => Value::Number(NumberValue::from_i32(d.years() as i32)),
@@ -245,24 +246,26 @@ fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let lhs = require_duration(args)?;
     let rhs = duration_arg(args, 0)?;
     let result = lhs.add(&rhs).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::Duration(result)))
+    make_temporal(args, TemporalPayload::Duration(result))
 }
 
 fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let lhs = require_duration(args)?;
     let rhs = duration_arg(args, 0)?;
     let result = lhs.subtract(&rhs).map_err(temporal_err)?;
-    Ok(make_temporal(TemporalPayload::Duration(result)))
+    make_temporal(args, TemporalPayload::Duration(result))
 }
 
 fn impl_negated(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let dur = require_duration(args)?;
-    Ok(make_temporal(TemporalPayload::Duration(dur.negated())))
+    let negated = dur.negated();
+    make_temporal(args, TemporalPayload::Duration(negated))
 }
 
 fn impl_abs(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let dur = require_duration(args)?;
-    Ok(make_temporal(TemporalPayload::Duration(dur.abs())))
+    let abs = dur.abs();
+    make_temporal(args, TemporalPayload::Duration(abs))
 }
 
 fn impl_total(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -297,8 +300,8 @@ fn duration_arg(
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
     match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload() {
-            TemporalPayload::Duration(d) => Ok(*d),
+        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+            TemporalPayload::Duration(d) => Ok(d),
             _ => Err(IntrinsicError::BadArgument {
                 index,
                 reason: "must be a Temporal.Duration",

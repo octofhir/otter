@@ -58,6 +58,7 @@ use crate::promise::{JsPromiseHandle, PurePromise, PurePromiseBody};
 use crate::regexp::{JsRegExp, JsRegExpBody};
 use crate::string::{JsStringBody, JsStringHandle};
 use crate::symbol::{SymbolBody, SymbolHandle};
+use crate::temporal::{TemporalBody, TemporalHandle};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
 use crate::{
     BoundFunction, BoundFunctionBody, ClassConstructor, ClassConstructorBody, IteratorHandle,
@@ -403,6 +404,16 @@ impl Value {
     #[must_use]
     pub fn symbol_gc(s: SymbolHandle) -> Self {
         Self(pack(TAG_PTR_OTHER, s.offset() as u64))
+    }
+
+    /// GC-managed Temporal body handle. Migration target for the
+    /// legacy `JsTemporal { inner: Rc<TemporalPayload> }` wrapper.
+    /// Packs under `TAG_PTR_OBJECT` because `Temporal.*` instances
+    /// are object-shaped per ECMA-262 / Temporal proposal §8.
+    #[inline]
+    #[must_use]
+    pub fn temporal_gc(t: TemporalHandle) -> Self {
+        Self::from_object_gc(t.raw())
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1069,6 +1080,25 @@ impl Value {
         top_tag(self.0) == TAG_PTR_OTHER
             && self.read_gc_type_tag()
                 == Some(<SymbolBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// GC-managed Temporal body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_temporal_gc(self) -> Option<TemporalHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<TemporalBody>()
+    }
+
+    /// `true` when the value is a GC-managed Temporal body.
+    #[inline]
+    #[must_use]
+    pub fn is_temporal_gc(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<TemporalBody as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 }
 

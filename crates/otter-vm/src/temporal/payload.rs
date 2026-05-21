@@ -20,6 +20,8 @@
 
 use std::rc::Rc;
 
+use otter_gc::raw::SlotVisitor;
+
 /// One Temporal value, parameterised over the [`temporal_rs`] type.
 ///
 /// Foundation slice ships every variant the task acceptance criteria
@@ -98,6 +100,41 @@ impl TemporalKind {
             _ => return None,
         })
     }
+}
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`TemporalBody`].
+pub const TEMPORAL_BODY_TYPE_TAG: u8 = 0x27;
+
+/// GC-managed body for [`crate::Value::Temporal`] — migration target
+/// for the legacy `JsTemporal { inner: Rc<TemporalPayload> }` wrapper.
+#[derive(Debug, Clone)]
+pub struct TemporalBody {
+    /// The variant-typed Temporal payload (Instant / Duration /
+    /// PlainDate / PlainTime / PlainDateTime).
+    pub payload: TemporalPayload,
+}
+
+impl otter_gc::SafeTraceable for TemporalBody {
+    const TYPE_TAG: u8 = TEMPORAL_BODY_TYPE_TAG;
+
+    /// No outgoing GC slots — every Temporal variant wraps
+    /// `temporal_rs::*` plain numeric data with no GC references.
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
+}
+
+/// 4-byte compressed GC handle to a [`TemporalBody`]. `Copy`.
+pub type TemporalHandle = otter_gc::Gc<TemporalBody>;
+
+/// Allocate a Temporal body on the GC heap.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_temporal(
+    heap: &mut otter_gc::GcHeap,
+    payload: TemporalPayload,
+) -> Result<TemporalHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(TemporalBody { payload })
 }
 
 /// Heap-shared handle for [`crate::Value::Temporal`].

@@ -38,7 +38,10 @@ pub mod plain_date_time;
 pub mod plain_time;
 
 pub use dispatch::{TemporalError, call as call_static, load_static};
-pub use payload::{JsTemporal, TemporalKind, TemporalPayload};
+pub use payload::{
+    JsTemporal, TEMPORAL_BODY_TYPE_TAG, TemporalBody, TemporalHandle, TemporalKind,
+    TemporalPayload, alloc_temporal,
+};
 
 use crate::Value;
 use crate::intrinsics::IntrinsicEntry;

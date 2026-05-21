@@ -820,35 +820,6 @@ fn intrinsic_to_native_error(
     }
 }
 
-/// `Type(value) is Object` per §6 — any value that an ECMAScript
-/// program can observe as a non-primitive carrier. The §22.2.6.11
-/// step 1 receiver guard rejects everything else.
-fn is_object_kind(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure { .. }
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Proxy(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Promise(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-    )
-}
-
 fn vm_err_to_native(name: &'static str) -> impl Fn(crate::VmError) -> crate::NativeError {
     move |err| match err {
         crate::VmError::Uncaught { value } => crate::NativeError::Thrown {
@@ -877,7 +848,7 @@ fn vm_err_to_native(name: &'static str) -> impl Fn(crate::VmError) -> crate::Nat
 /// `? Get(value, key)` driven through `ordinary_get_value` so accessor
 /// getters fire observably. Used by the @@replace ladder to call
 /// user-overridable `flags` / `exec` / `lastIndex` / `index` / etc.
-fn get_property_runtime(
+pub(crate) fn get_property_runtime(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
     key: &str,
@@ -940,7 +911,7 @@ fn set_property_runtime(
 /// `to_string_primitive`; objects run the §7.1.1 / §7.1.1.1
 /// `[Symbol.toPrimitive]` → `toString` → `valueOf` ladder via the
 /// interpreter helper.
-fn coerce_to_jsstring_runtime(
+pub(crate) fn coerce_to_jsstring_runtime(
     ctx: &mut NativeCtx<'_>,
     value: &Value,
     name: &'static str,
@@ -1062,7 +1033,7 @@ fn regexp_exec_runtime(
         let result = interp
             .run_callable_sync(&exec_ctx, &exec_fn, rx.clone(), args)
             .map_err(vm_err_to_native(name))?;
-        if !matches!(result, Value::Null) && !is_object_kind(&result) {
+        if !matches!(result, Value::Null) && !crate::value_kind::is_object_like_value(&result) {
             return Err(crate::NativeError::TypeError {
                 name,
                 reason: "exec did not return an Object or null".to_string(),
@@ -1154,7 +1125,7 @@ pub fn native_regexp_symbol_replace(
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@replace]";
     let receiver = ctx.this_value().clone();
-    if !is_object_kind(&receiver) {
+    if !crate::value_kind::is_object_like_value(&receiver) {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "called on a non-object receiver".to_string(),
@@ -1338,7 +1309,7 @@ pub fn native_regexp_symbol_replace(
 /// so accessor getters on symbol-keyed slots fire observably. Mirror
 /// of [`get_property_runtime`] for `Symbol.species` /
 /// `Symbol.toPrimitive` resolution inside @@split.
-fn get_symbol_property_runtime(
+pub(crate) fn get_symbol_property_runtime(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
     sym: &crate::symbol::JsSymbol,
@@ -1385,7 +1356,7 @@ fn species_constructor_runtime(
     if matches!(c, Value::Undefined) {
         return Ok(default_ctor.clone());
     }
-    if !is_object_kind(&c) {
+    if !crate::value_kind::is_object_like_value(&c) {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "constructor is not an Object".to_string(),
@@ -1435,7 +1406,7 @@ pub fn native_regexp_symbol_match_all(
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@matchAll]";
     let receiver = ctx.this_value().clone();
-    if !is_object_kind(&receiver) {
+    if !crate::value_kind::is_object_like_value(&receiver) {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "called on a non-object receiver".to_string(),
@@ -1527,7 +1498,7 @@ pub fn native_regexp_symbol_split(
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@split]";
     let receiver = ctx.this_value().clone();
-    if !is_object_kind(&receiver) {
+    if !crate::value_kind::is_object_like_value(&receiver) {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "called on a non-object receiver".to_string(),

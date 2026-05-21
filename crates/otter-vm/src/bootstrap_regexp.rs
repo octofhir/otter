@@ -417,56 +417,46 @@ pub fn install_regexp_well_knowns_post_bootstrap(
 fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pattern_arg = args.first().cloned().unwrap_or(Value::Undefined);
     let flags_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let pattern_is_regexp = is_regexp_runtime(ctx, &pattern_arg, "RegExp")?;
 
-    // Step 1 — if `pattern` is a RegExp and (called without new
-    // OR flags is undefined), reuse the existing handle when the
-    // active constructor matches. Foundation: always honour the
-    // identity for bare `RegExp(re)` with undefined flags.
-    if let Value::RegExp(existing) = &pattern_arg
+    // §22.2.3.1 steps 3-4 — bare `RegExp(pattern)` returns a
+    // RegExp-like input unchanged only when its observable
+    // `constructor` is the active `%RegExp%` constructor.
+    if pattern_is_regexp
         && matches!(flags_arg, Value::Undefined)
         && !ctx.is_construct_call()
+        && regexp_constructor_matches(ctx, &pattern_arg)?
     {
-        return Ok(Value::RegExp(*existing));
+        return Ok(pattern_arg);
     }
 
-    let heap = ctx.heap_mut();
     // Source + flag string preparation.
-    let (pattern_utf16, flags_str): (Vec<u16>, String) = match (&pattern_arg, &flags_arg) {
-        // RegExp + RegExp source clone.
-        (Value::RegExp(re), Value::Undefined) => {
-            (re.pattern_utf16(heap), re.flags(heap).to_js_string())
-        }
-        (Value::RegExp(re), Value::String(s)) => (re.pattern_utf16(heap), s.to_lossy_string()),
-        // String + flag.
-        (Value::String(s), flags) => {
-            let units = s.to_utf16_vec();
-            let f = match flags {
-                Value::Undefined => String::new(),
-                Value::String(fs) => fs.to_lossy_string(),
-                other => other.display_string(),
-            };
-            (units, f)
-        }
-        // Other source → ToString.
-        (Value::Undefined, flags) => {
-            let f = match flags {
-                Value::Undefined => String::new(),
-                Value::String(fs) => fs.to_lossy_string(),
-                other => other.display_string(),
-            };
-            (Vec::new(), f)
-        }
-        (other, flags) => {
-            let pattern_str = other.display_string();
-            let f = match flags {
-                Value::Undefined => String::new(),
-                Value::String(fs) => fs.to_lossy_string(),
-                other => other.display_string(),
-            };
-            (pattern_str.encode_utf16().collect(), f)
-        }
+    let (pattern_source, flags_value) = if pattern_is_regexp {
+        let source =
+            crate::regexp_prototype::get_property_runtime(ctx, &pattern_arg, "source", "RegExp")?;
+        let flags = if matches!(flags_arg, Value::Undefined) {
+            crate::regexp_prototype::get_property_runtime(ctx, &pattern_arg, "flags", "RegExp")?
+        } else {
+            flags_arg.clone()
+        };
+        (source, flags)
+    } else {
+        (pattern_arg.clone(), flags_arg.clone())
+    };
+    let pattern_utf16 = if matches!(pattern_source, Value::Undefined) {
+        Vec::new()
+    } else {
+        crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &pattern_source, "RegExp")?
+            .to_utf16_vec()
+    };
+    let flags_str = if matches!(flags_value, Value::Undefined) {
+        String::new()
+    } else {
+        crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &flags_value, "RegExp")?
+            .to_lossy_string()
     };
 
+    let heap = ctx.heap_mut();
     let re = JsRegExp::compile(heap, &pattern_utf16, &flags_str).map_err(|err| {
         NativeError::SyntaxError {
             name: "RegExp",
@@ -477,6 +467,38 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         re.set_prototype_override(ctx.heap_mut(), Some(proto));
     }
     Ok(Value::RegExp(re))
+}
+
+fn is_regexp_runtime(
+    ctx: &mut NativeCtx<'_>,
+    value: &Value,
+    name: &'static str,
+) -> Result<bool, NativeError> {
+    if !crate::value_kind::is_object_like_value(value) {
+        return Ok(false);
+    }
+    let match_sym = ctx
+        .cx
+        .interp
+        .well_known_symbols()
+        .get(crate::symbol::WellKnown::Match);
+    let matcher =
+        crate::regexp_prototype::get_symbol_property_runtime(ctx, value, &match_sym, name)?;
+    if !matches!(matcher, Value::Undefined) {
+        return Ok(matcher.to_boolean());
+    }
+    Ok(matches!(value, Value::RegExp(_)))
+}
+
+fn regexp_constructor_matches(
+    ctx: &mut NativeCtx<'_>,
+    pattern: &Value,
+) -> Result<bool, NativeError> {
+    let pattern_ctor =
+        crate::regexp_prototype::get_property_runtime(ctx, pattern, "constructor", "RegExp")?;
+    let regexp_ctor =
+        object::get(*ctx.cx.interp.global_this(), ctx.heap(), "RegExp").unwrap_or(Value::Undefined);
+    Ok(values_strict_equal(&pattern_ctor, &regexp_ctor))
 }
 
 // ---------------------------------------------------------------

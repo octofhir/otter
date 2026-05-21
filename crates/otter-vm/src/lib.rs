@@ -598,9 +598,10 @@ pub enum SetIteratorKind {
 /// Origin of a built-in iterator. Used to route
 /// `[[GetPrototypeOf]]` to the correct per-kind iterator prototype
 /// (`%ArrayIteratorPrototype%` / `%MapIteratorPrototype%` /
-/// `%SetIteratorPrototype%` / `%StringIteratorPrototype%`) so that
-/// `Object.prototype.toString` and other reflective probes observe
-/// the spec-mandated `@@toStringTag` for each kind.
+/// `%SetIteratorPrototype%` / `%StringIteratorPrototype%` /
+/// `%RegExpStringIteratorPrototype%`) so that `Object.prototype.toString`
+/// and other reflective probes observe the spec-mandated
+/// `@@toStringTag` for each kind.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-array-iterator-objects>
@@ -618,6 +619,8 @@ pub enum BuiltinIteratorOrigin {
     Set,
     /// `%StringIteratorPrototype%` — `@@toStringTag = "String Iterator"`.
     String,
+    /// `%RegExpStringIteratorPrototype%` — `@@toStringTag = "RegExp String Iterator"`.
+    RegExpString,
 }
 
 /// Runtime state for iterator handles driven via `Op::IteratorNext`.
@@ -1787,7 +1790,8 @@ pub struct Interpreter {
     dynamic_import_registry: dynamic_import::DynamicImportRegistry,
     /// Per-kind iterator prototypes — `%ArrayIteratorPrototype%`,
     /// `%MapIteratorPrototype%`, `%SetIteratorPrototype%`,
-    /// `%StringIteratorPrototype%`. Each inherits from
+    /// `%StringIteratorPrototype%`, and
+    /// `%RegExpStringIteratorPrototype%`. Each inherits from
     /// `%IteratorPrototype%` and carries its own `@@toStringTag`.
     /// Populated by bootstrap; consulted by
     /// `intrinsic_prototype_object_for(Value::Iterator(_))` to
@@ -1797,6 +1801,7 @@ pub struct Interpreter {
     map_iterator_prototype: Option<JsObject>,
     set_iterator_prototype: Option<JsObject>,
     string_iterator_prototype: Option<JsObject>,
+    regexp_string_iterator_prototype: Option<JsObject>,
     function_kind_prototypes: function_kind::FunctionKindPrototypes,
 }
 
@@ -1979,6 +1984,7 @@ impl Interpreter {
             map_iterator_prototype: None,
             set_iterator_prototype: None,
             string_iterator_prototype: None,
+            regexp_string_iterator_prototype: None,
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
         };
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
@@ -2002,6 +2008,7 @@ impl Interpreter {
             interp.map_iterator_prototype = Some(protos.map);
             interp.set_iterator_prototype = Some(protos.set);
             interp.string_iterator_prototype = Some(protos.string);
+            interp.regexp_string_iterator_prototype = Some(protos.regexp_string);
         }
         interp.install_function_kind_prototypes_post_bootstrap();
         interp
@@ -2018,6 +2025,7 @@ impl Interpreter {
             BuiltinIteratorOrigin::Map => self.map_iterator_prototype,
             BuiltinIteratorOrigin::Set => self.set_iterator_prototype,
             BuiltinIteratorOrigin::String => self.string_iterator_prototype,
+            BuiltinIteratorOrigin::RegExpString => self.regexp_string_iterator_prototype,
         }
     }
 

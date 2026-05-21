@@ -2830,6 +2830,8 @@ pub struct BuiltinIteratorPrototypes {
     pub set: JsObject,
     /// `%StringIteratorPrototype%` — §22.1.5.2.
     pub string: JsObject,
+    /// `%RegExpStringIteratorPrototype%` — §22.2.7.2.
+    pub regexp_string: JsObject,
 }
 
 /// §22.1.5.2 / §23.1.5.2 / §24.1.5.2 / §24.2.5.2 — materialise the
@@ -2877,11 +2879,13 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     let map = make("Map Iterator")?;
     let set = make("Set Iterator")?;
     let string = make("String Iterator")?;
+    let regexp_string = make("RegExp String Iterator")?;
     Ok(BuiltinIteratorPrototypes {
         array,
         map,
         set,
         string,
+        regexp_string,
     })
 }
 

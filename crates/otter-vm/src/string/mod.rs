@@ -62,8 +62,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 pub use gc_body::{
-    JS_STRING_BODY_TYPE_TAG, JS_STRING_CHUNK_BODY_TYPE_TAG, JsStringBody, JsStringChunkBody,
-    JsStringHandle, JsStringId, alloc_flat_string_body_with_roots, to_utf16_vec,
+    JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle, JsStringId,
+    MAX_ROPE_DEPTH as GC_MAX_ROPE_DEPTH, alloc_flat_string_body_with_roots,
+    alloc_latin1_string_body_with_roots, concat_string_bodies, equals_string_bodies,
+    flatten_string_body, hash_latin1, hash_utf16, slice_string_body, to_utf16_vec,
 };
 
 /// Per-variant header overhead used by the heap accountant. The

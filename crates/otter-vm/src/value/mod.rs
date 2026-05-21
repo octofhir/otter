@@ -54,8 +54,8 @@ use crate::native_function::NativeFunctionBody;
 use crate::object::{JsObject, ObjectBody};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
 use crate::{
-    BoundFunction, BoundFunctionBody, ClassConstructor, ClassConstructorBody, JsClosure,
-    NativeFunction, NumberValue,
+    BoundFunction, BoundFunctionBody, ClassConstructor, ClassConstructorBody, IteratorHandle,
+    IteratorState, JsClosure, NativeFunction, NumberValue,
 };
 
 use tag::*;
@@ -336,6 +336,13 @@ impl Value {
         Self::from_function_gc(c.raw())
     }
 
+    /// Iterator handle.
+    #[inline]
+    #[must_use]
+    pub fn iterator(i: IteratorHandle) -> Self {
+        Self::from_object_gc(i.raw())
+    }
+
     /// Recover a closure handle when this value carries one.
     ///
     /// Returns `None` for any other callable family (bytecode
@@ -464,6 +471,16 @@ impl Value {
         }
         let gc = self.as_raw_gc()?.checked_cast::<ClassConstructorBody>()?;
         Some(ClassConstructor::from_gc(gc))
+    }
+
+    /// Iterator handle.
+    #[inline]
+    #[must_use]
+    pub fn as_iterator(self) -> Option<IteratorHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<IteratorState>()
     }
 
     // -----------------------------------------------------------------------

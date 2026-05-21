@@ -586,7 +586,16 @@ impl ClassConstructor {
 }
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`IteratorState`].
-pub const ITERATOR_STATE_TYPE_TAG: u8 = 0x1c;
+///
+/// Previously shared `0x1c` with [`BOUND_FUNCTION_BODY_TYPE_TAG`].
+/// The collision is fatal once the eight-byte tagged
+/// [`crate::value::Value`] dispatches through
+/// [`otter_gc::raw::RawGc::checked_cast`] — both bodies live in the
+/// `TAG_PTR_FUNCTION` family, and a shared tag would let an
+/// iterator handle masquerade as a bound function. Bumped to a
+/// fresh value here; `BOUND_FUNCTION_BODY_TYPE_TAG` keeps its
+/// existing `0x1c` so no existing root-tracing test reshuffles.
+pub const ITERATOR_STATE_TYPE_TAG: u8 = 0x24;
 
 /// Heap-shared iterator state handle.
 pub type IteratorHandle = otter_gc::Gc<IteratorState>;

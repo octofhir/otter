@@ -2478,7 +2478,6 @@ pub(crate) fn define_global_value(
 /// per-class modules and drop these adapters; for now they cleanly
 /// retire the `install: install_xxx` function-pointer entries from
 /// `BOOTSTRAP_ENTRIES` without disturbing the installer bodies.
-
 /// `BuiltinIntrinsic` adapter for the global `Object` constructor.
 pub struct ObjectIntrinsic;
 impl crate::intrinsic_install::BuiltinIntrinsic for ObjectIntrinsic {
@@ -2880,9 +2879,14 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     let set = make("Set Iterator")?;
     let string = make("String Iterator")?;
     let regexp_string = make("RegExp String Iterator")?;
-    let next_fn =
-        native_static_with_value_roots(heap, "next", 0, iterator_proto_next, &[&parent_value])
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let next_fn = native_static_with_value_roots(
+        heap,
+        "next",
+        0,
+        regexp_string_iterator_proto_next,
+        &[&parent_value],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
     if !object::define_own_property(
         regexp_string,
         heap,
@@ -3424,6 +3428,71 @@ fn iterator_proto_next(
     ctx.set_property(obj, "done", Value::Boolean(done))
         .map_err(|e| crate::NativeError::TypeError {
             name: "Iterator.prototype.next",
+            reason: e.to_string(),
+        })?;
+    Ok(Value::Object(obj))
+}
+
+/// §22.2.7.2 `%RegExpStringIteratorPrototype%.next`.
+///
+/// Unlike the generic `%IteratorPrototype%.next` helper, this own
+/// method requires the receiver to carry RegExp String Iterator
+/// internal state.
+fn regexp_string_iterator_proto_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let name = "RegExpStringIteratorPrototype.next";
+    let this_value = ctx.this_value().clone();
+    let Value::Iterator(handle) = this_value else {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "this is not a RegExp String Iterator".to_string(),
+        });
+    };
+    let is_regexp_string = ctx
+        .cx
+        .interp
+        .gc_heap_for_cx()
+        .read_payload(handle, |state| {
+            matches!(state, crate::IteratorState::RegExpString { .. })
+        });
+    if !is_regexp_string {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "this is not a RegExp String Iterator".to_string(),
+        });
+    }
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+    let iter_value = Value::Iterator(handle);
+    let (value, done) = ctx
+        .cx
+        .interp
+        .iterator_next_full(&exec_ctx, &handle)
+        .map_err(|e| crate::NativeError::TypeError {
+            name,
+            reason: e.to_string(),
+        })?;
+    let obj = ctx
+        .alloc_object_with_roots(&[&iter_value, &value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "result allocation failed".to_string(),
+        })?;
+    ctx.set_property(obj, "value", value)
+        .map_err(|e| crate::NativeError::TypeError {
+            name,
+            reason: e.to_string(),
+        })?;
+    ctx.set_property(obj, "done", Value::Boolean(done))
+        .map_err(|e| crate::NativeError::TypeError {
+            name,
             reason: e.to_string(),
         })?;
     Ok(Value::Object(obj))

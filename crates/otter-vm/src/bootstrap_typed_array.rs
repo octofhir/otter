@@ -467,7 +467,6 @@ fn drain_iterable_into_values(
 /// for reflective access and `Function.prototype.call` style
 /// re-entries; the method-call fast path bypasses these into
 /// `Interpreter::typed_array_callback_dispatch` directly.
-
 fn ta_callback_receiver(
     ctx: &NativeCtx<'_>,
     method: &'static str,
@@ -1131,12 +1130,12 @@ fn ta_ctor_dispatch(
             if has_iter {
                 let src_value = Value::Object(*src_obj);
                 let drained = drain_iterable_into_values(ctx, exec, &src_value)?;
-                let arr = ctx.array_from_elements(drained.into_iter()).map_err(|_| {
-                    NativeError::TypeError {
+                let arr = ctx
+                    .array_from_elements(drained)
+                    .map_err(|_| NativeError::TypeError {
                         name: typed_array_name(kind),
                         reason: "out of memory while allocating array".to_string(),
-                    }
-                })?;
+                    })?;
                 let mut out: SmallVec<[Value; 4]> = SmallVec::new();
                 out.push(Value::Array(arr));
                 for v in args.iter().skip(1) {

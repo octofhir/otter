@@ -439,7 +439,7 @@ impl PurePromise {
     /// Install (or replace) the lazy expando bag.
     pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
         let barrier = Value::Object(expando);
-        let _ = heap.with_payload(self.inner, |body| {
+        heap.with_payload(self.inner, |body| {
             body.expando = Some(expando);
         });
         heap.record_write(self.inner, &barrier);
@@ -452,7 +452,7 @@ impl PurePromise {
 
     pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
         let barrier_value = proto.clone();
-        let _ = heap.with_payload(self.inner, |body| {
+        heap.with_payload(self.inner, |body| {
             body.prototype_override = proto;
         });
         if let Some(value) = &barrier_value {

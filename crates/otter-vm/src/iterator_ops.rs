@@ -58,6 +58,13 @@ fn string_iterator_values(
 /// helper callback so the GC body borrow does not span dispatch.
 enum IteratorStateSnapshot {
     User(Value),
+    RegExpString {
+        matcher: Value,
+        input: JsString,
+        global: bool,
+        full_unicode: bool,
+        done: bool,
+    },
     Generator(crate::generator::JsGenerator),
     Map {
         source: IteratorHandle,
@@ -219,6 +226,19 @@ impl Interpreter {
                 IteratorState::User { iterator } => {
                     Some(IteratorStateSnapshot::User(iterator.clone()))
                 }
+                IteratorState::RegExpString {
+                    matcher,
+                    input,
+                    global,
+                    full_unicode,
+                    done,
+                } => Some(IteratorStateSnapshot::RegExpString {
+                    matcher: matcher.clone(),
+                    input: input.clone(),
+                    global: *global,
+                    full_unicode: *full_unicode,
+                    done: *done,
+                }),
                 IteratorState::Generator { handle } => {
                     Some(IteratorStateSnapshot::Generator(*handle))
                 }
@@ -297,6 +317,41 @@ impl Interpreter {
                         .with_payload(*iter, |state| *state = IteratorState::Exhausted);
                 }
                 Ok((value, done))
+            }
+            IteratorStateSnapshot::RegExpString {
+                matcher,
+                input,
+                global,
+                full_unicode,
+                done,
+            } => {
+                if done {
+                    return Ok((Value::Undefined, true));
+                }
+                let result = crate::regexp_prototype::regexp_string_iterator_next_runtime(
+                    self,
+                    context,
+                    &matcher,
+                    &input,
+                    global,
+                    full_unicode,
+                )?;
+                let Some(match_value) = result else {
+                    self.gc_heap.with_payload(*iter, |state| {
+                        if let IteratorState::RegExpString { done, .. } = state {
+                            *done = true;
+                        }
+                    });
+                    return Ok((Value::Undefined, true));
+                };
+                if !global {
+                    self.gc_heap.with_payload(*iter, |state| {
+                        if let IteratorState::RegExpString { done, .. } = state {
+                            *done = true;
+                        }
+                    });
+                }
+                Ok((match_value, false))
             }
             IteratorStateSnapshot::Map { source, mapper } => {
                 let (v, done) = self.iterator_next_full(context, &source)?;
@@ -895,9 +950,9 @@ impl Interpreter {
             Value::String(s) => {
                 return string_iterator_values(s, &self.string_heap);
             }
-            Value::Set(s) => return Ok(crate::collections::set_values(*s, &mut self.gc_heap)),
+            Value::Set(s) => return Ok(crate::collections::set_values(*s, &self.gc_heap)),
             Value::Map(m) => {
-                let pairs = crate::collections::map_entries(*m, &mut self.gc_heap);
+                let pairs = crate::collections::map_entries(*m, &self.gc_heap);
                 let mut out = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
                     let entry = self.alloc_runtime_rooted_array_from_values(

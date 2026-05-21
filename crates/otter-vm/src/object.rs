@@ -1777,6 +1777,7 @@ pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &JsSymbol)
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
 /// - <https://tc39.es/ecma262/#sec-validateandapplypropertydescriptor>
+///
 /// Field-presence-aware §10.1.6.3 OrdinaryDefineOwnProperty for
 /// string-keyed properties. Mirrors V8 / JSC's
 /// `PropertyDescriptor`-based `[[DefineOwnProperty]]`: missing fields
@@ -3243,7 +3244,7 @@ mod tests {
         // `set` is the construction-time path that doesn't honour
         // attribute flags, so it doesn't apply here. The dispatch
         // layer reaches this through `resolve_set`.
-        match resolve_set(o, &mut heap, "x") {
+        match resolve_set(o, &heap, "x") {
             SetOutcome::Reject {
                 reason: SetRejectReason::NonWritable,
             } => {}
@@ -3259,7 +3260,7 @@ mod tests {
         seal(o, &mut heap);
         assert!(is_sealed(o, &heap));
         assert!(!is_frozen(o, &heap));
-        match resolve_set(o, &mut heap, "b") {
+        match resolve_set(o, &heap, "b") {
             SetOutcome::Reject {
                 reason: SetRejectReason::NonExtensible,
             } => {}

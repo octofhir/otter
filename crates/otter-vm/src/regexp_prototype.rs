@@ -1082,6 +1082,58 @@ fn regexp_exec_runtime(
     })
 }
 
+/// Advance a lazy RegExp String Iterator one step.
+///
+/// This is the §22.2.7.2 step body shared by reflective
+/// `%RegExpStringIteratorPrototype%.next` calls and VM-level
+/// `IteratorNext`. The observable operations deliberately route
+/// through the native runtime bridges used by the rest of
+/// `RegExp.prototype`: `RegExpExec`, `Get(match, "0")`, `ToString`,
+/// `Get(R, "lastIndex")`, `ToLength`, and `Set(R, "lastIndex", …)`.
+pub(crate) fn regexp_string_iterator_next_runtime(
+    interp: &mut crate::Interpreter,
+    context: &crate::ExecutionContext,
+    matcher: &Value,
+    input: &JsString,
+    global: bool,
+    full_unicode: bool,
+) -> Result<Option<Value>, crate::VmError> {
+    let name = "RegExp String Iterator.next";
+    let mut ctx = NativeCtx::new_with_call_info_and_context(
+        interp,
+        crate::NativeCallInfo::call(matcher.clone()),
+        Some(context.clone()),
+    );
+    let result =
+        regexp_exec_runtime(&mut ctx, matcher, input, name).map_err(crate::native_to_vm_error)?;
+    if matches!(result, Value::Null) {
+        return Ok(None);
+    }
+    if global {
+        let matched_val = get_property_runtime(&mut ctx, &result, "0", name)
+            .map_err(crate::native_to_vm_error)?;
+        let matched_str = coerce_to_jsstring_runtime(&mut ctx, &matched_val, name)
+            .map_err(crate::native_to_vm_error)?;
+        if matched_str.is_empty() {
+            let li_val = get_property_runtime(&mut ctx, matcher, "lastIndex", name)
+                .map_err(crate::native_to_vm_error)?;
+            let this_index = to_length_runtime(&mut ctx, &li_val, name)
+                .map_err(crate::native_to_vm_error)? as usize;
+            let input_units = input.to_utf16_vec();
+            let next_index = advance_string_index(&input_units, this_index, full_unicode);
+            set_property_runtime(
+                &mut ctx,
+                matcher,
+                "lastIndex",
+                Value::Number(NumberValue::from_f64(next_index as f64)),
+                name,
+            )
+            .map_err(crate::native_to_vm_error)?;
+        }
+    }
+    Ok(Some(result))
+}
+
 /// §22.2.6.11 `RegExp.prototype[@@replace](string, replaceValue)`.
 ///
 /// Walks the user-overridable protocol: `Get(rx, "flags")`,
@@ -1159,7 +1211,7 @@ pub fn native_regexp_symbol_replace(
         // (or two for paired surrogates under `u` / `v`).
         let matched_val = get_property_runtime(ctx, &result, "0", name)?;
         let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
-        if matched_str.len() == 0 {
+        if matched_str.is_empty() {
             let last_index_val = get_property_runtime(ctx, &receiver, "lastIndex", name)?;
             let this_index = to_length_runtime(ctx, &last_index_val, name)? as usize;
             let next_index = advance_string_index(&s_units, this_index, full_unicode);
@@ -1365,16 +1417,14 @@ fn species_constructor_runtime(
 /// §22.2.6.9 `RegExp.prototype[@@matchAll](string)`. Resolves
 /// `SpeciesConstructor(rx, %RegExp%)` (§7.3.21), builds the matcher
 /// with the receiver's flags, snapshots the receiver's `lastIndex`
-/// into the matcher, and pre-computes every match via
-/// `RegExpExec(matcher, S)`. The match arrays are wrapped in a
-/// `Value::Iterator` so each `next()` yields one entry — the
-/// foundation's iterator-protocol surface drives the
-/// `{ value, done }` shape directly.
+/// into the matcher, and returns a lazy RegExp String Iterator.
 ///
 /// `lastIndex` is cached at call time per §22.2.6.9 step 2.f — the
 /// matcher's `lastIndex` is read from the receiver before iteration
 /// starts, so mutating `rx.lastIndex` between the @@matchAll call
-/// and the iterator drain is observably ignored.
+/// and the iterator drain is observably ignored. Subsequent `exec`,
+/// match-result `"0"`, and matcher `lastIndex` operations happen at
+/// `.next()` time per `CreateRegExpStringIterator`.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@matchall>
@@ -1442,47 +1492,16 @@ pub fn native_regexp_symbol_match_all(
         name,
     )?;
 
-    let s_units = s.to_utf16_vec();
-    let mut out: Vec<Value> = Vec::new();
-    loop {
-        let result = regexp_exec_runtime(ctx, &matcher, &s, name)?;
-        if matches!(result, Value::Null) {
-            break;
-        }
-        out.push(result.clone());
-        if !global {
-            break;
-        }
-        let matched_val = get_property_runtime(ctx, &result, "0", name)?;
-        let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
-        if matched_str.len() == 0 {
-            let li_val = get_property_runtime(ctx, &matcher, "lastIndex", name)?;
-            let this_index = to_length_runtime(ctx, &li_val, name)? as usize;
-            let next_index = advance_string_index(&s_units, this_index, full_unicode);
-            set_property_runtime(
-                ctx,
-                &matcher,
-                "lastIndex",
-                Value::Number(NumberValue::from_f64(next_index as f64)),
-                name,
-            )?;
-        }
-    }
-
-    let arr = ctx
-        .array_from_elements_with_roots(out.iter().cloned(), &[&matcher], &[out.as_slice()])
-        .map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "array allocation failed".to_string(),
-        })?;
-    let iter_state = crate::IteratorState::Array {
-        array: arr,
-        index: 0,
-        origin: crate::BuiltinIteratorOrigin::RegExpString,
+    let input_root = Value::String(s.clone());
+    let iter_state = crate::IteratorState::RegExpString {
+        matcher: matcher.clone(),
+        input: s,
+        global,
+        full_unicode,
+        done: false,
     };
-    let arr_value = Value::Array(arr);
     let handle = ctx
-        .alloc_iterator_state(iter_state, &[&arr_value], &[])
+        .alloc_iterator_state(iter_state, &[&matcher, &input_root], &[])
         .map_err(|_| crate::NativeError::TypeError {
             name,
             reason: "iterator allocation failed".to_string(),
@@ -1607,7 +1626,7 @@ pub fn native_regexp_symbol_split(
     // Step 14 — lim == 0 short-circuits to an empty array.
     if lim == 0 {
         let arr = ctx
-            .array_from_elements_with_roots(out_elements.into_iter(), &[&splitter], &[])
+            .array_from_elements_with_roots(out_elements, &[&splitter], &[])
             .map_err(|_| crate::NativeError::TypeError {
                 name,
                 reason: "array allocation failed".to_string(),
@@ -1621,7 +1640,7 @@ pub fn native_regexp_symbol_split(
         let z = regexp_exec_runtime(ctx, &splitter, &s, name)?;
         if !matches!(z, Value::Null) {
             let arr = ctx
-                .array_from_elements_with_roots(out_elements.into_iter(), &[&splitter], &[])
+                .array_from_elements_with_roots(out_elements, &[&splitter], &[])
                 .map_err(|_| crate::NativeError::TypeError {
                     name,
                     reason: "array allocation failed".to_string(),
@@ -1789,7 +1808,7 @@ fn get_substitution(
                     .map(|c| (c - b'0' as u16) as usize);
                 let (idx, consumed) = match (first, second) {
                     (0, None) => (None, 2),
-                    (0, Some(d)) if d == 0 => (None, 3),
+                    (0, Some(0)) => (None, 3),
                     (0, Some(d)) if d > 0 && d <= m => (Some(d), 3),
                     (0, Some(_)) => (None, 2),
                     (a, Some(b)) => {

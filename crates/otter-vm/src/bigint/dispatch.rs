@@ -172,7 +172,7 @@ fn expect_bits(arg: Option<&Value>) -> Result<u32, VmError> {
         return Ok(0);
     }
     let trunc = n.trunc();
-    if trunc.is_infinite() || trunc < 0.0 || trunc > 9_007_199_254_740_991.0 {
+    if trunc.is_infinite() || !(0.0..=9_007_199_254_740_991.0).contains(&trunc) {
         return Err(VmError::RangeError {
             message: "Invalid bits parameter for BigInt.asIntN / asUintN".to_string(),
         });

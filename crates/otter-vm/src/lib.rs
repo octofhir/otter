@@ -668,6 +668,23 @@ pub enum IteratorState {
         /// Next code-unit index.
         index: u32,
     },
+    /// Lazy RegExp String Iterator created by
+    /// `RegExp.prototype[@@matchAll]` per §22.2.7.2. Each step
+    /// re-enters `RegExpExec` so overridden `exec`, observable
+    /// `lastIndex`, and match-result coercions fire at `.next()`
+    /// time instead of at iterator creation.
+    RegExpString {
+        /// The cloned matcher object used for iteration.
+        matcher: Value,
+        /// Input string being matched.
+        input: JsString,
+        /// Whether the matcher has the `g` flag.
+        global: bool,
+        /// Whether `AdvanceStringIndex` uses Unicode mode (`u`/`v`).
+        full_unicode: bool,
+        /// Sticky exhaustion flag for repeated `done` results.
+        done: bool,
+    },
     /// Walks a live `Map` in insertion order. Additions before the
     /// iterator is exhausted are observed by reading the map at each
     /// step instead of snapshotting entries at iterator creation.
@@ -785,6 +802,7 @@ impl IteratorState {
                 Some(BuiltinIteratorOrigin::Array)
             }
             IteratorState::String { .. } => Some(BuiltinIteratorOrigin::String),
+            IteratorState::RegExpString { .. } => Some(BuiltinIteratorOrigin::RegExpString),
             IteratorState::MapCollection { .. } => Some(BuiltinIteratorOrigin::Map),
             IteratorState::SetCollection { .. } => Some(BuiltinIteratorOrigin::Set),
             _ => None,
@@ -804,6 +822,7 @@ impl otter_gc::SafeTraceable for IteratorState {
                 visitor(p);
             }
             IteratorState::String { .. } | IteratorState::Exhausted => {}
+            IteratorState::RegExpString { matcher, .. } => matcher.trace_value_slots(visitor),
             IteratorState::MapCollection { map, .. } => {
                 let p = map as *const JsMap as *mut RawGc;
                 visitor(p);
@@ -1993,8 +2012,7 @@ impl Interpreter {
         // logic; this site only caches the resulting handles so
         // `intrinsic_prototype_object_for(Value::Iterator(_))` can
         // route without a global lookup per access.
-        if let Some(Value::Object(iter_proto)) = interp.constructor_prototype_value("Iterator").ok()
-        {
+        if let Ok(Value::Object(iter_proto)) = interp.constructor_prototype_value("Iterator") {
             let shape_root = interp.shape_runtime.root();
             let protos = bootstrap::build_builtin_iterator_prototypes_post_bootstrap(
                 &mut interp.gc_heap,
@@ -2256,10 +2274,7 @@ impl Interpreter {
         token: u64,
         outcome: Result<Value, Value>,
     ) -> Option<ExecutionContext> {
-        let entry = match self.dynamic_import_registry.take(token) {
-            Some(entry) => entry,
-            None => return None,
-        };
+        let entry = self.dynamic_import_registry.take(token)?;
         let jobs = match outcome {
             Ok(value) => crate::JsPromise::fulfill(&entry.promise, &mut self.gc_heap, value),
             Err(reason) => crate::JsPromise::reject(&entry.promise, &mut self.gc_heap, reason),
@@ -5487,7 +5502,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::BindFunction => {
-                    self.drive_bind_function(stack, context, &operands)?;
+                    self.drive_bind_function(stack, context, operands)?;
                     continue;
                 }
                 Op::SymbolCall => {
@@ -5856,7 +5871,7 @@ fn to_length(value: &Value) -> Result<usize, VmError> {
         return Ok(0);
     }
     if n.is_infinite() {
-        return Ok(usize::MAX.min(9_007_199_254_740_991));
+        return Ok(9_007_199_254_740_991);
     }
     let len = n.trunc().min(9_007_199_254_740_991.0);
     if len > usize::MAX as f64 {
@@ -5914,6 +5929,7 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 ///   subsequent in-place mutations through the same `JsArray`,
 ///   matching real-engine `Array.prototype[Symbol.iterator]`
 ///   semantics.
+///
 /// `String.prototype[Symbol.iterator]()` — receiver-dispatched
 /// shim that materialises a string iterator from the calling
 /// `this` value. Installed as the realm's iterator method per
@@ -6108,6 +6124,7 @@ fn step_iterator(
         }
         IteratorState::Exhausted => FastIteratorSnapshot::Exhausted,
         IteratorState::User { .. }
+        | IteratorState::RegExpString { .. }
         | IteratorState::Generator { .. }
         | IteratorState::Map { .. }
         | IteratorState::Filter { .. }

@@ -82,7 +82,7 @@ impl Interpreter {
         if let Value::Promise(p) = &recv_value {
             let promise = *p;
             if let Some(bag) = promise.expando(&self.gc_heap)
-                && let Some(method) = crate::object::get(bag, &self.gc_heap, &name)
+                && let Some(method) = crate::object::get(bag, &self.gc_heap, name)
                 && self.is_callable_runtime(&method)
             {
                 let top_idx = stack.len() - 1;
@@ -94,7 +94,7 @@ impl Interpreter {
                 self,
                 Some(context.clone()),
                 &promise,
-                &name,
+                name,
                 arg_values.as_slice(),
             )
             .map_err(native_to_vm_error)?;
@@ -139,7 +139,7 @@ impl Interpreter {
         // <https://tc39.es/proposal-iterator-helpers/>
         if let Value::Iterator(rc) = &recv_value {
             let iter_rc = *rc;
-            if self.iterator_helper_dispatch(stack, context, &iter_rc, &name, &arg_values, dst)? {
+            if self.iterator_helper_dispatch(stack, context, &iter_rc, name, &arg_values, dst)? {
                 return Ok(());
             }
         }
@@ -264,7 +264,7 @@ impl Interpreter {
                     _ => None,
                 };
             if let Some(Value::Object(proto)) = iterator_proto
-                && let Some(method) = crate::object::get(proto, &self.gc_heap, &name)
+                && let Some(method) = crate::object::get(proto, &self.gc_heap, name)
                 && self.is_callable_runtime(&method)
             {
                 let pc = stack[top_idx].pc;
@@ -295,7 +295,7 @@ impl Interpreter {
                     | "flatMap"
                     | "sort"
             )
-            && self.array_callback_dispatch(stack, context, arr, &name, &arg_values, dst)?
+            && self.array_callback_dispatch(stack, context, arr, name, &arg_values, dst)?
         {
             return Ok(());
         }
@@ -319,7 +319,7 @@ impl Interpreter {
                     | "reduce"
                     | "reduceRight"
             )
-            && self.typed_array_callback_dispatch(stack, context, t, &name, &arg_values, dst)?
+            && self.typed_array_callback_dispatch(stack, context, t, name, &arg_values, dst)?
         {
             return Ok(());
         }
@@ -407,14 +407,12 @@ impl Interpreter {
                 .pc
                 .checked_add(1)
                 .ok_or(VmError::InvalidOperand)?;
-            let result = self
-                .dispatch_string_callable_replace(
-                    context,
-                    &recv_value,
-                    &coerced_args,
-                    name == "replaceAll",
-                )
-                .map_err(VmError::from)?;
+            let result = self.dispatch_string_callable_replace(
+                context,
+                &recv_value,
+                &coerced_args,
+                name == "replaceAll",
+            )?;
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
             return Ok(());
@@ -422,32 +420,32 @@ impl Interpreter {
         // Primitive prototypes go through the intrinsic table —
         // synchronous, no frame push, advance pc and write directly.
         let intrinsic = match &recv_value {
-            Value::String(_) => string_prototype::lookup(&name),
-            Value::Array(_) => array_prototype::lookup(&name),
-            Value::Number(_) => number::prototype_lookup(&name),
-            Value::Boolean(_) => boolean_prototype::lookup(&name),
-            Value::BigInt(_) => bigint::prototype::lookup(&name),
+            Value::String(_) => string_prototype::lookup(name),
+            Value::Array(_) => array_prototype::lookup(name),
+            Value::Number(_) => number::prototype_lookup(name),
+            Value::Boolean(_) => boolean_prototype::lookup(name),
+            Value::BigInt(_) => bigint::prototype::lookup(name),
             // Date instances are ordinary objects with a
             // `[[DateValue]]` internal slot — when the receiver
             // is an Object we probe `crate::object::date_data` to
             // brand-check and route through the Date intrinsic
             // table.
             Value::Object(o) if crate::object::date_data(*o, &self.gc_heap).is_some() => {
-                date::prototype::lookup(&name)
+                date::prototype::lookup(name)
             }
-            Value::RegExp(_) => regexp_prototype::lookup(&name),
-            Value::Symbol(_) => symbol_prototype::lookup(&name),
-            Value::Map(_) => collections_prototype::lookup_map(&name),
-            Value::Set(_) => collections_prototype::lookup_set(&name),
-            Value::WeakMap(_) => collections_prototype::lookup_weak_map(&name),
-            Value::WeakSet(_) => collections_prototype::lookup_weak_set(&name),
-            Value::WeakRef(_) => weak_refs::lookup_weak_ref(&name),
-            Value::FinalizationRegistry(_) => weak_refs::lookup_finalization_registry(&name),
-            Value::Temporal(_) => temporal::lookup_prototype(&recv_value, &name),
-            Value::Intl(_) => intl::lookup_prototype(&recv_value, &name),
-            Value::ArrayBuffer(_) => binary::array_buffer_prototype::lookup(&name),
-            Value::DataView(_) => binary::data_view_prototype::lookup(&name),
-            Value::TypedArray(_) => binary::typed_array_prototype::lookup(&name),
+            Value::RegExp(_) => regexp_prototype::lookup(name),
+            Value::Symbol(_) => symbol_prototype::lookup(name),
+            Value::Map(_) => collections_prototype::lookup_map(name),
+            Value::Set(_) => collections_prototype::lookup_set(name),
+            Value::WeakMap(_) => collections_prototype::lookup_weak_map(name),
+            Value::WeakSet(_) => collections_prototype::lookup_weak_set(name),
+            Value::WeakRef(_) => weak_refs::lookup_weak_ref(name),
+            Value::FinalizationRegistry(_) => weak_refs::lookup_finalization_registry(name),
+            Value::Temporal(_) => temporal::lookup_prototype(&recv_value, name),
+            Value::Intl(_) => intl::lookup_prototype(&recv_value, name),
+            Value::ArrayBuffer(_) => binary::array_buffer_prototype::lookup(name),
+            Value::DataView(_) => binary::data_view_prototype::lookup(name),
+            Value::TypedArray(_) => binary::typed_array_prototype::lookup(name),
             _ => None,
         };
         if let Some(entry) = intrinsic {
@@ -461,7 +459,7 @@ impl Interpreter {
             // surface the correct error class.
             let mut small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
             if matches!(&recv_value, Value::Number(_))
-                && matches!(&*name, "toFixed" | "toExponential" | "toPrecision")
+                && matches!(name, "toFixed" | "toExponential" | "toPrecision")
             {
                 for slot in small_args.iter_mut() {
                     if matches!(
@@ -496,7 +494,7 @@ impl Interpreter {
             // intentionally restricted to Array / Object — the
             // primitive-receiver short-circuit returns the unmodified
             // value before the intrinsic body runs.
-            let int_coerce_indices: &[usize] = match &*name {
+            let int_coerce_indices: &[usize] = match name {
                 // §23.1.3.14 / .17 / .15
                 "indexOf" | "lastIndexOf" | "includes" => &[1],
                 // §23.1.3.7 fill(value, start, end)
@@ -544,7 +542,7 @@ impl Interpreter {
             // `ToPrimitive(arg, "string")`. Pre-coerce both shapes
             // when the receiver is a String primitive so user
             // `@@toPrimitive` / `valueOf` / `toString` fires per spec.
-            let (string_int_coerce, string_str_coerce): (&[usize], &[usize]) = match &*name {
+            let (string_int_coerce, string_str_coerce): (&[usize], &[usize]) = match name {
                 "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => (&[1], &[0]),
                 "slice" | "substring" | "substr" => (&[0, 1], &[]),
                 "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
@@ -619,7 +617,7 @@ impl Interpreter {
                 // `@@match` / `@@matchAll` / `@@search` ladder, so the
                 // pre-coerce here must not stringify a RegExp.
                 let regexp_pass_through =
-                    matches!(&*name, "match" | "matchAll" | "search" | "normalize");
+                    matches!(name, "match" | "matchAll" | "search" | "normalize");
                 let is_non_primitive = |v: &Value| {
                     matches!(
                         v,
@@ -700,7 +698,7 @@ impl Interpreter {
                 // always write through, so they fall into the
                 // normal restore-and-dispatch path below.
                 let nan_preserving = matches!(
-                    &*name,
+                    name,
                     "setMonth"
                         | "setUTCMonth"
                         | "setDate"
@@ -743,12 +741,12 @@ impl Interpreter {
         if let Value::Object(obj) = &recv_value
             && self.object_prototype_object_opt() != Some(*obj)
             && matches!(
-                crate::object::lookup(*obj, &self.gc_heap, &name),
+                crate::object::lookup(*obj, &self.gc_heap, name),
                 crate::object::PropertyLookup::Absent
             )
             && let Some(result) = object_prototype_intercept(
                 obj,
-                &name,
+                name,
                 &arg_values,
                 &self.string_heap,
                 &self.gc_heap,
@@ -806,7 +804,7 @@ impl Interpreter {
         if let Value::NativeFunction(native) = &recv_value
             && let Some(result) = native_function_object_prototype_intercept(
                 native,
-                &name,
+                name,
                 &arg_values,
                 &self.gc_heap,
                 &self.string_heap,
@@ -819,7 +817,7 @@ impl Interpreter {
         }
         if let Value::BoundFunction(bound) = &recv_value
             && let Some(result) =
-                bound_function_object_prototype_intercept(bound, &name, &arg_values, &self.gc_heap)?
+                bound_function_object_prototype_intercept(bound, name, &arg_values, &self.gc_heap)?
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
@@ -835,7 +833,7 @@ impl Interpreter {
         // `[0, length)` plus `"length"`; every other primitive has
         // no own properties.
         if matches!(
-            &*name,
+            name,
             "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
         ) && matches!(
             &recv_value,
@@ -845,7 +843,7 @@ impl Interpreter {
                 | Value::Symbol(_)
                 | Value::BigInt(_)
         ) {
-            let result = match &*name {
+            let result = match name {
                 "hasOwnProperty" | "propertyIsEnumerable" => {
                     let key = property_key_from_arg(arg_values.first())?;
                     match &recv_value {
@@ -889,7 +887,7 @@ impl Interpreter {
                 stack,
                 context,
                 &recv_value,
-                &name,
+                name,
                 arg_values,
                 dst,
             );
@@ -947,7 +945,7 @@ impl Interpreter {
                 // / `static set foo(v)`) invoke their getter rather
                 // than yielding `undefined`.
                 let statics = Value::Object(c.statics(&self.gc_heap));
-                let key = VmPropertyKey::String(&name);
+                let key = VmPropertyKey::String(name);
                 match self.ordinary_get_value(context, statics.clone(), statics.clone(), &key, 0)? {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
@@ -963,19 +961,16 @@ impl Interpreter {
             // happens below if we hand back `Undefined`.
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let fid = *function_id;
-                Some(self.function_property_get_stack_rooted(context, stack, fid, &name)?)
+                Some(self.function_property_get_stack_rooted(context, stack, fid, name)?)
             }
             // Native callable receiver (e.g. global `Promise` /
             // `Map` constructors). Look up `name` on the function
             // object's own-property table so `Promise.all(...)`,
             // `Map.groupBy(...)`, etc. dispatch through ordinary
             // method invocation.
-            Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, &self.string_heap, &name)? {
-                    Some(desc) => Some(descriptor_value(&desc)),
-                    None => None,
-                }
-            }
+            Value::NativeFunction(native) => native
+                .own_property_descriptor(&self.gc_heap, &self.string_heap, name)?
+                .map(|desc| descriptor_value(&desc)),
             // §7.1.18 ToObject — primitive receivers walk the
             // constructor's prototype to surface inherited
             // `Object.prototype.*` methods (e.g.
@@ -1024,7 +1019,7 @@ impl Interpreter {
                 stack,
                 context,
                 &recv_value,
-                &name,
+                name,
                 arg_values,
                 dst,
             );

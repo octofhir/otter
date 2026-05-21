@@ -410,7 +410,7 @@ mod tests {
         IntrinsicArgs {
             receiver: recv,
             args,
-            string_heap: &heap,
+            string_heap: heap,
             gc_heap,
             allocation_roots: &[],
         }

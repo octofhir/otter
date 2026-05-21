@@ -1328,9 +1328,7 @@ fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
         _ => unreachable!(),
     }
     // Write the head [0, start).
-    for k in 0..start {
-        out[k] = src[k].clone();
-    }
+    out[..start].clone_from_slice(&src[..start]);
     // Write the inserts at [start, start+item_count).
     for (k, v) in args.args.iter().skip(2).enumerate() {
         out[start + k] = v.clone();
@@ -1962,35 +1960,25 @@ fn array_callback_native_dispatch(
         match name {
             "forEach" => {}
             "map" => out.push((idx, result)),
-            "filter" => {
-                if result.to_boolean() {
-                    out.push((idx, v));
-                }
+            "filter" if result.to_boolean() => {
+                out.push((idx, v));
             }
-            "find" | "findLast" => {
-                if result.to_boolean() {
-                    found_val = v.clone();
-                    found_idx = Some(idx);
-                    break;
-                }
+            "find" | "findLast" if result.to_boolean() => {
+                found_val = v.clone();
+                found_idx = Some(idx);
+                break;
             }
-            "findIndex" | "findLastIndex" => {
-                if result.to_boolean() {
-                    found_idx = Some(idx);
-                    break;
-                }
+            "findIndex" | "findLastIndex" if result.to_boolean() => {
+                found_idx = Some(idx);
+                break;
             }
-            "every" => {
-                if !result.to_boolean() {
-                    bool_acc = false;
-                    break;
-                }
+            "every" if !result.to_boolean() => {
+                bool_acc = false;
+                break;
             }
-            "some" => {
-                if result.to_boolean() {
-                    bool_acc = true;
-                    break;
-                }
+            "some" if result.to_boolean() => {
+                bool_acc = true;
+                break;
             }
             "reduce" | "reduceRight" => {
                 acc = result;

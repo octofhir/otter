@@ -275,13 +275,15 @@ fn native_group_by_rooted(
 
 fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
     let proto = args.first().cloned().unwrap_or(Value::Undefined);
-    let proto_obj = match proto {
-        Value::Object(object) => Some(object),
+    let proto_value = match proto {
+        Value::Object(_) | Value::Iterator(_) => Some(proto.clone()),
         Value::Null => None,
         _ => return Err(VmError::TypeMismatch),
     };
     let obj = ctx.alloc_object_with_roots(&[&proto], &[args])?;
-    crate::object::set_prototype(obj, ctx.heap_mut(), proto_obj);
+    if !crate::object::set_prototype_value(obj, ctx.heap_mut(), proto_value) {
+        return Err(VmError::TypeMismatch);
+    }
     if let Some(props_arg) = args.get(1)
         && !matches!(props_arg, Value::Undefined)
     {
@@ -512,10 +514,11 @@ fn native_from_entries_rooted(
         // §20.1.2.7 step 5.b.iii — CreateDataPropertyOrThrow. Routes
         // through the spec ToPropertyKey ladder so accessor-bearing
         // key objects fire `toString` / `valueOf` here, not later.
-        let key_pk = match {
+        let res = {
             let interp = ctx.interp_mut();
             interp.to_property_key_sync(&exec_ctx, key)
-        } {
+        };
+        let key_pk = match res {
             Ok(v) => v,
             Err(err) => {
                 let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
@@ -817,11 +820,15 @@ fn native_get_own_property_descriptors_rooted(
             Value::String(s) => {
                 ctx.set_property(result, &s.to_lossy_string(), Value::Object(desc_obj))?;
             }
-            Value::Symbol(sym) => {
-                if !crate::object::set_symbol(result, ctx.heap_mut(), sym, Value::Object(desc_obj))
-                {
-                    return Err(VmError::TypeMismatch);
-                }
+            Value::Symbol(sym)
+                if !crate::object::set_symbol(
+                    result,
+                    ctx.heap_mut(),
+                    sym.clone(),
+                    Value::Object(desc_obj),
+                ) =>
+            {
+                return Err(VmError::TypeMismatch);
             }
             _ => {}
         }
@@ -1661,9 +1668,8 @@ fn define_accessor_helper(
 /// 2. Let `key` be `? ToPropertyKey(P)`.
 /// 3. Repeat:
 ///    a. Let `desc` be `? O.[[GetOwnProperty]](key)`.
-///    b. If `desc` is not undefined, then
-///       i. If `IsAccessorDescriptor(desc)` is true, return `desc.[[Get]]`.
-///       ii. Return undefined.
+///    b. If `desc` is not undefined, return the getter for an accessor
+///    descriptor and otherwise return undefined.
 ///    c. Let `O` be `? O.[[GetPrototypeOf]]()`.
 ///    d. If `O` is null, return undefined.
 ///
@@ -2042,13 +2048,15 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.create>
         M::Create => {
             let proto = args.first().cloned().unwrap_or(Value::Undefined);
-            let proto_obj = match proto {
-                Value::Object(o) => Some(o),
+            let proto_value = match proto {
+                Value::Object(_) | Value::Iterator(_) => Some(proto.clone()),
                 Value::Null => None,
                 _ => return Err(VmError::TypeMismatch),
             };
             let obj = rooted_object(gc_heap, &[&proto], &[args])?;
-            crate::object::set_prototype(obj, gc_heap, proto_obj);
+            if !crate::object::set_prototype_value(obj, gc_heap, proto_value) {
+                return Err(VmError::TypeMismatch);
+            }
             if let Some(props_arg) = args.get(1)
                 && !matches!(props_arg, Value::Undefined)
             {

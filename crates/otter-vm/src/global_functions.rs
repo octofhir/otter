@@ -184,24 +184,25 @@ fn legacy_unescape(units: &[u16]) -> Vec<u16> {
     let mut i = 0;
     while i < units.len() {
         if units[i] == b'%' as u16 {
-            if i + 5 < units.len() && units[i + 1] == b'u' as u16 {
-                if let (Some(a), Some(b), Some(c), Some(d)) = (
+            if i + 5 < units.len()
+                && units[i + 1] == b'u' as u16
+                && let (Some(a), Some(b), Some(c), Some(d)) = (
                     hex_u16(units[i + 2]),
                     hex_u16(units[i + 3]),
                     hex_u16(units[i + 4]),
                     hex_u16(units[i + 5]),
-                ) {
-                    out.push((a << 12) | (b << 8) | (c << 4) | d);
-                    i += 6;
-                    continue;
-                }
+                )
+            {
+                out.push((a << 12) | (b << 8) | (c << 4) | d);
+                i += 6;
+                continue;
             }
-            if i + 2 < units.len() {
-                if let (Some(hi), Some(lo)) = (hex_u16(units[i + 1]), hex_u16(units[i + 2])) {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                    continue;
-                }
+            if i + 2 < units.len()
+                && let (Some(hi), Some(lo)) = (hex_u16(units[i + 1]), hex_u16(units[i + 2]))
+            {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
             }
         }
         out.push(units[i]);

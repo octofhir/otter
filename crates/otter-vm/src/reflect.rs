@@ -348,8 +348,10 @@ fn set_data_on_receiver(
             }
             // §10.1.9 step 5.e.iii — write only `{value: V}`,
             // preserving existing attributes.
-            let mut partial = crate::object::PartialPropertyDescriptor::default();
-            partial.value = Some(value);
+            let partial = crate::object::PartialPropertyDescriptor {
+                value: Some(value),
+                ..Default::default()
+            };
             interp.define_own_property_value(context, &Value::Object(recv_obj), key, partial)
         }
         crate::object::PropertyLookup::Absent => {

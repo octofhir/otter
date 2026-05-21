@@ -268,7 +268,7 @@ pub struct ErrorClassRegistry {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
-#[must_use]
+///
 /// §20.5.3.4 `Error.prototype.toString` — accessor-aware spec
 /// implementation. Walks `Get(O, "name")` / `Get(O, "message")`
 /// through the interpreter so user-defined getters fire and any

@@ -227,8 +227,10 @@ pub(crate) fn from_elements_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
-    let mut body = ArrayBody::default();
-    body.length = collected.len();
+    let mut body = ArrayBody {
+        length: collected.len(),
+        ..Default::default()
+    };
     {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -263,12 +265,14 @@ fn from_elements_with_source_old_for_fixture(
     source_bytes: Arc<[u8]>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
-    let mut body = ArrayBody::default();
-    body.length = collected.len();
+    let mut body = ArrayBody {
+        length: collected.len(),
+        source_bytes: Some(source_bytes),
+        dirty: false,
+        ..Default::default()
+    };
     reserve_elements_for_len(&mut body, heap, collected.len())?;
     body.elements.extend(collected);
-    body.source_bytes = Some(source_bytes);
-    body.dirty = false;
     heap.alloc_old(body)
 }
 
@@ -282,8 +286,12 @@ pub(crate) fn from_elements_with_source_and_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsArray, otter_gc::OutOfMemory> {
     let collected: Vec<Value> = values.into_iter().collect();
-    let mut body = ArrayBody::default();
-    body.length = collected.len();
+    let mut body = ArrayBody {
+        length: collected.len(),
+        source_bytes: Some(source_bytes),
+        dirty: false,
+        ..Default::default()
+    };
     {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -294,8 +302,6 @@ pub(crate) fn from_elements_with_source_and_roots(
         reserve_elements_for_len_with_roots(&mut body, heap, collected.len(), &mut reserve_roots)?;
     }
     body.elements.extend(collected);
-    body.source_bytes = Some(source_bytes);
-    body.dirty = false;
     heap.alloc_with_roots(body, external_visit)
 }
 
@@ -824,14 +830,14 @@ pub fn delete_symbol_property(
     key: &crate::symbol::JsSymbol,
 ) -> bool {
     heap.with_payload(arr, |body| {
-        if let Some(table) = body.symbol_properties.as_mut() {
-            if let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key)) {
-                table.remove(pos);
-                if table.is_empty() {
-                    body.symbol_properties = None;
-                }
-                body.dirty = true;
+        if let Some(table) = body.symbol_properties.as_mut()
+            && let Some(pos) = table.iter().position(|(k, _)| k.ptr_eq(key))
+        {
+            table.remove(pos);
+            if table.is_empty() {
+                body.symbol_properties = None;
             }
+            body.dirty = true;
         }
         true
     })

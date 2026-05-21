@@ -881,10 +881,7 @@ fn add_entries_lazy(
             Err(err) => return Err(vm_to_native(err, ctor_name)),
         };
 
-        let call_args = match build_adder_args(ctx, context, &next, kind, Some(&iterator)) {
-            Ok(args) => args,
-            Err(err) => return Err(err),
-        };
+        let call_args = build_adder_args(ctx, context, &next, kind, Some(&iterator))?;
 
         let call_result = {
             let interp = ctx.interp_mut();

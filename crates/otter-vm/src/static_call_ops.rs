@@ -656,13 +656,17 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::Undefined);
-        let proto_obj = match proto {
-            Value::Object(object) => Some(object),
+        let proto_value = match proto {
+            Value::Object(_) | Value::Iterator(_) => Some(proto.clone()),
             Value::Null => None,
             _ => return Err(VmError::TypeMismatch),
         };
         let obj = self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?;
-        object::set_prototype(obj, &mut self.gc_heap, proto_obj);
+        if !object::set_prototype_value(obj, &mut self.gc_heap, proto_value) {
+            return Err(VmError::TypeError {
+                message: "Object.create failed".to_string(),
+            });
+        }
         if let Some(props_arg) = args.get(1)
             && !matches!(props_arg, Value::Undefined)
         {
@@ -1341,15 +1345,15 @@ impl Interpreter {
                                         Value::Object(desc_obj),
                                     )?;
                                 }
-                                Value::Symbol(sym) => {
+                                Value::Symbol(sym)
                                     if !object::set_symbol(
                                         result,
                                         &mut self.gc_heap,
                                         sym.clone(),
                                         Value::Object(desc_obj),
-                                    ) {
-                                        return Err(VmError::TypeMismatch);
-                                    }
+                                    ) =>
+                                {
+                                    return Err(VmError::TypeMismatch);
                                 }
                                 _ => {}
                             }

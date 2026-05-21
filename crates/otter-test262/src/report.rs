@@ -173,7 +173,7 @@ impl Baseline {
 
         // Top 50 failing sections by absolute fail count.
         let mut sections: Vec<(&String, &Totals)> = self.by_section.iter().collect();
-        sections.sort_by(|a, b| b.1.failed.cmp(&a.1.failed));
+        sections.sort_by_key(|section| std::cmp::Reverse(section.1.failed));
         let truncated_sections = sections.iter().take(50).collect::<Vec<_>>();
         if !truncated_sections.is_empty() {
             out.push_str("## Top failing sections (top 50)\n\n");

@@ -119,7 +119,7 @@ pub fn install_natives(runtime: &mut Runtime) -> Result<(), OtterError> {
 }
 
 /// `(name, length, fn)` table installed by [`install_natives`].
-const NATIVES: &[(&'static str, u8, NativeFastFn)] = &[
+const NATIVES: &[(&str, u8, NativeFastFn)] = &[
     ("__otter_agent_start", 1, agent_start),
     ("__otter_agent_broadcast", 2, agent_broadcast),
     ("__otter_agent_get_report", 0, agent_get_report),

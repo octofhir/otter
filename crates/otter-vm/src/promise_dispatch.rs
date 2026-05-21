@@ -855,6 +855,7 @@ fn invoke_then_interp(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.prototype.finally>
+///
 /// Public entry point for `Promise.prototype.finally` invoked via
 /// ordinary native dispatch (`Promise.prototype.finally.call(obj,
 /// ...)`). Threads through to [`method_finally_value`] so any
@@ -1607,7 +1608,8 @@ fn static_all_keyed_generic(
         Ok(keys) => keys,
         Err(err) => return reject_capability_error(interp, &cap, promise_vm_error(name, err)),
     };
-    let outcome = (|| -> Result<Value, NativeError> {
+
+    (|| -> Result<Value, NativeError> {
         let slots = PromiseSlots::new_keyed(
             interp,
             &[
@@ -1755,8 +1757,7 @@ fn static_all_keyed_generic(
             )?;
         }
         Ok(cap.promise.clone())
-    })();
-    outcome
+    })()
 }
 
 fn vm_property_key_from_value(key: &Value) -> Option<crate::VmPropertyKey<'static>> {

@@ -69,7 +69,7 @@ pub fn to_index(value: &Value) -> Option<u64> {
     // so `-0.9` (which truncates to `-0`) is a valid index, not a
     // `RangeError`.
     let truncated = n.trunc();
-    if truncated < 0.0 || truncated > 9_007_199_254_740_991.0 {
+    if !(0.0..=9_007_199_254_740_991.0).contains(&truncated) {
         return None;
     }
     Some(truncated as u64)

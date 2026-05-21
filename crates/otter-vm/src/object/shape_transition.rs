@@ -298,15 +298,15 @@ fn transition_kind_matches_receiver_body(
     body: &ObjectBody,
     kind: &StorePropertyTransitionKind,
 ) -> bool {
-    match (kind, &body.prototype) {
-        (StorePropertyTransitionKind::OwnAdd, ObjectPrototype::Null) => true,
-        (
-            StorePropertyTransitionKind::DirectPrototypeMissing { .. }
-            | StorePropertyTransitionKind::DirectPrototypeWritableData { .. },
-            ObjectPrototype::Object(_),
-        ) => true,
-        _ => false,
-    }
+    matches!(
+        (kind, &body.prototype),
+        (StorePropertyTransitionKind::OwnAdd, ObjectPrototype::Null)
+            | (
+                StorePropertyTransitionKind::DirectPrototypeMissing { .. }
+                    | StorePropertyTransitionKind::DirectPrototypeWritableData { .. },
+                ObjectPrototype::Object(_),
+            )
+    )
 }
 
 fn is_fast_shape_body(body: &ObjectBody) -> bool {

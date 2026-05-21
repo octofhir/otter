@@ -850,13 +850,13 @@ async fn resolve_package_script_invocation(
     let mut target = package_script_command_target(command, &tokens)?;
     target.args.extend(forwarded_args.iter().cloned());
 
-    if target.mode != ScriptCommandMode::Bin {
-        if let Some(path) = explicit_file_target(project_root, &target.target).await? {
-            return Ok(RunScriptInvocation {
-                path,
-                args: target.args,
-            });
-        }
+    if target.mode != ScriptCommandMode::Bin
+        && let Some(path) = explicit_file_target(project_root, &target.target).await?
+    {
+        return Ok(RunScriptInvocation {
+            path,
+            args: target.args,
+        });
     }
 
     let RunTarget::Bin(bin) = resolve_run_bin(project_root, &target.target).await? else {

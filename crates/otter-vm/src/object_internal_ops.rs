@@ -355,19 +355,23 @@ impl Interpreter {
             return Ok(());
         };
         match desc.kind {
-            object::DescriptorKind::Data { value } if !desc.configurable() && !desc.writable() => {
-                if !abstract_ops::same_value(trap_result, &value) {
-                    return Err(VmError::TypeError {
+            object::DescriptorKind::Data { value }
+                if !desc.configurable()
+                    && !desc.writable()
+                    && !abstract_ops::same_value(trap_result, &value) =>
+            {
+                return Err(VmError::TypeError {
                         message: "Proxy get trap returned incompatible value for non-writable non-configurable property".to_string(),
                     });
-                }
             }
-            object::DescriptorKind::Accessor { getter: None, .. } if !desc.configurable() => {
-                if !matches!(trap_result, Value::Undefined) {
-                    return Err(VmError::TypeError {
-                        message: "Proxy get trap returned value for non-configurable accessor without getter".to_string(),
-                    });
-                }
+            object::DescriptorKind::Accessor { getter: None, .. }
+                if !desc.configurable() && !matches!(trap_result, Value::Undefined) =>
+            {
+                return Err(VmError::TypeError {
+                    message:
+                        "Proxy get trap returned value for non-configurable accessor without getter"
+                            .to_string(),
+                });
             }
             _ => {}
         }
@@ -610,12 +614,11 @@ impl Interpreter {
                         if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, key) {
                             return Ok(Some(desc));
                         }
-                    } else if let VmPropertyKey::Symbol(sym) = key {
-                        if let Some(desc) =
+                    } else if let VmPropertyKey::Symbol(sym) = key
+                        && let Some(desc) =
                             object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
-                        {
-                            return Ok(Some(desc));
-                        }
+                    {
+                        return Ok(Some(desc));
                     }
                 }
                 Ok(None)
@@ -995,6 +998,23 @@ impl Interpreter {
                     )
                 }
             }),
+            Value::ClassConstructor(class) => {
+                let statics = class.statics(&self.gc_heap);
+                Ok(match key {
+                    VmPropertyKey::Symbol(sym) => object::define_own_symbol_property_partial(
+                        statics,
+                        &mut self.gc_heap,
+                        sym,
+                        descriptor,
+                    ),
+                    _ => {
+                        let k = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        self.define_own_property_partial(statics, k, descriptor)?
+                    }
+                })
+            }
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 if let VmPropertyKey::Symbol(sym) = key {
                     let bag = self.function_user_bag_runtime_rooted(*function_id, &[], &[])?;
@@ -2151,7 +2171,7 @@ impl Interpreter {
         let mut target_configurable: Vec<Value> = Vec::new();
         let mut target_nonconfigurable: Vec<Value> = Vec::new();
         for key in &target_keys {
-            let vm_key = property_key_from_value(&key)?;
+            let vm_key = property_key_from_value(key)?;
             let slice_roots: [&[Value]; 4] = [
                 target_keys.as_slice(),
                 trap_result.as_slice(),
@@ -3356,7 +3376,7 @@ impl Interpreter {
             let ok = self.define_own_property_value(context, target, &key, descriptor)?;
             if !ok {
                 return Err(VmError::TypeError {
-                    message: "Object.defineProperty failed".to_string(),
+                    message: "Cannot define property".to_string(),
                 });
             }
             return Ok(Some(target.clone()));
@@ -3510,6 +3530,7 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-topropertykey>
     /// - <https://tc39.es/ecma262/#sec-toprimitive>
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_property_key_sync(
         &mut self,
         context: &ExecutionContext,
@@ -3525,6 +3546,7 @@ impl Interpreter {
 
     /// §7.1.1 `ToPrimitive(value, hint)` — synchronous variant. See
     /// [`Self::to_property_key_sync`] for the rationale.
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn to_primitive_sync(
         &mut self,
         context: &ExecutionContext,
@@ -3866,7 +3888,7 @@ impl Interpreter {
                 }
                 None => true,
             }),
-            Value::RegExp(_) => Ok(!key.string_name().is_some_and(|key| key == "lastIndex")),
+            Value::RegExp(_) => Ok(key.string_name().is_none_or(|key| key != "lastIndex")),
             _ => Ok(true),
         }
     }
@@ -3922,15 +3944,14 @@ impl Interpreter {
                         {
                             match &desc.kind {
                                 object::DescriptorKind::Data { value: target_v }
-                                    if !desc.writable() =>
+                                    if !desc.writable()
+                                        && !abstract_ops::same_value(target_v, &value) =>
                                 {
-                                    if !abstract_ops::same_value(target_v, &value) {
-                                        return Err(VmError::TypeError {
+                                    return Err(VmError::TypeError {
                                             message:
                                                 "Proxy set trap reported success but target is non-configurable non-writable with a different value"
                                                     .to_string(),
                                         });
-                                    }
                                 }
                                 object::DescriptorKind::Accessor { setter: None, .. } => {
                                     return Err(VmError::TypeError {

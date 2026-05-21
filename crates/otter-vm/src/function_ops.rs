@@ -1567,7 +1567,6 @@ impl Interpreter {
     /// Returns `Ok(None)` when the method does not need proxy-aware
     /// dispatch, so the caller falls through to the ordinary
     /// `object_statics::call` path.
-
     pub(crate) fn function_property_get(
         &mut self,
         context: &ExecutionContext,

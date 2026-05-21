@@ -358,14 +358,11 @@ impl Interpreter {
                 if let Some(n) = canonical_numeric_index_string(name) {
                     if t.buffer().is_detached() {
                         true
-                    } else if n.is_finite()
-                        && n.fract() == 0.0
-                        && n >= 0.0
-                        && (n as usize) < t.length()
-                    {
-                        false
                     } else {
-                        true
+                        !(n.is_finite()
+                            && n.fract() == 0.0
+                            && n >= 0.0
+                            && (n as usize) < t.length())
                     }
                 } else if let Some(bag) = t.expando() {
                     crate::object::delete(bag, &mut self.gc_heap, name)
@@ -449,10 +446,9 @@ impl Interpreter {
             // keys succeed (the wrapper has no such own property and
             // ordinary [[Delete]] succeeds vacuously).
             // <https://tc39.es/ecma262/#sec-string-exotic-objects-delete-p>
-            (Value::String(s), Value::Number(n)) => match n.as_smi() {
-                Some(v) if v >= 0 && (v as u32) < s.len() => false,
-                _ => true,
-            },
+            (Value::String(s), Value::Number(n)) => {
+                !matches!(n.as_smi(), Some(v) if v >= 0 && (v as u32) < s.len())
+            }
             (Value::String(_), _) => true,
             (
                 Value::Function { function_id } | Value::Closure { function_id, .. },
@@ -485,14 +481,11 @@ impl Interpreter {
                     Some(n) => {
                         if t.buffer().is_detached() {
                             true
-                        } else if n.is_finite()
-                            && n.fract() == 0.0
-                            && n >= 0.0
-                            && (n as usize) < t.length()
-                        {
-                            false
                         } else {
-                            true
+                            !(n.is_finite()
+                                && n.fract() == 0.0
+                                && n >= 0.0
+                                && (n as usize) < t.length())
                         }
                     }
                     None => {
@@ -505,14 +498,8 @@ impl Interpreter {
                 }
             }
             (Value::TypedArray(t), Value::Number(n)) => {
-                if t.buffer().is_detached() {
-                    true
-                } else {
-                    match n.as_smi() {
-                        Some(v) if v >= 0 && (v as usize) < t.length() => false,
-                        _ => true,
-                    }
-                }
+                t.buffer().is_detached()
+                    || !matches!(n.as_smi(), Some(v) if v >= 0 && (v as usize) < t.length())
             }
             (Value::TypedArray(t), Value::Symbol(sym)) => {
                 if let Some(bag) = t.expando() {
@@ -554,7 +541,7 @@ impl Interpreter {
         proto_reg: u16,
     ) -> Result<(), VmError> {
         let proto = match read_register(frame, proto_reg)? {
-            Value::Object(_) | Value::Proxy(_) | Value::Null => {
+            Value::Object(_) | Value::Proxy(_) | Value::Iterator(_) | Value::Null => {
                 read_register(frame, proto_reg)?.clone()
             }
             Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
@@ -2273,7 +2260,7 @@ impl Interpreter {
                 bound,
                 &self.gc_heap,
                 &self.string_heap,
-                &name,
+                name,
             )? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { getter, .. },
@@ -2298,7 +2285,7 @@ impl Interpreter {
                     }) = object::get_own_descriptor(
                         self.function_prototype_object()?,
                         &self.gc_heap,
-                        &name,
+                        name,
                     ) {
                         let pc = stack[top_idx].pc;
                         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2311,7 +2298,7 @@ impl Interpreter {
                         }
                         return Ok(true);
                     }
-                    if is_restricted_function_property(&name) {
+                    if is_restricted_function_property(name) {
                         let pc = stack[top_idx].pc;
                         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                         let callee = self.restricted_throw_type_error()?;
@@ -2342,23 +2329,23 @@ impl Interpreter {
                     .copied()
                     .is_some_and(|bag| {
                         !matches!(
-                            object::lookup_own(bag, &self.gc_heap, &name),
+                            object::lookup_own(bag, &self.gc_heap, name),
                             object::PropertyLookup::Absent
                         )
                     }),
                 Value::ClassConstructor(c) => !matches!(
-                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, &name),
+                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, name),
                     object::PropertyLookup::Absent
                 ),
                 Value::NativeFunction(native) => native
-                    .own_property_descriptor(&self.gc_heap, &self.string_heap, &name)?
+                    .own_property_descriptor(&self.gc_heap, &self.string_heap, name)?
                     .is_some(),
                 _ => false,
             };
             if !own_present {
                 let proto = self.function_prototype_object()?;
                 if let object::PropertyLookup::Accessor { getter, .. } =
-                    object::lookup(proto, &self.gc_heap, &name)
+                    object::lookup(proto, &self.gc_heap, name)
                 {
                     let pc = stack[top_idx].pc;
                     stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2385,7 +2372,7 @@ impl Interpreter {
             }
             _ => return Ok(false),
         };
-        match crate::object::lookup(obj, &self.gc_heap, &name) {
+        match crate::object::lookup(obj, &self.gc_heap, name) {
             object::PropertyLookup::Accessor { getter, .. } => {
                 let pc = stack[top_idx].pc;
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -3318,15 +3305,14 @@ impl Interpreter {
                     {
                         match &desc.kind {
                             object::DescriptorKind::Data { value: target_v }
-                                if !desc.writable() =>
+                                if !desc.writable()
+                                    && !abstract_ops::same_value(target_v, &value) =>
                             {
-                                if !abstract_ops::same_value(target_v, &value) {
-                                    return Err(VmError::TypeError {
+                                return Err(VmError::TypeError {
                                         message:
                                             "Proxy set trap reported success but target is non-configurable non-writable with a different value"
                                                 .to_string(),
                                     });
-                                }
                             }
                             object::DescriptorKind::Accessor { setter: None, .. } => {
                                 return Err(VmError::TypeError {
@@ -3357,9 +3343,9 @@ impl Interpreter {
                         }
                         return Ok(true);
                     };
-                    match object::resolve_set(target, &self.gc_heap, &name) {
+                    match object::resolve_set(target, &self.gc_heap, name) {
                         object::SetOutcome::AssignData => {
-                            if !self.ordinary_set_data_property(target, &name, value)? {
+                            if !self.ordinary_set_data_property(target, name, value)? {
                                 Self::failed_set_result(
                                     strict,
                                     format!("Cannot assign to property '{name}'"),
@@ -3403,7 +3389,7 @@ impl Interpreter {
                 bound,
                 &self.gc_heap,
                 &self.string_heap,
-                &name,
+                name,
             )? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { setter, .. },
@@ -3428,7 +3414,7 @@ impl Interpreter {
                     }) = object::get_own_descriptor(
                         self.function_prototype_object()?,
                         &self.gc_heap,
-                        &name,
+                        name,
                     ) {
                         let setter = setter.ok_or(VmError::TypeMismatch)?;
                         if !abstract_ops::is_callable(&setter) {
@@ -3441,7 +3427,7 @@ impl Interpreter {
                         self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
-                    if is_restricted_function_property(&name) {
+                    if is_restricted_function_property(name) {
                         let pc = stack[top_idx].pc;
                         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                         let callee = self.restricted_throw_type_error()?;
@@ -3475,9 +3461,9 @@ impl Interpreter {
             Value::ClassConstructor(c) => c.statics(&self.gc_heap),
             Value::Function { function_id } | Value::Closure { function_id, .. } => {
                 let fid = *function_id;
-                if function_metadata::ordinary_function_metadata_key(&name).is_some()
+                if function_metadata::ordinary_function_metadata_key(name).is_some()
                     && let Some(desc) =
-                        self.ordinary_function_own_property_descriptor(Some(context), fid, &name)?
+                        self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
                     && !desc.writable()
                 {
                     return Self::finish_failed_set(
@@ -3495,7 +3481,7 @@ impl Interpreter {
             }
             _ => return Ok(false),
         };
-        let outcome = crate::object::resolve_set(obj, &self.gc_heap, &name);
+        let outcome = crate::object::resolve_set(obj, &self.gc_heap, name);
         match outcome {
             object::SetOutcome::AssignData => {
                 let transition = if matches!(receiver, Value::Object(_))
@@ -3510,7 +3496,7 @@ impl Interpreter {
                 } else {
                     None
                 };
-                if transition.is_none() && !self.ordinary_set_data_property(obj, &name, value)? {
+                if transition.is_none() && !self.ordinary_set_data_property(obj, name, value)? {
                     return Self::finish_failed_set(
                         stack,
                         context,

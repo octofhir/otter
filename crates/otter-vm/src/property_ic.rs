@@ -114,9 +114,10 @@ impl PropertyIcStats {
 }
 
 /// Per-site monomorphic IC state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PropertyIcEntry<T> {
     /// Site has not installed an IC yet.
+    #[default]
     Empty,
     /// Site guards one receiver shape/key pair and tracks guard misses.
     Monomorphic {
@@ -127,12 +128,6 @@ pub(crate) enum PropertyIcEntry<T> {
     },
     /// Site was too unstable for a monomorphic IC.
     Disabled,
-}
-
-impl<T> Default for PropertyIcEntry<T> {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 impl<T> PropertyIcEntry<T> {

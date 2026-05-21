@@ -693,7 +693,7 @@ fn create_html(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-string.prototype.substr>
-
+///
 /// §22.1.3.10 `String.prototype.isWellFormed()`. Returns `true` if
 /// every surrogate code unit is part of a valid pair.
 fn impl_is_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -2133,19 +2133,19 @@ mod tests {
         heap: &StringHeap,
         gc_heap: &mut otter_gc::GcHeap,
     ) -> Value {
-        let recv_v = Value::String(JsString::from_str(recv, &heap).unwrap());
+        let recv_v = Value::String(JsString::from_str(recv, heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|a| match a {
                 A::N(n) => Value::Number(NumberValue::from_i32(*n)),
-                A::S(s) => Value::String(JsString::from_str(s, &heap).unwrap()),
+                A::S(s) => Value::String(JsString::from_str(s, heap).unwrap()),
             })
             .collect();
         let entry = lookup(method).unwrap();
         (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv_v,
             args: &arg_vs,
-            string_heap: &heap,
+            string_heap: heap,
             gc_heap,
             allocation_roots: &[],
         })

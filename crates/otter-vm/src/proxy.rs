@@ -29,6 +29,61 @@ use std::rc::Rc;
 use crate::Value;
 use otter_gc::raw::SlotVisitor;
 
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ProxyBodyGc`].
+pub const PROXY_BODY_TYPE_TAG: u8 = 0x29;
+
+/// GC-managed migration target for [`ProxyBody`].
+///
+/// Diverges from the legacy `ProxyBody` in two ways:
+/// - The `revoked` flag is a plain `bool` rather than `Cell<bool>`;
+///   mutators flip it through [`otter_gc::GcHeap::with_payload`],
+///   honouring the project-wide rule that GC bodies must not embed
+///   `Cell`/`RefCell` (see `feedback_no_cell_refcell_leak`).
+/// - `target` / `handler` live as direct [`Value`] fields, traced
+///   by the [`otter_gc::SafeTraceable`] impl below.
+#[derive(Debug)]
+pub struct ProxyBodyGc {
+    /// Target value every trap-less operation falls through to.
+    /// Spec accepts any object, including callables.
+    pub target: Value,
+    /// Handler object trap properties live on.
+    pub handler: Value,
+    /// `true` once `Proxy.revocable().revoke()` has fired.
+    pub revoked: bool,
+}
+
+impl otter_gc::SafeTraceable for ProxyBodyGc {
+    const TYPE_TAG: u8 = PROXY_BODY_TYPE_TAG;
+
+    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
+        self.target.trace_value_slots(visitor);
+        self.handler.trace_value_slots(visitor);
+    }
+}
+
+/// 4-byte compressed GC handle to a [`ProxyBodyGc`]. `Copy`.
+pub type ProxyHandle = otter_gc::Gc<ProxyBodyGc>;
+
+/// Allocate a Proxy body on the GC heap.
+///
+/// The body lives in old-space because proxies hold `Value` slots
+/// that the scavenger does not yet rewrite.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_proxy(
+    heap: &mut otter_gc::GcHeap,
+    target: Value,
+    handler: Value,
+) -> Result<ProxyHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(ProxyBodyGc {
+        target,
+        handler,
+        revoked: false,
+    })
+}
+
 /// Cheap-to-clone Proxy handle.
 #[derive(Debug, Clone)]
 pub struct JsProxy {

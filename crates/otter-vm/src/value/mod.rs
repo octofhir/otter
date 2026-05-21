@@ -58,6 +58,7 @@ use crate::promise::{JsPromiseHandle, PurePromise, PurePromiseBody};
 use crate::regexp::{JsRegExp, JsRegExpBody};
 use crate::string::{JsStringBody, JsStringHandle};
 use crate::intl::{IntlBody, IntlHandle};
+use crate::proxy::{ProxyBodyGc, ProxyHandle};
 use crate::symbol::{SymbolBody, SymbolHandle};
 use crate::temporal::{TemporalBody, TemporalHandle};
 use crate::weak_refs::{FinalizationRegistryBody, JsFinalizationRegistry, JsWeakRef, WeakRefBody};
@@ -425,6 +426,15 @@ impl Value {
     #[must_use]
     pub fn intl_gc(i: IntlHandle) -> Self {
         Self::from_object_gc(i.raw())
+    }
+
+    /// GC-managed Proxy body handle. Migration target for the
+    /// legacy `JsProxy { inner: Rc<ProxyBody> }` wrapper.
+    /// See `docs/value-cutover-plan.md` step 5.
+    #[inline]
+    #[must_use]
+    pub fn proxy_gc(p: ProxyHandle) -> Self {
+        Self::from_object_gc(p.raw())
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1129,6 +1139,25 @@ impl Value {
         self.is_object_like()
             && self.read_gc_type_tag()
                 == Some(<IntlBody as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// GC-managed Proxy body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_proxy_gc(self) -> Option<ProxyHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<ProxyBodyGc>()
+    }
+
+    /// `true` when the value is a GC-managed Proxy body.
+    #[inline]
+    #[must_use]
+    pub fn is_proxy_gc(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 }
 

@@ -2880,6 +2880,19 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     let set = make("Set Iterator")?;
     let string = make("String Iterator")?;
     let regexp_string = make("RegExp String Iterator")?;
+    let next_fn =
+        native_static_with_value_roots(heap, "next", 0, iterator_proto_next, &[&parent_value])
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    if !object::define_own_property(
+        regexp_string,
+        heap,
+        "next",
+        object::PropertyDescriptor::data(Value::NativeFunction(next_fn), true, false, true),
+    ) {
+        return Err(JsSurfaceError::DefinePropertyFailed(
+            "RegExpStringIteratorPrototype.next",
+        ));
+    }
     Ok(BuiltinIteratorPrototypes {
         array,
         map,

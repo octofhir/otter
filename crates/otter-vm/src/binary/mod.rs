@@ -31,7 +31,9 @@ pub mod typed_array;
 pub mod typed_array_prototype;
 
 pub use array_buffer::JsArrayBuffer;
-pub use data_view::JsDataView;
+pub use data_view::{
+    DATA_VIEW_BODY_TYPE_TAG, DataViewBodyGc, DataViewHandle, JsDataView, alloc_data_view,
+};
 pub use typed_array::{JsTypedArray, TypedArrayKind};
 
 use crate::Value;

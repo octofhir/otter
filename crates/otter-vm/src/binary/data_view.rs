@@ -14,7 +14,60 @@
 
 use std::rc::Rc;
 
+use otter_gc::raw::SlotVisitor;
+
 use super::array_buffer::JsArrayBuffer;
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`DataViewBodyGc`].
+pub const DATA_VIEW_BODY_TYPE_TAG: u8 = 0x2a;
+
+/// GC-managed migration target for [`DataViewBody`].
+///
+/// The backing `JsArrayBuffer` is still an `Rc`-based wrapper; once
+/// the array buffer migrates onto a GC body, the trace impl below
+/// must yield the inner handle so the marker reaches the buffer's
+/// payload. Today the trace is a no-op.
+#[derive(Debug)]
+pub struct DataViewBodyGc {
+    /// Backing buffer (still Rc-based — wraps `Rc<LocalBody>` or
+    /// `Arc<SharedBody>` per `BufferStorage`).
+    pub buffer: JsArrayBuffer,
+    /// Byte offset into the backing buffer.
+    pub byte_offset: usize,
+    /// View byte length.
+    pub byte_length: usize,
+}
+
+impl otter_gc::SafeTraceable for DataViewBodyGc {
+    const TYPE_TAG: u8 = DATA_VIEW_BODY_TYPE_TAG;
+
+    /// No outgoing GC slots — the backing `JsArrayBuffer` still
+    /// holds `Rc`/`Arc` rather than a GC handle. Once the buffer
+    /// migrates onto a GC body, this trace must yield the buffer
+    /// handle so the marker reaches reachable bytes.
+    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
+}
+
+/// 4-byte compressed GC handle to a [`DataViewBodyGc`]. `Copy`.
+pub type DataViewHandle = otter_gc::Gc<DataViewBodyGc>;
+
+/// Allocate a DataView body on the GC heap.
+///
+/// # Errors
+///
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub fn alloc_data_view(
+    heap: &mut otter_gc::GcHeap,
+    buffer: JsArrayBuffer,
+    byte_offset: usize,
+    byte_length: usize,
+) -> Result<DataViewHandle, otter_gc::OutOfMemory> {
+    heap.alloc_old(DataViewBodyGc {
+        buffer,
+        byte_offset,
+        byte_length,
+    })
+}
 
 /// Cheap-to-clone DataView handle.
 #[derive(Debug, Clone)]

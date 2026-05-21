@@ -49,6 +49,7 @@ pub mod tag;
 
 use crate::array::{ArrayBody, JsArray};
 use crate::bigint::{BigIntBody, BigIntHandle};
+use crate::binary::{DataViewBodyGc, DataViewHandle};
 use crate::closure::{JS_CLOSURE_BODY_TYPE_TAG, JsClosureBody};
 use crate::collections::{JsMap, JsSet, JsWeakMap, JsWeakSet, MapBody, SetBody, WeakMapBody, WeakSetBody};
 use crate::generator::{GeneratorBody, JsGenerator};
@@ -435,6 +436,14 @@ impl Value {
     #[must_use]
     pub fn proxy_gc(p: ProxyHandle) -> Self {
         Self::from_object_gc(p.raw())
+    }
+
+    /// GC-managed DataView body handle. Migration target for the
+    /// legacy `JsDataView { inner: Rc<DataViewBody> }` wrapper.
+    #[inline]
+    #[must_use]
+    pub fn data_view_gc(v: DataViewHandle) -> Self {
+        Self::from_object_gc(v.raw())
     }
 
     /// Recover a closure handle when this value carries one.
@@ -1158,6 +1167,25 @@ impl Value {
         self.is_object_like()
             && self.read_gc_type_tag()
                 == Some(<ProxyBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
+    }
+
+    /// GC-managed DataView body handle.
+    #[inline]
+    #[must_use]
+    pub fn as_data_view_gc(self) -> Option<DataViewHandle> {
+        if !self.is_object_like() {
+            return None;
+        }
+        self.as_raw_gc()?.checked_cast::<DataViewBodyGc>()
+    }
+
+    /// `true` when the value is a GC-managed DataView body.
+    #[inline]
+    #[must_use]
+    pub fn is_data_view_gc(self) -> bool {
+        self.is_object_like()
+            && self.read_gc_type_tag()
+                == Some(<DataViewBodyGc as otter_gc::SafeTraceable>::TYPE_TAG)
     }
 }
 

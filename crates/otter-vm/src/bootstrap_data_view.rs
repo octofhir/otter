@@ -67,8 +67,9 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -125,7 +126,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         global,
         heap,
         <Intrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-        Value::NativeFunction(ctor),
+        Value::native_function(ctor),
     );
     Ok(())
 }
@@ -138,16 +139,15 @@ pub fn install_data_view_well_knowns_post_bootstrap(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "DataView") else {
+    let Some(ctor) = object::get(global, heap, "DataView").and_then(|v| v.as_native_function())
+    else {
         return Ok(());
     };
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
@@ -160,7 +160,7 @@ pub fn install_data_view_well_knowns_post_bootstrap(
         heap,
         &well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
-            value: Some(Value::String(tag)),
+            value: Some(Value::string(tag)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -188,7 +188,7 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     // construction forwards `new.target`, so the allocated exotic
     // receives `Subclass.prototype` as its observable [[Prototype]].
     // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
     if needs_proto_override
         && let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "DataView")?
     {
@@ -293,18 +293,16 @@ fn dispatch_method(
             let Some(slot) = out.get_mut(idx) else {
                 continue;
             };
-            if !matches!(
-                slot,
-                Value::Object(_)
-                    | Value::Array(_)
-                    | Value::Function { .. }
-                    | Value::Closure(_)
-                    | Value::NativeFunction(_)
-                    | Value::BoundFunction(_)
-                    | Value::ClassConstructor(_)
-                    | Value::Proxy(_)
-                    | Value::RegExp(_)
-            ) {
+            let is_object_like = slot.is_object()
+                || slot.is_array()
+                || slot.is_function()
+                || slot.is_closure()
+                || slot.is_native_function()
+                || slot.is_bound_function()
+                || slot.is_class_constructor()
+                || slot.is_proxy()
+                || slot.is_regexp();
+            if !is_object_like {
                 continue;
             }
             let interp = ctx.interp_mut();
@@ -349,7 +347,8 @@ fn install_accessor(
     let getter =
         crate::bootstrap::native_static_with_value_roots(heap, name, 0, call, roots.as_slice())
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
+    let desc =
+        PropertyDescriptor::accessor(Some(Value::native_function(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
     }
@@ -385,12 +384,13 @@ fn receiver_dv(
     ctx: &NativeCtx<'_>,
     name: &'static str,
 ) -> Result<crate::binary::data_view::JsDataView, NativeError> {
-    match ctx.this_value() {
-        Value::DataView(v) => Ok(*v),
-        _ => Err(NativeError::TypeError {
+    if let Some(v) = ctx.this_value().as_data_view() {
+        Ok(v)
+    } else {
+        Err(NativeError::TypeError {
             name,
             reason: "this is not a DataView".to_string(),
-        }),
+        })
     }
 }
 

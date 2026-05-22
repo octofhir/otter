@@ -69,7 +69,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
         heap: &mut otter_gc::GcHeap,
         global: crate::object::JsObject,
     ) -> Result<(), crate::js_surface::JsSurfaceError> {
-        let global_root = crate::Value::Object(global);
+        let global_root = crate::Value::object(global);
         let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
             heap,
             &JSON_SPEC,
@@ -80,7 +80,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
             global,
             heap,
             <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-            crate::Value::Object(namespace),
+            crate::Value::object(namespace),
         );
         Ok(())
     }
@@ -217,55 +217,49 @@ fn coerce_json_parse_args(
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     if let Some(slot) = out.first_mut() {
-        let s = match slot {
-            Value::String(s) => *s,
-            Value::Symbol(_) => {
+        let current = *slot;
+        let s = if let Some(s) = current.as_string() {
+            *s
+        } else if current.is_symbol() {
+            return Err(NativeError::TypeError {
+                name: "parse",
+                reason: "cannot convert a Symbol to a string".to_string(),
+            });
+        } else if crate::abstract_ops::is_primitive(&current) {
+            let text = current.display_string(ctx.heap());
+            JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
+                name: "parse",
+                reason: "out of memory".to_string(),
+            })?
+        } else {
+            let (interp, exec) = ctx.interp_mut_and_context();
+            let exec = exec.ok_or_else(|| NativeError::TypeError {
+                name: "parse",
+                reason: "missing execution context".to_string(),
+            })?;
+            let primitive = interp
+                .evaluate_to_primitive(
+                    &exec,
+                    &current,
+                    crate::abstract_ops::ToPrimitiveHint::String,
+                )
+                .map_err(|e| NativeError::TypeError {
+                    name: "parse",
+                    reason: e.to_string(),
+                })?;
+            if let Some(s) = primitive.as_string() {
+                *s
+            } else if primitive.is_symbol() {
                 return Err(NativeError::TypeError {
                     name: "parse",
                     reason: "cannot convert a Symbol to a string".to_string(),
                 });
-            }
-            ref primitive if crate::abstract_ops::is_primitive(primitive) => {
+            } else {
                 let text = primitive.display_string(ctx.heap());
                 JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
                     name: "parse",
                     reason: "out of memory".to_string(),
                 })?
-            }
-            ref non_primitive => {
-                let (interp, exec) = ctx.interp_mut_and_context();
-                let exec = exec.ok_or_else(|| NativeError::TypeError {
-                    name: "parse",
-                    reason: "missing execution context".to_string(),
-                })?;
-                let primitive = interp
-                    .evaluate_to_primitive(
-                        &exec,
-                        non_primitive,
-                        crate::abstract_ops::ToPrimitiveHint::String,
-                    )
-                    .map_err(|e| NativeError::TypeError {
-                        name: "parse",
-                        reason: e.to_string(),
-                    })?;
-                match primitive {
-                    Value::String(s) => s,
-                    Value::Symbol(_) => {
-                        return Err(NativeError::TypeError {
-                            name: "parse",
-                            reason: "cannot convert a Symbol to a string".to_string(),
-                        });
-                    }
-                    other => {
-                        let text = other.display_string(ctx.heap());
-                        JsString::from_str(&text, ctx.heap_mut()).map_err(|_| {
-                            NativeError::TypeError {
-                                name: "parse",
-                                reason: "out of memory".to_string(),
-                            }
-                        })?
-                    }
-                }
             }
         };
         *slot = Value::string(s);
@@ -314,16 +308,14 @@ fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Valu
 }
 
 fn json_parse(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
-    let text = match args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
-        _ => {
-            return Err(JsonError::BadArgument {
-                name: "parse",
-                index: 0,
-                reason: "must be a string",
-            });
-        }
+    let Some(s) = args.first().and_then(|v| v.as_string()) else {
+        return Err(JsonError::BadArgument {
+            name: "parse",
+            index: 0,
+            reason: "must be a string",
+        });
     };
+    let text = s.to_lossy_string(gc_heap);
     let value = parse(&text, gc_heap)?;
     Ok(value)
 }
@@ -333,16 +325,14 @@ fn json_parse_with_roots(
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, JsonError> {
-    let text = match args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
-        _ => {
-            return Err(JsonError::BadArgument {
-                name: "parse",
-                index: 0,
-                reason: "must be a string",
-            });
-        }
+    let Some(s) = args.first().and_then(|v| v.as_string()) else {
+        return Err(JsonError::BadArgument {
+            name: "parse",
+            index: 0,
+            reason: "must be a string",
+        });
     };
+    let text = s.to_lossy_string(gc_heap);
     let value = parse::parse_with_roots(&text, gc_heap, external_visit)?;
     Ok(value)
 }
@@ -350,10 +340,9 @@ fn json_parse_with_roots(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::number::NumberValue;
 
     fn n(v: i32) -> Value {
-        Value::Number(NumberValue::from_i32(v))
+        Value::number_i32(v)
     }
 
     fn make_heap() -> otter_gc::GcHeap {
@@ -363,23 +352,26 @@ mod tests {
     #[test]
     fn stringify_primitives() {
         let mut heap = make_heap();
-        assert_eq!(stringify(&Value::Null, &mut heap).unwrap().unwrap(), "null");
         assert_eq!(
-            stringify(&Value::Boolean(true), &mut heap)
+            stringify(&Value::null(), &mut heap).unwrap().unwrap(),
+            "null"
+        );
+        assert_eq!(
+            stringify(&Value::boolean(true), &mut heap)
                 .unwrap()
                 .unwrap(),
             "true"
         );
         assert_eq!(stringify(&n(42), &mut heap).unwrap().unwrap(), "42");
         // Undefined → omitted (returns None).
-        assert!(stringify(&Value::Undefined, &mut heap).unwrap().is_none());
+        assert!(stringify(&Value::undefined(), &mut heap).unwrap().is_none());
     }
 
     #[test]
     fn stringify_nan_and_infinity_become_null() {
         let mut heap = make_heap();
-        let nan = Value::number(NumberValue::Double(f64::NAN));
-        let inf = Value::number(NumberValue::Double(f64::INFINITY));
+        let nan = Value::number_f64(f64::NAN);
+        let inf = Value::number_f64(f64::INFINITY);
         assert_eq!(stringify(&nan, &mut heap).unwrap().unwrap(), "null");
         assert_eq!(stringify(&inf, &mut heap).unwrap().unwrap(), "null");
     }
@@ -390,7 +382,7 @@ mod tests {
         let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
         crate::object::set(obj, &mut heap, "b", n(1));
         crate::object::set(obj, &mut heap, "a", n(2));
-        let s = stringify(&Value::Object(obj), &mut heap).unwrap().unwrap();
+        let s = stringify(&Value::object(obj), &mut heap).unwrap().unwrap();
         assert_eq!(s, "{\"b\":1,\"a\":2}");
     }
 
@@ -417,13 +409,13 @@ mod tests {
     #[test]
     fn stringify_observably_equivalent_when_fast_path_disqualified() {
         let mut heap = make_heap();
-        let Value::Array(arr) = parse("[1,2,3]", &mut heap).unwrap() else {
+        let Some(arr) = parse("[1,2,3]", &mut heap).unwrap().as_array() else {
             panic!("parsed value should be an array")
         };
         // Mutating the array invalidates source_bytes; stringify must
         // still produce a correct (though re-rendered) result.
-        crate::array::set(arr, &mut heap, 0, Value::Number(NumberValue::from_i32(99))).unwrap();
-        let s = stringify(&Value::Array(arr), &mut heap).unwrap().unwrap();
+        crate::array::set(arr, &mut heap, 0, Value::number_i32(99)).unwrap();
+        let s = stringify(&Value::array(arr), &mut heap).unwrap().unwrap();
         assert_eq!(s, "[99,2,3]");
     }
 
@@ -431,7 +423,7 @@ mod tests {
     fn stringify_pretty_disables_source_bytes_fast_path() {
         let mut heap = make_heap();
         let parsed = parse("[1,2,3]", &mut heap).unwrap();
-        let opts = StringifyOptions::from_space(&Value::Number(NumberValue::from_i32(2))).unwrap();
+        let opts = StringifyOptions::from_space(&Value::number_i32(2)).unwrap();
         let s = stringify_with_options(&parsed, &opts, &mut heap)
             .unwrap()
             .unwrap();
@@ -444,8 +436,8 @@ mod tests {
     fn parse_round_trip() {
         let mut heap = make_heap();
         let v = parse("{\"x\":[1,2,3]}", &mut heap).unwrap();
-        if let Value::Object(o) = v {
-            if let Some(Value::Array(arr)) = crate::object::get(o, &heap, "x") {
+        if let Some(o) = v.as_object() {
+            if let Some(arr) = crate::object::get(o, &heap, "x").and_then(|v| v.as_array()) {
                 assert_eq!(crate::array::len(arr, &heap), 3);
                 assert_eq!(crate::array::get(arr, &heap, 1).display_string(&heap), "2");
             } else {
@@ -462,8 +454,8 @@ mod tests {
         // hot path; full path tracking can layer on later).
         let mut heap = make_heap();
         let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        crate::object::set(obj, &mut heap, "self", Value::Object(obj));
-        let err = stringify(&Value::Object(obj), &mut heap).unwrap_err();
+        crate::object::set(obj, &mut heap, "self", Value::object(obj));
+        let err = stringify(&Value::object(obj), &mut heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
         assert_eq!(
             err.to_string(),

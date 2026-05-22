@@ -35,91 +35,85 @@ pub(crate) fn to_number_primitive(
     value: &Value,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<NumberValue, VmError> {
-    let number = match value {
-        Value::Number(n) => *n,
-        Value::Boolean(true) => NumberValue::Smi(1),
-        Value::Boolean(false) | Value::Null => NumberValue::Smi(0),
-        Value::BigInt(_) | Value::Symbol(_) => return Err(VmError::TypeMismatch),
-        Value::Undefined
-        | Value::Hole
-        | Value::Function { .. }
-        | Value::Closure(_)
-        | Value::BoundFunction(_)
-        | Value::NativeFunction(_)
-        | Value::Object(_)
-        | Value::Array(_)
-        | Value::Iterator(_)
-        | Value::RegExp(_)
-        | Value::Promise(_)
-        | Value::ClassConstructor(_)
-        | Value::Map(_)
-        | Value::Set(_)
-        | Value::WeakMap(_)
-        | Value::WeakSet(_)
-        | Value::WeakRef(_)
-        | Value::FinalizationRegistry(_)
-        | Value::Temporal(_)
-        | Value::Intl(_)
-        | Value::ArrayBuffer(_)
-        | Value::DataView(_)
-        | Value::TypedArray(_)
-        | Value::Generator(_)
-        | Value::Proxy(_) => NumberValue::Double(f64::NAN),
-        Value::String(s) => number::to_number_from_string(&s.to_lossy_string(gc_heap)),
-    };
-    Ok(number)
+    if let Some(n) = value.as_number() {
+        return Ok(n);
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok(NumberValue::Smi(if b { 1 } else { 0 }));
+    }
+    if value.is_null() {
+        return Ok(NumberValue::Smi(0));
+    }
+    if value.is_big_int() || value.is_symbol() {
+        return Err(VmError::TypeMismatch);
+    }
+    if let Some(s) = value.as_string() {
+        return Ok(number::to_number_from_string(&s.to_lossy_string(gc_heap)));
+    }
+    Ok(NumberValue::Double(f64::NAN))
 }
 
 pub(crate) fn to_string_primitive(
     value: &Value,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<String, VmError> {
-    match value {
-        Value::String(s) => Ok(s.to_lossy_string(gc_heap)),
-        Value::Number(n) => Ok(n.to_display_string()),
-        Value::BigInt(b) => Ok(b.to_decimal_string(gc_heap)),
-        Value::Boolean(true) => Ok("true".to_string()),
-        Value::Boolean(false) => Ok("false".to_string()),
-        Value::Null => Ok("null".to_string()),
-        Value::Undefined | Value::Hole => Ok("undefined".to_string()),
-        Value::Symbol(_) => Err(VmError::TypeMismatch),
-        _ => Err(VmError::TypeMismatch),
+    if let Some(s) = value.as_string() {
+        return Ok(s.to_lossy_string(gc_heap));
     }
+    if let Some(n) = value.as_number() {
+        return Ok(n.to_display_string());
+    }
+    if let Some(b) = value.as_big_int() {
+        return Ok(b.to_decimal_string(gc_heap));
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok(if b { "true" } else { "false" }.to_string());
+    }
+    if value.is_null() {
+        return Ok("null".to_string());
+    }
+    if value.is_undefined() || value.is_hole() {
+        return Ok("undefined".to_string());
+    }
+    Err(VmError::TypeMismatch)
 }
 
 pub(crate) fn to_js_string_primitive(
     value: &Value,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
-    match value {
-        Value::String(s) => Ok(*s),
-        Value::Number(n) => {
-            number::ecma::number_to_string(n.as_f64(), gc_heap).map_err(|_| VmError::TypeMismatch)
-        }
-        // BigInt arm cannot fire here without a GcHeap; the caller is
-        // expected to coerce BigInt through
-        // `to_string_primitive(..., heap)` upstream of this helper.
-        _ => Err(VmError::TypeMismatch),
+    if let Some(s) = value.as_string() {
+        return Ok(*s);
     }
+    if let Some(n) = value.as_number() {
+        return number::ecma::number_to_string(n.as_f64(), gc_heap)
+            .map_err(|_| VmError::TypeMismatch);
+    }
+    // BigInt arm cannot fire here without a GcHeap; the caller is
+    // expected to coerce BigInt through
+    // `to_string_primitive(..., heap)` upstream of this helper.
+    Err(VmError::TypeMismatch)
 }
 
 pub(crate) fn string_constructor_js_string(
     value: Option<&Value>,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
-    match value {
-        Some(Value::Symbol(s)) => JsString::from_str(&s.descriptive_string(gc_heap), gc_heap)
-            .map_err(|_| VmError::TypeMismatch),
-        Some(value) => match to_js_string_primitive(value, gc_heap) {
-            Ok(value) => Ok(value),
-            Err(VmError::TypeMismatch) => {
-                let rendered = to_string_primitive(value, gc_heap)
-                    .unwrap_or_else(|_| value.display_string(gc_heap));
-                JsString::from_str(&rendered, gc_heap).map_err(|_| VmError::TypeMismatch)
-            }
-            Err(err) => Err(err),
-        },
-        None => JsString::empty(gc_heap).map_err(|_| VmError::TypeMismatch),
+    let Some(value) = value else {
+        return JsString::empty(gc_heap).map_err(|_| VmError::TypeMismatch);
+    };
+    if let Some(s) = value.as_symbol() {
+        return JsString::from_str(&s.descriptive_string(gc_heap), gc_heap)
+            .map_err(|_| VmError::TypeMismatch);
+    }
+    match to_js_string_primitive(value, gc_heap) {
+        Ok(v) => Ok(v),
+        Err(VmError::TypeMismatch) => {
+            let rendered = to_string_primitive(value, gc_heap)
+                .unwrap_or_else(|_| value.display_string(gc_heap));
+            JsString::from_str(&rendered, gc_heap).map_err(|_| VmError::TypeMismatch)
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -165,11 +159,11 @@ impl Interpreter {
         let src = register_operand(operands.get(1))?;
         let top_idx = stack.len() - 1;
         let recv = *read_register(&stack[top_idx], src)?;
-        let Value::Object(obj) = &recv else {
+        let Some(obj) = recv.as_object() else {
             return Ok(None);
         };
         let to_primitive_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let Some(callee) = crate::object::get_symbol(*obj, &self.gc_heap, &to_primitive_sym) else {
+        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, &to_primitive_sym) else {
             return Ok(None);
         };
         if !self.is_callable_runtime(&callee) {
@@ -298,7 +292,7 @@ impl Interpreter {
         value: &Value,
         key: &VmPropertyKey,
     ) -> Result<Option<VmGetOutcome>, VmError> {
-        if !matches!(value, Value::Undefined) {
+        if !value.is_undefined() {
             return Ok(None);
         }
         let Ok(proto) = self.function_prototype_object() else {
@@ -345,144 +339,147 @@ impl Interpreter {
     /// - <https://tc39.es/ecma262/#sec-toprimitive>
     /// - <https://tc39.es/ecma262/#sec-ordinaryget>
     pub(crate) fn intrinsic_prototype_object_for(&mut self, value: &Value) -> Option<JsObject> {
-        let constructor_name = match value {
-            Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_) => return self.function_prototype_object().ok(),
-            Value::Array(arr) => {
-                if let Some(Value::Object(proto)) =
-                    crate::array::prototype_override(*arr, &self.gc_heap)
-                {
-                    return Some(proto);
-                }
-                "Array"
+        if value.is_function()
+            || value.is_closure()
+            || value.is_native_function()
+            || value.is_bound_function()
+            || value.is_class_constructor()
+        {
+            return self.function_prototype_object().ok();
+        }
+        if value.is_object() || value.is_proxy() {
+            return None;
+        }
+        let constructor_name = if let Some(arr) = value.as_array() {
+            if let Some(proto) =
+                crate::array::prototype_override(arr, &self.gc_heap).and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::RegExp(regexp) => {
-                if let Some(Value::Object(proto)) = regexp.prototype_override(&self.gc_heap) {
-                    return Some(proto);
-                }
-                "RegExp"
+            "Array"
+        } else if let Some(regexp) = value.as_regexp() {
+            if let Some(proto) = regexp
+                .prototype_override(&self.gc_heap)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::Map(map) => {
-                if let Some(Value::Object(proto)) =
-                    crate::collections::map_prototype_override(*map, &self.gc_heap)
-                {
-                    return Some(proto);
-                }
-                "Map"
+            "RegExp"
+        } else if let Some(map) = value.as_map() {
+            if let Some(proto) = crate::collections::map_prototype_override(map, &self.gc_heap)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::Set(set) => {
-                if let Some(Value::Object(proto)) =
-                    crate::collections::set_prototype_override(*set, &self.gc_heap)
-                {
-                    return Some(proto);
-                }
-                "Set"
+            "Map"
+        } else if let Some(set) = value.as_set() {
+            if let Some(proto) = crate::collections::set_prototype_override(set, &self.gc_heap)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::WeakMap(map) => {
-                if let Some(Value::Object(proto)) =
-                    crate::collections::weak_map_prototype_override(*map, &self.gc_heap)
-                {
-                    return Some(proto);
-                }
-                "WeakMap"
+            "Set"
+        } else if let Some(map) = value.as_weak_map() {
+            if let Some(proto) = crate::collections::weak_map_prototype_override(map, &self.gc_heap)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::WeakSet(set) => {
-                if let Some(Value::Object(proto)) =
-                    crate::collections::weak_set_prototype_override(*set, &self.gc_heap)
-                {
-                    return Some(proto);
-                }
-                "WeakSet"
+            "WeakMap"
+        } else if let Some(set) = value.as_weak_set() {
+            if let Some(proto) = crate::collections::weak_set_prototype_override(set, &self.gc_heap)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::WeakRef(weak_ref) => {
-                if let Some(Value::Object(proto)) =
-                    crate::weak_refs::weak_ref_prototype_override(*weak_ref, &self.gc_heap)
-                {
-                    return Some(proto);
-                }
-                "WeakRef"
+            "WeakSet"
+        } else if let Some(weak_ref) = value.as_weak_ref() {
+            if let Some(proto) =
+                crate::weak_refs::weak_ref_prototype_override(weak_ref, &self.gc_heap)
+                    .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::FinalizationRegistry(registry) => {
-                if let Some(Value::Object(proto)) =
-                    crate::weak_refs::finalization_registry_prototype_override(
-                        *registry,
-                        &self.gc_heap,
-                    )
-                {
-                    return Some(proto);
-                }
-                "FinalizationRegistry"
+            "WeakRef"
+        } else if let Some(registry) = value.as_finalization_registry() {
+            if let Some(proto) =
+                crate::weak_refs::finalization_registry_prototype_override(registry, &self.gc_heap)
+                    .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::Promise(promise) => {
-                if let Some(Value::Object(proto)) = promise.prototype_override(&self.gc_heap) {
-                    return Some(proto);
-                }
-                "Promise"
+            "FinalizationRegistry"
+        } else if let Some(promise) = value.as_promise() {
+            if let Some(proto) = promise
+                .prototype_override(&self.gc_heap)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::ArrayBuffer(b) => {
-                if let Some(Value::Object(proto)) = self.non_gc_exotic_prototype_override(value) {
-                    return Some(proto);
-                }
-                if b.is_shared() {
-                    "SharedArrayBuffer"
-                } else {
-                    "ArrayBuffer"
-                }
+            "Promise"
+        } else if let Some(b) = value.as_array_buffer() {
+            if let Some(proto) = self
+                .non_gc_exotic_prototype_override(value)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
-            Value::DataView(_) => {
-                if let Some(Value::Object(proto)) = self.non_gc_exotic_prototype_override(value) {
-                    return Some(proto);
-                }
-                "DataView"
+            if b.is_shared() {
+                "SharedArrayBuffer"
+            } else {
+                "ArrayBuffer"
             }
-            Value::TypedArray(t) => {
-                if let Some(Value::Object(proto)) = self.non_gc_exotic_prototype_override(value) {
-                    return Some(proto);
-                }
-                t.kind().name()
+        } else if value.as_data_view().is_some() {
+            if let Some(proto) = self
+                .non_gc_exotic_prototype_override(value)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
             }
+            "DataView"
+        } else if let Some(t) = value.as_typed_array() {
+            if let Some(proto) = self
+                .non_gc_exotic_prototype_override(value)
+                .and_then(|v| v.as_object())
+            {
+                return Some(proto);
+            }
+            t.kind().name()
+        } else if let Some(handle) = value.as_iterator() {
             // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — per-kind
             // iterator prototypes inherit from `%IteratorPrototype%`
             // and override `@@toStringTag`. Route through the cached
             // realm prototypes before falling back to the generic
             // `%IteratorPrototype%`.
-            Value::Iterator(handle) => {
-                let origin = self.gc_heap.read_payload(*handle, |s| s.builtin_origin());
-                if let Some(origin) = origin
-                    && let Some(proto) = self.builtin_iterator_prototype_for(origin)
-                {
-                    return Some(proto);
-                }
-                "Iterator"
+            let origin = self.gc_heap.read_payload(handle, |s| s.builtin_origin());
+            if let Some(origin) = origin
+                && let Some(proto) = self.builtin_iterator_prototype_for(origin)
+            {
+                return Some(proto);
             }
+            "Iterator"
+        } else if value.is_generator() {
             // §27.5 generators expose `%GeneratorPrototype%`'s
             // intrinsic ancestor, which is `%IteratorPrototype%`.
             // The Otter foundation collapses both into the same
             // realm prototype today.
-            Value::Generator(_) => "Iterator",
-            // §20.1.2.10 Object.getPrototypeOf accepts primitives
-            // by routing through ToObject (§7.1.18), so we hand
-            // primitive values their own constructor's
-            // `%X.prototype%` here. Callers that only deal with
-            // exotic-object shapes already filter out primitives.
-            // (Date is now `Value::Object` with a `[[DateValue]]`
-            // internal slot — see `crate::object::date_data` — so
-            // it falls through to the Object branch below.)
-            Value::Symbol(_) => "Symbol",
-            Value::String(_) => "String",
-            Value::Number(_) => "Number",
-            Value::Boolean(_) => "Boolean",
-            Value::BigInt(_) => "BigInt",
-            Value::Object(_) | Value::Proxy(_) => return None,
-            _ => return None,
+            "Iterator"
+        } else if value.is_symbol() {
+            "Symbol"
+        } else if value.is_string() {
+            "String"
+        } else if value.is_number() {
+            "Number"
+        } else if value.is_boolean() {
+            "Boolean"
+        } else if value.is_big_int() {
+            "BigInt"
+        } else {
+            return None;
         };
-        match self.constructor_prototype_value(constructor_name).ok()? {
-            Value::Object(o) => Some(o),
-            _ => None,
-        }
+        self.constructor_prototype_value(constructor_name)
+            .ok()?
+            .as_object()
     }
 
     /// §7.1.1.1 step 4.a — `func = ? Get(O, name)`.
@@ -497,7 +494,7 @@ impl Interpreter {
         name: &str,
     ) -> Result<Option<Value>, VmError> {
         match self.ordinary_get_value(context, *base, *base, &VmPropertyKey::String(name), 0)? {
-            VmGetOutcome::Value(Value::Undefined) => Ok(None),
+            VmGetOutcome::Value(value) if value.is_undefined() => Ok(None),
             VmGetOutcome::Value(value) => Ok(Some(value)),
             VmGetOutcome::InvokeGetter { getter } => {
                 let value = self.run_callable_sync(context, &getter, *base, SmallVec::new())?;
@@ -514,7 +511,7 @@ impl Interpreter {
         sym: symbol::JsSymbol,
     ) -> Result<Option<Value>, VmError> {
         match self.ordinary_get_value(context, *base, *base, &VmPropertyKey::Symbol(sym), 0)? {
-            VmGetOutcome::Value(Value::Undefined) => Ok(None),
+            VmGetOutcome::Value(value) if value.is_undefined() => Ok(None),
             VmGetOutcome::Value(value) => Ok(Some(value)),
             VmGetOutcome::InvokeGetter { getter } => {
                 let value = self.run_callable_sync(context, &getter, *base, SmallVec::new())?;
@@ -541,7 +538,10 @@ impl Interpreter {
                 ToPrimitiveStage::SymbolToPrim => {
                     let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
                     match self.get_symbol_for_to_primitive(context, &obj, to_prim_sym)? {
-                        Some(Value::Undefined | Value::Null) | None => {
+                        Some(v) if v.is_nullish() => {
+                            stage = ToPrimitiveStage::OrdinaryFirst;
+                        }
+                        None => {
                             stage = ToPrimitiveStage::OrdinaryFirst;
                         }
                         Some(callee) if self.is_callable_runtime(&callee) => {
@@ -609,12 +609,12 @@ impl Interpreter {
                     // for plain object literals which never receive
                     // a real Object.prototype linkage.
                     if callee.is_none()
-                        && let Value::Object(o) = &obj
+                        && let Some(o) = obj.as_object()
                     {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
                         let fn_proto = self.function_prototype_object().ok();
                         if let Some(v) = object_prototype_intercept(
-                            o,
+                            &o,
                             method,
                             &no_args,
                             &mut self.gc_heap,
@@ -664,12 +664,12 @@ impl Interpreter {
                     // hint=string) when the chain has nothing
                     // callable.
                     if callee.is_none()
-                        && let Value::Object(o) = &obj
+                        && let Some(o) = obj.as_object()
                     {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
                         let fn_proto = self.function_prototype_object().ok();
                         if let Some(v) = object_prototype_intercept(
-                            o,
+                            &o,
                             method,
                             &no_args,
                             &mut self.gc_heap,

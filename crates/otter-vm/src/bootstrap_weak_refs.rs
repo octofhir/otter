@@ -292,12 +292,16 @@ fn link_object_prototype(heap: &mut otter_gc::GcHeap, prototype: JsObject, globa
     }
 }
 
-fn ctor_prototype(global: JsObject, heap: &otter_gc::GcHeap, ctor_name: &str) -> Option<JsObject> {
+fn ctor_prototype(
+    global: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    ctor_name: &str,
+) -> Option<JsObject> {
     let Some(Value::NativeFunction(f)) = object::get(global, heap, ctor_name) else {
         return None;
     };
     let descriptor = f
-        .own_property_descriptor(heap, "prototype")
+        .own_property_descriptor(&mut *heap, "prototype")
         .ok()
         .flatten()?;
     match descriptor.kind {

@@ -147,7 +147,7 @@ fn type_err(reason: impl Into<String>) -> NativeError {
 
 fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
     match value {
-        Value::String(s) => Ok(s.to_lossy_string()),
+        Value::String(s) => Ok(s.to_lossy_string(ctx.heap())),
         Value::Undefined => Ok("undefined".to_string()),
         Value::Null => Ok("null".to_string()),
         Value::Boolean(b) => Ok(if *b { "true" } else { "false" }.to_string()),
@@ -349,7 +349,7 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
         None => Ok(Value::Null),
         Some(s) => {
             let (interp, _exec) = ctx.interp_mut_and_context();
-            let js = JsString::from_str(&s, interp.gc_heap())
+            let js = JsString::from_str(&s, interp.gc_heap_mut())
                 .map_err(|e| type_err(format!("string alloc: {e}")))?;
             Ok(Value::String(js))
         }

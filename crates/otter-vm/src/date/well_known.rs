@@ -91,7 +91,7 @@ fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let hint_value = args.first().cloned().unwrap_or(Value::Undefined);
     let try_first = match &hint_value {
         Value::String(js) => {
-            let token = js.to_lossy_string();
+            let token = js.to_lossy_string(ctx.heap());
             match token.as_str() {
                 "string" | "default" => ToPrimitiveHint::String,
                 "number" => ToPrimitiveHint::Number,

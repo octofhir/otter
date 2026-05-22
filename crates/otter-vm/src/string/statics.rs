@@ -92,10 +92,10 @@ pub static STRING_STATIC_METHODS: &[MethodSpec] = &[
 fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let mut units: Vec<u16> = Vec::with_capacity(args.len());
     for arg in args {
-        let n = crate::number::parse::to_number_value(arg);
+        let n = crate::number::parse::to_number_value(arg, ctx.heap());
         units.push(to_uint16(n));
     }
-    JsString::from_utf16_units(&units, ctx.heap())
+    JsString::from_utf16_units(&units, ctx.heap_mut())
         .map(Value::String)
         .map_err(|_| NativeError::TypeError {
             name: "String.fromCharCode",
@@ -125,7 +125,7 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let mut units: Vec<u16> = Vec::with_capacity(args.len() * 2);
     for arg in args {
-        let n = crate::number::parse::to_number_value(arg);
+        let n = crate::number::parse::to_number_value(arg, ctx.heap());
         if !n.is_finite() || n < 0.0 || n > 0x10FFFF as f64 || n.fract() != 0.0 {
             return Err(NativeError::RangeError {
                 name: "String.fromCodePoint",
@@ -141,7 +141,7 @@ fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             units.push(0xDC00 | (v & 0x3FF) as u16);
         }
     }
-    JsString::from_utf16_units(&units, ctx.heap())
+    JsString::from_utf16_units(&units, ctx.heap_mut())
         .map(Value::String)
         .map_err(|_| NativeError::TypeError {
             name: "String.fromCodePoint",

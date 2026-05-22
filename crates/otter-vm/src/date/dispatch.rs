@@ -72,7 +72,7 @@ pub fn call(
             }
             Ok(Value::Object(obj))
         }
-        M::Now | M::Parse | M::UTC => call_static(method, args),
+        M::Now | M::Parse | M::UTC => call_static(method, args, heap),
     }
 }
 
@@ -88,6 +88,7 @@ pub fn call(
 pub fn call_static(
     method: otter_bytecode::method_id::DateMethod,
     args: &[Value],
+    heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::DateMethod as M;
     match method {
@@ -96,7 +97,7 @@ pub fn call_static(
         // §21.4.3.2 Date.parse(str).
         M::Parse => {
             let s = match args.first() {
-                Some(Value::String(s)) => s.to_lossy_string(),
+                Some(Value::String(s)) => s.to_lossy_string(heap),
                 _ => return Ok(Value::Number(NumberValue::from_f64(f64::NAN))),
             };
             Ok(Value::Number(NumberValue::from_f64(parse_date(&s))))
@@ -133,7 +134,7 @@ pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
     match args.len() {
         0 => now_ms(),
         1 => match &args[0] {
-            Value::String(s) => parse_date(&s.to_lossy_string()),
+            Value::String(s) => parse_date(&s.to_lossy_string(heap)),
             Value::Number(n) => n.as_f64(),
             // §21.4.2.2 step 3.b — if value has [[DateValue]], use
             // that. Other objects fall back to ToPrimitive→Number;

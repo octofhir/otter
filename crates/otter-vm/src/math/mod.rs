@@ -225,9 +225,10 @@ pub fn load_constant(name: &str) -> Option<Value> {
 pub fn call(
     method: otter_bytecode::method_id::MathMethod,
     args: &[Value],
+    heap: &otter_gc::GcHeap,
 ) -> Result<Value, MathError> {
     use otter_bytecode::method_id::MathMethod as M;
-    let nums = coerce_all(method.name(), args)?;
+    let nums = coerce_all(method.name(), args, heap)?;
     let value = match method {
         M::Abs => impl_abs(&nums),
         M::Acos => impl_acos(&nums),
@@ -271,8 +272,9 @@ pub fn call(
 fn native_call(
     method: otter_bytecode::method_id::MathMethod,
     args: &[Value],
+    heap: &otter_gc::GcHeap,
 ) -> Result<Value, NativeError> {
-    call(method, args).map_err(|err| match err {
+    call(method, args, heap).map_err(|err| match err {
         MathError::UnknownMember(member) => NativeError::TypeError {
             name: method.name(),
             reason: format!("unknown Math member {member}"),
@@ -286,8 +288,12 @@ fn native_call(
 
 macro_rules! native_math {
     ($fn_name:ident, $variant:ident) => {
-        fn $fn_name(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            native_call(otter_bytecode::method_id::MathMethod::$variant, args)
+        fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            native_call(
+                otter_bytecode::method_id::MathMethod::$variant,
+                args,
+                ctx.heap(),
+            )
         }
     };
 }
@@ -328,7 +334,11 @@ native_math!(native_clz32, Clz32);
 native_math!(native_imul, Imul);
 native_math!(native_random, Random);
 
-fn coerce_all(name: &'static str, args: &[Value]) -> Result<Vec<NumberValue>, MathError> {
+fn coerce_all(
+    name: &'static str,
+    args: &[Value],
+    heap: &otter_gc::GcHeap,
+) -> Result<Vec<NumberValue>, MathError> {
     let mut out = Vec::with_capacity(args.len());
     for (idx, v) in args.iter().enumerate() {
         let n = match v {
@@ -338,7 +348,9 @@ fn coerce_all(name: &'static str, args: &[Value]) -> Result<Vec<NumberValue>, Ma
             Value::Undefined => NumberValue::Double(f64::NAN),
             // §7.1.4 ToNumber on String → parse numeric literal,
             // NaN on failure.
-            Value::String(s) => crate::number::parse::to_number_from_string(&s.to_lossy_string()),
+            Value::String(s) => {
+                crate::number::parse::to_number_from_string(&s.to_lossy_string(heap))
+            }
             // §7.1.4 ToNumber on BigInt / Symbol throws.
             Value::BigInt(_) => {
                 return Err(MathError::BadArgument {
@@ -655,13 +667,15 @@ mod tests {
     #[test]
     fn min_and_max_handle_nan() {
         use otter_bytecode::method_id::MathMethod;
-        let r = call(MathMethod::Min, &[n(1), n(2), n(3)]).unwrap();
+        let heap = otter_gc::GcHeap::new().expect("heap");
+        let r = call(MathMethod::Min, &[n(1), n(2), n(3)], &heap).unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(1));
-        let r = call(MathMethod::Max, &[n(1), n(2), n(3)]).unwrap();
+        let r = call(MathMethod::Max, &[n(1), n(2), n(3)], &heap).unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(3));
         let nan_r = call(
             MathMethod::Max,
             &[n(1), Value::Number(NumberValue::Double(f64::NAN))],
+            &heap,
         )
         .unwrap();
         assert!(nan_r.as_number().unwrap().is_nan());
@@ -670,7 +684,8 @@ mod tests {
     #[test]
     fn pow_routes_to_bitwise_pow() {
         use otter_bytecode::method_id::MathMethod;
-        let r = call(MathMethod::Pow, &[n(2), n(10)]).unwrap();
+        let heap = otter_gc::GcHeap::new().expect("heap");
+        let r = call(MathMethod::Pow, &[n(2), n(10)], &heap).unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(1024));
     }
 }

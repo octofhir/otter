@@ -110,7 +110,7 @@ impl MapKey {
                 MapKey::Number(normalised)
             }
             Value::BigInt(b) => MapKey::BigInt(*b),
-            Value::String(s) => MapKey::String(s.clone()),
+            Value::String(s) => MapKey::String(*s),
             Value::Symbol(s) => MapKey::Symbol(s.clone()),
             Value::Object(_)
             | Value::Array(_)
@@ -144,7 +144,11 @@ impl PartialEq for MapKey {
                 }
             }
             (MapKey::BigInt(a), MapKey::BigInt(b)) => a == b,
-            (MapKey::String(a), MapKey::String(b)) => a.equals(b),
+            // Phase B: handle identity. Spec value-equality for Map
+            // keys is a regression pending interning; insertion sites
+            // that materialise distinct handles for identical text
+            // will store under separate slots.
+            (MapKey::String(a), MapKey::String(b)) => a == b,
             (MapKey::Symbol(a), MapKey::Symbol(b)) => a.ptr_eq(b),
             (MapKey::ObjectValue(a), MapKey::ObjectValue(b)) => a == b,
             _ => false,
@@ -170,7 +174,7 @@ impl std::hash::Hash for MapKey {
                 }
             }
             MapKey::BigInt(b) => b.handle().offset().hash(state),
-            MapKey::String(s) => s.to_lossy_string().hash(state),
+            MapKey::String(s) => s.handle().offset().hash(state),
             MapKey::Symbol(s) => s.identity_addr().hash(state),
             MapKey::ObjectValue(_) => {
                 // Identity-based fallback: hash by discriminant alone
@@ -1566,7 +1570,7 @@ mod tests {
     fn map_string_keys() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let m = alloc_map(&mut gc_heap).unwrap();
-        let key = Value::String(JsString::from_str("k", &gc_heap).unwrap());
+        let key = Value::String(JsString::from_str("k", &mut gc_heap).unwrap());
         map_set(m, &mut gc_heap, key.clone(), n(1)).unwrap();
         assert_eq!(map_get(m, &gc_heap, &key), Some(n(1)),);
     }

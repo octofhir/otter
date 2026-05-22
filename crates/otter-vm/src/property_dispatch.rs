@@ -169,10 +169,10 @@ impl Interpreter {
         name: &str,
     ) -> Result<Value, VmError> {
         match string_index_property_name(name) {
-            Some(index) => match string.char_code_at(index) {
+            Some(index) => match string.char_code_at(index, &self.gc_heap) {
                 Some(unit) => Ok(Value::String(JsString::from_utf16_units(
                     &[unit],
-                    &self.gc_heap,
+                    &mut self.gc_heap,
                 )?)),
                 None => Ok(Value::Undefined),
             },
@@ -200,7 +200,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_instanceof_legacy_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         lhs: u16,
@@ -228,7 +228,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_has_property_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         context: &crate::execution_context::ExecutionContext,
         dst: u16,
@@ -238,7 +238,7 @@ impl Interpreter {
         let lhs = read_register(frame, lhs)?.clone();
         let rhs = read_register(frame, rhs)?.clone();
         let key_name = match &lhs {
-            Value::String(s) => Some(s.to_lossy_string()),
+            Value::String(s) => Some(s.to_lossy_string(&self.gc_heap)),
             Value::Number(n) => Some(n.to_display_string()),
             Value::Boolean(b) => Some(if *b { "true" } else { "false" }.to_string()),
             Value::Null => Some("null".to_string()),
@@ -296,7 +296,7 @@ impl Interpreter {
             Value::NativeFunction(native) => {
                 if let Some(name) = key_name.as_deref() {
                     native
-                        .own_property_descriptor(&self.gc_heap, name)
+                        .own_property_descriptor(&mut self.gc_heap, name)
                         .ok()
                         .flatten()
                         .is_some()
@@ -311,7 +311,7 @@ impl Interpreter {
             }
             Value::BoundFunction(bound) => {
                 if let Some(name) = key_name.as_deref() {
-                    function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)
+                    function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)
                         .ok()
                         .flatten()
                         .is_some()
@@ -415,7 +415,8 @@ impl Interpreter {
                 crate::object::delete_symbol(*obj, &mut self.gc_heap, &sym)
             }
             (Value::Object(obj), Value::String(s)) => {
-                crate::object::delete(*obj, &mut self.gc_heap, &s.to_lossy_string())
+                let name = s.to_lossy_string(&self.gc_heap);
+                crate::object::delete(*obj, &mut self.gc_heap, &name)
             }
             (Value::Object(obj), Value::Number(n)) => match n.as_smi() {
                 Some(v) if v >= 0 => crate::object::delete(*obj, &mut self.gc_heap, &v.to_string()),
@@ -436,7 +437,8 @@ impl Interpreter {
                 ),
             },
             (Value::Array(arr), Value::String(s)) => {
-                crate::array::delete_named_property(*arr, &mut self.gc_heap, &s.to_lossy_string())
+                let name = s.to_lossy_string(&self.gc_heap);
+                crate::array::delete_named_property(*arr, &mut self.gc_heap, &name)
             }
             (Value::Array(arr), Value::Symbol(sym)) => {
                 crate::array::delete_symbol_property(*arr, &mut self.gc_heap, &sym)
@@ -459,19 +461,20 @@ impl Interpreter {
                     ..
                 }),
                 Value::String(s),
-            ) => self.ordinary_function_delete_own_property(*function_id, &s.to_lossy_string()),
+            ) => {
+                let name = s.to_lossy_string(&self.gc_heap);
+                self.ordinary_function_delete_own_property(*function_id, &name)
+            }
             (Value::NativeFunction(native), Value::Symbol(sym)) => {
                 native.delete_own_symbol_property(&mut self.gc_heap, &sym)
             }
             (Value::NativeFunction(native), Value::String(s)) => {
-                native.delete_own_property(&mut self.gc_heap, &s.to_lossy_string())
+                let name = s.to_lossy_string(&self.gc_heap);
+                native.delete_own_property(&mut self.gc_heap, &name)
             }
             (Value::BoundFunction(bound), Value::String(s)) => {
-                function_metadata::bound_delete_own_property(
-                    bound,
-                    &mut self.gc_heap,
-                    &s.to_lossy_string(),
-                )
+                let name = s.to_lossy_string(&self.gc_heap);
+                function_metadata::bound_delete_own_property(bound, &mut self.gc_heap, &name)
             }
             // §10.4.5.5 IntegerIndexedExoticObject [[Delete]]:
             // canonical-numeric-index strings reject deletion only
@@ -482,7 +485,7 @@ impl Interpreter {
             // TypedArray exotic has no expando own properties.
             // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-delete-p>
             (Value::TypedArray(t), Value::String(s)) => {
-                let name = s.to_lossy_string();
+                let name = s.to_lossy_string(&self.gc_heap);
                 match canonical_numeric_index_string(&name) {
                     Some(n) => {
                         if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
@@ -527,7 +530,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_get_prototype_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         src: u16,
@@ -665,14 +668,15 @@ impl Interpreter {
                                     | Value::Closure(_)
                                     | Value::NativeFunction(_)
                                     | Value::BoundFunction(_) => {
-                                        let ctx = function_metadata::FunctionMetadataContext::new(
-                                            context,
-                                            &self.gc_heap,
-                                            &self.function_user_props,
-                                            &self.function_deleted_metadata,
-                                        );
+                                        let mut ctx =
+                                            function_metadata::FunctionMetadataContext::new(
+                                                context,
+                                                &mut self.gc_heap,
+                                                &self.function_user_props,
+                                                &self.function_deleted_metadata,
+                                            );
                                         function_metadata::callable_intrinsic_property(
-                                            &ctx, &ctor, name,
+                                            &mut ctx, &ctor, name,
                                         )?
                                     }
                                     _ => Value::Undefined,
@@ -719,7 +723,7 @@ impl Interpreter {
                 self.function_property_get_stack_rooted(context, stack, fid, name)?
             }
             Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, name)? {
+                match native.own_property_descriptor(&mut self.gc_heap, name)? {
                     Some(desc) => match &desc.kind {
                         object::DescriptorKind::Data { value } => value.clone(),
                         // §10.1.8.1 OrdinaryGet step 7 — accessor
@@ -742,8 +746,11 @@ impl Interpreter {
                 }
             }
             Value::BoundFunction(bound) => {
-                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)?
-                {
+                match function_metadata::bound_own_property_descriptor(
+                    bound,
+                    &mut self.gc_heap,
+                    name,
+                )? {
                     Some(desc) => match &desc.kind {
                         object::DescriptorKind::Data { value } => value.clone(),
                         object::DescriptorKind::Accessor { getter, .. } => match getter {
@@ -778,7 +785,7 @@ impl Interpreter {
                 {
                     value
                 } else {
-                    let direct = regexp_prototype::load_property(&r, &self.gc_heap, name);
+                    let direct = regexp_prototype::load_property(&r, &mut self.gc_heap, name);
                     match direct {
                         Value::Undefined => {
                             self.load_from_constructor_prototype(context, "RegExp", v, name)?
@@ -1095,7 +1102,7 @@ impl Interpreter {
                 }
             }
             Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, name)? {
+                match native.own_property_descriptor(&mut self.gc_heap, name)? {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -1125,8 +1132,11 @@ impl Interpreter {
                 }
             }
             Value::BoundFunction(bound) => {
-                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)?
-                {
+                match function_metadata::bound_own_property_descriptor(
+                    bound,
+                    &mut self.gc_heap,
+                    name,
+                )? {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -1238,7 +1248,7 @@ impl Interpreter {
                 crate::object::get_symbol(*obj, &self.gc_heap, sym).unwrap_or(Value::Undefined)
             }
             (Value::Object(obj), Value::String(key)) => {
-                crate::object::get(*obj, &self.gc_heap, &key.to_lossy_string())
+                crate::object::get(*obj, &self.gc_heap, &key.to_lossy_string(&self.gc_heap))
                     .unwrap_or(Value::Undefined)
             }
             (Value::Object(obj), Value::Number(n)) => {
@@ -1256,23 +1266,25 @@ impl Interpreter {
                 match self.ordinary_function_own_property_descriptor(
                     Some(context),
                     *function_id,
-                    &key.to_lossy_string(),
+                    &key.to_lossy_string(&self.gc_heap),
                 )? {
                     Some(desc) => descriptor_value(&desc),
                     None => Value::Undefined,
                 }
             }
             (Value::NativeFunction(native), Value::String(key)) => {
-                match native.own_property_descriptor(&self.gc_heap, &key.to_lossy_string())? {
+                let key = key.to_lossy_string(&self.gc_heap);
+                match native.own_property_descriptor(&mut self.gc_heap, &key)? {
                     Some(desc) => descriptor_value(&desc),
                     None => Value::Undefined,
                 }
             }
             (Value::BoundFunction(bound), Value::String(key)) => {
+                let key = key.to_lossy_string(&self.gc_heap);
                 match function_metadata::bound_own_property_descriptor(
                     bound,
-                    &self.gc_heap,
-                    &key.to_lossy_string(),
+                    &mut self.gc_heap,
+                    &key,
                 )? {
                     Some(desc) => descriptor_value(&desc),
                     None => Value::Undefined,
@@ -1325,7 +1337,7 @@ impl Interpreter {
             // `TypeMismatch` for `for-in` body access.
             // <https://tc39.es/ecma262/#sec-array-exotic-objects-get-p-receiver>
             (Value::Array(arr), Value::String(key)) => {
-                let name = key.to_lossy_string();
+                let name = key.to_lossy_string(&self.gc_heap);
                 if name == "length" {
                     Value::Number(NumberValue::from_f64(
                         crate::array::len(*arr, &self.gc_heap) as f64,
@@ -1357,7 +1369,7 @@ impl Interpreter {
             // ordinary prototype chain.
             // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-get-p-receiver>
             (Value::TypedArray(t), Value::String(key)) => {
-                let name = key.to_lossy_string();
+                let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(n) = canonical_numeric_index_string(&name) {
                     if n.is_finite()
                         && n.fract() == 0.0
@@ -1404,7 +1416,7 @@ impl Interpreter {
             // before falling back to String.prototype.
             // <https://tc39.es/ecma262/#sec-string-exotic-objects-getownproperty-p>
             (Value::String(s), Value::String(key)) => {
-                let name = key.to_lossy_string();
+                let name = key.to_lossy_string(&self.gc_heap);
                 self.load_string_primitive_property(context, &recv, s, &name)?
             }
             (Value::String(s), Value::Number(key)) => {
@@ -1419,13 +1431,13 @@ impl Interpreter {
             // exposes `source`, `flags`, `global`, `lastIndex`, etc.
             // as proper own/prototype properties).
             (Value::RegExp(r), Value::String(key)) => {
-                let name = key.to_lossy_string();
+                let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(bag) = r.expando(&self.gc_heap)
                     && let Some(value) = crate::object::get(bag, &self.gc_heap, &name)
                 {
                     value
                 } else {
-                    let direct = regexp_prototype::load_property(r, &self.gc_heap, &name);
+                    let direct = regexp_prototype::load_property(r, &mut self.gc_heap, &name);
                     match direct {
                         Value::Undefined => {
                             self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
@@ -1513,7 +1525,9 @@ impl Interpreter {
                 };
                 let key = match &idx_value {
                     Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
-                    Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+                    Value::String(s) => {
+                        VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+                    }
                     Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
                     _ => unreachable!(),
                 };
@@ -1570,10 +1584,10 @@ impl Interpreter {
                         .unwrap_or(Value::Undefined),
                     },
                     Value::String(s) => match idx {
-                        Some(idx) => match s.char_code_at(idx as u32) {
+                        Some(idx) => match s.char_code_at(idx as u32, &self.gc_heap) {
                             Some(unit) => Value::String(crate::JsString::from_utf16_units(
                                 &[unit],
-                                &self.gc_heap,
+                                &mut self.gc_heap,
                             )?),
                             None => Value::String(crate::JsString::empty(self.gc_heap_mut())?),
                         },
@@ -1616,7 +1630,7 @@ impl Interpreter {
             }
             // Computed string-key write (`obj["k"] = ...`).
             (Value::Object(obj), Value::String(key)) => {
-                let key = key.to_lossy_string();
+                let key = key.to_lossy_string(&self.gc_heap);
                 self.store_computed_ordinary_property(*obj, &key, value, strict)?;
             }
             // Computed numeric property write on ordinary objects,
@@ -1633,7 +1647,7 @@ impl Interpreter {
                 }),
                 Value::String(key),
             ) => {
-                let key = key.to_lossy_string();
+                let key = key.to_lossy_string(&self.gc_heap);
                 let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
                     context,
                     *function_id,
@@ -1676,8 +1690,8 @@ impl Interpreter {
             // Computed write to built-in function metadata follows
             // the same descriptor path as `f.name = ...`.
             (Value::NativeFunction(native), Value::String(key)) => {
-                let key = key.to_lossy_string();
-                match native.own_property_descriptor(&self.gc_heap, &key)? {
+                let key = key.to_lossy_string(&self.gc_heap);
+                match native.own_property_descriptor(&mut self.gc_heap, &key)? {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -1707,9 +1721,12 @@ impl Interpreter {
                 }
             }
             (Value::BoundFunction(bound), Value::String(key)) => {
-                let key = key.to_lossy_string();
-                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, &key)?
-                {
+                let key = key.to_lossy_string(&self.gc_heap);
+                match function_metadata::bound_own_property_descriptor(
+                    bound,
+                    &mut self.gc_heap,
+                    &key,
+                )? {
                     Some(desc) if !desc.writable() => {
                         Self::failed_set_result(
                             strict,
@@ -1752,7 +1769,7 @@ impl Interpreter {
             // else stores on the named-properties side table so
             // `arr["i"] = 10` round-trips.
             (Value::Array(arr), Value::String(key)) => {
-                let name = key.to_lossy_string();
+                let name = key.to_lossy_string(&self.gc_heap);
                 if self.store_array_accessor_property(context, *arr, &name, &value, strict)? {
                     // Accessor setter handled the assignment.
                 } else if let Some(idx) = crate::object::array_index_property_name(&name) {
@@ -1848,7 +1865,7 @@ impl Interpreter {
             // storage (or no-op on out-of-range); non-canonical
             // string / symbol keys store into the lazy expando bag.
             (Value::TypedArray(t), Value::String(key)) => {
-                let name = key.to_lossy_string();
+                let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(n) = canonical_numeric_index_string(&name) {
                     if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                         || !n.is_finite()
@@ -2278,7 +2295,8 @@ impl Interpreter {
             return Ok(true);
         }
         if let Value::BoundFunction(bound) = &receiver {
-            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)? {
+            match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)?
+            {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
@@ -2359,7 +2377,7 @@ impl Interpreter {
                     object::PropertyLookup::Absent
                 ),
                 Value::NativeFunction(native) => native
-                    .own_property_descriptor(&self.gc_heap, name)?
+                    .own_property_descriptor(&mut self.gc_heap, name)?
                     .is_some(),
                 _ => false,
             };
@@ -2463,7 +2481,7 @@ impl Interpreter {
         let key_value_raw = read_register(&stack[top_idx], key_reg)?.clone();
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
         let key = match &key_value {
-            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap)),
             Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
             _ => return Ok(false),
@@ -2512,7 +2530,7 @@ impl Interpreter {
         }
 
         if let (Value::BoundFunction(bound), Some(key)) = (&receiver, key.string_name()) {
-            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, key)? {
+            match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, key)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
@@ -2866,7 +2884,7 @@ impl Interpreter {
             Symbol(crate::symbol::JsSymbol),
         }
         let key = match &key_value {
-            Value::String(s) => ComputedPropertyKey::String(s.to_lossy_string()),
+            Value::String(s) => ComputedPropertyKey::String(s.to_lossy_string(&self.gc_heap)),
             Value::Number(n) => ComputedPropertyKey::String(n.to_display_string()),
             Value::Symbol(sym) => ComputedPropertyKey::Symbol(sym.clone()),
             _ => return Ok(false),
@@ -2875,7 +2893,7 @@ impl Interpreter {
             let proxy = *p;
             let key_arg = match &key {
                 ComputedPropertyKey::String(key) => {
-                    Value::String(JsString::from_str(key, &self.gc_heap)?)
+                    Value::String(JsString::from_str(key, &mut self.gc_heap)?)
                 }
                 ComputedPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
             };
@@ -2963,7 +2981,7 @@ impl Interpreter {
             return Ok(true);
         }
         if let (Value::BoundFunction(bound), ComputedPropertyKey::String(key)) = (&receiver, &key) {
-            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, key)? {
+            match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, key)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { setter, .. },
                     ..
@@ -3412,7 +3430,8 @@ impl Interpreter {
             return Ok(true);
         }
         if let Value::BoundFunction(bound) = &receiver {
-            match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, name)? {
+            match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)?
+            {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { setter, .. },
                     ..
@@ -3649,7 +3668,7 @@ impl Interpreter {
         }
         let key = match &lhs {
             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
-            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap)),
             other => VmPropertyKey::OwnedString(other.display_string(&self.gc_heap)),
         };
         let pc = stack[top_idx].pc;
@@ -3707,7 +3726,7 @@ impl Interpreter {
             return Ok(false);
         }
         let idx = read_register(&stack[top_idx], idx_reg)?.clone();
-        let key = Self::coerce_vm_property_key(Some(&idx))?;
+        let key = Self::coerce_vm_property_key(Some(&idx), &self.gc_heap)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
@@ -3799,7 +3818,7 @@ fn has_object_property(interpreter: &Interpreter, obj: JsObject, key: &Value) ->
     match key {
         Value::Symbol(s) => crate::object::get_symbol(obj, &interpreter.gc_heap, s).is_some(),
         Value::String(s) => {
-            let key = s.to_lossy_string();
+            let key = s.to_lossy_string(&interpreter.gc_heap);
             !matches!(
                 crate::object::lookup(obj, &interpreter.gc_heap, &key),
                 object::PropertyLookup::Absent
@@ -3834,7 +3853,7 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
             }
         },
         Value::String(s) => {
-            let key = s.to_lossy_string();
+            let key = s.to_lossy_string(&interpreter.gc_heap);
             if key == "length" {
                 return true;
             }
@@ -3866,12 +3885,12 @@ fn has_class_static_property(
     key: &Value,
 ) -> bool {
     match key {
-        Value::String(s) if s.to_lossy_string() == "prototype" => true,
+        Value::String(s) if s.to_lossy_string(&interpreter.gc_heap) == "prototype" => true,
         Value::String(s) => !matches!(
             crate::object::lookup(
                 class.statics(&interpreter.gc_heap),
                 &interpreter.gc_heap,
-                &s.to_lossy_string()
+                &s.to_lossy_string(&interpreter.gc_heap)
             ),
             object::PropertyLookup::Absent
         ),

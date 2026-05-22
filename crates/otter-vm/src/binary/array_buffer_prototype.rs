@@ -55,15 +55,16 @@ fn impl_resize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             expected: "resizable non-detached arraybuffer",
         });
     }
-    let new_len = match super::to_index(args.args.first().unwrap_or(&Value::Undefined)) {
-        Some(n) => n as usize,
-        None => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a non-negative integer",
-            });
-        }
-    };
+    let new_len =
+        match super::to_index(args.args.first().unwrap_or(&Value::Undefined), args.gc_heap) {
+            Some(n) => n as usize,
+            None => {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "must be a non-negative integer",
+                });
+            }
+        };
     if !buf.resize(args.gc_heap, new_len) {
         return Err(IntrinsicError::BadArgument {
             index: 0,
@@ -96,7 +97,7 @@ fn transfer_inner(args: &mut IntrinsicArgs<'_>, fixed: bool) -> Result<Value, In
     let cur_len = buf.byte_length(args.gc_heap);
     let new_len = match args.args.first() {
         None | Some(Value::Undefined) => cur_len,
-        Some(v) => match super::to_index(v) {
+        Some(v) => match super::to_index(v, args.gc_heap) {
             Some(n) => n as usize,
             None => {
                 return Err(IntrinsicError::BadArgument {
@@ -165,15 +166,16 @@ fn impl_grow(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             expected: "growable shared arraybuffer",
         });
     }
-    let new_len = match super::to_index(args.args.first().unwrap_or(&Value::Undefined)) {
-        Some(n) => n as usize,
-        None => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a non-negative integer",
-            });
-        }
-    };
+    let new_len =
+        match super::to_index(args.args.first().unwrap_or(&Value::Undefined), args.gc_heap) {
+            Some(n) => n as usize,
+            None => {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "must be a non-negative integer",
+                });
+            }
+        };
     if !buf.grow(args.gc_heap, new_len) {
         return Err(IntrinsicError::BadArgument {
             index: 0,

@@ -688,19 +688,18 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 reason: "Symbol is not a constructor".to_string(),
             });
         }
-        let description =
-            match args.first() {
-                None | Some(Value::Undefined) => None,
-                Some(other) => {
-                    let context =
-                        ctx.execution_context()
-                            .cloned()
-                            .ok_or_else(|| NativeError::TypeError {
-                                name: "Symbol",
-                                reason: "missing execution context".to_string(),
-                            })?;
-                    let coerced = ctx
-                        .cx
+        let description = match args.first() {
+            None | Some(Value::Undefined) => None,
+            Some(other) => {
+                let context =
+                    ctx.execution_context()
+                        .cloned()
+                        .ok_or_else(|| NativeError::TypeError {
+                            name: "Symbol",
+                            reason: "missing execution context".to_string(),
+                        })?;
+                let coerced =
+                    ctx.cx
                         .interp
                         .coerce_to_string(&context, other)
                         .map_err(|e| match e {
@@ -718,15 +717,15 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                             },
                         })?;
 
-                    let _string_heap = ctx.heap_mut();
-                    let rendered = crate::string::JsString::from_str(&coerced, ctx.heap())
-                        .map_err(|_| NativeError::TypeError {
-                            name: "Symbol",
-                            reason: "out of memory".to_string(),
-                        })?;
-                    Some(rendered)
-                }
-            };
+                let _string_heap = ctx.heap_mut();
+                let rendered = crate::string::JsString::from_str(&coerced, ctx.heap_mut())
+                    .map_err(|_| NativeError::TypeError {
+                        name: "Symbol",
+                        reason: "out of memory".to_string(),
+                    })?;
+                Some(rendered)
+            }
+        };
         let sym = crate::symbol::JsSymbol::new(ctx.interp_mut().gc_heap_mut(), description)
             .map_err(|_| NativeError::TypeError {
                 name: "Symbol",
@@ -785,12 +784,13 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         let key = ctx.interp_mut().symbol_registry().key_for(sym);
         match key {
             Some(key) => {
-                let value = crate::string::JsString::from_str(&key, ctx.heap()).map_err(|_| {
-                    NativeError::TypeError {
-                        name: "Symbol.keyFor",
-                        reason: "out of memory".to_string(),
-                    }
-                })?;
+                let value =
+                    crate::string::JsString::from_str(&key, ctx.heap_mut()).map_err(|_| {
+                        NativeError::TypeError {
+                            name: "Symbol.keyFor",
+                            reason: "out of memory".to_string(),
+                        }
+                    })?;
                 Ok(Value::String(value))
             }
             None => Ok(Value::Undefined),
@@ -819,12 +819,12 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             }
         };
 
-        let s = crate::string::JsString::from_str(&sym.descriptive_string(), ctx.heap()).map_err(
-            |_| NativeError::TypeError {
-                name: "Symbol.prototype.toString",
-                reason: "out of memory".to_string(),
-            },
-        )?;
+        let s =
+            crate::string::JsString::from_str(&sym.descriptive_string(ctx.heap()), ctx.heap_mut())
+                .map_err(|_| NativeError::TypeError {
+                    name: "Symbol.prototype.toString",
+                    reason: "out of memory".to_string(),
+                })?;
         Ok(Value::String(s))
     }
 
@@ -902,14 +902,14 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     ) -> Result<Value, NativeError> {
         match ctx.this_value().clone() {
             Value::Symbol(sym) => match sym.description() {
-                Some(s) => Ok(Value::String(s.clone())),
+                Some(s) => Ok(Value::String(*s)),
                 None => Ok(Value::Undefined),
             },
             Value::Object(obj) => {
                 let heap = ctx.interp_mut().gc_heap();
                 match crate::object::symbol_data(obj, heap) {
                     Some(sym) => match sym.description() {
-                        Some(s) => Ok(Value::String(s.clone())),
+                        Some(s) => Ok(Value::String(*s)),
                         None => Ok(Value::Undefined),
                     },
                     None => Err(NativeError::TypeError {
@@ -1678,7 +1678,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let s = match args.first() {
-            Some(Value::String(s)) => s.to_lossy_string(),
+            Some(Value::String(s)) => s.to_lossy_string(ctx.heap()),
             Some(other) => other.display_string(ctx.heap()),
             None => {
                 return Ok(Value::Number(crate::number::NumberValue::from_f64(
@@ -1697,7 +1697,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let s = match args.first() {
-            Some(Value::String(s)) => s.to_lossy_string(),
+            Some(Value::String(s)) => s.to_lossy_string(ctx.heap()),
             Some(other) => other.display_string(ctx.heap()),
             None => {
                 return Ok(Value::Number(crate::number::NumberValue::from_f64(
@@ -1755,7 +1755,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::EncodeURI,
                 args,
-                ctx.heap(),
+                ctx.heap_mut(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "encodeURI",
@@ -1769,7 +1769,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
                 args,
-                ctx.heap(),
+                ctx.heap_mut(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "encodeURIComponent",
@@ -1783,7 +1783,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::DecodeURI,
                 args,
-                ctx.heap(),
+                ctx.heap_mut(),
             )
             .map_err(|err| match err {
                 crate::VmError::TypeError { message } => NativeError::TypeError {
@@ -1803,7 +1803,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
                 args,
-                ctx.heap(),
+                ctx.heap_mut(),
             )
             .map_err(|err| match err {
                 crate::VmError::TypeError { message } => NativeError::TypeError {
@@ -1823,7 +1823,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::Escape,
                 args,
-                ctx.heap(),
+                ctx.heap_mut(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "escape",
@@ -1834,7 +1834,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::global_functions::call(
                 otter_bytecode::method_id::GlobalMethod::Unescape,
                 args,
-                ctx.heap(),
+                ctx.heap_mut(),
             )
             .map_err(|err| NativeError::TypeError {
                 name: "unescape",
@@ -2128,7 +2128,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                         Ok(Value::Object(obj))
                     }
                     Value::String(s) => {
-                        let s = s.clone();
+                        let s = *s;
                         let interp = ctx.interp_mut();
                         let proto =
                             interp
@@ -2285,27 +2285,38 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
     // dispatcher with no `this`. The constructor's
     // `[[Construct]]` / `[[Call]]` slot still handles the
     // `Date(...)` and `new Date(...)` shapes via `date_ctor_call`.
-    fn date_now_call(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call_static(otter_bytecode::method_id::DateMethod::Now, &[]).map_err(
-            |err| NativeError::TypeError {
-                name: "Date.now",
-                reason: err.to_string(),
-            },
+    fn date_now_call(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        crate::date::dispatch::call_static(
+            otter_bytecode::method_id::DateMethod::Now,
+            &[],
+            ctx.heap(),
         )
+        .map_err(|err| NativeError::TypeError {
+            name: "Date.now",
+            reason: err.to_string(),
+        })
     }
-    fn date_parse_call(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call_static(otter_bytecode::method_id::DateMethod::Parse, args)
-            .map_err(|err| NativeError::TypeError {
-                name: "Date.parse",
-                reason: err.to_string(),
-            })
+    fn date_parse_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        crate::date::dispatch::call_static(
+            otter_bytecode::method_id::DateMethod::Parse,
+            args,
+            ctx.heap(),
+        )
+        .map_err(|err| NativeError::TypeError {
+            name: "Date.parse",
+            reason: err.to_string(),
+        })
     }
-    fn date_utc_call(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call_static(otter_bytecode::method_id::DateMethod::UTC, args)
-            .map_err(|err| NativeError::TypeError {
-                name: "Date.UTC",
-                reason: err.to_string(),
-            })
+    fn date_utc_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        crate::date::dispatch::call_static(
+            otter_bytecode::method_id::DateMethod::UTC,
+            args,
+            ctx.heap(),
+        )
+        .map_err(|err| NativeError::TypeError {
+            name: "Date.UTC",
+            reason: err.to_string(),
+        })
     }
 
     fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -2332,7 +2343,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         let text = crate::date::to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
 
         let value =
-            JsString::from_str(&text, ctx.heap()).map_err(|err| NativeError::TypeError {
+            JsString::from_str(&text, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
                 name: "Date",
                 reason: err.to_string(),
             })?;
@@ -2572,7 +2583,7 @@ fn iterator_ctor_call(
         })?;
     let proto = match &new_target {
         Value::NativeFunction(nf) => {
-            let heap = ctx.heap();
+            let heap = ctx.heap_mut();
 
             nf.own_property_descriptor(heap, "prototype")
                 .ok()
@@ -3123,7 +3134,7 @@ fn iterator_arg_count_native(
                 reason: e.to_string(),
             })?
     };
-    let n = crate::number::to_number_value(&primitive);
+    let n = crate::number::to_number_value(&primitive, ctx.heap());
     if n.is_nan() {
         return Err(crate::NativeError::RangeError {
             name,
@@ -3682,7 +3693,7 @@ fn iterator_from_native(
         }
         Value::String(s) => {
             let state = crate::IteratorState::String {
-                string: s.clone(),
+                string: *s,
                 index: 0,
             };
             let handle = ctx

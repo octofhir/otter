@@ -22,7 +22,7 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> D
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     DisplayNamesPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         kind: read_string_option(opts_ref, "type", "language", gc_heap),
         style: read_string_option(opts_ref, "style", "long", gc_heap),
         fallback: read_string_option(opts_ref, "fallback", "code", gc_heap),
@@ -137,7 +137,7 @@ fn lookup_name(kind: &str, code: &str) -> Option<&'static str> {
 fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let code = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         Some(Value::Number(n)) => n.to_display_string(),
         _ => {
             return Err(IntrinsicError::BadArgument {

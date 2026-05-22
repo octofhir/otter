@@ -47,7 +47,7 @@ pub fn resolve(
         day = true;
     }
     DateTimeFormatPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         year,
         month,
         day,
@@ -113,7 +113,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
             "".to_string()
         }
     };
-    let locale_value = js_string_value(&payload.locale, args)?;
+    let payload_locale = payload.locale.clone();
+    let locale_value = js_string_value(&payload_locale, args)?;
     let yr = if payload.year {
         Some(js_string_value(&component(true), args)?)
     } else {
@@ -190,7 +191,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     Ok(Value::Object(obj))
 }
 
-fn js_string_value(s: &str, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(crate::string::JsString::from_str(
         s,
         args.gc_heap,

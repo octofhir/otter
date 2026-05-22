@@ -375,7 +375,7 @@ fn clone_value(
         Value::Boolean(value) => Ok(StructuredCloneValue::Boolean(*value)),
         Value::Number(value) => Ok(StructuredCloneValue::Number((*value).into())),
         Value::BigInt(value) => Ok(StructuredCloneValue::BigInt(value.to_decimal_string(heap))),
-        Value::String(value) => Ok(StructuredCloneValue::String(value.to_lossy_string())),
+        Value::String(value) => Ok(StructuredCloneValue::String(value.to_lossy_string(heap))),
         Value::Array(array) => clone_array(*array, heap, options, depth, path, active),
         Value::Object(object) => clone_object(*object, heap, options, depth, path, active),
         Value::Map(map) => clone_map(*map, heap, options, depth, path, active),
@@ -448,18 +448,18 @@ fn clone_error_object(
     heap: &GcHeap,
 ) -> Option<StructuredCloneValue> {
     let name = match object::get(object, heap, "name") {
-        Some(Value::String(value)) => value.to_lossy_string(),
+        Some(Value::String(value)) => value.to_lossy_string(heap),
         Some(value) => value.display_string(heap),
         None => return None,
     };
     ErrorKind::from_class_name(&name)?;
     let message = match object::get(object, heap, "message") {
-        Some(Value::String(value)) => value.to_lossy_string(),
+        Some(Value::String(value)) => value.to_lossy_string(heap),
         Some(Value::Undefined) | None => String::new(),
         Some(value) => value.display_string(heap),
     };
     let stack = match object::get(object, heap, "stack") {
-        Some(Value::String(value)) => Some(value.to_lossy_string()),
+        Some(Value::String(value)) => Some(value.to_lossy_string(heap)),
         Some(Value::Undefined) | None => None,
         Some(value) => Some(value.display_string(heap)),
     };

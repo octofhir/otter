@@ -31,7 +31,10 @@ use crate::{
     ordinary_method_for, read_register, symbol, write_register,
 };
 
-pub(crate) fn to_number_primitive(value: &Value) -> Result<NumberValue, VmError> {
+pub(crate) fn to_number_primitive(
+    value: &Value,
+    gc_heap: &otter_gc::GcHeap,
+) -> Result<NumberValue, VmError> {
     let number = match value {
         Value::Number(n) => *n,
         Value::Boolean(true) => NumberValue::Smi(1),
@@ -62,7 +65,7 @@ pub(crate) fn to_number_primitive(value: &Value) -> Result<NumberValue, VmError>
         | Value::TypedArray(_)
         | Value::Generator(_)
         | Value::Proxy(_) => NumberValue::Double(f64::NAN),
-        Value::String(s) => number::to_number_from_string(&s.to_lossy_string()),
+        Value::String(s) => number::to_number_from_string(&s.to_lossy_string(gc_heap)),
     };
     Ok(number)
 }
@@ -72,7 +75,7 @@ pub(crate) fn to_string_primitive(
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<String, VmError> {
     match value {
-        Value::String(s) => Ok(s.to_lossy_string()),
+        Value::String(s) => Ok(s.to_lossy_string(gc_heap)),
         Value::Number(n) => Ok(n.to_display_string()),
         Value::BigInt(b) => Ok(b.to_decimal_string(gc_heap)),
         Value::Boolean(true) => Ok("true".to_string()),
@@ -86,10 +89,10 @@ pub(crate) fn to_string_primitive(
 
 pub(crate) fn to_js_string_primitive(
     value: &Value,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
     match value {
-        Value::String(s) => Ok(s.clone()),
+        Value::String(s) => Ok(*s),
         Value::Number(n) => {
             number::ecma::number_to_string(n.as_f64(), gc_heap).map_err(|_| VmError::TypeMismatch)
         }
@@ -102,12 +105,11 @@ pub(crate) fn to_js_string_primitive(
 
 pub(crate) fn string_constructor_js_string(
     value: Option<&Value>,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
     match value {
-        Some(Value::Symbol(s)) => {
-            JsString::from_str(&s.descriptive_string(), gc_heap).map_err(|_| VmError::TypeMismatch)
-        }
+        Some(Value::Symbol(s)) => JsString::from_str(&s.descriptive_string(gc_heap), gc_heap)
+            .map_err(|_| VmError::TypeMismatch),
         Some(value) => match to_js_string_primitive(value, gc_heap) {
             Ok(value) => Ok(value),
             Err(VmError::TypeMismatch) => {
@@ -128,7 +130,7 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let value = to_number_primitive(read_register(frame, src)?)?;
+        let value = to_number_primitive(read_register(frame, src)?, &self.gc_heap)?;
         write_register(frame, dst, Value::Number(value))?;
         frame.pc += 1;
         Ok(())
@@ -342,7 +344,7 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-toprimitive>
     /// - <https://tc39.es/ecma262/#sec-ordinaryget>
-    pub(crate) fn intrinsic_prototype_object_for(&self, value: &Value) -> Option<JsObject> {
+    pub(crate) fn intrinsic_prototype_object_for(&mut self, value: &Value) -> Option<JsObject> {
         let constructor_name = match value {
             Value::Function { .. }
             | Value::Closure(_)
@@ -557,7 +559,7 @@ impl Interpreter {
                             stage = ToPrimitiveStage::OrdinaryFirst;
                         }
                         Some(callee) if self.is_callable_runtime(&callee) => {
-                            let hint_str = JsString::from_str(hint.as_token(), &self.gc_heap)?;
+                            let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                             args.push(Value::String(hint_str));
                             // §7.1.1 step 5.d. The resume guard
@@ -624,12 +626,13 @@ impl Interpreter {
                         && let Value::Object(o) = &obj
                     {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
+                        let fn_proto = self.function_prototype_object().ok();
                         if let Some(v) = object_prototype_intercept(
                             o,
                             method,
                             &no_args,
-                            &self.gc_heap,
-                            self.function_prototype_object().ok(),
+                            &mut self.gc_heap,
+                            fn_proto,
                         )? && abstract_ops::is_primitive(&v)
                         {
                             let top_idx = stack.len() - 1;
@@ -678,12 +681,13 @@ impl Interpreter {
                         && let Value::Object(o) = &obj
                     {
                         let no_args: SmallVec<[Value; 8]> = SmallVec::new();
+                        let fn_proto = self.function_prototype_object().ok();
                         if let Some(v) = object_prototype_intercept(
                             o,
                             method,
                             &no_args,
-                            &self.gc_heap,
-                            self.function_prototype_object().ok(),
+                            &mut self.gc_heap,
+                            fn_proto,
                         )? && abstract_ops::is_primitive(&v)
                         {
                             let top_idx = stack.len() - 1;

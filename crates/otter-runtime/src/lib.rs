@@ -1486,12 +1486,10 @@ impl Runtime {
             .interp
             .alloc_host_object_with_roots(&[&proto_root], &[])?;
         otter_vm::object::set_prototype(obj, self.interp.gc_heap_mut(), Some(proto));
-        let message_str =
-            otter_vm::JsString::from_str(&message, self.interp.gc_heap()).map_err(|err| {
-                OtterError::Internal {
-                    code: DiagnosticCode::StringAlloc.as_str().to_string(),
-                    message: err.to_string(),
-                }
+        let message_str = otter_vm::JsString::from_str(&message, self.interp.gc_heap_mut())
+            .map_err(|err| OtterError::Internal {
+                code: DiagnosticCode::StringAlloc.as_str().to_string(),
+                message: err.to_string(),
             })?;
         otter_vm::object::set(
             obj,
@@ -1875,9 +1873,11 @@ impl Runtime {
     }
 
     fn alloc_string(&mut self, s: &str) -> Result<otter_vm::JsString, OtterError> {
-        otter_vm::JsString::from_str(s, self.interp.gc_heap()).map_err(|err| OtterError::Internal {
-            code: DiagnosticCode::StringAlloc.as_str().to_string(),
-            message: err.to_string(),
+        otter_vm::JsString::from_str(s, self.interp.gc_heap_mut()).map_err(|err| {
+            OtterError::Internal {
+                code: DiagnosticCode::StringAlloc.as_str().to_string(),
+                message: err.to_string(),
+            }
         })
     }
 
@@ -2107,7 +2107,7 @@ impl Runtime {
             (Ok(v), Ok(())) => v,
         };
         Ok(
-            ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap())
+            ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp)),
         )
     }
@@ -2284,7 +2284,7 @@ impl Runtime {
         };
         self.module_records.mark_evaluated();
         Ok(
-            ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap())
+            ExecutionResult::from_vm_value(value, start.elapsed(), self.interp.gc_heap_mut())
                 .with_exit_code(process::exit_code(&self.interp)),
         )
     }
@@ -2962,7 +2962,7 @@ fn alloc_dynamic_import_meta(
         .map_err(|e| {
             DynLoadError::Diagnostic(format!("dynamic import: alloc import_meta failed: {e}"))
         })?;
-    let url_string = otter_vm::JsString::from_str(url, interp.gc_heap()).map_err(|err| {
+    let url_string = otter_vm::JsString::from_str(url, interp.gc_heap_mut()).map_err(|err| {
         DynLoadError::Diagnostic(format!(
             "dynamic import: alloc import_meta.url failed: {err}"
         ))

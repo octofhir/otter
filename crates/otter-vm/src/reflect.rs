@@ -404,7 +404,9 @@ fn coerce_property_key(
     arg: Option<&Value>,
 ) -> Result<VmPropertyKey<'static>, VmError> {
     match arg {
-        Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(
+            s.to_lossy_string(interp.gc_heap()),
+        )),
         Some(Value::Number(n)) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
         Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
         Some(Value::Null) => Ok(VmPropertyKey::String("null")),
@@ -754,7 +756,7 @@ mod tests {
         );
         let context = empty_context();
         let key =
-            Value::String(crate::JsString::from_str("answer", interp.gc_heap()).expect("key"));
+            Value::String(crate::JsString::from_str("answer", interp.gc_heap_mut()).expect("key"));
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = call(

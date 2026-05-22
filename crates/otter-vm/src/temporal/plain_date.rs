@@ -69,12 +69,15 @@ fn parse_arg(
                 reason: "must be a Temporal.PlainDate",
             }),
         },
-        Some(Value::String(s)) => temporal_rs::PlainDate::from_utf8(s.to_lossy_string().as_bytes())
-            .map_err(|e| TemporalError::Engine {
-                class: "PlainDate",
-                method,
-                message: e.to_string(),
-            }),
+        Some(Value::String(s)) => {
+            temporal_rs::PlainDate::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
+                TemporalError::Engine {
+                    class: "PlainDate",
+                    method,
+                    message: e.to_string(),
+                }
+            })
+        }
         _ => Err(TemporalError::BadArgument {
             class: "PlainDate",
             method,
@@ -139,8 +142,10 @@ fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
         },
-        Some(Value::String(s)) => temporal_rs::PlainDate::from_utf8(s.to_lossy_string().as_bytes())
-            .map_err(temporal_err)?,
+        Some(Value::String(s)) => {
+            temporal_rs::PlainDate::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
+                .map_err(temporal_err)?
+        }
         _ => {
             return Err(IntrinsicError::BadArgument {
                 index: 0,

@@ -399,7 +399,10 @@ fn consume_keyword(cursor: &mut Cursor<'_>, keyword: &[u8]) -> Result<(), ParseE
     Ok(())
 }
 
-fn read_object_key(cursor: &mut Cursor<'_>, heap: &otter_gc::GcHeap) -> Result<String, ParseError> {
+fn read_object_key(
+    cursor: &mut Cursor<'_>,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<String, ParseError> {
     if cursor.peek() != Some(b'"') {
         return Err(ParseError::at(
             cursor.pos,
@@ -407,7 +410,7 @@ fn read_object_key(cursor: &mut Cursor<'_>, heap: &otter_gc::GcHeap) -> Result<S
         ));
     }
     let s = read_string(cursor, heap)?;
-    Ok(s.to_lossy_string())
+    Ok(s.to_lossy_string(heap))
 }
 
 /// Strict number parser. Accepts the JSON subset of JS numeric
@@ -491,7 +494,10 @@ fn read_number(cursor: &mut Cursor<'_>) -> Result<NumberValue, ParseError> {
 /// pairs fall back to a WTF-16 builder.
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-json.parse> §25.5.1
-fn read_string(cursor: &mut Cursor<'_>, heap: &otter_gc::GcHeap) -> Result<JsString, ParseError> {
+fn read_string(
+    cursor: &mut Cursor<'_>,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<JsString, ParseError> {
     debug_assert_eq!(cursor.peek(), Some(b'"'));
     cursor.pos += 1;
     let start = cursor.pos;
@@ -522,7 +528,7 @@ fn read_string(cursor: &mut Cursor<'_>, heap: &otter_gc::GcHeap) -> Result<JsStr
 fn read_string_with_escapes(
     cursor: &mut Cursor<'_>,
     plain_start: usize,
-    heap: &otter_gc::GcHeap,
+    heap: &mut otter_gc::GcHeap,
 ) -> Result<JsString, ParseError> {
     // Lift the plain prefix into a UTF-16 buffer. Bytes between
     // `plain_start` and `cursor.pos` are guaranteed ASCII (we'd
@@ -694,7 +700,7 @@ mod tests {
         // Surrogate pair → U+10000 '𐀀'.
         let v = parse_str_with_heap("\"\\uD800\\uDC00\"", &mut gc_heap).unwrap();
         match v {
-            Value::String(s) => assert_eq!(s.to_utf16_vec(), vec![0xD800, 0xDC00]),
+            Value::String(s) => assert_eq!(s.to_utf16_vec(&gc_heap), vec![0xD800, 0xDC00]),
             _ => panic!(),
         }
     }

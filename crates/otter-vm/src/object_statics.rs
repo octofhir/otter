@@ -44,10 +44,10 @@ enum PropertyKey {
 }
 
 impl PropertyKey {
-    fn label(&self) -> String {
+    fn label(&self, heap: &otter_gc::GcHeap) -> String {
         match self {
             Self::String(key) => key.clone(),
-            Self::Symbol(sym) => sym.descriptive_string(),
+            Self::Symbol(sym) => sym.descriptive_string(heap),
         }
     }
 }
@@ -335,7 +335,9 @@ fn native_keys_rooted(
             for key in trap_keys {
                 let Value::String(_) = &key else { continue };
                 let vm_key = match &key {
-                    Value::String(s) => crate::VmPropertyKey::OwnedString(s.to_lossy_string()),
+                    Value::String(s) => {
+                        crate::VmPropertyKey::OwnedString(s.to_lossy_string(ctx.heap()))
+                    }
                     Value::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
                     _ => return Err(VmError::TypeMismatch),
                 };
@@ -363,7 +365,7 @@ fn native_keys_rooted(
 
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
-                values.push(string_value(&key, ctx.heap())?);
+                values.push(string_value(&key, ctx.heap_mut())?);
             }
             values
         };
@@ -389,7 +391,7 @@ fn native_keys_rooted(
 
     let mut names = Vec::with_capacity(owned.len());
     for key in owned {
-        names.push(string_value(&key, ctx.heap())?);
+        names.push(string_value(&key, ctx.heap_mut())?);
     }
     Ok(Value::Array(ctx.array_from_elements_with_roots(
         names,
@@ -422,7 +424,7 @@ fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     let target_root = Value::Object(target);
     let mut pairs = Vec::with_capacity(raw.len());
     for (key, value) in raw {
-        let key_value = string_value(&key, ctx.heap())?;
+        let key_value = string_value(&key, ctx.heap_mut())?;
         let pair = ctx.array_from_elements_with_roots(
             [key_value, value],
             &[&target_root],
@@ -576,7 +578,7 @@ fn set_from_entries_key_heap(
             Ok(())
         }
         _ => {
-            let key_str = property_key_from_value(key)?;
+            let key_str = property_key_from_value(key, heap)?;
             crate::object::set(target, heap, &key_str, value);
             Ok(())
         }
@@ -588,7 +590,10 @@ fn set_from_entries_key_heap(
 /// context-less `object_statics::call` path. Accepts Array pairs,
 /// ordinary Objects with indexed keys, and String / String-wrapper
 /// entries.
-fn read_entry_pair_heap(entry: &Value, heap: &otter_gc::GcHeap) -> Result<(Value, Value), VmError> {
+fn read_entry_pair_heap(
+    entry: &Value,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<(Value, Value), VmError> {
     match entry {
         Value::Array(pair) => Ok((
             crate::array::get(*pair, heap, 0),
@@ -596,7 +601,7 @@ fn read_entry_pair_heap(entry: &Value, heap: &otter_gc::GcHeap) -> Result<(Value
         )),
         Value::Object(obj) => {
             if let Some(s) = crate::object::string_data(*obj, heap) {
-                let units = s.to_utf16_vec();
+                let units = s.to_utf16_vec(heap);
                 let zero = units.first().copied().map_or(Value::Undefined, |u| {
                     crate::string::JsString::from_utf16_units(&[u], heap)
                         .map(Value::String)
@@ -614,7 +619,7 @@ fn read_entry_pair_heap(entry: &Value, heap: &otter_gc::GcHeap) -> Result<(Value
             Ok((key, value))
         }
         Value::String(s) => {
-            let units = s.to_utf16_vec();
+            let units = s.to_utf16_vec(heap);
             let zero = units.first().copied().map_or(Value::Undefined, |u| {
                 crate::string::JsString::from_utf16_units(&[u], heap)
                     .map(Value::String)
@@ -668,7 +673,7 @@ fn native_get_own_property_descriptor_rooted(
         };
     }
 
-    let key = expect_property_key(args.get(1))?;
+    let key = expect_property_key(args.get(1), ctx.heap())?;
     let desc = match args.first() {
         Some(Value::Object(target)) => match &key {
             PropertyKey::String(key) => crate::object::get_own_descriptor(*target, ctx.heap(), key),
@@ -685,7 +690,7 @@ fn native_get_own_property_descriptor_rooted(
             }
         },
         Some(Value::NativeFunction(native)) => match &key {
-            PropertyKey::String(key) => native.own_property_descriptor(ctx.heap(), key)?,
+            PropertyKey::String(key) => native.own_property_descriptor(ctx.heap_mut(), key)?,
             PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
         },
         // §10.4.5.1 IntegerIndexedExoticObject [[GetOwnProperty]] —
@@ -788,7 +793,7 @@ fn native_get_own_property_descriptors_rooted(
     let keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
     for key in keys {
         let key_for_descriptor = match &key {
-            Value::String(s) => Value::String(s.clone()),
+            Value::String(s) => Value::String(*s),
             Value::Symbol(sym) => Value::Symbol(sym.clone()),
             _ => continue,
         };
@@ -804,7 +809,11 @@ fn native_get_own_property_descriptors_rooted(
             native_descriptor_to_object_rooted(ctx, &desc, &[&target, &result_root], args)?;
         match key {
             Value::String(s) => {
-                ctx.set_property(result, &s.to_lossy_string(), Value::Object(desc_obj))?;
+                ctx.set_property(
+                    result,
+                    &s.to_lossy_string(ctx.heap()),
+                    Value::Object(desc_obj),
+                )?;
             }
             Value::Symbol(sym)
                 if !crate::object::set_symbol(
@@ -857,7 +866,7 @@ fn native_get_own_property_names_rooted(
                 .interp
                 .class_constructor_own_property_keys(context, *class)?;
             keys.into_iter()
-                .map(|key| string_value(&key, ctx.heap()))
+                .map(|key| string_value(&key, ctx.heap_mut()))
                 .collect::<Result<Vec<_>, _>>()?
         }
         Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
@@ -865,7 +874,7 @@ fn native_get_own_property_names_rooted(
             let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
             keys.push("length".to_string());
             keys.into_iter()
-                .map(|key| string_value(&key, ctx.heap()))
+                .map(|key| string_value(&key, ctx.heap_mut()))
                 .collect::<Result<Vec<_>, _>>()?
         }
         _ => return Err(VmError::TypeMismatch),
@@ -1141,7 +1150,7 @@ fn native_prototype_to_string(
     let display = format!("[object {tag}]");
 
     Ok(Value::String(
-        JsString::from_str(&display, ctx.heap()).map_err(|_| NativeError::TypeError {
+        JsString::from_str(&display, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
             name: "toString",
             reason: "out of memory while allocating string".to_string(),
         })?,
@@ -1191,7 +1200,7 @@ fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, va
     match value {
         Value::Boolean(value) => crate::object::set_boolean_data(wrapper, heap, *value),
         Value::Number(value) => crate::object::set_number_data(wrapper, heap, *value),
-        Value::String(value) => crate::object::set_string_data(wrapper, heap, value.clone()),
+        Value::String(value) => crate::object::set_string_data(wrapper, heap, *value),
         Value::Symbol(value) => crate::object::set_symbol_data(wrapper, heap, value.clone()),
         Value::BigInt(value) => crate::object::set_bigint_data(wrapper, heap, *value),
         _ => {}
@@ -1271,10 +1280,14 @@ fn native_prototype_has_own_property(
             reason: "cannot convert null or undefined to object".to_string(),
         });
     }
-    let present = match ctx.this_value() {
+    let this_kind = ctx.this_value().clone();
+    let present = match &this_kind {
         Value::Object(obj) => has_own_property(*obj, ctx.heap(), args.first())
             .map_err(|err| object_native_error("hasOwnProperty", err))?,
-        Value::NativeFunction(native) => native_function_has_own(native, ctx.heap(), args.first()),
+        Value::NativeFunction(native) => {
+            let native = *native;
+            native_function_has_own(&native, ctx.heap_mut(), args.first())
+        }
         Value::BoundFunction(bound) => bound_function_has_own(bound, ctx.heap(), args.first()),
         Value::ClassConstructor(class) => {
             // The own-property surface for a `ClassConstructor` is
@@ -1284,7 +1297,8 @@ fn native_prototype_has_own_property(
             // like `Number.hasOwnProperty("EPSILON")` see the
             // installed statics.
             let key = args.first();
-            if matches!(key, Some(Value::String(s)) if s.to_lossy_string() == "prototype") {
+            if matches!(key, Some(Value::String(s)) if s.to_lossy_string(ctx.heap()) == "prototype")
+            {
                 true
             } else {
                 has_own_property(class.statics(ctx.heap()), ctx.heap(), key)
@@ -1317,9 +1331,10 @@ fn native_prototype_property_is_enumerable(
             desc.as_ref().is_some_and(PropertyDescriptor::enumerable),
         ));
     }
-    let enumerable = match ctx.this_value() {
+    let this_clone = ctx.this_value().clone();
+    let enumerable = match &this_clone {
         Value::Object(obj) => {
-            let key = expect_property_key(args.first())
+            let key = expect_property_key(args.first(), ctx.heap())
                 .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
             match key {
                 PropertyKey::String(key) => {
@@ -1339,18 +1354,19 @@ fn native_prototype_property_is_enumerable(
             }
         }
         Value::NativeFunction(native) => {
-            let key = expect_property_key(args.first())
+            let native = *native;
+            let key_owned = expect_property_key(args.first(), ctx.heap())
                 .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
-            let desc = match key {
+            let desc = match key_owned {
                 PropertyKey::String(key) => native
-                    .own_property_descriptor(ctx.heap(), &key)
+                    .own_property_descriptor(ctx.heap_mut(), &key)
                     .map_err(|err| object_native_error("propertyIsEnumerable", err.into()))?,
                 PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), &sym),
             };
             desc.as_ref().is_some_and(PropertyDescriptor::enumerable)
         }
         Value::BoundFunction(bound) => {
-            let key = expect_property_key(args.first())
+            let key = expect_property_key(args.first(), ctx.heap())
                 .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
             match key {
                 PropertyKey::String(key) => {
@@ -1979,17 +1995,17 @@ fn explicit_to_string_tag_with_context(
         )?,
     };
     match value {
-        Value::String(s) => Ok(Some(s.to_lossy_string())),
+        Value::String(s) => Ok(Some(s.to_lossy_string(ctx.heap()))),
         _ => Ok(None),
     }
 }
 
 fn native_function_has_own(
     native: &crate::NativeFunction,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
     key: Option<&Value>,
 ) -> bool {
-    match expect_property_key(key) {
+    match expect_property_key(key, gc_heap) {
         Ok(PropertyKey::String(key)) => native
             .own_property_descriptor(gc_heap, &key)
             .ok()
@@ -2007,7 +2023,7 @@ fn bound_function_has_own(
     gc_heap: &otter_gc::GcHeap,
     key: Option<&Value>,
 ) -> bool {
-    match expect_property_key(key) {
+    match expect_property_key(key, gc_heap) {
         Ok(PropertyKey::String(key)) => {
             crate::function_metadata::bound_has_own_property(bound, gc_heap, &key)
         }
@@ -2075,7 +2091,7 @@ pub fn call(
         // §20.1.2.4 Object.defineProperty(O, P, Attributes)
         // <https://tc39.es/ecma262/#sec-object.defineproperty>
         M::DefineProperty => {
-            let key = expect_property_key(args.get(1))?;
+            let key = expect_property_key(args.get(1), gc_heap)?;
             let desc_obj = expect_object(args.get(2))?;
             let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
             match args.first() {
@@ -2092,7 +2108,7 @@ pub fn call(
                     };
                     if !ok {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label()),
+                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
                     Ok(Value::Object(*target))
@@ -2116,7 +2132,7 @@ pub fn call(
                     };
                     if !ok {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label()),
+                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
                     Ok(Value::ClassConstructor(*class))
@@ -2136,7 +2152,7 @@ pub fn call(
                         return Err(VmError::TypeError {
                             message: format!(
                                 "Cannot define property '{}' on function {}",
-                                key.label(),
+                                key.label(gc_heap),
                                 native.name(gc_heap)
                             ),
                         });
@@ -2157,7 +2173,7 @@ pub fn call(
                     };
                     if !existing && !r.is_extensible(gc_heap) {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label()),
+                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
                     let bag = crate::property_dispatch::regexp_ensure_expando_pub(gc_heap, &r)?;
@@ -2173,7 +2189,7 @@ pub fn call(
                     };
                     if !ok {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label()),
+                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
                     Ok(Value::RegExp(r))
@@ -2195,7 +2211,7 @@ pub fn call(
                     };
                     if !ok {
                         return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label()),
+                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
                     Ok(Value::Promise(p))
@@ -2226,7 +2242,7 @@ pub fn call(
                                     return Err(VmError::TypeError {
                                         message: format!(
                                             "Cannot define property '{}'",
-                                            key.label()
+                                            key.label(gc_heap)
                                         ),
                                     });
                                 }
@@ -2249,7 +2265,7 @@ pub fn call(
                                     return Err(VmError::TypeError {
                                         message: format!(
                                             "Cannot define property '{}'",
-                                            key.label()
+                                            key.label(gc_heap)
                                         ),
                                     });
                                 }
@@ -2263,7 +2279,10 @@ pub fn call(
                                 bag, gc_heap, sym, descriptor,
                             ) {
                                 return Err(VmError::TypeError {
-                                    message: format!("Cannot define property '{}'", key.label()),
+                                    message: format!(
+                                        "Cannot define property '{}'",
+                                        key.label(gc_heap)
+                                    ),
                                 });
                             }
                         }
@@ -2303,7 +2322,7 @@ pub fn call(
         // §20.1.2.10 Object.getOwnPropertyDescriptor(O, P)
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptor>
         M::GetOwnPropertyDescriptor => {
-            let key = expect_property_key(args.get(1))?;
+            let key = expect_property_key(args.get(1), gc_heap)?;
             match args.first() {
                 Some(Value::Object(target)) => match &key {
                     PropertyKey::String(string_key) => {
@@ -2845,7 +2864,7 @@ pub fn call(
     }
 }
 
-fn string_value(s: &str, heap: &otter_gc::GcHeap) -> Result<Value, VmError> {
+fn string_value(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, VmError> {
     Ok(Value::String(
         JsString::from_str(s, heap).map_err(|_| VmError::TypeMismatch)?,
     ))
@@ -3035,9 +3054,12 @@ fn expect_object(arg: Option<&Value>) -> Result<JsObject, VmError> {
     }
 }
 
-fn expect_property_key(arg: Option<&Value>) -> Result<PropertyKey, VmError> {
+fn expect_property_key(
+    arg: Option<&Value>,
+    heap: &otter_gc::GcHeap,
+) -> Result<PropertyKey, VmError> {
     match arg {
-        Some(Value::String(s)) => Ok(PropertyKey::String(s.to_lossy_string())),
+        Some(Value::String(s)) => Ok(PropertyKey::String(s.to_lossy_string(heap))),
         Some(Value::Number(n)) => Ok(PropertyKey::String(n.to_display_string())),
         Some(Value::Boolean(b)) => Ok(PropertyKey::String(
             (if *b { "true" } else { "false" }).to_string(),
@@ -3056,7 +3078,7 @@ fn native_to_property_key(
 ) -> Result<PropertyKey, NativeError> {
     let value = arg.cloned().unwrap_or(Value::Undefined);
     let Some(exec_ctx) = ctx.execution_context().cloned() else {
-        return expect_property_key(Some(&value))
+        return expect_property_key(Some(&value), ctx.heap())
             .map_err(|err| object_native_error(method_name, err));
     };
     let key = ctx
@@ -3077,7 +3099,7 @@ fn has_own_property(
     gc_heap: &otter_gc::GcHeap,
     key: Option<&Value>,
 ) -> Result<bool, VmError> {
-    match expect_property_key(key)? {
+    match expect_property_key(key, gc_heap)? {
         PropertyKey::Symbol(sym) => Ok(crate::object::has_own_symbol(target, gc_heap, &sym)),
         PropertyKey::String(key) => Ok(!matches!(
             crate::object::lookup_own(target, gc_heap, &key),
@@ -3092,9 +3114,9 @@ fn has_own_property(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-topropertykey>
-fn property_key_from_value(value: &Value) -> Result<String, VmError> {
+fn property_key_from_value(value: &Value, heap: &otter_gc::GcHeap) -> Result<String, VmError> {
     match value {
-        Value::String(s) => Ok(s.to_lossy_string()),
+        Value::String(s) => Ok(s.to_lossy_string(heap)),
         Value::Number(n) => Ok(n.to_display_string()),
         Value::Boolean(b) => Ok((if *b { "true" } else { "false" }).to_string()),
         Value::Null => Ok("null".to_string()),

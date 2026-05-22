@@ -96,7 +96,7 @@ pub fn runtime_arg_to_string(
     heap: &otter_gc::GcHeap,
 ) -> String {
     match args.get(index) {
-        Some(RuntimeValue::String(value)) => value.to_lossy_string(),
+        Some(RuntimeValue::String(value)) => value.to_lossy_string(heap),
         Some(RuntimeValue::Undefined) | None => String::new(),
         Some(value) => value.display_string(heap),
     }
@@ -110,7 +110,7 @@ pub fn runtime_optional_arg_to_string(
     heap: &otter_gc::GcHeap,
 ) -> Option<String> {
     match args.get(index) {
-        Some(RuntimeValue::String(value)) => Some(value.to_lossy_string()),
+        Some(RuntimeValue::String(value)) => Some(value.to_lossy_string(heap)),
         Some(RuntimeValue::Undefined) | None => None,
         Some(value) => Some(value.display_string(heap)),
     }
@@ -122,7 +122,7 @@ pub fn runtime_string_value(
     value: &str,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     Ok(RuntimeValue::String(
-        RuntimeJsString::from_str(value, ctx.heap())
+        RuntimeJsString::from_str(value, ctx.heap_mut())
             .map_err(|err| runtime_type_error("string", err.to_string()))?,
     ))
 }

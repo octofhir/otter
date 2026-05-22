@@ -189,7 +189,7 @@ impl Interpreter {
                     self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
                 }
             };
-            let len = to_length(&length_value)?;
+            let len = to_length(&length_value, &self.gc_heap)?;
             let mut out = Vec::with_capacity(len);
             for index in 0..len {
                 let key = VmPropertyKey::OwnedString(index.to_string());

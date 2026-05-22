@@ -28,7 +28,7 @@ use crate::{NumberValue, Value, VmError, VmPropertyKey};
 pub(crate) fn descriptor_for_key(
     value: &JsString,
     key: &VmPropertyKey,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Option<PropertyDescriptor>, VmError> {
     let Some(key) = key.string_name() else {
         return Ok(None);
@@ -39,7 +39,7 @@ pub(crate) fn descriptor_for_key(
 pub(crate) fn descriptor_for_name(
     value: &JsString,
     key: &str,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Option<PropertyDescriptor>, VmError> {
     if key == "length" {
         return Ok(Some(PropertyDescriptor::data(
@@ -52,7 +52,7 @@ pub(crate) fn descriptor_for_name(
     let Ok(index) = key.parse::<u32>() else {
         return Ok(None);
     };
-    let Some(unit) = value.char_code_at(index) else {
+    let Some(unit) = value.char_code_at(index, gc_heap) else {
         return Ok(None);
     };
     Ok(Some(PropertyDescriptor::data(

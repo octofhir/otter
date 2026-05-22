@@ -58,13 +58,13 @@ use crate::number::NumberValue;
 ///
 /// <https://tc39.es/ecma262/#sec-toindex>
 #[must_use]
-pub fn to_index(value: &Value) -> Option<u64> {
+pub fn to_index(value: &Value, heap: &otter_gc::GcHeap) -> Option<u64> {
     let n = match value {
         Value::Undefined => return Some(0),
         Value::Number(n) => n.as_f64(),
         Value::Boolean(true) => 1.0,
         Value::Boolean(false) | Value::Null => 0.0,
-        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string()).as_f64(),
+        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string(heap)).as_f64(),
         _ => return None,
     };
     if n.is_nan() {

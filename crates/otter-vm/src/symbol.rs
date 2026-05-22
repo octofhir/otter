@@ -141,7 +141,7 @@ impl JsSymbol {
         heap: &mut otter_gc::GcHeap,
         description: Option<JsString>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let inner = alloc_symbol(heap, description.clone(), None, false)?;
+        let inner = alloc_symbol(heap, description, None, false)?;
         Ok(Self {
             inner,
             description,
@@ -162,7 +162,7 @@ impl JsSymbol {
         tag: WellKnown,
         description: JsString,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let inner = alloc_symbol(heap, Some(description.clone()), Some(tag), false)?;
+        let inner = alloc_symbol(heap, Some(description), Some(tag), false)?;
         Ok(Self {
             inner,
             description: Some(description),
@@ -182,7 +182,7 @@ impl JsSymbol {
         heap: &mut otter_gc::GcHeap,
         description: JsString,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let inner = alloc_symbol(heap, Some(description.clone()), None, true)?;
+        let inner = alloc_symbol(heap, Some(description), None, true)?;
         Ok(Self {
             inner,
             description: Some(description),
@@ -250,9 +250,9 @@ impl JsSymbol {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-symboldescriptivestring>
     #[must_use]
-    pub fn descriptive_string(&self) -> String {
+    pub fn descriptive_string(&self, heap: &otter_gc::GcHeap) -> String {
         match &self.description {
-            Some(s) => format!("Symbol({})", s.to_lossy_string()),
+            Some(s) => format!("Symbol({})", s.to_lossy_string(heap)),
             None => "Symbol()".to_string(),
         }
     }
@@ -568,11 +568,11 @@ mod tests {
     #[test]
     fn descriptive_string_format() {
         let mut gc = fresh_gc_heap();
-        let desc = JsString::from_str("x", &gc).unwrap();
+        let desc = JsString::from_str("x", &mut gc).unwrap();
         let s = JsSymbol::new(&mut gc, Some(desc)).unwrap();
-        assert_eq!(s.descriptive_string(), "Symbol(x)");
+        assert_eq!(s.descriptive_string(&gc), "Symbol(x)");
         let none = JsSymbol::new(&mut gc, None).unwrap();
-        assert_eq!(none.descriptive_string(), "Symbol()");
+        assert_eq!(none.descriptive_string(&gc), "Symbol()");
     }
 
     #[test]

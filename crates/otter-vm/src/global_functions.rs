@@ -37,7 +37,7 @@ use crate::{Value, VmError};
 pub fn call(
     method: otter_bytecode::method_id::GlobalMethod,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::GlobalMethod as M;
     match method {
@@ -64,13 +64,13 @@ pub fn call(
         M::IsNaN => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(number::is_nan(number::to_number_value(
-                &value,
+                &value, gc_heap,
             ))))
         }
         M::IsFinite => {
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             Ok(Value::Boolean(number::is_finite(number::to_number_value(
-                &value,
+                &value, gc_heap,
             ))))
         }
         // §21.1.2.3 / §21.1.2.2 — strict, no coercion.
@@ -137,7 +137,7 @@ pub fn call(
 fn coerce_to_utf16(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> Vec<u16> {
     match arg {
         None | Some(Value::Undefined) => "undefined".encode_utf16().collect(),
-        Some(Value::String(s)) => s.to_utf16_vec(),
+        Some(Value::String(s)) => s.to_utf16_vec(heap),
         Some(other) => other.display_string(heap).encode_utf16().collect(),
     }
 }
@@ -226,7 +226,7 @@ fn coerce_to_string(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> String {
     }
 }
 
-fn js_string(s: &str, heap: &otter_gc::GcHeap) -> Result<Value, VmError> {
+fn js_string(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, VmError> {
     Ok(Value::String(
         JsString::from_str(s, heap).map_err(|_| VmError::TypeMismatch)?,
     ))

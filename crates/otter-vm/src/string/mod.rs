@@ -1,40 +1,34 @@
-//! WTF-16 backed JavaScript string with rope variants.
+//! GC-backed JavaScript string handle.
 //!
-//! Implements the active string model:
-//!
-//! - canonical storage is WTF-16 (`Arc<[u16]>`); we never round-trip
-//!   through UTF-8 internally;
-//! - concatenation produces a `Cons` rope node — never an eager
-//!   flat copy — so `s += piece` loops stay O(n);
-//! - slices produce `Sliced` views (over flat parents) without
-//!   flattening; slicing a `Cons` flattens once;
-//! - `Thin` variant carries Latin-1 storage so ASCII-only callers
-//!   avoid the `&str → Vec<u16> → Arc<[u16]>` widening round-trip;
-//! - heap accounting flows through the shared GC heap
-//!   (`otter_gc::GcHeap`) — there is no separate string-heap
-//!   accountant any more (Phase A of the `JsString` migration).
-//!
-//! Ropes are flattened with an **iterative DFS** over an explicit
-//! stack — recursion is forbidden by the foundation plan.
+//! Phase B of the JsString migration: the public [`JsString`] is now
+//! a 12-byte `Copy` value pairing a 4-byte [`JsStringHandle`]
+//! (`Gc<JsStringBody>`) with a `u32` cached length. All payload data
+//! — flat WTF-16, Latin-1, cons-rope, sliced views — lives on the GC
+//! heap inside [`JsStringBody`]; tracing reaches every body through
+//! the handle stored on the wrapper.
 //!
 //! # Contents
-//! - [`JsString`] — the public string handle (cheap to clone).
-//! - [`StringRepr`] — internal representation enum.
-//! - [`MAX_ROPE_DEPTH`] — pinned at 64 (panicking flatten cap).
+//! - [`JsString`] — the public string handle (`Copy + Eq + Hash` by
+//!   handle identity).
+//! - [`MAX_ROPE_DEPTH`] — re-export of the body-level depth bound.
+//! - [`Interrupted`] / [`INDEX_OF_INTERRUPT_BUDGET`] —
+//!   interrupt-aware search primitives shared with the prototype.
 //!
 //! # Invariants
-//! - `len()` is O(1) for every variant.
-//! - `equals()` compares code units; surrogates round-trip.
-//! - `slice(parent, start, len)` over a `Sliced` parent collapses
-//!   into a single `Sliced` view (no `Sliced(Sliced(...))` chain).
+//! - `len()` is O(1) heap-free via the cached field; constructors
+//!   prime it from the body at allocation time and never re-read the
+//!   heap.
+//! - Derived [`PartialEq`] / [`Hash`] are **handle identity**.
+//!   Spec-shaped value equality flows through
+//!   [`JsString::equals(other, heap)`] / [`gc_body::equals_string_bodies`].
+//! - Reader methods (`to_utf16_vec`, `to_lossy_string`,
+//!   `char_code_at`, `index_of`, …) require an explicit
+//!   `&otter_gc::GcHeap` parameter; no thread-local heap.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type>
 //!
 //! # Submodules
-//! The String class is split into per-concern files to keep this
-//! root module focused on the value representation:
-//!
 //! - [`dispatch`] — compile-time `String.<static>` dispatcher used by
 //!   the `StringCall` opcode.
 //! - [`exotic`] — String exotic object virtual own-property helpers.
@@ -51,8 +45,6 @@ pub mod ops;
 pub mod prototype;
 pub mod statics;
 
-use std::sync::Arc;
-
 use otter_gc::{GcHeap, OutOfMemory};
 
 pub use gc_body::{
@@ -62,99 +54,84 @@ pub use gc_body::{
     flatten_string_body, hash_latin1, hash_utf16, slice_string_body, to_utf16_vec,
 };
 
-/// Maximum depth of an unflattened cons rope.
-///
-/// Operations that walk a rope (`charCodeAt`, `slice`, `flatten`)
-/// use an explicit stack capped at this depth. Concatenations that
-/// would exceed it trigger an eager flatten before the new `Cons`
-/// node is built, so the depth can never exceed [`MAX_ROPE_DEPTH`]
-/// in steady state.
-pub const MAX_ROPE_DEPTH: usize = 64;
+/// Maximum depth of an unflattened cons rope. Re-export of
+/// [`gc_body::MAX_ROPE_DEPTH`] cast to `usize` for callers that still
+/// reason in `Vec::with_capacity` units.
+pub const MAX_ROPE_DEPTH: usize = gc_body::MAX_ROPE_DEPTH as usize;
 
-/// Internal representation of a [`JsString`].
+/// GC-backed JavaScript string handle.
 ///
-/// All variants are cheap to clone — heavy data lives behind
-/// [`Arc`].
-#[derive(Debug, Clone)]
-pub enum StringRepr {
-    /// Flat WTF-16 storage. The canonical leaf form.
-    Flat(Arc<[u16]>),
-    /// Concatenation rope node. Length is precomputed.
-    Cons {
-        /// Left child.
-        left: Arc<JsString>,
-        /// Right child.
-        right: Arc<JsString>,
-        /// Total code-unit length (`left.len() + right.len()`).
-        len: u32,
-        /// Maximum depth of either child plus one.
-        depth: u8,
-    },
-    /// Slice view over a `Flat` parent. Slicing a `Cons` flattens
-    /// the parent before producing this variant.
-    Sliced {
-        /// Parent storage. Only `Flat` variants are referenced
-        /// here so indexing stays O(1).
-        parent: Arc<[u16]>,
-        /// Start offset (code units) into `parent`.
-        start: u32,
-        /// Length (code units).
-        len: u32,
-    },
-    /// Latin-1 storage. Each byte zero-extends to a `u16` code
-    /// unit on read. Used as the inline target of ASCII-only
-    /// constructors (e.g. numeric formatters in
-    /// `crate::number::ecma`) so the result avoids the
-    /// `&str → Vec<u16> → Arc<[u16]>` widening round-trip that
-    /// `from_str` performs.
-    Thin(Arc<[u8]>),
-}
-
-/// Cheap, cloneable JavaScript string handle.
-#[derive(Debug, Clone)]
+/// 12 bytes (`JsStringHandle` + `u32` len). `Copy`. Derived
+/// [`PartialEq`] / [`Hash`] are handle identity — value equality
+/// goes through [`Self::equals`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct JsString {
-    repr: Arc<StringRepr>,
+    /// Strong handle to the body. Traced through the wrapper at every
+    /// GC root.
+    handle: JsStringHandle,
+    /// O(1) heap-free length in UTF-16 code units. Primed at
+    /// construction from the body and never re-read.
+    cached_len: u32,
 }
+
+fn no_extra_roots(_v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {}
 
 impl JsString {
-    /// Construct a flat string from in-memory WTF-16 code units.
+    fn from_handle(handle: JsStringHandle, heap: &GcHeap) -> Self {
+        let cached_len = heap.read_payload(handle, |b| b.len);
+        Self { handle, cached_len }
+    }
+
+    /// Strong handle to the underlying body. Used by GC tracing and by
+    /// downstream collectors that need to compare strings by identity.
+    #[must_use]
+    pub fn handle(self) -> JsStringHandle {
+        self.handle
+    }
+
+    /// Construct a flat WTF-16 string body.
     ///
     /// # Errors
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim. The Arc-backed
-    /// body cannot fail today; the result type is preserved so
-    /// callers compile unchanged when Phase B flips storage to a
-    /// GC body.
-    pub fn from_utf16_units(units: &[u16], _heap: &GcHeap) -> Result<Self, OutOfMemory> {
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub fn from_utf16_units(units: &[u16], heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        let mut roots = no_extra_roots;
+        let handle = gc_body::alloc_flat_string_body_with_roots(
+            heap,
+            JsStringId::new(0),
+            units,
+            &mut roots,
+        )?;
         Ok(Self {
-            repr: Arc::new(StringRepr::Flat(units.into())),
+            handle,
+            cached_len: units.len() as u32,
         })
     }
 
-    /// Construct a flat string from a Rust `&str`. Convenience for
-    /// literal loading; the conversion to WTF-16 happens once.
+    /// Construct from a Rust `&str` — encodes once into WTF-16.
     ///
     /// # Errors
     /// See [`Self::from_utf16_units`].
-    pub fn from_str(s: &str, heap: &GcHeap) -> Result<Self, OutOfMemory> {
+    pub fn from_str(s: &str, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
         let units: Vec<u16> = s.encode_utf16().collect();
         Self::from_utf16_units(&units, heap)
     }
 
-    /// Construct a Latin-1-tagged string from an ASCII / Latin-1
-    /// byte slice. Each byte zero-extends to a `u16` code unit on
-    /// read; storage stays a single `Arc<[u8]>` to avoid the
-    /// `&str → Vec<u16>` widening allocation that
-    /// [`Self::from_str`] performs.
-    ///
-    /// Caller is responsible for ensuring `bytes` are valid Latin-1
-    /// (every byte ≤ `0xFF` is trivially Latin-1, but ASCII-only
-    /// callers preserve the spec semantics for code-unit access).
+    /// Construct from a Latin-1 / ASCII byte slice. Each byte
+    /// zero-extends to a `u16` on read.
     ///
     /// # Errors
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn from_latin1(bytes: &[u8], _heap: &GcHeap) -> Result<Self, OutOfMemory> {
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub fn from_latin1(bytes: &[u8], heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        let mut roots = no_extra_roots;
+        let handle = gc_body::alloc_latin1_string_body_with_roots(
+            heap,
+            JsStringId::new(0),
+            bytes,
+            &mut roots,
+        )?;
         Ok(Self {
-            repr: Arc::new(StringRepr::Thin(bytes.into())),
+            handle,
+            cached_len: bytes.len() as u32,
         })
     }
 
@@ -162,347 +139,190 @@ impl JsString {
     ///
     /// # Errors
     /// See [`Self::from_utf16_units`].
-    pub fn empty(heap: &GcHeap) -> Result<Self, OutOfMemory> {
+    pub fn empty(heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
         Self::from_utf16_units(&[], heap)
     }
 
-    /// Borrow the underlying Latin-1 byte storage iff this string
-    /// is the [`StringRepr::Thin`] variant. Returns `None` for
-    /// flat / sliced / cons UTF-16 strings.
-    ///
-    /// Callers exploit this for byte-level fast paths — substring
-    /// search, prefix / suffix tests — that would otherwise pay
-    /// the [`Self::to_utf16_vec`] widening allocation.
+    /// Length in WTF-16 code units (O(1), heap-free).
     #[must_use]
-    pub fn as_latin1(&self) -> Option<&[u8]> {
-        match &*self.repr {
-            StringRepr::Thin(bytes) => Some(bytes),
-            _ => None,
-        }
+    pub fn len(self) -> u32 {
+        self.cached_len
     }
 
-    /// Length in WTF-16 code units (O(1)).
+    /// `true` when [`Self::len`] is zero. Heap-free.
     #[must_use]
-    pub fn len(&self) -> u32 {
-        match &*self.repr {
-            StringRepr::Flat(units) => units.len() as u32,
-            StringRepr::Cons { len, .. } | StringRepr::Sliced { len, .. } => *len,
-            StringRepr::Thin(bytes) => bytes.len() as u32,
-        }
+    pub fn is_empty(self) -> bool {
+        self.cached_len == 0
     }
 
-    /// `true` when [`Self::len`] is zero.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Concatenate two strings into a `Cons` rope node.
-    ///
-    /// Cheap: the operation is bounded by the depth-bound check
-    /// plus an `Arc::clone` per child. If either operand pushes the
-    /// resulting depth above [`MAX_ROPE_DEPTH`], the deeper child
-    /// is flattened first.
+    /// Concatenate two strings; produces a cons-rope body unless one
+    /// side is empty (then returns the other handle unchanged).
     ///
     /// # Errors
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn concat(left: &JsString, right: &JsString, heap: &GcHeap) -> Result<Self, OutOfMemory> {
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub fn concat(
+        left: &JsString,
+        right: &JsString,
+        heap: &mut GcHeap,
+    ) -> Result<Self, OutOfMemory> {
         if right.is_empty() {
-            return Ok(left.clone());
+            return Ok(*left);
         }
         if left.is_empty() {
-            return Ok(right.clone());
+            return Ok(*right);
         }
-        let new_len = left.len().saturating_add(right.len());
-        let new_depth = left.depth().max(right.depth()).saturating_add(1);
+        let mut roots = no_extra_roots;
+        let handle = gc_body::concat_string_bodies(heap, left.handle, right.handle, &mut roots)?;
+        let cached_len = heap.read_payload(handle, |b| b.len);
+        Ok(Self { handle, cached_len })
+    }
 
-        // Force a flatten of the deeper side if we are about to
-        // exceed the depth budget.
-        let (l, r) = if (new_depth as usize) > MAX_ROPE_DEPTH {
-            if left.depth() >= right.depth() {
-                let flat = left.flatten(heap)?;
-                (flat, right.clone())
-            } else {
-                let flat = right.flatten(heap)?;
-                (left.clone(), flat)
-            }
-        } else {
-            (left.clone(), right.clone())
-        };
+    /// O(1) substring view (or fresh body when the source is cons /
+    /// latin-1; see [`gc_body::slice_string_body`]).
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub fn slice(self, start: u32, length: u32, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        let mut roots = no_extra_roots;
+        let handle = gc_body::slice_string_body(heap, self.handle, start, length, &mut roots)?;
+        let cached_len = heap.read_payload(handle, |b| b.len);
+        Ok(Self { handle, cached_len })
+    }
 
-        let final_depth = l.depth().max(r.depth()).saturating_add(1);
+    /// Realise a rope into a flat body. Returns `self` unchanged when
+    /// already flat.
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub fn flatten(self, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        let mut roots = no_extra_roots;
+        let handle = gc_body::flatten_string_body(heap, self.handle, &mut roots)?;
         Ok(Self {
-            repr: Arc::new(StringRepr::Cons {
-                left: Arc::new(l),
-                right: Arc::new(r),
-                len: new_len,
-                depth: final_depth,
-            }),
+            handle,
+            cached_len: self.cached_len,
         })
     }
 
-    /// Take an O(len) substring view.
-    ///
-    /// `start` is clamped to `[0, len()]`, `length` to
-    /// `[0, len() - start]`. Slicing a `Cons` parent flattens it
-    /// first; slicing a `Sliced` parent collapses to a single
-    /// `Sliced` view.
+    /// Body handle for the legacy bridge. Phase B: the wrapper *is*
+    /// the handle, so this is a copy.
     ///
     /// # Errors
-    /// See [`Self::flatten`].
-    pub fn slice(&self, start: u32, length: u32, heap: &GcHeap) -> Result<Self, OutOfMemory> {
-        let total = self.len();
-        let start = start.min(total);
-        let length = length.min(total.saturating_sub(start));
-        if length == 0 {
-            return Self::empty(heap);
-        }
-        match &*self.repr {
-            StringRepr::Flat(units) => Ok(Self {
-                repr: Arc::new(StringRepr::Sliced {
-                    parent: units.clone(),
-                    start,
-                    len: length,
-                }),
-            }),
-            StringRepr::Sliced {
-                parent,
-                start: outer_start,
-                ..
-            } => Ok(Self {
-                repr: Arc::new(StringRepr::Sliced {
-                    parent: parent.clone(),
-                    start: outer_start + start,
-                    len: length,
-                }),
-            }),
-            StringRepr::Cons { .. } => {
-                let flat = self.flatten(heap)?;
-                flat.slice(start, length, heap)
-            }
-            StringRepr::Thin(bytes) => {
-                // Latin-1 source: collapse the slice into a fresh
-                // `Thin` rather than widening to WTF-16. Keeps the
-                // 1-byte-per-code-unit advantage on the slice path.
-                let s = start as usize;
-                let e = s + (length as usize);
-                Ok(Self {
-                    repr: Arc::new(StringRepr::Thin(bytes[s..e].into())),
-                })
-            }
-        }
+    /// Never fails today; the result type is preserved so callers can
+    /// stay shaped like the Phase A bridge.
+    pub fn to_gc_handle(self, _heap: &mut GcHeap) -> Result<JsStringHandle, OutOfMemory> {
+        Ok(self.handle)
     }
 
-    /// Realize a rope into a flat representation. O(n) over the
-    /// length; iterative DFS — no recursion.
+    /// Build a wrapper around an existing GC body handle. Reads the
+    /// body once to prime [`Self::cached_len`].
     ///
     /// # Errors
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn flatten(&self, heap: &GcHeap) -> Result<Self, OutOfMemory> {
-        if let StringRepr::Flat(_) = &*self.repr {
-            return Ok(self.clone());
-        }
-        let mut buf: Vec<u16> = Vec::with_capacity(self.len() as usize);
-        // Iterative DFS over the rope; each `Cons` pushes its right
-        // child to the stack and descends left.
-        let mut stack: Vec<&JsString> = Vec::with_capacity(MAX_ROPE_DEPTH);
-        stack.push(self);
-        while let Some(node) = stack.pop() {
-            match &*node.repr {
-                StringRepr::Flat(units) => buf.extend_from_slice(units),
-                StringRepr::Sliced { parent, start, len } => {
-                    let s = *start as usize;
-                    let e = s + (*len as usize);
-                    buf.extend_from_slice(&parent[s..e]);
-                }
-                StringRepr::Cons { left, right, .. } => {
-                    // Push right first so left is processed first.
-                    stack.push(right);
-                    stack.push(left);
-                }
-                StringRepr::Thin(bytes) => {
-                    buf.extend(bytes.iter().map(|&b| u16::from(b)));
-                }
-            }
-        }
-        Self::from_utf16_units(&buf, heap)
+    /// Never fails today; the result type is preserved for legacy
+    /// bridge callers.
+    pub fn from_gc_handle(heap: &GcHeap, handle: JsStringHandle) -> Result<Self, OutOfMemory> {
+        Ok(Self::from_handle(handle, heap))
     }
 
-    /// `true` when the two strings have identical code units.
-    ///
-    /// Fast paths:
-    /// - identity (`Arc::ptr_eq` on the inner repr);
-    /// - identical `Flat` storages;
-    /// - length mismatch returns `false` immediately.
+    /// Materialise the string into a freshly-allocated `Vec<u16>` of
+    /// code units.
     #[must_use]
-    pub fn equals(&self, other: &JsString) -> bool {
-        if Arc::ptr_eq(&self.repr, &other.repr) {
-            return true;
-        }
-        if self.len() != other.len() {
-            return false;
-        }
-        if let (StringRepr::Flat(a), StringRepr::Flat(b)) = (&*self.repr, &*other.repr) {
-            return Arc::ptr_eq(a, b) || a == b;
-        }
-        // General path: walk both ropes via iterators.
-        let mut a = CodeUnits::new(self);
-        let mut b = CodeUnits::new(other);
-        loop {
-            match (a.next(), b.next()) {
-                (Some(x), Some(y)) if x == y => continue,
-                (None, None) => return true,
-                _ => return false,
-            }
-        }
+    pub fn to_utf16_vec(self, heap: &GcHeap) -> Vec<u16> {
+        gc_body::to_utf16_vec(heap, self.handle)
     }
 
-    /// `Display`/`Debug`-style rendering as a Rust `String`.
-    ///
-    /// Lone surrogates are preserved through
-    /// [`String::from_utf16_lossy`] semantics. Used by the CLI
-    /// formatter at the stdout boundary; **not** used internally.
+    /// Render as a lossy Rust `String` for display / diagnostics.
+    /// Lone surrogates round-trip via `String::from_utf16_lossy`.
     #[must_use]
-    pub fn to_lossy_string(&self) -> String {
-        let units: Vec<u16> = CodeUnits::new(self).collect();
+    pub fn to_lossy_string(self, heap: &GcHeap) -> String {
+        let units = gc_body::to_utf16_vec(heap, self.handle);
         String::from_utf16_lossy(&units)
     }
 
-    /// Collect the string into a freshly-allocated `Vec<u16>` of
-    /// code units. Useful for bytecode dumps and golden tests.
+    /// Borrow the underlying Latin-1 bytes when the body is the
+    /// Latin-1 variant. The closure receives a borrow scoped to the
+    /// payload read.
     #[must_use]
-    pub fn to_utf16_vec(&self) -> Vec<u16> {
-        CodeUnits::new(self).collect()
+    pub fn with_latin1<F, R>(self, heap: &GcHeap, f: F) -> Option<R>
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        heap.read_payload(self.handle, |body| match &body.repr {
+            JsStringBodyRepr::Latin1(bytes) => Some(f(bytes)),
+            _ => None,
+        })
     }
 
-    /// Materialise this wrapper into a GC-managed string body.
-    ///
-    /// `Flat` and `Thin` variants map onto the matching
-    /// [`JsStringBodyRepr`] payload directly; `Sliced` collapses
-    /// into a fresh flat body containing the sliced range; `Cons`
-    /// flattens the rope first. Caller supplies the GC heap; the
-    /// returned [`JsStringHandle`] is a 4-byte `Copy` handle
-    /// suitable for the tagged-value [`crate::Value::string_gc`]
-    /// surface.
-    ///
-    /// # Errors
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn to_gc_handle(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-    ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
-        let mut empty = |_v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
-        match &*self.repr {
-            StringRepr::Flat(units) => gc_body::alloc_flat_string_body_with_roots(
-                heap,
-                JsStringId::new(0),
-                units,
-                &mut empty,
-            ),
-            StringRepr::Thin(bytes) => gc_body::alloc_latin1_string_body_with_roots(
-                heap,
-                JsStringId::new(0),
-                bytes,
-                &mut empty,
-            ),
-            StringRepr::Sliced { parent, start, len } => {
-                let s = *start as usize;
-                let e = s + (*len as usize);
-                gc_body::alloc_flat_string_body_with_roots(
-                    heap,
-                    JsStringId::new(0),
-                    &parent[s..e],
-                    &mut empty,
-                )
-            }
-            StringRepr::Cons { .. } => {
-                let units = self.to_utf16_vec();
-                gc_body::alloc_flat_string_body_with_roots(
-                    heap,
-                    JsStringId::new(0),
-                    &units,
-                    &mut empty,
-                )
-            }
-        }
-    }
-
-    /// Construct a legacy Arc-backed wrapper from a GC-managed
-    /// string body. Materialises the body's UTF-16 units once into
-    /// a fresh `Flat` repr.
-    ///
-    /// # Errors
-    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-    pub fn from_gc_handle(heap: &GcHeap, handle: JsStringHandle) -> Result<Self, OutOfMemory> {
-        let units = gc_body::to_utf16_vec(heap, handle);
-        Self::from_utf16_units(&units, heap)
-    }
-
-    /// Code-unit at `index`, or `None` for out-of-range.
+    /// Code-unit at `index`, or `None` for out-of-range. Walks the
+    /// body iteratively — no allocation.
     #[must_use]
-    pub fn char_code_at(&self, index: u32) -> Option<u16> {
-        if index >= self.len() {
+    pub fn char_code_at(self, index: u32, heap: &GcHeap) -> Option<u16> {
+        if index >= self.cached_len {
             return None;
         }
-        // Iterative descent into the rope.
-        let mut node = self.clone();
+        enum Step {
+            Found(u16),
+            Descend(JsStringHandle, u32),
+        }
+        let mut handle = self.handle;
         let mut idx = index;
         loop {
-            match Arc::clone(&node.repr).as_ref() {
-                StringRepr::Flat(units) => return Some(units[idx as usize]),
-                StringRepr::Sliced { parent, start, .. } => {
-                    return Some(parent[(*start + idx) as usize]);
-                }
-                StringRepr::Cons { left, right, .. } => {
-                    let left_len = left.len();
+            let step = heap.read_payload(handle, |body| match &body.repr {
+                JsStringBodyRepr::Flat(units) => Step::Found(units[idx as usize]),
+                JsStringBodyRepr::Latin1(bytes) => Step::Found(u16::from(bytes[idx as usize])),
+                JsStringBodyRepr::Sliced { parent, start } => Step::Descend(*parent, *start + idx),
+                JsStringBodyRepr::Cons { left, right, .. } => {
+                    let left_len = heap.read_payload(*left, |b| b.len);
                     if idx < left_len {
-                        node = (**left).clone();
+                        Step::Descend(*left, idx)
                     } else {
-                        idx -= left_len;
-                        node = (**right).clone();
+                        Step::Descend(*right, idx - left_len)
                     }
                 }
-                StringRepr::Thin(bytes) => {
-                    return Some(u16::from(bytes[idx as usize]));
+            });
+            match step {
+                Step::Found(unit) => return Some(unit),
+                Step::Descend(h, i) => {
+                    handle = h;
+                    idx = i;
                 }
             }
         }
     }
 
-    fn depth(&self) -> u8 {
-        match &*self.repr {
-            StringRepr::Flat(_) | StringRepr::Sliced { .. } => 0,
-            StringRepr::Cons { depth, .. } => *depth,
-            StringRepr::Thin(_) => 0,
+    /// Value equality on code units. Fast-paths handle identity and
+    /// cached-length mismatch before delegating to
+    /// [`gc_body::equals_string_bodies`].
+    #[must_use]
+    pub fn equals(self, other: &JsString, heap: &GcHeap) -> bool {
+        if self.handle == other.handle {
+            return true;
         }
+        if self.cached_len != other.cached_len {
+            return false;
+        }
+        gc_body::equals_string_bodies(heap, self.handle, other.handle)
     }
 
-    /// Find `needle` starting at code-unit `from`. Returns the
-    /// match position (in code units) or `None`.
+    /// Find `needle` starting at code-unit `from`. Returns the match
+    /// position or `None`.
     ///
     /// `interrupt` is consulted every
     /// [`INDEX_OF_INTERRUPT_BUDGET`] iterations; a tripped flag
-    /// produces an [`Interrupted`] sentinel which callers translate
-    /// to `VmError::Interrupted`.
-    ///
-    /// Hot path uses [`crate::swar`] to scan 8 bytes (Latin-1) or
-    /// 4 code units (UTF-16) at a time when locating candidate
-    /// match positions, falling back to slice equality for the
-    /// per-candidate verify step.
+    /// produces an [`Interrupted`] sentinel.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.indexof>
-    /// §22.1.3.10
     pub fn index_of(
-        &self,
+        self,
         needle: &JsString,
         from: u32,
         interrupt: Option<&crate::InterruptFlag>,
+        heap: &GcHeap,
     ) -> Result<Option<u32>, Interrupted> {
-        let n_len = needle.len();
+        let n_len = needle.cached_len;
         if n_len == 0 {
-            return Ok(Some(from.min(self.len())));
+            return Ok(Some(from.min(self.cached_len)));
         }
-        let h_len = self.len();
+        let h_len = self.cached_len;
         if h_len < n_len {
             return Ok(None);
         }
@@ -510,25 +330,19 @@ impl JsString {
         if from > last_start {
             return Ok(None);
         }
-
-        // Both sides Latin-1 → byte-level scan (no `Vec<u16>`
-        // materialisation, SWAR memchr on the first byte).
-        if let (Some(h_bytes), Some(n_bytes)) = (self.as_latin1(), needle.as_latin1()) {
-            return latin1_index_of(
+        if let Some(result) = try_with_two_latin1(self, *needle, heap, |h_bytes, n_bytes| {
+            latin1_index_of(
                 h_bytes,
                 n_bytes,
                 from as usize,
                 last_start as usize,
                 interrupt,
-            );
+            )
+        }) {
+            return result;
         }
-
-        // UTF-16 path: still materialise to flat code-unit slices
-        // so the verify step stays a single `==` comparison, but
-        // route the candidate scan through the SWAR `find_u16`
-        // helper (4 lanes per `u64`).
-        let haystack: Vec<u16> = self.to_utf16_vec();
-        let needle_units: Vec<u16> = needle.to_utf16_vec();
+        let haystack = gc_body::to_utf16_vec(heap, self.handle);
+        let needle_units = gc_body::to_utf16_vec(heap, needle.handle);
         utf16_index_of(
             &haystack,
             &needle_units,
@@ -538,21 +352,19 @@ impl JsString {
         )
     }
 
-    /// Find the **last** occurrence of `needle` ending at or
-    /// before code-unit position `position` (exclusive upper
-    /// bound is `position + needle.len()`). Returns `None` if no
-    /// match exists.
+    /// Find the **last** occurrence of `needle` at or before
+    /// `position`. Returns `None` when no match exists.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.lastindexof>
-    /// §22.1.3.11
     pub fn last_index_of(
-        &self,
+        self,
         needle: &JsString,
         position: u32,
         interrupt: Option<&crate::InterruptFlag>,
+        heap: &GcHeap,
     ) -> Result<Option<u32>, Interrupted> {
-        let n_len = needle.len();
-        let h_len = self.len();
+        let n_len = needle.cached_len;
+        let h_len = self.cached_len;
         if n_len == 0 {
             return Ok(Some(position.min(h_len)));
         }
@@ -561,41 +373,37 @@ impl JsString {
         }
         let max_start = h_len - n_len;
         let last_start = position.min(max_start);
-
-        if let (Some(h_bytes), Some(n_bytes)) = (self.as_latin1(), needle.as_latin1()) {
-            return latin1_last_index_of(h_bytes, n_bytes, last_start as usize, interrupt);
+        if let Some(result) = try_with_two_latin1(self, *needle, heap, |h_bytes, n_bytes| {
+            latin1_last_index_of(h_bytes, n_bytes, last_start as usize, interrupt)
+        }) {
+            return result;
         }
-
-        let haystack: Vec<u16> = self.to_utf16_vec();
-        let needle_units: Vec<u16> = needle.to_utf16_vec();
+        let haystack = gc_body::to_utf16_vec(heap, self.handle);
+        let needle_units = gc_body::to_utf16_vec(heap, needle.handle);
         utf16_last_index_of(&haystack, &needle_units, last_start as usize, interrupt)
     }
 
-    /// `true` when this string starts with `prefix` at offset
-    /// `from`. Cheap: pulls only the relevant code units.
+    /// `true` when this string starts with `prefix` at offset `from`.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.startswith>
-    /// §22.1.3.22
     #[must_use]
-    pub fn starts_with(&self, prefix: &JsString, from: u32) -> bool {
-        let p_len = prefix.len();
+    pub fn starts_with(self, prefix: &JsString, from: u32, heap: &GcHeap) -> bool {
+        let p_len = prefix.cached_len;
         if p_len == 0 {
             return true;
         }
-        if from + p_len > self.len() {
+        if from + p_len > self.cached_len {
             return false;
         }
-        // Both Latin-1 → byte-level slice equality (compiler
-        // vectorises the memcmp). Skips the `Vec<u16>` widening
-        // both sides currently pay.
-        if let (Some(h), Some(p)) = (self.as_latin1(), prefix.as_latin1()) {
+        if let Some(result) = try_with_two_latin1(self, *prefix, heap, |h, p| {
             let from = from as usize;
             let p_len = p_len as usize;
-            return h[from..from + p_len] == *p;
+            h[from..from + p_len] == *p
+        }) {
+            return result;
         }
-        // Mixed / UTF-16: materialise once and compare slices.
-        let haystack: Vec<u16> = self.to_utf16_vec();
-        let prefix_units: Vec<u16> = prefix.to_utf16_vec();
+        let haystack = gc_body::to_utf16_vec(heap, self.handle);
+        let prefix_units = gc_body::to_utf16_vec(heap, prefix.handle);
         let from = from as usize;
         let p_len = p_len as usize;
         haystack[from..from + p_len] == prefix_units[..]
@@ -605,34 +413,42 @@ impl JsString {
     /// caps the haystack to the first `end_position` code units —
     /// matches `String.prototype.endsWith` semantics.
     #[must_use]
-    pub fn ends_with(&self, suffix: &JsString, end_position: u32) -> bool {
-        let total = self.len().min(end_position);
-        let s_len = suffix.len();
+    pub fn ends_with(self, suffix: &JsString, end_position: u32, heap: &GcHeap) -> bool {
+        let total = self.cached_len.min(end_position);
+        let s_len = suffix.cached_len;
         if s_len > total {
             return false;
         }
-        self.starts_with(suffix, total - s_len)
+        self.starts_with(suffix, total - s_len, heap)
     }
 
     /// Lexicographic code-unit comparison used by `<`, `<=`, `>`,
-    /// `>=` for two strings. Returns `Less`/`Equal`/`Greater`.
+    /// `>=` for two strings.
     #[must_use]
-    pub fn compare_lex(&self, other: &JsString) -> std::cmp::Ordering {
-        use std::cmp::Ordering;
-        let mut a = CodeUnits::new(self);
-        let mut b = CodeUnits::new(other);
-        loop {
-            match (a.next(), b.next()) {
-                (Some(x), Some(y)) => match x.cmp(&y) {
-                    Ordering::Equal => continue,
-                    other => return other,
-                },
-                (None, None) => return Ordering::Equal,
-                (None, Some(_)) => return Ordering::Less,
-                (Some(_), None) => return Ordering::Greater,
-            }
-        }
+    pub fn compare_lex(self, other: &JsString, heap: &GcHeap) -> std::cmp::Ordering {
+        let a = gc_body::to_utf16_vec(heap, self.handle);
+        let b = gc_body::to_utf16_vec(heap, other.handle);
+        a.cmp(&b)
     }
+}
+
+fn try_with_two_latin1<F, R>(a: JsString, b: JsString, heap: &GcHeap, f: F) -> Option<R>
+where
+    F: FnOnce(&[u8], &[u8]) -> R,
+{
+    heap.read_payload(a.handle, |a_body| {
+        if let JsStringBodyRepr::Latin1(a_bytes) = &a_body.repr {
+            heap.read_payload(b.handle, |b_body| {
+                if let JsStringBodyRepr::Latin1(b_bytes) = &b_body.repr {
+                    Some(f(a_bytes, b_bytes))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        }
+    })
 }
 
 /// Loop-iteration budget at which `index_of` checks the interrupt
@@ -717,8 +533,7 @@ fn latin1_last_index_of(
     Ok(None)
 }
 
-/// UTF-16 last_index_of with SWAR-assisted reverse candidate
-/// scan.
+/// UTF-16 last_index_of with SWAR-assisted reverse candidate scan.
 fn utf16_last_index_of(
     haystack: &[u16],
     needle: &[u16],
@@ -807,109 +622,6 @@ impl std::fmt::Display for Interrupted {
 
 impl std::error::Error for Interrupted {}
 
-impl PartialEq for JsString {
-    fn eq(&self, other: &Self) -> bool {
-        self.equals(other)
-    }
-}
-
-impl Eq for JsString {}
-
-/// Iterator over a rope's code units. Iterative — uses an
-/// explicit stack capped at [`MAX_ROPE_DEPTH`].
-struct CodeUnits<'a> {
-    stack: Vec<NodeFrame<'a>>,
-}
-
-enum NodeFrame<'a> {
-    Flat { slice: &'a [u16], pos: usize },
-    Sliced { slice: &'a [u16] },
-    Cons { right: &'a JsString },
-    Latin1 { slice: &'a [u8] },
-}
-
-impl<'a> CodeUnits<'a> {
-    fn new(s: &'a JsString) -> Self {
-        let mut iter = Self {
-            stack: Vec::with_capacity(MAX_ROPE_DEPTH),
-        };
-        iter.push(s);
-        iter
-    }
-
-    fn push(&mut self, s: &'a JsString) {
-        let mut current = s;
-        loop {
-            match &*current.repr {
-                StringRepr::Flat(units) => {
-                    self.stack.push(NodeFrame::Flat {
-                        slice: units,
-                        pos: 0,
-                    });
-                    return;
-                }
-                StringRepr::Sliced { parent, start, len } => {
-                    let s = *start as usize;
-                    let e = s + (*len as usize);
-                    self.stack.push(NodeFrame::Sliced {
-                        slice: &parent[s..e],
-                    });
-                    return;
-                }
-                StringRepr::Cons { left, right, .. } => {
-                    self.stack.push(NodeFrame::Cons { right });
-                    current = left;
-                }
-                StringRepr::Thin(bytes) => {
-                    self.stack.push(NodeFrame::Latin1 { slice: bytes });
-                    return;
-                }
-            }
-        }
-    }
-}
-
-impl<'a> Iterator for CodeUnits<'a> {
-    type Item = u16;
-
-    fn next(&mut self) -> Option<u16> {
-        loop {
-            let last = self.stack.last_mut()?;
-            match last {
-                NodeFrame::Flat { slice, pos } => {
-                    if *pos < slice.len() {
-                        let unit = slice[*pos];
-                        *pos += 1;
-                        return Some(unit);
-                    }
-                    self.stack.pop();
-                }
-                NodeFrame::Sliced { slice } => {
-                    if !slice.is_empty() {
-                        let unit = slice[0];
-                        *slice = &slice[1..];
-                        return Some(unit);
-                    }
-                    self.stack.pop();
-                }
-                NodeFrame::Cons { right } => {
-                    let r = *right;
-                    self.stack.pop();
-                    self.push(r);
-                }
-                NodeFrame::Latin1 { slice } => {
-                    if !slice.is_empty() {
-                        let byte = slice[0];
-                        *slice = &slice[1..];
-                        return Some(u16::from(byte));
-                    }
-                    self.stack.pop();
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -920,205 +632,153 @@ mod tests {
 
     #[test]
     fn from_str_roundtrip() {
-        let heap = h();
-        let s = JsString::from_str("abc", &heap).unwrap();
+        let mut heap = h();
+        let s = JsString::from_str("abc", &mut heap).unwrap();
         assert_eq!(s.len(), 3);
-        assert_eq!(s.to_lossy_string(), "abc");
+        assert_eq!(s.to_lossy_string(&heap), "abc");
     }
 
     #[test]
     fn to_gc_handle_round_trips_through_real_heap() {
         let mut gc = GcHeap::new().expect("gc heap");
-        let original = JsString::from_str("hello world", &gc).unwrap();
+        let original = JsString::from_str("hello world", &mut gc).unwrap();
         let handle = original.to_gc_handle(&mut gc).expect("to_gc_handle");
         let back = JsString::from_gc_handle(&gc, handle).expect("from_gc_handle");
         assert_eq!(back.len(), original.len());
-        assert_eq!(back.to_lossy_string(), original.to_lossy_string());
-    }
-
-    #[test]
-    fn to_gc_handle_preserves_latin1_payload() {
-        let mut gc = GcHeap::new().expect("gc heap");
-        let original = JsString::from_latin1(b"latin", &gc).unwrap();
-        let handle = original.to_gc_handle(&mut gc).expect("to_gc_handle");
-        gc.read_payload(handle, |body| {
-            assert!(matches!(body.repr, JsStringBodyRepr::Latin1(_)));
-            assert_eq!(body.len(), 5);
-        });
-    }
-
-    #[test]
-    fn to_gc_handle_flattens_cons() {
-        let mut gc = GcHeap::new().expect("gc heap");
-        let left = JsString::from_str("foo", &gc).unwrap();
-        let right = JsString::from_str("bar", &gc).unwrap();
-        let cons = JsString::concat(&left, &right, &gc).unwrap();
-        let handle = cons.to_gc_handle(&mut gc).expect("to_gc_handle");
-        gc.read_payload(handle, |body| {
-            // Cons collapses through to_utf16_vec then alloc_flat.
-            assert!(matches!(body.repr, JsStringBodyRepr::Flat(_)));
-            assert_eq!(body.len(), 6);
-        });
+        assert_eq!(back.to_lossy_string(&gc), original.to_lossy_string(&gc));
     }
 
     #[test]
     fn latin1_thin_roundtrip() {
-        let heap = h();
-        let thin = JsString::from_latin1(b"abc", &heap).unwrap();
+        let mut heap = h();
+        let thin = JsString::from_latin1(b"abc", &mut heap).unwrap();
         assert_eq!(thin.len(), 3);
-        assert_eq!(thin.to_lossy_string(), "abc");
-        assert_eq!(thin.char_code_at(0), Some(b'a' as u16));
-        assert_eq!(thin.char_code_at(1), Some(b'b' as u16));
-        assert_eq!(thin.char_code_at(2), Some(b'c' as u16));
-        assert_eq!(thin.char_code_at(3), None);
+        assert_eq!(thin.to_lossy_string(&heap), "abc");
+        assert_eq!(thin.char_code_at(0, &heap), Some(b'a' as u16));
+        assert_eq!(thin.char_code_at(1, &heap), Some(b'b' as u16));
+        assert_eq!(thin.char_code_at(2, &heap), Some(b'c' as u16));
+        assert_eq!(thin.char_code_at(3, &heap), None);
     }
 
     #[test]
     fn latin1_equals_flat_for_ascii() {
-        let heap = h();
-        let thin = JsString::from_latin1(b"hello", &heap).unwrap();
-        let flat = JsString::from_str("hello", &heap).unwrap();
-        assert!(thin.equals(&flat));
-        assert!(flat.equals(&thin));
+        let mut heap = h();
+        let thin = JsString::from_latin1(b"hello", &mut heap).unwrap();
+        let flat = JsString::from_str("hello", &mut heap).unwrap();
+        assert!(thin.equals(&flat, &heap));
+        assert!(flat.equals(&thin, &heap));
     }
 
     #[test]
     fn latin1_slice_stays_thin() {
-        let heap = h();
-        let thin = JsString::from_latin1(b"abcdef", &heap).unwrap();
-        let mid = thin.slice(1, 3, &heap).unwrap();
+        let mut heap = h();
+        let thin = JsString::from_latin1(b"abcdef", &mut heap).unwrap();
+        let mid = thin.slice(1, 3, &mut heap).unwrap();
         assert_eq!(mid.len(), 3);
-        assert_eq!(mid.to_lossy_string(), "bcd");
-    }
-
-    #[test]
-    fn latin1_in_cons_rope_iterates() {
-        let heap = h();
-        let left = JsString::from_latin1(b"foo", &heap).unwrap();
-        let right = JsString::from_str("bar", &heap).unwrap();
-        let cons = JsString::concat(&left, &right, &heap).unwrap();
-        assert_eq!(cons.to_lossy_string(), "foobar");
-        assert_eq!(cons.char_code_at(2), Some(b'o' as u16));
-        assert_eq!(cons.char_code_at(3), Some(b'b' as u16));
+        assert_eq!(mid.to_lossy_string(&heap), "bcd");
     }
 
     #[test]
     fn equality_on_flat() {
-        let heap = h();
-        let a = JsString::from_str("abc", &heap).unwrap();
-        let b = JsString::from_str("abc", &heap).unwrap();
-        let c = JsString::from_str("abd", &heap).unwrap();
-        assert!(a.equals(&b));
-        assert!(!a.equals(&c));
+        let mut heap = h();
+        let a = JsString::from_str("abc", &mut heap).unwrap();
+        let b = JsString::from_str("abc", &mut heap).unwrap();
+        let c = JsString::from_str("abd", &mut heap).unwrap();
+        assert!(a.equals(&b, &heap));
+        assert!(!a.equals(&c, &heap));
     }
 
     #[test]
-    fn concat_produces_cons_not_flat() {
-        let heap = h();
-        let a = JsString::from_str("a", &heap).unwrap();
-        let b = JsString::from_str("b", &heap).unwrap();
-        let ab = JsString::concat(&a, &b, &heap).unwrap();
-        assert!(matches!(*ab.repr, StringRepr::Cons { .. }));
+    fn concat_produces_cons_node() {
+        let mut heap = h();
+        let a = JsString::from_str("a", &mut heap).unwrap();
+        let b = JsString::from_str("b", &mut heap).unwrap();
+        let ab = JsString::concat(&a, &b, &mut heap).unwrap();
         assert_eq!(ab.len(), 2);
-        assert_eq!(ab.to_lossy_string(), "ab");
+        assert_eq!(ab.to_lossy_string(&heap), "ab");
+        heap.read_payload(ab.handle(), |body| {
+            assert!(matches!(body.repr, JsStringBodyRepr::Cons { .. }));
+        });
     }
 
     #[test]
     fn concat_loop_is_linear() {
         // Build s += "abcd" 1000 times. Each step is O(1) cons work.
-        let heap = h();
-        let mut s = JsString::empty(&heap).unwrap();
-        let piece = JsString::from_str("abcd", &heap).unwrap();
+        let mut heap = h();
+        let mut s = JsString::empty(&mut heap).unwrap();
+        let piece = JsString::from_str("abcd", &mut heap).unwrap();
         for _ in 0..1_000 {
-            s = JsString::concat(&s, &piece, &heap).unwrap();
+            s = JsString::concat(&s, &piece, &mut heap).unwrap();
         }
         assert_eq!(s.len(), 4_000);
-        assert_eq!(s.to_lossy_string().len(), 4_000);
+        assert_eq!(s.to_lossy_string(&heap).len(), 4_000);
     }
 
     #[test]
     fn slice_returns_view_for_flat_parent() {
-        let heap = h();
-        let s = JsString::from_str("abcdef", &heap).unwrap();
-        let sliced = s.slice(1, 3, &heap).unwrap();
+        let mut heap = h();
+        let s = JsString::from_str("abcdef", &mut heap).unwrap();
+        let sliced = s.slice(1, 3, &mut heap).unwrap();
         assert_eq!(sliced.len(), 3);
-        assert_eq!(sliced.to_lossy_string(), "bcd");
-        assert!(matches!(*sliced.repr, StringRepr::Sliced { .. }));
-    }
-
-    #[test]
-    fn slice_of_slice_collapses() {
-        let heap = h();
-        let s = JsString::from_str("abcdef", &heap).unwrap();
-        let outer = s.slice(1, 5, &heap).unwrap(); // "bcdef"
-        let inner = outer.slice(1, 2, &heap).unwrap(); // "cd"
-        assert_eq!(inner.to_lossy_string(), "cd");
-        match &*inner.repr {
-            StringRepr::Sliced { start, len, .. } => {
-                assert_eq!(*start, 2);
-                assert_eq!(*len, 2);
-            }
-            other => panic!("expected Sliced, got {other:?}"),
-        }
+        assert_eq!(sliced.to_lossy_string(&heap), "bcd");
+        heap.read_payload(sliced.handle(), |body| {
+            assert!(matches!(body.repr, JsStringBodyRepr::Sliced { .. }));
+        });
     }
 
     #[test]
     fn slice_of_cons_flattens() {
-        let heap = h();
-        let a = JsString::from_str("ab", &heap).unwrap();
-        let b = JsString::from_str("cd", &heap).unwrap();
-        let cons = JsString::concat(&a, &b, &heap).unwrap();
-        let sliced = cons.slice(1, 2, &heap).unwrap();
-        assert_eq!(sliced.to_lossy_string(), "bc");
+        let mut heap = h();
+        let a = JsString::from_str("ab", &mut heap).unwrap();
+        let b = JsString::from_str("cd", &mut heap).unwrap();
+        let cons = JsString::concat(&a, &b, &mut heap).unwrap();
+        let sliced = cons.slice(1, 2, &mut heap).unwrap();
+        assert_eq!(sliced.to_lossy_string(&heap), "bc");
     }
 
     #[test]
     fn char_code_at_walks_rope() {
-        let heap = h();
-        let a = JsString::from_str("ab", &heap).unwrap();
-        let b = JsString::from_str("cd", &heap).unwrap();
-        let cons = JsString::concat(&a, &b, &heap).unwrap();
-        assert_eq!(cons.char_code_at(0), Some(b'a' as u16));
-        assert_eq!(cons.char_code_at(2), Some(b'c' as u16));
-        assert_eq!(cons.char_code_at(4), None);
+        let mut heap = h();
+        let a = JsString::from_str("ab", &mut heap).unwrap();
+        let b = JsString::from_str("cd", &mut heap).unwrap();
+        let cons = JsString::concat(&a, &b, &mut heap).unwrap();
+        assert_eq!(cons.char_code_at(0, &heap), Some(b'a' as u16));
+        assert_eq!(cons.char_code_at(2, &heap), Some(b'c' as u16));
+        assert_eq!(cons.char_code_at(4, &heap), None);
     }
 
     #[test]
     fn surrogate_round_trip() {
-        // Construct from a lone surrogate pair manually.
-        let heap = h();
-        // U+10000 — '𐀀' encoded as a surrogate pair 0xD800 0xDC00.
+        let mut heap = h();
         let units: [u16; 2] = [0xD800, 0xDC00];
-        let s = JsString::from_utf16_units(&units, &heap).unwrap();
+        let s = JsString::from_utf16_units(&units, &mut heap).unwrap();
         assert_eq!(s.len(), 2);
-        assert_eq!(s.char_code_at(0), Some(0xD800));
-        assert_eq!(s.char_code_at(1), Some(0xDC00));
-        assert_eq!(s.to_utf16_vec(), units);
+        assert_eq!(s.char_code_at(0, &heap), Some(0xD800));
+        assert_eq!(s.char_code_at(1, &heap), Some(0xDC00));
+        assert_eq!(s.to_utf16_vec(&heap), units);
     }
 
     #[test]
     fn flatten_is_iterative_on_deep_rope() {
-        let heap = h();
-        // Build a left-leaning rope of depth ~MAX_ROPE_DEPTH; concat
-        // auto-flattens when deeper. Verify length matches.
-        let leaf = JsString::from_str("ab", &heap).unwrap();
-        let mut acc = leaf.clone();
+        let mut heap = h();
+        let leaf = JsString::from_str("ab", &mut heap).unwrap();
+        let mut acc = leaf;
         for _ in 0..(MAX_ROPE_DEPTH * 2) {
-            acc = JsString::concat(&acc, &leaf, &heap).unwrap();
+            acc = JsString::concat(&acc, &leaf, &mut heap).unwrap();
         }
         let len = acc.len();
-        let flat = acc.flatten(&heap).unwrap();
+        let flat = acc.flatten(&mut heap).unwrap();
         assert_eq!(flat.len(), len);
     }
 
     #[test]
     fn empty_concat_is_identity() {
-        let heap = h();
-        let a = JsString::from_str("abc", &heap).unwrap();
-        let empty = JsString::empty(&heap).unwrap();
-        let r1 = JsString::concat(&a, &empty, &heap).unwrap();
-        let r2 = JsString::concat(&empty, &a, &heap).unwrap();
-        assert_eq!(r1.to_lossy_string(), "abc");
-        assert_eq!(r2.to_lossy_string(), "abc");
+        let mut heap = h();
+        let a = JsString::from_str("abc", &mut heap).unwrap();
+        let empty = JsString::empty(&mut heap).unwrap();
+        let r1 = JsString::concat(&a, &empty, &mut heap).unwrap();
+        let r2 = JsString::concat(&empty, &a, &mut heap).unwrap();
+        assert_eq!(r1.to_lossy_string(&heap), "abc");
+        assert_eq!(r2.to_lossy_string(&heap), "abc");
     }
 }

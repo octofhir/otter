@@ -31,11 +31,14 @@ use crate::{
     step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
 
-fn string_iterator_values(s: &JsString, heap: &otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
+fn string_iterator_values(
+    s: &JsString,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<Vec<Value>, VmError> {
     let mut out = Vec::new();
     let mut index = 0;
-    while let Some(unit) = s.char_code_at(index) {
-        let next_unit = s.char_code_at(index + 1);
+    while let Some(unit) = s.char_code_at(index, heap) {
+        let next_unit = s.char_code_at(index + 1, heap);
         let is_pair = (0xD800..=0xDBFF).contains(&unit)
             && matches!(next_unit, Some(low) if (0xDC00..=0xDFFF).contains(&low));
         let units: smallvec::SmallVec<[u16; 2]> = if is_pair {
@@ -103,7 +106,7 @@ impl Interpreter {
                 origin: crate::BuiltinIteratorOrigin::Array,
             },
             Value::String(string) => IteratorState::String {
-                string: string.clone(),
+                string: *string,
                 index: 0,
             },
             // `for…of` over a `Map` yields `[key, value]` pairs (Spec
@@ -231,7 +234,7 @@ impl Interpreter {
                     done,
                 } => Some(IteratorStateSnapshot::RegExpString {
                     matcher: matcher.clone(),
-                    input: input.clone(),
+                    input: *input,
                     global: *global,
                     full_unicode: *full_unicode,
                     done: *done,
@@ -945,7 +948,7 @@ impl Interpreter {
                 return Ok(elements);
             }
             Value::String(s) => {
-                return string_iterator_values(s, &self.gc_heap);
+                return string_iterator_values(s, &mut self.gc_heap);
             }
             Value::Set(s) => return Ok(crate::collections::set_values(*s, &self.gc_heap)),
             Value::Map(m) => {

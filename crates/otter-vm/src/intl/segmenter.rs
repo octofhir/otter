@@ -22,7 +22,7 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> S
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     SegmenterPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         granularity: read_string_option(opts_ref, "granularity", "grapheme", gc_heap),
     }
 }
@@ -97,7 +97,7 @@ fn segment(text: &str, granularity: &str) -> Vec<(usize, String)> {
 fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let text = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         Some(Value::Number(n)) => n.to_display_string(),
         Some(Value::Boolean(b)) => (if *b { "true" } else { "false" }).to_string(),
         _ => {
@@ -204,7 +204,7 @@ mod tests {
             )
             .expect("intl"),
         );
-        let input = Value::String(JsString::from_str("alpha beta", &gc_heap).expect("input"));
+        let input = Value::String(JsString::from_str("alpha beta", &mut gc_heap).expect("input"));
         let args = [input];
         let before = gc_heap.stats().new_allocated_bytes;
 

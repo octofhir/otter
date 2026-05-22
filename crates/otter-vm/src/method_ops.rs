@@ -254,7 +254,7 @@ impl Interpreter {
                         crate::object::get(ctor, &self.gc_heap, "prototype")
                     }
                     Some(Value::NativeFunction(ctor)) => ctor
-                        .own_property_descriptor(&self.gc_heap, "prototype")
+                        .own_property_descriptor(&mut self.gc_heap, "prototype")
                         .ok()
                         .flatten()
                         .and_then(|d| match d.kind {
@@ -381,7 +381,7 @@ impl Interpreter {
                             crate::abstract_ops::ToPrimitiveHint::String,
                         )?;
                         match primitive {
-                            Value::String(s) => s.to_lossy_string(),
+                            Value::String(s) => s.to_lossy_string(&self.gc_heap),
                             Value::Number(n) => n.to_display_string(),
                             Value::Boolean(true) => "true".to_string(),
                             Value::Boolean(false) => "false".to_string(),
@@ -742,13 +742,10 @@ impl Interpreter {
                 crate::object::lookup(*obj, &self.gc_heap, name),
                 crate::object::PropertyLookup::Absent
             )
-            && let Some(result) = object_prototype_intercept(
-                obj,
-                name,
-                &arg_values,
-                &self.gc_heap,
-                self.function_prototype_object().ok(),
-            )?
+            && let Some(result) = {
+                let fn_proto = self.function_prototype_object().ok();
+                object_prototype_intercept(obj, name, &arg_values, &mut self.gc_heap, fn_proto)
+            }?
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
@@ -771,7 +768,7 @@ impl Interpreter {
         {
             let result = match name {
                 "hasOwnProperty" => {
-                    let key = property_key_from_arg(arg_values.first())?;
+                    let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
                     if key == "prototype" {
                         let _ = self.function_property_get(context, *function_id, "prototype")?;
                     }
@@ -783,7 +780,7 @@ impl Interpreter {
                     .is_some()
                 }
                 "propertyIsEnumerable" => {
-                    let key = property_key_from_arg(arg_values.first())?;
+                    let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
                     if key == "prototype" {
                         let _ = self.function_property_get(context, *function_id, "prototype")?;
                     }
@@ -807,7 +804,7 @@ impl Interpreter {
                 native,
                 name,
                 &arg_values,
-                &self.gc_heap,
+                &mut self.gc_heap,
             )?
         {
             let frame = &mut stack[top_idx];
@@ -845,7 +842,7 @@ impl Interpreter {
         ) {
             let result = match name {
                 "hasOwnProperty" | "propertyIsEnumerable" => {
-                    let key = property_key_from_arg(arg_values.first())?;
+                    let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
                     match &recv_value {
                         Value::String(s) => {
                             if key == "length" {
@@ -973,7 +970,7 @@ impl Interpreter {
             // `Map.groupBy(...)`, etc. dispatch through ordinary
             // method invocation.
             Value::NativeFunction(native) => native
-                .own_property_descriptor(&self.gc_heap, name)?
+                .own_property_descriptor(&mut self.gc_heap, name)?
                 .map(|desc| descriptor_value(&desc)),
             // §7.1.18 ToObject — primitive receivers walk the
             // constructor's prototype to surface inherited
@@ -1049,18 +1046,18 @@ impl Interpreter {
         use crate::number::NumberValue;
         use crate::string::JsString;
         let recv = match receiver {
-            Value::String(s) => s.clone(),
+            Value::String(s) => *s,
             _ => return Err(VmError::TypeMismatch),
         };
         let needle = match args.first() {
-            Some(Value::String(s)) => s.clone(),
+            Some(Value::String(s)) => *s,
             _ => return Err(VmError::TypeMismatch),
         };
         let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
-        let recv_units = recv.to_utf16_vec();
-        let needle_units = needle.to_utf16_vec();
+        let recv_units = recv.to_utf16_vec(&self.gc_heap);
+        let needle_units = needle.to_utf16_vec(&self.gc_heap);
         let needle_len = needle_units.len();
-        let recv_value = Value::String(recv.clone());
+        let recv_value = Value::String(recv);
         let mut out: Vec<u16> = Vec::with_capacity(recv_units.len());
         if needle_len == 0 {
             let positions: Vec<usize> = if replace_all {
@@ -1070,7 +1067,7 @@ impl Interpreter {
             };
             for pos in positions {
                 let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    Value::String(needle.clone()),
+                    Value::String(needle),
                     Value::Number(NumberValue::from_f64(pos as f64)),
                     recv_value.clone(),
                 ];
@@ -1078,17 +1075,17 @@ impl Interpreter {
                 let raw_string = match raw {
                     Value::String(s) => s,
                     other => {
-                        JsString::from_str(&other.display_string(&self.gc_heap), &self.gc_heap)
+                        JsString::from_str(&other.display_string(&self.gc_heap), &mut self.gc_heap)
                             .map_err(|_| VmError::TypeMismatch)?
                     }
                 };
-                out.extend_from_slice(&raw_string.to_utf16_vec());
+                out.extend_from_slice(&raw_string.to_utf16_vec(&self.gc_heap));
                 if pos < recv_units.len() {
                     out.push(recv_units[pos]);
                 }
             }
             return Ok(Value::String(
-                JsString::from_utf16_units(&out, &self.gc_heap)
+                JsString::from_utf16_units(&out, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?,
             ));
         }
@@ -1101,7 +1098,7 @@ impl Interpreter {
         while cursor <= last_start {
             if recv_units[cursor..cursor + needle_len] == needle_units[..] {
                 let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    Value::String(needle.clone()),
+                    Value::String(needle),
                     Value::Number(NumberValue::from_f64(cursor as f64)),
                     recv_value.clone(),
                 ];
@@ -1109,11 +1106,11 @@ impl Interpreter {
                 let raw_string = match raw {
                     Value::String(s) => s,
                     other => {
-                        JsString::from_str(&other.display_string(&self.gc_heap), &self.gc_heap)
+                        JsString::from_str(&other.display_string(&self.gc_heap), &mut self.gc_heap)
                             .map_err(|_| VmError::TypeMismatch)?
                     }
                 };
-                out.extend_from_slice(&raw_string.to_utf16_vec());
+                out.extend_from_slice(&raw_string.to_utf16_vec(&self.gc_heap));
                 cursor += needle_len;
                 if !replace_all {
                     break;
@@ -1125,7 +1122,8 @@ impl Interpreter {
         }
         out.extend_from_slice(&recv_units[cursor..]);
         Ok(Value::String(
-            JsString::from_utf16_units(&out, &self.gc_heap).map_err(|_| VmError::TypeMismatch)?,
+            JsString::from_utf16_units(&out, &mut self.gc_heap)
+                .map_err(|_| VmError::TypeMismatch)?,
         ))
     }
 
@@ -1858,14 +1856,14 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::Undefined);
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let ctx = function_metadata::FunctionMetadataContext::new(
+                let mut ctx = function_metadata::FunctionMetadataContext::new(
                     context,
-                    &self.gc_heap,
+                    &mut self.gc_heap,
                     &self.function_user_props,
                     &self.function_deleted_metadata,
                 );
                 let metadata =
-                    function_metadata::bound_create_metadata(&ctx, callee, bound_args.len())?;
+                    function_metadata::bound_create_metadata(&mut ctx, callee, bound_args.len())?;
                 let callee_root = callee.clone();
                 let this_root = this_value.clone();
                 let bound_args_root = bound_args.clone();
@@ -1900,14 +1898,16 @@ impl Interpreter {
             // foundation defers source preservation to a follow-up.
             // <https://tc39.es/ecma262/#sec-function.prototype.tostring>
             "toString" => {
-                let ctx = function_metadata::FunctionMetadataContext::new(
-                    context,
-                    &self.gc_heap,
-                    &self.function_user_props,
-                    &self.function_deleted_metadata,
-                );
-                let display = function_metadata::callable_to_string(&ctx, callee);
-                let s = JsString::from_str(&display, self.gc_heap_mut())
+                let display = {
+                    let mut ctx = function_metadata::FunctionMetadataContext::new(
+                        context,
+                        &mut self.gc_heap,
+                        &self.function_user_props,
+                        &self.function_deleted_metadata,
+                    );
+                    function_metadata::callable_to_string(&mut ctx, callee)
+                };
+                let s = JsString::from_str(&display, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::String(s))?;

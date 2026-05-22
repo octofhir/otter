@@ -52,7 +52,7 @@ pub(crate) fn install_global(
     let argv_values = process_argv
         .iter()
         .map(|arg| {
-            JsString::from_str(arg, interp.gc_heap())
+            JsString::from_str(arg, interp.gc_heap_mut())
                 .map(otter_vm::Value::String)
                 .map_err(string_oom_to_error)
         })
@@ -156,7 +156,7 @@ pub(crate) fn install_global(
         ) {
             continue;
         }
-        let value = JsString::from_str(&value, interp.gc_heap())
+        let value = JsString::from_str(&value, interp.gc_heap_mut())
             .map(otter_vm::Value::String)
             .map_err(string_oom_to_error)?;
         otter_vm::object::set(env, interp.gc_heap_mut(), &name, value);
@@ -253,14 +253,14 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
 
 fn string_value(interp: &mut Interpreter, value: &str) -> Result<otter_vm::Value, OtterError> {
     Ok(otter_vm::Value::String(
-        JsString::from_str(value, interp.gc_heap()).map_err(string_oom_to_error)?,
+        JsString::from_str(value, interp.gc_heap_mut()).map_err(string_oom_to_error)?,
     ))
 }
 
 fn cwd_call(cwd: String) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
         Ok(otter_vm::Value::String(
-            JsString::from_str(&cwd, ctx.heap()).map_err(|err| NativeError::TypeError {
+            JsString::from_str(&cwd, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
                 name: "process.cwd",
                 reason: err.to_string(),
             })?,
@@ -351,7 +351,7 @@ fn hrtime_call(start: Instant) -> NativeCall {
         let mut seconds = elapsed.as_secs() as i64;
         let mut nanos = elapsed.subsec_nanos() as i64;
         if let Some(Value::Array(previous)) = args.first() {
-            let heap = ctx.heap();
+            let heap = ctx.heap_mut();
             let prev_seconds = number_to_i64(&otter_vm::array::get(*previous, heap, 0));
             let prev_nanos = number_to_i64(&otter_vm::array::get(*previous, heap, 1));
             if let (Some(prev_seconds), Some(prev_nanos)) = (prev_seconds, prev_nanos) {

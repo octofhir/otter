@@ -27,7 +27,7 @@ use crate::temporal::payload::{JsTemporal, TemporalPayload};
 /// through every primitive — strings flow through directly.
 pub fn require_string_arg(args: &IntrinsicArgs<'_>, index: u16) -> Result<String, IntrinsicError> {
     match args.args.get(index as usize) {
-        Some(Value::String(s)) => Ok(s.to_lossy_string()),
+        Some(Value::String(s)) => Ok(s.to_lossy_string(args.gc_heap)),
         _ => Err(IntrinsicError::BadArgument {
             index,
             reason: "must be a string",
@@ -83,7 +83,7 @@ pub fn read_i64_field(
 /// Read an optional string field (`{ unit: "minutes" }`).
 pub fn read_string_field(obj: &JsObject, name: &str, gc_heap: &otter_gc::GcHeap) -> Option<String> {
     match crate::object::get(*obj, gc_heap, name) {
-        Some(Value::String(s)) => Some(s.to_lossy_string()),
+        Some(Value::String(s)) => Some(s.to_lossy_string(gc_heap)),
         _ => None,
     }
 }
@@ -218,6 +218,9 @@ pub fn temporal_err(err: temporal_rs::TemporalError) -> IntrinsicError {
 }
 
 /// Build a `Value::String` from a Rust string via the active heap.
-pub fn js_string_value(value: String, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+pub fn js_string_value(
+    value: String,
+    args: &mut IntrinsicArgs<'_>,
+) -> Result<Value, IntrinsicError> {
     Ok(Value::String(JsString::from_str(&value, args.gc_heap)?))
 }

@@ -21,7 +21,7 @@ use crate::{Value, VmError};
 pub fn call(
     method: otter_bytecode::method_id::StringMethod,
     args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::StringMethod as M;
     match method {

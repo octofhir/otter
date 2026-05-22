@@ -55,7 +55,8 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
                 Value::Boolean(true) => 1.0,
                 Value::Boolean(false) | Value::Null => 0.0,
                 Value::String(s) => {
-                    crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+                    crate::number::parse::to_number_from_string(&s.to_lossy_string(args.gc_heap))
+                        .as_f64()
                 }
                 _ => f64::NAN,
             };

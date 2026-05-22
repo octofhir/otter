@@ -21,7 +21,7 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> L
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     ListFormatPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         kind: read_string_option(opts_ref, "type", "conjunction", gc_heap),
         style: read_string_option(opts_ref, "style", "long", gc_heap),
     }
@@ -79,7 +79,7 @@ fn collect_items(
             let mut out: Vec<String> = Vec::with_capacity(values.len());
             for v in values {
                 match v {
-                    Value::String(s) => out.push(s.to_lossy_string()),
+                    Value::String(s) => out.push(s.to_lossy_string(gc_heap)),
                     Value::Number(n) => out.push(n.to_display_string()),
                     Value::Boolean(b) => out.push((if b { "true" } else { "false" }).to_string()),
                     _ => {

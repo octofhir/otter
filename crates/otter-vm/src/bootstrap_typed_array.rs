@@ -908,7 +908,7 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
     };
 
     Ok(Value::String(
-        crate::string::JsString::from_str(kind_name, ctx.heap()).map_err(|_| {
+        crate::string::JsString::from_str(kind_name, ctx.heap_mut()).map_err(|_| {
             NativeError::TypeError {
                 name: "TypedArray.prototype[@@toStringTag]",
                 reason: "out of memory".to_string(),

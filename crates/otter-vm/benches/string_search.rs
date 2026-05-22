@@ -31,7 +31,7 @@ fn scalar_find_byte(bytes: &[u8], c: u8, from: usize) -> Option<usize> {
 }
 
 fn bench_string_search(c: &mut Criterion) {
-    let heap = otter_gc::GcHeap::new().expect("gc heap");
+    let mut heap = otter_gc::GcHeap::new().expect("gc heap");
 
     let buf_late = make_clean(1024, Some(1000));
     let needle_5 = b"NEEDL";
@@ -115,11 +115,11 @@ fn bench_string_search(c: &mut Criterion) {
 
     // End-to-end through JsString::starts_with so we measure the
     // full Latin-1 fast path (including `as_latin1`).
-    let h_str = JsString::from_latin1(&make_clean(32, Some(0)), &heap).unwrap();
-    let p_str = JsString::from_latin1(b"NEEDLabcd", &heap).unwrap();
+    let h_str = JsString::from_latin1(&make_clean(32, Some(0)), &mut heap).unwrap();
+    let p_str = JsString::from_latin1(b"NEEDLabcd", &mut heap).unwrap();
     let mut g = c.benchmark_group("string_search/starts_with_short");
     g.bench_function("starts_with_latin1_path", |b| {
-        b.iter(|| black_box(&h_str).starts_with(black_box(&p_str), 0))
+        b.iter(|| black_box(&h_str).starts_with(black_box(&p_str), 0, &heap))
     });
     g.finish();
 }

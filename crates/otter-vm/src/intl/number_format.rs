@@ -43,7 +43,7 @@ pub fn resolve(
     let currency = match style.as_str() {
         "currency" => {
             match opts_ref.and_then(|o| match crate::object::get(*o, gc_heap, "currency") {
-                Some(Value::String(s)) => Some(s.to_lossy_string().to_uppercase()),
+                Some(Value::String(s)) => Some(s.to_lossy_string(gc_heap).to_uppercase()),
                 _ => None,
             }) {
                 Some(c) => Some(c),
@@ -82,7 +82,7 @@ pub fn resolve(
     );
     let use_grouping = read_bool_option(opts_ref, "useGrouping", true, gc_heap);
     Ok(NumberFormatPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         style,
         currency,
         minimum_fraction_digits,
@@ -109,7 +109,10 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_number_format(args)?;
     let n = match args.args.first() {
         Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s.to_lossy_string().parse::<f64>().unwrap_or(f64::NAN),
+        Some(Value::String(s)) => s
+            .to_lossy_string(args.gc_heap)
+            .parse::<f64>()
+            .unwrap_or(f64::NAN),
         Some(Value::Boolean(b)) => {
             if *b {
                 1.0
@@ -126,9 +129,12 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_number_format(args)?;
-    let locale = js_string_value(&payload.locale, args)?;
-    let style = js_string_value(&payload.style, args)?;
-    let currency_val = match &payload.currency {
+    let payload_locale = payload.locale.clone();
+    let payload_style = payload.style.clone();
+    let payload_currency = payload.currency.clone();
+    let locale = js_string_value(&payload_locale, args)?;
+    let style = js_string_value(&payload_style, args)?;
+    let currency_val = match &payload_currency {
         Some(c) => Some(js_string_value(c, args)?),
         None => None,
     };
@@ -162,7 +168,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     Ok(Value::Object(obj))
 }
 
-fn js_string_value(s: &str, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(crate::string::JsString::from_str(
         s,
         args.gc_heap,

@@ -1200,7 +1200,7 @@ fn call_capability_reject(
     call_capability_function(interp, cap, &cap.reject, reason)
 }
 
-fn native_error_rejection_value(err: NativeError, heap: &otter_gc::GcHeap) -> Value {
+fn native_error_rejection_value(err: NativeError, heap: &mut otter_gc::GcHeap) -> Value {
     if let NativeError::Thrown { message, .. } = err {
         return Value::String(
             crate::JsString::from_str(&message, heap).unwrap_or_else(|_| {
@@ -1221,7 +1221,7 @@ fn native_error_rejection_value_preserving_throw(
     {
         return value;
     }
-    native_error_rejection_value(err, interp.gc_heap())
+    native_error_rejection_value(err, interp.gc_heap_mut())
 }
 
 fn reject_capability_error(
@@ -1547,12 +1547,12 @@ fn static_try_generic(
         Err(crate::VmError::Uncaught { value }) => {
             let reason = crate::error_ops::vm_err_to_value(
                 &crate::VmError::Uncaught { value },
-                interp.gc_heap(),
+                interp.gc_heap_mut(),
             );
             call_capability_reject(interp, &cap, reason)?;
         }
         Err(other) => {
-            let reason = crate::error_ops::vm_err_to_value(&other, interp.gc_heap());
+            let reason = crate::error_ops::vm_err_to_value(&other, interp.gc_heap_mut());
             call_capability_reject(interp, &cap, reason)?;
         }
     }
@@ -1626,7 +1626,7 @@ fn static_all_keyed_generic(
         interp.push_iteration_anchor(slots_root.clone());
         interp.push_iteration_anchor(keys_root.clone());
         for key in all_keys {
-            let Some(vm_key) = vm_property_key_from_value(&key) else {
+            let Some(vm_key) = vm_property_key_from_value(&key, interp.gc_heap()) else {
                 continue;
             };
             let desc = match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
@@ -1757,9 +1757,12 @@ fn static_all_keyed_generic(
     })()
 }
 
-fn vm_property_key_from_value(key: &Value) -> Option<crate::VmPropertyKey<'static>> {
+fn vm_property_key_from_value(
+    key: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Option<crate::VmPropertyKey<'static>> {
     match key {
-        Value::String(s) => Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::String(s) => Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
         Value::Symbol(sym) => Some(crate::VmPropertyKey::Symbol(sym.clone())),
         _ => None,
     }
@@ -1898,7 +1901,7 @@ fn define_keyed_result_properties(
         let desc = crate::object::PropertyDescriptor::data(value.clone(), true, true, true);
         let ok = match key {
             Value::String(s) => {
-                let key = s.to_lossy_string();
+                let key = s.to_lossy_string(heap);
                 crate::object::define_own_property(obj, heap, &key, desc)
             }
             Value::Symbol(sym) => crate::object::define_own_symbol_property(obj, heap, sym, desc),
@@ -2376,11 +2379,12 @@ fn build_settled_record(
     ctx: &mut NativeCtx<'_>,
 ) -> Result<Value, NativeError> {
     let status_text = if fulfilled { "fulfilled" } else { "rejected" };
-    let status =
-        crate::JsString::from_str(status_text, ctx.heap()).map_err(|e| NativeError::TypeError {
+    let status = crate::JsString::from_str(status_text, ctx.heap_mut()).map_err(|e| {
+        NativeError::TypeError {
             name: "Promise",
             reason: format!("string allocation failed: {e}"),
-        })?;
+        }
+    })?;
     let key = if fulfilled { "value" } else { "reason" };
     let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
         name: "Promise",
@@ -2404,7 +2408,7 @@ fn make_aggregate_error_runtime_rooted(
     registry: &ErrorClassRegistry,
     errors: Vec<Value>,
 ) -> Result<Value, NativeError> {
-    let message = aggregate_error_message(interp.gc_heap())?;
+    let message = aggregate_error_message(interp.gc_heap_mut())?;
     let obj = interp
         .alloc_runtime_rooted_object_with_roots(&[&message], &[&errors])
         .map_err(|_| oom_native("Promise.any"))?;
@@ -2449,7 +2453,7 @@ fn make_aggregate_error_native_rooted(
     registry: &ErrorClassRegistry,
     errors: Vec<Value>,
 ) -> Result<Value, NativeError> {
-    let message = aggregate_error_message(ctx.heap())?;
+    let message = aggregate_error_message(ctx.heap_mut())?;
     let obj = ctx
         .alloc_object_with_roots(&[&message], &[&errors])
         .map_err(|_| oom_native("Promise.any"))?;
@@ -2478,7 +2482,7 @@ fn make_aggregate_error_native_rooted(
     Ok(Value::Object(obj))
 }
 
-fn aggregate_error_message(heap: &otter_gc::GcHeap) -> Result<Value, NativeError> {
+fn aggregate_error_message(heap: &mut otter_gc::GcHeap) -> Result<Value, NativeError> {
     Ok(Value::String(
         JsString::from_str("All promises were rejected", heap).map_err(|e| {
             NativeError::TypeError {

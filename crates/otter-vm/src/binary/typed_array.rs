@@ -232,39 +232,39 @@ impl TypedArrayKind {
         }
         match self {
             Self::Int8 => {
-                let n = number_to_int_truncated(value);
+                let n = number_to_int_truncated(value, heap);
                 bytes[offset] = (n as i8) as u8;
             }
             Self::Uint8 => {
-                let n = number_to_int_truncated(value);
+                let n = number_to_int_truncated(value, heap);
                 bytes[offset] = n as u8;
             }
             Self::Uint8Clamped => {
-                let n = to_uint8_clamp(value);
+                let n = to_uint8_clamp(value, heap);
                 bytes[offset] = n;
             }
             Self::Int16 => {
-                let n = number_to_int_truncated(value) as i16;
+                let n = number_to_int_truncated(value, heap) as i16;
                 bytes[offset..offset + 2].copy_from_slice(&n.to_le_bytes());
             }
             Self::Uint16 => {
-                let n = number_to_int_truncated(value) as u16;
+                let n = number_to_int_truncated(value, heap) as u16;
                 bytes[offset..offset + 2].copy_from_slice(&n.to_le_bytes());
             }
             Self::Int32 => {
-                let n = bitwise::to_int32(value_to_number(value));
+                let n = bitwise::to_int32(value_to_number(value, heap));
                 bytes[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
             }
             Self::Uint32 => {
-                let n = bitwise::to_uint32(value_to_number(value));
+                let n = bitwise::to_uint32(value_to_number(value, heap));
                 bytes[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
             }
             Self::Float32 => {
-                let n = value_to_number(value).as_f64() as f32;
+                let n = value_to_number(value, heap).as_f64() as f32;
                 bytes[offset..offset + 4].copy_from_slice(&n.to_le_bytes());
             }
             Self::Float64 => {
-                let n = value_to_number(value).as_f64();
+                let n = value_to_number(value, heap).as_f64();
                 bytes[offset..offset + 8].copy_from_slice(&n.to_le_bytes());
             }
             Self::BigInt64 => {
@@ -281,8 +281,8 @@ impl TypedArrayKind {
 
 /// §6.1.6.1.5 `Number::ToInt(value)` — truncate toward zero. NaN and
 /// infinities map to `0`.
-fn number_to_int_truncated(value: &Value) -> i64 {
-    let n = value_to_number(value).as_f64();
+fn number_to_int_truncated(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
+    let n = value_to_number(value, heap).as_f64();
     if !n.is_finite() {
         return 0;
     }
@@ -290,8 +290,8 @@ fn number_to_int_truncated(value: &Value) -> i64 {
 }
 
 /// §6.1.6.1 `ToUint8Clamp(value)`.
-fn to_uint8_clamp(value: &Value) -> u8 {
-    let n = value_to_number(value).as_f64();
+fn to_uint8_clamp(value: &Value, heap: &otter_gc::GcHeap) -> u8 {
+    let n = value_to_number(value, heap).as_f64();
     if n.is_nan() || n <= 0.0 {
         return 0;
     }
@@ -317,13 +317,13 @@ fn to_uint8_clamp(value: &Value) -> u8 {
 
 /// Coerce a JS value to a Number per §7.1.4 ToNumber. BigInt → drop
 /// to NaN (the per-kind path handles BigInt arrays separately).
-fn value_to_number(value: &Value) -> NumberValue {
+fn value_to_number(value: &Value, heap: &otter_gc::GcHeap) -> NumberValue {
     match value {
         Value::Number(n) => *n,
         Value::Boolean(true) => NumberValue::from_i32(1),
         Value::Boolean(false) | Value::Null => NumberValue::from_i32(0),
         Value::Undefined => NumberValue::from_f64(f64::NAN),
-        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string()),
+        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string(heap)),
         Value::BigInt(_) => NumberValue::from_f64(f64::NAN),
         _ => NumberValue::from_f64(f64::NAN),
     }

@@ -220,12 +220,12 @@ fn legacy_accessor_getter(
             reason: "Method called on incompatible receiver".to_string(),
         });
     }
-    Ok(Value::String(JsString::from_str("", ctx.heap()).map_err(
-        |_| NativeError::TypeError {
+    Ok(Value::String(
+        JsString::from_str("", ctx.heap_mut()).map_err(|_| NativeError::TypeError {
             name: "RegExp legacy accessor",
             reason: "out of memory".to_string(),
-        },
-    )?))
+        })?,
+    ))
 }
 
 /// §B.2.4.2 `SetLegacyRegExpStaticProperty` — accepts the assignment
@@ -440,13 +440,13 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         Vec::new()
     } else {
         crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &pattern_source, "RegExp")?
-            .to_utf16_vec()
+            .to_utf16_vec(ctx.heap())
     };
     let flags_str = if matches!(flags_value, Value::Undefined) {
         String::new()
     } else {
         crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &flags_value, "RegExp")?
-            .to_lossy_string()
+            .to_lossy_string(ctx.heap())
     };
 
     let heap = ctx.heap_mut();
@@ -581,7 +581,7 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
                 "RegExp.prototype.compile",
             )?;
             let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
-            (pattern.to_utf16_vec(), flags_text)
+            (pattern.to_utf16_vec(ctx.heap()), flags_text)
         }
     };
     let old_last_index = re.last_index_value(ctx.heap());
@@ -607,7 +607,7 @@ fn compile_flags_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<Str
             value,
             "RegExp.prototype.compile",
         )?
-        .to_lossy_string(),
+        .to_lossy_string(ctx.heap()),
     )
 }
 
@@ -635,8 +635,8 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
     let flags = re.flags(ctx.heap()).to_js_string();
     let rendered = format!("/{source}/{flags}");
 
-    let s =
-        JsString::from_str(&rendered, ctx.heap()).map_err(|_| oom("RegExp.prototype.toString"))?;
+    let s = JsString::from_str(&rendered, ctx.heap_mut())
+        .map_err(|_| oom("RegExp.prototype.toString"))?;
     Ok(Value::String(s))
 }
 
@@ -735,7 +735,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
                 });
             }
             return Ok(Value::String(
-                JsString::from_str("(?:)", ctx.heap()).map_err(|_| oom("source"))?,
+                JsString::from_str("(?:)", ctx.heap_mut()).map_err(|_| oom("source"))?,
             ));
         }
         _ => {
@@ -747,7 +747,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
     };
     let escaped = crate::regexp_prototype::escape_regexp_pattern(&raw);
     Ok(Value::String(
-        JsString::from_str(&escaped, ctx.heap()).map_err(|_| oom("source"))?,
+        JsString::from_str(&escaped, ctx.heap_mut()).map_err(|_| oom("source"))?,
     ))
 }
 
@@ -839,7 +839,7 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     }
 
     Ok(Value::String(
-        JsString::from_str(&out, ctx.heap()).map_err(|_| oom("flags"))?,
+        JsString::from_str(&out, ctx.heap_mut()).map_err(|_| oom("flags"))?,
     ))
 }
 
@@ -905,11 +905,11 @@ fn coerce_to_string(
     name: &'static str,
 ) -> Result<JsString, NativeError> {
     if let Value::String(s) = v {
-        return Ok(s.clone());
+        return Ok(*s);
     }
     let s = v.display_string(ctx.heap());
 
-    JsString::from_str(&s, ctx.heap()).map_err(|_| oom(name))
+    JsString::from_str(&s, ctx.heap_mut()).map_err(|_| oom(name))
 }
 
 fn oom(name: &'static str) -> NativeError {

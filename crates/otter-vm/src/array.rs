@@ -872,7 +872,7 @@ pub fn set_named_property(
             return Ok(());
         }
         let number_len =
-            crate::number::NumberValue::from_f64(crate::number::to_number_value(&value));
+            crate::number::NumberValue::from_f64(crate::number::to_number_value(&value, heap));
         let new_len = crate::number::bitwise::to_uint32(number_len);
         if (new_len as f64) != number_len.as_f64() {
             return Ok(());

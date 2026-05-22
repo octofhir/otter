@@ -296,7 +296,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         // route it through the captured native `reject`. The
         // resolve / reject natives are idempotent once the
         // promise is settled.
-        let reason = vm_err_to_value(&err, ctx.heap());
+        let reason = vm_err_to_value(&err, ctx.heap_mut());
         let _ = ctx.interp_mut().run_callable_sync(
             &context,
             &reject,
@@ -456,7 +456,7 @@ fn oom(name: &'static str) -> NativeError {
     }
 }
 
-fn vm_err_to_value(err: &VmError, heap: &otter_gc::GcHeap) -> Value {
+fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Value {
     Value::String(
         crate::JsString::from_str(&err.to_string(), heap).unwrap_or_else(|_| {
             crate::JsString::from_str("", heap).expect("empty string allocates")

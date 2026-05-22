@@ -308,7 +308,7 @@ pub(crate) fn render_error_to_string_spec(
             Value::Symbol(_) => Err(crate::VmError::TypeError {
                 message: format!("Cannot convert a Symbol value to a string ('{key}')"),
             }),
-            Value::String(s) => Ok(s.to_lossy_string()),
+            Value::String(s) => Ok(s.to_lossy_string(interp.gc_heap())),
             Value::Null | Value::Boolean(_) | Value::Number(_) | Value::BigInt(_) => {
                 Ok(value.display_string(interp.gc_heap()))
             }
@@ -322,7 +322,7 @@ pub(crate) fn render_error_to_string_spec(
                     Value::Symbol(_) => Err(crate::VmError::TypeError {
                         message: format!("Cannot convert a Symbol value to a string ('{key}')"),
                     }),
-                    Value::String(s) => Ok(s.to_lossy_string()),
+                    Value::String(s) => Ok(s.to_lossy_string(interp.gc_heap())),
                     other => Ok(other.display_string(interp.gc_heap())),
                 }
             }
@@ -355,11 +355,11 @@ pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> Stri
     // [`render_error_to_string_spec`] for that.
     let name = match crate::object::get(*obj, gc_heap, "name") {
         Some(Value::Undefined) | None => "Error".to_string(),
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
         Some(other) => other.display_string(gc_heap),
     };
     let message = match crate::object::get(*obj, gc_heap, "message") {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
         Some(Value::Undefined) | None => String::new(),
         Some(other) => other.display_string(gc_heap),
     };
@@ -479,11 +479,12 @@ impl ErrorClassRegistry {
                     },
                 },
             )?;
-            let s =
-                JsString::from_str(&display, ctx.heap()).map_err(|err| NativeError::TypeError {
+            let s = JsString::from_str(&display, ctx.heap_mut()).map_err(|err| {
+                NativeError::TypeError {
                     name: "Error.prototype.toString",
                     reason: err.to_string(),
-                })?;
+                }
+            })?;
             Ok(Value::String(s))
         }
         let to_string_native = native_static_with_roots(
@@ -566,7 +567,7 @@ impl ErrorClassRegistry {
             // (with `Symbol.toPrimitive`) lands in a follow-up.
             let message = match args.first() {
                 None | Some(Value::Undefined) => None,
-                Some(Value::String(s)) => Some(s.to_lossy_string()),
+                Some(Value::String(s)) => Some(s.to_lossy_string(ctx.heap())),
                 Some(Value::Symbol(_)) => {
                     return Err(NativeError::TypeError {
                         name: kind.class_name(),
@@ -662,7 +663,7 @@ impl ErrorClassRegistry {
         fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
             let message = match a.get(1) {
                 None | Some(Value::Undefined) => None,
-                Some(Value::String(s)) => Some(s.to_lossy_string()),
+                Some(Value::String(s)) => Some(s.to_lossy_string(c.heap())),
                 Some(Value::Symbol(_)) => {
                     return Err(NativeError::TypeError {
                         name: "AggregateError",
@@ -1017,7 +1018,7 @@ impl ErrorClassRegistry {
             })?;
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto));
         if let Some(text) = message {
-            let s = JsString::from_str(text, ctx.heap())?;
+            let s = JsString::from_str(text, ctx.heap_mut())?;
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
             // [[Writable]]: true, [[Enumerable]]: false,
             // [[Configurable]]: true }`. Going through ordinary

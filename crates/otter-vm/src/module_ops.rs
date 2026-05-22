@@ -48,19 +48,19 @@ impl Interpreter {
     }
 
     pub(crate) fn run_import_meta_resolve_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         spec_reg: u16,
     ) -> Result<(), VmError> {
         let spec_value = read_register(frame, spec_reg)?.clone();
         let specifier = match spec_value {
-            Value::String(s) => s.to_lossy_string(),
+            Value::String(s) => s.to_lossy_string(&self.gc_heap),
             _ => return Err(VmError::TypeMismatch),
         };
         let resolved = resolve_relative_url(Some(&frame.module_url), &specifier);
         let resolved_str =
-            JsString::from_str(&resolved, &self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
+            JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
         write_register(frame, dst, Value::String(resolved_str))?;
         frame.pc += 1;
         Ok(())
@@ -80,7 +80,7 @@ impl Interpreter {
         let import_context = context.clone();
         let promise = match spec_value {
             Value::String(s) => {
-                let specifier = s.to_lossy_string();
+                let specifier = s.to_lossy_string(&self.gc_heap);
                 if let Some(ns) =
                     self.resolve_module_namespace(context, referrer.as_ref(), &specifier)
                 {

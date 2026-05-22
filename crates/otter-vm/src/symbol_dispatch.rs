@@ -86,7 +86,7 @@ impl From<crate::symbol::SymbolRegistryError> for SymbolError {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-well-known-symbols>
-pub fn load_static(interp: &Interpreter, name: &str) -> Result<Value, SymbolError> {
+pub fn load_static(interp: &mut Interpreter, name: &str) -> Result<Value, SymbolError> {
     // Try to fetch the named own property from the realm-installed
     // Symbol constructor first. `Symbol.prototype`, `Symbol.for`,
     // `Symbol.keyFor`, plus every well-known own-data symbol slot
@@ -99,7 +99,7 @@ pub fn load_static(interp: &Interpreter, name: &str) -> Result<Value, SymbolErro
             }
         }
         Some(Value::NativeFunction(native)) => {
-            if let Ok(Some(desc)) = native.own_property_descriptor(&interp.gc_heap, name)
+            if let Ok(Some(desc)) = native.own_property_descriptor(&mut interp.gc_heap, name)
                 && let crate::object::DescriptorKind::Data { value } = desc.kind
             {
                 return Ok(value);
@@ -147,7 +147,7 @@ pub fn call(
 fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
     let description = match args.first() {
         None | Some(Value::Undefined) => None,
-        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::String(s)) => Some(*s),
         // §7.1.17 ToString rejects Symbol with TypeError.
         Some(Value::Symbol(_)) => {
             return Err(SymbolError::BadArgument {
@@ -180,7 +180,7 @@ fn symbol_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolE
 }
 
 /// `Symbol.keyFor(sym)` — Spec §20.4.2.6.
-fn symbol_key_for(interp: &Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
+fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
     let sym = match args.first() {
         Some(Value::Symbol(s)) => s,
         _ => {
@@ -193,7 +193,7 @@ fn symbol_key_for(interp: &Interpreter, args: &[Value]) -> Result<Value, SymbolE
     };
     match interp.symbol_registry().key_for(sym) {
         Some(key) => {
-            let s = JsString::from_str(&key, interp.gc_heap())?;
+            let s = JsString::from_str(&key, interp.gc_heap_mut())?;
             Ok(Value::String(s))
         }
         None => Ok(Value::Undefined),
@@ -210,7 +210,7 @@ fn key_argument(
 ) -> Result<String, SymbolError> {
     match args.first() {
         None | Some(Value::Undefined) => Ok("undefined".to_string()),
-        Some(Value::String(s)) => Ok(s.to_lossy_string()),
+        Some(Value::String(s)) => Ok(s.to_lossy_string(heap)),
         Some(Value::Symbol(_)) => Err(SymbolError::BadArgument {
             name,
             index: 0,

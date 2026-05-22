@@ -360,7 +360,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     check_not_detached(&t, &*args.gc_heap)?;
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => ",".to_string(),
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         Some(other) => other.display_string(args.gc_heap),
     };
     join_into_string(&t, &separator, args.gc_heap)
@@ -465,7 +465,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             // the destination kind.
             let len_value =
                 crate::object::get(obj, args.gc_heap, "length").unwrap_or(Value::Undefined);
-            let len_n = crate::number::to_number_value(&len_value);
+            let len_n = crate::number::to_number_value(&len_value, args.gc_heap);
             let src_len = if len_n.is_nan() || len_n <= 0.0 {
                 0
             } else {
@@ -490,7 +490,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         // indexed slots (length = 0, no-op write). Symbol /
         // BigInt fall through to TypeError per ToObject.
         Value::String(s) => {
-            let units = s.to_utf16_vec();
+            let units = s.to_utf16_vec(args.gc_heap);
             let src_len = units.len();
             if off + src_len > t.length(args.gc_heap) {
                 return Err(IntrinsicError::BadArgument {
@@ -788,7 +788,7 @@ mod tests {
         // `tracked_bytes` includes the new GC body plus the 4-byte
         // external backing store reservation.
         assert!(gc_heap.tracked_bytes() - before >= 4);
-        drop(result);
+        let _ = result;
         gc_heap.collect_full(&mut |_| {});
         // The source view + its buffer still live, so the post-GC
         // delta is the source buffer's body overhead. Just verify

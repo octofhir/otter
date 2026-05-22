@@ -403,7 +403,7 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
 /// reason for promise reactions. Foundation: a plain string is
 /// fine; once the full Error hierarchy is in we'll synthesize a
 /// real `TypeError` / `RangeError` instance.
-pub(crate) fn vm_err_to_value(err: &VmError, heap: &otter_gc::GcHeap) -> Value {
+pub(crate) fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Value {
     Value::String(
         crate::JsString::from_str(&err.to_string(), heap).unwrap_or_else(|_| {
             // Allocator failure here is exceptional; substitute

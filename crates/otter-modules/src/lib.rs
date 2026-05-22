@@ -89,7 +89,7 @@ fn value_to_json(
         Value::Number(value) => JsonNumber::from_f64(value.as_f64())
             .map(JsonValue::Number)
             .ok_or_else(|| type_error("json", "number is not finite JSON")),
-        Value::String(value) => Ok(JsonValue::String(value.to_lossy_string())),
+        Value::String(value) => Ok(JsonValue::String(value.to_lossy_string(heap))),
         other => Err(type_error(
             "json",
             format!("cannot convert {} to JSON", other.display_string(heap)),

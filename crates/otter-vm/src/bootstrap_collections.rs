@@ -215,13 +215,17 @@ impl CollectionKind {
     }
 }
 
-fn ctor_prototype(global: JsObject, heap: &otter_gc::GcHeap, ctor_name: &str) -> Option<JsObject> {
+fn ctor_prototype(
+    global: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    ctor_name: &str,
+) -> Option<JsObject> {
     let ctor = object::get(global, heap, ctor_name)?;
     let Value::NativeFunction(f) = ctor else {
         return None;
     };
     let descriptor = f
-        .own_property_descriptor(heap, "prototype")
+        .own_property_descriptor(&mut *heap, "prototype")
         .ok()
         .flatten()?;
     match descriptor.kind {
@@ -1982,7 +1986,7 @@ fn to_number_runtime(
             name,
             reason: "cannot convert value to number".to_string(),
         }),
-        value => Ok(crate::number::to_number_value(&value)),
+        value => Ok(crate::number::to_number_value(&value, ctx.heap())),
     }
 }
 

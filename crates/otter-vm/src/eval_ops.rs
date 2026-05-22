@@ -80,7 +80,7 @@ impl Interpreter {
     ///   parsing / compilation fail.
     pub(crate) fn run_eval(&mut self, value: &Value, force_strict: bool) -> Result<Value, VmError> {
         let source = match value {
-            Value::String(s) => s.to_lossy_string(),
+            Value::String(s) => s.to_lossy_string(&self.gc_heap),
             // Per §19.4.1.1 step 4, eval'd non-strings are returned
             // unchanged — `eval(42) === 42`.
             _ => return Ok(value.clone()),
@@ -197,16 +197,16 @@ impl Interpreter {
         if !matches!(value, Value::Function { .. } | Value::Closure(_)) {
             return Ok(value);
         }
-        let metadata_ctx = function_metadata::FunctionMetadataContext::new(
+        let mut metadata_ctx = function_metadata::FunctionMetadataContext::new(
             &function_context,
-            &self.gc_heap,
+            &mut self.gc_heap,
             &self.function_user_props,
             &self.function_deleted_metadata,
         );
         let name_value =
-            function_metadata::callable_intrinsic_property(&metadata_ctx, &value, "name")?;
+            function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "name")?;
         let length_value =
-            function_metadata::callable_intrinsic_property(&metadata_ctx, &value, "length")?;
+            function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "length")?;
         let prototype_value = match &value {
             Value::Function { function_id }
             | Value::Closure(crate::closure::JsClosure {
@@ -336,7 +336,7 @@ impl Interpreter {
             other => other.clone(),
         };
         match primitive {
-            Value::String(s) => Ok(s.to_lossy_string()),
+            Value::String(s) => Ok(s.to_lossy_string(&self.gc_heap)),
             Value::Symbol(_) => Err(VmError::TypeError {
                 message: "Cannot convert a Symbol value to a string".to_string(),
             }),

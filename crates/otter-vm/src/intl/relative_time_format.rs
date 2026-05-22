@@ -24,7 +24,7 @@ pub fn resolve(
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     RelativeTimeFormatPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         style: read_string_option(opts_ref, "style", "long", gc_heap),
         numeric: read_string_option(opts_ref, "numeric", "always", gc_heap),
     }
@@ -109,7 +109,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         _ => f64::NAN,
     };
     let unit = match args.args.get(1) {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         _ => {
             return Err(IntrinsicError::BadArgument {
                 index: 1,

@@ -1145,7 +1145,7 @@ pub fn has_in_proto_chain(obj: JsObject, heap: &otter_gc::GcHeap, target: JsObje
 /// sites that already hold the WTF-16 form.
 #[must_use]
 pub fn get_jsstring(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsString) -> Option<Value> {
-    let utf8 = key.to_lossy_string();
+    let utf8 = key.to_lossy_string(heap);
     get(obj, heap, &utf8)
 }
 
@@ -1311,7 +1311,7 @@ pub fn set_string_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: JsStri
 /// Read the `[[StringData]]` internal slot for a String wrapper.
 #[must_use]
 pub fn string_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsString> {
-    heap.read_payload(obj, |body| body.string_data.clone())
+    heap.read_payload(obj, |body| body.string_data)
 }
 
 /// Store the `[[SymbolData]]` internal slot for a Symbol wrapper.

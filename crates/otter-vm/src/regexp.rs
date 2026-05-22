@@ -430,9 +430,11 @@ impl JsRegExp {
     /// Read `lastIndex`.
     #[must_use]
     pub fn last_index(&self, heap: &otter_gc::GcHeap) -> u32 {
-        heap.read_payload(self.inner, |body| {
-            last_index_to_u32(&body.last_index.borrow())
-        })
+        // `read_payload` holds a shared borrow on the heap for the
+        // duration of the closure; route the helper through it so the
+        // nested `to_lossy_string(heap)` reborrows shared.
+        let raw = heap.read_payload(self.inner, |body| body.last_index.borrow().clone());
+        last_index_to_u32(&raw, heap)
     }
 
     /// Read the JS-visible `lastIndex` data-property value.
@@ -494,11 +496,11 @@ impl JsRegExp {
     }
 }
 
-fn last_index_to_u32(value: &Value) -> u32 {
+fn last_index_to_u32(value: &Value, heap: &otter_gc::GcHeap) -> u32 {
     let raw = match value {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s
-            .to_lossy_string()
+            .to_lossy_string(heap)
             .trim()
             .parse::<f64>()
             .unwrap_or(f64::NAN),

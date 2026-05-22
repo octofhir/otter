@@ -45,12 +45,14 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
                 });
             }
         },
-        Some(Value::String(s)) => temporal_rs::PlainTime::from_utf8(s.to_lossy_string().as_bytes())
-            .map_err(|e| TemporalError::Engine {
-                class: "PlainTime",
-                method: "from",
-                message: e.to_string(),
-            })?,
+        Some(Value::String(s)) => temporal_rs::PlainTime::from_utf8(
+            s.to_lossy_string(gc_heap).as_bytes(),
+        )
+        .map_err(|e| TemporalError::Engine {
+            class: "PlainTime",
+            method: "from",
+            message: e.to_string(),
+        })?,
         _ => {
             return Err(TemporalError::BadArgument {
                 class: "PlainTime",

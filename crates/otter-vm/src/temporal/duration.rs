@@ -55,12 +55,14 @@ pub fn dispatch_static(
 /// Spec §7.2.1 `Temporal.Duration.from`.
 fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
     let dur = match args.first() {
-        Some(Value::String(s)) => temporal_rs::Duration::from_utf8(s.to_lossy_string().as_bytes())
-            .map_err(|e| TemporalError::Engine {
-                class: "Duration",
-                method: "from",
-                message: e.to_string(),
-            })?,
+        Some(Value::String(s)) => temporal_rs::Duration::from_utf8(
+            s.to_lossy_string(gc_heap).as_bytes(),
+        )
+        .map_err(|e| TemporalError::Engine {
+            class: "Duration",
+            method: "from",
+            message: e.to_string(),
+        })?,
         Some(Value::Object(obj)) => {
             partial_from_object(obj, gc_heap).map_err(|e| TemporalError::Engine {
                 class: "Duration",
@@ -125,12 +127,15 @@ fn expect_duration(
                 reason: "must be a Temporal.Duration",
             }),
         },
-        Some(Value::String(s)) => temporal_rs::Duration::from_utf8(s.to_lossy_string().as_bytes())
-            .map_err(|e| TemporalError::Engine {
-                class: "Duration",
-                method: "compare",
-                message: e.to_string(),
-            }),
+        Some(Value::String(s)) => {
+            temporal_rs::Duration::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
+                TemporalError::Engine {
+                    class: "Duration",
+                    method: "compare",
+                    message: e.to_string(),
+                }
+            })
+        }
         Some(Value::Object(obj)) => {
             partial_from_object(obj, gc_heap).map_err(|e| TemporalError::Engine {
                 class: "Duration",

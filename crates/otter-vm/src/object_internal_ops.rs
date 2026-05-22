@@ -48,7 +48,7 @@ fn primitive_to_property_key(
 ) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
         Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym)),
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
         Value::Number(n) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
         Value::Boolean(true) => Ok(VmPropertyKey::String("true")),
         Value::Boolean(false) => Ok(VmPropertyKey::String("false")),
@@ -59,9 +59,12 @@ fn primitive_to_property_key(
     }
 }
 
-fn property_key_value_to_vm_key(value: &Value) -> Result<VmPropertyKey<'static>, VmError> {
+fn property_key_value_to_vm_key(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
         Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
         _ => Err(VmError::TypeError {
             message: "property key must be a string or symbol".to_string(),
@@ -206,9 +209,12 @@ impl Interpreter {
         Ok(Some(result))
     }
 
-    pub(crate) fn vm_property_key_to_value(&self, key: &VmPropertyKey) -> Result<Value, VmError> {
+    pub(crate) fn vm_property_key_to_value(
+        &mut self,
+        key: &VmPropertyKey,
+    ) -> Result<Value, VmError> {
         if let Some(key) = key.string_name() {
-            Ok(Value::String(JsString::from_str(key, &self.gc_heap)?))
+            Ok(Value::String(JsString::from_str(key, &mut self.gc_heap)?))
         } else if let VmPropertyKey::Symbol(sym) = key {
             Ok(Value::Symbol(sym.clone()))
         } else {
@@ -234,7 +240,7 @@ impl Interpreter {
     }
 
     pub(crate) fn string_object_exotic_get(
-        &self,
+        &mut self,
         obj: JsObject,
         key: &VmPropertyKey,
     ) -> Result<Option<Value>, VmError> {
@@ -252,24 +258,24 @@ impl Interpreter {
         let Ok(index) = key.parse::<u32>() else {
             return Ok(None);
         };
-        let Some(unit) = value.char_code_at(index) else {
+        let Some(unit) = value.char_code_at(index, &self.gc_heap) else {
             return Ok(None);
         };
         Ok(Some(Value::String(JsString::from_utf16_units(
             &[unit],
-            &self.gc_heap,
+            &mut self.gc_heap,
         )?)))
     }
 
     pub(crate) fn string_object_exotic_descriptor(
-        &self,
+        &mut self,
         obj: JsObject,
         key: &VmPropertyKey,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
         let Some(value) = object::string_data(obj, &self.gc_heap) else {
             return Ok(None);
         };
-        string::exotic::descriptor_for_key(&value, key, &self.gc_heap)
+        string::exotic::descriptor_for_key(&value, key, &mut self.gc_heap)
     }
 
     fn target_is_non_extensible_object(&self, target: &Value) -> bool {
@@ -386,7 +392,7 @@ impl Interpreter {
     }
 
     pub(crate) fn constructor_prototype_value(
-        &self,
+        &mut self,
         constructor_name: &str,
     ) -> Result<Value, VmError> {
         match object::get(self.global_this, &self.gc_heap, constructor_name) {
@@ -394,7 +400,7 @@ impl Interpreter {
                 Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::Null))
             }
             Some(Value::NativeFunction(ctor)) => {
-                match ctor.own_property_descriptor(&self.gc_heap, "prototype") {
+                match ctor.own_property_descriptor(&mut self.gc_heap, "prototype") {
                     Ok(Some(descriptor)) => Ok(descriptor_value(&descriptor)),
                     _ => Ok(Value::Null),
                 }
@@ -527,7 +533,9 @@ impl Interpreter {
                     None
                 })
             }
-            Value::String(value) => string::exotic::descriptor_for_key(&value, key, &self.gc_heap),
+            Value::String(value) => {
+                string::exotic::descriptor_for_key(&value, key, &mut self.gc_heap)
+            }
             Value::Array(arr) => {
                 // §10.4.2 — own symbol-keyed properties live in a
                 // dedicated side table; surface their data
@@ -680,7 +688,7 @@ impl Interpreter {
                 let Some(key) = key.string_name() else {
                     return Ok(None);
                 };
-                function_metadata::bound_own_property_descriptor(&bound, &self.gc_heap, key)
+                function_metadata::bound_own_property_descriptor(&bound, &mut self.gc_heap, key)
             }
             Value::NativeFunction(native) => Ok(match key {
                 VmPropertyKey::Symbol(sym) => {
@@ -690,7 +698,7 @@ impl Interpreter {
                     let key = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    native.own_property_descriptor(&self.gc_heap, key)?
+                    native.own_property_descriptor(&mut self.gc_heap, key)?
                 }
             }),
             _ => Ok(None),
@@ -1218,7 +1226,7 @@ impl Interpreter {
             return Ok(false);
         }
         for key_value in &keys {
-            let key = property_key_value_to_vm_key(key_value)?;
+            let key = property_key_value_to_vm_key(key_value, &self.gc_heap)?;
             let descriptor = match level {
                 ObjectIntegrityLevel::Sealed => object::PartialPropertyDescriptor {
                     configurable: Some(false),
@@ -1268,7 +1276,7 @@ impl Interpreter {
         }
         let keys = self.own_property_keys_value(context, target)?;
         for key_value in &keys {
-            let key = property_key_value_to_vm_key(key_value)?;
+            let key = property_key_value_to_vm_key(key_value, &self.gc_heap)?;
             let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 context,
                 target.clone(),
@@ -1727,7 +1735,7 @@ impl Interpreter {
                     message: "Symbol.toPrimitive method is not callable".to_string(),
                 });
             }
-            let hint_str = JsString::from_str(hint.as_token(), &self.gc_heap)?;
+            let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(Value::String(hint_str));
             let result = self.run_callable_sync(context, &exotic, input.clone(), args)?;
@@ -1959,7 +1967,7 @@ impl Interpreter {
                     for idx in 0..value.len() {
                         let key = idx.to_string();
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, &self.gc_heap)
+                            string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
                     }
@@ -1991,24 +1999,24 @@ impl Interpreter {
                     for index in indexed {
                         let key = index.to_string();
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, &self.gc_heap)
+                            string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
                     }
                     keys.push(Value::String(
-                        string::JsString::from_str("length", &self.gc_heap)
+                        string::JsString::from_str("length", &mut self.gc_heap)
                             .map_err(VmError::from)?,
                     ));
                     for key in non_index_strings {
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, &self.gc_heap)
+                            string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
                     }
                 } else {
                     for key in ordinary_strings {
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, &self.gc_heap)
+                            string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
                     }
@@ -2046,17 +2054,18 @@ impl Interpreter {
                     Vec::with_capacity(indices.len() + string_keys.len() + 2);
                 for idx in indices {
                     let key = idx.to_string();
-                    let s =
-                        string::JsString::from_str(&key, &self.gc_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&key, &mut self.gc_heap)
+                        .map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 // §10.4.2 Array exotic objects always expose `length`.
                 keys.push(Value::String(
-                    string::JsString::from_str("length", &self.gc_heap).map_err(VmError::from)?,
+                    string::JsString::from_str("length", &mut self.gc_heap)
+                        .map_err(VmError::from)?,
                 ));
                 for key in string_keys {
-                    let s =
-                        string::JsString::from_str(&key, &self.gc_heap).map_err(VmError::from)?;
+                    let s = string::JsString::from_str(&key, &mut self.gc_heap)
+                        .map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 // §10.4.2 — own symbol-keyed properties follow the
@@ -2075,7 +2084,8 @@ impl Interpreter {
                 let names = self.ordinary_function_own_property_keys(context, *function_id);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
+                    let s =
+                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2084,7 +2094,8 @@ impl Interpreter {
                 let names = native.own_property_keys(&self.gc_heap);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
+                    let s =
+                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2093,7 +2104,8 @@ impl Interpreter {
                 let names = function_metadata::bound_own_property_keys(bound, &self.gc_heap);
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
+                    let s =
+                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2102,7 +2114,8 @@ impl Interpreter {
                 let names = self.class_constructor_own_property_keys(Some(context), *class)?;
                 let mut keys: Vec<Value> = Vec::with_capacity(names.len());
                 for n in names {
-                    let s = string::JsString::from_str(&n, &self.gc_heap).map_err(VmError::from)?;
+                    let s =
+                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
                     keys.push(Value::String(s));
                 }
                 Ok(keys)
@@ -2110,7 +2123,7 @@ impl Interpreter {
             Value::RegExp(regexp) => {
                 let mut keys = Vec::new();
                 keys.push(Value::String(
-                    string::JsString::from_str("lastIndex", &self.gc_heap)
+                    string::JsString::from_str("lastIndex", &mut self.gc_heap)
                         .map_err(VmError::from)?,
                 ));
                 if let Some(expando) = regexp.expando(&self.gc_heap) {
@@ -2123,7 +2136,7 @@ impl Interpreter {
                         });
                     for key in strings {
                         keys.push(Value::String(
-                            string::JsString::from_str(&key, &self.gc_heap)
+                            string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
                     }
@@ -2164,7 +2177,7 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, list_value.clone(), args)?
             }
         };
-        let len = to_length(&len_value)?;
+        let len = to_length(&len_value, &self.gc_heap)?;
         let mut out: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
             let key = VmPropertyKey::OwnedString(i.to_string());
@@ -2203,7 +2216,7 @@ impl Interpreter {
         // Step 9 — reject duplicates.
         for i in 0..trap_result.len() {
             for j in (i + 1)..trap_result.len() {
-                if same_property_key(&trap_result[i], &trap_result[j]) {
+                if same_property_key(&trap_result[i], &trap_result[j], &self.gc_heap) {
                     return Err(VmError::TypeError {
                         message: "Proxy ownKeys trap result contains duplicate entries".to_string(),
                     });
@@ -2216,7 +2229,7 @@ impl Interpreter {
         let mut target_configurable: Vec<Value> = Vec::new();
         let mut target_nonconfigurable: Vec<Value> = Vec::new();
         for key in &target_keys {
-            let vm_key = property_key_from_value(key)?;
+            let vm_key = property_key_from_value(key, &self.gc_heap)?;
             let slice_roots: [&[Value]; 4] = [
                 target_keys.as_slice(),
                 trap_result.as_slice(),
@@ -2241,7 +2254,10 @@ impl Interpreter {
         }
         let mut unchecked: Vec<Value> = trap_result.clone();
         for key in &target_nonconfigurable {
-            match unchecked.iter().position(|v| same_property_key(v, key)) {
+            match unchecked
+                .iter()
+                .position(|v| same_property_key(v, key, &self.gc_heap))
+            {
                 Some(idx) => {
                     unchecked.swap_remove(idx);
                 }
@@ -2258,7 +2274,10 @@ impl Interpreter {
             return Ok(trap_result);
         }
         for key in &target_configurable {
-            match unchecked.iter().position(|v| same_property_key(v, key)) {
+            match unchecked
+                .iter()
+                .position(|v| same_property_key(v, key, &self.gc_heap))
+            {
                 Some(idx) => {
                     unchecked.swap_remove(idx);
                 }
@@ -2523,7 +2542,7 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => {
                 let desc = native
-                    .own_property_descriptor(&self.gc_heap, "prototype")
+                    .own_property_descriptor(&mut self.gc_heap, "prototype")
                     .map_err(VmError::from)?;
                 let value = match desc {
                     Some(object::PropertyDescriptor {
@@ -2608,7 +2627,7 @@ impl Interpreter {
             }
             Value::NativeFunction(native) => {
                 let desc = native
-                    .own_property_descriptor(&self.gc_heap, "prototype")
+                    .own_property_descriptor(&mut self.gc_heap, "prototype")
                     .map_err(VmError::from)?;
                 let value = match desc {
                     Some(object::PropertyDescriptor {
@@ -2907,7 +2926,7 @@ impl Interpreter {
                         let key = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
-                        match native.own_property_descriptor(&self.gc_heap, key)? {
+                        match native.own_property_descriptor(&mut self.gc_heap, key)? {
                             Some(object::PropertyDescriptor {
                                 kind: object::DescriptorKind::Data { value },
                                 ..
@@ -2950,7 +2969,7 @@ impl Interpreter {
                             .expect("non-symbol key has string spelling");
                         match function_metadata::bound_own_property_descriptor(
                             &bound,
-                            &self.gc_heap,
+                            &mut self.gc_heap,
                             key,
                         )? {
                             Some(desc) => match &desc.kind {
@@ -3054,7 +3073,7 @@ impl Interpreter {
                         let key = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
-                        regexp_prototype::load_property(&re, &self.gc_heap, key)
+                        regexp_prototype::load_property(&re, &mut self.gc_heap, key)
                     }
                 };
                 match direct {
@@ -3183,8 +3202,9 @@ impl Interpreter {
                         && n >= 0.0
                         && (n as usize) < s.len() as usize
                     {
-                        let unit = s.char_code_at(n as u32).unwrap_or(0);
-                        let unit_str = crate::JsString::from_utf16_units(&[unit], &self.gc_heap)?;
+                        let unit = s.char_code_at(n as u32, &self.gc_heap).unwrap_or(0);
+                        let unit_str =
+                            crate::JsString::from_utf16_units(&[unit], &mut self.gc_heap)?;
                         return Ok(VmGetOutcome::Value(Value::String(unit_str)));
                     }
                     if name == "length" {
@@ -3636,7 +3656,7 @@ impl Interpreter {
         if let Some(callee) = to_prim
             && self.is_callable_runtime(&callee)
         {
-            let hint_str = JsString::from_str(hint.as_token(), &self.gc_heap)?;
+            let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(Value::String(hint_str));
             let result = self.run_callable_sync(context, &callee, value.clone(), args)?;
@@ -3706,7 +3726,7 @@ impl Interpreter {
                     let Value::String(name) = key else {
                         continue;
                     };
-                    let name = name.to_lossy_string();
+                    let name = name.to_lossy_string(&self.gc_heap);
                     let proxy_root = Value::Proxy(proxy);
                     let slice_roots: [&[Value]; 1] = [keys.as_slice()];
                     let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
@@ -3744,7 +3764,7 @@ impl Interpreter {
                     let Value::String(name) = key_value else {
                         continue;
                     };
-                    let key = name.to_lossy_string();
+                    let key = name.to_lossy_string(&self.gc_heap);
                     if let Some(desc) = self
                         .ordinary_get_own_property_descriptor_value_runtime_rooted(
                             context,
@@ -3827,7 +3847,7 @@ impl Interpreter {
                 let Value::String(name) = key else {
                     continue;
                 };
-                let name = name.to_lossy_string();
+                let name = name.to_lossy_string(&self.gc_heap);
                 if !visited.insert(name.clone()) {
                     continue;
                 }
@@ -4233,9 +4253,9 @@ fn optional_value_eq_pair(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc:
 
 /// SameValue restricted to PropertyKey-typed values (Strings and
 /// Symbols). Used by §10.5.11 Proxy `ownKeys` invariant validation.
-fn same_property_key(a: &Value, b: &Value) -> bool {
+fn same_property_key(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
     match (a, b) {
-        (Value::String(x), Value::String(y)) => x.to_lossy_string() == y.to_lossy_string(),
+        (Value::String(x), Value::String(y)) => x.to_lossy_string(heap) == y.to_lossy_string(heap),
         (Value::Symbol(x), Value::Symbol(y)) => x.ptr_eq(y),
         _ => false,
     }
@@ -4245,9 +4265,12 @@ fn same_property_key(a: &Value, b: &Value) -> bool {
 /// [`VmPropertyKey`]. Caller is responsible for ensuring the value
 /// actually holds a PropertyKey-typed entry; anything else is a
 /// `TypeMismatch`.
-fn property_key_from_value(value: &Value) -> Result<VmPropertyKey<'static>, VmError> {
+fn property_key_from_value(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
         Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
         _ => Err(VmError::TypeMismatch),
     }

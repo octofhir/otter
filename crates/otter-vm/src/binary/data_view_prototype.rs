@@ -43,7 +43,7 @@ fn check_not_detached(view: &JsDataView, heap: &otter_gc::GcHeap) -> Result<(), 
 }
 
 fn read_byte_offset(args: &IntrinsicArgs<'_>) -> Result<usize, IntrinsicError> {
-    match to_index(args.args.first().unwrap_or(&Value::Undefined)) {
+    match to_index(args.args.first().unwrap_or(&Value::Undefined), args.gc_heap) {
         Some(n) => Ok(n as usize),
         None => Err(IntrinsicError::BadArgument {
             index: 0,
@@ -236,19 +236,19 @@ fn impl_get_biguint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 
 // ---- setX implementations -----------------------------------------------
 
-fn coerce_number(value: &Value) -> NumberValue {
+fn coerce_number(value: &Value, heap: &otter_gc::GcHeap) -> NumberValue {
     match value {
         Value::Number(n) => *n,
         Value::Boolean(true) => NumberValue::from_i32(1),
         Value::Boolean(false) | Value::Null => NumberValue::from_i32(0),
         Value::Undefined => NumberValue::from_f64(f64::NAN),
-        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string()),
+        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string(heap)),
         _ => NumberValue::from_f64(f64::NAN),
     }
 }
 
-fn coerce_int(value: &Value) -> i64 {
-    let n = coerce_number(value).as_f64();
+fn coerce_int(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
+    let n = coerce_number(value, heap).as_f64();
     if !n.is_finite() {
         return 0;
     }
@@ -290,62 +290,62 @@ fn coerce_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
 }
 
 fn impl_set_int8(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 1, |b, v, _, _heap| {
-        let n = coerce_int(v) as i8;
+    write_bytes(args, 1, |b, v, _, heap| {
+        let n = coerce_int(v, heap) as i8;
         b[0] = n as u8;
     })
 }
 
 fn impl_set_uint8(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 1, |b, v, _, _heap| {
-        let n = coerce_int(v) as u8;
+    write_bytes(args, 1, |b, v, _, heap| {
+        let n = coerce_int(v, heap) as u8;
         b[0] = n;
     })
 }
 
 fn impl_set_int16(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 2, |b, v, le, _heap| {
-        let n = coerce_int(v) as i16;
+    write_bytes(args, 2, |b, v, le, heap| {
+        let n = coerce_int(v, heap) as i16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
     })
 }
 
 fn impl_set_uint16(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 2, |b, v, le, _heap| {
-        let n = coerce_int(v) as u16;
+    write_bytes(args, 2, |b, v, le, heap| {
+        let n = coerce_int(v, heap) as u16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
     })
 }
 
 fn impl_set_int32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 4, |b, v, le, _heap| {
-        let n = crate::number::bitwise::to_int32(coerce_number(v));
+    write_bytes(args, 4, |b, v, le, heap| {
+        let n = crate::number::bitwise::to_int32(coerce_number(v, heap));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
     })
 }
 
 fn impl_set_uint32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 4, |b, v, le, _heap| {
-        let n = crate::number::bitwise::to_uint32(coerce_number(v));
+    write_bytes(args, 4, |b, v, le, heap| {
+        let n = crate::number::bitwise::to_uint32(coerce_number(v, heap));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
     })
 }
 
 fn impl_set_float32(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 4, |b, v, le, _heap| {
-        let n = coerce_number(v).as_f64() as f32;
+    write_bytes(args, 4, |b, v, le, heap| {
+        let n = coerce_number(v, heap).as_f64() as f32;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
     })
 }
 
 fn impl_set_float64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    write_bytes(args, 8, |b, v, le, _heap| {
-        let n = coerce_number(v).as_f64();
+    write_bytes(args, 8, |b, v, le, heap| {
+        let n = coerce_number(v, heap).as_f64();
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
         b.copy_from_slice(&bytes);
     })

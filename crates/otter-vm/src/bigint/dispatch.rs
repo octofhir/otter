@@ -41,7 +41,7 @@ pub fn call(
         }
         // §21.2.2.1 BigInt.asIntN(bits, value).
         M::AsIntN => {
-            let bits = expect_bits(args.first())?;
+            let bits = expect_bits(args.first(), heap)?;
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
             let n = to_bigint(heap, &value)?;
             let clipped = as_int_n(bits, &n);
@@ -50,7 +50,7 @@ pub fn call(
         }
         // §21.2.2.2 BigInt.asUintN(bits, value).
         M::AsUintN => {
-            let bits = expect_bits(args.first())?;
+            let bits = expect_bits(args.first(), heap)?;
             let value = args.get(1).cloned().unwrap_or(Value::Undefined);
             let n = to_bigint(heap, &value)?;
             let clipped = as_uint_n(bits, &n);
@@ -79,7 +79,7 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
             }
             Ok(BigInt::from(f as i128))
         }
-        Value::String(s) => string_to_bigint(&s.to_lossy_string()),
+        Value::String(s) => string_to_bigint(&s.to_lossy_string(heap)),
         // §7.1.13 step 7 — Symbol → TypeError.
         Value::Symbol(_) => Err(VmError::TypeError {
             message: "Cannot convert a Symbol value to a BigInt".to_string(),
@@ -141,7 +141,7 @@ fn parse_radix_literal(input: &str) -> Option<BigInt> {
 /// then `ToIntegerOrInfinity`, rejecting Symbol / BigInt with
 /// **TypeError**, negatives and overflow with **RangeError**, and
 /// returning `0` for NaN / undefined per the spec.
-fn expect_bits(arg: Option<&Value>) -> Result<u32, VmError> {
+fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
     let n = match arg {
         None | Some(Value::Undefined) => return Ok(0),
         Some(Value::Number(n)) => n.as_f64(),
@@ -149,7 +149,7 @@ fn expect_bits(arg: Option<&Value>) -> Result<u32, VmError> {
         Some(Value::Boolean(true)) => 1.0,
         Some(Value::Boolean(false)) => 0.0,
         Some(Value::String(s)) => {
-            crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+            crate::number::parse::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
         }
         Some(Value::Symbol(_)) => {
             return Err(VmError::TypeError {

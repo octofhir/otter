@@ -31,10 +31,10 @@ pub const DEFAULT_LOCALE: &str = "en-US";
 ///
 /// # See also
 /// - <https://tc39.es/ecma402/#sec-canonicalizelocalelist>
-pub fn coerce_locale(arg: Option<&Value>) -> String {
+pub fn coerce_locale(arg: Option<&Value>, gc_heap: &otter_gc::GcHeap) -> String {
     match arg {
         None | Some(Value::Undefined) => DEFAULT_LOCALE.to_string(),
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
         Some(Value::Array(_)) => DEFAULT_LOCALE.to_string(),
         _ => DEFAULT_LOCALE.to_string(),
     }
@@ -59,7 +59,7 @@ pub fn read_string_option(
 ) -> String {
     options
         .and_then(|o| match crate::object::get(*o, gc_heap, name) {
-            Some(Value::String(s)) => Some(s.to_lossy_string()),
+            Some(Value::String(s)) => Some(s.to_lossy_string(gc_heap)),
             _ => None,
         })
         .unwrap_or_else(|| default.to_string())
@@ -99,7 +99,7 @@ pub fn read_u8_option(
 }
 
 /// Build a `Value::String` from a Rust string via the active heap.
-pub fn js_string(value: &str, heap: &otter_gc::GcHeap) -> Result<Value, IntlError> {
+pub fn js_string(value: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, IntlError> {
     Ok(Value::String(JsString::from_str(value, heap)?))
 }
 

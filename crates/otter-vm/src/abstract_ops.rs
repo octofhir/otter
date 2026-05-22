@@ -183,9 +183,13 @@ pub fn same_value_non_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> 
         // equality and is not spec-correct on its own; route here
         // to `numeric_eq` which reads the bodies through `heap`.
         (Value::BigInt(a), Value::BigInt(b)) => a.numeric_eq(*b, heap),
+        // §7.2.11 SameValueNonNumber for String: code-unit equality
+        // through the heap. Derived `PartialEq` on `JsString` is
+        // handle identity after Phase B, which is too strict here.
+        (Value::String(a), Value::String(b)) => a.equals(b, heap),
         // For every other variant `Value::PartialEq` matches the
         // spec's `SameValueNonNumber` reduction (identity for
-        // heap-shared shapes, content equality for strings).
+        // heap-shared shapes).
         _ => x == y,
     }
 }
@@ -370,11 +374,11 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
 
         // Steps 4, 5: Number x String — ToNumber the string.
         (Value::Number(n), Value::String(s)) => {
-            let parsed = number::to_number_from_string(&s.to_lossy_string());
+            let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
             number::strict_equals(*n, parsed)
         }
         (Value::String(s), Value::Number(n)) => {
-            let parsed = number::to_number_from_string(&s.to_lossy_string());
+            let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
             number::strict_equals(*n, parsed)
         }
 
@@ -392,7 +396,7 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
         // the grammar surface as `undefined`, which §7.2.13 step 8
         // collapses to `false`.
         (Value::BigInt(big), Value::String(s)) | (Value::String(s), Value::BigInt(big)) => {
-            match string_to_big_int(&s.to_lossy_string()) {
+            match string_to_big_int(&s.to_lossy_string(heap)) {
                 Some(parsed) => big.with_inner(heap, |b| b == &parsed),
                 None => false,
             }
@@ -510,14 +514,14 @@ pub fn abstract_relational_comparison(
 ) -> RelationalOutcome {
     // Step 1: both String → lexicographic.
     if let (Value::String(a), Value::String(b)) = (x, y) {
-        return match a.compare_lex(b) {
+        return match a.compare_lex(b, heap) {
             std::cmp::Ordering::Less => RelationalOutcome::LessThan,
             _ => RelationalOutcome::NotLessThan,
         };
     }
     // Step 2 / 3: BigInt x String.
     if let (Value::BigInt(big), Value::String(s)) = (x, y) {
-        return match string_to_big_int(&s.to_lossy_string()) {
+        return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(b, &parsed)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,
@@ -526,7 +530,7 @@ pub fn abstract_relational_comparison(
         };
     }
     if let (Value::String(s), Value::BigInt(big)) = (x, y) {
-        return match string_to_big_int(&s.to_lossy_string()) {
+        return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(&parsed, b)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
                 _ => RelationalOutcome::NotLessThan,
@@ -598,7 +602,7 @@ pub fn to_numeric_kind(value: &Value, heap: &otter_gc::GcHeap) -> Option<Numeric
         Value::Number(n) => Some(NumericKind::Num(*n)),
         Value::BigInt(b) => Some(NumericKind::Big(b.clone_inner(heap))),
         Value::String(s) => Some(NumericKind::Num(number::to_number_from_string(
-            &s.to_lossy_string(),
+            &s.to_lossy_string(heap),
         ))),
         Value::Boolean(true) => Some(NumericKind::Num(NumberValue::from_i32(1))),
         Value::Boolean(false) => Some(NumericKind::Num(NumberValue::from_i32(0))),
@@ -623,7 +627,7 @@ mod tests {
         Value::Number(NumberValue::Double(v))
     }
 
-    fn s(v: &str, heap: &otter_gc::GcHeap) -> Value {
+    fn s(v: &str, heap: &mut otter_gc::GcHeap) -> Value {
         Value::String(JsString::from_str(v, heap).expect("foundation heap fits the literal"))
     }
 
@@ -656,9 +660,12 @@ mod tests {
 
     #[test]
     fn strings_compare_by_content() {
-        let heap = fresh_heap();
-        assert!(same_value(&s("hi", &heap), &s("hi", &heap), &heap));
-        assert!(!same_value(&s("hi", &heap), &s("bye", &heap), &heap));
+        let mut heap = fresh_heap();
+        let hi1 = s("hi", &mut heap);
+        let hi2 = s("hi", &mut heap);
+        let bye = s("bye", &mut heap);
+        assert!(same_value(&hi1, &hi2, &heap));
+        assert!(!same_value(&hi1, &bye, &heap));
     }
 
     #[test]

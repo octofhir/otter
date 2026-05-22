@@ -213,7 +213,7 @@ fn coerce_bigint_call_args(
                 };
                 let joined = parts.join(",");
                 *slot = Value::String(
-                    crate::string::JsString::from_str(&joined, ctx.heap()).map_err(|_| {
+                    crate::string::JsString::from_str(&joined, ctx.heap_mut()).map_err(|_| {
                         NativeError::TypeError {
                             name,
                             reason: "out of memory".to_string(),
@@ -300,7 +300,8 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
                 Value::Boolean(false) => 0.0,
                 Value::Null => 0.0,
                 Value::String(s) => {
-                    crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+                    crate::number::parse::to_number_from_string(&s.to_lossy_string(ctx.heap()))
+                        .as_f64()
                 }
                 _ => f64::NAN,
             };
@@ -316,7 +317,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     };
     let rendered = b.with_inner(ctx.heap(), |bi| bi.to_str_radix(radix));
 
-    let s = crate::string::JsString::from_str(&rendered, ctx.heap())
+    let s = crate::string::JsString::from_str(&rendered, ctx.heap_mut())
         .map_err(|_| oom("BigInt.prototype.toString"))?;
     Ok(Value::String(s))
 }

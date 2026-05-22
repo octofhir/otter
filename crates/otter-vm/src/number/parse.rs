@@ -112,14 +112,14 @@ fn parse_radix_digits(digits: &str, radix: u32) -> NumberValue {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-tonumber>
 #[must_use]
-pub fn to_number_value(value: &Value) -> f64 {
+pub fn to_number_value(value: &Value, heap: &otter_gc::GcHeap) -> f64 {
     match value {
         Value::Number(n) => n.as_f64(),
         Value::Boolean(true) => 1.0,
         Value::Boolean(false) => 0.0,
         Value::Null => 0.0,
         Value::Undefined => f64::NAN,
-        Value::String(s) => match to_number_from_string(&s.to_lossy_string()) {
+        Value::String(s) => match to_number_from_string(&s.to_lossy_string(heap)) {
             NumberValue::Smi(v) => v as f64,
             NumberValue::Double(d) => d,
         },
@@ -136,8 +136,8 @@ pub fn to_number_value(value: &Value) -> f64 {
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-tointegerorinfinity>
 #[must_use]
-pub fn to_integer_or_infinity(value: &Value) -> f64 {
-    let n = to_number_value(value);
+pub fn to_integer_or_infinity(value: &Value, heap: &otter_gc::GcHeap) -> f64 {
+    let n = to_number_value(value, heap);
     if n.is_nan() {
         0.0
     } else if !n.is_finite() {
@@ -165,11 +165,11 @@ pub enum IntegerCoercion {
 /// spec-correct `TypeError` (per §7.1.4 ToNumber). Other inputs go
 /// through [`to_number_value`] like the loose form.
 #[must_use]
-pub fn to_integer_or_infinity_strict(value: &Value) -> IntegerCoercion {
+pub fn to_integer_or_infinity_strict(value: &Value, heap: &otter_gc::GcHeap) -> IntegerCoercion {
     match value {
         Value::Symbol(_) => IntegerCoercion::SymbolNotConvertible,
         Value::BigInt(_) => IntegerCoercion::BigIntNotConvertible,
-        _ => IntegerCoercion::Ok(to_integer_or_infinity(value)),
+        _ => IntegerCoercion::Ok(to_integer_or_infinity(value, heap)),
     }
 }
 

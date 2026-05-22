@@ -290,6 +290,7 @@ impl Interpreter {
             &target_name,
             &target_length,
             bound_args.len(),
+            &self.gc_heap,
         );
         let target_root = target.clone();
         let bound_this_root = bound_this.clone();
@@ -359,14 +360,17 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let receiver = iter.next().unwrap_or(Value::Undefined);
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
-                let ctx = function_metadata::FunctionMetadataContext::new(
+                let mut ctx = function_metadata::FunctionMetadataContext::new(
                     context,
-                    &self.gc_heap,
+                    &mut self.gc_heap,
                     &self.function_user_props,
                     &self.function_deleted_metadata,
                 );
-                let metadata =
-                    function_metadata::bound_create_metadata(&ctx, &this_value, bound_args.len())?;
+                let metadata = function_metadata::bound_create_metadata(
+                    &mut ctx,
+                    &this_value,
+                    bound_args.len(),
+                )?;
                 let this_root = this_value.clone();
                 let receiver_root = receiver.clone();
                 let bound_args_root = bound_args.clone();
@@ -395,14 +399,16 @@ impl Interpreter {
                 if !self.is_callable_runtime(&this_value) {
                     return Err(VmError::NotCallable);
                 }
-                let ctx = function_metadata::FunctionMetadataContext::new(
-                    context,
-                    &self.gc_heap,
-                    &self.function_user_props,
-                    &self.function_deleted_metadata,
-                );
-                let display = function_metadata::callable_to_string(&ctx, &this_value);
-                let s = JsString::from_str(&display, self.gc_heap_mut())
+                let display = {
+                    let mut ctx = function_metadata::FunctionMetadataContext::new(
+                        context,
+                        &mut self.gc_heap,
+                        &self.function_user_props,
+                        &self.function_deleted_metadata,
+                    );
+                    function_metadata::callable_to_string(&mut ctx, &this_value)
+                };
+                let s = JsString::from_str(&display, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
                 Ok(Value::String(s))
             }
@@ -677,7 +683,7 @@ impl Interpreter {
             });
         }
         let length = self.get_property_value_for_call(context, value.clone(), "length")?;
-        let len = to_length(&length)?;
+        let len = to_length(&length, &self.gc_heap)?;
         let mut values = SmallVec::new();
         for index in 0..len {
             let key = index.to_string();
@@ -707,7 +713,7 @@ impl Interpreter {
         }
     }
     fn callable_bind_metadata_get(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         target: &Value,
         key: &str,
@@ -728,25 +734,31 @@ impl Interpreter {
                 }
             }
             Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&self.gc_heap, key)? {
+                match native.own_property_descriptor(&mut self.gc_heap, key)? {
                     Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
                     None => Ok(BindMetadataGet::Value(Value::Undefined)),
                 }
             }
             Value::BoundFunction(bound) => {
-                match function_metadata::bound_own_property_descriptor(bound, &self.gc_heap, key)? {
+                match function_metadata::bound_own_property_descriptor(
+                    bound,
+                    &mut self.gc_heap,
+                    key,
+                )? {
                     Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
                     None => Ok(BindMetadataGet::Value(Value::Undefined)),
                 }
             }
             Value::ClassConstructor(class) => {
-                self.callable_bind_metadata_get(context, &class.ctor(&self.gc_heap), key)
+                let ctor = class.ctor(&self.gc_heap);
+                self.callable_bind_metadata_get(context, &ctor, key)
             }
             Value::Object(obj) => {
-                if let Some(desc) = object::get_own_descriptor(*obj, &self.gc_heap, key) {
+                let obj = *obj;
+                if let Some(desc) = object::get_own_descriptor(obj, &self.gc_heap, key) {
                     return Ok(bind_metadata_get_from_descriptor(desc));
                 }
-                match object::constructor_native(*obj, &self.gc_heap) {
+                match object::constructor_native(obj, &self.gc_heap) {
                     Some(native @ Value::NativeFunction(_)) => {
                         self.callable_bind_metadata_get(context, &native, key)
                     }
@@ -759,9 +771,10 @@ impl Interpreter {
 
     pub(crate) fn coerce_vm_property_key(
         arg: Option<&Value>,
+        heap: &otter_gc::GcHeap,
     ) -> Result<VmPropertyKey<'static>, VmError> {
         match arg {
-            Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+            Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
             Some(Value::Number(n)) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
             Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
             Some(Value::Null) => Ok(VmPropertyKey::String("null")),
@@ -822,7 +835,7 @@ impl Interpreter {
     }
 
     pub(crate) fn ordinary_function_has_own_string_property_for_extensibility(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         function_id: u32,
         key: &str,
@@ -953,7 +966,7 @@ impl Interpreter {
     }
 
     pub(crate) fn ordinary_function_own_property_descriptor(
-        &self,
+        &mut self,
         context: Option<&ExecutionContext>,
         function_id: u32,
         key: &str,
@@ -975,14 +988,14 @@ impl Interpreter {
         let Some(context) = context else {
             return Ok(None);
         };
-        let ctx = function_metadata::FunctionMetadataContext::new(
+        let mut ctx = function_metadata::FunctionMetadataContext::new(
             context,
-            &self.gc_heap,
+            &mut self.gc_heap,
             &self.function_user_props,
             &self.function_deleted_metadata,
         );
         let value =
-            function_metadata::ordinary_function_intrinsic_property(&ctx, function_id, key)?;
+            function_metadata::ordinary_function_intrinsic_property(&mut ctx, function_id, key)?;
         Ok(Some(object::PropertyDescriptor::data(
             value, false, false, true,
         )))
@@ -1225,7 +1238,9 @@ impl Interpreter {
                     for key in trap_keys {
                         let Value::String(_) = &key else { continue };
                         let vm_key = match &key {
-                            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+                            Value::String(s) => {
+                                VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+                            }
                             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
                             _ => return Err(VmError::TypeMismatch),
                         };
@@ -1302,7 +1317,7 @@ impl Interpreter {
         };
         match method {
             M::DefineProperty => {
-                let key = Self::coerce_vm_property_key(args.get(1))?;
+                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
                 let desc_obj = match args.get(2) {
                     Some(Value::Object(obj)) => *obj,
                     _ => return Err(VmError::TypeMismatch),
@@ -1364,7 +1379,7 @@ impl Interpreter {
                 Ok(Some(target))
             }
             M::GetOwnPropertyDescriptor => {
-                let key = Self::coerce_vm_property_key(args.get(1))?;
+                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
                 let desc = match (&target, function_id, &key) {
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let Some(bag) = self.function_user_props.get(&function_id).copied() else {
@@ -1382,7 +1397,7 @@ impl Interpreter {
                     (Value::BoundFunction(bound), None, _) => {
                         function_metadata::bound_own_property_descriptor(
                             bound,
-                            &self.gc_heap,
+                            &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                         )?
@@ -1402,7 +1417,7 @@ impl Interpreter {
                 }
             }
             M::HasOwn => {
-                let key = Self::coerce_vm_property_key(args.get(1))?;
+                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
                 let present = match (&target, function_id, &key) {
                     (_, Some(function_id), VmPropertyKey::Symbol(sym)) => self
                         .function_user_props
@@ -1593,14 +1608,14 @@ impl Interpreter {
             return Ok(v);
         }
         if name == "name" || name == "length" {
-            let ctx = function_metadata::FunctionMetadataContext::new(
+            let mut ctx = function_metadata::FunctionMetadataContext::new(
                 context,
-                &self.gc_heap,
+                &mut self.gc_heap,
                 &self.function_user_props,
                 &self.function_deleted_metadata,
             );
             return function_metadata::ordinary_function_intrinsic_property(
-                &ctx,
+                &mut ctx,
                 function_id,
                 name,
             );

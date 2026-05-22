@@ -55,7 +55,8 @@ impl Interpreter {
                 // user-installed `@@toPrimitive` / `valueOf` /
                 // `toString` ladder fires per spec.
                 let coerced = self.math_coerce_args(context, args)?;
-                let result = math::call(method, &coerced).map_err(math_to_vm_error)?;
+                let result =
+                    math::call(method, &coerced, &self.gc_heap).map_err(math_to_vm_error)?;
                 finish_static_call(frame, dst, result)
             }
             Op::JsonCall => {
@@ -152,7 +153,7 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
                     method_id::GlobalMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result = global_functions::call(method, &args, &self.gc_heap)?;
+                let result = global_functions::call(method, &args, &mut self.gc_heap)?;
                 finish_static_call(frame, dst, result)
             }
             Op::SymbolCall => {
@@ -688,7 +689,10 @@ impl Interpreter {
                     descriptor,
                 )? {
                     return Err(VmError::TypeError {
-                        message: format!("Cannot define property '{}'", property_key_label(&key)),
+                        message: format!(
+                            "Cannot define property '{}'",
+                            property_key_label(&key, &self.gc_heap)
+                        ),
                     });
                 }
             }
@@ -764,7 +768,7 @@ impl Interpreter {
                 return Err(VmError::TypeError {
                     message: format!(
                         "Object.defineProperties: cannot define '{}'",
-                        property_key_label(&key)
+                        property_key_label(&key, &self.gc_heap)
                     ),
                 });
             }
@@ -847,7 +851,7 @@ impl Interpreter {
                     // as own indexed properties plus a `length`. The
                     // latter is read-only on the wrapper, so we copy
                     // only the indexed slots.
-                    let lossy = s.to_lossy_string();
+                    let lossy = s.to_lossy_string(&self.gc_heap);
                     for (idx, ch) in lossy.chars().enumerate() {
                         let mut buf = [0u16; 2];
                         let units = ch.encode_utf16(&mut buf);
@@ -960,7 +964,7 @@ impl Interpreter {
                     | Some(Value::Symbol(_))
                     | Some(Value::BigInt(_)) => Vec::new(),
                     Some(Value::String(s)) => {
-                        let units = s.to_utf16_vec();
+                        let units = s.to_utf16_vec(&self.gc_heap);
                         units
                             .into_iter()
                             .map(|u| {
@@ -998,7 +1002,7 @@ impl Interpreter {
                     | Some(Value::Symbol(_))
                     | Some(Value::BigInt(_)) => Vec::new(),
                     Some(Value::String(s)) => {
-                        let units = s.to_utf16_vec();
+                        let units = s.to_utf16_vec(&self.gc_heap);
                         units
                             .into_iter()
                             .enumerate()
@@ -1121,7 +1125,7 @@ impl Interpreter {
                 Ok(Some(Value::Object(result)))
             }
             M::GetOwnPropertyDescriptor => {
-                let key = Self::coerce_vm_property_key(args.get(1))?;
+                let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
                 let desc = match args.first() {
                     Some(target @ (Value::Object(_) | Value::String(_))) => self
                         .ordinary_get_own_property_descriptor_value_stack_rooted(
@@ -1152,7 +1156,7 @@ impl Interpreter {
                             let key = key
                                 .string_name()
                                 .expect("non-symbol property key has string spelling");
-                            native.own_property_descriptor(self.gc_heap(), key)?
+                            native.own_property_descriptor(self.gc_heap_mut(), key)?
                         }
                     },
                     // §10.4.5.1 IntegerIndexedExoticObject
@@ -1250,7 +1254,7 @@ impl Interpreter {
                         // surface.
                     }
                     Some(Value::String(s)) => {
-                        let units = s.to_utf16_vec();
+                        let units = s.to_utf16_vec(&self.gc_heap);
                         let result_root = Value::Object(result);
                         for (i, u) in units.iter().enumerate() {
                             let key = i.to_string();
@@ -1299,9 +1303,9 @@ impl Interpreter {
                         let keys = self.own_property_keys_value(context, &target_value)?;
                         for key in keys {
                             let vm_key = match &key {
-                                Value::String(s) => {
-                                    crate::VmPropertyKey::OwnedString(s.to_lossy_string())
-                                }
+                                Value::String(s) => crate::VmPropertyKey::OwnedString(
+                                    s.to_lossy_string(&self.gc_heap),
+                                ),
                                 Value::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
                                 _ => continue,
                             };
@@ -1326,7 +1330,7 @@ impl Interpreter {
                                 Value::String(s) => {
                                     self.set_property(
                                         result,
-                                        &s.to_lossy_string(),
+                                        &s.to_lossy_string(&self.gc_heap),
                                         Value::Object(desc_obj),
                                     )?;
                                 }
@@ -1363,7 +1367,7 @@ impl Interpreter {
                         .own_property_keys_value(context, target)?
                         .into_iter()
                         .filter_map(|key| match key {
-                            Value::String(name) => Some(name.to_lossy_string()),
+                            Value::String(name) => Some(name.to_lossy_string(&self.gc_heap)),
                             _ => None,
                         })
                         .collect(),
@@ -1765,7 +1769,7 @@ fn own_enumerable_keys_for_define(
             let keys = interp.own_property_keys_value(context, props)?;
             let mut out = Vec::new();
             for key in keys {
-                let vm_key = value_to_static_property_key(&key)?;
+                let vm_key = value_to_static_property_key(&key, interp.gc_heap())?;
                 let desc = interp.get_own_property_descriptor_for_value(
                     context,
                     props.clone(),
@@ -1811,7 +1815,7 @@ fn own_enumerable_keys_for_define(
             Ok(out.into_iter().map(VmPropertyKey::OwnedString).collect())
         }
         Value::String(s) => {
-            let units = s.to_utf16_vec();
+            let units = s.to_utf16_vec(interp.gc_heap());
             Ok((0..units.len())
                 .map(|i| VmPropertyKey::OwnedString(i.to_string()))
                 .collect())
@@ -1820,9 +1824,12 @@ fn own_enumerable_keys_for_define(
     }
 }
 
-fn value_to_static_property_key(value: &Value) -> Result<VmPropertyKey<'static>, VmError> {
+fn value_to_static_property_key(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string())),
+        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
         Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
         _ => Err(VmError::TypeError {
             message: "property key must be a string or symbol".to_string(),
@@ -1830,9 +1837,9 @@ fn value_to_static_property_key(value: &Value) -> Result<VmPropertyKey<'static>,
     }
 }
 
-fn property_key_label(key: &VmPropertyKey<'_>) -> String {
+fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> String {
     match key {
-        VmPropertyKey::Symbol(sym) => sym.descriptive_string(),
+        VmPropertyKey::Symbol(sym) => sym.descriptive_string(heap),
         _ => key
             .string_name()
             .expect("non-symbol key has string spelling")
@@ -1847,9 +1854,9 @@ fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
     }
 }
 
-fn stack_static_string_value(s: &str, interp: &Interpreter) -> Result<Value, VmError> {
+fn stack_static_string_value(s: &str, interp: &mut Interpreter) -> Result<Value, VmError> {
     Ok(Value::String(
-        JsString::from_str(s, interp.gc_heap()).map_err(|_| VmError::TypeMismatch)?,
+        JsString::from_str(s, interp.gc_heap_mut()).map_err(|_| VmError::TypeMismatch)?,
     ))
 }
 
@@ -1956,7 +1963,7 @@ fn enumerable_own_string_entries(
         let Value::String(name) = key_value else {
             continue;
         };
-        let key_name = name.to_lossy_string();
+        let key_name = name.to_lossy_string(interp.gc_heap());
         let key = VmPropertyKey::OwnedString(key_name.clone());
         let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
@@ -2020,7 +2027,7 @@ fn assign_copy_source_keys(
     let keys = interp.own_property_keys_value(context, source)?;
     for key_value in &keys {
         let key = match key_value {
-            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string()),
+            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap())),
             Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
             _ => {
                 return Err(VmError::TypeError {

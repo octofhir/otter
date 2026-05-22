@@ -231,11 +231,11 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
     }
 }
 
-fn coerce_delay_ms(value: Option<&Value>) -> u64 {
+fn coerce_delay_ms(value: Option<&Value>, heap: &otter_gc::GcHeap) -> u64 {
     let n = match value {
         Some(Value::Number(num)) => num.as_f64(),
         Some(Value::Undefined) | None => 0.0,
-        Some(other) => number::parse::to_number_value(other),
+        Some(other) => number::parse::to_number_value(other, heap),
     };
     if n.is_nan() || n <= 0.0 {
         0
@@ -264,7 +264,7 @@ fn schedule_timer_common(
 ) -> Result<Value, NativeError> {
     let callback = args.first().cloned().unwrap_or(Value::Undefined);
     ensure_callable(&callback, native_name)?;
-    let delay_ms = coerce_delay_ms(args.get(1));
+    let delay_ms = coerce_delay_ms(args.get(1), ctx.heap());
     let extra: SmallVec<[Value; 4]> = args.iter().skip(2).cloned().collect();
     let context = ctx
         .execution_context()

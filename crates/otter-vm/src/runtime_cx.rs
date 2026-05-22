@@ -236,7 +236,7 @@ impl<'rt> NativeCtx<'rt> {
 
     /// Borrow the GC heap mutably.
     #[must_use]
-    pub(crate) fn heap_mut(&mut self) -> &mut otter_gc::GcHeap {
+    pub fn heap_mut(&mut self) -> &mut otter_gc::GcHeap {
         self.cx.heap_mut()
     }
 

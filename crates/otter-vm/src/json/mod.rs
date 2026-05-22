@@ -218,7 +218,7 @@ fn coerce_json_parse_args(
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     if let Some(slot) = out.first_mut() {
         let s = match slot {
-            Value::String(s) => s.clone(),
+            Value::String(s) => *s,
             Value::Symbol(_) => {
                 return Err(NativeError::TypeError {
                     name: "parse",
@@ -227,7 +227,7 @@ fn coerce_json_parse_args(
             }
             ref primitive if crate::abstract_ops::is_primitive(primitive) => {
                 let text = primitive.display_string(ctx.heap());
-                JsString::from_str(&text, ctx.heap()).map_err(|_| NativeError::TypeError {
+                JsString::from_str(&text, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
                     name: "parse",
                     reason: "out of memory".to_string(),
                 })?
@@ -258,7 +258,7 @@ fn coerce_json_parse_args(
                     }
                     other => {
                         let text = other.display_string(ctx.heap());
-                        JsString::from_str(&text, ctx.heap()).map_err(|_| {
+                        JsString::from_str(&text, ctx.heap_mut()).map_err(|_| {
                             NativeError::TypeError {
                                 name: "parse",
                                 reason: "out of memory".to_string(),
@@ -315,7 +315,7 @@ fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Valu
 
 fn json_parse(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
     let text = match args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
         _ => {
             return Err(JsonError::BadArgument {
                 name: "parse",
@@ -334,7 +334,7 @@ fn json_parse_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, JsonError> {
     let text = match args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
         _ => {
             return Err(JsonError::BadArgument {
                 name: "parse",

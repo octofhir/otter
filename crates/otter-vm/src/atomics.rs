@@ -214,7 +214,7 @@ fn coerce_to_index(
         }
         _ => {}
     }
-    let n = to_integer_or_infinity(&primitive);
+    let n = to_integer_or_infinity(&primitive, ctx.heap());
     if !n.is_finite() {
         return Err(range_err(method_name, "index is not finite".to_string()));
     }
@@ -301,7 +301,7 @@ fn coerce_element_value(
                 Ok(Value::BigInt(handle))
             }
             Value::String(s) => {
-                let txt = s.to_lossy_string();
+                let txt = s.to_lossy_string(heap);
                 let trimmed = txt.trim();
                 let parsed = trimmed.parse::<num_bigint::BigInt>().map_err(|_| {
                     type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
@@ -329,7 +329,7 @@ fn coerce_element_value(
                 "cannot convert Symbol to a number".to_string(),
             )),
             other => {
-                let mut n = to_integer_or_infinity(&other);
+                let mut n = to_integer_or_infinity(&other, ctx.heap());
                 // §7.1.5 step 2 — `ToIntegerOrInfinity` collapses
                 // `+0` / `-0` / `NaN` to `0` (positive zero). Force
                 // the sign here so `Atomics.store(view, 0, -0)`
@@ -623,7 +623,7 @@ fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             "cannot convert Symbol to a number".to_string(),
         ));
     }
-    let n = to_integer_or_infinity(&primitive);
+    let n = to_integer_or_infinity(&primitive, ctx.heap());
     let supported = n.is_finite() && matches!(n as i64, 1 | 2 | 4 | 8) && (n as i64 as f64) == n;
     Ok(Value::Boolean(supported))
 }
@@ -709,7 +709,7 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
                     "cannot convert Symbol to a number".to_string(),
                 ));
             }
-            let n = crate::number::parse::to_number_value(&primitive);
+            let n = crate::number::parse::to_number_value(&primitive, ctx.heap());
             if n.is_nan() {
                 f64::INFINITY
             } else {
@@ -801,7 +801,7 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
                     "cannot convert Symbol to a number".to_string(),
                 ));
             }
-            let n = to_integer_or_infinity(&primitive);
+            let n = to_integer_or_infinity(&primitive, ctx.heap());
             if n.is_infinite() && n.is_sign_positive() {
                 usize::MAX
             } else if n.is_nan() || n.is_sign_negative() {

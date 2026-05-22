@@ -69,7 +69,7 @@ pub(crate) fn exec_once(
     text: &JsString,
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
-    let units = text.to_utf16_vec();
+    let units = text.to_utf16_vec(args.gc_heap);
     let len = units.len();
     let flags = re.flags(args.gc_heap);
     let mut start = re.last_index(args.gc_heap) as usize;
@@ -118,7 +118,7 @@ pub(crate) fn exec_once_native(
     ctx: &mut NativeCtx<'_>,
     slice_roots: &[&[Value]],
 ) -> Result<Value, IntrinsicError> {
-    let units = text.to_utf16_vec();
+    let units = text.to_utf16_vec(ctx.heap());
     let len = units.len();
     let flags = re.flags(ctx.heap());
     let mut start = re.last_index(ctx.heap()) as usize;
@@ -187,7 +187,7 @@ pub(crate) fn build_match_result(
             None => out.push(Value::Undefined),
         }
     }
-    let input_value = Value::String(input.clone());
+    let input_value = Value::String(*input);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&input_value);
     roots.extend_from_slice(value_roots);
@@ -326,19 +326,19 @@ pub(crate) fn build_match_result_native(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<JsArray, IntrinsicError> {
-    let full = JsString::from_utf16_units(&units[m.range.clone()], ctx.heap())?;
+    let full = JsString::from_utf16_units(&units[m.range.clone()], ctx.heap_mut())?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
     out.push(Value::String(full));
     for cap in &m.captures {
         match cap {
             Some(r) => {
-                let s = JsString::from_utf16_units(&units[r.clone()], ctx.heap())?;
+                let s = JsString::from_utf16_units(&units[r.clone()], ctx.heap_mut())?;
                 out.push(Value::String(s));
             }
             None => out.push(Value::Undefined),
         }
     }
-    let input_value = Value::String(input.clone());
+    let input_value = Value::String(*input);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&input_value);
     roots.extend_from_slice(value_roots);
@@ -366,14 +366,14 @@ pub(crate) fn build_match_result_native(
         let groups_obj = ctx.alloc_object_with_roots(&roots, &slices)?;
         crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
         let value = match range {
-            Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap())?),
+            Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
             None => Value::Undefined,
         };
         ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
             .map_err(vm_shape_error_to_intrinsic)?;
         for (name, range) in named_iter {
             let value = match range {
-                Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap())?),
+                Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
                 None => Value::Undefined,
             };
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
@@ -517,16 +517,14 @@ fn pair_array_native(
 }
 
 fn impl_exec(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let re = receiver_regexp(args)?;
+    let re_clone = *receiver_regexp(args)?;
     let text = arg_to_string_primitive(args, 0)?;
-    let re_clone = *re;
     exec_once(&re_clone, &text, args)
 }
 
 fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let re = receiver_regexp(args)?;
+    let re_clone = *receiver_regexp(args)?;
     let text = arg_to_string_primitive(args, 0)?;
-    let re_clone = *re;
     let result = exec_once(&re_clone, &text, args)?;
     Ok(Value::Boolean(!matches!(result, Value::Null)))
 }
@@ -539,12 +537,12 @@ fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// in the runtime entry point that already routes
 /// `RegExp.prototype.exec` calls through `evaluate_to_primitive`).
 fn arg_to_string_primitive(
-    args: &IntrinsicArgs<'_>,
+    args: &mut IntrinsicArgs<'_>,
     index: usize,
 ) -> Result<JsString, IntrinsicError> {
     let raw = args.args.get(index).cloned().unwrap_or(Value::Undefined);
     let text: String = match &raw {
-        Value::String(s) => return Ok(s.clone()),
+        Value::String(s) => return Ok(*s),
         Value::Undefined => "undefined".to_string(),
         Value::Null => "null".to_string(),
         Value::Boolean(true) => "true".to_string(),
@@ -603,7 +601,7 @@ pub fn native_regexp_symbol_match(
 
     let text = string_arg_to_jsstring(ctx, args, 0, "RegExp.prototype[@@match]")?;
     let flags = re.flags(ctx.heap());
-    let units = text.to_utf16_vec();
+    let units = text.to_utf16_vec(ctx.heap());
     if !flags.global {
         return exec_once_native(&re, &text, ctx, &[])
             .map_err(intrinsic_to_native_error("RegExp.prototype[@@match]"));
@@ -618,14 +616,12 @@ pub fn native_regexp_symbol_match(
             Some(m) => m,
             None => break,
         };
-        let match_str =
-            JsString::from_utf16_units(&units[m.range.clone()], ctx.heap()).map_err(|_| {
-                crate::NativeError::TypeError {
-                    name: "RegExp.prototype[@@match]",
-                    reason: "out of memory".to_string(),
-                }
+        let match_str = JsString::from_utf16_units(&units[m.range.clone()], ctx.heap_mut())
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "RegExp.prototype[@@match]",
+                reason: "out of memory".to_string(),
             })?;
-        matches_out.push(Value::String(match_str.clone()));
+        matches_out.push(Value::String(match_str));
         if m.range.start == m.range.end {
             cursor = advance_string_index(&units, m.range.end, full_unicode);
         } else {
@@ -675,7 +671,7 @@ pub fn native_regexp_symbol_search(
     let text = string_arg_to_jsstring(ctx, args, 0, "RegExp.prototype[@@search]")?;
     let previous = re.last_index_value(ctx.heap());
     re.set_last_index(ctx.heap_mut(), 0);
-    let units = text.to_utf16_vec();
+    let units = text.to_utf16_vec(ctx.heap());
     let result = re.find_from_utf16(ctx.heap(), &units, 0).into_iter().next();
     re.set_last_index_value(ctx.heap_mut(), previous);
     Ok(match result {
@@ -709,7 +705,7 @@ fn string_arg_to_jsstring(
 ) -> Result<JsString, crate::NativeError> {
     let raw = args.get(index).cloned().unwrap_or(Value::Undefined);
     let text: String = match &raw {
-        Value::String(s) => return Ok(s.clone()),
+        Value::String(s) => return Ok(*s),
         Value::Undefined => "undefined".to_string(),
         Value::Null => "null".to_string(),
         Value::Boolean(true) => "true".to_string(),
@@ -724,7 +720,7 @@ fn string_arg_to_jsstring(
         }
         other => other.display_string(ctx.heap()),
     };
-    JsString::from_str(&text, ctx.heap()).map_err(|_| crate::NativeError::TypeError {
+    JsString::from_str(&text, ctx.heap_mut()).map_err(|_| crate::NativeError::TypeError {
         name: method_name,
         reason: "out of memory".to_string(),
     })
@@ -842,7 +838,7 @@ pub(crate) fn coerce_to_jsstring_runtime(
         });
     }
     if let Value::String(s) = value {
-        return Ok(s.clone());
+        return Ok(*s);
     }
     let primitive = if crate::abstract_ops::is_primitive(value) {
         value.clone()
@@ -857,7 +853,7 @@ pub(crate) fn coerce_to_jsstring_runtime(
             .map_err(vm_err_to_native(name))?
     };
 
-    crate::conversion::to_js_string_primitive(&primitive, ctx.heap()).map_err(|e| {
+    crate::conversion::to_js_string_primitive(&primitive, ctx.heap_mut()).map_err(|e| {
         crate::NativeError::TypeError {
             name,
             reason: format!("ToString failed: {e:?}"),
@@ -885,7 +881,7 @@ fn to_length_runtime(
             .evaluate_to_primitive(&exec, value, crate::abstract_ops::ToPrimitiveHint::Number)
             .map_err(vm_err_to_native(name))?
     };
-    let n = crate::number::to_number_value(&primitive);
+    let n = crate::number::to_number_value(&primitive, ctx.heap());
     if n.is_nan() || n <= 0.0 {
         return Ok(0);
     }
@@ -916,7 +912,7 @@ fn to_integer_or_infinity_runtime(
             .evaluate_to_primitive(&exec, value, crate::abstract_ops::ToPrimitiveHint::Number)
             .map_err(vm_err_to_native(name))?
     };
-    let n = crate::number::to_number_value(&primitive);
+    let n = crate::number::to_number_value(&primitive, ctx.heap());
     if n.is_nan() {
         return Ok(0.0);
     }
@@ -948,7 +944,7 @@ fn regexp_exec_runtime(
             reason: "missing execution context".to_string(),
         })?;
         let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        args.push(Value::String(s.clone()));
+        args.push(Value::String(*s));
         let result = interp
             .run_callable_sync(&exec_ctx, &exec_fn, rx.clone(), args)
             .map_err(vm_err_to_native(name))?;
@@ -1007,7 +1003,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
                 .map_err(crate::native_to_vm_error)?;
             let this_index = to_length_runtime(&mut ctx, &li_val, name)
                 .map_err(crate::native_to_vm_error)? as usize;
-            let input_units = input.to_utf16_vec();
+            let input_units = input.to_utf16_vec(ctx.heap());
             let next_index = advance_string_index(&input_units, this_index, full_unicode);
             set_property_runtime(
                 &mut ctx,
@@ -1054,7 +1050,7 @@ pub fn native_regexp_symbol_replace(
 
     // Step 3 — S = ? ToString(string).
     let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
-    let s_units = s.to_utf16_vec();
+    let s_units = s.to_utf16_vec(ctx.heap());
     let length_s = s_units.len();
 
     // Step 4 — functionalReplace = IsCallable(replaceValue).
@@ -1069,7 +1065,7 @@ pub fn native_regexp_symbol_replace(
 
     // Step 6 — flags = ? ToString(? Get(rx, "flags")).
     let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
-    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string();
+    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
     let global = flags_str.contains('g');
     let full_unicode = flags_str.contains('u') || flags_str.contains('v');
 
@@ -1124,7 +1120,7 @@ pub fn native_regexp_symbol_replace(
 
         let matched_val = get_property_runtime(ctx, result, "0", name)?;
         let matched_str = coerce_to_jsstring_runtime(ctx, &matched_val, name)?;
-        let match_units = matched_str.to_utf16_vec();
+        let match_units = matched_str.to_utf16_vec(ctx.heap());
         let match_length = match_units.len();
 
         let index_val = get_property_runtime(ctx, result, "index", name)?;
@@ -1151,15 +1147,15 @@ pub fn native_regexp_symbol_replace(
 
         let replacement: Vec<u16> = if functional_replace {
             let mut replacer_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-            replacer_args.push(Value::String(matched_str.clone()));
+            replacer_args.push(Value::String(matched_str));
             for cap in &captures {
                 replacer_args.push(match cap {
-                    Some(s) => Value::String(s.clone()),
+                    Some(s) => Value::String(*s),
                     None => Value::Undefined,
                 });
             }
             replacer_args.push(Value::Number(NumberValue::from_f64(position as f64)));
-            replacer_args.push(Value::String(s.clone()));
+            replacer_args.push(Value::String(s));
             if let Some(nc) = &named_captures_obj {
                 replacer_args.push(nc.clone());
             }
@@ -1182,12 +1178,12 @@ pub fn native_regexp_symbol_replace(
                     .map_err(vm_err_to_native(name))?
             };
             let raw_str = coerce_to_jsstring_runtime(ctx, &raw, name)?;
-            raw_str.to_utf16_vec()
+            raw_str.to_utf16_vec(ctx.heap())
         } else {
             let template = replacement_template
                 .as_ref()
                 .expect("non-functional path has a template")
-                .to_utf16_vec();
+                .to_utf16_vec(ctx.heap());
             get_substitution(
                 ctx,
                 &match_units,
@@ -1212,7 +1208,7 @@ pub fn native_regexp_symbol_replace(
     }
 
     Ok(Value::String(
-        JsString::from_utf16_units(&accumulated, ctx.heap()).map_err(|_| {
+        JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
             crate::NativeError::TypeError {
                 name,
                 reason: "out of memory".to_string(),
@@ -1343,14 +1339,16 @@ pub fn native_regexp_symbol_match_all(
     let c = species_constructor_runtime(ctx, &receiver, &default_ctor, name)?;
 
     let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
-    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string();
+    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
     let global = flags_str.contains('g');
     let full_unicode = flags_str.contains('u') || flags_str.contains('v');
 
     let flags_js = {
-        JsString::from_str(&flags_str, ctx.heap()).map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "out of memory".to_string(),
+        JsString::from_str(&flags_str, ctx.heap_mut()).map_err(|_| {
+            crate::NativeError::TypeError {
+                name,
+                reason: "out of memory".to_string(),
+            }
         })?
     };
     let matcher = {
@@ -1378,7 +1376,7 @@ pub fn native_regexp_symbol_match_all(
         name,
     )?;
 
-    let input_root = Value::String(s.clone());
+    let input_root = Value::String(s);
     let iter_state = crate::IteratorState::RegExpString {
         matcher: matcher.clone(),
         input: s,
@@ -1424,7 +1422,7 @@ pub fn native_regexp_symbol_split(
 
     // Step 4 — S = ? ToString(string).
     let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
-    let s_units = s.to_utf16_vec();
+    let s_units = s.to_utf16_vec(ctx.heap());
     let size = s_units.len();
 
     // Step 5 — C = ? SpeciesConstructor(rx, %RegExp%).
@@ -1443,7 +1441,7 @@ pub fn native_regexp_symbol_split(
     // `y` so the splitter probes exactly the requested position each
     // step. `unicodeMatching` keys off `u` or `v`.
     let flags_val = get_property_runtime(ctx, &receiver, "flags", name)?;
-    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string();
+    let flags_str = coerce_to_jsstring_runtime(ctx, &flags_val, name)?.to_lossy_string(ctx.heap());
     let unicode_matching = flags_str.contains('u') || flags_str.contains('v');
     let new_flags = if flags_str.contains('y') {
         flags_str.clone()
@@ -1454,9 +1452,11 @@ pub fn native_regexp_symbol_split(
         combined
     };
     let new_flags_js = {
-        JsString::from_str(&new_flags, ctx.heap()).map_err(|_| crate::NativeError::TypeError {
-            name,
-            reason: "out of memory".to_string(),
+        JsString::from_str(&new_flags, ctx.heap_mut()).map_err(|_| {
+            crate::NativeError::TypeError {
+                name,
+                reason: "out of memory".to_string(),
+            }
         })?
     };
 
@@ -1495,7 +1495,7 @@ pub fn native_regexp_symbol_split(
                 )
                 .map_err(vm_err_to_native(name))?
         };
-        let n = crate::number::to_number_value(&primitive);
+        let n = crate::number::to_number_value(&primitive, ctx.heap());
         if n.is_nan() {
             0
         } else {
@@ -1532,7 +1532,7 @@ pub fn native_regexp_symbol_split(
                 })?;
             return Ok(Value::Array(arr));
         }
-        out_elements.push(Value::String(s.clone()));
+        out_elements.push(Value::String(s));
         let arr = ctx
             .array_from_elements_with_roots(
                 out_elements.iter().cloned(),
@@ -1717,7 +1717,7 @@ fn get_substitution(
                 };
                 if let Some(group_index) = idx {
                     if let Some(Some(cap)) = captures.get(group_index - 1) {
-                        out.extend_from_slice(&cap.to_utf16_vec());
+                        out.extend_from_slice(&cap.to_utf16_vec(ctx.heap()));
                     }
                     // Undefined capture group → emit nothing.
                 } else {
@@ -1758,7 +1758,7 @@ fn get_substitution(
                         let val = get_property_runtime(ctx, nc, &group_name, name)?;
                         if !matches!(val, Value::Undefined) {
                             let coerced = coerce_to_jsstring_runtime(ctx, &val, name)?;
-                            out.extend_from_slice(&coerced.to_utf16_vec());
+                            out.extend_from_slice(&coerced.to_utf16_vec(ctx.heap()));
                         }
                         i = end + 1;
                     }
@@ -1795,7 +1795,7 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
 /// back to `Value::Undefined`. `lastIndex` reads and writes flow
 /// through here too.
 #[must_use]
-pub fn load_property(re: &JsRegExp, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     match name {
         "source" => {
             let raw = re.source(gc_heap);
@@ -1902,12 +1902,12 @@ mod tests {
     fn test_returns_boolean() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("ab+c", "", &mut gc_heap);
-        let text = Value::String(JsString::from_str("abbbc", &gc_heap).unwrap());
+        let text = Value::String(JsString::from_str("abbbc", &mut gc_heap).unwrap());
         assert_eq!(
             call("test", &re, &[text], &mut gc_heap),
             Value::Boolean(true)
         );
-        let no = Value::String(JsString::from_str("xy", &gc_heap).unwrap());
+        let no = Value::String(JsString::from_str("xy", &mut gc_heap).unwrap());
         assert_eq!(
             call("test", &re, &[no], &mut gc_heap),
             Value::Boolean(false)
@@ -1918,7 +1918,7 @@ mod tests {
     fn exec_returns_array_or_null() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("(a)(b)", "", &mut gc_heap);
-        let text = Value::String(JsString::from_str("ab", &gc_heap).unwrap());
+        let text = Value::String(JsString::from_str("ab", &mut gc_heap).unwrap());
         let r = call("exec", &re, &[text], &mut gc_heap);
         match r {
             Value::Array(arr) => {
@@ -1941,7 +1941,9 @@ mod tests {
         let miss = call(
             "exec",
             &re,
-            &[Value::String(JsString::from_str("zz", &gc_heap).unwrap())],
+            &[Value::String(
+                JsString::from_str("zz", &mut gc_heap).unwrap(),
+            )],
             &mut gc_heap,
         );
         assert_eq!(miss, Value::Null);
@@ -1951,7 +1953,7 @@ mod tests {
     fn exec_result_arrays_use_intrinsic_rooted_allocation() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("(?<first>a)(b)", "d", &mut gc_heap);
-        let text = Value::String(JsString::from_str("ab", &gc_heap).unwrap());
+        let text = Value::String(JsString::from_str("ab", &mut gc_heap).unwrap());
         let before = gc_heap.stats().new_allocated_bytes;
         let result = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         let after = gc_heap.stats().new_allocated_bytes;
@@ -1977,7 +1979,7 @@ mod tests {
     fn exec_global_walks_through_text() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("a", "g", &mut gc_heap);
-        let text = Value::String(JsString::from_str("abab", &gc_heap).unwrap());
+        let text = Value::String(JsString::from_str("abab", &mut gc_heap).unwrap());
         // First call → match at 0, lastIndex moves to 1.
         let r1 = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         match (&r1, &re) {
@@ -2012,17 +2014,20 @@ mod tests {
             "gi",
         )
         .unwrap();
-        let src = load_property(&re, &gc_heap, "source");
+        let src = load_property(&re, &mut gc_heap, "source");
         assert_eq!(src.display_string(&gc_heap), "ab+c");
-        let flags = load_property(&re, &gc_heap, "flags");
+        let flags = load_property(&re, &mut gc_heap, "flags");
         assert_eq!(flags.display_string(&gc_heap), "gi");
-        assert_eq!(load_property(&re, &gc_heap, "global"), Value::Boolean(true));
         assert_eq!(
-            load_property(&re, &gc_heap, "ignoreCase"),
+            load_property(&re, &mut gc_heap, "global"),
             Value::Boolean(true)
         );
         assert_eq!(
-            load_property(&re, &gc_heap, "multiline"),
+            load_property(&re, &mut gc_heap, "ignoreCase"),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            load_property(&re, &mut gc_heap, "multiline"),
             Value::Boolean(false)
         );
     }
@@ -2049,25 +2054,20 @@ mod tests {
         );
         assert_eq!(re.last_index(&gc_heap), 0);
         assert_eq!(
-            load_property(&re, &gc_heap, "lastIndex"),
+            load_property(&re, &mut gc_heap, "lastIndex"),
             Value::Number(NumberValue::from_i32(-3))
         );
         // String writes are observable, and execution coerces them
         // numerically when needed.
-        let written = JsString::from_str("9", &gc_heap).unwrap();
-        store_property(
-            &re,
-            &mut gc_heap,
-            "lastIndex",
-            Value::String(written.clone()),
-        );
+        let written = JsString::from_str("9", &mut gc_heap).unwrap();
+        store_property(&re, &mut gc_heap, "lastIndex", Value::String(written));
         assert_eq!(
-            load_property(&re, &gc_heap, "lastIndex"),
+            load_property(&re, &mut gc_heap, "lastIndex"),
             Value::String(written)
         );
         assert_eq!(re.last_index(&gc_heap), 9);
         // Non-lastIndex names are silently ignored.
-        let nope = Value::String(JsString::from_str("nope", &gc_heap).unwrap());
+        let nope = Value::String(JsString::from_str("nope", &mut gc_heap).unwrap());
         store_property(&re, &mut gc_heap, "source", nope);
     }
 }

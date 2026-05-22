@@ -80,13 +80,15 @@ pub fn array_buffer_call_with_roots(
         M::Construct => {
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
-                Some(v) => to_index(v).ok_or_else(|| to_index_error(v, "ArrayBuffer length"))?,
+                Some(v) => {
+                    to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "ArrayBuffer length"))?
+                }
             };
             let max_byte_length = match args.get(1) {
                 Some(Value::Object(opts)) => {
                     if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
                         Some(
-                            to_index(&v)
+                            to_index(&v, gc_heap)
                                 .ok_or_else(|| to_index_error(&v, "ArrayBuffer maxByteLength"))?,
                         )
                     } else {
@@ -148,15 +150,14 @@ pub fn shared_array_buffer_call_with_roots(
             external_visit(&mut |_| {});
             let length = match args.first() {
                 None | Some(Value::Undefined) => 0u64,
-                Some(v) => {
-                    to_index(v).ok_or_else(|| to_index_error(v, "SharedArrayBuffer length"))?
-                }
+                Some(v) => to_index(v, gc_heap)
+                    .ok_or_else(|| to_index_error(v, "SharedArrayBuffer length"))?,
             };
             let max_byte_length =
                 match args.get(1) {
                     Some(Value::Object(opts)) => {
                         if let Some(v) = crate::object::get(*opts, gc_heap, "maxByteLength") {
-                            Some(to_index(&v).ok_or_else(|| {
+                            Some(to_index(&v, gc_heap).ok_or_else(|| {
                                 to_index_error(&v, "SharedArrayBuffer maxByteLength")
                             })?)
                         } else {
@@ -225,7 +226,7 @@ pub fn data_view_call(
             let buffer_byte_length = buffer.byte_length(gc_heap);
             let byte_offset = match args.get(1) {
                 None | Some(Value::Undefined) => 0u64,
-                Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
+                Some(v) => to_index(v, gc_heap).ok_or(VmError::TypeMismatch)?,
             } as usize;
             if byte_offset > buffer_byte_length {
                 return Err(VmError::TypeMismatch);
@@ -233,7 +234,7 @@ pub fn data_view_call(
             let byte_length = match args.get(2) {
                 None | Some(Value::Undefined) => buffer_byte_length - byte_offset,
                 Some(v) => {
-                    let n = to_index(v).ok_or(VmError::TypeMismatch)? as usize;
+                    let n = to_index(v, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
                     if byte_offset + n > buffer_byte_length {
                         return Err(VmError::TypeMismatch);
                     }
@@ -339,7 +340,7 @@ fn construct_typed_array_with_roots(
             }
             let byte_offset = match args.get(1) {
                 None | Some(Value::Undefined) => 0u64,
-                Some(v) => to_index(v).ok_or(VmError::TypeMismatch)?,
+                Some(v) => to_index(v, gc_heap).ok_or(VmError::TypeMismatch)?,
             } as usize;
             if !byte_offset.is_multiple_of(bpe) {
                 return Err(VmError::TypeMismatch);
@@ -357,7 +358,7 @@ fn construct_typed_array_with_roots(
                     remaining / bpe
                 }
                 Some(v) => {
-                    let n = to_index(v).ok_or(VmError::TypeMismatch)? as usize;
+                    let n = to_index(v, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
                     if byte_offset + n * bpe > buf_len {
                         return Err(VmError::TypeMismatch);
                     }
@@ -390,17 +391,19 @@ fn construct_typed_array_with_roots(
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
         Some(Value::Number(_) | Value::Boolean(_) | Value::Null) => {
-            let length = to_index(args.first().unwrap()).ok_or(VmError::TypeMismatch)? as usize;
+            let length =
+                to_index(args.first().unwrap(), gc_heap).ok_or(VmError::TypeMismatch)? as usize;
             new_zeroed_typed_array_with_roots(kind, length, gc_heap, external_visit)
         }
         Some(Value::String(_)) => {
-            let length = to_index(args.first().unwrap()).ok_or(VmError::TypeMismatch)? as usize;
+            let length =
+                to_index(args.first().unwrap(), gc_heap).ok_or(VmError::TypeMismatch)? as usize;
             new_zeroed_typed_array_with_roots(kind, length, gc_heap, external_visit)
         }
         Some(Value::Object(obj)) => {
             let length_value =
                 crate::object::get(*obj, gc_heap, "length").unwrap_or(Value::Undefined);
-            let len = to_index(&length_value).ok_or(VmError::TypeMismatch)? as usize;
+            let len = to_index(&length_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v =
@@ -443,7 +446,7 @@ fn from_static_with_roots(
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
         }
         Value::String(s) => {
-            let text = s.to_lossy_string();
+            let text = s.to_lossy_string(gc_heap);
             let mut chars: Vec<Value> = Vec::with_capacity(text.chars().count());
             for c in text.chars() {
                 if kind.is_bigint() {
@@ -460,7 +463,7 @@ fn from_static_with_roots(
         }
         Value::Object(obj) => {
             let len_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::Undefined);
-            let len = to_index(&len_value).ok_or(VmError::TypeMismatch)? as usize;
+            let len = to_index(&len_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v =
@@ -505,7 +508,7 @@ fn coerce_for_kind(
             // Spec rejects Number → BigInt array store with TypeError.
             Value::Number(_) => Err(VmError::TypeMismatch),
             Value::String(s) => {
-                let text = s.to_lossy_string();
+                let text = s.to_lossy_string(gc_heap);
                 match crate::bigint::BigIntValue::from_decimal(gc_heap, text.trim()) {
                     Some(Ok(b)) => Ok(Value::BigInt(b)),
                     Some(Err(e)) => Err(oom_to_vm(e)),
@@ -576,7 +579,7 @@ mod tests {
         // overhead on top of the 64-byte backing store.
         let after = heap.tracked_bytes();
         assert!(after - before >= 64);
-        drop(value);
+        let _ = value;
         // The backing store stays accounted until the GC body that
         // owns the `ExternalMemory` token is collected. After full
         // GC, the external reservation is released even if the
@@ -604,7 +607,7 @@ mod tests {
         assert!(matches!(value, Value::TypedArray(_)));
         let after = heap.tracked_bytes();
         assert!(after - before >= 8);
-        drop(value);
+        let _ = value;
         heap.collect_full(&mut |_| {});
         assert!(heap.tracked_bytes() <= after - 8);
     }

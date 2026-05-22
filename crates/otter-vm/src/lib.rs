@@ -183,7 +183,7 @@ pub use promise::{
     PromiseState, PromiseThenOutcome, PurePromise, ReactionKind,
 };
 pub use regexp::{JsRegExp, RegExpError, RegExpFlags};
-pub use string::{JsString, MAX_ROPE_DEPTH, StringRepr};
+pub use string::{JsString, MAX_ROPE_DEPTH};
 pub use symbol::{JsSymbol, SymbolBody, SymbolRegistry, WellKnown, WellKnownSymbols};
 pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 pub use timers::{TimerCallbacks, TimerEntry, TimerScheduler, TimerSchedulerHandle};
@@ -1386,7 +1386,7 @@ impl Value {
 
     /// Convenience: shared empty-string constant. Allocates only on
     /// first call per heap.
-    pub fn empty_string(heap: &otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
+    pub fn empty_string(heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self::String(JsString::empty(heap)?))
     }
 
@@ -1405,8 +1405,8 @@ impl Value {
             // BigInt rendering matches `BigInt.prototype.toString`:
             // decimal digits, no `n` suffix.
             Value::BigInt(b) => b.to_decimal_string(heap),
-            Value::String(s) => s.to_lossy_string(),
-            Value::Symbol(s) => s.descriptive_string(),
+            Value::String(s) => s.to_lossy_string(heap),
+            Value::Symbol(s) => s.descriptive_string(heap),
             Value::Function { function_id }
             | Value::Closure(crate::closure::JsClosure {
                 cached_function_id: function_id,
@@ -1630,7 +1630,7 @@ impl Value {
     ///
     /// # Errors
     /// See [`JsString::from_str`].
-    pub fn from_str(s: &str, heap: &otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
+    pub fn from_str(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         Ok(Self::String(JsString::from_str(s, heap)?))
     }
 }
@@ -1667,7 +1667,11 @@ impl PartialEq for Value {
             // `abstract_ops::same_value` (which routes through
             // `BigIntValue::numeric_eq`).
             (Value::BigInt(a), Value::BigInt(b)) => a.ptr_eq(*b),
-            (Value::String(a), Value::String(b)) => a.equals(b),
+            // Strings compare by **handle identity** here —
+            // value-equal strings with distinct GC bodies fall
+            // through to `abstract_ops::strict_equality`, which
+            // routes through `JsString::equals(other, heap)`.
+            (Value::String(a), Value::String(b)) => a == b,
             // Symbol identity is ptr_eq on the inner Rc — distinct
             // `Symbol("x")` calls compare unequal even with matching
             // descriptions.
@@ -2436,7 +2440,7 @@ impl Interpreter {
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
-    pub(crate) fn get_prototype_for_op(&self, value: &Value) -> Result<Value, VmError> {
+    pub(crate) fn get_prototype_for_op(&mut self, value: &Value) -> Result<Value, VmError> {
         match value {
             Value::Object(obj) => {
                 let stored = object::prototype_value(*obj, &self.gc_heap);
@@ -2830,14 +2834,14 @@ impl Interpreter {
         );
     }
 
-    fn primitive_wrapper_prototype(&self, constructor_name: &str) -> Result<JsObject, VmError> {
+    fn primitive_wrapper_prototype(&mut self, constructor_name: &str) -> Result<JsObject, VmError> {
         let constructor = object::get(self.global_this, &self.gc_heap, constructor_name)
             .ok_or(VmError::InvalidOperand)?;
         let prototype = match &constructor {
             Value::Object(ctor) => object::get(*ctor, &self.gc_heap, "prototype"),
             Value::NativeFunction(native) => {
                 let desc = native
-                    .own_property_descriptor(&self.gc_heap, "prototype")
+                    .own_property_descriptor(&mut self.gc_heap, "prototype")
                     .map_err(|_| VmError::InvalidOperand)?;
                 desc.and_then(|d| match d.kind {
                     object::DescriptorKind::Data { value } => Some(value),
@@ -2885,7 +2889,7 @@ impl Interpreter {
                     &[&this_value],
                     slice_roots,
                 )?;
-                object::set_string_data(obj, &mut self.gc_heap, value.clone());
+                object::set_string_data(obj, &mut self.gc_heap, *value);
                 obj
             }
             Value::Symbol(sym) => {
@@ -2950,7 +2954,7 @@ impl Interpreter {
                     &[&this_value],
                     slice_roots,
                 )?;
-                object::set_string_data(obj, &mut self.gc_heap, value.clone());
+                object::set_string_data(obj, &mut self.gc_heap, *value);
                 obj
             }
             Value::Symbol(sym) => {
@@ -3001,7 +3005,7 @@ impl Interpreter {
             Value::String(v) => {
                 let proto = self.primitive_wrapper_prototype("String")?;
                 let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
-                object::set_string_data(obj, &mut self.gc_heap, v.clone());
+                object::set_string_data(obj, &mut self.gc_heap, *v);
                 obj
             }
             Value::Symbol(_) => {
@@ -3686,7 +3690,7 @@ impl Interpreter {
                     }
                     Err(vm_err) => {
                         if result_capability.is_some() {
-                            let reason = vm_err_to_value(&vm_err, &self.gc_heap);
+                            let reason = vm_err_to_value(&vm_err, &mut self.gc_heap);
                             self.settle_microtask_capability(
                                 context,
                                 result_capability,
@@ -3727,7 +3731,7 @@ impl Interpreter {
                         let reason = self
                             .pending_uncaught_throw
                             .take()
-                            .unwrap_or_else(|| vm_err_to_value(&vm_err, &self.gc_heap));
+                            .unwrap_or_else(|| vm_err_to_value(&vm_err, &mut self.gc_heap));
                         self.settle_microtask_capability(context, result_capability, Err(reason));
                         Ok(())
                     } else {
@@ -3816,7 +3820,7 @@ impl Interpreter {
                     let reason = self
                         .pending_uncaught_throw
                         .take()
-                        .unwrap_or_else(|| vm_err_to_value(&error, &self.gc_heap));
+                        .unwrap_or_else(|| vm_err_to_value(&error, &mut self.gc_heap));
                     self.settle_microtask_capability(context, result_capability, Err(reason));
                     Ok(())
                 } else {
@@ -5725,14 +5729,14 @@ fn object_prototype_intercept(
     obj: &object::JsObject,
     name: &str,
     args: &SmallVec<[Value; 8]>,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
     function_prototype: Option<object::JsObject>,
 ) -> Result<Option<Value>, VmError> {
     match name {
         // §20.1.3.2 Object.prototype.hasOwnProperty(V)
         // <https://tc39.es/ecma262/#sec-object.prototype.hasownproperty>
         "hasOwnProperty" => {
-            let key = property_key_from_arg(args.first())?;
+            let key = property_key_from_arg(args.first(), gc_heap)?;
             let present = !matches!(
                 object::lookup_own(*obj, gc_heap, &key),
                 object::PropertyLookup::Absent
@@ -5742,7 +5746,7 @@ fn object_prototype_intercept(
         // §20.1.3.4 Object.prototype.propertyIsEnumerable(V)
         // <https://tc39.es/ecma262/#sec-object.prototype.propertyisenumerable>
         "propertyIsEnumerable" => {
-            let key = property_key_from_arg(args.first())?;
+            let key = property_key_from_arg(args.first(), gc_heap)?;
             let result = match object::lookup_own(*obj, gc_heap, &key) {
                 object::PropertyLookup::Data { flags, .. } => flags.enumerable(),
                 object::PropertyLookup::Accessor { flags, .. } => flags.enumerable(),
@@ -5828,17 +5832,17 @@ fn native_function_object_prototype_intercept(
     native: &NativeFunction,
     name: &str,
     args: &SmallVec<[Value; 8]>,
-    gc_heap: &otter_gc::GcHeap,
+    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Option<Value>, VmError> {
     match name {
         "hasOwnProperty" => {
-            let key = property_key_from_arg(args.first())?;
+            let key = property_key_from_arg(args.first(), gc_heap)?;
             Ok(Some(Value::Boolean(
                 native.own_property_descriptor(gc_heap, &key)?.is_some(),
             )))
         }
         "propertyIsEnumerable" => {
-            let _key = property_key_from_arg(args.first())?;
+            let _key = property_key_from_arg(args.first(), gc_heap)?;
             Ok(Some(Value::Boolean(false)))
         }
         "isPrototypeOf" => Ok(Some(Value::Boolean(false))),
@@ -5854,13 +5858,13 @@ fn bound_function_object_prototype_intercept(
 ) -> Result<Option<Value>, VmError> {
     match name {
         "hasOwnProperty" => {
-            let key = property_key_from_arg(args.first())?;
+            let key = property_key_from_arg(args.first(), gc_heap)?;
             Ok(Some(Value::Boolean(
                 function_metadata::bound_has_own_property(bound, gc_heap, &key),
             )))
         }
         "propertyIsEnumerable" => {
-            let key = property_key_from_arg(args.first())?;
+            let key = property_key_from_arg(args.first(), gc_heap)?;
             Ok(Some(Value::Boolean(
                 function_metadata::bound_own_property_is_enumerable(bound, gc_heap, &key),
             )))
@@ -5913,9 +5917,9 @@ pub(crate) fn value_kind_name(value: &Value) -> &'static str {
 
 /// §7.1.19 ToPropertyKey for a single optional argument used by
 /// `Object.prototype.hasOwnProperty` / `propertyIsEnumerable`.
-fn property_key_from_arg(arg: Option<&Value>) -> Result<String, VmError> {
+fn property_key_from_arg(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> Result<String, VmError> {
     match arg {
-        Some(Value::String(s)) => Ok(s.to_lossy_string()),
+        Some(Value::String(s)) => Ok(s.to_lossy_string(heap)),
         Some(Value::Number(n)) => Ok(n.to_display_string()),
         Some(Value::Boolean(b)) => Ok((if *b { "true" } else { "false" }).to_string()),
         Some(Value::Null) => Ok("null".to_string()),
@@ -5924,12 +5928,12 @@ fn property_key_from_arg(arg: Option<&Value>) -> Result<String, VmError> {
     }
 }
 
-fn to_length(value: &Value) -> Result<usize, VmError> {
+fn to_length(value: &Value, heap: &otter_gc::GcHeap) -> Result<usize, VmError> {
     match value {
         Value::Symbol(_) | Value::BigInt(_) => return Err(VmError::TypeMismatch),
         _ => {}
     }
-    let n = number::to_number_value(value);
+    let n = number::to_number_value(value, heap);
     if n.is_nan() || n <= 0.0 {
         return Ok(0);
     }
@@ -5999,7 +6003,7 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// §22.1.3.34.
 fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let string = match ctx.this_value() {
-        Value::String(s) => s.clone(),
+        Value::String(s) => *s,
         Value::Object(obj) => match crate::object::string_data(*obj, ctx.heap()) {
             Some(s) => s,
             None => {
@@ -6175,9 +6179,7 @@ fn step_iterator(
         IteratorState::ArrayEntry { array, index } => {
             FastIteratorSnapshot::ArrayEntry(*array, *index)
         }
-        IteratorState::String { string, index } => {
-            FastIteratorSnapshot::String(string.clone(), *index)
-        }
+        IteratorState::String { string, index } => FastIteratorSnapshot::String(*string, *index),
         IteratorState::MapCollection { map, index, kind } => {
             FastIteratorSnapshot::MapCollection(*map, *index, *kind)
         }
@@ -6256,8 +6258,8 @@ fn step_iterator(
         }
         FastIteratorSnapshot::String(string, index) => {
             // §22.1.5.1 `%StringIteratorPrototype%.next`.
-            if let Some(unit) = string.char_code_at(index) {
-                let next_unit = string.char_code_at(index + 1);
+            if let Some(unit) = string.char_code_at(index, gc_heap) {
+                let next_unit = string.char_code_at(index + 1, gc_heap);
                 let is_pair = (0xD800..=0xDBFF).contains(&unit)
                     && matches!(next_unit, Some(low) if (0xDC00..=0xDFFF).contains(&low));
                 let (s, advance) = if is_pair {
@@ -7705,10 +7707,12 @@ mod tests {
             after > before,
             "VM error throwable conversion should allocate through stack roots"
         );
+        let message_value = object::get(error, interp.gc_heap(), "message");
+        let heap_ref = interp.gc_heap();
         assert!(matches!(
-            object::get(error, interp.gc_heap(), "message"),
-            Some(Value::String(message)) if message
-                .to_lossy_string()
+            message_value,
+            Some(Value::String(ref message)) if message
+                .to_lossy_string(heap_ref)
                 .contains("type mismatch")
         ));
     }
@@ -8248,10 +8252,12 @@ mod tests {
         else {
             panic!("expected TypeError rejection object");
         };
+        let msg = object::get(reason, interp.gc_heap(), "message");
+        let heap_ref = interp.gc_heap();
         assert!(matches!(
-            object::get(reason, interp.gc_heap(), "message"),
-            Some(Value::String(message)) if message
-                .to_lossy_string()
+            msg,
+            Some(Value::String(ref message)) if message
+                .to_lossy_string(heap_ref)
                 .contains("specifier must be a string")
         ));
     }
@@ -9101,9 +9107,11 @@ mod tests {
         let Value::Array(pair) = array::get(entries, interp.gc_heap(), 0) else {
             panic!("Object.entries should contain pair arrays");
         };
+        let first = array::get(pair, interp.gc_heap(), 0);
+        let heap_ref = interp.gc_heap();
         assert!(matches!(
-            array::get(pair, interp.gc_heap(), 0),
-            Value::String(name) if name.to_lossy_string() == "answer"
+            first,
+            Value::String(ref name) if name.to_lossy_string(heap_ref) == "answer"
         ));
         assert_eq!(
             array::get(pair, interp.gc_heap(), 1),
@@ -9406,9 +9414,11 @@ mod tests {
         let Value::Array(names) = stack[0].registers[1] else {
             panic!("Object.getOwnPropertyNames(proxy) should return an array");
         };
+        let first = array::get(names, interp.gc_heap(), 0);
+        let heap_ref = interp.gc_heap();
         assert!(matches!(
-            array::get(names, interp.gc_heap(), 0),
-            Value::String(name) if name.to_lossy_string() == "answer"
+            first,
+            Value::String(ref name) if name.to_lossy_string(heap_ref) == "answer"
         ));
     }
 
@@ -9792,7 +9802,7 @@ mod tests {
             interp.gc_heap_mut(),
             1,
             Vec::new(),
-            Some(Value::String(bound.clone())),
+            Some(Value::String(bound)),
         )
         .expect("closure alloc");
         let closure = Value::Closure(closure_handle);

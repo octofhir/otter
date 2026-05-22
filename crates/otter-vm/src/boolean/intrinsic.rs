@@ -91,7 +91,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     // §20.3.2 — `Boolean.name` is `"Boolean"`, non-writable,
     // non-enumerable, configurable.
     let name_value = Value::String(
-        crate::string::JsString::from_str("Boolean", &otter_gc::GcHeap::new().expect("heap"))
+        crate::string::JsString::from_str("Boolean", heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let _ = object::define_own_property(

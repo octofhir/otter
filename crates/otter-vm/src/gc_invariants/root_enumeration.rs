@@ -208,7 +208,7 @@ fn error_class_registry_prototypes_survive_force_gc() {
         .expect("TypeError.prototype.name survives force_gc");
 
     match name {
-        crate::Value::String(s) => assert_eq!(s.to_lossy_string(), "TypeError"),
+        crate::Value::String(s) => assert_eq!(s.to_lossy_string(interp.gc_heap()), "TypeError"),
         other => panic!("expected TypeError.prototype.name string, got {other:?}"),
     }
 }

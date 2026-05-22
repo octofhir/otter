@@ -82,8 +82,10 @@ impl StringifyOptions {
                 })
             }
             Value::String(s) => {
-                let lossy = s.to_lossy_string();
-                let bytes = lossy.as_bytes();
+                let bytes = match gc_heap {
+                    Some(heap) => s.to_lossy_string(heap).into_bytes(),
+                    None => Vec::new(),
+                };
                 let take = bytes.len().min(10);
                 Ok(Self {
                     indent: bytes[..take].to_vec(),
@@ -289,7 +291,7 @@ fn emit_value(
         Value::Boolean(false) => out.push_str("false"),
         Value::Number(n) => write_number(out, *n),
         Value::BigInt(_) => return Err(JsonError::BigInt),
-        Value::String(s) => write_string_literal(out, &s.to_lossy_string()),
+        Value::String(s) => write_string_literal(out, &s.to_lossy_string(gc_heap)),
         Value::Array(arr) => {
             // Lazy stringify memcpy fast-path: an array that came
             // from `JSON.parse` and has not been mutated since
@@ -512,9 +514,9 @@ mod tests {
 
     #[test]
     fn options_string_truncated_to_ten_bytes() {
-        let heap = otter_gc::GcHeap::new().expect("heap");
-        let s = crate::string::JsString::from_str("xxxxxxxxxxYYYY", &heap).unwrap();
-        let opts = StringifyOptions::from_space(&Value::String(s)).unwrap();
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let s = crate::string::JsString::from_str("xxxxxxxxxxYYYY", &mut heap).unwrap();
+        let opts = StringifyOptions::from_space_with_heap(&Value::String(s), Some(&heap)).unwrap();
         assert_eq!(opts.indent.len(), 10);
     }
 

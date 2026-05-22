@@ -31,11 +31,15 @@ use crate::{NativeCall, NativeCtx, NativeError};
 /// `BigInt` arms as `TypeError` (which the wrapper translates to
 /// `IntrinsicError::BadArgument`); the rest go through the loose
 /// numeric coercion.
-fn coerce_digits_arg(arg: Option<&Value>, default_undefined: f64) -> Result<f64, IntrinsicError> {
+fn coerce_digits_arg(
+    arg: Option<&Value>,
+    default_undefined: f64,
+    heap: &otter_gc::GcHeap,
+) -> Result<f64, IntrinsicError> {
     use super::parse::IntegerCoercion;
     match arg {
         None | Some(Value::Undefined) => Ok(default_undefined),
-        Some(v) => match super::parse::to_integer_or_infinity_strict(v) {
+        Some(v) => match super::parse::to_integer_or_infinity_strict(v, heap) {
             IntegerCoercion::Ok(n) => Ok(n),
             IntegerCoercion::SymbolNotConvertible => Err(IntrinsicError::BadArgument {
                 index: 0,
@@ -90,7 +94,8 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
                 Value::Boolean(true) => 1.0,
                 Value::Boolean(false) | Value::Null => 0.0,
                 Value::String(s) => {
-                    crate::number::parse::to_number_from_string(&s.to_lossy_string()).as_f64()
+                    crate::number::parse::to_number_from_string(&s.to_lossy_string(args.gc_heap))
+                        .as_f64()
                 }
                 _ => f64::NAN,
             };
@@ -118,7 +123,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 fn impl_to_fixed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_number(args)?;
     // §21.1.3.3 step 2: `f = ToIntegerOrInfinity(fractionDigits)`.
-    let f_arg = coerce_digits_arg(args.args.first(), 0.0)?;
+    let f_arg = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
     // §21.1.3.3 step 3: `f` outside `[0, 100]` (or `±Infinity`)
     // raises `RangeError`.
     if !f_arg.is_finite() || !(0.0..=100.0).contains(&f_arg) {
@@ -157,7 +162,7 @@ fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     let digits: Option<u32> = match args.args.first() {
         None | Some(Value::Undefined) => None,
         Some(_) => {
-            let f = coerce_digits_arg(args.args.first(), 0.0)?;
+            let f = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
             // §21.1.3.2 step 6: out-of-range raises `RangeError`.
             if !f.is_finite() || !(0.0..=100.0).contains(&f) {
                 return Err(IntrinsicError::OutOfRange {
@@ -194,7 +199,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     // `BigInt` arg surfaces a `TypeError` and a throwing `valueOf`
     // propagates per §21.1.3.5 step 3 (matching test262
     // `nan.js` / `return-abrupt-tointeger-precision*` cases).
-    let p = coerce_digits_arg(args.args.first(), 0.0)?;
+    let p = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
     // §21.1.3.5 step 4: NaN/Infinity short-circuit AFTER coercion.
     if !value.is_finite() {
         return Ok(Value::String(super::ecma::number_to_string(

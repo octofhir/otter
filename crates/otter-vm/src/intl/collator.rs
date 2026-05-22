@@ -29,7 +29,7 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> C
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     CollatorPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         usage: read_string_option(opts_ref, "usage", "sort", gc_heap),
         sensitivity: read_string_option(opts_ref, "sensitivity", "variant", gc_heap),
         ignore_punctuation: read_bool_option(opts_ref, "ignorePunctuation", false, gc_heap),
@@ -55,13 +55,13 @@ fn require_collator(args: &IntrinsicArgs<'_>) -> Result<CollatorPayload, Intrins
 fn impl_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_collator(args)?;
     let x = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         Some(Value::Number(n)) => n.to_display_string(),
         Some(Value::Boolean(b)) => if *b { "true" } else { "false" }.to_string(),
         _ => return Ok(Value::Number(NumberValue::from_i32(0))),
     };
     let y = match args.args.get(1) {
-        Some(Value::String(s)) => s.to_lossy_string(),
+        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         Some(Value::Number(n)) => n.to_display_string(),
         Some(Value::Boolean(b)) => if *b { "true" } else { "false" }.to_string(),
         _ => return Ok(Value::Number(NumberValue::from_i32(0))),
@@ -72,10 +72,14 @@ fn impl_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_collator(args)?;
-    let locale = js_string_value(&payload.locale, args)?;
-    let usage = js_string_value(&payload.usage, args)?;
-    let sensitivity = js_string_value(&payload.sensitivity, args)?;
-    let case_first = js_string_value(&payload.case_first, args)?;
+    let payload_locale = payload.locale.clone();
+    let payload_usage = payload.usage.clone();
+    let payload_sensitivity = payload.sensitivity.clone();
+    let payload_case_first = payload.case_first.clone();
+    let locale = js_string_value(&payload_locale, args)?;
+    let usage = js_string_value(&payload_usage, args)?;
+    let sensitivity = js_string_value(&payload_sensitivity, args)?;
+    let case_first = js_string_value(&payload_case_first, args)?;
     let ignore_punctuation = payload.ignore_punctuation;
     let numeric = payload.numeric;
     let obj = args.alloc_object_rooted(&[&locale, &usage, &sensitivity, &case_first], &[])?;
@@ -94,7 +98,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     Ok(Value::Object(obj))
 }
 
-fn js_string_value(s: &str, args: &IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     Ok(Value::String(crate::string::JsString::from_str(
         s,
         args.gc_heap,

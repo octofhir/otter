@@ -309,11 +309,12 @@ impl HasPropertyIc {
         &self,
         shape_id: ShapeId,
         key_value: &JsString,
+        heap: &otter_gc::GcHeap,
     ) -> Option<OwnPropertySlotHit> {
         let Self::OwnData { key, hit } = self else {
             return None;
         };
-        (hit.shape_id == shape_id && key.equals(key_value)).then_some(*hit)
+        (hit.shape_id == shape_id && key.equals(key_value, heap)).then_some(*hit)
     }
 
     /// Direct-prototype IC metadata when the receiver shape/key guard matches.
@@ -322,6 +323,7 @@ impl HasPropertyIc {
         &self,
         receiver_shape_id: ShapeId,
         key_value: &JsString,
+        heap: &otter_gc::GcHeap,
     ) -> Option<OwnPropertySlotHit> {
         let Self::DirectPrototypeData {
             receiver_shape_id: cached_receiver_shape_id,
@@ -331,7 +333,8 @@ impl HasPropertyIc {
         else {
             return None;
         };
-        (*cached_receiver_shape_id == receiver_shape_id && key.equals(key_value)).then_some(*hit)
+        (*cached_receiver_shape_id == receiver_shape_id && key.equals(key_value, heap))
+            .then_some(*hit)
     }
 
     /// Replay this IC against an ordinary object receiver.
@@ -343,12 +346,12 @@ impl HasPropertyIc {
         key: &JsString,
     ) -> Option<()> {
         let receiver_shape_id = object::shape_id(obj, heap);
-        if let Some(hit) = self.own_hit(receiver_shape_id, key)
+        if let Some(hit) = self.own_hit(receiver_shape_id, key, heap)
             && object::has_own_slot(obj, heap, hit)
         {
             return Some(());
         }
-        if let Some(hit) = self.direct_prototype_hit(receiver_shape_id, key)
+        if let Some(hit) = self.direct_prototype_hit(receiver_shape_id, key, heap)
             && let Some(proto) = object::prototype(obj, heap)
             && object::supports_fast_property_ic(proto, heap)
             && object::has_own_slot(proto, heap, hit)
@@ -368,11 +371,11 @@ impl HasPropertyIc {
         if !object::supports_fast_property_ic(obj, heap) {
             return None;
         }
-        let key_name = key.to_lossy_string();
+        let key_name = key.to_lossy_string(heap);
         let receiver_shape_id = object::shape_id(obj, heap);
         let (own_hit, own_lookup) = object::lookup_own_slot(obj, heap, &key_name);
         if let (Some(hit), object::PropertyLookup::Data { .. }) = (own_hit, own_lookup) {
-            return Some(Self::own_data(key.clone(), hit));
+            return Some(Self::own_data(*key, hit));
         }
         let proto = object::prototype(obj, heap)?;
         if !object::supports_fast_property_ic(proto, heap) {
@@ -380,11 +383,7 @@ impl HasPropertyIc {
         }
         let (proto_hit, proto_lookup) = object::lookup_own_slot(proto, heap, &key_name);
         if let (Some(hit), object::PropertyLookup::Data { .. }) = (proto_hit, proto_lookup) {
-            return Some(Self::direct_prototype_data(
-                receiver_shape_id,
-                key.clone(),
-                hit,
-            ));
+            return Some(Self::direct_prototype_data(receiver_shape_id, *key, hit));
         }
         None
     }
@@ -723,7 +722,7 @@ mod tests {
         object::set(proto, &mut heap, "y", Value::Null);
         let receiver = object::alloc_object_old_for_fixture(&mut heap).unwrap();
         object::set_prototype(receiver, &mut heap, Some(proto));
-        let key_string = JsString::from_str("x", &heap).expect("string");
+        let key_string = JsString::from_str("x", &mut heap).expect("string");
         let ic = HasPropertyIc::install_candidate(receiver, &heap, &key_string).expect("has ic");
 
         assert!(object::delete(proto, &mut heap, "y"));

@@ -29,7 +29,7 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> P
     let opts = options_object(Some(options));
     let opts_ref = opts.as_ref();
     PluralRulesPayload {
-        locale: coerce_locale(Some(locale)),
+        locale: coerce_locale(Some(locale), gc_heap),
         kind: read_string_option(opts_ref, "type", "cardinal", gc_heap),
         minimum_integer_digits: read_u8_option(opts_ref, "minimumIntegerDigits", 1, 1, 21, gc_heap),
         minimum_fraction_digits: read_u8_option(

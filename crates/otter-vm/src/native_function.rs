@@ -605,7 +605,7 @@ impl NativeFunction {
     /// non-enumerable, configurable data properties.
     pub(crate) fn own_property_descriptor(
         &self,
-        heap: &otter_gc::GcHeap,
+        heap: &mut otter_gc::GcHeap,
         key: &str,
     ) -> Result<Option<PropertyDescriptor>, otter_gc::OutOfMemory> {
         // Read property metadata under a shared payload borrow, then
@@ -1047,7 +1047,7 @@ struct NativeFunctionBodySnapshot {
 
 fn native_builtin_descriptor(
     body: &NativeFunctionBodySnapshot,
-    heap: &otter_gc::GcHeap,
+    heap: &mut otter_gc::GcHeap,
     key: &str,
 ) -> Result<PropertyDescriptor, otter_gc::OutOfMemory> {
     let value = match key {

@@ -67,15 +67,14 @@ fn parse_arg(
                 reason: "must be a Temporal.PlainDateTime",
             }),
         },
-        Some(Value::String(s)) => {
-            temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string().as_bytes()).map_err(|e| {
-                TemporalError::Engine {
-                    class: "PlainDateTime",
-                    method,
-                    message: e.to_string(),
-                }
-            })
-        }
+        Some(Value::String(s)) => temporal_rs::PlainDateTime::from_utf8(
+            s.to_lossy_string(gc_heap).as_bytes(),
+        )
+        .map_err(|e| TemporalError::Engine {
+            class: "PlainDateTime",
+            method,
+            message: e.to_string(),
+        }),
         _ => Err(TemporalError::BadArgument {
             class: "PlainDateTime",
             method,

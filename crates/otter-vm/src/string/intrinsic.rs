@@ -98,11 +98,9 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         object::set_prototype(constructor, heap, Some(object_proto));
         object::set_prototype(prototype, heap, Some(object_proto));
     }
-    crate::object::set_string_data(
-        prototype,
-        heap,
-        crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
-    );
+    let empty_str =
+        crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
+    crate::object::set_string_data(prototype, heap, empty_str);
 
     let prototype_root = Value::Object(prototype);
     let ctor_native = native_static_with_value_roots(
@@ -138,8 +136,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     // §22.1.2 — `String.name` is `"String"`, non-writable,
     // non-enumerable, configurable.
     let string_name_value = Value::String(
-        crate::JsString::from_str("String", &otter_gc::GcHeap::new().expect("heap"))
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
+        crate::JsString::from_str("String", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let _ = object::define_own_property(
         constructor,
@@ -234,7 +231,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     let raw = match args.first() {
         Some(value) => value.clone(),
         None => {
-            let empty = crate::string::JsString::from_str("", ctx.heap()).map_err(|_| {
+            let empty = crate::string::JsString::from_str("", ctx.heap_mut()).map_err(|_| {
                 NativeError::TypeError {
                     name: "String",
                     reason: "string allocation failed".to_string(),
@@ -274,7 +271,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     let value = crate::string::dispatch::call(
         otter_bytecode::method_id::StringMethod::Construct,
         std::slice::from_ref(&primitive),
-        ctx.heap(),
+        ctx.heap_mut(),
     )
     .map_err(|err| NativeError::TypeError {
         name: "String",

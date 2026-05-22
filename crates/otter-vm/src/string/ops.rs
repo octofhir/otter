@@ -21,29 +21,28 @@ use crate::{Frame, Interpreter, JsString, Value, VmError, read_register, write_r
 
 impl Interpreter {
     pub(crate) fn run_typeof_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
         let tag = read_register(frame, src)?.typeof_string_with_heap(&self.gc_heap);
-        let s = JsString::from_str(tag, &self.gc_heap)?;
+        let s = JsString::from_str(tag, &mut self.gc_heap)?;
         write_register(frame, dst, Value::String(s))?;
         frame.pc += 1;
         Ok(())
     }
 
     pub(crate) fn run_get_string_index_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         dst: u16,
         recv: u16,
         idx: u16,
     ) -> Result<(), VmError> {
-        let recv_s = read_register(frame, recv)?
+        let recv_s = *read_register(frame, recv)?
             .as_string()
-            .ok_or(VmError::TypeMismatch)?
-            .clone();
+            .ok_or(VmError::TypeMismatch)?;
         let idx = match read_register(frame, idx)? {
             Value::Number(n) => match n.as_smi() {
                 Some(v) if v >= 0 => v as u32,
@@ -51,9 +50,9 @@ impl Interpreter {
             },
             _ => return Err(VmError::TypeMismatch),
         };
-        let result = match recv_s.char_code_at(idx) {
-            Some(unit) => JsString::from_utf16_units(&[unit], &self.gc_heap)?,
-            None => JsString::empty(&self.gc_heap)?,
+        let result = match recv_s.char_code_at(idx, &self.gc_heap) {
+            Some(unit) => JsString::from_utf16_units(&[unit], &mut self.gc_heap)?,
+            None => JsString::empty(&mut self.gc_heap)?,
         };
         write_register(frame, dst, Value::String(result))?;
         frame.pc += 1;

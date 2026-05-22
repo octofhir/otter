@@ -193,7 +193,7 @@ fn open_kv(
             .map_err(|err| crate::type_error("openKv", err.to_string()))?
     };
     let object = build_store_object(ctx, store)?;
-    Ok(Value::Object(object))
+    Ok(Value::object(object))
 }
 
 fn build_store_object(ctx: &mut NativeCtx<'_>, store: KvStore) -> Result<JsObject, NativeError> {
@@ -234,7 +234,7 @@ fn method_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         runtime_with_host_data_mut::<KvStore, _>(ctx, object, |store| store.set(key, value))
             .map_err(|err| host_error("KvStore.set", err))?;
     result.map_err(|err| crate::type_error("KvStore.set", err.to_string()))?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn method_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -252,7 +252,7 @@ fn method_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let key = crate::arg_string(args, 0, "KvStore.has", ctx.heap())?;
     let has = runtime_with_host_data::<KvStore, _>(ctx, object, |store| store.has(&key))
         .map_err(|err| host_error("KvStore.has", err))?;
-    Ok(Value::Boolean(has))
+    Ok(Value::boolean(has))
 }
 
 fn method_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -261,7 +261,7 @@ fn method_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let result = runtime_with_host_data_mut::<KvStore, _>(ctx, object, |store| store.delete(&key))
         .map_err(|err| host_error("KvStore.delete", err))?;
     let deleted = result.map_err(|err| crate::type_error("KvStore.delete", err.to_string()))?;
-    Ok(Value::Boolean(deleted))
+    Ok(Value::boolean(deleted))
 }
 
 fn method_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -273,7 +273,7 @@ fn method_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
         .map(|key| crate::string_value(ctx, key))
         .collect::<Result<Vec<_>, _>>()?;
     let array = runtime_array_from_elements(ctx, values)?;
-    Ok(Value::Array(array))
+    Ok(Value::array(array))
 }
 
 fn method_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -281,5 +281,5 @@ fn method_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
     let result = runtime_with_host_data_mut::<KvStore, _>(ctx, object, KvStore::clear)
         .map_err(|err| host_error("KvStore.clear", err))?;
     result.map_err(|err| crate::type_error("KvStore.clear", err.to_string()))?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }

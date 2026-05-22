@@ -8,10 +8,9 @@ use std::path::{Path, PathBuf};
 use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
 use otter_runtime::{
     RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNumberValue as NumberValue,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_alloc_object,
-    runtime_array_from_elements, runtime_set_property, runtime_this_object,
-    runtime_with_host_data_mut,
+    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
+    RuntimeValue as Value, runtime_alloc_object, runtime_array_from_elements, runtime_set_property,
+    runtime_this_object, runtime_with_host_data_mut,
 };
 use rusqlite::types::{ToSqlOutput, Value as SqliteValue, ValueRef};
 use rusqlite::{Connection, OpenFlags};
@@ -211,7 +210,7 @@ fn open_sql(
             .map_err(|err| crate::type_error("openSql", err.to_string()))?
     };
     let object = build_database_object(ctx, db)?;
-    Ok(Value::Object(object))
+    Ok(Value::object(object))
 }
 
 fn build_database_object(
@@ -250,7 +249,7 @@ fn method_execute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
             .map_err(|err| host_error("SqlDatabase.execute", err))?;
     let affected =
         result.map_err(|err| crate::type_error("SqlDatabase.execute", err.to_string()))?;
-    Ok(Value::Number(NumberValue::from_f64(affected as f64)))
+    Ok(Value::number_f64(affected as f64))
 }
 
 fn method_query(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -272,8 +271,8 @@ fn method_query_one(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         runtime_with_host_data_mut::<SqlDatabase, _>(ctx, object, |db| db.query_one(&sql, &params))
             .map_err(|err| host_error("SqlDatabase.queryOne", err))?;
     match result.map_err(|err| crate::type_error("SqlDatabase.queryOne", err.to_string()))? {
-        Some(row) => json_row_to_object(ctx, row).map(Value::Object),
-        None => Ok(Value::Null),
+        Some(row) => json_row_to_object(ctx, row).map(Value::object),
+        None => Ok(Value::null()),
     }
 }
 
@@ -290,10 +289,10 @@ fn js_params(
 fn json_rows_to_array(ctx: &mut NativeCtx<'_>, rows: Vec<JsonValue>) -> Result<Value, NativeError> {
     let values = rows
         .into_iter()
-        .map(|row| json_row_to_object(ctx, row).map(Value::Object))
+        .map(|row| json_row_to_object(ctx, row).map(Value::object))
         .collect::<Result<Vec<_>, _>>()?;
     let arr = runtime_array_from_elements(ctx, values)?;
-    Ok(Value::Array(arr))
+    Ok(Value::array(arr))
 }
 
 fn json_row_to_object(ctx: &mut NativeCtx<'_>, row: JsonValue) -> Result<JsObject, NativeError> {

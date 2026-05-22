@@ -224,5 +224,5 @@ fn open_library(
         .data_property("path", path_value)
         .map_err(|err| crate::type_error("dlopen", err.to_string()))?;
     let object = builder.build();
-    Ok(Value::Object(object))
+    Ok(Value::object(object))
 }

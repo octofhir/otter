@@ -51,7 +51,6 @@ use std::time::{Duration, Instant};
 use otter_runtime::{OtterError, Runtime, SourceInput};
 use otter_vm::binary::JsArrayBuffer;
 use otter_vm::binary::array_buffer::SharedBody;
-use otter_vm::number::NumberValue;
 use otter_vm::string::JsString;
 use otter_vm::{NativeCtx, NativeError, NativeFastFn, Value};
 
@@ -168,7 +167,7 @@ fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, Nativ
 // =====================================================================
 
 fn agent_start(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let source = arg_to_string(ctx, args.first().unwrap_or(&Value::Undefined))?;
+    let source = arg_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
     let (tx, rx) = mpsc::channel::<BroadcastMessage>();
 
     {
@@ -189,7 +188,7 @@ fn agent_start(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
         })
         .map_err(|e| type_err(format!("agent thread spawn failed: {e}")))?;
 
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn run_agent_source(source: String) {
@@ -218,8 +217,8 @@ fn run_agent_source(source: String) {
 // =====================================================================
 
 fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let sab_value = args.first().unwrap_or(&Value::Undefined);
-    let Value::ArrayBuffer(buf) = sab_value else {
+    let sab_value = args.first().copied().unwrap_or(Value::undefined());
+    let Value::ArrayBuffer(buf) = &sab_value else {
         return Err(type_err("first argument must be a SharedArrayBuffer"));
     };
     let Some(shared) = buf.as_shared_arc(ctx.heap()) else {
@@ -240,7 +239,7 @@ fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     for tx in senders {
         let _ = tx.send(msg.clone());
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 // =====================================================================
@@ -248,7 +247,7 @@ fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 // =====================================================================
 
 fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let handler = args.first().cloned().unwrap_or(Value::Undefined);
+    let handler = args.first().copied().unwrap_or(Value::undefined());
     if !matches!(
         handler,
         Value::NativeFunction(_)
@@ -276,7 +275,7 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         Ok(m) => m,
         Err(_) => {
             // Senders all dropped before any broadcast arrived.
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         }
     };
 
@@ -286,11 +285,11 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     // Rewrap the shared buffer on this agent's heap.
     let sab_handle = JsArrayBuffer::from_shared_arc(interp.gc_heap_mut(), msg.sab)
         .map_err(|_| type_err("out of memory while wrapping SharedArrayBuffer"))?;
-    let sab_value = Value::ArrayBuffer(sab_handle);
+    let sab_value = Value::array_buffer(sab_handle);
 
     let num_value = match msg.num {
-        Some(n) => Value::Number(NumberValue::from_f64(n)),
-        None => Value::Undefined,
+        Some(n) => Value::number_f64(n),
+        None => Value::undefined(),
     };
 
     let mut args_vec = smallvec::SmallVec::<[Value; 8]>::new();
@@ -298,7 +297,7 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     args_vec.push(num_value);
 
     interp
-        .run_callable_sync(&exec, &handler, Value::Undefined, args_vec)
+        .run_callable_sync(&exec, &handler, Value::undefined(), args_vec)
         .map_err(|e| match e {
             otter_vm::VmError::Uncaught { value } => NativeError::Thrown {
                 name: "$262.agent.receiveBroadcast",
@@ -321,13 +320,13 @@ fn agent_sleep(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     if ms.is_finite() && ms > 0.0 {
         thread::sleep(Duration::from_millis(ms as u64));
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn agent_monotonic_now(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let base = *MONOTONIC_BASE;
     let elapsed_ms = base.elapsed().as_secs_f64() * 1000.0;
-    Ok(Value::Number(NumberValue::from_f64(elapsed_ms)))
+    Ok(Value::number_f64(elapsed_ms))
 }
 
 // =====================================================================
@@ -335,10 +334,10 @@ fn agent_monotonic_now(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Valu
 // =====================================================================
 
 fn agent_report(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let msg = arg_to_string(ctx, args.first().unwrap_or(&Value::Undefined))?;
+    let msg = arg_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
     let mut reg = AGENTS.lock().expect("agent registry poisoned");
     reg.reports.push_back(msg);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -346,12 +345,12 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     let msg = reg.reports.pop_front();
     drop(reg);
     match msg {
-        None => Ok(Value::Null),
+        None => Ok(Value::null()),
         Some(s) => {
             let (interp, _exec) = ctx.interp_mut_and_context();
             let js = JsString::from_str(&s, interp.gc_heap_mut())
                 .map_err(|e| type_err(format!("string alloc: {e}")))?;
-            Ok(Value::String(js))
+            Ok(Value::string(js))
         }
     }
 }
@@ -362,5 +361,5 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 fn agent_leaving(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     AGENT_LEAVING.with(|f| f.store(true, Ordering::Release));
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }

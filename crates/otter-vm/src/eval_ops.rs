@@ -39,7 +39,7 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let src_reg = register_operand(operands.get(1))?;
         let top_idx = stack.len() - 1;
-        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        let value = *read_register(&stack[top_idx], src_reg)?;
         let force_strict = context.function_is_strict(stack[top_idx].function_id);
         let result = self.run_eval(&value, force_strict)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
@@ -83,7 +83,7 @@ impl Interpreter {
             Value::String(s) => s.to_lossy_string(&self.gc_heap),
             // Per §19.4.1.1 step 4, eval'd non-strings are returned
             // unchanged — `eval(42) === 42`.
-            _ => return Ok(value.clone()),
+            _ => return Ok(*value),
         };
         let module = self.compile_eval_source(&source, EvalCompileOptions { force_strict })?;
         let context = ExecutionContext::from_module(module);
@@ -234,15 +234,15 @@ impl Interpreter {
             }
             _ => Value::Undefined,
         };
-        let target_capture = value.clone();
+        let target_capture = value;
         let callback_context = function_context.clone();
         let stack_slots = stack_roots
             .map(|stack| self.collect_allocation_roots(stack))
             .unwrap_or_default();
-        let native_value_root = value.clone();
-        let name_root = name_value.clone();
-        let length_root = length_value.clone();
-        let prototype_root = prototype_value.clone();
+        let native_value_root = value;
+        let name_root = name_value;
+        let length_root = length_value;
+        let prototype_root = prototype_value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &stack_slots {
                 visitor(slot);
@@ -274,12 +274,12 @@ impl Interpreter {
                 };
                 let args: SmallVec<[Value; 8]> = call_args.iter().cloned().collect();
                 let is_construct_call = ctx.is_construct_call();
-                let this_value = ctx.this_value().clone();
+                let this_value = *ctx.this_value();
                 let interp = ctx.interp_mut();
                 let result = if is_construct_call {
-                    interp.run_construct_sync(&callback_context, &target, target.clone(), args)
+                    interp.run_construct_sync(&callback_context, &target, target, args)
                 } else {
-                    interp.run_callable_sync(&callback_context, &target, this_value.clone(), args)
+                    interp.run_callable_sync(&callback_context, &target, this_value, args)
                 }
                 .map_err(|err| crate::native_function::NativeError::TypeError {
                     name: "anonymous",
@@ -306,12 +306,10 @@ impl Interpreter {
             let _ = native.define_own_property(&mut self.gc_heap, "name", name);
             let length = object::PropertyDescriptor::data(length_value, false, false, true);
             let _ = native.define_own_property(&mut self.gc_heap, "length", length);
-            let prototype =
-                object::PropertyDescriptor::data(prototype_value.clone(), true, false, false);
+            let prototype = object::PropertyDescriptor::data(prototype_value, true, false, false);
             let _ = native.define_own_property(&mut self.gc_heap, "prototype", prototype);
             if let Value::Object(proto) = prototype_value {
-                let constructor =
-                    object::PropertyDescriptor::data(wrapper.clone(), true, false, true);
+                let constructor = object::PropertyDescriptor::data(wrapper, true, false, true);
                 let _ = object::define_own_property(
                     proto,
                     &mut self.gc_heap,
@@ -331,9 +329,9 @@ impl Interpreter {
     ) -> Result<String, VmError> {
         let primitive = match value {
             Value::Object(_) | Value::Proxy(_) => {
-                self.to_primitive_string_hint_sync(context, value.clone())?
+                self.to_primitive_string_hint_sync(context, *value)?
             }
-            other => other.clone(),
+            other => *other,
         };
         match primitive {
             Value::String(s) => Ok(s.to_lossy_string(&self.gc_heap)),
@@ -354,12 +352,11 @@ impl Interpreter {
         value: Value,
     ) -> Result<Value, VmError> {
         for method in ["toString", "valueOf"] {
-            let callee = self.get_property_value_for_call(context, value.clone(), method)?;
+            let callee = self.get_property_value_for_call(context, value, method)?;
             if !self.is_callable_runtime(&callee) {
                 continue;
             }
-            let result =
-                self.run_callable_sync(context, &callee, value.clone(), SmallVec::new())?;
+            let result = self.run_callable_sync(context, &callee, value, SmallVec::new())?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);
             }
@@ -399,7 +396,7 @@ fn collect_new_function_args(
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
     for i in 0..argc {
         let r = register_operand(operands.get(2 + i))?;
-        args.push(read_register(frame, r)?.clone());
+        args.push(*read_register(frame, r)?);
     }
     Ok(args)
 }

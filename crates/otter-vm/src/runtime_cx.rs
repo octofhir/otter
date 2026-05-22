@@ -250,8 +250,8 @@ impl<'rt> NativeCtx<'rt> {
         value: T,
     ) -> Result<otter_gc::Gc<T>, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
@@ -284,8 +284,8 @@ impl<'rt> NativeCtx<'rt> {
         bytes: u64,
     ) -> Result<otter_gc::ExternalMemory, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
@@ -305,8 +305,8 @@ impl<'rt> NativeCtx<'rt> {
         slice_roots: &[&[Value]],
     ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let shape_root = self.cx.interp.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
@@ -343,9 +343,9 @@ impl<'rt> NativeCtx<'rt> {
         slice_roots: &[&[Value]],
     ) -> Result<(), VmError> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
-        let value_root = value.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let value_root = value;
         let mut combined_roots = Vec::with_capacity(value_roots.len() + 1);
         combined_roots.push(&value_root);
         combined_roots.extend_from_slice(value_roots);
@@ -380,8 +380,8 @@ impl<'rt> NativeCtx<'rt> {
         slice_roots: &[&[Value]],
     ) -> Result<object::JsObject, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let shape_root = self.cx.interp.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
@@ -415,8 +415,8 @@ impl<'rt> NativeCtx<'rt> {
             + 'static,
     {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let capture_roots = captures.clone();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
@@ -448,9 +448,9 @@ impl<'rt> NativeCtx<'rt> {
         slice_roots: &[&[Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
-        let value_root = value.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let value_root = value;
         let mut combined_roots = Vec::with_capacity(value_roots.len() + 1);
         combined_roots.push(&value_root);
         combined_roots.extend_from_slice(value_roots);
@@ -470,8 +470,8 @@ impl<'rt> NativeCtx<'rt> {
     /// Allocate a `Map` body through the native root contract.
     pub fn alloc_map(&mut self) -> Result<collections::JsMap, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
@@ -481,8 +481,8 @@ impl<'rt> NativeCtx<'rt> {
     /// Allocate a `Set` body through the native root contract.
     pub fn alloc_set(&mut self) -> Result<collections::JsSet, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
@@ -492,8 +492,8 @@ impl<'rt> NativeCtx<'rt> {
     /// Allocate a `WeakMap` body through the native root contract.
     pub fn alloc_weak_map(&mut self) -> Result<collections::JsWeakMap, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
@@ -503,8 +503,8 @@ impl<'rt> NativeCtx<'rt> {
     /// Allocate a `WeakSet` body through the native root contract.
     pub fn alloc_weak_set(&mut self) -> Result<collections::JsWeakSet, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(visitor, &roots, &this_value, new_target.as_ref(), &[], &[]);
         };
@@ -519,8 +519,8 @@ impl<'rt> NativeCtx<'rt> {
         slice_roots: &[&[Value]],
     ) -> Result<weak_refs::JsWeakRef, crate::VmError> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -543,8 +543,8 @@ impl<'rt> NativeCtx<'rt> {
         slice_roots: &[&[Value]],
     ) -> Result<weak_refs::JsFinalizationRegistry, crate::VmError> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -571,11 +571,11 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
     ) -> Result<(), otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let map_root = Value::Map(*map);
-        let key_root = key.clone();
-        let value_root = value.clone();
+        let key_root = key;
+        let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -596,10 +596,10 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
     ) -> Result<(), otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let set_root = Value::Set(*set);
-        let value_root = value.clone();
+        let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -621,11 +621,11 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
     ) -> Result<(), collections::CollectionError> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let map_root = Value::WeakMap(*map);
-        let key_root = key.clone();
-        let value_root = value.clone();
+        let key_root = key;
+        let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -646,10 +646,10 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
     ) -> Result<(), collections::CollectionError> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let set_root = Value::WeakSet(*set);
-        let value_root = value.clone();
+        let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -686,8 +686,8 @@ impl<'rt> NativeCtx<'rt> {
     {
         let elements: Vec<Value> = elements.into_iter().collect();
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -709,9 +709,9 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
     ) -> Result<(), otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
-        let value_root = value.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -732,9 +732,9 @@ impl<'rt> NativeCtx<'rt> {
         value: Value,
     ) -> Result<usize, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
-        let value_root = value.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -756,8 +756,8 @@ impl<'rt> NativeCtx<'rt> {
         slice_roots: &[&[Value]],
     ) -> Result<IteratorHandle, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
-        let this_value = self.call_info.this_value.clone();
-        let new_target = self.call_info.new_target.clone();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
                 visitor,
@@ -923,7 +923,7 @@ mod tests {
             let weak_key = Value::Object(ctx.alloc_object().expect("native weak key"));
             let weak_value = Value::Object(ctx.alloc_object().expect("native weak value"));
             let mut weak_map = ctx.alloc_weak_map().expect("native weak map allocation");
-            ctx.weak_map_set(&mut weak_map, weak_key.clone(), weak_value)
+            ctx.weak_map_set(&mut weak_map, weak_key, weak_value)
                 .expect("native weak map insert");
             let mut weak_set = ctx.alloc_weak_set().expect("native weak set allocation");
             ctx.weak_set_add(&mut weak_set, weak_key)

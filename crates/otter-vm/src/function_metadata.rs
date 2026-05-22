@@ -485,7 +485,7 @@ pub(crate) fn ordinary_function_metadata_key(key: &str) -> Option<&'static str> 
 
 fn descriptor_value(desc: &PropertyDescriptor) -> Value {
     match &desc.kind {
-        DescriptorKind::Data { value } => value.clone(),
+        DescriptorKind::Data { value } => *value,
         DescriptorKind::Accessor { .. } => Value::Undefined,
     }
 }

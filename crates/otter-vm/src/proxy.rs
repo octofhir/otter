@@ -119,13 +119,13 @@ impl JsProxy {
     /// Target value.
     #[must_use]
     pub fn target(self, heap: &otter_gc::GcHeap) -> Value {
-        heap.read_payload(self.handle, |body| body.target.clone())
+        heap.read_payload(self.handle, |body| body.target)
     }
 
     /// Handler object.
     #[must_use]
     pub fn handler(self, heap: &otter_gc::GcHeap) -> Value {
-        heap.read_payload(self.handle, |body| body.handler.clone())
+        heap.read_payload(self.handle, |body| body.handler)
     }
 
     /// `true` once revoked.

@@ -83,7 +83,7 @@ impl Interpreter {
         // Arrow-closure receivers are bound lexically: every later invocation
         // ignores the call site and uses the enclosing frame's `this`.
         let bound_this = if context.function_is_arrow(function_id) {
-            Some(frame.this_value.clone())
+            Some(frame.this_value)
         } else {
             None
         };
@@ -105,7 +105,7 @@ impl Interpreter {
         statics_reg: u16,
     ) -> Result<(), VmError> {
         let frame = &stack[frame_idx];
-        let ctor = read_register(frame, ctor_reg)?.clone();
+        let ctor = *read_register(frame, ctor_reg)?;
         if !self.is_callable_runtime(&ctor) {
             return Err(VmError::NotCallable);
         }
@@ -168,7 +168,7 @@ impl Interpreter {
             .filter(|state| state.pc == pc && state.dst == dst)
             .cloned();
         if let Some(state) = pending {
-            let produced = read_register(&stack[top_idx], dst)?.clone();
+            let produced = *read_register(&stack[top_idx], dst)?;
             return match state.stage {
                 PendingBindStage::Name => self.continue_bind_function_after_name(
                     stack,
@@ -201,15 +201,15 @@ impl Interpreter {
             Some(&Operand::ConstIndex(n)) => n as usize,
             _ => return Err(VmError::InvalidOperand),
         };
-        let target = read_register(&stack[top_idx], callee_reg)?.clone();
+        let target = *read_register(&stack[top_idx], callee_reg)?;
         if !self.is_callable_runtime(&target) {
             return Err(VmError::NotCallable);
         }
-        let bound_this = read_register(&stack[top_idx], this_reg)?.clone();
+        let bound_this = *read_register(&stack[top_idx], this_reg)?;
         let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
             let r = register_operand(operands.get(4 + i))?;
-            bound_args.push(read_register(&stack[top_idx], r)?.clone());
+            bound_args.push(*read_register(&stack[top_idx], r)?);
         }
         match self.callable_bind_metadata_get(context, &target, "name")? {
             BindMetadataGet::Value(target_name) => self.continue_bind_function_after_name(
@@ -225,7 +225,7 @@ impl Interpreter {
                 stack[top_idx].pending_bind_function = Some(PendingBindFunction {
                     pc,
                     dst,
-                    target: target.clone(),
+                    target,
                     bound_this,
                     bound_args,
                     stage: PendingBindStage::Name,
@@ -265,7 +265,7 @@ impl Interpreter {
                 stack[top_idx].pending_bind_function = Some(PendingBindFunction {
                     pc,
                     dst,
-                    target: target.clone(),
+                    target,
                     bound_this,
                     bound_args,
                     stage: PendingBindStage::Length,
@@ -292,8 +292,8 @@ impl Interpreter {
             bound_args.len(),
             &self.gc_heap,
         );
-        let target_root = target.clone();
-        let bound_this_root = bound_this.clone();
+        let target_root = target;
+        let bound_this_root = bound_this;
         let bound_args_root = bound_args.clone();
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -371,8 +371,8 @@ impl Interpreter {
                     &this_value,
                     bound_args.len(),
                 )?;
-                let this_root = this_value.clone();
-                let receiver_root = receiver.clone();
+                let this_root = this_value;
+                let receiver_root = receiver;
                 let bound_args_root = bound_args.clone();
                 let roots = self.collect_runtime_roots();
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -473,7 +473,7 @@ impl Interpreter {
                     .to_string(),
             });
         }
-        self.value_has_proxy_aware_prototype(context, o.clone(), &prototype)
+        self.value_has_proxy_aware_prototype(context, *o, &prototype)
     }
 
     pub(crate) fn ordinary_has_instance_stack_rooted(
@@ -524,7 +524,7 @@ impl Interpreter {
                     .to_string(),
             });
         }
-        self.value_has_proxy_aware_prototype(context, o.clone(), &prototype)
+        self.value_has_proxy_aware_prototype(context, *o, &prototype)
     }
 
     /// ECMA-262 §13.10.2 `InstanceofOperator(V, target)`.
@@ -553,13 +553,12 @@ impl Interpreter {
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
-        let handler =
-            match self.ordinary_get_value(context, target.clone(), target.clone(), &key, 0)? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, target.clone(), SmallVec::new())?
-                }
-            };
+        let handler = match self.ordinary_get_value(context, *target, *target, &key, 0)? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, *target, SmallVec::new())?
+            }
+        };
         if !matches!(handler, Value::Undefined | Value::Null) {
             if !self.is_callable_runtime(&handler) {
                 return Err(VmError::TypeError {
@@ -575,8 +574,8 @@ impl Interpreter {
                 return self.ordinary_has_instance(context, target, v);
             }
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(v.clone());
-            let result = self.run_callable_sync(context, &handler, target.clone(), args)?;
+            args.push(*v);
+            let result = self.run_callable_sync(context, &handler, *target, args)?;
             return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(target) {
@@ -610,13 +609,12 @@ impl Interpreter {
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);
-        let handler =
-            match self.ordinary_get_value(context, target.clone(), target.clone(), &key, 0)? {
-                VmGetOutcome::Value(v) => v,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, target.clone(), SmallVec::new())?
-                }
-            };
+        let handler = match self.ordinary_get_value(context, *target, *target, &key, 0)? {
+            VmGetOutcome::Value(v) => v,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, *target, SmallVec::new())?
+            }
+        };
         if !matches!(handler, Value::Undefined | Value::Null) {
             if !self.is_callable_runtime(&handler) {
                 return Err(VmError::TypeError {
@@ -632,8 +630,8 @@ impl Interpreter {
                 return self.ordinary_has_instance_stack_rooted(context, stack, target, v);
             }
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(v.clone());
-            let result = self.run_callable_sync(context, &handler, target.clone(), args)?;
+            args.push(*v);
+            let result = self.run_callable_sync(context, &handler, *target, args)?;
             return Ok(result.to_boolean(&self.gc_heap));
         }
         if !self.is_callable_runtime(target) {
@@ -682,12 +680,12 @@ impl Interpreter {
                 message: "Function.prototype.apply argument list must be object-like".to_string(),
             });
         }
-        let length = self.get_property_value_for_call(context, value.clone(), "length")?;
+        let length = self.get_property_value_for_call(context, value, "length")?;
         let len = to_length(&length, &self.gc_heap)?;
         let mut values = SmallVec::new();
         for index in 0..len {
             let key = index.to_string();
-            values.push(self.get_property_value_for_call(context, value.clone(), &key)?);
+            values.push(self.get_property_value_for_call(context, value, &key)?);
         }
         Ok(values)
     }
@@ -699,13 +697,7 @@ impl Interpreter {
         key: &str,
     ) -> Result<Value, VmError> {
         let property_key = VmPropertyKey::String(key);
-        match self.ordinary_get_value(
-            context,
-            receiver.clone(),
-            receiver.clone(),
-            &property_key,
-            0,
-        )? {
+        match self.ordinary_get_value(context, receiver, receiver, &property_key, 0)? {
             VmGetOutcome::Value(value) => Ok(value),
             VmGetOutcome::InvokeGetter { getter } => {
                 self.run_callable_sync(context, &getter, receiver, SmallVec::new())
@@ -779,7 +771,7 @@ impl Interpreter {
             Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
             Some(Value::Null) => Ok(VmPropertyKey::String("null")),
             Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined")),
-            Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(sym.clone())),
+            Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(*sym)),
             _ => Err(VmError::TypeMismatch),
         }
     }
@@ -1241,22 +1233,18 @@ impl Interpreter {
                             Value::String(s) => {
                                 VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
                             }
-                            Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+                            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
                             _ => return Err(VmError::TypeMismatch),
                         };
                         let desc = match stack_roots {
                             Some(stack) => self
                                 .ordinary_get_own_property_descriptor_value_stack_rooted(
-                                    context,
-                                    stack,
-                                    target.clone(),
-                                    &vm_key,
-                                    0,
+                                    context, stack, target, &vm_key, 0,
                                 )?,
                             None => self
                                 .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                     context,
-                                    target.clone(),
+                                    target,
                                     &vm_key,
                                     0,
                                     &[&target],
@@ -1274,7 +1262,7 @@ impl Interpreter {
                         &[args],
                     )?)));
                 }
-                let keys = self.enumerable_own_string_keys_for_value(context, target.clone(), 0)?;
+                let keys = self.enumerable_own_string_keys_for_value(context, target, 0)?;
                 let mut values = Vec::with_capacity(keys.len());
                 for key in keys {
                     values.push(Value::String(
@@ -1289,8 +1277,7 @@ impl Interpreter {
                     &[args],
                 )?)));
             }
-            let desc =
-                self.get_own_property_descriptor_for_value(context, target.clone(), args.get(1))?;
+            let desc = self.get_own_property_descriptor_for_value(context, target, args.get(1))?;
             if matches!(method, M::HasOwn) {
                 return Ok(Some(Value::Boolean(desc.is_some())));
             }
@@ -1560,12 +1547,12 @@ impl Interpreter {
         };
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
-                self.set_property(result, "value", value.clone())?;
+                self.set_property(result, "value", *value)?;
                 self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
-                self.set_property(result, "get", getter.clone().unwrap_or(Value::Undefined))?;
-                self.set_property(result, "set", setter.clone().unwrap_or(Value::Undefined))?;
+                self.set_property(result, "get", (*getter).unwrap_or(Value::Undefined))?;
+                self.set_property(result, "set", (*setter).unwrap_or(Value::Undefined))?;
             }
         }
         self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
@@ -1680,8 +1667,7 @@ impl Interpreter {
         let proto_value = Value::Object(proto);
         let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
         let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
-        let prototype_desc =
-            object::PropertyDescriptor::data(proto_value.clone(), true, false, false);
+        let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
         Ok(proto_value)
     }
@@ -1741,8 +1727,7 @@ impl Interpreter {
         let proto_value = Value::Object(proto);
         let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
         let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
-        let prototype_desc =
-            object::PropertyDescriptor::data(proto_value.clone(), true, false, false);
+        let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
         let _ = object::define_own_property(bag, &mut self.gc_heap, "prototype", prototype_desc);
         Ok(proto_value)
     }
@@ -1835,7 +1820,7 @@ fn complete_descriptor_defaults_from_object(
             value: descriptor_value,
         } = &mut descriptor.kind
     {
-        *descriptor_value = value.clone();
+        *descriptor_value = *value;
     }
     if !has_writable {
         descriptor.flags = descriptor.flags.with_writable(existing.writable());

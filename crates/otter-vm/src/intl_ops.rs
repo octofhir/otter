@@ -30,8 +30,8 @@ impl Interpreter {
         let class = context
             .string_constant_str(class_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let locale = read_register(frame, locale_reg)?.clone();
-        let options = read_register(frame, options_reg)?.clone();
+        let locale = *read_register(frame, locale_reg)?;
+        let options = *read_register(frame, options_reg)?;
         let value = intl::construct(class, &locale, &options, &mut self.gc_heap)
             .map_err(intl_to_vm_error)?;
         write_register(frame, dst, value)?;

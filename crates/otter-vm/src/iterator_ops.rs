@@ -98,7 +98,7 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
-        let value = read_register(frame, src)?.clone();
+        let value = *read_register(frame, src)?;
         let state = match &value {
             Value::Array(array) => IteratorState::Array {
                 array: *array,
@@ -223,9 +223,7 @@ impl Interpreter {
     ) -> Result<(Value, bool), VmError> {
         let snapshot: Option<IteratorStateSnapshot> =
             self.gc_heap.read_payload(*iter, |state| match state {
-                IteratorState::User { iterator } => {
-                    Some(IteratorStateSnapshot::User(iterator.clone()))
-                }
+                IteratorState::User { iterator } => Some(IteratorStateSnapshot::User(*iterator)),
                 IteratorState::RegExpString {
                     matcher,
                     input,
@@ -233,7 +231,7 @@ impl Interpreter {
                     full_unicode,
                     done,
                 } => Some(IteratorStateSnapshot::RegExpString {
-                    matcher: matcher.clone(),
+                    matcher: *matcher,
                     input: *input,
                     global: *global,
                     full_unicode: *full_unicode,
@@ -244,12 +242,12 @@ impl Interpreter {
                 }
                 IteratorState::Map { source, mapper } => Some(IteratorStateSnapshot::Map {
                     source: *source,
-                    mapper: mapper.clone(),
+                    mapper: *mapper,
                 }),
                 IteratorState::Filter { source, predicate } => {
                     Some(IteratorStateSnapshot::Filter {
                         source: *source,
-                        predicate: predicate.clone(),
+                        predicate: *predicate,
                     })
                 }
                 IteratorState::Take { source, remaining } => Some(IteratorStateSnapshot::Take {
@@ -266,7 +264,7 @@ impl Interpreter {
                     inner,
                 } => Some(IteratorStateSnapshot::FlatMap {
                     source: *source,
-                    mapper: mapper.clone(),
+                    mapper: *mapper,
                     inner: *inner,
                 }),
                 _ => None,
@@ -303,7 +301,7 @@ impl Interpreter {
                     return Err(VmError::TypeMismatch);
                 }
                 let result =
-                    self.run_callable_sync(context, &next_fn, iter_value.clone(), SmallVec::new())?;
+                    self.run_callable_sync(context, &next_fn, iter_value, SmallVec::new())?;
                 let Value::Object(record) = &result else {
                     return Err(VmError::TypeMismatch);
                 };
@@ -379,7 +377,7 @@ impl Interpreter {
                     context,
                     &predicate,
                     Value::Undefined,
-                    smallvec::smallvec![v.clone()],
+                    smallvec::smallvec![v],
                 )?;
                 if kept.to_boolean(&self.gc_heap) {
                     return Ok((v, false));
@@ -492,36 +490,21 @@ impl Interpreter {
                             .well_known_symbols
                             .get(crate::symbol::WellKnown::Iterator);
                         let key = crate::VmPropertyKey::Symbol(iterator_sym);
-                        let outcome = self.ordinary_get_value(
-                            context,
-                            mapped.clone(),
-                            mapped.clone(),
-                            &key,
-                            0,
-                        )?;
+                        let outcome = self.ordinary_get_value(context, mapped, mapped, &key, 0)?;
                         let iter_method = match outcome {
                             crate::VmGetOutcome::Value(v) => v,
-                            crate::VmGetOutcome::InvokeGetter { getter } => self
-                                .run_callable_sync(
-                                    context,
-                                    &getter,
-                                    mapped.clone(),
-                                    SmallVec::new(),
-                                )?,
+                            crate::VmGetOutcome::InvokeGetter { getter } => {
+                                self.run_callable_sync(context, &getter, mapped, SmallVec::new())?
+                            }
                         };
                         let iter_value = if matches!(iter_method, Value::Undefined | Value::Null) {
                             // Iterator-without-`@@iterator` shape —
                             // wrap the mapped object directly so
                             // subsequent `IteratorNext` calls invoke
                             // its own `.next`.
-                            mapped.clone()
+                            mapped
                         } else if self.is_callable_runtime(&iter_method) {
-                            self.run_callable_sync(
-                                context,
-                                &iter_method,
-                                mapped.clone(),
-                                SmallVec::new(),
-                            )?
+                            self.run_callable_sync(context, &iter_method, mapped, SmallVec::new())?
                         } else {
                             return Err(VmError::TypeError {
                                 message:
@@ -556,7 +539,7 @@ impl Interpreter {
                 };
                 let iter_root = Value::Iterator(*iter);
                 let source_root = Value::Iterator(source);
-                let mapper_root = mapper.clone();
+                let mapper_root = mapper;
                 let new_inner = self.alloc_runtime_rooted_iterator_state(
                     inner_state,
                     &[&iter_root, &source_root, &mapper_root],
@@ -594,7 +577,7 @@ impl Interpreter {
         let result = match name {
             "map" => {
                 let mapper = require_callable(args.first())?;
-                let mapper_root = mapper.clone();
+                let mapper_root = mapper;
                 let state = IteratorState::Map {
                     source: *iter_rc,
                     mapper,
@@ -608,7 +591,7 @@ impl Interpreter {
             }
             "filter" => {
                 let predicate = require_callable(args.first())?;
-                let predicate_root = predicate.clone();
+                let predicate_root = predicate;
                 let state = IteratorState::Filter {
                     source: *iter_rc,
                     predicate,
@@ -648,7 +631,7 @@ impl Interpreter {
             }
             "flatMap" => {
                 let mapper = require_callable(args.first())?;
-                let mapper_root = mapper.clone();
+                let mapper_root = mapper;
                 let state = IteratorState::FlatMap {
                     source: *iter_rc,
                     mapper,
@@ -688,7 +671,7 @@ impl Interpreter {
                 let reducer = require_callable(args.first())?;
                 let has_initial = args.len() >= 2;
                 let mut acc = if has_initial {
-                    args[1].clone()
+                    args[1]
                 } else {
                     Value::Undefined
                 };
@@ -790,14 +773,14 @@ impl Interpreter {
         let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
         let method = match self.ordinary_get_value(
             context,
-            iterable.clone(),
-            iterable.clone(),
+            *iterable,
+            *iterable,
             &VmPropertyKey::Symbol(iterator_sym),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, iterable.clone(), SmallVec::new())?
+                self.run_callable_sync(context, &getter, *iterable, SmallVec::new())?
             }
         };
         if matches!(method, Value::Undefined | Value::Null) {
@@ -810,8 +793,7 @@ impl Interpreter {
                 message: "iterator method is not callable".to_string(),
             });
         }
-        let iterator =
-            self.run_callable_sync(context, &method, iterable.clone(), SmallVec::new())?;
+        let iterator = self.run_callable_sync(context, &method, *iterable, SmallVec::new())?;
         if !matches!(
             iterator,
             Value::Object(_)
@@ -828,14 +810,14 @@ impl Interpreter {
         }
         let next_method = match self.ordinary_get_value(
             context,
-            iterator.clone(),
-            iterator.clone(),
+            iterator,
+            iterator,
             &VmPropertyKey::String("next"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, iterator.clone(), SmallVec::new())?
+                self.run_callable_sync(context, &getter, iterator, SmallVec::new())?
             }
         };
         Ok((iterator, next_method))
@@ -858,8 +840,7 @@ impl Interpreter {
         iterator: &Value,
         next_method: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let result =
-            self.run_callable_sync(context, next_method, iterator.clone(), SmallVec::new())?;
+        let result = self.run_callable_sync(context, next_method, *iterator, SmallVec::new())?;
         if !matches!(result, Value::Object(_) | Value::Proxy(_)) {
             return Err(VmError::TypeError {
                 message: "iterator result is not an object".to_string(),
@@ -871,7 +852,7 @@ impl Interpreter {
         // getter (or by allocations on the way to the slot lookup)
         // could reclaim the IterResult — its shape/keys would then
         // dangle when the second read walks the same shape chain.
-        let anchor_depth = self.push_iteration_anchor(result.clone());
+        let anchor_depth = self.push_iteration_anchor(result);
         let outcome = iterator_step_read(self, context, &result);
         self.pop_iteration_anchors_to(anchor_depth - 1);
         outcome
@@ -894,14 +875,14 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let return_method = match self.ordinary_get_value(
             context,
-            iterator.clone(),
-            iterator.clone(),
+            *iterator,
+            *iterator,
             &VmPropertyKey::String("return"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, iterator.clone(), SmallVec::new())?
+                self.run_callable_sync(context, &getter, *iterator, SmallVec::new())?
             }
         };
         if matches!(return_method, Value::Undefined | Value::Null) {
@@ -912,8 +893,7 @@ impl Interpreter {
                 message: "iterator `return` is not callable".to_string(),
             });
         }
-        let result =
-            self.run_callable_sync(context, &return_method, iterator.clone(), SmallVec::new())?;
+        let result = self.run_callable_sync(context, &return_method, *iterator, SmallVec::new())?;
         if !matches!(result, Value::Object(_) | Value::Proxy(_)) {
             return Err(VmError::TypeError {
                 message: "iterator `return` did not yield an object".to_string(),
@@ -956,7 +936,7 @@ impl Interpreter {
                 let mut out = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
                     let entry = self.alloc_runtime_rooted_array_from_values(
-                        [k.clone(), v.clone()],
+                        [k, v],
                         &[iterable, &k, &v],
                         &[out.as_slice()],
                     )?;
@@ -1016,8 +996,8 @@ impl Interpreter {
         // user code cannot reclaim them. The pop-to depth captured
         // here matches the LIFO push order even when the inner
         // body recurses into another `iterator_to_list_sync`.
-        let anchor_depth = self.push_iteration_anchor(iterator.clone());
-        self.push_iteration_anchor(next_method.clone());
+        let anchor_depth = self.push_iteration_anchor(iterator);
+        self.push_iteration_anchor(next_method);
         let mut values: Vec<Value> = Vec::new();
         let result = loop {
             match self.iterator_step_sync(context, &iterator, &next_method) {
@@ -1080,17 +1060,17 @@ impl Interpreter {
                 if frame.pc != 0
                     && let Some(slot) = frame.registers.get_mut(resume_dst as usize)
                 {
-                    *slot = arg.clone();
+                    *slot = *arg;
                 }
             }
             GeneratorResumeKind::Return(arg) => {
                 // Foundation: mark done and surface arg without
                 // running the body further.
                 handle.mark_done(&mut self.gc_heap);
-                return self.make_runtime_rooted_iter_result(arg.clone(), true, &[], &[]);
+                return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
             }
             GeneratorResumeKind::Throw(reason) => {
-                throw_value = Some(reason.clone());
+                throw_value = Some(*reason);
             }
         }
         let mut sub_stack: SmallVec<[Frame; 8]> = SmallVec::new();
@@ -1101,7 +1081,7 @@ impl Interpreter {
             // does not catch it (the unwind_throw machinery
             // converts the value to a string when it surfaces as
             // VmError::Uncaught, losing the payload).
-            self.pending_generator_throw = Some(reason.clone());
+            self.pending_generator_throw = Some(reason);
             match self.unwind_throw(&mut sub_stack, reason) {
                 Ok(_) => {}
                 Err(err) => {
@@ -1230,16 +1210,14 @@ impl Interpreter {
             .filter(|s| s.pc == pc && s.dst == dst)
             .cloned();
         if let Some(_state) = resume {
-            let produced = read_register(&stack[top_idx], dst)?.clone();
+            let produced = *read_register(&stack[top_idx], dst)?;
             // §7.4.3 step 2 — `[@@iterator]()` must return an
             // Object. Anything else is a TypeError.
             if !matches!(produced, Value::Object(_)) {
                 stack[top_idx].pending_get_iterator = None;
                 return Err(VmError::TypeMismatch);
             }
-            let iter_state = IteratorState::User {
-                iterator: produced.clone(),
-            };
+            let iter_state = IteratorState::User { iterator: produced };
             let iter =
                 self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
             write_register(&mut stack[top_idx], dst, Value::Iterator(iter))?;
@@ -1250,7 +1228,7 @@ impl Interpreter {
 
         // 2 + 3. Fresh entry — only intercept user objects. The
         // built-in fast path is the existing in-frame match arm.
-        let value = read_register(&stack[top_idx], src)?.clone();
+        let value = *read_register(&stack[top_idx], src)?;
         let Value::Object(obj) = &value else {
             return Ok(false);
         };
@@ -1310,7 +1288,7 @@ impl Interpreter {
             .filter(|s| s.pc == pc && s.value_dst == value_dst && s.done_dst == done_dst)
             .cloned();
         if let Some(state) = resume {
-            let result = read_register(&stack[top_idx], state.result_reg)?.clone();
+            let result = *read_register(&stack[top_idx], state.result_reg)?;
             let Value::Object(obj) = &result else {
                 stack[top_idx].pending_iterator_next = None;
                 return Err(VmError::TypeMismatch);
@@ -1332,7 +1310,7 @@ impl Interpreter {
         }
 
         // 2 + 3. Fresh entry. Inspect the iterator's inner state.
-        let iter_value = read_register(&stack[top_idx], iter_reg)?.clone();
+        let iter_value = *read_register(&stack[top_idx], iter_reg)?;
         let Value::Iterator(iter_rc) = &iter_value else {
             return Err(VmError::TypeMismatch);
         };
@@ -1389,7 +1367,7 @@ impl Interpreter {
         // state so the borrow does not span the `invoke` call
         // below.
         let user_iter = self.gc_heap.read_payload(*iter_rc, |state| match state {
-            IteratorState::User { iterator } => Some(iterator.clone()),
+            IteratorState::User { iterator } => Some(*iterator),
             _ => None,
         });
         let Some(user_iter_value) = user_iter else {
@@ -1430,14 +1408,14 @@ fn iterator_step_read(
 ) -> Result<Option<Value>, VmError> {
     let done_value = match interp.ordinary_get_value(
         context,
-        result.clone(),
-        result.clone(),
+        *result,
+        *result,
         &VmPropertyKey::String("done"),
         0,
     )? {
         VmGetOutcome::Value(v) => v,
         VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
+            interp.run_callable_sync(context, &getter, *result, SmallVec::new())?
         }
     };
     if done_value.to_boolean(interp.gc_heap()) {
@@ -1445,14 +1423,14 @@ fn iterator_step_read(
     }
     let value = match interp.ordinary_get_value(
         context,
-        result.clone(),
-        result.clone(),
+        *result,
+        *result,
         &VmPropertyKey::String("value"),
         0,
     )? {
         VmGetOutcome::Value(v) => v,
         VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, result.clone(), SmallVec::new())?
+            interp.run_callable_sync(context, &getter, *result, SmallVec::new())?
         }
     };
     Ok(Some(value))

@@ -252,7 +252,7 @@ fn install_collection(
         object::set_prototype(prototype, heap, Some(object_proto));
     }
 
-    install_prototype_methods(heap, prototype, kind, vec![global_root.clone()])?;
+    install_prototype_methods(heap, prototype, kind, vec![global_root])?;
 
     // §24.1.1 / §24.2.1 / §24.3.1 / §24.4.1 — constructor proper.
     let ctor_name = kind.name();
@@ -347,7 +347,7 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     let result_value = Value::Map(result);
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        cb_args.push(item.clone());
+        cb_args.push(*item);
         cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
             idx as f64,
         )));
@@ -370,7 +370,7 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
                         name: "Map.groupBy",
                         reason: "out of memory".to_string(),
                     })?;
-                crate::collections::map_set(result, ctx.heap_mut(), key.clone(), Value::Array(arr))
+                crate::collections::map_set(result, ctx.heap_mut(), key, Value::Array(arr))
                     .map_err(|_| NativeError::TypeError {
                         name: "Map.groupBy",
                         reason: "out of memory".to_string(),
@@ -381,7 +381,7 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         let arr_value = Value::Array(group_arr);
         let len = crate::array::len(group_arr, ctx.heap());
         let roots = ctx.collect_native_roots();
-        let item_clone = item.clone();
+        let item_clone = *item;
         let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -389,11 +389,12 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             arr_value.trace_value_slots(visitor);
             item_clone.trace_value_slots(visitor);
         };
-        crate::array::set_with_roots(group_arr, ctx.heap_mut(), len, item.clone(), &mut visit)
-            .map_err(|_| NativeError::TypeError {
+        crate::array::set_with_roots(group_arr, ctx.heap_mut(), len, *item, &mut visit).map_err(
+            |_| NativeError::TypeError {
                 name: "Map.groupBy",
                 reason: "out of memory".to_string(),
-            })?;
+            },
+        )?;
     }
     Ok(result_value)
 }
@@ -794,8 +795,8 @@ fn add_entries_from_iterable(
         let outcome = interp
             .ordinary_get_value(
                 &context,
-                target.clone(),
-                target.clone(),
+                *target,
+                *target,
                 &VmPropertyKey::String(adder_name),
                 0,
             )
@@ -803,7 +804,7 @@ fn add_entries_from_iterable(
         match outcome {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => interp
-                .run_callable_sync(&context, &getter, target.clone(), SmallVec::new())
+                .run_callable_sync(&context, &getter, *target, SmallVec::new())
                 .map_err(|e| vm_to_native(e, ctor_name))?,
         }
     };
@@ -849,7 +850,7 @@ fn add_entries_eager(
         let call_args = build_adder_args(ctx, context, &next, kind, None)?;
         let interp = ctx.interp_mut();
         interp
-            .run_callable_sync(context, adder, target.clone(), call_args)
+            .run_callable_sync(context, adder, *target, call_args)
             .map_err(|e| vm_to_native(e, ctor_name))?;
     }
     Ok(())
@@ -886,7 +887,7 @@ fn add_entries_lazy(
 
         let call_result = {
             let interp = ctx.interp_mut();
-            interp.run_callable_sync(context, adder, target.clone(), call_args)
+            interp.run_callable_sync(context, adder, *target, call_args)
         };
         if let Err(err) = call_result {
             let original_throw = ctx.interp_mut().take_pending_uncaught_throw();
@@ -911,7 +912,7 @@ fn build_adder_args(
     iterator_for_close: Option<&Value>,
 ) -> Result<SmallVec<[Value; 8]>, NativeError> {
     if !kind.is_pair() {
-        return Ok(smallvec::smallvec![next.clone()]);
+        return Ok(smallvec::smallvec![*next]);
     }
     let ctor_name = kind.name();
     if !value_is_object_like(next) {
@@ -959,17 +960,12 @@ fn read_indexed_property(
     name: &str,
 ) -> Result<Value, VmError> {
     let interp = ctx.interp_mut();
-    let outcome = interp.ordinary_get_value(
-        context,
-        target.clone(),
-        target.clone(),
-        &VmPropertyKey::String(name),
-        0,
-    )?;
+    let outcome =
+        interp.ordinary_get_value(context, *target, *target, &VmPropertyKey::String(name), 0)?;
     match outcome {
         VmGetOutcome::Value(v) => Ok(v),
         VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, target.clone(), SmallVec::new())
+            interp.run_callable_sync(context, &getter, *target, SmallVec::new())
         }
     }
 }
@@ -1061,8 +1057,8 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             .run_callable_sync(
                 &context,
                 &callback,
-                this_arg.clone(),
-                smallvec::smallvec![v, k, map_value.clone()],
+                this_arg,
+                smallvec::smallvec![v, k, map_value],
             )
             .map_err(|e| vm_to_native(e, "Map.prototype.forEach"))?;
     }
@@ -1179,8 +1175,8 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             .run_callable_sync(
                 &context,
                 &callback,
-                this_arg.clone(),
-                smallvec::smallvec![v.clone(), v, set_value.clone()],
+                this_arg,
+                smallvec::smallvec![v, v, set_value],
             )
             .map_err(|e| vm_to_native(e, "Set.prototype.forEach"))?;
     }
@@ -1316,7 +1312,7 @@ fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
         .map_err(|_| oom("Set.prototype.difference"))?;
     let this_values = collections::set_values(this, ctx.heap());
     for value in &this_values {
-        ctx.set_add(&mut result, value.clone())
+        ctx.set_add(&mut result, *value)
             .map_err(|_| oom("Set.prototype.difference"))?;
     }
     let context = execution_context(ctx, "Set.prototype.difference")?;
@@ -1765,12 +1761,7 @@ fn set_record_has(
         SetRecord::Dynamic { set, has, .. } => {
             let result = ctx
                 .interp_mut()
-                .run_callable_sync(
-                    context,
-                    has,
-                    set.clone(),
-                    smallvec::smallvec![value.clone()],
-                )
+                .run_callable_sync(context, has, *set, smallvec::smallvec![*value])
                 .map_err(|err| vm_to_native(err, name))?;
             Ok(result.to_boolean(ctx.heap()))
         }
@@ -1798,7 +1789,7 @@ fn set_record_keys(
         SetRecord::Dynamic { set, keys, .. } => {
             let iterator = ctx
                 .interp_mut()
-                .run_callable_sync(context, keys, set.clone(), SmallVec::new())
+                .run_callable_sync(context, keys, *set, SmallVec::new())
                 .map_err(|err| vm_to_native(err, name))?;
             if let Value::Generator(handle) = iterator {
                 return Ok(SetRecordKeys::Generator { handle });
@@ -1924,8 +1915,8 @@ fn read_property(
     let outcome = interp
         .ordinary_get_value(
             context,
-            target.clone(),
-            target.clone(),
+            *target,
+            *target,
             &VmPropertyKey::String(property),
             0,
         )
@@ -1933,7 +1924,7 @@ fn read_property(
     match outcome {
         VmGetOutcome::Value(value) => Ok(value),
         VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(context, &getter, target.clone(), SmallVec::new())
+            .run_callable_sync(context, &getter, *target, SmallVec::new())
             .map_err(|err| vm_to_native(err, name)),
     }
 }
@@ -1952,8 +1943,8 @@ fn iterator_has_callable_iterator(
     let outcome = interp
         .ordinary_get_value(
             context,
-            target.clone(),
-            target.clone(),
+            *target,
+            *target,
             &VmPropertyKey::Symbol(iterator_sym),
             0,
         )
@@ -1961,7 +1952,7 @@ fn iterator_has_callable_iterator(
     let method = match outcome {
         VmGetOutcome::Value(value) => value,
         VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(context, &getter, target.clone(), SmallVec::new())
+            .run_callable_sync(context, &getter, *target, SmallVec::new())
             .map_err(|err| vm_to_native(err, name))?,
     };
     Ok(!matches!(method, Value::Undefined | Value::Null)
@@ -1975,7 +1966,7 @@ fn to_number_runtime(
     name: &'static str,
 ) -> Result<f64, NativeError> {
     let primitive = if crate::abstract_ops::is_primitive(value) {
-        value.clone()
+        *value
     } else {
         ctx.interp_mut()
             .evaluate_to_primitive(context, value, crate::abstract_ops::ToPrimitiveHint::Number)

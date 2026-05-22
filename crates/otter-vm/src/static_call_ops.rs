@@ -74,7 +74,7 @@ impl Interpreter {
                     && !matches!(slot, Value::String(_))
                 {
                     let primitive = if crate::abstract_ops::is_primitive(slot) {
-                        slot.clone()
+                        *slot
                     } else {
                         self.evaluate_to_primitive(
                             context,
@@ -275,7 +275,7 @@ impl Interpreter {
                 && !matches!(slot, Value::String(_))
             {
                 let primitive = if crate::abstract_ops::is_primitive(slot) {
-                    slot.clone()
+                    *slot
                 } else if let Some(context) = context {
                     self.evaluate_to_primitive(
                         context,
@@ -566,7 +566,7 @@ impl Interpreter {
                 if needs_coercion {
                     let coerced_key = self.evaluate_to_property_key(context, &key_arg)?;
                     let coerced_value = match &coerced_key {
-                        crate::VmPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
+                        crate::VmPropertyKey::Symbol(sym) => Value::Symbol(*sym),
                         other => Value::String(crate::string::JsString::from_str(
                             other
                                 .string_name()
@@ -646,7 +646,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::Undefined);
         let proto_value = match proto {
-            Value::Object(_) | Value::Iterator(_) => Some(proto.clone()),
+            Value::Object(_) | Value::Iterator(_) => Some(proto),
             Value::Null => None,
             _ => return Err(VmError::TypeMismatch),
         };
@@ -664,21 +664,16 @@ impl Interpreter {
             // accessor-aware path so user-defined `valueOf` /
             // `toString` / accessor getters fire per §6.2.5.5
             // ToPropertyDescriptor.
-            let props_owned = props_arg.clone();
+            let props_owned = *props_arg;
             let keys = own_enumerable_keys_for_define(self, context, &props_owned)?;
             for key in keys {
-                let outcome = self.ordinary_get_value(
-                    context,
-                    props_owned.clone(),
-                    props_owned.clone(),
-                    &key,
-                    0,
-                )?;
+                let outcome =
+                    self.ordinary_get_value(context, props_owned, props_owned, &key, 0)?;
                 let desc_value = match outcome {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, props_owned.clone(), args)?
+                        self.run_callable_sync(context, &getter, props_owned, args)?
                     }
                 };
                 let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
@@ -748,18 +743,12 @@ impl Interpreter {
             // accessor / data fields off the resolved value. Thread
             // both through the interpreter so user getters fire and
             // any abrupt completion propagates.
-            let outcome = self.ordinary_get_value(
-                context,
-                props_value.clone(),
-                props_value.clone(),
-                &key,
-                0,
-            )?;
+            let outcome = self.ordinary_get_value(context, props_value, props_value, &key, 0)?;
             let desc_value = match outcome {
                 crate::VmGetOutcome::Value(v) => v,
                 crate::VmGetOutcome::InvokeGetter { getter } => {
                     let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                    self.run_callable_sync(context, &getter, props_value.clone(), args)?
+                    self.run_callable_sync(context, &getter, props_value, args)?
                 }
             };
             let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
@@ -820,7 +809,7 @@ impl Interpreter {
             | Value::ArrayBuffer(_)
             | Value::DataView(_)
             | Value::TypedArray(_)
-            | Value::Proxy(_) => target_input.clone(),
+            | Value::Proxy(_) => target_input,
             Value::Null | Value::Undefined => {
                 return Err(VmError::TypeError {
                     message: "Object.assign called on null or undefined".to_string(),
@@ -828,11 +817,7 @@ impl Interpreter {
             }
             _ => {
                 let arg_slice = args;
-                self.box_sloppy_this_primitive_stack_rooted(
-                    stack,
-                    target_input.clone(),
-                    &[arg_slice],
-                )?
+                self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[arg_slice])?
             }
         };
         // Cache the object form when applicable so the existing
@@ -936,7 +921,7 @@ impl Interpreter {
                         (0..len).map(|i| i.to_string()).collect()
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
-                        self.enumerable_own_string_keys_for_value(context, target.clone(), 0)?
+                        self.enumerable_own_string_keys_for_value(context, *target, 0)?
                     }
                     Some(Value::Null) | Some(Value::Undefined) | None => {
                         return Err(VmError::TypeError {
@@ -1105,7 +1090,7 @@ impl Interpreter {
                     };
                     let set_result = match &key_pk {
                         VmPropertyKey::Symbol(sym) => {
-                            object::set_symbol(result, &mut self.gc_heap, sym.clone(), value);
+                            object::set_symbol(result, &mut self.gc_heap, *sym, value);
                             Ok(())
                         }
                         _ => {
@@ -1129,11 +1114,7 @@ impl Interpreter {
                 let desc = match args.first() {
                     Some(target @ (Value::Object(_) | Value::String(_))) => self
                         .ordinary_get_own_property_descriptor_value_stack_rooted(
-                            context,
-                            stack,
-                            target.clone(),
-                            &key,
-                            0,
+                            context, stack, *target, &key, 0,
                         )?,
                     Some(Value::ClassConstructor(class)) => match &key {
                         VmPropertyKey::Symbol(sym) => object::get_own_symbol_descriptor(
@@ -1298,7 +1279,7 @@ impl Interpreter {
                         // `[[GetOwnProperty]]`. This keeps RegExp
                         // `lastIndex`, callable metadata, proxies, and
                         // expando bags on the same reflective path.
-                        let target_value = target.clone();
+                        let target_value = *target;
                         let result_root = Value::Object(result);
                         let keys = self.own_property_keys_value(context, &target_value)?;
                         for key in keys {
@@ -1306,14 +1287,14 @@ impl Interpreter {
                                 Value::String(s) => crate::VmPropertyKey::OwnedString(
                                     s.to_lossy_string(&self.gc_heap),
                                 ),
-                                Value::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
+                                Value::Symbol(sym) => crate::VmPropertyKey::Symbol(*sym),
                                 _ => continue,
                             };
                             let desc = self
                                 .ordinary_get_own_property_descriptor_value_stack_rooted(
                                     context,
                                     stack,
-                                    target_value.clone(),
+                                    target_value,
                                     &vm_key,
                                     0,
                                 )?;
@@ -1338,7 +1319,7 @@ impl Interpreter {
                                     if !object::set_symbol(
                                         result,
                                         &mut self.gc_heap,
-                                        sym.clone(),
+                                        *sym,
                                         Value::Object(desc_obj),
                                     ) =>
                                 {
@@ -1457,7 +1438,7 @@ impl Interpreter {
 
         for (idx, item) in items_snapshot.iter().enumerate() {
             let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-            cb_args.push(item.clone());
+            cb_args.push(*item);
             cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
                 idx as f64,
             )));
@@ -1478,13 +1459,13 @@ impl Interpreter {
                             crate::object::set_symbol(
                                 result,
                                 &mut self.gc_heap,
-                                sym.clone(),
+                                sym,
                                 Value::Array(arr),
                             );
                             arr
                         }
                     };
-                    let value_root = item.clone();
+                    let value_root = *item;
                     let arr_value = Value::Array(group);
                     let res_root = Value::Object(result);
                     let roots = [&value_root, &arr_value, &res_root];
@@ -1497,7 +1478,7 @@ impl Interpreter {
                     crate::array::push_with_roots(
                         group,
                         &mut self.gc_heap,
-                        item.clone(),
+                        *item,
                         &mut external_visit,
                     )?;
                     continue;
@@ -1520,7 +1501,7 @@ impl Interpreter {
                     arr
                 }
             };
-            let value_root = item.clone();
+            let value_root = *item;
             let arr_value = Value::Array(group);
             let res_root = Value::Object(result);
             let roots = [&value_root, &arr_value, &res_root];
@@ -1529,12 +1510,7 @@ impl Interpreter {
                     v.trace_value_slots(visitor);
                 }
             };
-            crate::array::push_with_roots(
-                group,
-                &mut self.gc_heap,
-                item.clone(),
-                &mut external_visit,
-            )?;
+            crate::array::push_with_roots(group, &mut self.gc_heap, *item, &mut external_visit)?;
         }
         Ok(Value::Object(result))
     }
@@ -1569,12 +1545,12 @@ impl Interpreter {
         }
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
-                self.set_property(result, "value", value.clone())?;
+                self.set_property(result, "value", *value)?;
                 self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
-                self.set_property(result, "get", getter.clone().unwrap_or(Value::Undefined))?;
-                self.set_property(result, "set", setter.clone().unwrap_or(Value::Undefined))?;
+                self.set_property(result, "get", (*getter).unwrap_or(Value::Undefined))?;
+                self.set_property(result, "set", (*setter).unwrap_or(Value::Undefined))?;
             }
         }
         self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
@@ -1631,9 +1607,8 @@ impl Interpreter {
             M::Revocable => {
                 let target = coerce_proxy_target(args.first())?;
                 let handler = coerce_proxy_target(args.get(1))?;
-                let proxy =
-                    crate::proxy::JsProxy::new(&mut self.gc_heap, target.clone(), handler.clone())
-                        .map_err(crate::oom_to_vm)?;
+                let proxy = crate::proxy::JsProxy::new(&mut self.gc_heap, target, handler)
+                    .map_err(crate::oom_to_vm)?;
                 let proxy_value = Value::Proxy(proxy);
                 let target_root = target;
                 let handler_root = handler;
@@ -1651,7 +1626,7 @@ impl Interpreter {
                 let revoke = native_function::native_value_with_captures_unchecked_with_roots(
                     &mut self.gc_heap,
                     "revoke",
-                    smallvec::smallvec![proxy_value.clone()],
+                    smallvec::smallvec![proxy_value],
                     &mut external_visit,
                     move |ctx, _, captures| {
                         if let Some(Value::Proxy(proxy)) = captures.first() {
@@ -1770,11 +1745,8 @@ fn own_enumerable_keys_for_define(
             let mut out = Vec::new();
             for key in keys {
                 let vm_key = value_to_static_property_key(&key, interp.gc_heap())?;
-                let desc = interp.get_own_property_descriptor_for_value(
-                    context,
-                    props.clone(),
-                    Some(&key),
-                )?;
+                let desc =
+                    interp.get_own_property_descriptor_for_value(context, *props, Some(&key))?;
                 if desc.is_some_and(|desc| desc.enumerable()) {
                     out.push(vm_key);
                 }
@@ -1830,7 +1802,7 @@ fn value_to_static_property_key(
 ) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
         Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
+        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(*sym)),
         _ => Err(VmError::TypeError {
             message: "property key must be a string or symbol".to_string(),
         }),
@@ -1849,7 +1821,7 @@ fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> Strin
 
 fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
     match arg {
-        Some(v) if constructor_return_is_object(v) || abstract_ops::is_callable(v) => Ok(v.clone()),
+        Some(v) if constructor_return_is_object(v) || abstract_ops::is_callable(v) => Ok(*v),
         _ => Err(VmError::TypeMismatch),
     }
 }
@@ -1886,7 +1858,7 @@ fn collect_call_args(
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
     for i in 0..argc {
         let r = register_operand(operands.get(args_start + i))?;
-        args.push(read_register(frame, r)?.clone());
+        args.push(*read_register(frame, r)?);
     }
     Ok(args)
 }
@@ -1967,7 +1939,7 @@ fn enumerable_own_string_entries(
         let key = VmPropertyKey::OwnedString(key_name.clone());
         let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
-            target.clone(),
+            *target,
             &key,
             0,
             &[target],
@@ -1979,13 +1951,12 @@ fn enumerable_own_string_entries(
         if !desc.enumerable() {
             continue;
         }
-        let value =
-            match interp.ordinary_get_value(context, target.clone(), target.clone(), &key, 0)? {
-                crate::VmGetOutcome::Value(value) => value,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    interp.run_callable_sync(context, &getter, target.clone(), SmallVec::new())?
-                }
-            };
+        let value = match interp.ordinary_get_value(context, *target, *target, &key, 0)? {
+            crate::VmGetOutcome::Value(value) => value,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                interp.run_callable_sync(context, &getter, *target, SmallVec::new())?
+            }
+        };
         entries.push((key_name, value));
     }
     Ok(entries)
@@ -2028,7 +1999,7 @@ fn assign_copy_source_keys(
     for key_value in &keys {
         let key = match key_value {
             Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap())),
-            Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
             _ => {
                 return Err(VmError::TypeError {
                     message: "Object.assign source ownKeys returned non-property key".to_string(),
@@ -2037,7 +2008,7 @@ fn assign_copy_source_keys(
         };
         let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
-            source.clone(),
+            *source,
             &key,
             0,
             &[target_value, source],
@@ -2049,13 +2020,12 @@ fn assign_copy_source_keys(
         if !desc.enumerable() {
             continue;
         }
-        let value =
-            match interp.ordinary_get_value(context, source.clone(), source.clone(), &key, 0)? {
-                crate::VmGetOutcome::Value(value) => value,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    interp.run_callable_sync(context, &getter, source.clone(), SmallVec::new())?
-                }
-            };
+        let value = match interp.ordinary_get_value(context, *source, *source, &key, 0)? {
+            crate::VmGetOutcome::Value(value) => value,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                interp.run_callable_sync(context, &getter, *source, SmallVec::new())?
+            }
+        };
         match &key {
             VmPropertyKey::Symbol(sym) => {
                 assign_set_symbol(interp, context, target_value, target_object, sym, value)?;
@@ -2179,17 +2149,12 @@ fn read_indexed_entry(
     target: &Value,
     name: &str,
 ) -> Result<Value, VmError> {
-    let outcome = interp.ordinary_get_value(
-        context,
-        target.clone(),
-        target.clone(),
-        &VmPropertyKey::String(name),
-        0,
-    )?;
+    let outcome =
+        interp.ordinary_get_value(context, *target, *target, &VmPropertyKey::String(name), 0)?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
         crate::VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, target.clone(), SmallVec::new())
+            interp.run_callable_sync(context, &getter, *target, SmallVec::new())
         }
     }
 }

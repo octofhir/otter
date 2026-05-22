@@ -63,7 +63,7 @@ fn install_array_buffer(
     }
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         for (name, length, call) in AB_METHODS {
             builder.method(
                 name,
@@ -139,7 +139,7 @@ fn install_array_buffer(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(ctor_root.clone(), true, false, true),
+        PropertyDescriptor::data(ctor_root, true, false, true),
     );
     crate::bootstrap::define_global_value(global, heap, name, ctor_root);
     Ok(())
@@ -175,7 +175,7 @@ fn install_shared_array_buffer(
     }
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         // `slice` + `grow` are the spec methods on SAB. `transfer`
         // / `transferToFixedLength` belong to ArrayBuffer only.
         builder.method(
@@ -230,7 +230,7 @@ fn install_shared_array_buffer(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(ctor_root.clone(), true, false, true),
+        PropertyDescriptor::data(ctor_root, true, false, true),
     );
     crate::bootstrap::define_global_value(global, heap, name, ctor_root);
     Ok(())
@@ -244,7 +244,7 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         });
     }
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         crate::runtime_cx::visit_native_roots(
@@ -381,7 +381,7 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         });
     }
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         crate::runtime_cx::visit_native_roots(
@@ -449,7 +449,7 @@ fn dispatch_method(
             name: "ArrayBuffer.prototype",
             reason: format!("method {method_name} missing"),
         })?;
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
     let allocation_roots = ctx.collect_native_roots();
     let gc_heap = ctx.heap_mut();

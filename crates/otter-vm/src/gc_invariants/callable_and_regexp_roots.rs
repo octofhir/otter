@@ -67,12 +67,7 @@ fn native_function_captures_root_gc_values_when_rooted() {
     )
     .expect("native");
     let global = *interp.global_this();
-    crate::object::set(
-        global,
-        interp.gc_heap_mut(),
-        "__gc_native_function",
-        native.clone(),
-    );
+    crate::object::set(global, interp.gc_heap_mut(), "__gc_native_function", native);
 
     let _ = captured;
     interp.force_gc();

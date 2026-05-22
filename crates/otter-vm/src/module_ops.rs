@@ -53,7 +53,7 @@ impl Interpreter {
         dst: u16,
         spec_reg: u16,
     ) -> Result<(), VmError> {
-        let spec_value = read_register(frame, spec_reg)?.clone();
+        let spec_value = *read_register(frame, spec_reg)?;
         let specifier = match spec_value {
             Value::String(s) => s.to_lossy_string(&self.gc_heap),
             _ => return Err(VmError::TypeMismatch),
@@ -75,7 +75,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let dst = register_operand(operands.first())?;
         let spec_reg = register_operand(operands.get(1))?;
-        let spec_value = read_register(&stack[top_idx], spec_reg)?.clone();
+        let spec_value = *read_register(&stack[top_idx], spec_reg)?;
         let referrer = stack[top_idx].module_url.clone();
         let import_context = context.clone();
         let promise = match spec_value {

@@ -294,13 +294,12 @@ pub(crate) fn render_error_to_string_spec(
         default: &str,
     ) -> Result<String, crate::VmError> {
         let vm_key = crate::VmPropertyKey::String(key);
-        let outcome =
-            interp.ordinary_get_value(context, receiver.clone(), receiver.clone(), &vm_key, 0)?;
+        let outcome = interp.ordinary_get_value(context, *receiver, *receiver, &vm_key, 0)?;
         let value = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                interp.run_callable_sync(context, &getter, receiver.clone(), args)?
+                interp.run_callable_sync(context, &getter, *receiver, args)?
             }
         };
         match value {
@@ -450,7 +449,7 @@ impl ErrorClassRegistry {
             ctx: &mut NativeCtx<'_>,
             _args: &[Value],
         ) -> Result<Value, NativeError> {
-            let receiver = ctx.this_value().clone();
+            let receiver = *ctx.this_value();
             // §20.5.3.4 step 2 — Type(O) is not Object → TypeError.
             let Value::Object(_) = &receiver else {
                 return Err(NativeError::TypeError {
@@ -499,7 +498,7 @@ impl ErrorClassRegistry {
             error_proto,
             gc_heap,
             "toString",
-            PropertyDescriptor::data(to_string_root.clone(), true, false, true),
+            PropertyDescriptor::data(to_string_root, true, false, true),
         );
         // §20.5.3.4 Error.prototype.toString is intercepted by
         // `object_prototype_intercept` in the dispatcher when the
@@ -813,7 +812,7 @@ impl ErrorClassRegistry {
             );
             let mut roots = class_entry_roots(&entries);
             roots.push(Value::Object(error_proto));
-            roots.push(proto_root.clone());
+            roots.push(proto_root);
             let root_refs: Vec<&Value> = roots.iter().collect();
             let ctor = alloc_registry_object(gc_heap, root_refs.as_slice())?;
             let ctor_root = Value::Object(ctor);

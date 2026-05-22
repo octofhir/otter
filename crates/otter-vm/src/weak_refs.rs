@@ -168,7 +168,7 @@ pub(crate) fn weak_ref_prototype_override(
     weak_ref: JsWeakRef,
     heap: &otter_gc::GcHeap,
 ) -> Option<Value> {
-    heap.read_payload(weak_ref, |body| body.prototype_override.clone())
+    heap.read_payload(weak_ref, |body| body.prototype_override)
 }
 
 pub(crate) fn set_weak_ref_prototype_override(
@@ -176,7 +176,7 @@ pub(crate) fn set_weak_ref_prototype_override(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) {
-    let barrier_value = proto.clone();
+    let barrier_value = proto;
     heap.with_payload(weak_ref, |body| {
         body.prototype_override = proto;
     });
@@ -208,7 +208,7 @@ pub(crate) fn alloc_finalization_registry_with_context_and_roots(
     if !is_callable(&cleanup_callback) {
         return Err(crate::VmError::NotCallable);
     }
-    let cleanup_callback_root = cleanup_callback.clone();
+    let cleanup_callback_root = cleanup_callback;
     let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
         cleanup_callback_root.trace_value_slots(visitor);
@@ -235,7 +235,7 @@ pub(crate) fn alloc_finalization_registry_for_mark_sweep_fixture(
     if !is_callable(&cleanup_callback) {
         return Err(crate::VmError::NotCallable);
     }
-    let barrier_cleanup_callback = cleanup_callback.clone();
+    let barrier_cleanup_callback = cleanup_callback;
     let registry = heap.alloc_old(FinalizationRegistryBody {
         cleanup_callback,
         cleanup_context,
@@ -251,7 +251,7 @@ pub(crate) fn finalization_registry_prototype_override(
     registry: JsFinalizationRegistry,
     heap: &otter_gc::GcHeap,
 ) -> Option<Value> {
-    heap.read_payload(registry, |body| body.prototype_override.clone())
+    heap.read_payload(registry, |body| body.prototype_override)
 }
 
 pub(crate) fn set_finalization_registry_prototype_override(
@@ -259,7 +259,7 @@ pub(crate) fn set_finalization_registry_prototype_override(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) {
-    let barrier_value = proto.clone();
+    let barrier_value = proto;
     heap.with_payload(registry, |body| {
         body.prototype_override = proto;
     });
@@ -280,7 +280,7 @@ pub fn finalization_registry_register(
     if held_value.as_gc_raw() == Some(target_raw) {
         return Err(crate::VmError::TypeMismatch);
     }
-    let barrier_held_value = held_value.clone();
+    let barrier_held_value = held_value;
     let unregister_token = match unregister_token {
         Some(Value::Undefined) | None => None,
         Some(value) => Some(weak_target_raw(value)?),
@@ -371,13 +371,13 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
             continue;
         }
         heap.with_payload(registry, |body| {
-            let cleanup_callback = body.cleanup_callback.clone();
+            let cleanup_callback = body.cleanup_callback;
             let cleanup_context = body.cleanup_context.clone();
             let mut retained = Vec::with_capacity(body.cells.len());
             for cell in body.cells.drain(..) {
                 if dead_targets.contains(&cell.target) {
                     jobs.push(FinalizationJob {
-                        cleanup_callback: cleanup_callback.clone(),
+                        cleanup_callback,
                         context: cleanup_context.clone(),
                         held_value: cell.held_value,
                     });

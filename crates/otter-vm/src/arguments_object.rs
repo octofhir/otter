@@ -55,12 +55,7 @@ pub(crate) fn initialize_unmapped(
         obj,
         heap,
         "callee",
-        PropertyDescriptor::accessor(
-            Some(throw_type_error.clone()),
-            Some(throw_type_error),
-            false,
-            false,
-        ),
+        PropertyDescriptor::accessor(Some(throw_type_error), Some(throw_type_error), false, false),
     );
 }
 

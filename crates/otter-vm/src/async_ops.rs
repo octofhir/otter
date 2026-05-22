@@ -174,7 +174,7 @@ impl Interpreter {
     ) -> Result<(), RunError> {
         if fulfilled {
             if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
-                *slot = value.clone();
+                *slot = value;
             } else {
                 return Err(RunError {
                     error: VmError::InvalidOperand,
@@ -185,7 +185,7 @@ impl Interpreter {
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(*frame);
         if !fulfilled {
-            if let Err(error) = self.unwind_throw(&mut stack, value.clone()) {
+            if let Err(error) = self.unwind_throw(&mut stack, value) {
                 let frames = snapshot_frames(context, &stack);
                 return Err(RunError { error, frames });
             }
@@ -279,7 +279,7 @@ impl Interpreter {
     ) -> Result<(), RunError> {
         if fulfilled {
             if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
-                *slot = value.clone();
+                *slot = value;
             } else {
                 return Err(RunError {
                     error: VmError::InvalidOperand,
@@ -362,7 +362,7 @@ impl Interpreter {
         loop {
             let Some(frame) = stack.last_mut() else {
                 if uncaught_error.is_none() {
-                    self.pending_uncaught_throw = Some(payload.clone());
+                    self.pending_uncaught_throw = Some(payload);
                 }
                 return Err(uncaught_error
                     .take()

@@ -64,7 +64,7 @@ fn native_is_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 /// §23.1.2.3 `Array.of(...items)` JS-visible NativeFunction.
 fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if is_constructor(&this_value) {
         return construct_and_fill(ctx, &this_value, args)
             .map_err(|e| vm_to_native_array_static("Array.of", e));
@@ -117,7 +117,7 @@ fn construct_and_fill(
     let receiver = {
         let (interp, exec) = ctx.interp_mut_and_context();
         let exec = exec.ok_or(VmError::InvalidOperand)?;
-        interp.run_construct_sync(&exec, target, target.clone(), ctor_args)?
+        interp.run_construct_sync(&exec, target, *target, ctor_args)?
     };
     let receiver_obj = match &receiver {
         Value::Object(obj) => *obj,
@@ -130,7 +130,7 @@ fn construct_and_fill(
     };
     for (idx, value) in args.iter().enumerate() {
         let key = idx.to_string();
-        ctx.set_property(receiver_obj, &key, value.clone())?;
+        ctx.set_property(receiver_obj, &key, *value)?;
     }
     ctx.set_property(
         receiver_obj,

@@ -306,9 +306,9 @@ impl<'rt> ObjectBuilder<'rt> {
         ctx: &'a mut NativeCtx<'_>,
     ) -> Result<ObjectBuilder<'a>, otter_gc::OutOfMemory> {
         let raw_roots = ctx.collect_native_roots();
-        let mut value_roots = vec![ctx.this_value().clone()];
+        let mut value_roots = vec![*ctx.this_value()];
         if let Some(new_target) = ctx.new_target() {
-            value_roots.push(new_target.clone());
+            value_roots.push(*new_target);
         }
         let object = ctx.alloc_object()?;
         Ok(ObjectBuilder::<'a>::from_object_with_raw_and_value_roots(
@@ -327,9 +327,9 @@ impl<'rt> ObjectBuilder<'rt> {
         object: JsObject,
     ) -> ObjectBuilder<'a> {
         let raw_roots = ctx.collect_native_roots();
-        let mut value_roots = vec![ctx.this_value().clone()];
+        let mut value_roots = vec![*ctx.this_value()];
         if let Some(new_target) = ctx.new_target() {
-            value_roots.push(new_target.clone());
+            value_roots.push(*new_target);
         }
         ObjectBuilder::<'a>::from_object_with_raw_and_value_roots(
             ctx.heap_mut(),
@@ -456,7 +456,7 @@ impl<'rt> ObjectBuilder<'rt> {
             )?)),
             None => None,
         };
-        let getter_root = getter.clone().unwrap_or(Value::Undefined);
+        let getter_root = getter.unwrap_or(Value::Undefined);
         let mut setter_roots = Vec::with_capacity(self.value_roots.len() + 2);
         setter_roots.push(&object_root);
         setter_roots.push(&getter_root);
@@ -571,7 +571,7 @@ impl<'rt> ConstructorBuilder<'rt> {
             ctor,
             self.heap,
             "call",
-            function_root.clone(),
+            function_root,
             Attr::builtin_function(),
         )?;
         define_data(
@@ -682,9 +682,9 @@ impl<'rt> ClassBuilder<'rt> {
             &[],
         )?);
         let mut builder_roots = Vec::with_capacity(self.value_roots.len() + 3);
-        builder_roots.push(prototype_root.clone());
-        builder_roots.push(statics_root.clone());
-        builder_roots.push(constructor.clone());
+        builder_roots.push(prototype_root);
+        builder_roots.push(statics_root);
+        builder_roots.push(constructor);
         builder_roots.extend(self.value_roots);
 
         {
@@ -734,7 +734,7 @@ impl<'rt> ClassBuilder<'rt> {
             prototype,
             self.heap,
             "constructor",
-            class.clone(),
+            class,
             Attr::builtin_function(),
         )?;
         Ok(class)
@@ -793,9 +793,9 @@ impl<'rt> NamespaceBuilder<'rt> {
         spec: &'static NamespaceSpec,
     ) -> Result<NamespaceBuilder<'a>, otter_gc::OutOfMemory> {
         let raw_roots = ctx.collect_native_roots();
-        let mut value_roots = vec![ctx.this_value().clone()];
+        let mut value_roots = vec![*ctx.this_value()];
         if let Some(new_target) = ctx.new_target() {
-            value_roots.push(new_target.clone());
+            value_roots.push(*new_target);
         }
         let object = ctx.alloc_object()?;
         Ok(NamespaceBuilder {

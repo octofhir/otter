@@ -133,7 +133,7 @@ pub fn runtime_this_object(
     name: &'static str,
     expected: &'static str,
 ) -> Result<RuntimeJsObject, RuntimeNativeError> {
-    match ctx.this_value().clone() {
+    match *ctx.this_value() {
         RuntimeValue::Object(object) => Ok(object),
         _ => Err(runtime_type_error(
             name,

@@ -242,7 +242,7 @@ fn to_primitive_number(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     if abstract_ops::is_primitive(value) {
-        return Ok(value.clone());
+        return Ok(*value);
     }
     let (interp, exec) = ctx.interp_mut_and_context();
     let exec = exec.ok_or_else(|| {
@@ -757,7 +757,7 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     if is_async {
         let label_value = Value::String(label_str);
         let promise = ctx
-            .fulfilled_promise_with_roots(label_value.clone(), &[], &[args])
+            .fulfilled_promise_with_roots(label_value, &[], &[args])
             .map_err(|e| type_err(method_name, format!("promise allocation failed: {e}")))?;
         let promise_value = Value::Promise(promise);
         let result = ctx

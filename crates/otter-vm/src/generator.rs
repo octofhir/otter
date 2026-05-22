@@ -184,7 +184,7 @@ impl JsGenerator {
     /// Call-time `[[Prototype]]` override.
     #[must_use]
     pub fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<crate::Value> {
-        heap.read_payload(self.inner, |body| body.prototype_override.clone())
+        heap.read_payload(self.inner, |body| body.prototype_override)
     }
 
     /// `true` when a frame is currently saved on the generator.
@@ -212,7 +212,7 @@ impl JsGenerator {
         resume_dst: u16,
         yielded: crate::Value,
     ) {
-        let barrier_value = yielded.clone();
+        let barrier_value = yielded;
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
             body.resume_dst = resume_dst;

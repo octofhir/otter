@@ -111,7 +111,7 @@ impl MapKey {
             }
             Value::BigInt(b) => MapKey::BigInt(*b),
             Value::String(s) => MapKey::String(*s),
-            Value::Symbol(s) => MapKey::Symbol(s.clone()),
+            Value::Symbol(s) => MapKey::Symbol(*s),
             Value::Object(_)
             | Value::Array(_)
             | Value::RegExp(_)
@@ -119,11 +119,11 @@ impl MapKey {
             | Value::Iterator(_)
             | Value::Generator(_)
             | Value::BoundFunction(_)
-            | Value::NativeFunction(_) => MapKey::ObjectValue(value.clone()),
+            | Value::NativeFunction(_) => MapKey::ObjectValue(*value),
             // Functions, closures, class constructors, and other reference
             // wrappers compare via the originating `Value`'s `PartialEq`,
             // which is identity on every callable shape.
-            _ => MapKey::ObjectValue(value.clone()),
+            _ => MapKey::ObjectValue(*value),
         }
     }
 }
@@ -233,7 +233,7 @@ impl MapEntry {
     }
 
     fn pair(&self) -> Option<(Value, Value)> {
-        Some((self.key.as_ref()?.clone(), self.value.as_ref()?.clone()))
+        Some((*self.key.as_ref()?, *self.value.as_ref()?))
     }
 
     fn clear(&mut self) {
@@ -278,7 +278,7 @@ pub(crate) fn alloc_map_with_roots(
 }
 
 pub(crate) fn map_prototype_override(map: JsMap, heap: &otter_gc::GcHeap) -> Option<Value> {
-    heap.read_payload(map, |body| body.prototype_override.clone())
+    heap.read_payload(map, |body| body.prototype_override)
 }
 
 pub(crate) fn set_map_prototype_override(
@@ -286,7 +286,7 @@ pub(crate) fn set_map_prototype_override(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) {
-    let barrier_value = proto.clone();
+    let barrier_value = proto;
     heap.with_payload(map, |body| {
         body.prototype_override = proto;
     });
@@ -320,7 +320,7 @@ pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value
         body.entries
             .iter()
             .find(|entry| entry.key_matches(&k, heap))
-            .and_then(|entry| entry.value.clone())
+            .and_then(|entry| entry.value)
     })
 }
 
@@ -341,8 +341,8 @@ pub fn map_set(
     key: Value,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let barrier_key = key.clone();
-    let barrier_value = value.clone();
+    let barrier_key = key;
+    let barrier_value = value;
     let k = MapKey::from_value(&key);
     let existing_idx = heap.read_payload(map, |body| {
         body.entries
@@ -377,8 +377,8 @@ pub(crate) fn map_set_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let barrier_key = key.clone();
-    let barrier_value = value.clone();
+    let barrier_key = key;
+    let barrier_value = value;
     let k = MapKey::from_value(&key);
     let existing_idx = heap.read_payload(*map, |body| {
         body.entries
@@ -437,10 +437,7 @@ pub fn map_clear(map: JsMap, heap: &mut otter_gc::GcHeap) {
 #[must_use]
 pub fn map_keys(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
-        body.entries
-            .iter()
-            .filter_map(|entry| entry.key.clone())
-            .collect()
+        body.entries.iter().filter_map(|entry| entry.key).collect()
     })
 }
 
@@ -450,7 +447,7 @@ pub fn map_values(map: JsMap, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(map, |body| {
         body.entries
             .iter()
-            .filter_map(|entry| entry.value.clone())
+            .filter_map(|entry| entry.value)
             .collect()
     })
 }
@@ -558,7 +555,7 @@ pub(crate) fn alloc_set_with_roots(
 }
 
 pub(crate) fn set_prototype_override(set: JsSet, heap: &otter_gc::GcHeap) -> Option<Value> {
-    heap.read_payload(set, |body| body.prototype_override.clone())
+    heap.read_payload(set, |body| body.prototype_override)
 }
 
 pub(crate) fn set_set_prototype_override(
@@ -566,7 +563,7 @@ pub(crate) fn set_set_prototype_override(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) {
-    let barrier_value = proto.clone();
+    let barrier_value = proto;
     heap.with_payload(set, |body| {
         body.prototype_override = proto;
     });
@@ -607,7 +604,7 @@ pub fn set_add(
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let k = MapKey::from_value(&value);
     let exists = heap.read_payload(set, |body| {
         body.entries.iter().any(|entry| entry.key_matches(&k, heap))
@@ -633,7 +630,7 @@ pub(crate) fn set_add_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let k = MapKey::from_value(&value);
     let exists = heap.read_payload(*set, |body| {
         body.entries.iter().any(|entry| entry.key_matches(&k, heap))
@@ -685,7 +682,7 @@ pub fn set_values(set: JsSet, heap: &otter_gc::GcHeap) -> Vec<Value> {
     heap.read_payload(set, |body| {
         body.entries
             .iter()
-            .filter_map(|entry| entry.value.clone())
+            .filter_map(|entry| entry.value)
             .collect()
     })
 }
@@ -700,9 +697,7 @@ pub(crate) fn set_raw_len(set: JsSet, heap: &otter_gc::GcHeap) -> usize {
 #[must_use]
 pub(crate) fn set_value_at(set: JsSet, heap: &otter_gc::GcHeap, index: usize) -> Option<Value> {
     heap.read_payload(set, |body| {
-        body.entries
-            .get(index)
-            .and_then(|entry| entry.value.clone())
+        body.entries.get(index).and_then(|entry| entry.value)
     })
 }
 
@@ -789,7 +784,7 @@ pub(crate) fn weak_map_prototype_override(
     map: JsWeakMap,
     heap: &otter_gc::GcHeap,
 ) -> Option<Value> {
-    heap.read_payload(map, |body| body.prototype_override.clone())
+    heap.read_payload(map, |body| body.prototype_override)
 }
 
 pub(crate) fn set_weak_map_prototype_override(
@@ -797,7 +792,7 @@ pub(crate) fn set_weak_map_prototype_override(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) {
-    let barrier_value = proto.clone();
+    let barrier_value = proto;
     heap.with_payload(map, |body| {
         body.prototype_override = proto;
     });
@@ -816,7 +811,7 @@ pub fn weak_map_get(
     Ok(heap.read_payload(map, |body| {
         body.entries
             .iter()
-            .find_map(|(entry_key, value)| entry_key.matches(&key).then(|| value.clone()))
+            .find_map(|(entry_key, value)| entry_key.matches(&key).then_some(*value))
     }))
 }
 
@@ -852,9 +847,9 @@ pub fn weak_map_set(
     key: Value,
     value: Value,
 ) -> Result<(), CollectionError> {
-    let barrier_value = value.clone();
-    let key_root = key.clone();
-    let value_root = value.clone();
+    let barrier_value = value;
+    let key_root = key;
+    let value_root = value;
     let key_for_exists = weak_collection_key(&key)?;
     let exists = heap.read_payload(map, |body| {
         body.entries
@@ -893,9 +888,9 @@ pub(crate) fn weak_map_set_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), CollectionError> {
-    let barrier_value = value.clone();
-    let key_root = key.clone();
-    let value_root = value.clone();
+    let barrier_value = value;
+    let key_root = key;
+    let value_root = value;
     let key = weak_collection_key(&key)?;
     let exists = heap.read_payload(*map, |body| {
         body.entries
@@ -1003,7 +998,7 @@ pub(crate) fn weak_set_prototype_override(
     set: JsWeakSet,
     heap: &otter_gc::GcHeap,
 ) -> Option<Value> {
-    heap.read_payload(set, |body| body.prototype_override.clone())
+    heap.read_payload(set, |body| body.prototype_override)
 }
 
 pub(crate) fn set_weak_set_prototype_override(
@@ -1011,7 +1006,7 @@ pub(crate) fn set_weak_set_prototype_override(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) {
-    let barrier_value = proto.clone();
+    let barrier_value = proto;
     heap.with_payload(set, |body| {
         body.prototype_override = proto;
     });
@@ -1049,7 +1044,7 @@ pub fn weak_set_add(
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<(), CollectionError> {
-    let value_root = value.clone();
+    let value_root = value;
     let key_for_exists = weak_collection_key(&value)?;
     let exists = heap.read_payload(set, |body| {
         body.entries
@@ -1079,7 +1074,7 @@ pub(crate) fn weak_set_add_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), CollectionError> {
-    let value_root = value.clone();
+    let value_root = value;
     let key = weak_collection_key(&value)?;
     let exists = heap.read_payload(*set, |body| {
         body.entries.iter().any(|entry_key| entry_key.matches(&key))
@@ -1220,9 +1215,7 @@ fn weak_collection_key(value: &Value) -> Result<WeakCollectionKey, CollectionErr
         return Ok(WeakCollectionKey::Object(raw));
     }
     match value {
-        Value::Symbol(symbol) if !symbol.is_registered() => {
-            Ok(WeakCollectionKey::Symbol(symbol.clone()))
-        }
+        Value::Symbol(symbol) if !symbol.is_registered() => Ok(WeakCollectionKey::Symbol(*symbol)),
         _ => Err(CollectionError::NonObjectKey),
     }
 }
@@ -1465,7 +1458,7 @@ mod tests {
         let key = young_object_value(&mut heap);
         let before = key.as_gc_raw().unwrap();
 
-        map_set(m, &mut heap, key.clone(), n(42)).unwrap();
+        map_set(m, &mut heap, key, n(42)).unwrap();
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(m) as *mut RawGc);
@@ -1487,7 +1480,7 @@ mod tests {
         let key = young_object_value(&mut heap);
         let before = key.as_gc_raw().unwrap();
 
-        set_add(s, &mut heap, key.clone()).unwrap();
+        set_add(s, &mut heap, key).unwrap();
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(s) as *mut RawGc);
@@ -1514,7 +1507,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let wm = alloc_weak_map(&mut heap).unwrap();
         let obj = Value::Object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
-        weak_map_set(wm, &mut heap, obj.clone(), n(42)).unwrap();
+        weak_map_set(wm, &mut heap, obj, n(42)).unwrap();
         assert!(weak_map_has(wm, &heap, &obj).unwrap());
         assert_eq!(weak_map_get(wm, &heap, &obj).unwrap(), Some(n(42)));
         let other = Value::Object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
@@ -1530,7 +1523,7 @@ mod tests {
         let key_before = key.as_gc_raw().unwrap();
         let value_before = value.as_gc_raw().unwrap();
 
-        weak_map_set(wm, &mut heap, key.clone(), value).unwrap();
+        weak_map_set(wm, &mut heap, key, value).unwrap();
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(wm) as *mut RawGc);
@@ -1572,7 +1565,7 @@ mod tests {
         let key = young_object_value(&mut heap);
         let before = key.as_gc_raw().unwrap();
 
-        weak_set_add(ws, &mut heap, key.clone()).unwrap();
+        weak_set_add(ws, &mut heap, key).unwrap();
 
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visitor(std::ptr::addr_of_mut!(ws) as *mut RawGc);
@@ -1590,7 +1583,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let m = alloc_map(&mut gc_heap).unwrap();
         let key = Value::String(JsString::from_str("k", &mut gc_heap).unwrap());
-        map_set(m, &mut gc_heap, key.clone(), n(1)).unwrap();
+        map_set(m, &mut gc_heap, key, n(1)).unwrap();
         assert_eq!(map_get(m, &gc_heap, &key), Some(n(1)),);
     }
 }

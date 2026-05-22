@@ -130,7 +130,7 @@ impl JsClosure {
     /// body once.
     #[must_use]
     pub fn bound_this(self, heap: &GcHeap) -> Option<Value> {
-        heap.read_payload(self.handle, |body| body.bound_this.clone())
+        heap.read_payload(self.handle, |body| body.bound_this)
     }
 
     /// Number of captured upvalue cells. Reads the body once.

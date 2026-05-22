@@ -35,7 +35,7 @@ impl Interpreter {
             .string_constant_str(kind_idx)
             .ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
-        let seed = read_register(frame, iter_reg)?.clone();
+        let seed = *read_register(frame, iter_reg)?;
         let value = self.build_collection_with_stack_roots(kind, &seed, stack)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
@@ -108,7 +108,7 @@ impl Interpreter {
                     crate::collections::set_add_with_roots(
                         &mut s,
                         &mut self.gc_heap,
-                        v.clone(),
+                        *v,
                         &mut external_visit,
                     )?;
                 }
@@ -167,7 +167,7 @@ impl Interpreter {
                     crate::collections::weak_set_add_with_roots(
                         &mut s,
                         &mut self.gc_heap,
-                        v.clone(),
+                        *v,
                         &mut external_visit,
                     )
                     .map_err(weak_collection_to_vm_error)?;

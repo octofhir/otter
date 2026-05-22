@@ -221,7 +221,7 @@ pub(crate) fn install_typed_array_entry(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(ctor_root.clone(), true, false, true),
+        PropertyDescriptor::data(ctor_root, true, false, true),
     );
 
     crate::bootstrap::define_global_value(global, heap, name, ctor_root);
@@ -383,12 +383,12 @@ fn drain_iterable_into_values(
         .interp
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Iterator);
-    let src_value = src.clone();
+    let src_value = *src;
     let key = crate::VmPropertyKey::Symbol(iterator_sym);
     let outcome = ctx
         .cx
         .interp
-        .ordinary_get_value(exec_ctx, src_value.clone(), src_value.clone(), &key, 0)
+        .ordinary_get_value(exec_ctx, src_value, src_value, &key, 0)
         .map_err(|e| NativeError::TypeError {
             name: "TypedArray",
             reason: e.to_string(),
@@ -399,7 +399,7 @@ fn drain_iterable_into_values(
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
             ctx.cx
                 .interp
-                .run_callable_sync(exec_ctx, &getter, src_value.clone(), args)
+                .run_callable_sync(exec_ctx, &getter, src_value, args)
                 .map_err(|e| NativeError::TypeError {
                     name: "TypedArray",
                     reason: e.to_string(),
@@ -433,7 +433,7 @@ fn drain_iterable_into_values(
                 })?
         }
         other => {
-            let other_root = other.clone();
+            let other_root = other;
             let state = crate::IteratorState::User { iterator: other };
             ctx.alloc_iterator_state(state, &[&other_root], &[])
                 .map_err(|_| NativeError::TypeError {
@@ -527,14 +527,14 @@ fn ta_invoke_callback(
             reason: "missing execution context".to_string(),
         })?;
     let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-    cb_args.push(value.clone());
+    cb_args.push(*value);
     cb_args.push(Value::Number(crate::number::NumberValue::from_i32(
         index as i32,
     )));
-    cb_args.push(ta.clone());
+    cb_args.push(*ta);
     ctx.cx
         .interp
-        .run_callable_sync(&exec_ctx, callee, this_arg.clone(), cb_args)
+        .run_callable_sync(&exec_ctx, callee, *this_arg, cb_args)
         .map_err(|e| NativeError::TypeError {
             name: "TypedArray callback",
             reason: e.to_string(),
@@ -587,7 +587,7 @@ fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     for (i, v) in elements.iter().enumerate() {
         let kept = ta_invoke_callback(ctx, &callee, &this_arg, v, i, &ta_value)?;
         if kept.to_boolean(ctx.interp_mut().gc_heap()) {
-            out.push(v.clone());
+            out.push(*v);
         }
     }
     ta_build_result(ctx, t.kind(), &out, "TypedArray.prototype.filter")
@@ -635,7 +635,7 @@ fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for i in (0..elements.len()).rev() {
-        let v = elements[i].clone();
+        let v = elements[i];
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if hit.to_boolean(ctx.interp_mut().gc_heap()) {
             return Ok(v);
@@ -652,7 +652,7 @@ fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for i in (0..elements.len()).rev() {
-        let v = elements[i].clone();
+        let v = elements[i];
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if hit.to_boolean(ctx.interp_mut().gc_heap()) {
             return Ok(Value::Number(crate::number::NumberValue::from_i32(
@@ -735,21 +735,21 @@ fn ta_proto_reduce_dir(
         })?;
     let step: i64 = if reverse { -1 } else { 1 };
     let (mut acc, start_idx) = if has_init {
-        (args[1].clone(), if reverse { len as i64 - 1 } else { 0 })
+        (args[1], if reverse { len as i64 - 1 } else { 0 })
     } else {
         let seed = if reverse { len - 1 } else { 0 };
-        (elements[seed].clone(), seed as i64 + step)
+        (elements[seed], seed as i64 + step)
     };
     let mut i = start_idx;
     while i >= 0 && (i as usize) < len {
-        let value = elements[i as usize].clone();
+        let value = elements[i as usize];
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        cb_args.push(acc.clone());
+        cb_args.push(acc);
         cb_args.push(value);
         cb_args.push(Value::Number(crate::number::NumberValue::from_i32(
             i as i32,
         )));
-        cb_args.push(ta_value.clone());
+        cb_args.push(ta_value);
         acc = ctx
             .cx
             .interp
@@ -778,7 +778,7 @@ fn ta_build_result(
             reason: "TypedArray byte length overflow".to_string(),
         })?;
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let value_slice: &[Value] = values;
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -901,7 +901,7 @@ fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 ///
 /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype-%symbol.tostringtag%>
 fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let kind_name = match this_value {
         Value::TypedArray(t) => t.kind().name(),
         _ => return Ok(Value::Undefined),
@@ -1003,7 +1003,7 @@ fn ensure_abstract_typed_array_prototype(
     }
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, proto, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, proto, vec![global_root]);
         for (name, length, call) in TYPED_ARRAY_METHODS {
             builder.method(
                 name,
@@ -1098,7 +1098,7 @@ fn ta_from_dispatch(
     kind: TypedArrayKind,
 ) -> Result<Value, NativeError> {
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         crate::runtime_cx::visit_native_roots(visitor, &roots, &this_value, None, &[], &[args]);
     };
@@ -1118,7 +1118,7 @@ fn ta_of_dispatch(
     kind: TypedArrayKind,
 ) -> Result<Value, NativeError> {
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         crate::runtime_cx::visit_native_roots(visitor, &roots, &this_value, None, &[], &[args]);
     };
@@ -1188,7 +1188,7 @@ fn ta_ctor_dispatch(
                 let mut out: SmallVec<[Value; 4]> = SmallVec::new();
                 out.push(Value::Array(arr));
                 for v in args.iter().skip(1) {
-                    out.push(v.clone());
+                    out.push(*v);
                 }
                 Some(out)
             } else {
@@ -1238,7 +1238,7 @@ fn ta_ctor_dispatch(
     };
     let coerced_slice: &[Value] = coerced.as_slice();
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         crate::runtime_cx::visit_native_roots(
@@ -1333,7 +1333,7 @@ fn ta_proto_dispatch(
             name: "TypedArray.prototype",
             reason: format!("method {method_name} missing"),
         })?;
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
     let allocation_roots = ctx.collect_native_roots();
     let gc_heap = ctx.heap_mut();

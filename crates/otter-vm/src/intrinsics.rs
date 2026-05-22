@@ -295,7 +295,7 @@ impl IntrinsicArgs<'_> {
         array: JsArray,
         value: Value,
     ) -> Result<usize, otter_gc::OutOfMemory> {
-        let value_root = value.clone();
+        let value_root = value;
         let allocation_roots = self.allocation_roots;
         let receiver = self.receiver;
         let args = self.args;

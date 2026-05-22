@@ -334,7 +334,7 @@ impl NativeFunction {
     /// constructors point at `%TypedArray%` per §23.2.6.1.
     /// <https://tc39.es/ecma262/#sec-properties-of-the-typedarray-constructors>
     pub fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
-        let proto_clone = proto.clone();
+        let proto_clone = proto;
         let success = heap.with_payload(self.inner, |body| {
             body.prototype_override = proto;
             true
@@ -347,7 +347,7 @@ impl NativeFunction {
     /// Current `[[Prototype]]` override, if set.
     #[must_use]
     pub fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
-        heap.read_payload(self.inner, |body| body.prototype_override.clone())
+        heap.read_payload(self.inner, |body| body.prototype_override)
     }
 
     /// Build a native function with a static name and an `Fn`
@@ -1172,7 +1172,7 @@ mod tests {
                         reason: format!("expected 1 arg, got {}", args.len()),
                     });
                 }
-                Ok(args[0].clone())
+                Ok(args[0])
             },
         )
         .expect("native");

@@ -202,7 +202,7 @@ pub(crate) fn build_match_result(
         "index",
         Value::Number(NumberValue::from_i32(m.range.start as i32)),
     )?;
-    crate::array::set_named_property(arr, args.gc_heap, "input", input_value.clone())?;
+    crate::array::set_named_property(arr, args.gc_heap, "input", input_value)?;
 
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
@@ -353,7 +353,7 @@ pub(crate) fn build_match_result_native(
         "index",
         Value::Number(NumberValue::from_i32(m.range.start as i32)),
     )?;
-    crate::array::set_named_property(arr, ctx.heap_mut(), "input", input_value.clone())?;
+    crate::array::set_named_property(arr, ctx.heap_mut(), "input", input_value)?;
 
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
@@ -591,7 +591,7 @@ pub fn native_regexp_symbol_match(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     let Value::RegExp(re) = receiver else {
         return Err(crate::NativeError::TypeError {
             name: "RegExp.prototype[@@match]",
@@ -660,7 +660,7 @@ pub fn native_regexp_symbol_search(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     let Value::RegExp(re) = receiver else {
         return Err(crate::NativeError::TypeError {
             name: "RegExp.prototype[@@search]",
@@ -777,8 +777,8 @@ pub(crate) fn get_property_runtime(
     let outcome = interp
         .ordinary_get_value(
             &exec,
-            receiver.clone(),
-            receiver.clone(),
+            *receiver,
+            *receiver,
             &crate::VmPropertyKey::String(key),
             0,
         )
@@ -788,7 +788,7 @@ pub(crate) fn get_property_runtime(
         crate::VmGetOutcome::InvokeGetter { getter } => {
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
             interp
-                .run_callable_sync(&exec, &getter, receiver.clone(), args)
+                .run_callable_sync(&exec, &getter, *receiver, args)
                 .map_err(vm_err_to_native(name))
         }
     }
@@ -812,10 +812,10 @@ fn set_property_runtime(
     interp
         .ordinary_set_data_value(
             &exec,
-            receiver.clone(),
+            *receiver,
             &crate::VmPropertyKey::String(key),
             value,
-            receiver.clone(),
+            *receiver,
             0,
         )
         .map_err(vm_err_to_native(name))?;
@@ -841,7 +841,7 @@ pub(crate) fn coerce_to_jsstring_runtime(
         return Ok(*s);
     }
     let primitive = if crate::abstract_ops::is_primitive(value) {
-        value.clone()
+        *value
     } else {
         let (interp, exec) = ctx.interp_mut_and_context();
         let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
@@ -870,7 +870,7 @@ fn to_length_runtime(
     name: &'static str,
 ) -> Result<u64, crate::NativeError> {
     let primitive = if crate::abstract_ops::is_primitive(value) {
-        value.clone()
+        *value
     } else {
         let (interp, exec) = ctx.interp_mut_and_context();
         let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
@@ -901,7 +901,7 @@ fn to_integer_or_infinity_runtime(
     name: &'static str,
 ) -> Result<f64, crate::NativeError> {
     let primitive = if crate::abstract_ops::is_primitive(value) {
-        value.clone()
+        *value
     } else {
         let (interp, exec) = ctx.interp_mut_and_context();
         let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
@@ -946,7 +946,7 @@ fn regexp_exec_runtime(
         let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         args.push(Value::String(*s));
         let result = interp
-            .run_callable_sync(&exec_ctx, &exec_fn, rx.clone(), args)
+            .run_callable_sync(&exec_ctx, &exec_fn, *rx, args)
             .map_err(vm_err_to_native(name))?;
         if !matches!(result, Value::Null) && !crate::value_kind::is_object_like_value(&result) {
             return Err(crate::NativeError::TypeError {
@@ -985,7 +985,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     let name = "RegExp String Iterator.next";
     let mut ctx = NativeCtx::new_with_call_info_and_context(
         interp,
-        crate::NativeCallInfo::call(matcher.clone()),
+        crate::NativeCallInfo::call(*matcher),
         Some(context.clone()),
     );
     let result =
@@ -1037,7 +1037,7 @@ pub fn native_regexp_symbol_replace(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@replace]";
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     if !crate::value_kind::is_object_like_value(&receiver) {
         return Err(crate::NativeError::TypeError {
             name,
@@ -1087,7 +1087,7 @@ pub fn native_regexp_symbol_replace(
         if matches!(result, Value::Null) {
             break;
         }
-        results.push(result.clone());
+        results.push(result);
         if !global {
             break;
         }
@@ -1142,7 +1142,7 @@ pub fn native_regexp_symbol_replace(
         let named_captures_obj = if matches!(named_captures, Value::Undefined) {
             None
         } else {
-            Some(named_captures.clone())
+            Some(named_captures)
         };
 
         let replacement: Vec<u16> = if functional_replace {
@@ -1157,7 +1157,7 @@ pub fn native_regexp_symbol_replace(
             replacer_args.push(Value::Number(NumberValue::from_f64(position as f64)));
             replacer_args.push(Value::String(s));
             if let Some(nc) = &named_captures_obj {
-                replacer_args.push(nc.clone());
+                replacer_args.push(*nc);
             }
             let exec_ctx =
                 ctx.execution_context()
@@ -1235,9 +1235,9 @@ pub(crate) fn get_symbol_property_runtime(
     let outcome = interp
         .ordinary_get_value(
             &exec,
-            receiver.clone(),
-            receiver.clone(),
-            &crate::VmPropertyKey::Symbol(sym.clone()),
+            *receiver,
+            *receiver,
+            &crate::VmPropertyKey::Symbol(*sym),
             0,
         )
         .map_err(vm_err_to_native(name))?;
@@ -1246,7 +1246,7 @@ pub(crate) fn get_symbol_property_runtime(
         crate::VmGetOutcome::InvokeGetter { getter } => {
             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
             interp
-                .run_callable_sync(&exec, &getter, receiver.clone(), args)
+                .run_callable_sync(&exec, &getter, *receiver, args)
                 .map_err(vm_err_to_native(name))
         }
     }
@@ -1266,7 +1266,7 @@ fn species_constructor_runtime(
 ) -> Result<Value, crate::NativeError> {
     let c = get_property_runtime(ctx, obj, "constructor", name)?;
     if matches!(c, Value::Undefined) {
-        return Ok(default_ctor.clone());
+        return Ok(*default_ctor);
     }
     if !crate::value_kind::is_object_like_value(&c) {
         return Err(crate::NativeError::TypeError {
@@ -1317,7 +1317,7 @@ pub fn native_regexp_symbol_match_all(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@matchAll]";
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     if !crate::value_kind::is_object_like_value(&receiver) {
         return Err(crate::NativeError::TypeError {
             name,
@@ -1353,7 +1353,7 @@ pub fn native_regexp_symbol_match_all(
     };
     let matcher = {
         let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        ctor_args.push(receiver.clone());
+        ctor_args.push(receiver);
         ctor_args.push(Value::String(flags_js));
         let (interp, exec_ctx) = ctx.interp_mut_and_context();
         let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
@@ -1361,7 +1361,7 @@ pub fn native_regexp_symbol_match_all(
             reason: "missing execution context".to_string(),
         })?;
         interp
-            .run_construct_sync(&exec_ctx, &c, c.clone(), ctor_args)
+            .run_construct_sync(&exec_ctx, &c, c, ctor_args)
             .map_err(vm_err_to_native(name))?
     };
 
@@ -1378,7 +1378,7 @@ pub fn native_regexp_symbol_match_all(
 
     let input_root = Value::String(s);
     let iter_state = crate::IteratorState::RegExpString {
-        matcher: matcher.clone(),
+        matcher,
         input: s,
         global,
         full_unicode,
@@ -1410,7 +1410,7 @@ pub fn native_regexp_symbol_split(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@split]";
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     if !crate::value_kind::is_object_like_value(&receiver) {
         return Err(crate::NativeError::TypeError {
             name,
@@ -1463,7 +1463,7 @@ pub fn native_regexp_symbol_split(
     // Step 9 — splitter = ? Construct(C, [rx, newFlags]).
     let splitter = {
         let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        ctor_args.push(receiver.clone());
+        ctor_args.push(receiver);
         ctor_args.push(Value::String(new_flags_js));
         let (interp, exec_ctx) = ctx.interp_mut_and_context();
         let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
@@ -1471,7 +1471,7 @@ pub fn native_regexp_symbol_split(
             reason: "missing execution context".to_string(),
         })?;
         interp
-            .run_construct_sync(&exec_ctx, &c, c.clone(), ctor_args)
+            .run_construct_sync(&exec_ctx, &c, c, ctor_args)
             .map_err(vm_err_to_native(name))?
     };
 
@@ -1480,7 +1480,7 @@ pub fn native_regexp_symbol_split(
         u32::MAX
     } else {
         let primitive = if crate::abstract_ops::is_primitive(&limit_arg) {
-            limit_arg.clone()
+            limit_arg
         } else {
             let (interp, exec) = ctx.interp_mut_and_context();
             let exec = exec.ok_or_else(|| crate::NativeError::TypeError {

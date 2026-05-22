@@ -457,11 +457,11 @@ impl PurePromise {
 
     #[must_use]
     pub(crate) fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
-        heap.read_payload(self.inner, |body| body.prototype_override.clone())
+        heap.read_payload(self.inner, |body| body.prototype_override)
     }
 
     pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
-        let barrier_value = proto.clone();
+        let barrier_value = proto;
         heap.with_payload(self.inner, |body| {
             body.prototype_override = proto;
         });
@@ -585,12 +585,12 @@ impl JsPromise for PurePromise {
     }
 
     fn fulfill(&self, heap: &mut otter_gc::GcHeap, value: Value) -> PromiseSettleJobs {
-        let barrier_value = value.clone();
+        let barrier_value = value;
         let reactions: Vec<PromiseReaction> = heap.with_payload(self.inner, |body| {
             if body.state.is_settled() {
                 return Vec::new();
             }
-            body.state = PromiseState::Fulfilled(value.clone());
+            body.state = PromiseState::Fulfilled(value);
             let taken = std::mem::take(&mut body.fulfill_reactions);
             body.reject_reactions.clear();
             taken
@@ -599,18 +599,18 @@ impl JsPromise for PurePromise {
         PromiseSettleJobs {
             jobs: reactions
                 .into_iter()
-                .filter_map(|r| reaction_to_microtask(heap, r, value.clone()))
+                .filter_map(|r| reaction_to_microtask(heap, r, value))
                 .collect(),
         }
     }
 
     fn reject(&self, heap: &mut otter_gc::GcHeap, reason: Value) -> PromiseSettleJobs {
-        let barrier_reason = reason.clone();
+        let barrier_reason = reason;
         let reactions: Vec<PromiseReaction> = heap.with_payload(self.inner, |body| {
             if body.state.is_settled() {
                 return Vec::new();
             }
-            body.state = PromiseState::Rejected(reason.clone());
+            body.state = PromiseState::Rejected(reason);
             let taken = std::mem::take(&mut body.reject_reactions);
             body.fulfill_reactions.clear();
             taken
@@ -619,7 +619,7 @@ impl JsPromise for PurePromise {
         PromiseSettleJobs {
             jobs: reactions
                 .into_iter()
-                .filter_map(|r| reaction_to_microtask(heap, r, reason.clone()))
+                .filter_map(|r| reaction_to_microtask(heap, r, reason))
                 .collect(),
         }
     }
@@ -643,8 +643,8 @@ impl JsPromise for PurePromise {
         context: Option<ExecutionContext>,
     ) -> PromiseThenOutcome {
         let outcome = self.perform_then_internal(heap, capability, context, |kind| match kind {
-            ReactionKind::Fulfill => PromiseReactionHandler::Call(on_fulfilled.clone()),
-            ReactionKind::Reject => PromiseReactionHandler::Call(on_rejected.clone()),
+            ReactionKind::Fulfill => PromiseReactionHandler::Call(on_fulfilled),
+            ReactionKind::Reject => PromiseReactionHandler::Call(on_rejected),
         });
         self.finish_then_outcome(heap, outcome)
     }
@@ -930,13 +930,13 @@ fn reaction_to_microtask(
                 Some(h) => (
                     h,
                     Some(MicrotaskCapability {
-                        resolve: reaction.capability.resolve.clone(),
-                        reject: reaction.capability.reject.clone(),
+                        resolve: reaction.capability.resolve,
+                        reject: reaction.capability.reject,
                     }),
                 ),
                 None => match reaction.kind {
-                    ReactionKind::Fulfill => (reaction.capability.resolve.clone(), None),
-                    ReactionKind::Reject => (reaction.capability.reject.clone(), None),
+                    ReactionKind::Fulfill => (reaction.capability.resolve, None),
+                    ReactionKind::Reject => (reaction.capability.reject, None),
                 },
             };
             Some(Microtask {

@@ -348,7 +348,7 @@ fn impl_set_symmetric_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, 
             .iter()
             .any(|o| crate::abstract_ops::same_value_zero(o, v, &*args.gc_heap));
         if !in_other {
-            args.set_add_rooted(&mut new_set, v.clone())?;
+            args.set_add_rooted(&mut new_set, *v)?;
         }
     }
     for v in other_values {

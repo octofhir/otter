@@ -238,7 +238,7 @@ fn drive(
                     let (k, v) = &entries[*idx];
                     *idx += 1;
                     if is_serialisable(v) {
-                        next_pair = Some((k.clone(), v.clone()));
+                        next_pair = Some((k.clone(), *v));
                         break;
                     }
                 }

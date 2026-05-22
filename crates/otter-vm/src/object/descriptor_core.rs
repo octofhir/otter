@@ -38,7 +38,7 @@ pub(super) fn ordinary_set_data_property(
     key: &str,
     value: Value,
 ) -> bool {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let dictionary_keys = super::dictionary_keys_for_shape_transition(heap, obj, existing_offset);
     let success = heap.with_payload(obj, |body| {
@@ -79,7 +79,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
     value: Value,
     next_shape: ShapeHandle,
 ) -> bool {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| super::body_offset_of(heap, body, key));
     let success = heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
@@ -114,7 +114,7 @@ pub(super) fn ordinary_set_symbol_data_property(
     key: &JsSymbol,
     value: Value,
 ) -> bool {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let success = heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
             let slot = &mut body.symbol_props[pos].1;
@@ -132,7 +132,7 @@ pub(super) fn ordinary_set_symbol_data_property(
             return false;
         }
         body.symbol_props
-            .push((key.clone(), PropertySlot::data_default(value)));
+            .push((*key, PropertySlot::data_default(value)));
         true
     });
     if success {
@@ -213,32 +213,32 @@ pub(super) fn validate_and_apply_partial(
     let kind = if incoming_is_accessor || (!incoming_is_data && !existing_is_data) {
         // Result is an accessor descriptor.
         let (mut getter, mut setter) = match &existing.body {
-            SlotBody::Accessor { getter, setter } => (getter.clone(), setter.clone()),
+            SlotBody::Accessor { getter, setter } => (*getter, *setter),
             SlotBody::Data { .. } => (None, None),
         };
         if let Some(g) = &incoming.get {
             getter = if matches!(g, Value::Undefined) {
                 None
             } else {
-                Some(g.clone())
+                Some(*g)
             };
         }
         if let Some(s) = &incoming.set {
             setter = if matches!(s, Value::Undefined) {
                 None
             } else {
-                Some(s.clone())
+                Some(*s)
             };
         }
         DescriptorKind::Accessor { getter, setter }
     } else {
         // Data descriptor.
         let mut value = match &existing.body {
-            SlotBody::Data { value } => value.clone(),
+            SlotBody::Data { value } => *value,
             SlotBody::Accessor { .. } => Value::Undefined,
         };
         if let Some(v) = &incoming.value {
-            value = v.clone();
+            value = *v;
         }
         if let Some(w) = incoming.writable {
             writable = w;

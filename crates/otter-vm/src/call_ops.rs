@@ -75,7 +75,7 @@ impl Interpreter {
                 let function_id = c.function_id();
                 let (upvalues, bound_this) = heap.read_payload(c.handle, |body| {
                     let ups: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(&body.upvalues[..]);
-                    (ups, body.bound_this.clone())
+                    (ups, body.bound_this)
                 });
                 let this_value = bound_this.unwrap_or(effective_this);
                 Ok((function_id, upvalues, this_value))
@@ -166,7 +166,7 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let call = native.call_target(&self.gc_heap);
-        let call_info = NativeCallInfo::construct(this_value.clone(), Some(new_target.clone()));
+        let call_info = NativeCallInfo::construct(*this_value, Some(*new_target));
         self.record_runtime_native_call();
         let mut ctx =
             NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -174,7 +174,7 @@ impl Interpreter {
         Ok(if constructor_return_is_object(&result) {
             result
         } else {
-            this_value.clone()
+            *this_value
         })
     }
 
@@ -352,7 +352,7 @@ impl Interpreter {
         argc: usize,
         dst: u16,
     ) -> Result<bool, VmError> {
-        let mut current = callee.clone();
+        let mut current = *callee;
         let effective_this = this_value;
         let mut hops: u32 = 0;
         loop {
@@ -364,7 +364,7 @@ impl Interpreter {
             match current {
                 Value::ClassConstructor(cc) => {
                     hops += 1;
-                    current = cc.ctor(&self.gc_heap).clone();
+                    current = cc.ctor(&self.gc_heap);
                 }
                 Value::BoundFunction(_) => return Ok(false),
                 _ => break,
@@ -441,7 +441,7 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
                 return Ok(false);
             }
-            let call_info = NativeCallInfo::call(this_value.clone());
+            let call_info = NativeCallInfo::call(this_value);
             self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -455,7 +455,7 @@ impl Interpreter {
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
                 return Ok(false);
             }
-            let call_info = NativeCallInfo::call(this_value.clone());
+            let call_info = NativeCallInfo::call(this_value);
             self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -484,7 +484,7 @@ impl Interpreter {
         };
 
         let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
@@ -543,7 +543,7 @@ impl Interpreter {
         // JS-call stack-depth limit so a pathological self-bound
         // chain still surfaces as `StackOverflow` rather than
         // unbounded recursion.
-        let mut current = callee.clone();
+        let mut current = *callee;
         let mut effective_this = this_value;
         let mut effective_args = args;
         let mut hops: u32 = 0;
@@ -567,7 +567,7 @@ impl Interpreter {
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
-                    current = cc.ctor(&self.gc_heap).clone();
+                    current = cc.ctor(&self.gc_heap);
                 }
                 _ => break,
             }
@@ -594,7 +594,7 @@ impl Interpreter {
                 crate::object::call_native(*obj, &self.gc_heap)
         {
             let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::call(effective_this.clone());
+            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -614,7 +614,7 @@ impl Interpreter {
                 write_register(&mut stack[top_idx], dst, result)?;
                 return Ok(());
             }
-            let call_info = NativeCallInfo::call(effective_this.clone());
+            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -638,7 +638,7 @@ impl Interpreter {
             )?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
-                effective_this.clone(),
+                effective_this,
                 Value::Array(argv_array),
             ];
             let result = match self.invoke_proxy_trap(context, &proxy, "apply", trap_args)? {
@@ -687,7 +687,7 @@ impl Interpreter {
             _ => return Err(VmError::InvalidOperand),
         };
         let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
         if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
@@ -698,7 +698,7 @@ impl Interpreter {
         if self.try_dispatch_construct_from_window(
             stack,
             context,
-            callee.clone(),
+            callee,
             operands,
             3,
             argc as usize,
@@ -722,9 +722,9 @@ impl Interpreter {
         dst: u16,
     ) -> Result<bool, VmError> {
         let mut current = callee;
-        let effective_new_target = current.clone();
+        let effective_new_target = current;
         if let Value::ClassConstructor(class) = &current {
-            current = class.ctor(&self.gc_heap).clone();
+            current = class.ctor(&self.gc_heap);
         }
         if !matches!(current, Value::Function { .. } | Value::Closure(_)) {
             return Ok(false);
@@ -772,11 +772,11 @@ impl Interpreter {
         let callee_reg = register_operand(operands.get(1))?;
         let args_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
         if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
-        let args_value = read_register(&stack[top_idx], args_reg)?.clone();
+        let args_value = *read_register(&stack[top_idx], args_reg)?;
         let arr = match args_value {
             Value::Array(a) => a,
             _ => return Err(VmError::TypeMismatch),
@@ -802,15 +802,12 @@ impl Interpreter {
         let callee_reg = register_operand(operands.get(1))?;
         let args_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
         if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
-        let new_target = stack[top_idx]
-            .new_target
-            .clone()
-            .unwrap_or_else(|| callee.clone());
-        let args_value = read_register(&stack[top_idx], args_reg)?.clone();
+        let new_target = stack[top_idx].new_target.unwrap_or(callee);
+        let args_value = *read_register(&stack[top_idx], args_reg)?;
         let arr = match args_value {
             Value::Array(a) => a,
             _ => return Err(VmError::TypeMismatch),
@@ -834,7 +831,7 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
-        self.dispatch_construct_with_new_target(stack, context, callee.clone(), callee, args, dst)
+        self.dispatch_construct_with_new_target(stack, context, callee, callee, args, dst)
     }
 
     fn dispatch_construct_with_new_target(
@@ -864,7 +861,7 @@ impl Interpreter {
             combined.extend(bound_args);
             combined.extend(args);
             if abstract_ops::same_value(&callee, &new_target, &self.gc_heap) {
-                new_target = target.clone();
+                new_target = target;
             }
             callee = target;
             args = combined;
@@ -883,7 +880,7 @@ impl Interpreter {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
                 Value::Array(argv_array),
-                new_target.clone(),
+                new_target,
             ];
             let result = match self.invoke_proxy_trap(context, &proxy, "construct", trap_args)? {
                 Some(v) => {
@@ -904,7 +901,7 @@ impl Interpreter {
                     self.run_construct_sync(
                         context,
                         &proxy.target(&self.gc_heap),
-                        new_target.clone(),
+                        new_target,
                         args,
                     )?
                 }
@@ -995,8 +992,8 @@ impl Interpreter {
             return Ok(());
         }
         let bytecode_callee = match &callee {
-            Value::ClassConstructor(class) => class.ctor(&self.gc_heap).clone(),
-            _ => callee.clone(),
+            Value::ClassConstructor(class) => class.ctor(&self.gc_heap),
+            _ => callee,
         };
         if matches!(bytecode_callee, Value::Function { .. } | Value::Closure(_)) {
             let frame = self.build_construct_bytecode_frame(
@@ -1094,13 +1091,12 @@ impl Interpreter {
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
         let key = VmPropertyKey::String("prototype");
-        let proto =
-            match self.ordinary_get_value(context, callee.clone(), callee.clone(), &key, 0)? {
-                VmGetOutcome::Value(value) => value,
-                VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, callee.clone(), SmallVec::new())?
-                }
-            };
+        let proto = match self.ordinary_get_value(context, *callee, *callee, &key, 0)? {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, *callee, SmallVec::new())?
+            }
+        };
         Ok(constructor_return_is_object(&proto).then_some(proto))
     }
 
@@ -1131,8 +1127,8 @@ impl Interpreter {
         let this_reg = register_operand(operands.get(2))?;
         let args_reg = register_operand(operands.get(3))?;
         let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        let this_value = read_register(&stack[top_idx], this_reg)?.clone();
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let this_value = *read_register(&stack[top_idx], this_reg)?;
         let args_array = match read_register(&stack[top_idx], args_reg)? {
             Value::Array(a) => *a,
             _ => return Err(VmError::TypeMismatch),
@@ -1166,8 +1162,8 @@ impl Interpreter {
             _ => return Err(VmError::InvalidOperand),
         };
         let top_idx = stack.len() - 1;
-        let callee = read_register(&stack[top_idx], callee_reg)?.clone();
-        let this_value = read_register(&stack[top_idx], this_reg)?.clone();
+        let callee = *read_register(&stack[top_idx], callee_reg)?;
+        let this_value = *read_register(&stack[top_idx], this_reg)?;
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
@@ -1176,7 +1172,7 @@ impl Interpreter {
             stack,
             context,
             &callee,
-            this_value.clone(),
+            this_value,
             operands,
             4,
             argc as usize,
@@ -1188,7 +1184,7 @@ impl Interpreter {
             stack,
             context,
             &callee,
-            this_value.clone(),
+            this_value,
             operands,
             4,
             argc as usize,
@@ -1223,7 +1219,7 @@ impl Interpreter {
         this_value: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
-        let mut current = callee.clone();
+        let mut current = *callee;
         let mut effective_this = this_value;
         let mut effective_args = args;
         let mut hops: u32 = 0;
@@ -1247,7 +1243,7 @@ impl Interpreter {
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
-                    current = cc.ctor(&self.gc_heap).clone();
+                    current = cc.ctor(&self.gc_heap);
                 }
                 // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
                 // fall through to target.[[Call]] when the trap is
@@ -1264,21 +1260,13 @@ impl Interpreter {
                     hops += 1;
                     let handler = proxy.handler(&self.gc_heap);
                     let trap_key = VmPropertyKey::String("apply");
-                    let trap_value = match self.ordinary_get_value(
-                        context,
-                        handler.clone(),
-                        handler.clone(),
-                        &trap_key,
-                        0,
-                    )? {
-                        VmGetOutcome::Value(value) => value,
-                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                            context,
-                            &getter,
-                            handler.clone(),
-                            SmallVec::new(),
-                        )?,
-                    };
+                    let trap_value =
+                        match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
+                            VmGetOutcome::Value(value) => value,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                self.run_callable_sync(context, &getter, handler, SmallVec::new())?
+                            }
+                        };
                     match trap_value {
                         trap if self.is_callable_runtime(&trap) => {
                             let argv_array = self.alloc_runtime_rooted_array_from_values(
@@ -1288,7 +1276,7 @@ impl Interpreter {
                             )?;
                             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                                 proxy.target(&self.gc_heap),
-                                effective_this.clone(),
+                                effective_this,
                                 Value::Array(argv_array),
                             ];
                             return self.run_callable_sync(context, &trap, handler, trap_args);
@@ -1311,7 +1299,7 @@ impl Interpreter {
                 crate::object::call_native(*obj, &self.gc_heap)
         {
             let call = native.call_target(&self.gc_heap);
-            let call_info = NativeCallInfo::call(effective_this.clone());
+            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -1329,7 +1317,7 @@ impl Interpreter {
                     effective_args,
                 );
             }
-            let call_info = NativeCallInfo::call(effective_this.clone());
+            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -1402,7 +1390,7 @@ impl Interpreter {
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
         self.record_runtime_construct_call();
-        let mut current = target.clone();
+        let mut current = *target;
         let mut effective_new_target = new_target;
         let mut effective_args = args;
         let mut hops: u32 = 0;
@@ -1421,7 +1409,7 @@ impl Interpreter {
                     combined.extend(bound_args);
                     combined.extend(effective_args);
                     if abstract_ops::same_value(&current, &effective_new_target, &self.gc_heap) {
-                        effective_new_target = next_target.clone();
+                        effective_new_target = next_target;
                     }
                     current = next_target;
                     effective_args = combined;
@@ -1440,21 +1428,13 @@ impl Interpreter {
                     hops += 1;
                     let handler = proxy.handler(&self.gc_heap);
                     let trap_key = VmPropertyKey::String("construct");
-                    let trap_value = match self.ordinary_get_value(
-                        context,
-                        handler.clone(),
-                        handler.clone(),
-                        &trap_key,
-                        0,
-                    )? {
-                        VmGetOutcome::Value(value) => value,
-                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                            context,
-                            &getter,
-                            handler.clone(),
-                            SmallVec::new(),
-                        )?,
-                    };
+                    let trap_value =
+                        match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
+                            VmGetOutcome::Value(value) => value,
+                            VmGetOutcome::InvokeGetter { getter } => {
+                                self.run_callable_sync(context, &getter, handler, SmallVec::new())?
+                            }
+                        };
                     match trap_value {
                         trap if self.is_callable_runtime(&trap) => {
                             let target_value = proxy.target(&self.gc_heap);
@@ -1472,7 +1452,7 @@ impl Interpreter {
                             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                                 target_value,
                                 Value::Array(argv_array),
-                                effective_new_target.clone(),
+                                effective_new_target,
                             ];
                             let result =
                                 self.run_callable_sync(context, &trap, handler, trap_args)?;
@@ -1562,7 +1542,7 @@ impl Interpreter {
             );
         }
         if let Value::ClassConstructor(class) = &current {
-            current = class.ctor(&self.gc_heap).clone();
+            current = class.ctor(&self.gc_heap);
         }
 
         let new_frame = self.build_construct_bytecode_frame(

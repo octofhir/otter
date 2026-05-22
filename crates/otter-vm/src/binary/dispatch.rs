@@ -498,7 +498,7 @@ fn coerce_for_kind(
 ) -> Result<Value, VmError> {
     if kind.is_bigint() {
         match value {
-            Value::BigInt(_) => Ok(value.clone()),
+            Value::BigInt(_) => Ok(*value),
             Value::Boolean(true) => Ok(Value::BigInt(
                 crate::bigint::BigIntValue::from_i32(gc_heap, 1).map_err(oom_to_vm)?,
             )),
@@ -521,7 +521,7 @@ fn coerce_for_kind(
         match value {
             // Spec rejects BigInt → Number array store with TypeError.
             Value::BigInt(_) => Err(VmError::TypeMismatch),
-            _ => Ok(value.clone()),
+            _ => Ok(*value),
         }
     }
 }

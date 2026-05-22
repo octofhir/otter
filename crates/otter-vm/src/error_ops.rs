@@ -35,7 +35,7 @@ impl Interpreter {
         msg_reg: u16,
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
-        let value = read_register(frame, msg_reg)?.clone();
+        let value = *read_register(frame, msg_reg)?;
         let owned_message = self.coerce_error_message(context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(
             stack,
@@ -63,7 +63,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
-        let value = read_register(frame, msg_reg)?.clone();
+        let value = *read_register(frame, msg_reg)?;
         let owned_message = self.coerce_error_message(context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(stack, kind, owned_message, &value)?;
         let frame = &mut stack[top_idx];

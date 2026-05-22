@@ -253,7 +253,7 @@ fn map_entry_root_survives_force_gc() {
     crate::collections::map_set(
         map,
         interp.gc_heap_mut(),
-        key.clone(),
+        key,
         crate::Value::Object(stashed),
     )
     .expect("map set");

@@ -236,7 +236,7 @@ static_assertions::assert_not_impl_any!(crate::runtime_cx::NativeCtx<'static>: S
 /// See `docs/value-cutover-plan.md` for the ordered migration list and
 /// `docs/architecture-refactor-plan-2026-05.md` §Phase 1 for the
 /// design.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Value {
     /// JS `undefined`.
     Undefined,
@@ -520,7 +520,7 @@ impl ClassConstructor {
         Ok(Self {
             inner: heap.alloc_with_roots(
                 ClassConstructorBody {
-                    ctor: ctor.clone(),
+                    ctor,
                     prototype,
                     statics,
                 },
@@ -541,7 +541,7 @@ impl ClassConstructor {
     #[inline]
     #[must_use]
     pub fn ctor(self, heap: &otter_gc::GcHeap) -> Value {
-        heap.read_payload(self.inner, |body| body.ctor.clone())
+        heap.read_payload(self.inner, |body| body.ctor)
     }
 
     /// Read `C.prototype`.
@@ -1063,8 +1063,8 @@ impl BoundFunction {
         Ok(Self {
             inner: heap.alloc_with_roots(
                 BoundFunctionBody {
-                    target: target.clone(),
-                    bound_this: bound_this.clone(),
+                    target,
+                    bound_this,
                     bound_args: bound_args.clone(),
                     builtin_name: metadata.name,
                     builtin_length: metadata.length,
@@ -1110,11 +1110,7 @@ impl BoundFunction {
     #[must_use]
     pub fn parts(&self, heap: &otter_gc::GcHeap) -> (Value, Value, SmallVec<[Value; 4]>) {
         heap.read_payload(self.inner, |body| {
-            (
-                body.target.clone(),
-                body.bound_this.clone(),
-                body.bound_args.clone(),
-            )
+            (body.target, body.bound_this, body.bound_args.clone())
         })
     }
 
@@ -1210,7 +1206,7 @@ pub fn alloc_upvalue(
 /// Read the captured value of `cell` (clones the payload).
 #[must_use]
 pub fn read_upvalue(heap: &otter_gc::GcHeap, cell: UpvalueCell) -> Value {
-    heap.read_payload(cell, |body| body.value.clone())
+    heap.read_payload(cell, |body| body.value)
 }
 
 /// Map an [`otter_gc::OutOfMemory`] from a GC body allocation into the
@@ -1233,7 +1229,7 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
 /// As tasks 77+ add `Gc<…>` arms to [`Value`], the barrier
 /// becomes load-bearing without changes to this call site.
 pub fn store_upvalue(heap: &mut otter_gc::GcHeap, cell: UpvalueCell, value: Value) {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     heap.with_payload(cell, |body| {
         body.value = value;
     });
@@ -2899,7 +2895,7 @@ impl Interpreter {
                     &[&this_value],
                     slice_roots,
                 )?;
-                object::set_symbol_data(obj, &mut self.gc_heap, sym.clone());
+                object::set_symbol_data(obj, &mut self.gc_heap, *sym);
                 obj
             }
             Value::BigInt(value) => {
@@ -2965,7 +2961,7 @@ impl Interpreter {
                     &[&this_value],
                     slice_roots,
                 )?;
-                object::set_symbol_data(obj, &mut self.gc_heap, sym.clone());
+                object::set_symbol_data(obj, &mut self.gc_heap, *sym);
                 obj
             }
             Value::BigInt(value) => {
@@ -3668,7 +3664,7 @@ impl Interpreter {
                 }
                 Value::ClassConstructor(cc) => {
                     hops += 1;
-                    current = cc.ctor(&self.gc_heap).clone();
+                    current = cc.ctor(&self.gc_heap);
                 }
                 _ => break,
             }
@@ -3706,7 +3702,7 @@ impl Interpreter {
                     }
                 };
             }
-            let call_info = NativeCallInfo::call(effective_this.clone());
+            let call_info = NativeCallInfo::call(effective_this);
             self.record_runtime_native_call();
             let mut ctx =
                 NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
@@ -4135,7 +4131,7 @@ impl Interpreter {
                 Op::Await => {
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let src = register_operand(context.exec_operand(instr, 1))?;
-                    let awaited = read_register(&stack[top_idx], src)?.clone();
+                    let awaited = *read_register(&stack[top_idx], src)?;
                     self.do_await(stack, context, dst, awaited)?;
                     if stack.is_empty() {
                         return Ok(Value::Undefined);
@@ -4154,12 +4150,12 @@ impl Interpreter {
                 Op::Yield => {
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let src = register_operand(context.exec_operand(instr, 1))?;
-                    let yielded = read_register(&stack[top_idx], src)?.clone();
+                    let yielded = *read_register(&stack[top_idx], src)?;
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let popped = stack.pop().expect("frame present");
-                    owner.park_after_yield(&mut self.gc_heap, popped, dst, yielded.clone());
+                    owner.park_after_yield(&mut self.gc_heap, popped, dst, yielded);
                     let pending_request = if owner.is_async(&self.gc_heap) {
                         owner.take_pending_request(&mut self.gc_heap)
                     } else {
@@ -4172,7 +4168,7 @@ impl Interpreter {
                     // caller can shape it.
                     if let Some(cap) = pending_request {
                         let record = self.make_runtime_rooted_iter_result(
-                            yielded.clone(),
+                            yielded,
                             false,
                             &[&cap.resolve],
                             &[],
@@ -5145,7 +5141,7 @@ impl Interpreter {
                         .exec_imm32(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    let value = read_register(frame, idx as u16)?.clone();
+                    let value = *read_register(frame, idx as u16)?;
                     write_register(frame, dst, value)?;
                     frame.pc += 1;
                     continue;
@@ -5158,7 +5154,7 @@ impl Interpreter {
                         .exec_imm32(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    let value = read_register(frame, src)?.clone();
+                    let value = *read_register(frame, src)?;
                     write_register(frame, idx as u16, value)?;
                     frame.pc += 1;
                     continue;
@@ -5361,7 +5357,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    let value = read_register(frame, src)?.clone();
+                    let value = *read_register(frame, src)?;
                     let result = abstract_ops::is_array(&value);
                     write_register(frame, dst, Value::Boolean(result))?;
                     frame.pc += 1;
@@ -5876,7 +5872,7 @@ fn bound_function_object_prototype_intercept(
 
 fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {
     match &desc.kind {
-        crate::object::DescriptorKind::Data { value } => value.clone(),
+        crate::object::DescriptorKind::Data { value } => *value,
         crate::object::DescriptorKind::Accessor { .. } => Value::Undefined,
     }
 }
@@ -5954,7 +5950,7 @@ fn to_length(value: &Value, heap: &otter_gc::GcHeap) -> Result<usize, VmError> {
 /// dispatch loop.
 fn require_callable(arg: Option<&Value>) -> Result<Value, VmError> {
     match arg {
-        Some(v) if abstract_ops::is_callable(v) => Ok(v.clone()),
+        Some(v) if abstract_ops::is_callable(v) => Ok(*v),
         _ => Err(VmError::NotCallable),
     }
 }
@@ -5963,9 +5959,9 @@ fn require_callable(arg: Option<&Value>) -> Result<Value, VmError> {
 /// `Array.prototype` callback expects.
 fn build_array_cb_args(value: &Value, index: usize, arr: &Value) -> SmallVec<[Value; 8]> {
     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-    cb_args.push(value.clone());
+    cb_args.push(*value);
     cb_args.push(Value::Number(NumberValue::from_i32(index as i32)));
-    cb_args.push(arr.clone());
+    cb_args.push(*arr);
     cb_args
 }
 
@@ -6352,7 +6348,7 @@ fn step_iterator(
                                 .map_err(|_| VmError::TypeMismatch)?
                         };
                         crate::array::with_elements_mut(pair, gc_heap, |elements| {
-                            elements.push(value.clone());
+                            elements.push(value);
                             elements.push(value);
                         });
                         Value::Array(pair)
@@ -6980,7 +6976,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let target = Value::Function { function_id: 1 };
         let arg = Value::String(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
-        let args = [arg.clone()];
+        let args = [arg];
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let prototype = interp
@@ -7068,7 +7064,7 @@ mod tests {
         let args = [arg];
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&outer.functions[0]);
-        frame.registers[0] = args[0].clone();
+        frame.registers[0] = args[0];
         stack.push(frame);
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -7254,7 +7250,7 @@ mod tests {
         let context = ExecutionContext::from_module(module);
 
         interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = match stack[0].registers[1].clone() {
+        let iter = match stack[0].registers[1] {
             Value::Iterator(iter) => iter,
             _ => panic!("GetIterator should produce an iterator handle"),
         };
@@ -7309,7 +7305,7 @@ mod tests {
         let context = ExecutionContext::from_module(module);
 
         interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = match stack[0].registers[1].clone() {
+        let iter = match stack[0].registers[1] {
             Value::Iterator(iter) => iter,
             _ => panic!("GetIterator should produce an iterator handle"),
         };
@@ -7358,7 +7354,7 @@ mod tests {
         let context = ExecutionContext::from_module(module);
 
         interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = match stack[0].registers[1].clone() {
+        let iter = match stack[0].registers[1] {
             Value::Iterator(iter) => iter,
             _ => panic!("GetIterator should produce an iterator handle"),
         };
@@ -7368,7 +7364,7 @@ mod tests {
                 .iterator_helper_dispatch(&mut stack, &context, &iter, "flatMap", &args, 2)
                 .unwrap()
         );
-        let flat_iter = match stack[0].registers[2].clone() {
+        let flat_iter = match stack[0].registers[2] {
             Value::Iterator(iter) => iter,
             _ => panic!("flatMap should return an iterator"),
         };
@@ -7465,7 +7461,7 @@ mod tests {
         let context = ExecutionContext::from_module(module);
 
         interp.run_get_iterator_regs(&mut stack, 0, 1, 0).unwrap();
-        let iter = match stack[0].registers[1].clone() {
+        let iter = match stack[0].registers[1] {
             Value::Iterator(iter) => iter,
             _ => panic!("GetIterator should produce an iterator handle"),
         };
@@ -7575,7 +7571,7 @@ mod tests {
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
         let result = interp
-            .make_runtime_rooted_iter_result(value.clone(), true, &[], &[])
+            .make_runtime_rooted_iter_result(value, true, &[], &[])
             .unwrap();
 
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -8954,7 +8950,7 @@ mod tests {
     #[test]
     fn native_call_context_receives_method_receiver() {
         fn return_this(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-            Ok(ctx.this_value().clone())
+            Ok(*ctx.this_value())
         }
 
         let module = module_with(vec![], 1);
@@ -8969,14 +8965,7 @@ mod tests {
         let context = ExecutionContext::from_module(module.clone());
 
         interp
-            .invoke(
-                &mut stack,
-                &context,
-                &callee,
-                receiver.clone(),
-                SmallVec::new(),
-                0,
-            )
+            .invoke(&mut stack, &context, &callee, receiver, SmallVec::new(), 0)
             .unwrap();
 
         assert_eq!(stack[0].registers[0], receiver);
@@ -9634,7 +9623,7 @@ mod tests {
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let result = interp
-            .run_construct_sync(&context, &target, target.clone(), SmallVec::new())
+            .run_construct_sync(&context, &target, target, SmallVec::new())
             .unwrap();
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -9695,7 +9684,7 @@ mod tests {
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let result = interp
-            .run_construct_sync(&context, &proxy, proxy.clone(), args)
+            .run_construct_sync(&context, &proxy, proxy, args)
             .unwrap();
         let after = interp.gc_heap_mut().stats().new_allocated_bytes;
 
@@ -9832,7 +9821,7 @@ mod tests {
             let pc = stack[top].pc as usize;
             let instr = &f.code[pc];
             if matches!(instr.op, Op::ReturnValue) {
-                let value = stack[top].registers[0].clone();
+                let value = stack[top].registers[0];
                 stack.pop();
                 let caller = stack.last_mut().unwrap();
                 let dst = caller.return_register.unwrap_or(0) as usize;
@@ -9844,7 +9833,7 @@ mod tests {
                     Operand::Register(r) => r,
                     _ => unreachable!(),
                 };
-                let value = stack[top].this_value.clone();
+                let value = stack[top].this_value;
                 stack[top].registers[dst as usize] = value;
                 stack[top].pc += 1;
                 continue;

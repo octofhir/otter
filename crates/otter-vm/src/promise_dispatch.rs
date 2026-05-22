@@ -200,7 +200,7 @@ impl PromiseSlots {
                 reason: "missing keyed slots".to_string(),
             });
         };
-        let key_root = key.clone();
+        let key_root = key;
         let values_root = self.array_value();
         let keys_root = Value::Array(keys);
         let mut roots = Vec::with_capacity(value_roots.len() + 3);
@@ -258,7 +258,7 @@ impl PromiseSlots {
                     if matches!(slot, Value::Hole) {
                         Value::Undefined
                     } else {
-                        slot.clone()
+                        *slot
                     }
                 })
                 .collect()
@@ -394,7 +394,7 @@ impl PromiseBuilder {
         slice_roots: &[&[Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = ctx.collect_native_roots();
-        let this_value = ctx.this_value().clone();
+        let this_value = *ctx.this_value();
         let new_target = ctx.new_target().cloned();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             crate::runtime_cx::visit_native_roots(
@@ -566,7 +566,7 @@ where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         crate::runtime_cx::visit_native_roots(
@@ -669,7 +669,7 @@ where
 {
     let trace = trace_captures(&captures);
     let roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         crate::runtime_cx::visit_native_roots(
@@ -831,7 +831,7 @@ fn invoke_then_interp(
     on_rejected: Value,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.prototype";
-    let then = get_callable_property(interp, exec, receiver.clone(), "then", NAME)?;
+    let then = get_callable_property(interp, exec, receiver, "then", NAME)?;
     interp
         .run_callable_sync(exec, &then, receiver, smallvec![on_fulfilled, on_rejected])
         .map_err(|err| promise_vm_error(NAME, err))
@@ -888,11 +888,11 @@ fn method_finally_value(
         reason: "missing execution context".to_string(),
     })?;
     if !crate::is_callable_value(&on_finally) {
-        return invoke_then_interp(interp, &exec, receiver, on_finally.clone(), on_finally);
+        return invoke_then_interp(interp, &exec, receiver, on_finally, on_finally);
     }
     let default_ctor = builtin_promise_constructor(interp)?;
     let c = species_constructor_runtime(interp, &exec, &receiver, &default_ctor, NAME)?;
-    let then_finally = make_then_finally(interp, &exec, c.clone(), on_finally.clone())?;
+    let then_finally = make_then_finally(interp, &exec, c, on_finally)?;
     let catch_finally = make_catch_finally(interp, &exec, c, on_finally)?;
     invoke_then_interp(interp, &exec, receiver, then_finally, catch_finally)
 }
@@ -903,7 +903,7 @@ fn make_then_finally(
     constructor: Value,
     on_finally: Value,
 ) -> Result<Value, NativeError> {
-    let captures: SmallVec<[Value; 4]> = smallvec![constructor.clone(), on_finally.clone()];
+    let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
     let trace = trace_captures(&captures);
     let exec_for_call = exec.clone();
     let constructor_root = constructor;
@@ -921,8 +921,8 @@ fn make_then_finally(
         trace,
         &mut external_visit,
         move |ctx, args, captures| {
-            let c = captures[0].clone();
-            let on_finally = captures[1].clone();
+            let c = captures[0];
+            let on_finally = captures[1];
             let value = args.first().cloned().unwrap_or(Value::Undefined);
             let result = {
                 let (interp, _) = ctx.interp_mut_and_context();
@@ -953,7 +953,7 @@ fn make_catch_finally(
     constructor: Value,
     on_finally: Value,
 ) -> Result<Value, NativeError> {
-    let captures: SmallVec<[Value; 4]> = smallvec![constructor.clone(), on_finally.clone()];
+    let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
     let trace = trace_captures(&captures);
     let exec_for_call = exec.clone();
     let constructor_root = constructor;
@@ -971,8 +971,8 @@ fn make_catch_finally(
         trace,
         &mut external_visit,
         move |ctx, args, captures| {
-            let c = captures[0].clone();
-            let on_finally = captures[1].clone();
+            let c = captures[0];
+            let on_finally = captures[1];
             let reason = args.first().cloned().unwrap_or(Value::Undefined);
             let result = {
                 let (interp, _) = ctx.interp_mut_and_context();
@@ -998,7 +998,7 @@ fn make_catch_finally(
 }
 
 fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
-    let captures: SmallVec<[Value; 4]> = smallvec![value.clone()];
+    let captures: SmallVec<[Value; 4]> = smallvec![value];
     let trace = trace_captures(&captures);
     let value_root = value;
     let (interp, _) = ctx.interp_mut_and_context();
@@ -1014,13 +1014,13 @@ fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, Nati
         captures,
         trace,
         &mut external_visit,
-        move |_ctx, _args, captures| Ok(captures[0].clone()),
+        move |_ctx, _args, captures| Ok(captures[0]),
     )
     .map_err(|_| oom_native("Promise.prototype.finally"))
 }
 
 fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeError> {
-    let captures: SmallVec<[Value; 4]> = smallvec![reason.clone()];
+    let captures: SmallVec<[Value; 4]> = smallvec![reason];
     let trace = trace_captures(&captures);
     let reason_root = reason;
     let (interp, _) = ctx.interp_mut_and_context();
@@ -1037,7 +1037,7 @@ fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeE
         trace,
         &mut external_visit,
         move |ctx, _args, captures| {
-            let reason = captures[0].clone();
+            let reason = captures[0];
             // Stash the original Value so the microtask drain can
             // settle the chained promise with identity preserved.
             // NativeError::Thrown alone would render the reason as
@@ -1139,15 +1139,10 @@ fn new_generic_promise_capability(
         )?
     };
     let promise = interp
-        .run_construct_sync(
-            &exec,
-            &constructor,
-            constructor.clone(),
-            smallvec![executor.clone()],
-        )
+        .run_construct_sync(&exec, &constructor, constructor, smallvec![executor])
         .map_err(|err| promise_vm_error("Promise", err))?;
-    let resolve = state.resolve.borrow().clone().unwrap_or(Value::Undefined);
-    let reject = state.reject.borrow().clone().unwrap_or(Value::Undefined);
+    let resolve = (*state.resolve.borrow()).unwrap_or(Value::Undefined);
+    let reject = (*state.reject.borrow()).unwrap_or(Value::Undefined);
     if !crate::is_callable_value(&resolve) {
         return Err(NativeError::TypeError {
             name: "Promise",
@@ -1231,7 +1226,7 @@ fn reject_capability_error(
 ) -> Result<Value, NativeError> {
     let reason = native_error_rejection_value_preserving_throw(interp, err);
     call_capability_reject(interp, cap, reason)?;
-    Ok(cap.promise.clone())
+    Ok(cap.promise)
 }
 
 /// Read an own/inherited property by string key without callability check.
@@ -1246,13 +1241,7 @@ fn get_property_runtime(
 ) -> Result<Value, NativeError> {
     let property_key = crate::VmPropertyKey::String(key);
     match interp
-        .ordinary_get_value(
-            context,
-            receiver.clone(),
-            receiver.clone(),
-            &property_key,
-            0,
-        )
+        .ordinary_get_value(context, receiver, receiver, &property_key, 0)
         .map_err(|err| promise_vm_error(name, err))?
     {
         crate::VmGetOutcome::Value(value) => Ok(value),
@@ -1270,15 +1259,9 @@ fn get_symbol_property_runtime(
     sym: &crate::symbol::JsSymbol,
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let property_key = crate::VmPropertyKey::Symbol(sym.clone());
+    let property_key = crate::VmPropertyKey::Symbol(*sym);
     match interp
-        .ordinary_get_value(
-            context,
-            receiver.clone(),
-            receiver.clone(),
-            &property_key,
-            0,
-        )
+        .ordinary_get_value(context, receiver, receiver, &property_key, 0)
         .map_err(|err| promise_vm_error(name, err))?
     {
         crate::VmGetOutcome::Value(value) => Ok(value),
@@ -1304,9 +1287,9 @@ fn species_constructor_runtime(
     default_ctor: &Value,
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let c = get_property_runtime(interp, context, obj.clone(), "constructor", name)?;
+    let c = get_property_runtime(interp, context, *obj, "constructor", name)?;
     if matches!(c, Value::Undefined) {
-        return Ok(default_ctor.clone());
+        return Ok(*default_ctor);
     }
     if !is_object_like(&c) {
         return Err(NativeError::TypeError {
@@ -1317,7 +1300,7 @@ fn species_constructor_runtime(
     let species_sym = interp
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Species);
-    let s = get_symbol_property_runtime(interp, context, c.clone(), &species_sym, name)?;
+    let s = get_symbol_property_runtime(interp, context, c, &species_sym, name)?;
     if matches!(s, Value::Undefined | Value::Null) {
         return Ok(c);
     }
@@ -1365,18 +1348,12 @@ fn get_callable_property(
 ) -> Result<Value, NativeError> {
     let property_key = crate::VmPropertyKey::String(key);
     let value = match interp
-        .ordinary_get_value(
-            context,
-            receiver.clone(),
-            receiver.clone(),
-            &property_key,
-            0,
-        )
+        .ordinary_get_value(context, receiver, receiver, &property_key, 0)
         .map_err(|err| promise_vm_error(name, err))?
     {
         crate::VmGetOutcome::Value(value) => value,
         crate::VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(context, &getter, receiver.clone(), SmallVec::new())
+            .run_callable_sync(context, &getter, receiver, SmallVec::new())
             .map_err(|err| promise_vm_error(name, err))?,
     };
     if !interp.is_callable_runtime(&value) {
@@ -1393,13 +1370,7 @@ fn get_promise_resolve(
     context: &ExecutionContext,
     constructor: &Value,
 ) -> Result<Value, NativeError> {
-    get_callable_property(
-        interp,
-        context,
-        constructor.clone(),
-        "resolve",
-        "Promise.resolve",
-    )
+    get_callable_property(interp, context, *constructor, "resolve", "Promise.resolve")
 }
 
 fn call_promise_resolve(
@@ -1410,7 +1381,7 @@ fn call_promise_resolve(
     value: Value,
 ) -> Result<Value, NativeError> {
     interp
-        .run_callable_sync(context, resolve_fn, constructor.clone(), smallvec![value])
+        .run_callable_sync(context, resolve_fn, *constructor, smallvec![value])
         .map_err(|err| promise_vm_error("Promise.resolve", err))
 }
 
@@ -1421,13 +1392,7 @@ fn attach_then_value(
     on_fulfilled: Value,
     on_rejected: Value,
 ) -> Result<(), NativeError> {
-    let then = get_callable_property(
-        interp,
-        context,
-        promise.clone(),
-        "then",
-        "Promise combinator",
-    )?;
+    let then = get_callable_property(interp, context, promise, "then", "Promise combinator")?;
     interp
         .run_callable_sync(
             context,
@@ -1448,13 +1413,8 @@ fn static_resolve(
     let value = args.first().cloned().unwrap_or(Value::Undefined);
     if let Value::Promise(p) = &value {
         if let Some(exec) = context.as_ref() {
-            let value_constructor = get_property_runtime(
-                interp,
-                exec,
-                value.clone(),
-                "constructor",
-                "Promise.resolve",
-            )?;
+            let value_constructor =
+                get_property_runtime(interp, exec, value, "constructor", "Promise.resolve")?;
             if crate::abstract_ops::same_value(&value_constructor, &constructor, interp.gc_heap()) {
                 return Ok(Value::Promise(*p));
             }
@@ -1582,8 +1542,7 @@ fn static_all_keyed_generic(
     variant: KeyedVariant,
 ) -> Result<Value, NativeError> {
     let name = variant.name();
-    let cap =
-        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
+    let cap = new_generic_promise_capability(interp, context.clone(), constructor, &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name,
         reason: "missing execution context".to_string(),
@@ -1623,15 +1582,15 @@ fn static_all_keyed_generic(
         )?;
         let slots_root = slots.array_value();
         let keys_root = slots.keys_value().unwrap_or(Value::Undefined);
-        interp.push_iteration_anchor(slots_root.clone());
-        interp.push_iteration_anchor(keys_root.clone());
+        interp.push_iteration_anchor(slots_root);
+        interp.push_iteration_anchor(keys_root);
         for key in all_keys {
             let Some(vm_key) = vm_property_key_from_value(&key, interp.gc_heap()) else {
                 continue;
             };
             let desc = match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 &exec,
-                promises.clone(),
+                promises,
                 &vm_key,
                 0,
                 &[
@@ -1655,13 +1614,13 @@ fn static_all_keyed_generic(
             if !desc.as_ref().is_some_and(|desc| desc.enumerable()) {
                 continue;
             }
-            let next_value = match keyed_get(interp, &exec, promises.clone(), &vm_key, name) {
+            let next_value = match keyed_get(interp, &exec, promises, &vm_key, name) {
                 Ok(value) => value,
                 Err(err) => return reject_capability_error(interp, &cap, err),
             };
             let i = slots.reserve_keyed_slot(
                 interp,
-                key.clone(),
+                key,
                 &[
                     &cap.promise,
                     &cap.resolve,
@@ -1676,7 +1635,7 @@ fn static_all_keyed_generic(
                 ],
                 &[args],
             )?;
-            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let value_anchor_base = interp.push_iteration_anchor(next_value) - 1;
             let entry_promise_result =
                 call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
             interp.pop_iteration_anchors_to(value_anchor_base);
@@ -1684,7 +1643,7 @@ fn static_all_keyed_generic(
                 Ok(value) => value,
                 Err(err) => return reject_capability_error(interp, &cap, err),
             };
-            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise) - 1;
             let on_fulfill = keyed_element_function(
                 interp,
                 slots.clone(),
@@ -1706,7 +1665,7 @@ fn static_all_keyed_generic(
                 &[args],
             )?;
             let on_reject = match variant {
-                KeyedVariant::All => cap.reject.clone(),
+                KeyedVariant::All => cap.reject,
                 KeyedVariant::AllSettled => keyed_element_function(
                     interp,
                     slots.clone(),
@@ -1753,7 +1712,7 @@ fn static_all_keyed_generic(
                 &[args],
             )?;
         }
-        Ok(cap.promise.clone())
+        Ok(cap.promise)
     })()
 }
 
@@ -1763,7 +1722,7 @@ fn vm_property_key_from_value(
 ) -> Option<crate::VmPropertyKey<'static>> {
     match key {
         Value::String(s) => Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Some(crate::VmPropertyKey::Symbol(sym.clone())),
+        Value::Symbol(sym) => Some(crate::VmPropertyKey::Symbol(*sym)),
         _ => None,
     }
 }
@@ -1776,7 +1735,7 @@ fn keyed_get(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     match interp
-        .ordinary_get_value(context, receiver.clone(), receiver.clone(), key, 0)
+        .ordinary_get_value(context, receiver, receiver, key, 0)
         .map_err(|err| promise_vm_error(name, err))?
     {
         crate::VmGetOutcome::Value(value) => Ok(value),
@@ -1811,7 +1770,7 @@ fn keyed_element_function(
         interp,
         "",
         1,
-        smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+        smallvec![cap.promise, cap.resolve, cap.reject],
         trace_slots,
         value_roots,
         slice_roots,
@@ -1898,7 +1857,7 @@ fn define_keyed_result_properties(
     name: &'static str,
 ) -> Result<(), NativeError> {
     for (key, value) in keys.iter().zip(values.iter()) {
-        let desc = crate::object::PropertyDescriptor::data(value.clone(), true, true, true);
+        let desc = crate::object::PropertyDescriptor::data(*value, true, true, true);
         let ok = match key {
             Value::String(s) => {
                 let key = s.to_lossy_string(heap);
@@ -1923,8 +1882,7 @@ fn static_all_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let cap =
-        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
+    let cap = new_generic_promise_capability(interp, context.clone(), constructor, &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.all",
         reason: "missing execution context".to_string(),
@@ -1940,8 +1898,8 @@ fn static_all_generic(
             return reject_capability_error(interp, &cap, promise_vm_error("Promise.all", err));
         }
     };
-    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
-    interp.push_iteration_anchor(next_method.clone());
+    let anchor_base = interp.push_iteration_anchor(iterator) - 1;
+    interp.push_iteration_anchor(next_method);
     let outcome = (|| -> Result<Value, NativeError> {
         let slots = PromiseSlots::new(
             interp,
@@ -1958,7 +1916,7 @@ fn static_all_generic(
             &[args],
         )?;
         let slots_root = slots.array_value();
-        interp.push_iteration_anchor(slots_root.clone());
+        interp.push_iteration_anchor(slots_root);
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
                 Ok(Some(value)) => value,
@@ -1987,7 +1945,7 @@ fn static_all_generic(
                 ],
                 &[args],
             )?;
-            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let value_anchor_base = interp.push_iteration_anchor(next_value) - 1;
             let entry_promise_result =
                 call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
             interp.pop_iteration_anchors_to(value_anchor_base);
@@ -1998,7 +1956,7 @@ fn static_all_generic(
                     return reject_capability_error(interp, &cap, err);
                 }
             };
-            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise) - 1;
             let cap_for_fulfill = cap.clone();
             let slots_for_trace = slots.clone();
             let trace_slots = Rc::new(move |visitor: &mut SlotVisitor<'_>| {
@@ -2013,7 +1971,7 @@ fn static_all_generic(
                 interp,
                 "",
                 1,
-                smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                smallvec![cap.promise, cap.resolve, cap.reject],
                 trace_slots,
                 &[
                     &cap.promise,
@@ -2045,7 +2003,7 @@ fn static_all_generic(
                 },
             )?;
             let attach_result =
-                attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject.clone());
+                attach_then_value(interp, &exec, entry_promise, on_fulfill, cap.reject);
             interp.pop_iteration_anchors_to(entry_anchor_base);
             if let Err(err) = attach_result {
                 let _ = interp.iterator_close_sync(&exec, &iterator);
@@ -2075,7 +2033,7 @@ fn static_all_generic(
                 return reject_capability_error(interp, &cap, err);
             }
         }
-        Ok(cap.promise.clone())
+        Ok(cap.promise)
     })();
     interp.pop_iteration_anchors_to(anchor_base);
     outcome
@@ -2087,8 +2045,7 @@ fn static_race_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let cap =
-        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
+    let cap = new_generic_promise_capability(interp, context.clone(), constructor, &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.race",
         reason: "missing execution context".to_string(),
@@ -2104,8 +2061,8 @@ fn static_race_generic(
             return reject_capability_error(interp, &cap, promise_vm_error("Promise.race", err));
         }
     };
-    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
-    interp.push_iteration_anchor(next_method.clone());
+    let anchor_base = interp.push_iteration_anchor(iterator) - 1;
+    interp.push_iteration_anchor(next_method);
     let outcome = (|| -> Result<Value, NativeError> {
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
@@ -2119,7 +2076,7 @@ fn static_race_generic(
                     );
                 }
             };
-            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let value_anchor_base = interp.push_iteration_anchor(next_value) - 1;
             let entry_promise_result =
                 call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
             interp.pop_iteration_anchors_to(value_anchor_base);
@@ -2130,21 +2087,16 @@ fn static_race_generic(
                     return reject_capability_error(interp, &cap, err);
                 }
             };
-            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
-            let attach_result = attach_then_value(
-                interp,
-                &exec,
-                entry_promise,
-                cap.resolve.clone(),
-                cap.reject.clone(),
-            );
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise) - 1;
+            let attach_result =
+                attach_then_value(interp, &exec, entry_promise, cap.resolve, cap.reject);
             interp.pop_iteration_anchors_to(entry_anchor_base);
             if let Err(err) = attach_result {
                 let _ = interp.iterator_close_sync(&exec, &iterator);
                 return reject_capability_error(interp, &cap, err);
             }
         }
-        Ok(cap.promise.clone())
+        Ok(cap.promise)
     })();
     interp.pop_iteration_anchors_to(anchor_base);
     outcome
@@ -2156,8 +2108,7 @@ fn static_all_settled_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let cap =
-        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
+    let cap = new_generic_promise_capability(interp, context.clone(), constructor, &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.allSettled",
         reason: "missing execution context".to_string(),
@@ -2177,8 +2128,8 @@ fn static_all_settled_generic(
             );
         }
     };
-    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
-    interp.push_iteration_anchor(next_method.clone());
+    let anchor_base = interp.push_iteration_anchor(iterator) - 1;
+    interp.push_iteration_anchor(next_method);
     let _heap = interp.gc_heap_mut();
     let outcome = (|| -> Result<Value, NativeError> {
         let slots = PromiseSlots::new(
@@ -2196,7 +2147,7 @@ fn static_all_settled_generic(
             &[args],
         )?;
         let slots_root = slots.array_value();
-        interp.push_iteration_anchor(slots_root.clone());
+        interp.push_iteration_anchor(slots_root);
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
                 Ok(Some(value)) => value,
@@ -2225,7 +2176,7 @@ fn static_all_settled_generic(
                 ],
                 &[args],
             )?;
-            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let value_anchor_base = interp.push_iteration_anchor(next_value) - 1;
             let entry_promise_result =
                 call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
             interp.pop_iteration_anchors_to(value_anchor_base);
@@ -2236,13 +2187,13 @@ fn static_all_settled_generic(
                     return reject_capability_error(interp, &cap, err);
                 }
             };
-            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise) - 1;
             let on_fulfill = {
                 let slots = slots.clone();
                 let cap = cap.clone();
-                let promise_root = cap.promise.clone();
-                let resolve_root = cap.resolve.clone();
-                let reject_root = cap.reject.clone();
+                let promise_root = cap.promise;
+                let resolve_root = cap.resolve;
+                let reject_root = cap.reject;
                 let trace_slots = {
                     let slots = slots.clone();
                     let cap = cap.clone();
@@ -2257,7 +2208,7 @@ fn static_all_settled_generic(
                     interp,
                     "",
                     1,
-                    smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                    smallvec![cap.promise, cap.resolve, cap.reject],
                     trace_slots,
                     &[
                         &promise_root,
@@ -2289,9 +2240,9 @@ fn static_all_settled_generic(
             let on_reject = {
                 let slots = slots.clone();
                 let cap = cap.clone();
-                let promise_root = cap.promise.clone();
-                let resolve_root = cap.resolve.clone();
-                let reject_root = cap.reject.clone();
+                let promise_root = cap.promise;
+                let resolve_root = cap.resolve;
+                let reject_root = cap.reject;
                 let trace_slots = {
                     let slots = slots.clone();
                     let cap = cap.clone();
@@ -2306,7 +2257,7 @@ fn static_all_settled_generic(
                     interp,
                     "",
                     1,
-                    smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                    smallvec![cap.promise, cap.resolve, cap.reject],
                     trace_slots,
                     &[
                         &promise_root,
@@ -2367,7 +2318,7 @@ fn static_all_settled_generic(
                 return reject_capability_error(interp, &cap, err);
             }
         }
-        Ok(cap.promise.clone())
+        Ok(cap.promise)
     })();
     interp.pop_iteration_anchors_to(anchor_base);
     outcome
@@ -2522,8 +2473,7 @@ fn static_any_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let cap =
-        new_generic_promise_capability(interp, context.clone(), constructor.clone(), &[], &[args])?;
+    let cap = new_generic_promise_capability(interp, context.clone(), constructor, &[], &[args])?;
     let exec = context.clone().ok_or_else(|| NativeError::TypeError {
         name: "Promise.any",
         reason: "missing execution context".to_string(),
@@ -2539,8 +2489,8 @@ fn static_any_generic(
             return reject_capability_error(interp, &cap, promise_vm_error("Promise.any", err));
         }
     };
-    let anchor_base = interp.push_iteration_anchor(iterator.clone()) - 1;
-    interp.push_iteration_anchor(next_method.clone());
+    let anchor_base = interp.push_iteration_anchor(iterator) - 1;
+    interp.push_iteration_anchor(next_method);
     let _heap = interp.gc_heap_mut();
     let registry = interp.error_classes_clone();
     let outcome = (|| -> Result<Value, NativeError> {
@@ -2559,7 +2509,7 @@ fn static_any_generic(
             &[args],
         )?;
         let errors_root = errors.array_value();
-        interp.push_iteration_anchor(errors_root.clone());
+        interp.push_iteration_anchor(errors_root);
         loop {
             let next_value = match interp.iterator_step_sync(&exec, &iterator, &next_method) {
                 Ok(Some(value)) => value,
@@ -2588,7 +2538,7 @@ fn static_any_generic(
                 ],
                 &[args],
             )?;
-            let value_anchor_base = interp.push_iteration_anchor(next_value.clone()) - 1;
+            let value_anchor_base = interp.push_iteration_anchor(next_value) - 1;
             let entry_promise_result =
                 call_promise_resolve(interp, &exec, &promise_resolve, &constructor, next_value);
             interp.pop_iteration_anchors_to(value_anchor_base);
@@ -2599,14 +2549,14 @@ fn static_any_generic(
                     return reject_capability_error(interp, &cap, err);
                 }
             };
-            let entry_anchor_base = interp.push_iteration_anchor(entry_promise.clone()) - 1;
+            let entry_anchor_base = interp.push_iteration_anchor(entry_promise) - 1;
             let on_reject = {
                 let errors = errors.clone();
                 let registry = registry.clone();
                 let cap = cap.clone();
-                let promise_root = cap.promise.clone();
-                let resolve_root = cap.resolve.clone();
-                let reject_root = cap.reject.clone();
+                let promise_root = cap.promise;
+                let resolve_root = cap.resolve;
+                let reject_root = cap.reject;
                 let trace_errors = {
                     let errors = errors.clone();
                     let cap = cap.clone();
@@ -2621,7 +2571,7 @@ fn static_any_generic(
                     interp,
                     "",
                     1,
-                    smallvec![cap.promise.clone(), cap.resolve.clone(), cap.reject.clone()],
+                    smallvec![cap.promise, cap.resolve, cap.reject],
                     trace_errors,
                     &[
                         &promise_root,
@@ -2647,7 +2597,7 @@ fn static_any_generic(
                 )?
             };
             let attach_result =
-                attach_then_value(interp, &exec, entry_promise, cap.resolve.clone(), on_reject);
+                attach_then_value(interp, &exec, entry_promise, cap.resolve, on_reject);
             interp.pop_iteration_anchors_to(entry_anchor_base);
             if let Err(err) = attach_result {
                 let _ = interp.iterator_close_sync(&exec, &iterator);
@@ -2659,7 +2609,7 @@ fn static_any_generic(
             let agg = make_aggregate_error_runtime_rooted(interp, &registry, collected)?;
             call_capability_reject(interp, &cap, agg)?;
         }
-        Ok(cap.promise.clone())
+        Ok(cap.promise)
     })();
     interp.pop_iteration_anchors_to(anchor_base);
     outcome
@@ -2691,7 +2641,7 @@ fn static_with_resolvers(
         cap.reject.trace_value_slots(visitor);
     };
     interp
-        .set_property_with_extra_roots(obj, "promise", cap.promise.clone(), &mut cap_roots)
+        .set_property_with_extra_roots(obj, "promise", cap.promise, &mut cap_roots)
         .map_err(|err| NativeError::TypeError {
             name: "Promise.withResolvers",
             reason: err.to_string(),
@@ -2702,7 +2652,7 @@ fn static_with_resolvers(
         cap.reject.trace_value_slots(visitor);
     };
     interp
-        .set_property_with_extra_roots(obj, "resolve", cap.resolve.clone(), &mut cap_roots)
+        .set_property_with_extra_roots(obj, "resolve", cap.resolve, &mut cap_roots)
         .map_err(|err| NativeError::TypeError {
             name: "Promise.withResolvers",
             reason: err.to_string(),
@@ -2713,7 +2663,7 @@ fn static_with_resolvers(
         cap.reject.trace_value_slots(visitor);
     };
     interp
-        .set_property_with_extra_roots(obj, "reject", cap.reject.clone(), &mut cap_roots)
+        .set_property_with_extra_roots(obj, "reject", cap.reject, &mut cap_roots)
         .map_err(|err| NativeError::TypeError {
             name: "Promise.withResolvers",
             reason: err.to_string(),
@@ -2739,7 +2689,7 @@ fn static_with_resolvers_generic(
         cap.reject.trace_value_slots(visitor);
     };
     interp
-        .set_property_with_extra_roots(obj, "promise", cap.promise.clone(), &mut cap_roots)
+        .set_property_with_extra_roots(obj, "promise", cap.promise, &mut cap_roots)
         .map_err(|err| NativeError::TypeError {
             name: "Promise.withResolvers",
             reason: err.to_string(),
@@ -2750,7 +2700,7 @@ fn static_with_resolvers_generic(
         cap.reject.trace_value_slots(visitor);
     };
     interp
-        .set_property_with_extra_roots(obj, "resolve", cap.resolve.clone(), &mut cap_roots)
+        .set_property_with_extra_roots(obj, "resolve", cap.resolve, &mut cap_roots)
         .map_err(|err| NativeError::TypeError {
             name: "Promise.withResolvers",
             reason: err.to_string(),
@@ -2761,7 +2711,7 @@ fn static_with_resolvers_generic(
         cap.reject.trace_value_slots(visitor);
     };
     interp
-        .set_property_with_extra_roots(obj, "reject", cap.reject.clone(), &mut cap_roots)
+        .set_property_with_extra_roots(obj, "reject", cap.reject, &mut cap_roots)
         .map_err(|err| NativeError::TypeError {
             name: "Promise.withResolvers",
             reason: err.to_string(),
@@ -2798,11 +2748,11 @@ fn method_then(
     let c = species_constructor_runtime(interp, &exec, &promise_root, &default_ctor, NAME)?;
 
     let on_fulfilled = match args.first() {
-        Some(v) if crate::is_callable_value(v) => Some(v.clone()),
+        Some(v) if crate::is_callable_value(v) => Some(*v),
         _ => None,
     };
     let on_rejected = match args.get(1) {
-        Some(v) if crate::is_callable_value(v) => Some(v.clone()),
+        Some(v) if crate::is_callable_value(v) => Some(*v),
         _ => None,
     };
 
@@ -2818,7 +2768,7 @@ fn method_then(
             .capability_runtime_rooted(interp, &roots, &[])
             .map_err(|_| oom_native(NAME))?
     } else {
-        new_generic_promise_capability(interp, context.clone(), c.clone(), &roots, &[])?
+        new_generic_promise_capability(interp, context.clone(), c, &roots, &[])?
     };
 
     let outcome = promise.perform_then_with_context(
@@ -2841,7 +2791,7 @@ fn method_catch(
     args: &[Value],
 ) -> Value {
     let on_rejected = match args.first() {
-        Some(v) if crate::is_callable_value(v) => Some(v.clone()),
+        Some(v) if crate::is_callable_value(v) => Some(*v),
         _ => None,
     };
     perform_then_with_handlers(interp, context, promise, None, on_rejected)
@@ -3025,7 +2975,7 @@ fn make_resolve_adoption_handlers_native_rooted(
     let on_fulfill = native_value_with_captures_native_rooted(
         ctx,
         "Promise resolve adopt fulfill",
-        smallvec![resolver_value.clone()],
+        smallvec![resolver_value],
         &fulfill_roots,
         slice_roots,
         move |ctx, args, _captures| {
@@ -3046,7 +2996,7 @@ fn make_resolve_adoption_handlers_native_rooted(
     let on_reject = native_value_with_captures_native_rooted(
         ctx,
         "Promise resolve adopt reject",
-        smallvec![resolver_reject_value.clone()],
+        smallvec![resolver_reject_value],
         &reject_roots,
         slice_roots,
         move |ctx, args, _captures| {
@@ -3249,7 +3199,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
         let executor = Value::Number(NumberValue::from_i32(17));
-        let args = vec![executor.clone()];
+        let args = vec![executor];
 
         let (handle, resolve, reject) = {
             let mut ctx = NativeCtx::new_with_call_info(

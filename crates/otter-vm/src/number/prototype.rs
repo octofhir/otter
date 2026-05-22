@@ -283,7 +283,7 @@ fn native_number_method(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     // §21.1.3.{3,4,5} — `toFixed` / `toExponential` / `toPrecision`
     // route their fractional-digits / precision argument through
     // `ToIntegerOrInfinity`, which itself starts with `ToNumber`.
@@ -312,7 +312,7 @@ fn native_number_method(
                         | Value::RegExp(_)
                 ) {
                     let Some(exec) = &exec else {
-                        out.push(arg.clone());
+                        out.push(*arg);
                         continue;
                     };
                     let interp = ctx.interp_mut();
@@ -336,7 +336,7 @@ fn native_number_method(
                         }
                     }
                 } else {
-                    out.push(arg.clone());
+                    out.push(*arg);
                 }
             }
             out

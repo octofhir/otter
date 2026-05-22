@@ -158,14 +158,14 @@ impl Interpreter {
             let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
             match self.ordinary_get_value(
                 context,
-                items.clone(),
-                items.clone(),
+                items,
+                items,
                 &VmPropertyKey::Symbol(iterator_sym),
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                    self.run_callable_sync(context, &getter, items, SmallVec::new())?
                 }
             }
         };
@@ -179,30 +179,24 @@ impl Interpreter {
             }
             let length_value = match self.ordinary_get_value(
                 context,
-                items.clone(),
-                items.clone(),
+                items,
+                items,
                 &VmPropertyKey::String("length"),
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
-                    self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                    self.run_callable_sync(context, &getter, items, SmallVec::new())?
                 }
             };
             let len = to_length(&length_value, &self.gc_heap)?;
             let mut out = Vec::with_capacity(len);
             for index in 0..len {
                 let key = VmPropertyKey::OwnedString(index.to_string());
-                let value = match self.ordinary_get_value(
-                    context,
-                    items.clone(),
-                    items.clone(),
-                    &key,
-                    0,
-                )? {
+                let value = match self.ordinary_get_value(context, items, items, &key, 0)? {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
-                        self.run_callable_sync(context, &getter, items.clone(), SmallVec::new())?
+                        self.run_callable_sync(context, &getter, items, SmallVec::new())?
                     }
                 };
                 out.push(value);
@@ -226,8 +220,7 @@ impl Interpreter {
                 let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                 cb_args.push(value);
                 cb_args.push(Value::Number(number::NumberValue::from_i32(index as i32)));
-                let mapped_value =
-                    self.run_callable_sync(context, &map_fn, this_arg.clone(), cb_args)?;
+                let mapped_value = self.run_callable_sync(context, &map_fn, this_arg, cb_args)?;
                 mapped.push(mapped_value);
             } else {
                 mapped.push(value);
@@ -252,7 +245,7 @@ fn collect_array_args(
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
     for i in 0..argc {
         let r = register_operand(operands.get(2 + i))?;
-        args.push(read_register(frame, r)?.clone());
+        args.push(*read_register(frame, r)?);
     }
     Ok(args)
 }

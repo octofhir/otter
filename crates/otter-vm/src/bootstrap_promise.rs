@@ -65,7 +65,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     // §27.2.5 — `then` / `catch` / `finally` prototype methods.
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         builder.method(
             "then",
             2,
@@ -105,7 +105,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     }
 
     // §27.2.4 — static methods.
-    let ctor_roots = vec![global_root.clone(), Value::Object(prototype)];
+    let ctor_roots = vec![global_root, Value::Object(prototype)];
     define_ctor_method(
         heap,
         ctor,
@@ -243,7 +243,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-get-promise-@@species>
 fn promise_species_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    Ok(ctx.this_value().clone())
+    Ok(*ctx.this_value())
 }
 
 // ---------------------------------------------------------------
@@ -287,7 +287,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         handle.set_prototype_override(ctx.heap_mut(), Some(proto));
     }
     let promise_value = Value::Promise(handle);
-    let invoke_args: SmallVec<[Value; 8]> = smallvec::smallvec![resolve, reject.clone()];
+    let invoke_args: SmallVec<[Value; 8]> = smallvec::smallvec![resolve, reject];
     let invoke_result =
         ctx.interp_mut()
             .run_callable_sync(&context, &executor, Value::Undefined, invoke_args);
@@ -366,7 +366,7 @@ fn invoke_static(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
-    let constructor = Some(ctx.this_value().clone());
+    let constructor = Some(*ctx.this_value());
     let (interp, _ignored_ctx) = ctx.interp_mut_and_context();
     promise_dispatch::statics_call(interp, context, constructor, method, args)
 }
@@ -401,13 +401,13 @@ fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.prototype.catch>
 fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let on_rejected = args.first().cloned().unwrap_or(Value::Undefined);
     promise_dispatch::invoke_then(ctx, this_value, Value::Undefined, on_rejected)
 }
 
 fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let on_finally = args.first().cloned().unwrap_or(Value::Undefined);
     promise_dispatch::method_finally_invoke(ctx, this_value, on_finally)
 }

@@ -28,7 +28,7 @@ use crate::{
 
 impl Interpreter {
     pub(crate) fn run_load_this_reg(&self, frame: &mut Frame, dst: u16) -> Result<(), VmError> {
-        let value = frame.this_value.clone();
+        let value = frame.this_value;
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())
@@ -39,7 +39,7 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
     ) -> Result<(), VmError> {
-        let value = frame.new_target.clone().unwrap_or(Value::Undefined);
+        let value = frame.new_target.unwrap_or(Value::Undefined);
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())
@@ -73,7 +73,7 @@ impl Interpreter {
         if idx < 0 {
             return Err(VmError::InvalidOperand);
         }
-        let value = read_register(frame, src)?.clone();
+        let value = *read_register(frame, src)?;
         let cell = *frame
             .upvalues
             .get(idx as usize)

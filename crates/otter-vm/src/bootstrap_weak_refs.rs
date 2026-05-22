@@ -49,7 +49,7 @@ fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     link_object_prototype(heap, prototype, global);
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         builder.method(
             "deref",
             0,
@@ -107,7 +107,7 @@ fn install_finalization_registry(
     link_object_prototype(heap, prototype, global);
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         builder.method(
             "register",
             2,

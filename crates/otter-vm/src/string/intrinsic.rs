@@ -151,7 +151,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         let mut builder = ObjectBuilder::from_object_with_value_roots(
             heap,
             constructor,
-            vec![global_root.clone(), prototype_root.clone()],
+            vec![global_root, prototype_root],
         );
         for spec in super::statics::STRING_STATIC_METHODS {
             builder.method_from_spec(spec)?;
@@ -167,7 +167,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         let mut builder = ObjectBuilder::from_object_with_value_roots(
             heap,
             prototype,
-            vec![global_root.clone(), constructor_root.clone()],
+            vec![global_root, constructor_root],
         );
         for spec in super::prototype::STRING_PROTOTYPE_METHODS {
             builder.method_from_spec(spec)?;
@@ -192,7 +192,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         prototype,
         heap,
         "constructor",
-        crate::object::PropertyDescriptor::data(string_value.clone(), true, false, true),
+        crate::object::PropertyDescriptor::data(string_value, true, false, true),
     );
     crate::bootstrap::define_global_value(
         global,
@@ -229,7 +229,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 ///   exception (rethrown without wrapping).
 fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let raw = match args.first() {
-        Some(value) => value.clone(),
+        Some(value) => *value,
         None => {
             let empty = crate::string::JsString::from_str("", ctx.heap_mut()).map_err(|_| {
                 NativeError::TypeError {
@@ -247,7 +247,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         | Value::Number(_)
         | Value::BigInt(_)
         | Value::String(_)
-        | Value::Symbol(_) => raw.clone(),
+        | Value::Symbol(_) => raw,
         _ => {
             let (interp, exec) = ctx.interp_mut_and_context();
             let exec = exec.ok_or_else(|| NativeError::TypeError {
@@ -284,7 +284,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                 reason: "constructor did not return a string primitive".to_string(),
             });
         };
-        let this = ctx.this_value().clone();
+        let this = *ctx.this_value();
         if let Value::Object(obj) = this {
             crate::object::set_string_data(obj, ctx.heap_mut(), string);
             Ok(Value::Object(obj))

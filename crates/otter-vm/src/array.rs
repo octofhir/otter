@@ -153,7 +153,7 @@ impl otter_gc::SafeTraceable for ArrayBody {
 
 /// Read the Array exotic's per-instance `[[Prototype]]` override.
 pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {
-    heap.read_payload(arr, |body| body.prototype_override.clone())
+    heap.read_payload(arr, |body| body.prototype_override)
 }
 
 /// Set the Array exotic's per-instance `[[Prototype]]` override.
@@ -165,7 +165,7 @@ pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {
 ///
 /// <https://tc39.es/ecma262/#sec-array-exotic-objects>
 pub(crate) fn set_prototype_override(arr: JsArray, heap: &mut GcHeap, proto: Option<Value>) {
-    let barrier_value = proto.clone();
+    let barrier_value = proto;
     heap.with_payload(arr, |body| {
         body.prototype_override = proto;
     });
@@ -399,7 +399,7 @@ fn set_index_value(
     if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
         return Ok(());
     }
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         heap.with_payload(arr, |body| {
@@ -453,7 +453,7 @@ pub(crate) fn set_with_roots(
     if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
         return Ok(());
     }
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         heap.with_payload(arr, |body| {
@@ -503,7 +503,7 @@ pub fn push(
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<usize, otter_gc::OutOfMemory> {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let target_len = len(arr, heap).saturating_add(1);
     reserve_for_target_len(arr, heap, target_len)?;
     let new_len = heap.with_payload(arr, |body| {
@@ -534,7 +534,7 @@ pub(crate) fn push_with_roots(
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<usize, otter_gc::OutOfMemory> {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let target_len = len(arr, heap).saturating_add(1);
     {
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -789,13 +789,13 @@ pub fn set_symbol_property(
     key: &crate::symbol::JsSymbol,
     value: Value,
 ) {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     heap.with_payload(arr, |body| {
         let table = body.symbol_properties.get_or_insert_with(Vec::new);
         if let Some(slot) = table.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
             slot.1 = value;
         } else {
-            table.push((key.clone(), value));
+            table.push((*key, value));
         }
         body.dirty = true;
     });
@@ -811,12 +811,9 @@ pub fn get_symbol_property(
     key: &crate::symbol::JsSymbol,
 ) -> Option<Value> {
     heap.read_payload(arr, |body| {
-        body.symbol_properties.as_ref().and_then(|table| {
-            table
-                .iter()
-                .find(|(k, _)| k.ptr_eq(key))
-                .map(|(_, v)| v.clone())
-        })
+        body.symbol_properties
+            .as_ref()
+            .and_then(|table| table.iter().find(|(k, _)| k.ptr_eq(key)).map(|(_, v)| *v))
     })
 }
 
@@ -850,7 +847,7 @@ pub fn own_symbol_keys(arr: JsArray, heap: &otter_gc::GcHeap) -> Vec<crate::symb
     heap.read_payload(arr, |body| {
         body.symbol_properties
             .as_ref()
-            .map_or_else(Vec::new, |t| t.iter().map(|(k, _)| k.clone()).collect())
+            .map_or_else(Vec::new, |t| t.iter().map(|(k, _)| *k).collect())
     })
 }
 
@@ -897,7 +894,7 @@ pub fn set_named_property(
     if absent && !is_extensible(arr, heap) {
         return Ok(());
     }
-    let barrier_value = value.clone();
+    let barrier_value = value;
     heap.with_payload(arr, |body| {
         let map = body.named_properties.get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), value);
@@ -919,7 +916,7 @@ pub(crate) fn define_named_data_property(
     key: &str,
     value: Value,
 ) {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     heap.with_payload(arr, |body| {
         let map = body.named_properties.get_or_insert_with(HashMap::new);
         map.insert(key.to_string(), value);
@@ -1000,7 +997,7 @@ pub fn set_accessor(
 ) {
     heap.with_payload(arr, |body| {
         let map = body.accessors.get_or_insert_with(HashMap::new);
-        map.insert(key.to_string(), (getter.clone(), setter.clone()));
+        map.insert(key.to_string(), (getter, setter));
         // Hide the underlying dense / sparse / named data slot so
         // subsequent ordinary reads see the accessor instead of the
         // previous data value.

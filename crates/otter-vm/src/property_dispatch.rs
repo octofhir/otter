@@ -51,7 +51,7 @@ impl Interpreter {
         match setter {
             Some(setter) if abstract_ops::is_callable(&setter) => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                args.push(value.clone());
+                args.push(*value);
                 self.run_callable_sync(context, &setter, Value::Array(arr), args)?;
             }
             _ => {
@@ -206,8 +206,8 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
     ) -> Result<(), VmError> {
-        let lhs = read_register(frame, lhs)?.clone();
-        let rhs = read_register(frame, rhs)?.clone();
+        let lhs = *read_register(frame, lhs)?;
+        let rhs = *read_register(frame, rhs)?;
         let result = match (&lhs, &rhs) {
             (Value::Object(a), Value::Object(target)) => {
                 match crate::object::get(*target, &self.gc_heap, "prototype") {
@@ -235,8 +235,8 @@ impl Interpreter {
         lhs: u16,
         rhs: u16,
     ) -> Result<(), VmError> {
-        let lhs = read_register(frame, lhs)?.clone();
-        let rhs = read_register(frame, rhs)?.clone();
+        let lhs = *read_register(frame, lhs)?;
+        let rhs = *read_register(frame, rhs)?;
         let key_name = match &lhs {
             Value::String(s) => Some(s.to_lossy_string(&self.gc_heap)),
             Value::Number(n) => Some(n.to_display_string()),
@@ -336,7 +336,7 @@ impl Interpreter {
         strict: bool,
     ) -> Result<(), VmError> {
         let name = key.name();
-        let receiver = read_register(frame, obj_reg)?.clone();
+        let receiver = *read_register(frame, obj_reg)?;
         let removed = match &receiver {
             Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, name),
             // §10.4.2 [[Delete]] for Array exotic objects: integer
@@ -408,8 +408,8 @@ impl Interpreter {
         idx_reg: u16,
         strict: bool,
     ) -> Result<(), VmError> {
-        let receiver = read_register(frame, obj_reg)?.clone();
-        let idx = read_register(frame, idx_reg)?.clone();
+        let receiver = *read_register(frame, obj_reg)?;
+        let idx = *read_register(frame, idx_reg)?;
         let removed = match (&receiver, idx) {
             (Value::Object(obj), Value::Symbol(sym)) => {
                 crate::object::delete_symbol(*obj, &mut self.gc_heap, &sym)
@@ -535,7 +535,7 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let value = read_register(frame, src)?.clone();
+        let value = *read_register(frame, src)?;
         let result = self.get_prototype_for_op(&value)?;
         write_register(frame, dst, result)?;
         frame.pc += 1;
@@ -551,7 +551,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let proto = match read_register(frame, proto_reg)? {
             Value::Object(_) | Value::Proxy(_) | Value::Iterator(_) | Value::Null => {
-                read_register(frame, proto_reg)?.clone()
+                *read_register(frame, proto_reg)?
             }
             Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
             // §15.7.14 ClassDefinitionEvaluation step 6.b — `class D
@@ -562,10 +562,10 @@ impl Interpreter {
             // native callable through as an `ObjectPrototype::Value`
             // — the prototype walker in `ordinary_get_value` knows
             // how to walk into a NativeFunction receiver.
-            Value::NativeFunction(_) => read_register(frame, proto_reg)?.clone(),
+            Value::NativeFunction(_) => *read_register(frame, proto_reg)?,
             _ => return Err(VmError::TypeMismatch),
         };
-        let receiver = read_register(frame, obj_reg)?.clone();
+        let receiver = *read_register(frame, obj_reg)?;
         match &receiver {
             Value::Object(_) => {
                 let ok = self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
@@ -607,7 +607,7 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
     ) -> Result<(), VmError> {
         let name = key.name();
-        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let value = match &receiver {
             Value::Object(o) => {
                 crate::object::get(*o, &self.gc_heap, name).unwrap_or(Value::Undefined)
@@ -642,7 +642,7 @@ impl Interpreter {
                                 match self.ordinary_get_value(
                                     context,
                                     p,
-                                    receiver.clone(),
+                                    receiver,
                                     &VmPropertyKey::String(name),
                                     0,
                                 )? {
@@ -651,7 +651,7 @@ impl Interpreter {
                                         Some(self.run_callable_sync(
                                             context,
                                             &getter,
-                                            receiver.clone(),
+                                            receiver,
                                             SmallVec::new(),
                                         )?)
                                     }
@@ -696,7 +696,7 @@ impl Interpreter {
                         match getter {
                             Some(getter) if abstract_ops::is_callable(&getter) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                Some(self.run_callable_sync(context, &getter, v.clone(), args)?)
+                                Some(self.run_callable_sync(context, &getter, *v, args)?)
                             }
                             _ => Some(Value::Undefined),
                         }
@@ -725,7 +725,7 @@ impl Interpreter {
             Value::NativeFunction(native) => {
                 match native.own_property_descriptor(&mut self.gc_heap, name)? {
                     Some(desc) => match &desc.kind {
-                        object::DescriptorKind::Data { value } => value.clone(),
+                        object::DescriptorKind::Data { value } => *value,
                         // §10.1.8.1 OrdinaryGet step 7 — accessor
                         // descriptors invoke `[[Get]]` with the
                         // receiver. RegExp's `%RegExp%.input` /
@@ -734,7 +734,7 @@ impl Interpreter {
                         object::DescriptorKind::Accessor { getter, .. } => match getter {
                             Some(g) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                self.run_callable_sync(context, g, receiver.clone(), args)?
+                                self.run_callable_sync(context, g, receiver, args)?
                             }
                             None => Value::Undefined,
                         },
@@ -752,14 +752,11 @@ impl Interpreter {
                     name,
                 )? {
                     Some(desc) => match &desc.kind {
-                        object::DescriptorKind::Data { value } => value.clone(),
+                        object::DescriptorKind::Data { value } => *value,
                         object::DescriptorKind::Accessor { getter, .. } => match getter {
-                            Some(g) if abstract_ops::is_callable(g) => self.run_callable_sync(
-                                context,
-                                g,
-                                receiver.clone(),
-                                SmallVec::new(),
-                            )?,
+                            Some(g) if abstract_ops::is_callable(g) => {
+                                self.run_callable_sync(context, g, receiver, SmallVec::new())?
+                            }
                             _ => Value::Undefined,
                         },
                     },
@@ -845,12 +842,12 @@ impl Interpreter {
                         Value::Undefined
                     } else {
                         let key = VmPropertyKey::String(name);
-                        match self.ordinary_get_value(context, proto, v.clone(), &key, 0)? {
+                        match self.ordinary_get_value(context, proto, *v, &key, 0)? {
                             VmGetOutcome::Value(value) => value,
                             VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
                                 context,
                                 &getter,
-                                v.clone(),
+                                *v,
                                 smallvec::SmallVec::new(),
                             )?,
                         }
@@ -961,9 +958,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = key.name();
         let frame = &stack[top_idx];
-        let value = read_register(frame, src)?.clone();
+        let value = *read_register(frame, src)?;
         let strict = context.function_is_strict(frame.function_id);
-        let receiver = read_register(frame, obj_reg)?.clone();
+        let receiver = *read_register(frame, obj_reg)?;
         let target = match &receiver {
             Value::Object(o) => Some(*o),
             Value::ClassConstructor(c) => Some(c.statics(&self.gc_heap)),
@@ -973,7 +970,7 @@ impl Interpreter {
                 // `re.global = false` / `re.exec = fn` survive
                 // observability checks.
                 if name == "lastIndex" {
-                    regexp_prototype::store_property(r, &mut self.gc_heap, name, value.clone());
+                    regexp_prototype::store_property(r, &mut self.gc_heap, name, value);
                     None
                 } else {
                     let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
@@ -990,7 +987,7 @@ impl Interpreter {
                         None
                     } else {
                         let bag = regexp_ensure_expando(self, r, &receiver)?;
-                        if !self.ordinary_set_data_property(bag, name, value.clone())? {
+                        if !self.ordinary_set_data_property(bag, name, value)? {
                             Self::failed_set_result(
                                 strict,
                                 format!("Cannot assign to property '{name}'"),
@@ -1010,7 +1007,7 @@ impl Interpreter {
                             match crate::object::resolve_set(proto, &self.gc_heap, name) {
                                 object::SetOutcome::InvokeSetter { setter } => {
                                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                    args.push(value.clone());
+                                    args.push(value);
                                     self.run_callable_sync(
                                         context,
                                         &setter,
@@ -1032,7 +1029,7 @@ impl Interpreter {
                             }
                         }
                     }
-                    crate::array::set_named_property(*a, &mut self.gc_heap, name, value.clone())?;
+                    crate::array::set_named_property(*a, &mut self.gc_heap, name, value)?;
                 }
                 None
             }
@@ -1053,7 +1050,7 @@ impl Interpreter {
                     }
                 } else {
                     let t_clone = *t;
-                    typed_array_set_expando(self, &t_clone, name, value.clone())?;
+                    typed_array_set_expando(self, &t_clone, name, value)?;
                 }
                 None
             }
@@ -1116,8 +1113,7 @@ impl Interpreter {
                     _ => {
                         let enumerable =
                             function_metadata::ordinary_function_metadata_key(name).is_none();
-                        let desc =
-                            object::PropertyDescriptor::data(value.clone(), true, enumerable, true);
+                        let desc = object::PropertyDescriptor::data(value, true, enumerable, true);
                         if !native.define_own_property(&mut self.gc_heap, name, desc) {
                             Self::failed_set_result(
                                 strict,
@@ -1147,8 +1143,7 @@ impl Interpreter {
                         None
                     }
                     _ => {
-                        let desc =
-                            object::PropertyDescriptor::data(value.clone(), true, true, true);
+                        let desc = object::PropertyDescriptor::data(value, true, true, true);
                         if !function_metadata::bound_define_own_property(
                             bound,
                             &mut self.gc_heap,
@@ -1168,7 +1163,7 @@ impl Interpreter {
                 let bag = if let Some(bag) = p.expando(&self.gc_heap) {
                     bag
                 } else {
-                    let p_value = receiver.clone();
+                    let p_value = receiver;
                     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                         p_value.trace_value_slots(visitor);
                     };
@@ -1240,8 +1235,8 @@ impl Interpreter {
         recv_reg: u16,
         idx_reg: u16,
     ) -> Result<(), VmError> {
-        let recv = read_register(frame, recv_reg)?.clone();
-        let idx_value_raw = read_register(frame, idx_reg)?.clone();
+        let recv = *read_register(frame, recv_reg)?;
+        let idx_value_raw = *read_register(frame, idx_reg)?;
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         let value = match (&recv, &idx_value) {
             (Value::Object(obj), Value::Symbol(sym)) => {
@@ -1348,7 +1343,7 @@ impl Interpreter {
                     match getter {
                         Some(getter) if abstract_ops::is_callable(&getter) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.run_callable_sync(context, &getter, recv.clone(), args)?
+                            self.run_callable_sync(context, &getter, recv, args)?
                         }
                         _ => Value::Undefined,
                     }
@@ -1488,14 +1483,14 @@ impl Interpreter {
                 Value::Symbol(_),
             ) => {
                 let key = match &idx_value {
-                    Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+                    Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
                     _ => unreachable!(),
                 };
-                match self.ordinary_get_value(context, recv.clone(), recv.clone(), &key, 0)? {
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
                         let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                        self.run_callable_sync(context, &getter, recv.clone(), args)?
+                        self.run_callable_sync(context, &getter, recv, args)?
                     }
                 }
             }
@@ -1524,7 +1519,7 @@ impl Interpreter {
                     _ => unreachable!(),
                 };
                 let key = match &idx_value {
-                    Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+                    Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
                     Value::String(s) => {
                         VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
                     }
@@ -1535,11 +1530,11 @@ impl Interpreter {
                 if matches!(proto, Value::Null | Value::Undefined) {
                     Value::Undefined
                 } else {
-                    match self.ordinary_get_value(context, proto, recv.clone(), &key, 0)? {
+                    match self.ordinary_get_value(context, proto, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => {
                             let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                            self.run_callable_sync(context, &getter, recv.clone(), args)?
+                            self.run_callable_sync(context, &getter, recv, args)?
                         }
                     }
                 }
@@ -1616,15 +1611,15 @@ impl Interpreter {
         src_reg: u16,
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
-        let recv = read_register(frame, recv_reg)?.clone();
-        let idx_value_raw = read_register(frame, idx_reg)?.clone();
-        let value = read_register(frame, src_reg)?.clone();
+        let recv = *read_register(frame, recv_reg)?;
+        let idx_value_raw = *read_register(frame, idx_reg)?;
+        let value = *read_register(frame, src_reg)?;
         let strict = context.function_is_strict(frame.function_id);
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         match (&recv, &idx_value) {
             // Symbol-keyed write on an object.
             (Value::Object(obj), Value::Symbol(sym)) => {
-                if !crate::object::set_symbol(*obj, &mut self.gc_heap, sym.clone(), value) {
+                if !crate::object::set_symbol(*obj, &mut self.gc_heap, *sym, value) {
                     Self::failed_set_result(strict, "Cannot assign to symbol property")?;
                 }
             }
@@ -1702,12 +1697,8 @@ impl Interpreter {
                         )?;
                     }
                     _ => {
-                        let desc = crate::object::PropertyDescriptor::data(
-                            value.clone(),
-                            true,
-                            false,
-                            true,
-                        );
+                        let desc =
+                            crate::object::PropertyDescriptor::data(value, true, false, true);
                         if !native.define_own_property(&mut self.gc_heap, &key, desc) {
                             Self::failed_set_result(
                                 strict,
@@ -1736,12 +1727,8 @@ impl Interpreter {
                         )?;
                     }
                     _ => {
-                        let desc = crate::object::PropertyDescriptor::data(
-                            value.clone(),
-                            true,
-                            false,
-                            true,
-                        );
+                        let desc =
+                            crate::object::PropertyDescriptor::data(value, true, false, true);
                         if !function_metadata::bound_define_own_property(
                             bound,
                             &mut self.gc_heap,
@@ -1883,12 +1870,12 @@ impl Interpreter {
                         t.set(&mut self.gc_heap, n as usize, &coerced);
                     }
                 } else {
-                    typed_array_set_expando(self, t, &name, value.clone())?;
+                    typed_array_set_expando(self, t, &name, value)?;
                 }
             }
             (Value::TypedArray(t), Value::Symbol(sym)) => {
                 let bag = typed_array_ensure_expando(self, t)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on TypedArray".to_string(),
                     });
@@ -1912,7 +1899,7 @@ impl Interpreter {
                     return Ok(());
                 }
                 let bag = regexp_ensure_expando(self, r, &recv)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on RegExp".to_string(),
                     });
@@ -1920,7 +1907,7 @@ impl Interpreter {
             }
             (Value::Promise(p), Value::Symbol(sym)) => {
                 let bag = promise_ensure_expando_pub(&mut self.gc_heap, p)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on Promise".to_string(),
                     });
@@ -1953,7 +1940,7 @@ impl Interpreter {
                     *function_id,
                     &[&recv, &idx_value, &value],
                 )?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value.clone()) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on function".to_string(),
                     });
@@ -1961,7 +1948,7 @@ impl Interpreter {
             }
             (Value::NativeFunction(native), Value::Symbol(sym)) => {
                 let desc = object::PartialPropertyDescriptor {
-                    value: Some(value.clone()),
+                    value: Some(value),
                     writable: Some(true),
                     enumerable: Some(false),
                     configurable: Some(true),
@@ -1971,12 +1958,7 @@ impl Interpreter {
             }
             (Value::ClassConstructor(c), Value::Symbol(sym)) => {
                 let statics = c.statics(&self.gc_heap);
-                if !crate::object::set_symbol(
-                    statics,
-                    &mut self.gc_heap,
-                    sym.clone(),
-                    value.clone(),
-                ) {
+                if !crate::object::set_symbol(statics, &mut self.gc_heap, *sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on class constructor".to_string(),
                     });
@@ -2089,7 +2071,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         match crate::object::resolve_symbol_set(obj, &self.gc_heap, sym) {
             object::SetOutcome::AssignData => {
-                if !crate::object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value) {
+                if !crate::object::set_symbol(obj, &mut self.gc_heap, *sym, value) {
                     Self::failed_set_result(strict, "Cannot assign to symbol property")?;
                 }
                 Ok(())
@@ -2118,20 +2100,11 @@ impl Interpreter {
             return Ok(Value::Undefined);
         };
         let key = VmPropertyKey::String(name);
-        match self.ordinary_get_value(
-            context,
-            Value::Object(proto_obj),
-            receiver.clone(),
-            &key,
-            0,
-        )? {
+        match self.ordinary_get_value(context, Value::Object(proto_obj), *receiver, &key, 0)? {
             VmGetOutcome::Value(value) => Ok(value),
-            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                context,
-                &getter,
-                receiver.clone(),
-                smallvec::SmallVec::new(),
-            ),
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, *receiver, smallvec::SmallVec::new())
+            }
         }
     }
     /// Drive one tick of [`Op::LoadProperty`] when the receiver is
@@ -2169,7 +2142,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
-        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
         if let Value::Object(obj) = &receiver {
             let obj = *obj;
             let site = context
@@ -2255,7 +2228,7 @@ impl Interpreter {
             let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
@@ -2276,12 +2249,11 @@ impl Interpreter {
                 | Value::Symbol(_)
                 | Value::BigInt(_)
         ) {
-            let boxed =
-                self.box_sloppy_this_primitive_stack_rooted(stack, receiver.clone(), &[])?;
+            let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])?;
             let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.ordinary_get_value(context, boxed, receiver.clone(), &key, 0)? {
+            match self.ordinary_get_value(context, boxed, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
@@ -2456,8 +2428,8 @@ impl Interpreter {
         let lhs_reg = register_operand(operands.get(1))?;
         let rhs_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let lhs = read_register(&stack[top_idx], lhs_reg)?.clone();
-        let rhs = read_register(&stack[top_idx], rhs_reg)?.clone();
+        let lhs = *read_register(&stack[top_idx], lhs_reg)?;
+        let rhs = *read_register(&stack[top_idx], rhs_reg)?;
         let result = self.instanceof_operator_stack_rooted(context, stack, &lhs, &rhs)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2477,13 +2449,13 @@ impl Interpreter {
         let obj_reg = register_operand(operands.get(1))?;
         let key_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
-        let key_value_raw = read_register(&stack[top_idx], key_reg)?.clone();
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
         let key = match &key_value {
             Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap)),
             Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
-            Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
             _ => return Ok(false),
         };
 
@@ -2515,7 +2487,7 @@ impl Interpreter {
         if prototype_routed {
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-            match self.ordinary_get_value(context, receiver.clone(), receiver.clone(), &key, 0)? {
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
@@ -2778,8 +2750,8 @@ impl Interpreter {
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         proxy.target(&self.gc_heap),
                         key_value,
-                        value.clone(),
-                        receiver.clone()
+                        value,
+                        receiver
                     ];
                     let top_idx = stack.len() - 1;
                     let pc = stack[top_idx].pc;
@@ -2874,10 +2846,10 @@ impl Interpreter {
         let src_reg = register_operand(operands.get(2))?;
         let scratch_reg = register_operand(operands.get(3))?;
         let top_idx = stack.len() - 1;
-        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
-        let key_value_raw = read_register(&stack[top_idx], key_reg)?.clone();
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
-        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        let value = *read_register(&stack[top_idx], src_reg)?;
         let strict = Self::current_frame_is_strict(stack, context);
         enum ComputedPropertyKey {
             String(String),
@@ -2886,7 +2858,7 @@ impl Interpreter {
         let key = match &key_value {
             Value::String(s) => ComputedPropertyKey::String(s.to_lossy_string(&self.gc_heap)),
             Value::Number(n) => ComputedPropertyKey::String(n.to_display_string()),
-            Value::Symbol(sym) => ComputedPropertyKey::Symbol(sym.clone()),
+            Value::Symbol(sym) => ComputedPropertyKey::Symbol(*sym),
             _ => return Ok(false),
         };
         if let Value::Proxy(p) = &receiver {
@@ -2895,12 +2867,12 @@ impl Interpreter {
                 ComputedPropertyKey::String(key) => {
                     Value::String(JsString::from_str(key, &mut self.gc_heap)?)
                 }
-                ComputedPropertyKey::Symbol(sym) => Value::Symbol(sym.clone()),
+                ComputedPropertyKey::Symbol(sym) => Value::Symbol(*sym),
             };
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
                 key_arg,
-                value.clone(),
+                value,
                 Value::Proxy(proxy),
             ];
             let pc = stack[top_idx].pc;
@@ -2914,7 +2886,7 @@ impl Interpreter {
                             ComputedPropertyKey::String(key) => {
                                 VmPropertyKey::OwnedString(key.clone())
                             }
-                            ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+                            ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(*sym),
                         };
                         if !self.ordinary_set_data_value(
                             context,
@@ -2942,12 +2914,9 @@ impl Interpreter {
                                 ComputedPropertyKey::String(key) => {
                                     self.ordinary_set_data_property(target, key, value)?
                                 }
-                                ComputedPropertyKey::Symbol(sym) => object::set_symbol(
-                                    target,
-                                    &mut self.gc_heap,
-                                    sym.clone(),
-                                    value,
-                                ),
+                                ComputedPropertyKey::Symbol(sym) => {
+                                    object::set_symbol(target, &mut self.gc_heap, *sym, value)
+                                }
                             };
                             if !ok {
                                 Self::failed_set_result(strict, "Cannot assign to property")?;
@@ -3035,7 +3004,7 @@ impl Interpreter {
             let obj = native.own_properties_object(&self.gc_heap);
             match object::resolve_symbol_set(obj, &self.gc_heap, sym) {
                 object::SetOutcome::AssignData => {
-                    if !object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value) {
+                    if !object::set_symbol(obj, &mut self.gc_heap, *sym, value) {
                         return Self::finish_failed_set(
                             stack,
                             context,
@@ -3124,7 +3093,7 @@ impl Interpreter {
                         );
                     }
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
-                    if !object::set_symbol(bag, &mut self.gc_heap, sym.clone(), value) {
+                    if !object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
                         return Self::finish_failed_set(
                             stack,
                             context,
@@ -3206,7 +3175,7 @@ impl Interpreter {
                         self.ordinary_set_data_property(obj, key, value)?
                     }
                     ComputedPropertyKey::Symbol(sym) => {
-                        object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value)
+                        object::set_symbol(obj, &mut self.gc_heap, *sym, value)
                     }
                 };
                 if !ok {
@@ -3270,8 +3239,8 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
-        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
-        let value = read_register(&stack[top_idx], src_reg)?.clone();
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let value = *read_register(&stack[top_idx], src_reg)?;
         let strict = Self::current_frame_is_strict(stack, context);
         if let Value::Object(obj) = &receiver
             && object::supports_fast_property_ic(*obj, &self.gc_heap)
@@ -3314,7 +3283,7 @@ impl Interpreter {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
                 Value::String(key_str),
-                value.clone(),
+                value,
                 Value::Proxy(proxy),
             ];
             let pc = stack[top_idx].pc;
@@ -3337,7 +3306,7 @@ impl Interpreter {
                         .ordinary_get_own_property_descriptor_value_stack_rooted(
                             context,
                             stack,
-                            target_value.clone(),
+                            target_value,
                             &key_vm,
                             0,
                         )?;
@@ -3618,8 +3587,8 @@ impl Interpreter {
         let lhs_reg = register_operand(operands.get(1))?;
         let rhs_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let lhs = read_register(&stack[top_idx], lhs_reg)?.clone();
-        let rhs = read_register(&stack[top_idx], rhs_reg)?.clone();
+        let lhs = *read_register(&stack[top_idx], lhs_reg)?;
+        let rhs = *read_register(&stack[top_idx], rhs_reg)?;
         if !matches!(rhs, Value::Object(_) | Value::Proxy(_)) {
             return Ok(false);
         };
@@ -3667,7 +3636,7 @@ impl Interpreter {
                 .disable_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
         }
         let key = match &lhs {
-            Value::Symbol(sym) => VmPropertyKey::Symbol(sym.clone()),
+            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
             Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap)),
             other => VmPropertyKey::OwnedString(other.display_string(&self.gc_heap)),
         };
@@ -3693,7 +3662,7 @@ impl Interpreter {
             .property_atom(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
-        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let Value::Proxy(proxy) = receiver else {
             return Ok(false);
         };
@@ -3721,11 +3690,11 @@ impl Interpreter {
         let obj_reg = register_operand(operands.get(1))?;
         let idx_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let receiver = read_register(&stack[top_idx], obj_reg)?.clone();
+        let receiver = *read_register(&stack[top_idx], obj_reg)?;
         if !matches!(receiver, Value::Proxy(_)) {
             return Ok(false);
         }
-        let idx = read_register(&stack[top_idx], idx_reg)?.clone();
+        let idx = *read_register(&stack[top_idx], idx_reg)?;
         let key = Self::coerce_vm_property_key(Some(&idx), &self.gc_heap)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -3751,7 +3720,7 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let src = register_operand(operands.get(1))?;
         let top_idx = stack.len() - 1;
-        let value = read_register(&stack[top_idx], src)?.clone();
+        let value = *read_register(&stack[top_idx], src)?;
         if !matches!(value, Value::Proxy(_)) {
             return Ok(false);
         };
@@ -3773,13 +3742,13 @@ impl Interpreter {
         let obj_reg = register_operand(operands.first())?;
         let proto_reg = register_operand(operands.get(1))?;
         let top_idx = stack.len() - 1;
-        let recv = read_register(&stack[top_idx], obj_reg)?.clone();
+        let recv = *read_register(&stack[top_idx], obj_reg)?;
         let Value::Proxy(_) = &recv else {
             return Ok(false);
         };
-        let proto_val = read_register(&stack[top_idx], proto_reg)?.clone();
+        let proto_val = *read_register(&stack[top_idx], proto_reg)?;
         let proto_obj = match &proto_val {
-            Value::Object(_) | Value::Proxy(_) | Value::Null => proto_val.clone(),
+            Value::Object(_) | Value::Proxy(_) | Value::Null => proto_val,
             Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
             _ => return Err(VmError::TypeMismatch),
         };

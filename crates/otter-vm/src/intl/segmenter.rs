@@ -118,20 +118,20 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let wordlike = granularity_word && seg.chars().any(char::is_alphanumeric);
         prepared.push((seg_str, idx as i32, wordlike));
     }
-    let prepared_values: Vec<Value> = prepared.iter().map(|(value, _, _)| value.clone()).collect();
+    let prepared_values: Vec<Value> = prepared.iter().map(|(value, _, _)| *value).collect();
     let mut elements: Vec<Value> = Vec::with_capacity(prepared.len());
     for (seg_str, idx, wordlike) in &prepared {
         let obj =
             args.alloc_object_rooted(&[seg_str, &input_value], &[&prepared_values, &elements])?;
         let heap = &mut *args.gc_heap;
-        crate::object::set(obj, heap, "segment", seg_str.clone());
+        crate::object::set(obj, heap, "segment", *seg_str);
         crate::object::set(
             obj,
             heap,
             "index",
             Value::Number(crate::number::NumberValue::from_i32(*idx)),
         );
-        crate::object::set(obj, heap, "input", input_value.clone());
+        crate::object::set(obj, heap, "input", input_value);
         if granularity_word {
             crate::object::set(obj, heap, "isWordLike", Value::Boolean(*wordlike));
         }

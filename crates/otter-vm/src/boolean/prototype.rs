@@ -92,7 +92,7 @@ fn native_boolean_method(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,

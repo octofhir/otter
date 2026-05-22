@@ -74,7 +74,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     }
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         for (name, length, call) in DATA_VIEW_METHODS {
             builder.method(
                 name,
@@ -85,7 +85,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         }
     }
     // Accessor properties: buffer / byteLength / byteOffset.
-    let accessor_roots = vec![global_root.clone()];
+    let accessor_roots = vec![global_root];
     install_accessor(heap, prototype, "buffer", dv_get_buffer, &accessor_roots)?;
     install_accessor(
         heap,
@@ -272,7 +272,7 @@ fn dispatch_method(
         name: "DataView.prototype",
         reason: format!("method {method_name} missing"),
     })?;
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     // §24.3.1.1 GetViewValue / §24.3.1.2 SetViewValue both start with
     // `ToIndex(byteOffset)`, which runs `ToPrimitive(Number)` →
     // `ToIntegerOrInfinity` per spec. For setters the third arg

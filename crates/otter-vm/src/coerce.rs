@@ -92,7 +92,7 @@ pub(crate) fn to_primitive_or_throw(
     hint: ToPrimitiveHint,
 ) -> Result<Value, VmError> {
     if abstract_ops::is_primitive(input) {
-        return Ok(input.clone());
+        return Ok(*input);
     }
     interp.evaluate_to_primitive(context, input, hint)
 }
@@ -111,7 +111,7 @@ pub(crate) fn to_string_or_throw(
     input: &Value,
 ) -> Result<String, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
-        input.clone()
+        *input
     } else {
         interp.evaluate_to_primitive(context, input, ToPrimitiveHint::String)?
     };
@@ -138,7 +138,7 @@ pub(crate) fn to_number_or_throw(
     input: &Value,
 ) -> Result<NumberValue, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
-        input.clone()
+        *input
     } else {
         interp.evaluate_to_primitive(context, input, ToPrimitiveHint::Number)?
     };
@@ -177,7 +177,7 @@ pub(crate) fn to_number_for_number_ctor(
         return Ok(NumberValue::from_f64(f));
     }
     let primitive = if abstract_ops::is_primitive(input) {
-        input.clone()
+        *input
     } else {
         interp.evaluate_to_primitive(context, input, ToPrimitiveHint::Number)?
     };
@@ -214,7 +214,7 @@ pub(crate) fn to_big_int_or_throw(
     input: &Value,
 ) -> Result<BigIntValue, VmError> {
     let primitive = if abstract_ops::is_primitive(input) {
-        input.clone()
+        *input
     } else {
         interp.evaluate_to_primitive(context, input, ToPrimitiveHint::Number)?
     };

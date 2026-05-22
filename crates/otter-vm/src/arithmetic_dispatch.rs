@@ -152,7 +152,7 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let v = read_register(frame, src)?.clone();
+        let v = *read_register(frame, src)?;
         let value =
             match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
                 abstract_ops::NumericKind::Num(n) => Value::Number(number::neg(n)),
@@ -174,7 +174,7 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let v = read_register(frame, src)?.clone();
+        let v = *read_register(frame, src)?;
         let value =
             match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
                 abstract_ops::NumericKind::Num(n) => Value::Number(number::bitwise_not(n)),
@@ -251,11 +251,11 @@ impl Interpreter {
         let (lhs_p, rhs_p) = if !abstract_ops::is_primitive(x) {
             let coerced =
                 self.evaluate_to_primitive(context, x, abstract_ops::ToPrimitiveHint::Default)?;
-            (coerced, y.clone())
+            (coerced, *y)
         } else {
             let coerced =
                 self.evaluate_to_primitive(context, y, abstract_ops::ToPrimitiveHint::Default)?;
-            (x.clone(), coerced)
+            (*x, coerced)
         };
         Ok(abstract_ops::is_loosely_equal(
             &lhs_p,
@@ -285,8 +285,8 @@ fn binop_values(
     lhs: u16,
     rhs: u16,
 ) -> Result<(u16, Value, Value), VmError> {
-    let l = read_register(frame, lhs)?.clone();
-    let r = read_register(frame, rhs)?.clone();
+    let l = *read_register(frame, lhs)?;
+    let r = *read_register(frame, rhs)?;
     Ok((dst, l, r))
 }
 

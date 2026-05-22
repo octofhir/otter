@@ -65,7 +65,7 @@ fn property_key_value_to_vm_key(
 ) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
         Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
+        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(*sym)),
         _ => Err(VmError::TypeError {
             message: "property key must be a string or symbol".to_string(),
         }),
@@ -79,7 +79,7 @@ fn complete_partial_descriptor_against_current(
     match &current.kind {
         object::DescriptorKind::Data { value } if !partial.is_accessor() => {
             object::PropertyDescriptor::data(
-                partial.value.clone().unwrap_or_else(|| value.clone()),
+                partial.value.unwrap_or(*value),
                 partial.writable.unwrap_or(current.writable()),
                 partial.enumerable.unwrap_or(current.enumerable()),
                 partial.configurable.unwrap_or(current.configurable()),
@@ -88,27 +88,27 @@ fn complete_partial_descriptor_against_current(
         object::DescriptorKind::Accessor { getter, setter } if !partial.is_data() => {
             object::PropertyDescriptor::accessor(
                 if partial.get.is_some() {
-                    normalize_accessor_slot(partial.get.clone())
+                    normalize_accessor_slot(partial.get)
                 } else {
-                    getter.clone()
+                    *getter
                 },
                 if partial.set.is_some() {
-                    normalize_accessor_slot(partial.set.clone())
+                    normalize_accessor_slot(partial.set)
                 } else {
-                    setter.clone()
+                    *setter
                 },
                 partial.enumerable.unwrap_or(current.enumerable()),
                 partial.configurable.unwrap_or(current.configurable()),
             )
         }
         _ if partial.is_accessor() => object::PropertyDescriptor::accessor(
-            normalize_accessor_slot(partial.get.clone()),
-            normalize_accessor_slot(partial.set.clone()),
+            normalize_accessor_slot(partial.get),
+            normalize_accessor_slot(partial.set),
             partial.enumerable.unwrap_or(false),
             partial.configurable.unwrap_or(false),
         ),
         _ => object::PropertyDescriptor::data(
-            partial.value.clone().unwrap_or(Value::Undefined),
+            partial.value.unwrap_or(Value::Undefined),
             partial.writable.unwrap_or(false),
             partial.enumerable.unwrap_or(false),
             partial.configurable.unwrap_or(false),
@@ -158,13 +158,13 @@ enum DescriptorAllocationRoots<'a> {
 fn partial_descriptor_value_roots(descriptor: &object::PartialPropertyDescriptor) -> Vec<Value> {
     let mut roots = Vec::with_capacity(3);
     if let Some(value) = &descriptor.value {
-        roots.push(value.clone());
+        roots.push(*value);
     }
     if let Some(get) = &descriptor.get {
-        roots.push(get.clone());
+        roots.push(*get);
     }
     if let Some(set) = &descriptor.set {
-        roots.push(set.clone());
+        roots.push(*set);
     }
     roots
 }
@@ -188,16 +188,10 @@ impl Interpreter {
         }
         let handler = proxy.handler(&self.gc_heap);
         let trap_key = VmPropertyKey::String(trap);
-        let trap_value = match self.ordinary_get_value(
-            context,
-            handler.clone(),
-            handler.clone(),
-            &trap_key,
-            0,
-        )? {
+        let trap_value = match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
             VmGetOutcome::Value(value) => value,
             VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, handler.clone(), SmallVec::new())?
+                self.run_callable_sync(context, &getter, handler, SmallVec::new())?
             }
         };
         let trap_fn = match trap_value {
@@ -216,7 +210,7 @@ impl Interpreter {
         if let Some(key) = key.string_name() {
             Ok(Value::String(JsString::from_str(key, &mut self.gc_heap)?))
         } else if let VmPropertyKey::Symbol(sym) = key {
-            Ok(Value::Symbol(sym.clone()))
+            Ok(Value::Symbol(*sym))
         } else {
             unreachable!("every non-string property key is a symbol")
         }
@@ -716,11 +710,9 @@ impl Interpreter {
         if object::is_extensible(*obj, &self.gc_heap) {
             return Ok(None);
         }
-        Ok(Some(self.ordinary_get_prototype_value(
-            context,
-            target.clone(),
-            0,
-        )?))
+        Ok(Some(
+            self.ordinary_get_prototype_value(context, *target, 0)?,
+        ))
     }
 
     pub(crate) fn ordinary_get_prototype_value(
@@ -892,11 +884,8 @@ impl Interpreter {
                 let target_value = proxy.target(&self.gc_heap);
                 let descriptor_object =
                     self.partial_descriptor_to_object(&descriptor, &[&key_value, &target_value])?;
-                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    target_value.clone(),
-                    key_value,
-                    Value::Object(descriptor_object),
-                ];
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![target_value, key_value, Value::Object(descriptor_object),];
                 match self.invoke_proxy_trap(context, proxy, "defineProperty", trap_args)? {
                     Some(result) => {
                         let ok = result.to_boolean(&self.gc_heap);
@@ -910,7 +899,7 @@ impl Interpreter {
                         let target_desc = self
                             .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                 context,
-                                target_value.clone(),
+                                target_value,
                                 key,
                                 0,
                                 value_roots.as_slice(),
@@ -1104,7 +1093,7 @@ impl Interpreter {
                     let object::DescriptorKind::Data { value } = &updated.kind else {
                         return Ok(false);
                     };
-                    regexp.set_last_index_value(&mut self.gc_heap, value.clone());
+                    regexp.set_last_index_value(&mut self.gc_heap, *value);
                     regexp.set_last_index_writable(&mut self.gc_heap, updated.writable());
                     return Ok(true);
                 }
@@ -1141,7 +1130,7 @@ impl Interpreter {
                 // data values; full descriptor attributes will land
                 // alongside the rest of the array attribute story.
                 if let VmPropertyKey::Symbol(sym) = key {
-                    let value = descriptor.value.clone().unwrap_or(Value::Undefined);
+                    let value = descriptor.value.unwrap_or(Value::Undefined);
                     array::set_symbol_property(*arr, &mut self.gc_heap, sym, value);
                     return Ok(true);
                 }
@@ -1167,7 +1156,7 @@ impl Interpreter {
                         if matches!(descriptor.writable, Some(true)) {
                             return Ok(false);
                         }
-                        if let Some(v) = descriptor.value.clone() {
+                        if let Some(v) = descriptor.value {
                             let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
                             let new_len = crate::number::bitwise::to_uint32(number_len);
                             if (new_len as f64) != number_len.as_f64() {
@@ -1180,7 +1169,7 @@ impl Interpreter {
                         return Ok(true);
                     }
                     let new_writable = descriptor.writable.unwrap_or(true);
-                    if let Some(v) = descriptor.value.clone() {
+                    if let Some(v) = descriptor.value {
                         let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
                         let new_len = crate::number::bitwise::to_uint32(number_len);
                         if (new_len as f64) != number_len.as_f64() {
@@ -1235,7 +1224,7 @@ impl Interpreter {
                 ObjectIntegrityLevel::Frozen => {
                     let current = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
-                        target.clone(),
+                        *target,
                         &key,
                         0,
                         &[target],
@@ -1279,7 +1268,7 @@ impl Interpreter {
             let key = property_key_value_to_vm_key(key_value, &self.gc_heap)?;
             let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 context,
-                target.clone(),
+                *target,
                 &key,
                 0,
                 &[target],
@@ -1369,7 +1358,7 @@ impl Interpreter {
             }
             let updated = if descriptor.is_data() {
                 object::PropertyDescriptor::data(
-                    descriptor.value.clone().unwrap_or(Value::Undefined),
+                    descriptor.value.unwrap_or(Value::Undefined),
                     descriptor.writable.unwrap_or(false),
                     descriptor.enumerable.unwrap_or(current.enumerable()),
                     descriptor.configurable.unwrap_or(current.configurable()),
@@ -1377,12 +1366,12 @@ impl Interpreter {
             } else {
                 object::PropertyDescriptor::accessor(
                     if descriptor.get.is_some() {
-                        normalize_accessor_slot(descriptor.get.clone())
+                        normalize_accessor_slot(descriptor.get)
                     } else {
                         None
                     },
                     if descriptor.set.is_some() {
-                        normalize_accessor_slot(descriptor.set.clone())
+                        normalize_accessor_slot(descriptor.set)
                     } else {
                         None
                     },
@@ -1409,7 +1398,7 @@ impl Interpreter {
                     }
                 }
                 let updated = object::PropertyDescriptor::data(
-                    descriptor.value.clone().unwrap_or(current_value),
+                    descriptor.value.unwrap_or(current_value),
                     descriptor.writable.unwrap_or(current.writable()),
                     descriptor.enumerable.unwrap_or(current.enumerable()),
                     descriptor.configurable.unwrap_or(current.configurable()),
@@ -1421,8 +1410,8 @@ impl Interpreter {
                 getter: current_getter,
                 setter: current_setter,
             } => {
-                let getter = normalize_accessor_slot(descriptor.get.clone());
-                let setter = normalize_accessor_slot(descriptor.set.clone());
+                let getter = normalize_accessor_slot(descriptor.get);
+                let setter = normalize_accessor_slot(descriptor.set);
                 if !current.configurable()
                     && ((descriptor.get.is_some()
                         && !same_optional_value(&getter, &current_getter, &self.gc_heap))
@@ -1533,7 +1522,7 @@ impl Interpreter {
             }
             let updated = if descriptor.is_data() {
                 object::PropertyDescriptor::data(
-                    descriptor.value.clone().unwrap_or(Value::Undefined),
+                    descriptor.value.unwrap_or(Value::Undefined),
                     descriptor.writable.unwrap_or(false),
                     descriptor.enumerable.unwrap_or(current.enumerable()),
                     descriptor.configurable.unwrap_or(current.configurable()),
@@ -1541,12 +1530,12 @@ impl Interpreter {
             } else {
                 object::PropertyDescriptor::accessor(
                     if descriptor.get.is_some() {
-                        normalize_accessor_slot(descriptor.get.clone())
+                        normalize_accessor_slot(descriptor.get)
                     } else {
                         None
                     },
                     if descriptor.set.is_some() {
-                        normalize_accessor_slot(descriptor.set.clone())
+                        normalize_accessor_slot(descriptor.set)
                     } else {
                         None
                     },
@@ -1573,7 +1562,7 @@ impl Interpreter {
                     }
                 }
                 let updated = object::PropertyDescriptor::data(
-                    descriptor.value.clone().unwrap_or(current_value),
+                    descriptor.value.unwrap_or(current_value),
                     descriptor.writable.unwrap_or(current.writable()),
                     descriptor.enumerable.unwrap_or(current.enumerable()),
                     descriptor.configurable.unwrap_or(current.configurable()),
@@ -1585,8 +1574,8 @@ impl Interpreter {
                 getter: current_getter,
                 setter: current_setter,
             } => {
-                let getter = normalize_accessor_slot(descriptor.get.clone());
-                let setter = normalize_accessor_slot(descriptor.set.clone());
+                let getter = normalize_accessor_slot(descriptor.get);
+                let setter = normalize_accessor_slot(descriptor.set);
                 if !current.configurable()
                     && ((descriptor.get.is_some()
                         && !same_optional_value(&getter, &current_getter, &self.gc_heap))
@@ -1677,16 +1666,16 @@ impl Interpreter {
         }
         let obj = self.alloc_runtime_rooted_object_with_roots(roots.as_slice(), &[])?;
         if let Some(v) = &descriptor.value {
-            self.set_property(obj, "value", v.clone())?;
+            self.set_property(obj, "value", *v)?;
         }
         if let Some(w) = descriptor.writable {
             self.set_property(obj, "writable", Value::Boolean(w))?;
         }
         if let Some(g) = &descriptor.get {
-            self.set_property(obj, "get", g.clone())?;
+            self.set_property(obj, "get", *g)?;
         }
         if let Some(s) = &descriptor.set {
-            self.set_property(obj, "set", s.clone())?;
+            self.set_property(obj, "set", *s)?;
         }
         if let Some(e) = descriptor.enumerable {
             self.set_property(obj, "enumerable", Value::Boolean(e))?;
@@ -1710,7 +1699,7 @@ impl Interpreter {
         hint: abstract_ops::ToPrimitiveHint,
     ) -> Result<Value, VmError> {
         if abstract_ops::is_primitive(input) {
-            return Ok(input.clone());
+            return Ok(*input);
         }
         // Step 1.a — try `@@toPrimitive` via OrdinaryGet on the
         // object's prototype chain. Falls back to ordinary toString /
@@ -1718,15 +1707,15 @@ impl Interpreter {
         let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
         let exotic = match self.ordinary_get_value(
             context,
-            input.clone(),
-            input.clone(),
+            *input,
+            *input,
             &VmPropertyKey::Symbol(to_prim_sym),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                self.run_callable_sync(context, &getter, input.clone(), args)?
+                self.run_callable_sync(context, &getter, *input, args)?
             }
         };
         if !matches!(exotic, Value::Undefined | Value::Null) {
@@ -1738,7 +1727,7 @@ impl Interpreter {
             let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(Value::String(hint_str));
-            let result = self.run_callable_sync(context, &exotic, input.clone(), args)?;
+            let result = self.run_callable_sync(context, &exotic, *input, args)?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);
             }
@@ -1771,22 +1760,22 @@ impl Interpreter {
         for name in names {
             let method = match self.ordinary_get_value(
                 context,
-                input.clone(),
-                input.clone(),
+                *input,
+                *input,
                 &VmPropertyKey::String(name),
                 0,
             )? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    self.run_callable_sync(context, &getter, input.clone(), args)?
+                    self.run_callable_sync(context, &getter, *input, args)?
                 }
             };
             if !self.is_callable_runtime(&method) {
                 continue;
             }
             let args: SmallVec<[Value; 8]> = SmallVec::new();
-            let result = self.run_callable_sync(context, &method, input.clone(), args)?;
+            let result = self.run_callable_sync(context, &method, *input, args)?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);
             }
@@ -1842,20 +1831,14 @@ impl Interpreter {
 
         let read_field = |this: &mut Self, name: &str| -> Result<Option<Value>, VmError> {
             let key = VmPropertyKey::String(name);
-            if !this.ordinary_has_property_value(context, attributes.clone(), &key, 0)? {
+            if !this.ordinary_has_property_value(context, *attributes, &key, 0)? {
                 return Ok(None);
             }
-            let value = match this.ordinary_get_value(
-                context,
-                attributes.clone(),
-                attributes.clone(),
-                &key,
-                0,
-            )? {
+            let value = match this.ordinary_get_value(context, *attributes, *attributes, &key, 0)? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    this.run_callable_sync(context, &getter, attributes.clone(), args)?
+                    this.run_callable_sync(context, &getter, *attributes, args)?
                 }
             };
             Ok(Some(value))
@@ -2166,32 +2149,26 @@ impl Interpreter {
         }
         let len_value = match self.ordinary_get_value(
             context,
-            list_value.clone(),
-            list_value.clone(),
+            list_value,
+            list_value,
             &VmPropertyKey::String("length"),
             0,
         )? {
             VmGetOutcome::Value(v) => v,
             VmGetOutcome::InvokeGetter { getter } => {
                 let args: SmallVec<[Value; 8]> = SmallVec::new();
-                self.run_callable_sync(context, &getter, list_value.clone(), args)?
+                self.run_callable_sync(context, &getter, list_value, args)?
             }
         };
         let len = to_length(&len_value, &self.gc_heap)?;
         let mut out: Vec<Value> = Vec::with_capacity(len);
         for i in 0..len {
             let key = VmPropertyKey::OwnedString(i.to_string());
-            let element = match self.ordinary_get_value(
-                context,
-                list_value.clone(),
-                list_value.clone(),
-                &key,
-                0,
-            )? {
+            let element = match self.ordinary_get_value(context, list_value, list_value, &key, 0)? {
                 VmGetOutcome::Value(v) => v,
                 VmGetOutcome::InvokeGetter { getter } => {
                     let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    self.run_callable_sync(context, &getter, list_value.clone(), args)?
+                    self.run_callable_sync(context, &getter, list_value, args)?
                 }
             };
             if !matches!(element, Value::String(_) | Value::Symbol(_)) {
@@ -2238,15 +2215,15 @@ impl Interpreter {
             ];
             let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 context,
-                target_value.clone(),
+                target_value,
                 &vm_key,
                 0,
                 &[&target_value],
                 &slice_roots,
             )?;
             match desc {
-                Some(d) if !d.configurable() => target_nonconfigurable.push(key.clone()),
-                _ => target_configurable.push(key.clone()),
+                Some(d) if !d.configurable() => target_nonconfigurable.push(*key),
+                _ => target_configurable.push(*key),
             }
         }
         if extensible_target && target_nonconfigurable.is_empty() {
@@ -2318,7 +2295,7 @@ impl Interpreter {
                     });
                 }
                 let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), proto.clone()];
+                    smallvec::smallvec![proxy.target(&self.gc_heap), *proto];
                 match self.invoke_proxy_trap(context, proxy, "setPrototypeOf", trap_args)? {
                     Some(result) => {
                         let ok = result.to_boolean(&self.gc_heap);
@@ -2376,7 +2353,7 @@ impl Interpreter {
                 // Step 8 cycle check — walk the candidate chain looking
                 // for O itself. Only ordinary-object hops; the spec
                 // stops when an exotic [[GetPrototypeOf]] is hit.
-                let mut p = proto.clone();
+                let mut p = *proto;
                 let hard_cap = object::PROTO_CHAIN_HARD_CAP;
                 let mut hops = 0;
                 loop {
@@ -2404,7 +2381,7 @@ impl Interpreter {
                 }
                 let proto_opt = match proto {
                     Value::Null => None,
-                    v => Some(v.clone()),
+                    v => Some(*v),
                 };
                 Ok(object::set_prototype_value(
                     obj,
@@ -2426,7 +2403,7 @@ impl Interpreter {
                 let proto_opt = match proto {
                     Value::Null => None,
                     v if constructor_return_is_object(v) || matches!(v, Value::Proxy(_)) => {
-                        Some(v.clone())
+                        Some(*v)
                     }
                     _ => return Ok(false),
                 };
@@ -2502,8 +2479,8 @@ impl Interpreter {
         match rhs {
             Value::Object(_) | Value::Proxy(_) => {
                 let key = VmPropertyKey::String("prototype");
-                match self.ordinary_get_value(context, rhs.clone(), rhs.clone(), &key, 0)? {
-                    VmGetOutcome::Value(Value::Undefined) => Ok(Some(rhs.clone())),
+                match self.ordinary_get_value(context, *rhs, *rhs, &key, 0)? {
+                    VmGetOutcome::Value(Value::Undefined) => Ok(Some(*rhs)),
                     VmGetOutcome::Value(value @ (Value::Object(_) | Value::Proxy(_))) => {
                         Ok(Some(value))
                     }
@@ -2512,7 +2489,7 @@ impl Interpreter {
                     }),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        let value = self.run_callable_sync(context, &getter, rhs.clone(), args)?;
+                        let value = self.run_callable_sync(context, &getter, *rhs, args)?;
                         if matches!(value, Value::Object(_) | Value::Proxy(_)) {
                             Ok(Some(value))
                         } else {
@@ -2555,7 +2532,7 @@ impl Interpreter {
                     }) => match getter {
                         Some(getter) if abstract_ops::is_callable(&getter) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.run_callable_sync(context, &getter, rhs.clone(), args)?
+                            self.run_callable_sync(context, &getter, *rhs, args)?
                         }
                         _ => Value::Undefined,
                     },
@@ -2582,8 +2559,8 @@ impl Interpreter {
         match rhs {
             Value::Object(_) | Value::Proxy(_) => {
                 let key = VmPropertyKey::String("prototype");
-                match self.ordinary_get_value(context, rhs.clone(), rhs.clone(), &key, 0)? {
-                    VmGetOutcome::Value(Value::Undefined) => Ok(Some(rhs.clone())),
+                match self.ordinary_get_value(context, *rhs, *rhs, &key, 0)? {
+                    VmGetOutcome::Value(Value::Undefined) => Ok(Some(*rhs)),
                     VmGetOutcome::Value(value @ (Value::Object(_) | Value::Proxy(_))) => {
                         Ok(Some(value))
                     }
@@ -2592,7 +2569,7 @@ impl Interpreter {
                     }),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        let value = self.run_callable_sync(context, &getter, rhs.clone(), args)?;
+                        let value = self.run_callable_sync(context, &getter, *rhs, args)?;
                         if matches!(value, Value::Object(_) | Value::Proxy(_)) {
                             Ok(Some(value))
                         } else {
@@ -2640,7 +2617,7 @@ impl Interpreter {
                     }) => match getter {
                         Some(getter) if abstract_ops::is_callable(&getter) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
-                            self.run_callable_sync(context, &getter, rhs.clone(), args)?
+                            self.run_callable_sync(context, &getter, *rhs, args)?
                         }
                         _ => Value::Undefined,
                     },
@@ -2714,7 +2691,7 @@ impl Interpreter {
             Value::Proxy(proxy) => {
                 let key_value = self.vm_property_key_to_value(key)?;
                 let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value, receiver.clone()];
+                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value, receiver];
                 match self.invoke_proxy_trap(context, &proxy, "get", trap_args)? {
                     Some(value) => {
                         self.validate_proxy_get_invariants(
@@ -2973,13 +2950,11 @@ impl Interpreter {
                             key,
                         )? {
                             Some(desc) => match &desc.kind {
-                                object::DescriptorKind::Data { value } => value.clone(),
+                                object::DescriptorKind::Data { value } => *value,
                                 object::DescriptorKind::Accessor { getter, .. } => {
                                     return Ok(match getter {
                                         Some(getter) if abstract_ops::is_callable(getter) => {
-                                            VmGetOutcome::InvokeGetter {
-                                                getter: getter.clone(),
-                                            }
+                                            VmGetOutcome::InvokeGetter { getter: *getter }
                                         }
                                         _ => VmGetOutcome::Value(Value::Undefined),
                                     });
@@ -3021,7 +2996,7 @@ impl Interpreter {
                     hops + 1,
                 )?;
                 let value = match &outcome {
-                    VmGetOutcome::Value(v) => v.clone(),
+                    VmGetOutcome::Value(v) => *v,
                     VmGetOutcome::InvokeGetter { .. } => return Ok(outcome),
                 };
                 if let Some(outcome) =
@@ -3339,7 +3314,7 @@ impl Interpreter {
                             let target_desc = self
                                 .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                     context,
-                                    target_value.clone(),
+                                    target_value,
                                     key,
                                     hops + 1,
                                     &[&target_value],
@@ -3442,7 +3417,7 @@ impl Interpreter {
             | Value::TypedArray(_)
             | Value::WeakRef(_)
             | Value::FinalizationRegistry(_) => {
-                match self.ordinary_get_value(context, base.clone(), base, key, hops + 1)? {
+                match self.ordinary_get_value(context, base, base, key, hops + 1)? {
                     VmGetOutcome::Value(Value::Undefined) => Ok(false),
                     _ => Ok(true),
                 }
@@ -3475,7 +3450,7 @@ impl Interpreter {
                     message: "Cannot define property".to_string(),
                 });
             }
-            return Ok(Some(target.clone()));
+            return Ok(Some(*target));
         }
         if !matches!(target, Value::Proxy(_)) {
             return Ok(None);
@@ -3487,7 +3462,7 @@ impl Interpreter {
                         message: "Object.freeze failed".to_string(),
                     });
                 }
-                Ok(Some(target.clone()))
+                Ok(Some(*target))
             }
             M::Seal => {
                 if !self.set_integrity_level_value(context, target, ObjectIntegrityLevel::Sealed)? {
@@ -3495,7 +3470,7 @@ impl Interpreter {
                         message: "Object.seal failed".to_string(),
                     });
                 }
-                Ok(Some(target.clone()))
+                Ok(Some(*target))
             }
             M::IsFrozen => {
                 let frozen =
@@ -3520,7 +3495,7 @@ impl Interpreter {
                         message: "Object.preventExtensions failed".to_string(),
                     });
                 }
-                Ok(Some(target.clone()))
+                Ok(Some(*target))
             }
             // §20.1.2.4 Object.defineProperty(O, P, Attributes) —
             // handled in the pre-Proxy block above.
@@ -3535,13 +3510,13 @@ impl Interpreter {
                         message: "Object.defineProperty failed".to_string(),
                     });
                 }
-                Ok(Some(target.clone()))
+                Ok(Some(*target))
             }
             // §20.1.2.10 Object.getOwnPropertyNames(O) — full string
             // key set (enumerable + non-enumerable) for Proxy targets,
             // validated against §10.5.11 invariants.
             M::GetOwnPropertyNames => {
-                let target_clone = target.clone();
+                let target_clone = *target;
                 let trap_keys = self.own_property_keys_value(context, &target_clone)?;
                 let values: Vec<Value> = trap_keys
                     .into_iter()
@@ -3563,7 +3538,7 @@ impl Interpreter {
                 Ok(Some(Value::Array(array)))
             }
             M::GetOwnPropertySymbols => {
-                let target_clone = target.clone();
+                let target_clone = *target;
                 let trap_keys = self.own_property_keys_value(context, &target_clone)?;
                 let values: Vec<Value> = trap_keys
                     .into_iter()
@@ -3597,7 +3572,7 @@ impl Interpreter {
         let key = self.to_property_key_sync(context, key.cloned().unwrap_or(Value::Undefined))?;
         self.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
-            target.clone(),
+            target,
             &key,
             0,
             &[&target],
@@ -3659,7 +3634,7 @@ impl Interpreter {
             let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
             args.push(Value::String(hint_str));
-            let result = self.run_callable_sync(context, &callee, value.clone(), args)?;
+            let result = self.run_callable_sync(context, &callee, value, args)?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);
             }
@@ -3674,12 +3649,11 @@ impl Interpreter {
             }
         };
         for method in order {
-            let callee = self.get_property_value_for_call(context, value.clone(), method)?;
+            let callee = self.get_property_value_for_call(context, value, method)?;
             if !self.is_callable_runtime(&callee) {
                 continue;
             }
-            let result =
-                self.run_callable_sync(context, &callee, value.clone(), SmallVec::new())?;
+            let result = self.run_callable_sync(context, &callee, value, SmallVec::new())?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);
             }
@@ -3731,7 +3705,7 @@ impl Interpreter {
                     let slice_roots: [&[Value]; 1] = [keys.as_slice()];
                     let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
-                        proxy_root.clone(),
+                        proxy_root,
                         &VmPropertyKey::OwnedString(name.clone()),
                         hops + 1,
                         &[&proxy_root],
@@ -3768,7 +3742,7 @@ impl Interpreter {
                     if let Some(desc) = self
                         .ordinary_get_own_property_descriptor_value_runtime_rooted(
                             context,
-                            target.clone(),
+                            target,
                             &VmPropertyKey::OwnedString(key.clone()),
                             hops + 1,
                             &[&target],
@@ -3855,7 +3829,7 @@ impl Interpreter {
                 let key = VmPropertyKey::OwnedString(name.clone());
                 let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                     context,
-                    current.clone(),
+                    current,
                     &key,
                     hops + 1,
                     &[&current],
@@ -3905,7 +3879,7 @@ impl Interpreter {
                         let target_desc = self
                             .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                 context,
-                                target_value.clone(),
+                                target_value,
                                 key,
                                 hops + 1,
                                 &[&target_value],
@@ -4016,12 +3990,8 @@ impl Interpreter {
                     });
                 }
                 let key_value = self.vm_property_key_to_value(key)?;
-                let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    proxy.target(&self.gc_heap),
-                    key_value,
-                    value.clone(),
-                    receiver.clone(),
-                ];
+                let trap_args: SmallVec<[Value; 8]> =
+                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value, value, receiver,];
                 match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                     Some(result) => {
                         let ok = result.to_boolean(&self.gc_heap);
@@ -4035,7 +4005,7 @@ impl Interpreter {
                         let target_desc = self
                             .ordinary_get_own_property_descriptor_value_runtime_rooted(
                                 context,
-                                target_value.clone(),
+                                target_value,
                                 key,
                                 hops + 1,
                                 &[&target_value, &value, &receiver],
@@ -4096,7 +4066,7 @@ impl Interpreter {
                 }
                 Ok(match key {
                     VmPropertyKey::Symbol(sym) => {
-                        object::set_symbol(obj, &mut self.gc_heap, sym.clone(), value)
+                        object::set_symbol(obj, &mut self.gc_heap, *sym, value)
                     }
                     _ => self.ordinary_set_data_property(
                         obj,
@@ -4127,12 +4097,7 @@ impl Interpreter {
                         return Ok(false);
                     }
                     let bag = self.function_user_bag_runtime_rooted(function_id, &[&value], &[])?;
-                    Ok(object::set_symbol(
-                        bag,
-                        &mut self.gc_heap,
-                        sym.clone(),
-                        value,
-                    ))
+                    Ok(object::set_symbol(bag, &mut self.gc_heap, *sym, value))
                 }
                 _ => {
                     let key = key
@@ -4222,7 +4187,7 @@ fn is_compatible_partial_descriptor(
                 let normalised = if matches!(g, Value::Undefined) {
                     None
                 } else {
-                    Some(g.clone())
+                    Some(*g)
                 };
                 if !optional_value_eq_pair(ex_get, &normalised, heap) {
                     return false;
@@ -4232,7 +4197,7 @@ fn is_compatible_partial_descriptor(
                 let normalised = if matches!(s, Value::Undefined) {
                     None
                 } else {
-                    Some(s.clone())
+                    Some(*s)
                 };
                 if !optional_value_eq_pair(ex_set, &normalised, heap) {
                     return false;
@@ -4271,7 +4236,7 @@ fn property_key_from_value(
 ) -> Result<VmPropertyKey<'static>, VmError> {
     match value {
         Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym.clone())),
+        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(*sym)),
         _ => Err(VmError::TypeMismatch),
     }
 }

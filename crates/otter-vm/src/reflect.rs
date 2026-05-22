@@ -78,7 +78,7 @@ pub fn call(
             if !is_constructor(&target, context, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
-            let new_target = args.get(2).cloned().unwrap_or_else(|| target.clone());
+            let new_target = args.get(2).cloned().unwrap_or(target);
             if !is_constructor(&new_target, context, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
@@ -108,8 +108,8 @@ pub fn call(
         M::Get => {
             let target = expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
-            let receiver = args.get(2).cloned().unwrap_or_else(|| target.clone());
-            match interp.ordinary_get_value(context, target, receiver.clone(), &key, 0)? {
+            let receiver = args.get(2).cloned().unwrap_or(target);
+            match interp.ordinary_get_value(context, target, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => Ok(v),
                 VmGetOutcome::InvokeGetter { getter } => {
                     let argv: SmallVec<[Value; 8]> = SmallVec::new();
@@ -124,7 +124,7 @@ pub fn call(
             let key = coerce_property_key(interp, context, args.get(1))?;
             match interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
                 context,
-                target.clone(),
+                target,
                 &key,
                 0,
                 &[&target],
@@ -134,10 +134,10 @@ pub fn call(
                 Some(desc) => {
                     let flags = desc.flags;
                     let descriptor_roots: Vec<Value> = match &desc.kind {
-                        crate::object::DescriptorKind::Data { value } => vec![value.clone()],
+                        crate::object::DescriptorKind::Data { value } => vec![*value],
                         crate::object::DescriptorKind::Accessor { getter, setter } => vec![
-                            getter.clone().unwrap_or(Value::Undefined),
-                            setter.clone().unwrap_or(Value::Undefined),
+                            (*getter).unwrap_or(Value::Undefined),
+                            (*setter).unwrap_or(Value::Undefined),
                         ],
                     };
                     let obj =
@@ -153,7 +153,7 @@ pub fn call(
                             interp.set_property_with_extra_roots(
                                 obj,
                                 "value",
-                                descriptor_roots[0].clone(),
+                                descriptor_roots[0],
                                 &mut external_visit,
                             )?;
                             interp.set_property(
@@ -172,7 +172,7 @@ pub fn call(
                             interp.set_property_with_extra_roots(
                                 obj,
                                 "get",
-                                descriptor_roots[0].clone(),
+                                descriptor_roots[0],
                                 &mut external_visit,
                             )?;
                             let mut external_visit =
@@ -184,7 +184,7 @@ pub fn call(
                             interp.set_property_with_extra_roots(
                                 obj,
                                 "set",
-                                descriptor_roots[1].clone(),
+                                descriptor_roots[1],
                                 &mut external_visit,
                             )?;
                         }
@@ -242,7 +242,7 @@ pub fn call(
             let target = expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
             let value = args.get(2).cloned().unwrap_or(Value::Undefined);
-            let receiver = args.get(3).cloned().unwrap_or_else(|| target.clone());
+            let receiver = args.get(3).cloned().unwrap_or(target);
             // §10.1.9 OrdinarySet with receiver semantics for ordinary
             // object targets. Proxy / non-ordinary targets route
             // through `ordinary_set_data_value` (which dispatches the
@@ -389,7 +389,7 @@ fn is_type_object(value: &Value) -> bool {
 /// throw a TypeError exception."
 fn expect_object_value(arg: Option<&Value>) -> Result<Value, VmError> {
     match arg {
-        Some(v) if is_type_object(v) => Ok(v.clone()),
+        Some(v) if is_type_object(v) => Ok(*v),
         _ => Err(VmError::TypeMismatch),
     }
 }
@@ -411,7 +411,7 @@ fn coerce_property_key(
         Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
         Some(Value::Null) => Ok(VmPropertyKey::String("null")),
         Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined")),
-        Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(sym.clone())),
+        Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(*sym)),
         Some(v) => interp.evaluate_to_property_key(context, v),
     }
 }
@@ -442,7 +442,7 @@ fn create_list_from_array_like(
                     .iter()
                     .map(|v| match v {
                         Value::Hole => Value::Undefined,
-                        other => other.clone(),
+                        other => *other,
                     })
                     .collect()
             },
@@ -450,7 +450,7 @@ fn create_list_from_array_like(
         Some(v) if is_type_object(v) => {
             // §7.3.18 CreateListFromArrayLike: probe `length` then
             // walk indexed properties.
-            interp.create_list_from_array_like(context, v.clone())
+            interp.create_list_from_array_like(context, *v)
         }
         // §7.3.18 step 1 — non-Object argumentsList throws TypeError.
         _ => Err(VmError::TypeError {

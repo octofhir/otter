@@ -117,7 +117,7 @@ impl otter_gc::SafeTraceable for SymbolBody {
 /// matches the JsIntl / JsTemporal cache pattern in
 /// `docs/value-cutover-plan.md`. Cloning copies the cache and the
 /// handle (a 4-byte offset), preserving identity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct JsSymbol {
     inner: SymbolHandle,
     description: Option<JsString>,
@@ -479,9 +479,7 @@ impl SymbolRegistry {
         }
         let desc = JsString::from_str(key, gc_heap)?;
         let sym = JsSymbol::registered(gc_heap, desc)?;
-        self.entries
-            .borrow_mut()
-            .push((key.to_string(), sym.clone()));
+        self.entries.borrow_mut().push((key.to_string(), sym));
         Ok(sym)
     }
 
@@ -503,7 +501,7 @@ impl SymbolRegistry {
             .borrow()
             .iter()
             .find(|(k, _)| k == key)
-            .map(|(_, s)| s.clone())
+            .map(|(_, s)| *s)
     }
 
     /// Run `f` against each registered symbol. Used by
@@ -539,7 +537,7 @@ mod tests {
         let a = JsSymbol::new(&mut gc, None).unwrap();
         let b = JsSymbol::new(&mut gc, None).unwrap();
         assert!(!a.ptr_eq(&b));
-        let c = a.clone();
+        let c = a;
         assert!(a.ptr_eq(&c));
     }
 

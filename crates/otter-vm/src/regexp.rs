@@ -383,11 +383,11 @@ impl JsRegExp {
     }
 
     pub(crate) fn prototype_override(&self, heap: &otter_gc::GcHeap) -> Option<Value> {
-        heap.read_payload(self.inner, |body| body.prototype_override.clone())
+        heap.read_payload(self.inner, |body| body.prototype_override)
     }
 
     pub(crate) fn set_prototype_override(&self, heap: &mut otter_gc::GcHeap, proto: Option<Value>) {
-        let barrier_value = proto.clone();
+        let barrier_value = proto;
         heap.with_payload(self.inner, |body| {
             body.prototype_override = proto;
         });
@@ -433,14 +433,14 @@ impl JsRegExp {
         // `read_payload` holds a shared borrow on the heap for the
         // duration of the closure; route the helper through it so the
         // nested `to_lossy_string(heap)` reborrows shared.
-        let raw = heap.read_payload(self.inner, |body| body.last_index.borrow().clone());
+        let raw = heap.read_payload(self.inner, |body| *body.last_index.borrow());
         last_index_to_u32(&raw, heap)
     }
 
     /// Read the JS-visible `lastIndex` data-property value.
     #[must_use]
     pub fn last_index_value(&self, heap: &otter_gc::GcHeap) -> Value {
-        heap.read_payload(self.inner, |body| body.last_index.borrow().clone())
+        heap.read_payload(self.inner, |body| *body.last_index.borrow())
     }
 
     /// Read the writable bit of the JS-visible `lastIndex` data property.
@@ -466,7 +466,7 @@ impl JsRegExp {
 
     /// Store the JS-visible `lastIndex` data-property value.
     pub fn set_last_index_value(&self, heap: &mut otter_gc::GcHeap, value: Value) {
-        let barrier_value = value.clone();
+        let barrier_value = value;
         heap.read_payload(self.inner, |body| {
             *body.last_index.borrow_mut() = value;
         });

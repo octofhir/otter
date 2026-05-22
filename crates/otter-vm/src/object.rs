@@ -165,7 +165,7 @@ impl ObjectPrototype {
         match self {
             Self::Null => None,
             Self::Object(obj) => Some(Value::Object(*obj)),
-            Self::Value(value) => Some(value.clone()),
+            Self::Value(value) => Some(*value),
             Self::Proxy(proxy) => Some(Value::Proxy(*proxy)),
         }
     }
@@ -245,12 +245,10 @@ impl PropertySlot {
         PropertyDescriptor {
             flags: self.flags,
             kind: match &self.body {
-                SlotBody::Data { value } => DescriptorKind::Data {
-                    value: value.clone(),
-                },
+                SlotBody::Data { value } => DescriptorKind::Data { value: *value },
                 SlotBody::Accessor { getter, setter } => DescriptorKind::Accessor {
-                    getter: getter.clone(),
-                    setter: setter.clone(),
+                    getter: *getter,
+                    setter: *setter,
                 },
             },
         }
@@ -259,12 +257,12 @@ impl PropertySlot {
     fn to_lookup(&self) -> PropertyLookup {
         match &self.body {
             SlotBody::Data { value } => PropertyLookup::Data {
-                value: value.clone(),
+                value: *value,
                 flags: self.flags,
             },
             SlotBody::Accessor { getter, setter } => PropertyLookup::Accessor {
-                getter: getter.clone(),
-                setter: setter.clone(),
+                getter: *getter,
+                setter: *setter,
                 flags: self.flags,
             },
         }
@@ -836,7 +834,7 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
             return Some(read_upvalue(heap, cell));
         }
         body_offset_of(heap, body, key).map(|offset| match &body.slots[offset as usize].body {
-            SlotBody::Data { value } => value.clone(),
+            SlotBody::Data { value } => *value,
             SlotBody::Accessor { .. } => Value::Undefined,
         })
     })
@@ -976,7 +974,7 @@ pub(crate) fn load_own_data_slot_atom(
             return Some(read_upvalue(heap, cell));
         }
         match &body.slots.get(offset)?.body {
-            SlotBody::Data { value } => Some(value.clone()),
+            SlotBody::Data { value } => Some(*value),
             SlotBody::Accessor { .. } => None,
         }
     })
@@ -1012,14 +1010,14 @@ pub(crate) fn store_own_data_slot_atom(
         let SlotBody::Data { value: stored } = &mut slot.body else {
             return false;
         };
-        *stored = value.clone();
+        *stored = *value;
         true
     });
     if !success {
         return None;
     }
     if let Some(cell) = mapped_cell {
-        store_upvalue(heap, cell, value.clone());
+        store_upvalue(heap, cell, *value);
     }
     heap.record_write(obj, value);
     Some(())
@@ -1157,7 +1155,7 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) ->
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
             .map(|(_, slot)| match &slot.body {
-                SlotBody::Data { value } => value.clone(),
+                SlotBody::Data { value } => *value,
                 SlotBody::Accessor { .. } => Value::Undefined,
             })
     })
@@ -1247,7 +1245,7 @@ pub fn get_own_symbol_descriptor(
 /// objects.
 pub fn set_call_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
     heap.with_payload(obj, |body| {
-        body.call_native = Some(native.clone());
+        body.call_native = Some(native);
     });
     heap.record_write(obj, &native);
 }
@@ -1255,7 +1253,7 @@ pub fn set_call_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value
 /// Read the internal native `[[Call]]` slot.
 #[must_use]
 pub fn call_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
-    heap.read_payload(obj, |body| body.call_native.clone())
+    heap.read_payload(obj, |body| body.call_native)
 }
 
 /// Store the internal native `[[Construct]]` slot for constructor-shaped
@@ -1263,8 +1261,8 @@ pub fn call_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
 /// too, so this also installs the same callback as `[[Call]]`.
 pub fn set_constructor_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native: Value) {
     heap.with_payload(obj, |body| {
-        body.call_native = Some(native.clone());
-        body.constructor_native = Some(native.clone());
+        body.call_native = Some(native);
+        body.constructor_native = Some(native);
     });
     heap.record_write(obj, &native);
 }
@@ -1272,7 +1270,7 @@ pub fn set_constructor_native(obj: JsObject, heap: &mut otter_gc::GcHeap, native
 /// Read the internal native `[[Construct]]` slot.
 #[must_use]
 pub fn constructor_native(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
-    heap.read_payload(obj, |body| body.constructor_native.clone())
+    heap.read_payload(obj, |body| body.constructor_native)
 }
 
 /// Store the `[[BooleanData]]` internal slot for a Boolean wrapper.
@@ -1324,7 +1322,7 @@ pub fn set_symbol_data(obj: JsObject, heap: &mut otter_gc::GcHeap, value: crate:
 /// Read the `[[SymbolData]]` internal slot for a Symbol wrapper.
 #[must_use]
 pub fn symbol_data(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<crate::symbol::JsSymbol> {
-    heap.read_payload(obj, |body| body.symbol_data.clone())
+    heap.read_payload(obj, |body| body.symbol_data)
 }
 
 /// Store the `[[BigIntData]]` internal slot for a BigInt wrapper.
@@ -1498,7 +1496,7 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// Records the GC store when `value` carries a `Gc<…>` handle so the
 /// marker / scavenger see the new edge.
 pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
@@ -1523,7 +1521,7 @@ pub(crate) fn set_with_shape(
     value: Value,
     next_shape: ShapeHandle,
 ) {
-    let barrier_value = value.clone();
+    let barrier_value = value;
     let existing_offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key));
     heap.with_payload(obj, |body| {
         if let Some(offset) = existing_offset {
@@ -1561,7 +1559,7 @@ pub fn ordinary_set_data_property(
     value: Value,
 ) -> bool {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-    let success = descriptor_core::ordinary_set_data_property(obj, heap, key, value.clone());
+    let success = descriptor_core::ordinary_set_data_property(obj, heap, key, value);
     if success && let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, value);
     }
@@ -1576,13 +1574,8 @@ pub(crate) fn ordinary_set_data_property_with_shape(
     next_shape: ShapeHandle,
 ) -> bool {
     let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
-    let success = descriptor_core::ordinary_set_data_property_with_shape(
-        obj,
-        heap,
-        key,
-        value.clone(),
-        next_shape,
-    );
+    let success =
+        descriptor_core::ordinary_set_data_property_with_shape(obj, heap, key, value, next_shape);
     if success && let Some(cell) = mapped_cell {
         store_upvalue(heap, cell, value);
     }
@@ -1831,7 +1824,7 @@ pub fn define_own_property_partial(
         if let Some(cell) = mapped_cell {
             match &map_descriptor.kind {
                 DescriptorKind::Data { value } => {
-                    store_upvalue(heap, cell, value.clone());
+                    store_upvalue(heap, cell, *value);
                     if !map_descriptor.writable() {
                         heap.with_payload(obj, |body| remove_mapped_argument(body, key));
                     }
@@ -1885,7 +1878,7 @@ pub(crate) fn define_own_property_partial_with_shape(
         if let Some(cell) = mapped_cell {
             match &map_descriptor.kind {
                 DescriptorKind::Data { value } => {
-                    store_upvalue(heap, cell, value.clone());
+                    store_upvalue(heap, cell, *value);
                     if !map_descriptor.writable() {
                         heap.with_payload(obj, |body| remove_mapped_argument(body, key));
                     }
@@ -1933,10 +1926,8 @@ pub fn define_own_symbol_property_partial(
             if !body.extensible {
                 return false;
             }
-            body.symbol_props.push((
-                key.clone(),
-                PropertySlot::from_descriptor(completed.clone()),
-            ));
+            body.symbol_props
+                .push((*key, PropertySlot::from_descriptor(completed.clone())));
             true
         }
     });
@@ -1992,7 +1983,7 @@ pub fn define_own_property(
         if let Some(cell) = mapped_cell {
             match &map_descriptor.kind {
                 DescriptorKind::Data { value } => {
-                    store_upvalue(heap, cell, value.clone());
+                    store_upvalue(heap, cell, *value);
                     if !map_descriptor.writable() {
                         heap.with_payload(obj, |body| remove_mapped_argument(body, key));
                     }
@@ -2039,7 +2030,7 @@ pub fn define_own_symbol_property(
                 return false;
             }
             body.symbol_props
-                .push((key.clone(), PropertySlot::from_descriptor(descriptor)));
+                .push((*key, PropertySlot::from_descriptor(descriptor)));
             true
         }
     });
@@ -2289,7 +2280,7 @@ impl<'a> Properties<'a> {
         self.string_keys.iter().map(|(key, idx)| {
             let slot = &self.body.slots[*idx];
             let value = match &slot.body {
-                SlotBody::Data { value } => value.clone(),
+                SlotBody::Data { value } => *value,
                 SlotBody::Accessor { .. } => Value::Undefined,
             };
             (key.as_str(), value)
@@ -2305,7 +2296,7 @@ impl<'a> Properties<'a> {
     /// Used by `Object.getOwnPropertySymbols` (§20.1.2.13) and
     /// `Reflect.ownKeys` (§28.1.16) to surface symbol keys.
     pub fn symbol_keys(&self) -> impl Iterator<Item = JsSymbol> + '_ {
-        self.body.symbol_props.iter().map(|(k, _)| k.clone())
+        self.body.symbol_props.iter().map(|(k, _)| *k)
     }
 
     /// Iterate `(key, data-value)` pairs in ordinary own-key order,
@@ -2318,7 +2309,7 @@ impl<'a> Properties<'a> {
                 return None;
             }
             match &slot.body {
-                SlotBody::Data { value } => Some((key.as_str(), value.clone())),
+                SlotBody::Data { value } => Some((key.as_str(), *value)),
                 SlotBody::Accessor { .. } => None,
             }
         })
@@ -2345,7 +2336,7 @@ impl<'a> Properties<'a> {
                 return None;
             }
             match &slot.body {
-                SlotBody::Data { value } => Some((sym.clone(), value.clone())),
+                SlotBody::Data { value } => Some((*sym, *value)),
                 SlotBody::Accessor { .. } => None,
             }
         })

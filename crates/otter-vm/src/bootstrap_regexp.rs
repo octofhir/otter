@@ -61,8 +61,8 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         object::set_prototype(prototype, heap, Some(object_proto));
     }
 
-    install_prototype_methods(heap, prototype, vec![global_root.clone()])?;
-    install_prototype_accessors(heap, prototype, vec![global_root.clone()])?;
+    install_prototype_methods(heap, prototype, vec![global_root])?;
+    install_prototype_accessors(heap, prototype, vec![global_root])?;
 
     let prototype_root = Value::Object(prototype);
     let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
@@ -122,7 +122,7 @@ fn install_regexp_legacy_accessors(
         getter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
         let ctor_value = Value::NativeFunction(ctor);
-        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value.clone()];
+        let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
         let getter = NativeFunction::with_length_and_captures(
             heap,
             getter_name,
@@ -147,8 +147,8 @@ fn install_regexp_legacy_accessors(
         setter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
         let ctor_value = Value::NativeFunction(ctor);
-        let g_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value.clone()];
-        let s_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value.clone()];
+        let g_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
+        let s_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
         let getter = NativeFunction::with_length_and_captures(
             heap,
             getter_name,
@@ -212,7 +212,7 @@ fn legacy_accessor_getter(
     _args: &[Value],
     captures: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let ctor = captures.first().cloned().unwrap_or(Value::Undefined);
     if !values_strict_equal(&this_value, &ctor) {
         return Err(NativeError::TypeError {
@@ -238,7 +238,7 @@ fn legacy_accessor_setter(
     _args: &[Value],
     captures: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let ctor = captures.first().cloned().unwrap_or(Value::Undefined);
     if !values_strict_equal(&this_value, &ctor) {
         return Err(NativeError::TypeError {
@@ -430,11 +430,11 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         let flags = if matches!(flags_arg, Value::Undefined) {
             crate::regexp_prototype::get_property_runtime(ctx, &pattern_arg, "flags", "RegExp")?
         } else {
-            flags_arg.clone()
+            flags_arg
         };
         (source, flags)
     } else {
-        (pattern_arg.clone(), flags_arg.clone())
+        (pattern_arg, flags_arg)
     };
     let pattern_utf16 = if matches!(pattern_source, Value::Undefined) {
         Vec::new()
@@ -714,7 +714,7 @@ fn install_accessor(
 /// `EscapeRegExpPattern(src, flags)`: empty source → `"(?:)"`,
 /// unescaped `/` / line terminators escaped.
 fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
 
     let raw = match &receiver {
         Value::RegExp(re) => re.source(ctx.heap()),
@@ -757,7 +757,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 /// Spec order is `d g i m s u v y` (hasIndices, global, ignoreCase,
 /// multiline, dotAll, unicode, unicodeSets, sticky).
 fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     if !matches!(
         receiver,
         Value::Object(_)
@@ -818,8 +818,8 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
         let outcome = interp
             .ordinary_get_value(
                 &exec,
-                receiver.clone(),
-                receiver.clone(),
+                receiver,
+                receiver,
                 &crate::VmPropertyKey::String(prop),
                 0,
             )
@@ -829,7 +829,7 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
                 interp
-                    .run_callable_sync(&exec, &getter, receiver.clone(), args)
+                    .run_callable_sync(&exec, &getter, receiver, args)
                     .map_err(map_err)?
             }
         };

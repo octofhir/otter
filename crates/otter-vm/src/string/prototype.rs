@@ -1610,7 +1610,7 @@ fn native_string_method(
     {
         return native_string_replace_callable(name == "replaceAll", ctx, args);
     }
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     // §B.2.3.* CreateHTML — `String.prototype.{anchor, big, blink,
     // bold, fixed, fontcolor, fontsize, italics, link, small, strike,
     // sub, sup}` and §B.2.3.1 `substr` start with
@@ -1809,7 +1809,7 @@ fn native_string_replace_callable(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
 
     let mut intrinsic_args = IntrinsicArgs {
         receiver: &receiver,
@@ -1857,7 +1857,7 @@ fn native_string_replace_callable(
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 Value::String(needle),
                 Value::Number(crate::number::NumberValue::from_f64(pos as f64)),
-                recv_value.clone(),
+                recv_value,
             ];
             let raw = interp
                 .run_callable_sync(&context, &callback, Value::Undefined, cb_args)
@@ -1897,7 +1897,7 @@ fn native_string_replace_callable(
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 Value::String(needle),
                 Value::Number(crate::number::NumberValue::from_f64(cursor as f64)),
-                recv_value.clone(),
+                recv_value,
             ];
             let raw = interp
                 .run_callable_sync(&context, &callback, Value::Undefined, cb_args)

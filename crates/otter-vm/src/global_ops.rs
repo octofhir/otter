@@ -78,7 +78,7 @@ impl Interpreter {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let value = crate::read_register(frame, value_reg)?.clone();
+        let value = *crate::read_register(frame, value_reg)?;
         let descriptor = object::PartialPropertyDescriptor {
             value: Some(value),
             writable: Some(true),

@@ -43,14 +43,14 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// receiver symbol primitive.
 fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
-    Ok(Value::Symbol(sym.clone()))
+    Ok(Value::Symbol(*sym))
 }
 
 /// `Symbol.prototype[@@toPrimitive]` — Spec §20.4.3.5. The hint is
 /// ignored; the symbol primitive is returned for every hint.
 fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
-    Ok(Value::Symbol(sym.clone()))
+    Ok(Value::Symbol(*sym))
 }
 
 /// Read a non-method property off `Symbol.prototype`-bearing

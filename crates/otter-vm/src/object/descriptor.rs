@@ -289,14 +289,14 @@ impl PartialPropertyDescriptor {
     pub fn complete_for_new_property(&self) -> PropertyDescriptor {
         if self.is_accessor() {
             PropertyDescriptor::accessor(
-                self.get.clone(),
-                self.set.clone(),
+                self.get,
+                self.set,
                 self.enumerable.unwrap_or(false),
                 self.configurable.unwrap_or(false),
             )
         } else {
             PropertyDescriptor::data(
-                self.value.clone().unwrap_or(Value::Undefined),
+                self.value.unwrap_or(Value::Undefined),
                 self.writable.unwrap_or(false),
                 self.enumerable.unwrap_or(false),
                 self.configurable.unwrap_or(false),
@@ -311,7 +311,7 @@ impl PartialPropertyDescriptor {
     pub fn from_full(desc: &PropertyDescriptor) -> Self {
         match &desc.kind {
             DescriptorKind::Data { value } => Self {
-                value: Some(value.clone()),
+                value: Some(*value),
                 writable: Some(desc.flags.writable()),
                 get: None,
                 set: None,
@@ -321,8 +321,8 @@ impl PartialPropertyDescriptor {
             DescriptorKind::Accessor { getter, setter } => Self {
                 value: None,
                 writable: None,
-                get: getter.clone(),
-                set: setter.clone(),
+                get: *getter,
+                set: *setter,
                 enumerable: Some(desc.flags.enumerable()),
                 configurable: Some(desc.flags.configurable()),
             },

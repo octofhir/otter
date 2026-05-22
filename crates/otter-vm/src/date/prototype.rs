@@ -481,7 +481,7 @@ fn native_date_method(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -595,7 +595,7 @@ date_prototype_methods!(
 /// - <https://tc39.es/ecma262/#sec-invoke>
 fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "Date.prototype.toJSON";
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     // §7.1.18 ToObject(undefined / null) → TypeError.
     if matches!(receiver, Value::Undefined | Value::Null) {
         return Err(NativeError::TypeError {
@@ -636,15 +636,15 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
             interp.ordinary_get_value(
                 &exec,
                 Value::Object(proto),
-                receiver.clone(),
+                receiver,
                 &VmPropertyKey::String("toISOString"),
                 0,
             )
         }
         _ => interp.ordinary_get_value(
             &exec,
-            receiver.clone(),
-            receiver.clone(),
+            receiver,
+            receiver,
             &VmPropertyKey::String("toISOString"),
             0,
         ),
@@ -653,7 +653,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     let method = match method {
         VmGetOutcome::Value(v) => v,
         VmGetOutcome::InvokeGetter { getter } => interp
-            .run_callable_sync(&exec, &getter, receiver.clone(), SmallVec::new())
+            .run_callable_sync(&exec, &getter, receiver, SmallVec::new())
             .map_err(|err| vm_to_native(NAME, err))?,
     };
     if !abstract_ops::is_callable(&method) {

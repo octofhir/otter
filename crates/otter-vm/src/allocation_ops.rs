@@ -561,7 +561,7 @@ impl Interpreter {
             let frame = &stack[top_idx];
             for i in 0..count {
                 let r = register_operand(operands.get(2 + i))?;
-                elements.push(read_register(frame, r)?.clone());
+                elements.push(*read_register(frame, r)?);
             }
         }
         let array = self.alloc_stack_rooted_array_from_elements(stack, elements)?;
@@ -600,7 +600,7 @@ impl Interpreter {
         value_reg: u16,
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
-        let value = read_register(frame, value_reg)?.clone();
+        let value = *read_register(frame, value_reg)?;
         let array = match read_register(frame, arr_reg)? {
             Value::Array(a) => *a,
             _ => return Err(VmError::TypeMismatch),
@@ -625,7 +625,7 @@ impl Interpreter {
         target_reg: u16,
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
-        let target = read_register(frame, target_reg)?.clone();
+        let target = *read_register(frame, target_reg)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -652,7 +652,7 @@ impl Interpreter {
         callback_reg: u16,
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
-        let callback = read_register(frame, callback_reg)?.clone();
+        let callback = *read_register(frame, callback_reg)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {

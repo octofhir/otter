@@ -36,7 +36,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         for method in super::prototype::BOOLEAN_PROTOTYPE_METHODS {
             builder.method_from_spec(method)?;
         }
@@ -105,7 +105,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         prototype,
         heap,
         "constructor",
-        crate::object::PropertyDescriptor::data(boolean_value.clone(), true, false, true),
+        crate::object::PropertyDescriptor::data(boolean_value, true, false, true),
     );
     crate::bootstrap::define_global_value(
         global,
@@ -124,7 +124,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
 fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let value = args.first().is_some_and(|v| v.to_boolean(ctx.heap()));
     if ctx.is_construct_call() {
-        let this = ctx.this_value().clone();
+        let this = *ctx.this_value();
         if let Value::Object(obj) = this {
             crate::object::set_boolean_data(obj, ctx.heap_mut(), value);
             Ok(Value::Object(obj))

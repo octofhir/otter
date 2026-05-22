@@ -84,7 +84,7 @@ impl FunctionKindPrototypes {
                 ctor,
                 heap,
                 "prototype",
-                object::PropertyDescriptor::data(proto_value.clone(), false, false, false),
+                object::PropertyDescriptor::data(proto_value, false, false, false),
             );
             object::define_own_property(
                 proto,

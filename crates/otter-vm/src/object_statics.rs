@@ -227,7 +227,7 @@ fn native_group_by_rooted(
 
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        cb_args.push(item.clone());
+        cb_args.push(*item);
         cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
             idx as f64,
         )));
@@ -259,7 +259,7 @@ fn native_group_by_rooted(
                 arr
             }
         };
-        let value_root = item.clone();
+        let value_root = *item;
         let arr_value = Value::Array(group);
         let roots = [&value_root, &arr_value, &Value::Object(result)];
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -267,7 +267,7 @@ fn native_group_by_rooted(
                 v.trace_value_slots(visitor);
             }
         };
-        crate::array::push_with_roots(group, ctx.heap_mut(), item.clone(), &mut external_visit)?;
+        crate::array::push_with_roots(group, ctx.heap_mut(), *item, &mut external_visit)?;
     }
     Ok(Value::Object(result))
 }
@@ -275,7 +275,7 @@ fn native_group_by_rooted(
 fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
     let proto = args.first().cloned().unwrap_or(Value::Undefined);
     let proto_value = match proto {
-        Value::Object(_) | Value::Iterator(_) => Some(proto.clone()),
+        Value::Object(_) | Value::Iterator(_) => Some(proto),
         Value::Null => None,
         _ => return Err(VmError::TypeMismatch),
     };
@@ -338,7 +338,7 @@ fn native_keys_rooted(
                     Value::String(s) => {
                         crate::VmPropertyKey::OwnedString(s.to_lossy_string(ctx.heap()))
                     }
-                    Value::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
+                    Value::Symbol(sym) => crate::VmPropertyKey::Symbol(*sym),
                     _ => return Err(VmError::TypeMismatch),
                 };
                 let desc = ctx
@@ -346,7 +346,7 @@ fn native_keys_rooted(
                     .interp
                     .ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
-                        target.clone(),
+                        target,
                         &vm_key,
                         0,
                         &[&target],
@@ -358,10 +358,10 @@ fn native_keys_rooted(
             }
             values
         } else {
-            let keys =
-                ctx.cx
-                    .interp
-                    .enumerable_own_string_keys_for_value(context, target.clone(), 0)?;
+            let keys = ctx
+                .cx
+                .interp
+                .enumerable_own_string_keys_for_value(context, target, 0)?;
 
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
@@ -524,7 +524,7 @@ fn native_from_entries_rooted(
         };
         let set_result = match &key_pk {
             crate::VmPropertyKey::Symbol(sym) => {
-                crate::object::set_symbol(result, ctx.heap_mut(), sym.clone(), value);
+                crate::object::set_symbol(result, ctx.heap_mut(), *sym, value);
                 Ok(())
             }
             _ => {
@@ -551,15 +551,15 @@ fn read_entry_index(
     let interp = ctx.interp_mut();
     let outcome = interp.ordinary_get_value(
         context,
-        target.clone(),
-        target.clone(),
+        *target,
+        *target,
         &crate::VmPropertyKey::String(name),
         0,
     )?;
     match outcome {
         crate::VmGetOutcome::Value(v) => Ok(v),
         crate::VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, target.clone(), smallvec::SmallVec::new())
+            interp.run_callable_sync(context, &getter, *target, smallvec::SmallVec::new())
         }
     }
 }
@@ -574,7 +574,7 @@ fn set_from_entries_key_heap(
 ) -> Result<(), VmError> {
     match key {
         Value::Symbol(sym) => {
-            crate::object::set_symbol(target, heap, sym.clone(), value);
+            crate::object::set_symbol(target, heap, *sym, value);
             Ok(())
         }
         _ => {
@@ -657,11 +657,10 @@ fn native_get_own_property_descriptor_rooted(
         let Some(context) = context else {
             return Err(VmError::InvalidOperand);
         };
-        let desc = ctx.cx.interp.get_own_property_descriptor_for_value(
-            context,
-            target.clone(),
-            args.get(1),
-        )?;
+        let desc =
+            ctx.cx
+                .interp
+                .get_own_property_descriptor_for_value(context, target, args.get(1))?;
         return match desc {
             Some(desc) => Ok(Value::Object(native_descriptor_to_object_rooted(
                 ctx,
@@ -794,12 +793,12 @@ fn native_get_own_property_descriptors_rooted(
     for key in keys {
         let key_for_descriptor = match &key {
             Value::String(s) => Value::String(*s),
-            Value::Symbol(sym) => Value::Symbol(sym.clone()),
+            Value::Symbol(sym) => Value::Symbol(*sym),
             _ => continue,
         };
         let Some(desc) = ctx.cx.interp.get_own_property_descriptor_for_value(
             context,
-            target.clone(),
+            target,
             Some(&key_for_descriptor),
         )?
         else {
@@ -819,7 +818,7 @@ fn native_get_own_property_descriptors_rooted(
                 if !crate::object::set_symbol(
                     result,
                     ctx.heap_mut(),
-                    sym.clone(),
+                    sym,
                     Value::Object(desc_obj),
                 ) =>
             {
@@ -852,7 +851,7 @@ fn native_get_own_property_names_rooted(
             let Some(context) = context else {
                 return Err(VmError::InvalidOperand);
             };
-            let target = target.clone();
+            let target = *target;
             ctx.cx
                 .interp
                 .own_property_keys_value(context, &target)?
@@ -924,7 +923,7 @@ fn native_get_own_property_symbols_rooted(
         let Some(context) = context else {
             return Err(VmError::InvalidOperand);
         };
-        let target = target.clone();
+        let target = *target;
 
         let trap_keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
         let values: Vec<Value> = trap_keys
@@ -979,12 +978,12 @@ fn native_descriptor_to_object_rooted(
     }
     match &desc.kind {
         DescriptorKind::Data { value } => {
-            ctx.set_property(result, "value", value.clone())?;
+            ctx.set_property(result, "value", *value)?;
             ctx.set_property(result, "writable", Value::Boolean(desc.writable()))?;
         }
         DescriptorKind::Accessor { getter, setter } => {
-            ctx.set_property(result, "get", getter.clone().unwrap_or(Value::Undefined))?;
-            ctx.set_property(result, "set", setter.clone().unwrap_or(Value::Undefined))?;
+            ctx.set_property(result, "get", (*getter).unwrap_or(Value::Undefined))?;
+            ctx.set_property(result, "set", (*setter).unwrap_or(Value::Undefined))?;
         }
     }
     ctx.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
@@ -1168,7 +1167,7 @@ fn object_prototype_to_object(
     ctx: &mut NativeCtx<'_>,
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let (proto_name, setter): (&str, fn(JsObject, &mut otter_gc::GcHeap, &Value)) =
         match &this_value {
             Value::Null | Value::Undefined => {
@@ -1201,7 +1200,7 @@ fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, va
         Value::Boolean(value) => crate::object::set_boolean_data(wrapper, heap, *value),
         Value::Number(value) => crate::object::set_number_data(wrapper, heap, *value),
         Value::String(value) => crate::object::set_string_data(wrapper, heap, *value),
-        Value::Symbol(value) => crate::object::set_symbol_data(wrapper, heap, value.clone()),
+        Value::Symbol(value) => crate::object::set_symbol_data(wrapper, heap, *value),
         Value::BigInt(value) => crate::object::set_bigint_data(wrapper, heap, *value),
         _ => {}
     }
@@ -1224,12 +1223,12 @@ fn native_prototype_to_locale_string(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
         let callee = ctx
             .cx
             .interp
-            .get_property_value_for_call(&context, this_value.clone(), "toString")
+            .get_property_value_for_call(&context, this_value, "toString")
             .map_err(|err| object_native_error("toLocaleString", err))?;
         if crate::is_callable_value(&callee) {
             let result = ctx
@@ -1247,7 +1246,7 @@ fn native_prototype_has_own_property(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
         let key = ctx
             .cx
@@ -1265,7 +1264,7 @@ fn native_prototype_has_own_property(
             .interp
             .ordinary_get_own_property_descriptor_value_runtime_rooted(
                 &context,
-                this_value.clone(),
+                this_value,
                 &key,
                 0,
                 &[&this_value],
@@ -1280,7 +1279,7 @@ fn native_prototype_has_own_property(
             reason: "cannot convert null or undefined to object".to_string(),
         });
     }
-    let this_kind = ctx.this_value().clone();
+    let this_kind = *ctx.this_value();
     let present = match &this_kind {
         Value::Object(obj) => has_own_property(*obj, ctx.heap(), args.first())
             .map_err(|err| object_native_error("hasOwnProperty", err))?,
@@ -1314,7 +1313,7 @@ fn native_prototype_property_is_enumerable(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
             name: "propertyIsEnumerable",
@@ -1331,7 +1330,7 @@ fn native_prototype_property_is_enumerable(
             desc.as_ref().is_some_and(PropertyDescriptor::enumerable),
         ));
     }
-    let this_clone = ctx.this_value().clone();
+    let this_clone = *ctx.this_value();
     let enumerable = match &this_clone {
         Value::Object(obj) => {
             let key = expect_property_key(args.first(), ctx.heap())
@@ -1388,7 +1387,7 @@ fn native_prototype_is_prototype_of(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let target = args.first().cloned().unwrap_or(Value::Undefined);
     if !is_object_like_value(&target) {
         return Ok(Value::Boolean(false));
@@ -1439,7 +1438,7 @@ pub fn native_prototype_proto_get(
     ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
             name: "get __proto__",
@@ -1497,7 +1496,7 @@ pub fn native_prototype_proto_set(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
             name: "set __proto__",
@@ -1597,7 +1596,7 @@ fn define_accessor_helper(
     is_setter: bool,
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
             name: method_name,
@@ -1710,7 +1709,7 @@ fn lookup_accessor_helper(
     lookup_setter: bool,
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
             name: method_name,
@@ -1730,7 +1729,7 @@ fn lookup_accessor_helper(
                 .interp
                 .ordinary_get_own_property_descriptor_value_runtime_rooted(
                     &exec_ctx,
-                    value.clone(),
+                    value,
                     &key,
                     0,
                     &[&value],
@@ -1789,7 +1788,7 @@ fn lookup_accessor_helper(
 fn property_key_to_vm_key(key: &PropertyKey) -> crate::VmPropertyKey<'static> {
     match key {
         PropertyKey::String(name) => crate::VmPropertyKey::OwnedString(name.clone()),
-        PropertyKey::Symbol(sym) => crate::VmPropertyKey::Symbol(sym.clone()),
+        PropertyKey::Symbol(sym) => crate::VmPropertyKey::Symbol(*sym),
     }
 }
 
@@ -1876,7 +1875,7 @@ fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
 /// `[[ProxyTarget]]` chain until reaching a non-proxy value and
 /// returns the builtin tag of that underlying value.
 fn proxy_builtin_tag(value: &Value, heap: &otter_gc::GcHeap) -> String {
-    let mut current = value.clone();
+    let mut current = *value;
     let mut hops = 0_usize;
     loop {
         if hops >= crate::object::PROTO_CHAIN_HARD_CAP {
@@ -1957,7 +1956,7 @@ fn explicit_to_string_tag_with_context(
     // builtin tags before ToObject and never enter the `[[Get]]`
     // ladder. The `Hole` sentinel never reaches user code, but if it
     // somehow does, behave like `undefined`.
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     if matches!(this_value, Value::Undefined | Value::Null | Value::Hole) {
         return Ok(None);
     }
@@ -1976,12 +1975,12 @@ fn explicit_to_string_tag_with_context(
             None => return Ok(None),
         }
     } else {
-        this_value.clone()
+        this_value
     };
     let outcome = ctx.cx.interp.ordinary_get_value(
         exec_ctx,
         base,
-        this_value.clone(),
+        this_value,
         &crate::VmPropertyKey::Symbol(tag_symbol),
         0,
     )?;
@@ -2054,7 +2053,7 @@ pub fn call(
         M::Create => {
             let proto = args.first().cloned().unwrap_or(Value::Undefined);
             let proto_value = match proto {
-                Value::Object(_) | Value::Iterator(_) => Some(proto.clone()),
+                Value::Object(_) | Value::Iterator(_) => Some(proto),
                 Value::Null => None,
                 _ => return Err(VmError::TypeMismatch),
             };
@@ -2246,7 +2245,7 @@ pub fn call(
                                         ),
                                     });
                                 }
-                                if let Some(value) = descriptor.value.clone() {
+                                if let Some(value) = descriptor.value {
                                     let coerced =
                                         crate::binary::dispatch::coerce_element_for_store(
                                             gc_heap,
@@ -2741,7 +2740,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.fromentries>
         M::FromEntries => {
             let iter = args.first().cloned().unwrap_or(Value::Undefined);
-            let iter_root = iter.clone();
+            let iter_root = iter;
             let result = rooted_object(gc_heap, &[&iter_root], &[args])?;
             match iter {
                 Value::Array(arr) => {
@@ -2993,7 +2992,7 @@ fn descriptor_to_object_with_roots(
     let result = rooted_object(gc_heap, &roots, slice_roots)?;
     match &desc.kind {
         DescriptorKind::Data { value } => {
-            crate::object::set(result, gc_heap, "value", value.clone());
+            crate::object::set(result, gc_heap, "value", *value);
             crate::object::set(result, gc_heap, "writable", Value::Boolean(desc.writable()));
         }
         DescriptorKind::Accessor { getter, setter } => {
@@ -3001,13 +3000,13 @@ fn descriptor_to_object_with_roots(
                 result,
                 gc_heap,
                 "get",
-                getter.clone().unwrap_or(Value::Undefined),
+                (*getter).unwrap_or(Value::Undefined),
             );
             crate::object::set(
                 result,
                 gc_heap,
                 "set",
-                setter.clone().unwrap_or(Value::Undefined),
+                (*setter).unwrap_or(Value::Undefined),
             );
         }
     }
@@ -3041,7 +3040,7 @@ fn lookup_to_optional_value(lookup: &PropertyLookup) -> Result<Option<Value>, Vm
         PropertyLookup::Absent => Ok(None),
         PropertyLookup::Data { value, .. } => match value {
             Value::Undefined => Ok(None),
-            v => Ok(Some(v.clone())),
+            v => Ok(Some(*v)),
         },
         PropertyLookup::Accessor { .. } => Ok(None),
     }
@@ -3066,7 +3065,7 @@ fn expect_property_key(
         )),
         Some(Value::Null) => Ok(PropertyKey::String("null".to_string())),
         Some(Value::Undefined) | None => Ok(PropertyKey::String("undefined".to_string())),
-        Some(Value::Symbol(sym)) => Ok(PropertyKey::Symbol(sym.clone())),
+        Some(Value::Symbol(sym)) => Ok(PropertyKey::Symbol(*sym)),
         _ => Err(VmError::TypeMismatch),
     }
 }

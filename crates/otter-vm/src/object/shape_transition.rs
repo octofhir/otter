@@ -114,7 +114,7 @@ pub(crate) fn capture_store_property_transition(
         body.dictionary_shape_id = to_shape_id;
         body.dictionary_keys.push(key.name().to_owned());
         body.shape = super::ShapeHandle::null();
-        body.slots.push(PropertySlot::data_default(value.clone()));
+        body.slots.push(PropertySlot::data_default(*value));
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -152,7 +152,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
         }
         let slot = u16::try_from(body.slots.len()).ok()?;
         body.shape = next_shape;
-        body.slots.push(PropertySlot::data_default(value.clone()));
+        body.slots.push(PropertySlot::data_default(*value));
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -212,7 +212,7 @@ pub(crate) fn replay_store_property_transition(
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));
             body.shape = transition.to_shape;
         }
-        body.slots.push(PropertySlot::data_default(value.clone()));
+        body.slots.push(PropertySlot::data_default(*value));
         true
     });
     if !success {

@@ -57,7 +57,7 @@ fn collect_reflect_args(
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
     for i in 0..argc {
         let r = register_operand(operands.get(3 + i))?;
-        args.push(read_register(frame, r)?.clone());
+        args.push(*read_register(frame, r)?);
     }
     Ok(args)
 }

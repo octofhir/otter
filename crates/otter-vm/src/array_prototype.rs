@@ -104,7 +104,7 @@ pub(crate) fn array_like_present_entries(
                     .enumerate()
                     .filter_map(|(i, v)| match v {
                         Value::Hole => None,
-                        other => Some((i, other.clone())),
+                        other => Some((i, *other)),
                     })
                     .collect()
             }))
@@ -304,7 +304,7 @@ fn impl_push(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let new_len = base_len.saturating_add(added);
         for (i, v) in args.args.iter().enumerate() {
             let key = (base_len + i).to_string();
-            crate::object::set(*obj, heap, &key, v.clone());
+            crate::object::set(*obj, heap, &key, *v);
         }
         crate::object::set(
             *obj,
@@ -398,13 +398,13 @@ fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let mut post_present: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for (i, v) in &entries {
             if *i == 0 {
-                first = Some(v.clone());
+                first = Some(*v);
                 continue;
             }
             if *i < len {
                 let new_idx = *i - 1;
                 let new_key = new_idx.to_string();
-                crate::object::set(*obj, heap, &new_key, v.clone());
+                crate::object::set(*obj, heap, &new_key, *v);
                 post_present.insert(new_idx);
             }
         }
@@ -500,7 +500,7 @@ fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         // Prepend the new items at indices 0..arg_count.
         for (i, v) in args.args.iter().enumerate() {
-            crate::object::set(*obj, heap, &i.to_string(), v.clone());
+            crate::object::set(*obj, heap, &i.to_string(), *v);
         }
         let new_len = existing_len + arg_count;
         crate::object::set(
@@ -594,7 +594,7 @@ fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                     combined.extend(elements.iter().cloned());
                 });
             }
-            other => combined.push(other.clone()),
+            other => combined.push(*other),
         }
     }
     Ok(Value::Array(args.array_from_elements_rooted(
@@ -843,7 +843,7 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let heap_ref = &mut *args.gc_heap;
         let len = read_array_like_length(*obj, heap_ref);
         if len < 2 {
-            return Ok(args.receiver.clone());
+            return Ok(*args.receiver);
         }
         let entries = array_like_present_entries(args.receiver, heap_ref)
             .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
@@ -893,7 +893,7 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             crate::object::set(*obj, heap, &key_m, v_i);
             let _ = crate::object::delete(*obj, heap, &key_i);
         }
-        return Ok(args.receiver.clone());
+        return Ok(*args.receiver);
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -911,7 +911,7 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let heap = &mut *args.gc_heap;
             array::with_elements_mut(*arr, heap, |elements| {
                 for slot in elements.iter_mut().take(end).skip(start) {
-                    *slot = value.clone();
+                    *slot = value;
                 }
             });
         }
@@ -926,9 +926,9 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         // bounded `start..end` walk is safe.
         let heap = &mut *args.gc_heap;
         for k in start..end {
-            crate::object::set(*obj, heap, &k.to_string(), value.clone());
+            crate::object::set(*obj, heap, &k.to_string(), value);
         }
-        return Ok(args.receiver.clone());
+        return Ok(*args.receiver);
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -956,7 +956,7 @@ fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 Value::Array(a) if depth > 0 => {
                     array::with_elements(*a, heap, |inner| walk(out, heap, inner, depth - 1));
                 }
-                other => out.push(other.clone()),
+                other => out.push(*other),
             }
         }
     }
@@ -1055,7 +1055,7 @@ fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let mut removed: Vec<Value> = vec![Value::Undefined; delete_count];
         for (i, v) in &entries {
             if *i >= start && *i < start + delete_count {
-                removed[*i - start] = v.clone();
+                removed[*i - start] = *v;
             }
         }
         let heap = &mut *args.gc_heap;
@@ -1069,7 +1069,7 @@ fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 .filter(|(i, _)| *i >= start + delete_count && *i < len)
             {
                 let new_idx = i - shift;
-                crate::object::set(*obj, heap, &new_idx.to_string(), v.clone());
+                crate::object::set(*obj, heap, &new_idx.to_string(), *v);
             }
             // Delete pre-present positions that no longer hold a
             // value. Post-present positions = {i - shift for i in
@@ -1100,11 +1100,11 @@ fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let tail: Vec<(usize, Value)> = entries
                 .iter()
                 .filter(|(i, _)| *i >= start + delete_count && *i < len)
-                .map(|(i, v)| (*i, v.clone()))
+                .map(|(i, v)| (*i, *v))
                 .collect();
             for (i, v) in tail.iter().rev() {
                 let new_idx = i + shift;
-                crate::object::set(*obj, heap, &new_idx.to_string(), v.clone());
+                crate::object::set(*obj, heap, &new_idx.to_string(), *v);
             }
             let mut post_present: std::collections::BTreeSet<usize> =
                 std::collections::BTreeSet::new();
@@ -1224,7 +1224,7 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let end = clamp_index(end_raw, len);
     let count = end.saturating_sub(from).min(len.saturating_sub(to));
     if count == 0 {
-        return Ok(args.receiver.clone());
+        return Ok(*args.receiver);
     }
     if let Value::Array(arr) = args.receiver {
         let heap = &mut *args.gc_heap;
@@ -1249,7 +1249,7 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         let mut src: Vec<Option<Value>> = vec![None; count];
         for (i, v) in &entries {
             if *i >= from && *i < from + count {
-                src[*i - from] = Some(v.clone());
+                src[*i - from] = Some(*v);
             }
         }
         let heap = &mut *args.gc_heap;
@@ -1262,7 +1262,7 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
                 }
             }
         }
-        return Ok(args.receiver.clone());
+        return Ok(*args.receiver);
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -1307,7 +1307,7 @@ fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
                     if let Some(v) = elements.get(i) {
                         *slot = match v {
                             Value::Hole => Value::Undefined,
-                            other => other.clone(),
+                            other => *other,
                         };
                     }
                 }
@@ -1328,14 +1328,14 @@ fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
     out[..start].clone_from_slice(&src[..start]);
     // Write the inserts at [start, start+item_count).
     for (k, v) in args.args.iter().skip(2).enumerate() {
-        out[start + k] = v.clone();
+        out[start + k] = *v;
     }
     // Write the tail [start+skip_count, len) shifted to
     // [start+item_count, new_len).
     let mut dst = start + item_count;
     let mut srcidx = start + skip_count;
     while srcidx < len {
-        out[dst] = src[srcidx].clone();
+        out[dst] = src[srcidx];
         dst += 1;
         srcidx += 1;
     }
@@ -1527,7 +1527,7 @@ fn impl_to_sorted(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
                     if let Some(v) = elements.get(i) {
                         *slot = match v {
                             Value::Hole => Value::Undefined,
-                            other => other.clone(),
+                            other => *other,
                         };
                     }
                 }
@@ -1579,7 +1579,7 @@ fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
                 if let Some(v) = elements.get(len - 1 - i) {
                     *slot = match v {
                         Value::Hole => Value::Undefined,
-                        other => other.clone(),
+                        other => *other,
                     };
                 }
             }
@@ -1625,11 +1625,11 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         array::with_elements(*arr, &*args.gc_heap, |elements| {
             for (i, slot) in out.iter_mut().enumerate() {
                 if i == actual {
-                    *slot = replacement.clone();
+                    *slot = replacement;
                 } else if let Some(v) = elements.get(i) {
                     *slot = match v {
                         Value::Hole => Value::Undefined,
-                        other => other.clone(),
+                        other => *other,
                     };
                 }
             }
@@ -1761,7 +1761,7 @@ fn native_array_method(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     // Pre-coerce integer-typed args via `ToPrimitive(Number)` so the
     // intrinsic's strict `arg_signed_index` guard observes user
     // `@@toPrimitive` / `valueOf` / `toString` side effects per spec.
@@ -1886,7 +1886,7 @@ fn array_callback_native_dispatch(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let receiver = ctx.this_value().clone();
+    let receiver = *ctx.this_value();
     let callback = args.first().cloned().unwrap_or(Value::Undefined);
     let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
     let (interp, ctx_opt) = ctx.interp_mut_and_context();
@@ -1914,7 +1914,7 @@ fn array_callback_native_dispatch(
     let mut reduce_has_init = args.len() >= 2;
     if name == "reduce" || name == "reduceRight" {
         acc = if reduce_has_init {
-            args[1].clone()
+            args[1]
         } else {
             Value::Undefined
         };
@@ -1929,25 +1929,25 @@ fn array_callback_native_dispatch(
         let cb_args: SmallVec<[Value; 8]> = match name {
             "reduce" | "reduceRight" => {
                 if !reduce_has_init {
-                    acc = v.clone();
+                    acc = v;
                     reduce_has_init = true;
                     continue;
                 }
                 smallvec::smallvec![
-                    acc.clone(),
-                    v.clone(),
+                    acc,
+                    v,
                     Value::Number(NumberValue::from_f64(idx as f64)),
-                    receiver.clone(),
+                    receiver,
                 ]
             }
             _ => smallvec::smallvec![
-                v.clone(),
+                v,
                 Value::Number(NumberValue::from_f64(idx as f64)),
-                receiver.clone(),
+                receiver,
             ],
         };
         let result = interp
-            .run_callable_sync(&context, &callback, this_arg.clone(), cb_args)
+            .run_callable_sync(&context, &callback, this_arg, cb_args)
             .map_err(|err| NativeError::TypeError {
                 name: "Array.prototype callback",
                 reason: err.to_string(),
@@ -1959,7 +1959,7 @@ fn array_callback_native_dispatch(
                 out.push((idx, v));
             }
             "find" | "findLast" if result.to_boolean(interp.gc_heap()) => {
-                found_val = v.clone();
+                found_val = v;
                 found_idx = Some(idx);
                 break;
             }
@@ -2154,7 +2154,7 @@ mod tests {
         let arr = make_arr(&mut gc_heap, &[1, 2]);
         let r = call(
             "push",
-            arr.clone(),
+            arr,
             &[Value::Number(NumberValue::from_i32(3))],
             &mut gc_heap,
         );
@@ -2166,7 +2166,7 @@ mod tests {
     fn pop_yields_tail() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let arr = make_arr(&mut gc_heap, &[1, 2, 3]);
-        let r = call("pop", arr.clone(), &[], &mut gc_heap);
+        let r = call("pop", arr, &[], &mut gc_heap);
         assert_eq!(r.display_string(&gc_heap), "3");
         assert_eq!(render(&arr, &gc_heap), "1,2");
     }
@@ -2175,7 +2175,7 @@ mod tests {
     fn shift_yields_head() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let arr = make_arr(&mut gc_heap, &[10, 20, 30]);
-        let r = call("shift", arr.clone(), &[], &mut gc_heap);
+        let r = call("shift", arr, &[], &mut gc_heap);
         assert_eq!(r.display_string(&gc_heap), "10");
         assert_eq!(render(&arr, &gc_heap), "20,30");
     }
@@ -2224,13 +2224,13 @@ mod tests {
         let arr = make_arr(&mut gc_heap, &[10, 20, 30]);
         let yes = call(
             "includes",
-            arr.clone(),
+            arr,
             &[Value::Number(NumberValue::from_i32(20))],
             &mut gc_heap,
         );
         let no = call(
             "includes",
-            arr.clone(),
+            arr,
             &[Value::Number(NumberValue::from_i32(99))],
             &mut gc_heap,
         );

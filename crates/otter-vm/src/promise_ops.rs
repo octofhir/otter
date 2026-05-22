@@ -39,7 +39,7 @@ impl Interpreter {
         dst: u16,
         src: u16,
     ) -> Result<(), VmError> {
-        let value = read_register(&stack[top_idx], src)?.clone();
+        let value = *read_register(&stack[top_idx], src)?;
         let promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .fulfilled_stack_rooted(self, stack, value, &[], &[])?;
         write_register(&mut stack[top_idx], dst, Value::Promise(promise))?;
@@ -54,7 +54,7 @@ impl Interpreter {
         operands: &[Operand],
     ) -> Result<(), VmError> {
         let callee_reg = register_operand(operands.first())?;
-        let callee = read_register(frame, callee_reg)?.clone();
+        let callee = *read_register(frame, callee_reg)?;
         if !self.is_callable_runtime(&callee) {
             return Err(VmError::NotCallable);
         }
@@ -81,7 +81,7 @@ impl Interpreter {
         let executor_reg = register_operand(operands.get(1))?;
         let scratch_dst = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let executor = read_register(&stack[top_idx], executor_reg)?.clone();
+        let executor = *read_register(&stack[top_idx], executor_reg)?;
         if !self.is_callable_runtime(&executor) {
             return Err(VmError::NotCallable);
         }
@@ -142,7 +142,7 @@ fn collect_variadic_args(
     let mut args: SmallVec<[Value; 4]> = SmallVec::with_capacity(argc);
     for i in 0..argc {
         let r = register_operand(operands.get(args_start + i))?;
-        args.push(read_register(frame, r)?.clone());
+        args.push(*read_register(frame, r)?);
     }
     Ok(args)
 }

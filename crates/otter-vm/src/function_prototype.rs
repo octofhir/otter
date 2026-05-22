@@ -113,8 +113,7 @@ pub(crate) fn install_restricted_accessors(
         &mut external_visit,
     )?);
     for name in ["caller", "arguments"] {
-        let descriptor =
-            PropertyDescriptor::accessor(Some(thrower.clone()), Some(thrower.clone()), false, true);
+        let descriptor = PropertyDescriptor::accessor(Some(thrower), Some(thrower), false, true);
         if !object::define_own_property(prototype, heap, name, descriptor) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }

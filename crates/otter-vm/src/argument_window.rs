@@ -89,7 +89,7 @@ impl<'a> BytecodeArgumentWindow<'a> {
     pub(crate) fn to_smallvec8(&self) -> Result<SmallVec<[Value; 8]>, VmError> {
         let mut args = SmallVec::with_capacity(self.len);
         for index in 0..self.len {
-            args.push(self.get(index)?.clone());
+            args.push(*self.get(index)?);
         }
         Ok(args)
     }
@@ -101,9 +101,9 @@ impl<'a> BytecodeArgumentWindow<'a> {
     ) -> Result<(), VmError> {
         let bind_count = (function.param_count as usize).min(self.len);
         for index in 0..self.len {
-            let value = self.get(index)?.clone();
+            let value = *self.get(index)?;
             if function.needs_arguments {
-                frame.incoming_args.push(value.clone());
+                frame.incoming_args.push(value);
             }
             if index < bind_count {
                 let slot = frame

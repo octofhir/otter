@@ -67,11 +67,11 @@ impl Interpreter {
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
-        let recv_value = read_register(&stack[top_idx], recv_reg)?.clone();
+        let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
         for i in 0..argc {
             let r = register_operand(operands.get(4 + i))?;
-            arg_values.push(read_register(&stack[top_idx], r)?.clone());
+            arg_values.push(*read_register(&stack[top_idx], r)?);
         }
 
         // Promise.prototype dispatches separately because it
@@ -88,7 +88,7 @@ impl Interpreter {
                 let top_idx = stack.len() - 1;
                 let pc = stack[top_idx].pc;
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                return self.invoke(stack, context, &method, recv_value.clone(), arg_values, dst);
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
             let result = promise_dispatch::prototype_call(
                 self,
@@ -121,7 +121,7 @@ impl Interpreter {
             let result = {
                 let mut ctx = NativeCtx::new_with_call_info_and_context(
                     self,
-                    NativeCallInfo::call(recv_value.clone()),
+                    NativeCallInfo::call(recv_value),
                     Some(context.clone()),
                 );
                 bootstrap_collections::set_method_call(&mut ctx, name, &arg_values)
@@ -179,7 +179,7 @@ impl Interpreter {
                             &[&recv_value],
                             &[arg_values.as_slice()],
                         )?;
-                    let promise = cap.promise.clone();
+                    let promise = cap.promise;
                     g.set_pending_request(&mut self.gc_heap, cap.clone());
                     let outcome = self.resume_generator(context, &g, kind);
                     match outcome {
@@ -269,7 +269,7 @@ impl Interpreter {
             {
                 let pc = stack[top_idx].pc;
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                self.invoke(stack, context, &method, recv_value.clone(), arg_values, dst)?;
+                self.invoke(stack, context, &method, recv_value, arg_values, dst)?;
                 return Ok(());
             }
         }
@@ -334,7 +334,7 @@ impl Interpreter {
         // unwrap their `[[StringData]]` so the receiver flows in as
         // a primitive string for the callable-replace bridge.
         let string_recv: Option<Value> = match &recv_value {
-            Value::String(_) => Some(recv_value.clone()),
+            Value::String(_) => Some(recv_value),
             Value::Object(obj) => {
                 crate::object::string_data(*obj, &self.gc_heap).map(Value::String)
             }
@@ -920,17 +920,11 @@ impl Interpreter {
             | Value::TypedArray(_)
             | Value::Iterator(_) => {
                 let key = VmPropertyKey::String(name);
-                match self.ordinary_get_value(
-                    context,
-                    recv_value.clone(),
-                    recv_value.clone(),
-                    &key,
-                    0,
-                )? {
+                match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
                     VmGetOutcome::Value(value) => Some(value),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        Some(self.run_callable_sync(context, &getter, recv_value.clone(), args)?)
+                        Some(self.run_callable_sync(context, &getter, recv_value, args)?)
                     }
                 }
             }
@@ -943,11 +937,11 @@ impl Interpreter {
                 // than yielding `undefined`.
                 let statics = Value::Object(c.statics(&self.gc_heap));
                 let key = VmPropertyKey::String(name);
-                match self.ordinary_get_value(context, statics.clone(), statics.clone(), &key, 0)? {
+                match self.ordinary_get_value(context, statics, statics, &key, 0)? {
                     VmGetOutcome::Value(v) => v,
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, statics.clone(), args)?
+                        self.run_callable_sync(context, &getter, statics, args)?
                     }
                 }
             }),
@@ -982,17 +976,11 @@ impl Interpreter {
             // (or user-monkey-patched constructor.prototype) method.
             Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_) => {
                 let key = VmPropertyKey::String(name);
-                match self.ordinary_get_value(
-                    context,
-                    recv_value.clone(),
-                    recv_value.clone(),
-                    &key,
-                    0,
-                )? {
+                match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
                     VmGetOutcome::Value(value) if !matches!(value, Value::Undefined) => Some(value),
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        Some(self.run_callable_sync(context, &getter, recv_value.clone(), args)?)
+                        Some(self.run_callable_sync(context, &getter, recv_value, args)?)
                     }
                     _ => None,
                 }
@@ -1007,7 +995,7 @@ impl Interpreter {
                 .pc
                 .checked_add(1)
                 .ok_or(VmError::InvalidOperand)?;
-            return self.invoke(stack, context, &method, recv_value.clone(), arg_values, dst);
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
         // `Function.prototype.{call, apply, bind, toString}` on a
@@ -1069,7 +1057,7 @@ impl Interpreter {
                 let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                     Value::String(needle),
                     Value::Number(NumberValue::from_f64(pos as f64)),
-                    recv_value.clone(),
+                    recv_value,
                 ];
                 let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
                 let raw_string = match raw {
@@ -1100,7 +1088,7 @@ impl Interpreter {
                 let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                     Value::String(needle),
                     Value::Number(NumberValue::from_f64(cursor as f64)),
-                    recv_value.clone(),
+                    recv_value,
                 ];
                 let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
                 let raw_string = match raw {
@@ -1160,7 +1148,7 @@ impl Interpreter {
         dst: u16,
     ) -> Result<(), VmError> {
         let callee = match args.first() {
-            Some(c) if is_callable(c) => c.clone(),
+            Some(c) if is_callable(c) => *c,
             _ => return Err(VmError::NotCallable),
         };
         // §24.1.3.5 / §24.2.3.6 step 4 — when `thisArg` is supplied,
@@ -1182,7 +1170,7 @@ impl Interpreter {
         // `undefined` synchronously, even if the callback chain
         // produces values.
         write_register(&mut stack[top_idx], dst, Value::Undefined)?;
-        let recv_for_callback = recv.clone();
+        let recv_for_callback = *recv;
         match recv {
             Value::Map(m) => {
                 let mut index = 0;
@@ -1197,8 +1185,8 @@ impl Interpreter {
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                     cb_args.push(value);
                     cb_args.push(key);
-                    cb_args.push(recv_for_callback.clone());
-                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    cb_args.push(recv_for_callback);
+                    self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
             }
             Value::Set(s) => {
@@ -1211,10 +1199,10 @@ impl Interpreter {
                     };
                     index += 1;
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(value.clone());
                     cb_args.push(value);
-                    cb_args.push(recv_for_callback.clone());
-                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    cb_args.push(value);
+                    cb_args.push(recv_for_callback);
+                    self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
             }
             _ => unreachable!(),
@@ -1293,7 +1281,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
                 Value::Undefined
             }
@@ -1308,12 +1296,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    out.push(self.run_callable_sync(
-                        context,
-                        &callee,
-                        this_arg.clone(),
-                        cb_args,
-                    )?);
+                    out.push(self.run_callable_sync(context, &callee, this_arg, cb_args)?);
                 }
                 let result = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
@@ -1331,8 +1314,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let kept =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let kept = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if kept.to_boolean(&self.gc_heap) {
                         out.push(crate::array::get(*arr, &self.gc_heap, i));
                     }
@@ -1351,11 +1333,7 @@ impl Interpreter {
                 // TypeError.
                 let callee = require_callable(args.first())?;
                 let has_init = args.len() >= 2;
-                let initial = if has_init {
-                    args[1].clone()
-                } else {
-                    Value::Undefined
-                };
+                let initial = if has_init { args[1] } else { Value::Undefined };
                 let reverse = name == "reduceRight";
                 let mut acc;
                 let start_idx: i64;
@@ -1385,7 +1363,7 @@ impl Interpreter {
                         }
                     }
                     let seed = seed_idx.ok_or(VmError::TypeMismatch)?;
-                    acc = elements[seed].clone();
+                    acc = elements[seed];
                     start_idx = seed as i64 + step;
                 }
                 let mut i = start_idx;
@@ -1395,10 +1373,10 @@ impl Interpreter {
                         continue;
                     }
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(acc.clone());
-                    cb_args.push(elements[i as usize].clone());
+                    cb_args.push(acc);
+                    cb_args.push(elements[i as usize]);
                     cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
-                    cb_args.push(arr_value.clone());
+                    cb_args.push(arr_value);
                     acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     i += step;
                 }
@@ -1416,8 +1394,7 @@ impl Interpreter {
                         value
                     };
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         found = elem;
                         break;
@@ -1436,8 +1413,7 @@ impl Interpreter {
                         value
                     };
                     let cb_args = build_array_cb_args(&elem, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         idx = i as i32;
                         break;
@@ -1454,8 +1430,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if !hit.to_boolean(&self.gc_heap) {
                         all = false;
                         break;
@@ -1472,8 +1447,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         any = true;
                         break;
@@ -1492,8 +1466,7 @@ impl Interpreter {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
-                    let mapped =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let mapped = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     match mapped {
                         Value::Array(inner) => {
                             crate::array::with_elements(inner, &self.gc_heap, |elements| {
@@ -1535,8 +1508,8 @@ impl Interpreter {
                     let mut j = i;
                     while j > 0 {
                         let mut cmp_args: SmallVec<[Value; 8]> = SmallVec::new();
-                        cmp_args.push(buffer[j - 1].clone());
-                        cmp_args.push(buffer[j].clone());
+                        cmp_args.push(buffer[j - 1]);
+                        cmp_args.push(buffer[j]);
                         let outcome =
                             self.run_callable_sync(context, &callee, Value::Undefined, cmp_args)?;
                         let order = match outcome {
@@ -1560,7 +1533,7 @@ impl Interpreter {
                         }
                     });
                 }
-                arr_value.clone()
+                arr_value
             }
             _ => return Ok(false),
         };
@@ -1613,7 +1586,7 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
                 Value::Undefined
             }
@@ -1622,8 +1595,7 @@ impl Interpreter {
                 let mut out: Vec<Value> = Vec::with_capacity(len);
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let mapped =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let mapped = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     let coerced = crate::binary::dispatch::coerce_element_for_store(
                         &mut self.gc_heap,
                         kind,
@@ -1638,8 +1610,7 @@ impl Interpreter {
                 let mut out: Vec<Value> = Vec::new();
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let kept =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let kept = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if kept.to_boolean(&self.gc_heap) {
                         out.push(t.get(&mut self.gc_heap, i).map_err(crate::oom_to_vm)?);
                     }
@@ -1651,8 +1622,7 @@ impl Interpreter {
                 let mut found = Value::Undefined;
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         found = value;
                         break;
@@ -1665,8 +1635,7 @@ impl Interpreter {
                 let mut idx: i32 = -1;
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         idx = i as i32;
                         break;
@@ -1678,10 +1647,9 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut found = Value::Undefined;
                 for i in (0..len).rev() {
-                    let value = elements[i].clone();
+                    let value = elements[i];
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         found = value;
                         break;
@@ -1693,10 +1661,9 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut idx: i32 = -1;
                 for i in (0..len).rev() {
-                    let value = elements[i].clone();
+                    let value = elements[i];
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         idx = i as i32;
                         break;
@@ -1709,8 +1676,7 @@ impl Interpreter {
                 let mut all = true;
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if !hit.to_boolean(&self.gc_heap) {
                         all = false;
                         break;
@@ -1723,8 +1689,7 @@ impl Interpreter {
                 let mut any = false;
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let hit =
-                        self.run_callable_sync(context, &callee, this_arg.clone(), cb_args)?;
+                    let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     if hit.to_boolean(&self.gc_heap) {
                         any = true;
                         break;
@@ -1741,19 +1706,19 @@ impl Interpreter {
                 }
                 let step: i64 = if reverse { -1 } else { 1 };
                 let (mut acc, start_idx) = if has_init {
-                    (args[1].clone(), if reverse { len as i64 - 1 } else { 0 })
+                    (args[1], if reverse { len as i64 - 1 } else { 0 })
                 } else {
                     let seed = if reverse { len - 1 } else { 0 };
-                    (elements[seed].clone(), seed as i64 + step)
+                    (elements[seed], seed as i64 + step)
                 };
                 let mut i = start_idx;
                 while i >= 0 && (i as usize) < len {
-                    let value = elements[i as usize].clone();
+                    let value = elements[i as usize];
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(acc.clone());
+                    cb_args.push(acc);
                     cb_args.push(value);
                     cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
-                    cb_args.push(ta_value.clone());
+                    cb_args.push(ta_value);
                     acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     i += step;
                 }
@@ -1864,8 +1829,8 @@ impl Interpreter {
                 );
                 let metadata =
                     function_metadata::bound_create_metadata(&mut ctx, callee, bound_args.len())?;
-                let callee_root = callee.clone();
-                let this_root = this_value.clone();
+                let callee_root = *callee;
+                let this_root = this_value;
                 let bound_args_root = bound_args.clone();
                 let roots = self.collect_allocation_roots(stack);
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -1880,7 +1845,7 @@ impl Interpreter {
                 };
                 let bound = BoundFunction::new_with_metadata_and_roots(
                     &mut self.gc_heap,
-                    callee.clone(),
+                    *callee,
                     this_value,
                     bound_args,
                     metadata,

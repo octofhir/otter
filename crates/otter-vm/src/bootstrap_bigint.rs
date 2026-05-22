@@ -50,7 +50,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     }
     {
         let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root.clone()]);
+            ObjectBuilder::from_object_with_value_roots(heap, prototype, vec![global_root]);
         builder.method(
             "toString",
             0,
@@ -80,7 +80,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
-    let ctor_roots = vec![global_root.clone(), Value::Object(prototype)];
+    let ctor_roots = vec![global_root, Value::Object(prototype)];
     define_static(heap, ctor, "asIntN", 2, bigint_static_as_int_n, &ctor_roots)?;
     define_static(
         heap,

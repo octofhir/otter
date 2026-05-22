@@ -164,7 +164,7 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let src = register_operand(operands.get(1))?;
         let top_idx = stack.len() - 1;
-        let recv = read_register(&stack[top_idx], src)?.clone();
+        let recv = *read_register(&stack[top_idx], src)?;
         let Value::Object(obj) = &recv else {
             return Ok(None);
         };
@@ -182,7 +182,7 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        self.invoke(stack, context, &callee, recv.clone(), args, dst)?;
+        self.invoke(stack, context, &callee, recv, args, dst)?;
         Ok(Some(()))
     }
 
@@ -244,7 +244,7 @@ impl Interpreter {
             .filter(|s| s.pc == pc && s.dst == dst)
             .cloned();
         if let Some(state) = resume {
-            let produced = read_register(&stack[top_idx], dst)?.clone();
+            let produced = *read_register(&stack[top_idx], dst)?;
             if abstract_ops::is_primitive(&produced) {
                 stack[top_idx].pending_to_primitive = None;
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -262,7 +262,7 @@ impl Interpreter {
         }
 
         // 2. Fresh entry — primitive fast path.
-        let recv = read_register(&stack[top_idx], src)?.clone();
+        let recv = *read_register(&stack[top_idx], src)?;
         if abstract_ops::is_primitive(&recv) {
             write_register(&mut stack[top_idx], dst, recv)?;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -496,18 +496,11 @@ impl Interpreter {
         base: &Value,
         name: &str,
     ) -> Result<Option<Value>, VmError> {
-        match self.ordinary_get_value(
-            context,
-            base.clone(),
-            base.clone(),
-            &VmPropertyKey::String(name),
-            0,
-        )? {
+        match self.ordinary_get_value(context, *base, *base, &VmPropertyKey::String(name), 0)? {
             VmGetOutcome::Value(Value::Undefined) => Ok(None),
             VmGetOutcome::Value(value) => Ok(Some(value)),
             VmGetOutcome::InvokeGetter { getter } => {
-                let value =
-                    self.run_callable_sync(context, &getter, base.clone(), SmallVec::new())?;
+                let value = self.run_callable_sync(context, &getter, *base, SmallVec::new())?;
                 Ok(Some(value))
             }
         }
@@ -520,18 +513,11 @@ impl Interpreter {
         base: &Value,
         sym: symbol::JsSymbol,
     ) -> Result<Option<Value>, VmError> {
-        match self.ordinary_get_value(
-            context,
-            base.clone(),
-            base.clone(),
-            &VmPropertyKey::Symbol(sym),
-            0,
-        )? {
+        match self.ordinary_get_value(context, *base, *base, &VmPropertyKey::Symbol(sym), 0)? {
             VmGetOutcome::Value(Value::Undefined) => Ok(None),
             VmGetOutcome::Value(value) => Ok(Some(value)),
             VmGetOutcome::InvokeGetter { getter } => {
-                let value =
-                    self.run_callable_sync(context, &getter, base.clone(), SmallVec::new())?;
+                let value = self.run_callable_sync(context, &getter, *base, SmallVec::new())?;
                 Ok(Some(value))
             }
         }
@@ -578,11 +564,11 @@ impl Interpreter {
                                 stack,
                                 context,
                                 dst,
-                                obj.clone(),
+                                obj,
                                 hint,
                                 ToPrimitiveStage::OrdinaryFirst,
                                 &callee,
-                                obj.clone(),
+                                obj,
                                 args,
                             );
                         }
@@ -606,11 +592,11 @@ impl Interpreter {
                             stack,
                             context,
                             dst,
-                            obj.clone(),
+                            obj,
                             hint,
                             ToPrimitiveStage::OrdinarySecond,
                             callee,
-                            obj.clone(),
+                            obj,
                             args,
                         );
                     }
@@ -664,11 +650,11 @@ impl Interpreter {
                             stack,
                             context,
                             dst,
-                            obj.clone(),
+                            obj,
                             hint,
                             ToPrimitiveStage::Exhausted,
                             callee,
-                            obj.clone(),
+                            obj,
                             args,
                         );
                     }

@@ -283,7 +283,7 @@ fn native_json_call(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let runtime_roots = ctx.collect_native_roots();
-    let this_value = ctx.this_value().clone();
+    let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         visit_native_roots(

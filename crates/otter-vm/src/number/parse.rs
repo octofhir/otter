@@ -113,17 +113,21 @@ fn parse_radix_digits(digits: &str, radix: u32) -> NumberValue {
 /// - <https://tc39.es/ecma262/#sec-tonumber>
 #[must_use]
 pub fn to_number_value(value: &Value, heap: &otter_gc::GcHeap) -> f64 {
-    match value {
-        Value::Number(n) => n.as_f64(),
-        Value::Boolean(true) => 1.0,
-        Value::Boolean(false) => 0.0,
-        Value::Null => 0.0,
-        Value::Undefined => f64::NAN,
-        Value::String(s) => match to_number_from_string(&s.to_lossy_string(heap)) {
+    if let Some(n) = value.as_number() {
+        n.as_f64()
+    } else if let Some(b) = value.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if value.is_null() {
+        0.0
+    } else if value.is_undefined() {
+        f64::NAN
+    } else if let Some(s) = value.as_string() {
+        match to_number_from_string(&s.to_lossy_string(heap)) {
             NumberValue::Smi(v) => v as f64,
             NumberValue::Double(d) => d,
-        },
-        _ => f64::NAN,
+        }
+    } else {
+        f64::NAN
     }
 }
 
@@ -166,10 +170,12 @@ pub enum IntegerCoercion {
 /// through [`to_number_value`] like the loose form.
 #[must_use]
 pub fn to_integer_or_infinity_strict(value: &Value, heap: &otter_gc::GcHeap) -> IntegerCoercion {
-    match value {
-        Value::Symbol(_) => IntegerCoercion::SymbolNotConvertible,
-        Value::BigInt(_) => IntegerCoercion::BigIntNotConvertible,
-        _ => IntegerCoercion::Ok(to_integer_or_infinity(value, heap)),
+    if value.is_symbol() {
+        IntegerCoercion::SymbolNotConvertible
+    } else if value.is_big_int() {
+        IntegerCoercion::BigIntNotConvertible
+    } else {
+        IntegerCoercion::Ok(to_integer_or_infinity(value, heap))
     }
 }
 
@@ -305,24 +311,22 @@ pub fn is_finite(n: f64) -> bool {
 /// §21.1.2.5 `Number.isInteger(value)`.
 #[must_use]
 pub fn is_integer(value: &Value) -> bool {
-    match value {
-        Value::Number(n) => {
-            let v = n.as_f64();
-            v.is_finite() && v.trunc() == v
-        }
-        _ => false,
+    if let Some(n) = value.as_number() {
+        let v = n.as_f64();
+        v.is_finite() && v.trunc() == v
+    } else {
+        false
     }
 }
 
 /// §21.1.2.6 `Number.isSafeInteger(value)`.
 #[must_use]
 pub fn is_safe_integer(value: &Value) -> bool {
-    match value {
-        Value::Number(n) => {
-            let v = n.as_f64();
-            v.is_finite() && v.trunc() == v && v.abs() <= 9_007_199_254_740_991.0
-        }
-        _ => false,
+    if let Some(n) = value.as_number() {
+        let v = n.as_f64();
+        v.is_finite() && v.trunc() == v && v.abs() <= 9_007_199_254_740_991.0
+    } else {
+        false
     }
 }
 

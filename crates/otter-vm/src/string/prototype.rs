@@ -61,84 +61,73 @@ use crate::{NativeCtx, NativeError};
 /// - `Value::Null` / `Value::Undefined` reject per
 ///   `RequireObjectCoercible`.
 fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError> {
-    match args.receiver {
-        Value::String(s) => Ok(*s),
-        Value::Object(obj) => {
-            let gc = &*args.gc_heap;
-            // Wrapper objects expose their primitive via the matching
-            // internal slot; missing-slot ordinary objects fall back
-            // to `Object.prototype.toString`'s "[object Object]"
-            // shape so `String.prototype.*.call({})` doesn't bail.
-            // User-defined `toString` overrides require an
-            // `ExecutionContext` we don't carry into the intrinsic
-            // layer yet — handled in a follow-up.
-            if let Some(s) = crate::object::string_data(*obj, gc) {
-                return Ok(s);
-            }
-            if let Some(b) = crate::object::boolean_data(*obj, gc) {
-                let text = if b { "true" } else { "false" };
-                return Ok(JsString::from_str(text, args.gc_heap)?);
-            }
-            if let Some(n) = crate::object::number_data(*obj, gc) {
-                let text = n.to_display_string();
-                return Ok(JsString::from_str(&text, args.gc_heap)?);
-            }
-            Ok(JsString::from_str("[object Object]", args.gc_heap)?)
-        }
-        Value::Boolean(b) => {
-            let text = if *b { "true" } else { "false" };
-            Ok(JsString::from_str(text, args.gc_heap)?)
-        }
-        Value::Number(n) => {
-            let text = n.to_display_string();
-            Ok(JsString::from_str(&text, args.gc_heap)?)
-        }
-        Value::BigInt(b) => {
-            let text = b.to_decimal_string(&*args.gc_heap);
-            Ok(JsString::from_str(&text, args.gc_heap)?)
-        }
-        Value::Array(arr) => {
-            // §22.1.3.32 Array.prototype.toString → Array.prototype.join(",").
-            // We mirror the spec result for the common no-override
-            // case: comma-joined dense elements with null/undefined
-            // displayed as "".
-            let gc = &*args.gc_heap;
-            let items: Vec<String> = crate::array::with_elements(*arr, gc, |els| {
-                els.iter()
-                    .map(|v| match v {
-                        Value::Null | Value::Undefined | Value::Hole => String::new(),
-                        Value::String(s) => s.to_lossy_string(args.gc_heap),
-                        Value::Number(n) => n.to_display_string(),
-                        Value::Boolean(b) => {
-                            if *b {
-                                "true".to_string()
-                            } else {
-                                "false".to_string()
-                            }
-                        }
-                        _ => v.display_string(gc),
-                    })
-                    .collect()
-            });
-            Ok(JsString::from_str(&items.join(","), args.gc_heap)?)
-        }
-        Value::RegExp(re) => {
-            // §22.2.6.13 RegExp.prototype.toString — `/source/flags`.
-            let gc = &*args.gc_heap;
-            let pattern = re.source(gc);
-            let flags = re.flags(gc);
-            let pattern_str = if pattern.is_empty() {
-                "(?:)".to_string()
-            } else {
-                pattern
-            };
-            let text = format!("/{}/{}", pattern_str, flags.to_js_string());
-            Ok(JsString::from_str(&text, args.gc_heap)?)
-        }
-        Value::Symbol(_) => Err(IntrinsicError::BadReceiver { expected: "string" }),
-        Value::Null | Value::Undefined => Err(IntrinsicError::BadReceiver { expected: "string" }),
-        _ => Err(IntrinsicError::BadReceiver { expected: "string" }),
+    let recv = args.receiver;
+    if let Some(s) = recv.as_string() {
+        return Ok(*s);
     }
+    if let Some(obj) = recv.as_object() {
+        let gc = &*args.gc_heap;
+        if let Some(s) = crate::object::string_data(obj, gc) {
+            return Ok(s);
+        }
+        if let Some(b) = crate::object::boolean_data(obj, gc) {
+            let text = if b { "true" } else { "false" };
+            return Ok(JsString::from_str(text, args.gc_heap)?);
+        }
+        if let Some(n) = crate::object::number_data(obj, gc) {
+            let text = n.to_display_string();
+            return Ok(JsString::from_str(&text, args.gc_heap)?);
+        }
+        return Ok(JsString::from_str("[object Object]", args.gc_heap)?);
+    }
+    if let Some(b) = recv.as_boolean() {
+        let text = if b { "true" } else { "false" };
+        return Ok(JsString::from_str(text, args.gc_heap)?);
+    }
+    if let Some(n) = recv.as_number() {
+        let text = n.to_display_string();
+        return Ok(JsString::from_str(&text, args.gc_heap)?);
+    }
+    if let Some(b) = recv.as_big_int() {
+        let text = b.to_decimal_string(&*args.gc_heap);
+        return Ok(JsString::from_str(&text, args.gc_heap)?);
+    }
+    if let Some(arr) = recv.as_array() {
+        // §22.1.3.32 Array.prototype.toString → Array.prototype.join(",").
+        let gc = &*args.gc_heap;
+        let items: Vec<String> = crate::array::with_elements(arr, gc, |els| {
+            els.iter()
+                .map(|v| {
+                    if v.is_null() || v.is_undefined() || v.is_hole() {
+                        String::new()
+                    } else if let Some(s) = v.as_string() {
+                        s.to_lossy_string(args.gc_heap)
+                    } else if let Some(n) = v.as_number() {
+                        n.to_display_string()
+                    } else if let Some(b) = v.as_boolean() {
+                        if b { "true" } else { "false" }.to_string()
+                    } else {
+                        v.display_string(gc)
+                    }
+                })
+                .collect()
+        });
+        return Ok(JsString::from_str(&items.join(","), args.gc_heap)?);
+    }
+    if let Some(re) = recv.as_regexp() {
+        // §22.2.6.13 RegExp.prototype.toString — `/source/flags`.
+        let gc = &*args.gc_heap;
+        let pattern = re.source(gc);
+        let flags = re.flags(gc);
+        let pattern_str = if pattern.is_empty() {
+            "(?:)".to_string()
+        } else {
+            pattern
+        };
+        let text = format!("/{}/{}", pattern_str, flags.to_js_string());
+        return Ok(JsString::from_str(&text, args.gc_heap)?);
+    }
+    Err(IntrinsicError::BadReceiver { expected: "string" })
 }
 
 /// §7.1.17 ToString applied to argument `index`.
@@ -152,41 +141,47 @@ fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicEr
 /// Missing arguments coerce to `"undefined"` per §7.1.17 step 1
 /// (`ToString(undefined) = "undefined"`).
 fn arg_to_string(args: &mut IntrinsicArgs<'_>, index: u16) -> Result<JsString, IntrinsicError> {
-    match args.args.get(index as usize) {
-        None | Some(Value::Undefined) => Ok(JsString::from_str("undefined", args.gc_heap)?),
-        Some(Value::Null) => Ok(JsString::from_str("null", args.gc_heap)?),
-        Some(Value::String(s)) => Ok(*s),
-        Some(Value::Boolean(b)) => {
-            let text = if *b { "true" } else { "false" };
-            Ok(JsString::from_str(text, args.gc_heap)?)
-        }
-        Some(Value::Number(n)) => {
-            let text = n.to_display_string();
-            Ok(JsString::from_str(&text, args.gc_heap)?)
-        }
-        Some(Value::BigInt(b)) => {
-            let text = b.to_decimal_string(&*args.gc_heap);
-            Ok(JsString::from_str(&text, args.gc_heap)?)
-        }
-        Some(Value::Object(obj)) => {
-            // Wrapper objects with `[[StringData]]` unwrap directly.
-            // Plain objects routing through §7.1.1 OrdinaryToPrimitive
-            // is not yet wired here; we still reject for those.
-            let gc = &*args.gc_heap;
-            crate::object::string_data(*obj, gc).ok_or(IntrinsicError::BadArgument {
-                index,
-                reason: "must be a string",
-            })
-        }
-        Some(Value::Symbol(_)) => Err(IntrinsicError::BadArgument {
-            index,
-            reason: "Symbol values cannot be converted to a string",
-        }),
-        Some(_) => Err(IntrinsicError::BadArgument {
+    let Some(arg) = args.args.get(index as usize) else {
+        return Ok(JsString::from_str("undefined", args.gc_heap)?);
+    };
+    if arg.is_undefined() {
+        return Ok(JsString::from_str("undefined", args.gc_heap)?);
+    }
+    if arg.is_null() {
+        return Ok(JsString::from_str("null", args.gc_heap)?);
+    }
+    if let Some(s) = arg.as_string() {
+        return Ok(*s);
+    }
+    if let Some(b) = arg.as_boolean() {
+        let text = if b { "true" } else { "false" };
+        return Ok(JsString::from_str(text, args.gc_heap)?);
+    }
+    if let Some(n) = arg.as_number() {
+        let text = n.to_display_string();
+        return Ok(JsString::from_str(&text, args.gc_heap)?);
+    }
+    if let Some(b) = arg.as_big_int() {
+        let text = b.to_decimal_string(&*args.gc_heap);
+        return Ok(JsString::from_str(&text, args.gc_heap)?);
+    }
+    if let Some(obj) = arg.as_object() {
+        let gc = &*args.gc_heap;
+        return crate::object::string_data(obj, gc).ok_or(IntrinsicError::BadArgument {
             index,
             reason: "must be a string",
-        }),
+        });
     }
+    if arg.is_symbol() {
+        return Err(IntrinsicError::BadArgument {
+            index,
+            reason: "Symbol values cannot be converted to a string",
+        });
+    }
+    Err(IntrinsicError::BadArgument {
+        index,
+        reason: "must be a string",
+    })
 }
 
 /// Pull a u32 index from arg `index`. §7.1.5 ToUint32 coerces every
@@ -196,17 +191,28 @@ fn arg_to_string(args: &mut IntrinsicArgs<'_>, index: u16) -> Result<JsString, I
 /// per ToUint32 modulo), `Value::Undefined` and missing arguments
 /// collapse to `default`.
 fn arg_u32_or(args: &IntrinsicArgs<'_>, index: u16, default: u32) -> Result<u32, IntrinsicError> {
-    match args.args.get(index as usize) {
-        None | Some(Value::Undefined) => Ok(default),
-        Some(Value::Number(n)) => Ok(number_to_u32(*n)),
-        Some(Value::Boolean(true)) => Ok(1),
-        Some(Value::Boolean(false)) | Some(Value::Null) => Ok(0),
-        Some(Value::String(s)) => Ok(parse_index(s, args.gc_heap).unwrap_or(0)),
-        Some(_) => Err(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a non-negative integer",
-        }),
+    let Some(arg) = args.args.get(index as usize) else {
+        return Ok(default);
+    };
+    if arg.is_undefined() {
+        return Ok(default);
     }
+    if let Some(n) = arg.as_number() {
+        return Ok(number_to_u32(n));
+    }
+    if let Some(b) = arg.as_boolean() {
+        return Ok(if b { 1 } else { 0 });
+    }
+    if arg.is_null() {
+        return Ok(0);
+    }
+    if let Some(s) = arg.as_string() {
+        return Ok(parse_index(s, args.gc_heap).unwrap_or(0));
+    }
+    Err(IntrinsicError::BadArgument {
+        index,
+        reason: "must be a non-negative integer",
+    })
 }
 
 fn number_to_u32(n: NumberValue) -> u32 {
@@ -240,25 +246,33 @@ fn arg_int_or(args: &IntrinsicArgs<'_>, index: u16, default: i64) -> Result<i64,
     // §7.1.5 ToIntegerOrInfinity — coerce the spec-relevant operand
     // set (Number / Boolean / Null / String) before treating
     // non-finite / NaN as the default.
-    match args.args.get(index as usize) {
-        None | Some(Value::Undefined) => Ok(default),
-        Some(Value::Number(n)) => Ok(number_to_int(*n)),
-        Some(Value::Boolean(true)) => Ok(1),
-        Some(Value::Boolean(false)) | Some(Value::Null) => Ok(0),
-        Some(Value::String(s)) => {
-            let text = s.to_lossy_string(args.gc_heap);
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                Ok(0)
-            } else {
-                Ok(trimmed.parse::<i64>().unwrap_or(0))
-            }
-        }
-        Some(_) => Err(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a number",
-        }),
+    let Some(arg) = args.args.get(index as usize) else {
+        return Ok(default);
+    };
+    if arg.is_undefined() {
+        return Ok(default);
     }
+    if let Some(n) = arg.as_number() {
+        return Ok(number_to_int(n));
+    }
+    if let Some(b) = arg.as_boolean() {
+        return Ok(if b { 1 } else { 0 });
+    }
+    if arg.is_null() {
+        return Ok(0);
+    }
+    if let Some(s) = arg.as_string() {
+        let text = s.to_lossy_string(args.gc_heap);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+        return Ok(trimmed.parse::<i64>().unwrap_or(0));
+    }
+    Err(IntrinsicError::BadArgument {
+        index,
+        reason: "must be a number",
+    })
 }
 
 fn number_to_int(n: NumberValue) -> i64 {
@@ -571,7 +585,8 @@ fn pad_impl(args: &mut IntrinsicArgs<'_>, side: PadSide) -> Result<Value, Intrin
     // shape through `arg_to_string` so primitive fill strings
     // round-trip without bailing.
     let pad_units: Vec<u16> = match args.args.get(1) {
-        None | Some(Value::Undefined) => vec![0x0020],
+        None => vec![0x0020],
+        Some(v) if v.is_undefined() => vec![0x0020],
         _ => arg_to_string(args, 1)?.to_utf16_vec(args.gc_heap),
     };
     if pad_units.is_empty() {
@@ -664,10 +679,16 @@ fn create_html(
     out.push('<');
     out.push_str(tag);
     if let Some(attr) = attribute {
-        let raw = match args.args.first() {
-            None | Some(Value::Undefined) => "undefined".to_string(),
-            Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-            Some(other) => other.display_string(&*args.gc_heap),
+        let raw = if let Some(arg) = args.args.first() {
+            if arg.is_undefined() {
+                "undefined".to_string()
+            } else if let Some(s) = arg.as_string() {
+                s.to_lossy_string(args.gc_heap)
+            } else {
+                arg.display_string(&*args.gc_heap)
+            }
+        } else {
+            "undefined".to_string()
         };
         let escaped = raw.replace('"', "&quot;");
         out.push(' ');
@@ -766,7 +787,8 @@ fn impl_substr(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         std::cmp::min(raw_start, size)
     };
     let int_length = match args.args.get(1) {
-        None | Some(Value::Undefined) => size,
+        None => size,
+        Some(v) if v.is_undefined() => size,
         Some(_) => {
             let raw = arg_int_or(args, 1, 0)?;
             std::cmp::min(std::cmp::max(raw, 0), size - int_start)
@@ -912,11 +934,11 @@ fn impl_to_upper_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 
 fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    if let Some(Value::RegExp(re)) = args.args.first() {
+    if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
         let replacement = arg_to_string(args, 1)?;
         return regex_replace(
             &recv,
-            re,
+            &re,
             args.gc_heap,
             &replacement.to_utf16_vec(args.gc_heap),
         );
@@ -953,7 +975,7 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    if let Some(Value::RegExp(re)) = args.args.first() {
+    if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
         // Spec: `replaceAll` requires the `g` flag for regex args.
         let heap = &*args.gc_heap;
         if !re.flags(heap).global {
@@ -965,7 +987,7 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         let replacement = arg_to_string(args, 1)?;
         return regex_replace(
             &recv,
-            re,
+            &re,
             args.gc_heap,
             &replacement.to_utf16_vec(args.gc_heap),
         );
@@ -1016,8 +1038,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
 
     // Regex separator → defer to the dedicated walker.
-    if let Some(Value::RegExp(re)) = args.args.first() {
-        let re = *re;
+    if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
         let limit = parse_split_limit(args)?;
         return regex_split(&recv, &re, limit, args);
     }
@@ -1027,7 +1048,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     // BigInt / Null / wrapper objects) before the search.
     let separator_owned: JsString;
     let separator = match args.args.first() {
-        None | Some(Value::Undefined) => {
+        None => {
             let singleton = [Value::string(recv)];
             return Ok(Value::array(args.array_from_elements_rooted(
                 singleton.iter().cloned(),
@@ -1035,10 +1056,21 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 &[singleton.as_slice()],
             )?));
         }
-        Some(Value::String(s)) => s,
-        Some(_) => {
-            separator_owned = arg_to_string(args, 0)?;
-            &separator_owned
+        Some(v) if v.is_undefined() => {
+            let singleton = [Value::string(recv)];
+            return Ok(Value::array(args.array_from_elements_rooted(
+                singleton.iter().cloned(),
+                &[],
+                &[singleton.as_slice()],
+            )?));
+        }
+        Some(v) => {
+            if let Some(s) = v.as_string() {
+                s
+            } else {
+                separator_owned = arg_to_string(args, 0)?;
+                &separator_owned
+            }
         }
     };
 
@@ -1101,10 +1133,35 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
     // (`Number` / `Boolean` / `null` / `String` — strings parsed as
     // decimal integers). Non-integer / negative coerce to 0 per
     // ToUint32 modulo.
-    Ok(match args.args.get(1) {
-        None | Some(Value::Undefined) => u32::MAX,
-        Some(Value::Number(n)) => {
-            let v = number_to_int(*n);
+    let Some(arg) = args.args.get(1) else {
+        return Ok(u32::MAX);
+    };
+    if arg.is_undefined() {
+        return Ok(u32::MAX);
+    }
+    if let Some(n) = arg.as_number() {
+        let v = number_to_int(n);
+        return Ok(if v < 0 {
+            0
+        } else if v > u32::MAX as i64 {
+            u32::MAX
+        } else {
+            v as u32
+        });
+    }
+    if let Some(b) = arg.as_boolean() {
+        return Ok(if b { 1 } else { 0 });
+    }
+    if arg.is_null() {
+        return Ok(0);
+    }
+    if let Some(s) = arg.as_string() {
+        let text = s.to_lossy_string(args.gc_heap);
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+        return Ok(trimmed.parse::<i64>().map_or(0, |v| {
             if v < 0 {
                 0
             } else if v > u32::MAX as i64 {
@@ -1112,32 +1169,11 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
             } else {
                 v as u32
             }
-        }
-        Some(Value::Boolean(true)) => 1,
-        Some(Value::Boolean(false) | Value::Null) => 0,
-        Some(Value::String(s)) => {
-            let text = s.to_lossy_string(args.gc_heap);
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                0
-            } else {
-                trimmed.parse::<i64>().map_or(0, |v| {
-                    if v < 0 {
-                        0
-                    } else if v > u32::MAX as i64 {
-                        u32::MAX
-                    } else {
-                        v as u32
-                    }
-                })
-            }
-        }
-        Some(_) => {
-            return Err(IntrinsicError::BadArgument {
-                index: 1,
-                reason: "must be a number",
-            });
-        }
+        }));
+    }
+    Err(IntrinsicError::BadArgument {
+        index: 1,
+        reason: "must be a number",
     })
 }
 
@@ -1218,16 +1254,6 @@ fn regex_split(
     )?))
 }
 
-/// §7.2.8 [`IsRegExp`](https://tc39.es/ecma262/#sec-isregexp): the
-/// foundation surface treats any `Value::RegExp` as regex-shaped.
-/// User objects can opt in via `[Symbol.match]` (a truthy property);
-/// the intrinsic dispatcher does not currently invoke user `@@match`
-/// traps, but the helper lights up the regex path so the rest of
-/// the algorithm follows §22.1.3.13 / .14 / .15 / .17 / .18 / .19.
-fn is_regexp_arg(arg: Option<&Value>) -> bool {
-    matches!(arg, Some(Value::RegExp(_)))
-}
-
 /// §22.1.3.13 step 6 / §22.1.3.14 step 6 / §22.1.3.15 step 4: when
 /// the first argument is not a `RegExp`, ToString-coerce it and run
 /// `RegExpCreate(pattern, flags)`. The string fast-path matters for
@@ -1239,35 +1265,34 @@ fn coerce_pattern_to_regexp(
 ) -> Result<JsRegExp, IntrinsicError> {
     // §22.1.3.{13,14,15} step 6 — `pattern = ? ToString(arg)`.
     // Coerce every spec-relevant operand before compiling.
-    let pattern_units: Vec<u16> = match value {
-        Value::Undefined => Vec::new(),
-        Value::String(s) => s.to_utf16_vec(gc_heap),
-        Value::Null => "null".encode_utf16().collect(),
-        Value::Boolean(b) => {
-            let text = if *b { "true" } else { "false" };
-            text.encode_utf16().collect()
+    let pattern_units: Vec<u16> = if value.is_undefined() {
+        Vec::new()
+    } else if let Some(s) = value.as_string() {
+        s.to_utf16_vec(gc_heap)
+    } else if value.is_null() {
+        "null".encode_utf16().collect()
+    } else if let Some(b) = value.as_boolean() {
+        if b { "true" } else { "false" }.encode_utf16().collect()
+    } else if let Some(n) = value.as_number() {
+        n.to_display_string().encode_utf16().collect()
+    } else if let Some(b) = value.as_big_int() {
+        b.to_decimal_string(&*gc_heap).encode_utf16().collect()
+    } else if let Some(obj) = value.as_object() {
+        let gc = &*gc_heap;
+        if let Some(s) = crate::object::string_data(obj, gc) {
+            s.to_utf16_vec(gc_heap)
+        } else if let Some(b) = crate::object::boolean_data(obj, gc) {
+            if b { "true" } else { "false" }.encode_utf16().collect()
+        } else if let Some(n) = crate::object::number_data(obj, gc) {
+            n.to_display_string().encode_utf16().collect()
+        } else {
+            "[object Object]".encode_utf16().collect()
         }
-        Value::Number(n) => n.to_display_string().encode_utf16().collect(),
-        Value::BigInt(b) => b.to_decimal_string(&*gc_heap).encode_utf16().collect(),
-        Value::Object(obj) => {
-            let gc = &*gc_heap;
-            if let Some(s) = crate::object::string_data(*obj, gc) {
-                s.to_utf16_vec(gc_heap)
-            } else if let Some(b) = crate::object::boolean_data(*obj, gc) {
-                let text = if b { "true" } else { "false" };
-                text.encode_utf16().collect()
-            } else if let Some(n) = crate::object::number_data(*obj, gc) {
-                n.to_display_string().encode_utf16().collect()
-            } else {
-                "[object Object]".encode_utf16().collect()
-            }
-        }
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a regular expression or string",
-            });
-        }
+    } else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a regular expression or string",
+        });
     };
     JsRegExp::compile(gc_heap, &pattern_units, flags).map_err(|_| IntrinsicError::BadArgument {
         index: 0,
@@ -1277,17 +1302,14 @@ fn coerce_pattern_to_regexp(
 
 fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let coerced;
-    let re = if is_regexp_arg(args.args.first()) {
-        match args.args.first() {
-            Some(Value::RegExp(r)) => r,
-            _ => unreachable!(),
-        }
+    let undef = Value::undefined();
+    let re = if let Some(r) = args.args.first().and_then(|v| v.as_regexp()) {
+        r
     } else {
-        let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        coerced = coerce_pattern_to_regexp(arg0, "", args.gc_heap)?;
-        &coerced
+        let arg0 = args.args.first().unwrap_or(&undef);
+        coerce_pattern_to_regexp(arg0, "", args.gc_heap)?
     };
+    let re = &re;
     let recv_units = recv.to_utf16_vec(args.gc_heap);
     if re.flags(&*args.gc_heap).global {
         // `g` flag → return array of full matches only (no captures).
@@ -1332,12 +1354,8 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
 fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let coerced;
-    let re = if is_regexp_arg(args.args.first()) {
-        let r = match args.args.first() {
-            Some(Value::RegExp(r)) => r,
-            _ => unreachable!(),
-        };
+    let undef = Value::undefined();
+    let re = if let Some(r) = args.args.first().and_then(|v| v.as_regexp()) {
         // §22.1.3.14 step 5.b: matchAll requires the global flag on
         // a RegExp arg; non-global is a TypeError.
         let heap = &*args.gc_heap;
@@ -1352,10 +1370,10 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         // §22.1.3.14 step 6.b: when the arg is not a RegExp, the
         // synthesised regex always has `g` set so the iteration
         // sweep visits every match.
-        let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        coerced = coerce_pattern_to_regexp(arg0, "g", args.gc_heap)?;
-        &coerced
+        let arg0 = args.args.first().unwrap_or(&undef);
+        coerce_pattern_to_regexp(arg0, "g", args.gc_heap)?
     };
+    let re = &re;
     let recv_units = recv.to_utf16_vec(args.gc_heap);
     let matches = collect_regex_matches(re, &*args.gc_heap, &recv_units);
     let has_indices = re.flags(&*args.gc_heap).has_indices;
@@ -1397,17 +1415,14 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 
 fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    let coerced;
-    let re = if is_regexp_arg(args.args.first()) {
-        match args.args.first() {
-            Some(Value::RegExp(r)) => r,
-            _ => unreachable!(),
-        }
+    let undef = Value::undefined();
+    let re = if let Some(r) = args.args.first().and_then(|v| v.as_regexp()) {
+        r
     } else {
-        let arg0 = args.args.first().unwrap_or(&Value::Undefined);
-        coerced = coerce_pattern_to_regexp(arg0, "", args.gc_heap)?;
-        &coerced
+        let arg0 = args.args.first().unwrap_or(&undef);
+        coerce_pattern_to_regexp(arg0, "", args.gc_heap)?
     };
+    let re = &re;
     let recv_units = recv.to_utf16_vec(args.gc_heap);
     // `search` always starts at index 0 — `lastIndex` is ignored
     // and not mutated per spec §22.1.3.13.
@@ -1530,8 +1545,13 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?.to_lossy_string(args.gc_heap);
     let other = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        Some(other) => other.display_string(&*args.gc_heap),
+        Some(v) => {
+            if let Some(s) = v.as_string() {
+                s.to_lossy_string(args.gc_heap)
+            } else {
+                v.display_string(&*args.gc_heap)
+            }
+        }
         None => "undefined".to_string(),
     };
     let cmp = match recv.cmp(&other) {
@@ -1552,13 +1572,17 @@ fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 fn impl_normalize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
     let form = match args.args.first() {
-        None | Some(Value::Undefined) => "NFC".to_string(),
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a string",
-            });
+        None => "NFC".to_string(),
+        Some(v) if v.is_undefined() => "NFC".to_string(),
+        Some(v) => {
+            if let Some(s) = v.as_string() {
+                s.to_lossy_string(args.gc_heap)
+            } else {
+                return Err(IntrinsicError::BadArgument {
+                    index: 0,
+                    reason: "must be a string",
+                });
+            }
         }
     };
     if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
@@ -1606,7 +1630,7 @@ fn native_string_method(
     if (name == "replace" || name == "replaceAll")
         && args.len() >= 2
         && ctx.cx.interp.is_callable_runtime(args.get(1).unwrap())
-        && matches!(args.first(), Some(Value::String(_)))
+        && args.first().is_some_and(|v| v.is_string())
     {
         return native_string_replace_callable(name == "replaceAll", ctx, args);
     }
@@ -1638,22 +1662,19 @@ fn native_string_method(
             | "substr"
     );
     let receiver = if html_wrap {
-        let needs_coerce = matches!(
-            receiver,
-            Value::Object(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::Proxy(_)
-                | Value::RegExp(_)
-                | Value::Promise(_)
-                | Value::Map(_)
-                | Value::Set(_)
-        );
-        if matches!(receiver, Value::Null | Value::Undefined) {
+        let needs_coerce = receiver.is_object()
+            || receiver.is_array()
+            || receiver.is_function()
+            || receiver.is_closure()
+            || receiver.is_native_function()
+            || receiver.is_bound_function()
+            || receiver.is_class_constructor()
+            || receiver.is_proxy()
+            || receiver.is_regexp()
+            || receiver.is_promise()
+            || receiver.is_map()
+            || receiver.is_set();
+        if receiver.is_nullish() {
             return Err(NativeError::TypeError {
                 name,
                 reason: "Cannot convert undefined or null to object".to_string(),
@@ -1678,7 +1699,7 @@ fn native_string_method(
                     },
                 })?;
 
-            Value::String(JsString::from_str(&s, ctx.heap_mut()).map_err(|_| {
+            Value::string(JsString::from_str(&s, ctx.heap_mut()).map_err(|_| {
                 NativeError::TypeError {
                     name,
                     reason: "out of memory".to_string(),
@@ -1719,18 +1740,15 @@ fn native_string_method(
             let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
             if let Some(exec) = ctx.execution_context().cloned() {
                 let is_non_primitive = |v: &Value| {
-                    matches!(
-                        v,
-                        Value::Object(_)
-                            | Value::Array(_)
-                            | Value::Function { .. }
-                            | Value::Closure(_)
-                            | Value::NativeFunction(_)
-                            | Value::BoundFunction(_)
-                            | Value::ClassConstructor(_)
-                            | Value::Proxy(_)
-                            | Value::RegExp(_)
-                    )
+                    v.is_object()
+                        || v.is_array()
+                        || v.is_function()
+                        || v.is_closure()
+                        || v.is_native_function()
+                        || v.is_bound_function()
+                        || v.is_class_constructor()
+                        || v.is_proxy()
+                        || v.is_regexp()
                 };
                 for &idx in string_int_coerce {
                     let Some(slot) = out.get_mut(idx) else {
@@ -1821,10 +1839,11 @@ fn native_string_replace_callable(
         name: if replace_all { "replaceAll" } else { "replace" },
         reason: err.to_string(),
     })?;
-    let needle = match args.first() {
-        Some(Value::String(s)) => *s,
-        _ => unreachable!("guarded by caller — args[0] is Value::String"),
-    };
+    let needle = args
+        .first()
+        .and_then(|v| v.as_string())
+        .copied()
+        .expect("guarded by caller — args[0] is a string");
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     let recv_units = recv.to_utf16_vec(ctx.heap());
     let needle_units = needle.to_utf16_vec(ctx.heap());
@@ -1855,27 +1874,26 @@ fn native_string_replace_callable(
         };
         for pos in positions {
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                Value::String(needle),
-                Value::Number(crate::number::NumberValue::from_f64(pos as f64)),
+                Value::string(needle),
+                Value::number_f64(pos as f64),
                 recv_value,
             ];
             let raw = interp
-                .run_callable_sync(&context, &callback, Value::Undefined, cb_args)
+                .run_callable_sync(&context, &callback, Value::undefined(), cb_args)
                 .map_err(|err| NativeError::TypeError {
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string = match raw {
-                Value::String(s) => s,
-                other => {
-                    let text = other.display_string(interp.gc_heap());
-                    JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
-                        NativeError::TypeError {
-                            name: if replace_all { "replaceAll" } else { "replace" },
-                            reason: err.to_string(),
-                        }
-                    })?
-                }
+            let raw_string = if let Some(s) = raw.as_string() {
+                *s
+            } else {
+                let text = raw.display_string(interp.gc_heap());
+                JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
+                    NativeError::TypeError {
+                        name: if replace_all { "replaceAll" } else { "replace" },
+                        reason: err.to_string(),
+                    }
+                })?
             };
             out.extend_from_slice(&raw_string.to_utf16_vec(interp.gc_heap()));
             if pos < recv_units.len() {
@@ -1895,27 +1913,26 @@ fn native_string_replace_callable(
     while cursor <= last_start {
         if recv_units[cursor..cursor + needle_len] == needle_units[..] {
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                Value::String(needle),
-                Value::Number(crate::number::NumberValue::from_f64(cursor as f64)),
+                Value::string(needle),
+                Value::number_f64(cursor as f64),
                 recv_value,
             ];
             let raw = interp
-                .run_callable_sync(&context, &callback, Value::Undefined, cb_args)
+                .run_callable_sync(&context, &callback, Value::undefined(), cb_args)
                 .map_err(|err| NativeError::TypeError {
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string = match raw {
-                Value::String(s) => s,
-                other => {
-                    let text = other.display_string(interp.gc_heap());
-                    JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
-                        NativeError::TypeError {
-                            name: if replace_all { "replaceAll" } else { "replace" },
-                            reason: err.to_string(),
-                        }
-                    })?
-                }
+            let raw_string = if let Some(s) = raw.as_string() {
+                *s
+            } else {
+                let text = raw.display_string(interp.gc_heap());
+                JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
+                    NativeError::TypeError {
+                        name: if replace_all { "replaceAll" } else { "replace" },
+                        reason: err.to_string(),
+                    }
+                })?
             };
             out.extend_from_slice(&raw_string.to_utf16_vec(interp.gc_heap()));
             cursor += needle_len;
@@ -2097,7 +2114,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let entry = lookup("length").unwrap();
         let err = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &Value::Undefined,
+            receiver: &Value::undefined(),
             args: &[],
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
@@ -2153,16 +2170,16 @@ mod tests {
     fn includes_returns_boolean() {
         assert_eq!(
             call_v("includes", "abcabc", &[A::S("bc")]),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             call_v("includes", "abcabc", &[A::S("zz")]),
-            Value::Boolean(false)
+            Value::boolean(false)
         );
         // includes uses `from` argument like indexOf.
         assert_eq!(
             call_v("includes", "abcabc", &[A::S("bc"), A::N(2)]),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
     }
 
@@ -2187,10 +2204,10 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        match result {
-            Value::String(s) => assert_eq!(s.to_lossy_string(&gc_heap), "a3"),
-            other => panic!("expected string result, got {other:?}"),
-        }
+        let Some(s) = result.as_string() else {
+            panic!("expected string result, got {result:?}");
+        };
+        assert_eq!(s.to_lossy_string(&gc_heap), "a3");
     }
 
     #[test]
@@ -2251,8 +2268,8 @@ mod tests {
         assert_eq!(call_s("at", "abc", &[A::N(-1)]), "c");
         assert_eq!(call_s("at", "abc", &[A::N(-3)]), "a");
         // Out of range → undefined.
-        assert_eq!(call_v("at", "abc", &[A::N(3)]), Value::Undefined);
-        assert_eq!(call_v("at", "abc", &[A::N(-4)]), Value::Undefined);
+        assert_eq!(call_v("at", "abc", &[A::N(3)]), Value::undefined());
+        assert_eq!(call_v("at", "abc", &[A::N(-4)]), Value::undefined());
     }
 
     #[test]
@@ -2260,7 +2277,7 @@ mod tests {
         // ASCII.
         assert_eq!(call_s("codePointAt", "abc", &[A::N(0)]), "97");
         // Out of range.
-        assert_eq!(call_v("codePointAt", "abc", &[A::N(5)]), Value::Undefined);
+        assert_eq!(call_v("codePointAt", "abc", &[A::N(5)]), Value::undefined());
     }
 
     #[test]
@@ -2308,13 +2325,11 @@ mod tests {
         })
         .unwrap();
         // 'É' should stay (ASCII-only fold), 'a','b' lowercase.
-        match r {
-            Value::String(s) => {
-                let v = s.to_utf16_vec(&gc_heap);
-                assert_eq!(v, vec![0x00C9, b'a' as u16, b'b' as u16]);
-            }
-            _ => panic!("expected string"),
-        }
+        let Some(s) = r.as_string() else {
+            panic!("expected string");
+        };
+        let v = s.to_utf16_vec(&gc_heap);
+        assert_eq!(v, vec![0x00C9, b'a' as u16, b'b' as u16]);
     }
 
     #[test]
@@ -2350,108 +2365,98 @@ mod tests {
     fn split_basic() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = call_v_with_heap("split", "a,b,c", &[A::S(",")], &mut gc_heap);
-        match v {
-            Value::Array(a) => {
-                assert_eq!(crate::array::len(a, &gc_heap), 3);
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
-                    "a"
-                );
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
-                    "b"
-                );
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
-                    "c"
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(a) = v.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(a, &gc_heap), 3);
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            "a"
+        );
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            "b"
+        );
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+            "c"
+        );
     }
 
     #[test]
     fn split_consecutive_separators_yield_empty_chunks() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = call_v_with_heap("split", "a,,b", &[A::S(",")], &mut gc_heap);
-        match v {
-            Value::Array(a) => {
-                assert_eq!(crate::array::len(a, &gc_heap), 3);
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
-                    "a"
-                );
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
-                    ""
-                );
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
-                    "b"
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(a) = v.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(a, &gc_heap), 3);
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            "a"
+        );
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            ""
+        );
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+            "b"
+        );
     }
 
     #[test]
     fn split_empty_separator_yields_code_units() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = call_v_with_heap("split", "abc", &[A::S("")], &mut gc_heap);
-        match v {
-            Value::Array(a) => {
-                assert_eq!(crate::array::len(a, &gc_heap), 3);
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
-                    "a"
-                );
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
-                    "b"
-                );
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
-                    "c"
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(a) = v.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(a, &gc_heap), 3);
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            "a"
+        );
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            "b"
+        );
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 2).display_string(&gc_heap),
+            "c"
+        );
     }
 
     #[test]
     fn split_with_limit() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = call_v_with_heap("split", "a,b,c,d", &[A::S(","), A::N(2)], &mut gc_heap);
-        match v {
-            Value::Array(a) => {
-                assert_eq!(crate::array::len(a, &gc_heap), 2);
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
-                    "a"
-                );
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
-                    "b"
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(a) = v.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(a, &gc_heap), 2);
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            "a"
+        );
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 1).display_string(&gc_heap),
+            "b"
+        );
     }
 
     #[test]
     fn split_no_match_returns_singleton() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = call_v_with_heap("split", "abc", &[A::S(",")], &mut gc_heap);
-        match v {
-            Value::Array(a) => {
-                assert_eq!(crate::array::len(a, &gc_heap), 1);
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
-                    "abc"
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(a) = v.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(a, &gc_heap), 1);
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            "abc"
+        );
     }
 
     #[test]
@@ -2459,21 +2464,22 @@ mod tests {
         // "".split(",") === [""]
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = call_v_with_heap("split", "", &[A::S(",")], &mut gc_heap);
-        match v {
-            Value::Array(a) => {
-                assert_eq!(crate::array::len(a, &gc_heap), 1);
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
-                    ""
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(a) = v.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(a, &gc_heap), 1);
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            ""
+        );
+
         // "".split("") === []
         let v2 = call_v_with_heap("split", "", &[A::S("")], &mut gc_heap);
-        match v2 {
-            Value::Array(a) => assert_eq!(crate::array::len(a, &gc_heap), 0),
-            _ => panic!("expected array"),
+        {
+            let Some(a) = v2.as_array() else {
+                panic!("expected array");
+            };
+            assert_eq!(crate::array::len(a, &gc_heap), 0);
         }
     }
 
@@ -2490,15 +2496,13 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        match r {
-            Value::Array(a) => {
-                assert_eq!(crate::array::len(a, &gc_heap), 1);
-                assert_eq!(
-                    crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
-                    "abc"
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(a) = r.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(a, &gc_heap), 1);
+        assert_eq!(
+            crate::array::get(a, &gc_heap, 0).display_string(&gc_heap),
+            "abc"
+        );
     }
 }

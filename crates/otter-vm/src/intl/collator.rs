@@ -22,7 +22,6 @@ use crate::intl::helpers::{
 };
 use crate::intl::payload::{CollatorPayload, IntlPayload};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
 
 /// Resolve the constructor option bag.
 pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> CollatorPayload {
@@ -39,35 +38,40 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> C
 }
 
 fn require_collator(args: &IntrinsicArgs<'_>) -> Result<CollatorPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::Collator(c) => Ok(c),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.Collator",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.Collator",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.Collator",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::Collator(c) => Ok(c),
+        _ => Err(bad()),
     }
+}
+
+fn coerce_compare_arg(value: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<String> {
+    let v = value?;
+    if let Some(s) = v.as_string() {
+        return Some(s.to_lossy_string(heap));
+    }
+    if let Some(n) = v.as_number() {
+        return Some(n.to_display_string());
+    }
+    if let Some(b) = v.as_boolean() {
+        return Some((if b { "true" } else { "false" }).to_string());
+    }
+    None
 }
 
 fn impl_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_collator(args)?;
-    let x = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        Some(Value::Number(n)) => n.to_display_string(),
-        Some(Value::Boolean(b)) => if *b { "true" } else { "false" }.to_string(),
-        _ => return Ok(Value::number(NumberValue::from_i32(0))),
+    let Some(x) = coerce_compare_arg(args.args.first(), args.gc_heap) else {
+        return Ok(Value::number_i32(0));
     };
-    let y = match args.args.get(1) {
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        Some(Value::Number(n)) => n.to_display_string(),
-        Some(Value::Boolean(b)) => if *b { "true" } else { "false" }.to_string(),
-        _ => return Ok(Value::number(NumberValue::from_i32(0))),
+    let Some(y) = coerce_compare_arg(args.args.get(1), args.gc_heap) else {
+        return Ok(Value::number_i32(0));
     };
     let n = compare_with_payload(&x, &y, &payload);
-    Ok(Value::number(NumberValue::from_i32(n)))
+    Ok(Value::number_i32(n))
 }
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -91,9 +95,9 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         obj,
         heap,
         "ignorePunctuation",
-        Value::Boolean(ignore_punctuation),
+        Value::boolean(ignore_punctuation),
     );
-    crate::object::set(obj, heap, "numeric", Value::Boolean(numeric));
+    crate::object::set(obj, heap, "numeric", Value::boolean(numeric));
     crate::object::set(obj, heap, "caseFirst", case_first);
     Ok(Value::object(obj))
 }

@@ -25,7 +25,6 @@ use crate::intl::helpers::{
 };
 use crate::intl::payload::{IntlPayload, NumberFormatPayload};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
 
 /// Resolve the `(locale, options)` argument pair to a payload.
 ///
@@ -42,10 +41,12 @@ pub fn resolve(
     let style = read_string_option(opts_ref, "style", "decimal", gc_heap);
     let currency = match style.as_str() {
         "currency" => {
-            match opts_ref.and_then(|o| match crate::object::get(*o, gc_heap, "currency") {
-                Some(Value::String(s)) => Some(s.to_lossy_string(gc_heap).to_uppercase()),
-                _ => None,
-            }) {
+            match opts_ref
+                .and_then(|o| crate::object::get(*o, gc_heap, "currency"))
+                .and_then(|v| {
+                    v.as_string()
+                        .map(|s| s.to_lossy_string(gc_heap).to_uppercase())
+                }) {
                 Some(c) => Some(c),
                 None => {
                     return Err(IntlError::BadArgument {
@@ -92,36 +93,31 @@ pub fn resolve(
 }
 
 fn require_number_format(args: &IntrinsicArgs<'_>) -> Result<NumberFormatPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::NumberFormat(n) => Ok(n),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.NumberFormat",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.NumberFormat",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.NumberFormat",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::NumberFormat(n) => Ok(n),
+        _ => Err(bad()),
     }
 }
 
 fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_number_format(args)?;
-    let n = match args.args.first() {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::String(s)) => s
-            .to_lossy_string(args.gc_heap)
+    let first = args.args.first();
+    let n = if let Some(num) = first.and_then(|v| v.as_number()) {
+        num.as_f64()
+    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+        s.to_lossy_string(args.gc_heap)
             .parse::<f64>()
-            .unwrap_or(f64::NAN),
-        Some(Value::Boolean(b)) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        Some(Value::Null) => 0.0,
-        _ => f64::NAN,
+            .unwrap_or(f64::NAN)
+    } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
+        if b { 1.0 } else { 0.0 }
+    } else if first.is_some_and(|v| v.is_null()) {
+        0.0
+    } else {
+        f64::NAN
     };
     let rendered = format_number(n, &payload);
     js_string(&rendered, args.gc_heap).map_err(intl_to_intrinsic)
@@ -156,15 +152,15 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         obj,
         heap,
         "minimumFractionDigits",
-        Value::Number(NumberValue::from_i32(min_fd)),
+        Value::number_i32(min_fd),
     );
     crate::object::set(
         obj,
         heap,
         "maximumFractionDigits",
-        Value::Number(NumberValue::from_i32(max_fd)),
+        Value::number_i32(max_fd),
     );
-    crate::object::set(obj, heap, "useGrouping", Value::Boolean(use_grouping));
+    crate::object::set(obj, heap, "useGrouping", Value::boolean(use_grouping));
     Ok(Value::object(obj))
 }
 

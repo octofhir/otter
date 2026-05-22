@@ -1,18 +1,12 @@
-//! Interpreter and value model for the new Otter engine.
-//!
-//! Foundation phase is **interpreter-only** (foundation plan §15).
-//! No JIT, no GC integration yet — values for the harness slice are
-//! plain `Value::Undefined`. Slice tasks `09`+ extend the value
-//! model.
+//! Interpreter and value model for the Otter engine.
 //!
 //! # Contents
-//! - [`Value`] — opaque runtime value (foundation: only `Undefined`).
+//! - [`Value`] — opaque NaN-boxed runtime value.
 //! - [`Frame`] — compact call frame.
 //! - [`Interpreter`] — match-based dispatch loop over the frozen
 //!   executable view inside [`ExecutionContext`].
 //! - [`InterruptFlag`] — atomic flag observed at back-edges; cheap.
-//! - [`VmError`] — the small enum of runtime errors the interpreter
-//!   can raise.
+//! - [`VmError`] — runtime errors the interpreter can raise.
 //!
 //! # Invariants
 //! - One thread, one [`Interpreter`]. `Send`/`Sync` are not
@@ -464,7 +458,7 @@ pub struct Interpreter {
     /// `%RegExpStringIteratorPrototype%`. Each inherits from
     /// `%IteratorPrototype%` and carries its own `@@toStringTag`.
     /// Populated by bootstrap; consulted by
-    /// `intrinsic_prototype_object_for(Value::Iterator(_))` to
+    /// `intrinsic_prototype_object_for` (iterator family) to
     /// route `[[GetPrototypeOf]]` per ECMA-262
     /// §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5.
     array_iterator_prototype: Option<JsObject>,
@@ -658,7 +652,7 @@ impl Interpreter {
         // iterator prototypes once `%Iterator.prototype%` is wired
         // into the global. The bootstrap helper owns the install
         // logic; this site only caches the resulting handles so
-        // `intrinsic_prototype_object_for(Value::Iterator(_))` can
+        // `intrinsic_prototype_object_for` (iterator family) can
         // route without a global lookup per access.
         if let Ok(iter_proto_value) = interp.constructor_prototype_value("Iterator")
             && let Some(iter_proto) = iter_proto_value.as_object()
@@ -1535,9 +1529,10 @@ impl Interpreter {
         if function.is_strict || function.is_arrow {
             return Ok(this_value);
         }
-        match this_value {
-            Value::Undefined | Value::Null => Ok(Value::object(self.global_this)),
-            other => self.box_sloppy_this_primitive_stack_rooted(stack, other, slice_roots),
+        if this_value.is_undefined() || this_value.is_null() {
+            Ok(Value::object(self.global_this))
+        } else {
+            self.box_sloppy_this_primitive_stack_rooted(stack, this_value, slice_roots)
         }
     }
 
@@ -2341,7 +2336,7 @@ impl Interpreter {
         // generation).
         self.microtasks.enqueue(Microtask {
             callee,
-            this_value: Value::Undefined,
+            this_value: Value::undefined(),
             args,
             context: Some(context.clone()),
             result_capability: None,
@@ -2503,7 +2498,7 @@ impl Interpreter {
             if stack.is_empty() {
                 // Defensive: unwind paths (throw / finally) can
                 // pop the last frame without writing back to a
-                // caller register. Surface `Value::Undefined` so
+                // caller register. Surface `undefined` so
                 // the dispatch loop terminates cleanly instead of
                 // panicking on the next `stack.len() - 1`. Tests
                 // that rely on the throw escape will already have
@@ -4435,20 +4430,27 @@ pub(crate) fn value_kind_name(value: &Value) -> &'static str {
 /// §7.1.19 ToPropertyKey for a single optional argument used by
 /// `Object.prototype.hasOwnProperty` / `propertyIsEnumerable`.
 fn property_key_from_arg(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> Result<String, VmError> {
-    match arg {
-        Some(Value::String(s)) => Ok(s.to_lossy_string(heap)),
-        Some(Value::Number(n)) => Ok(n.to_display_string()),
-        Some(Value::Boolean(b)) => Ok((if *b { "true" } else { "false" }).to_string()),
-        Some(Value::Null) => Ok("null".to_string()),
-        Some(Value::Undefined) | None => Ok("undefined".to_string()),
-        _ => Err(VmError::TypeMismatch),
+    let Some(v) = arg else {
+        return Ok("undefined".to_string());
+    };
+    if let Some(s) = v.as_string() {
+        Ok(s.to_lossy_string(heap))
+    } else if let Some(n) = v.as_number() {
+        Ok(n.to_display_string())
+    } else if let Some(b) = v.as_boolean() {
+        Ok((if b { "true" } else { "false" }).to_string())
+    } else if v.is_null() {
+        Ok("null".to_string())
+    } else if v.is_undefined() {
+        Ok("undefined".to_string())
+    } else {
+        Err(VmError::TypeMismatch)
     }
 }
 
 fn to_length(value: &Value, heap: &otter_gc::GcHeap) -> Result<usize, VmError> {
-    match value {
-        Value::Symbol(_) | Value::BigInt(_) => return Err(VmError::TypeMismatch),
-        _ => {}
+    if value.is_symbol() || value.is_big_int() {
+        return Err(VmError::TypeMismatch);
     }
     let n = number::to_number_value(value, heap);
     if n.is_nan() || n <= 0.0 {
@@ -4504,7 +4506,7 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 
 /// Build the native callable that `arr[Symbol.iterator]` evaluates
 /// to. Invoking the returned function (with any `this`) yields a
-/// fresh [`Value::Iterator`] over the captured array — matching the
+/// fresh iterator over the captured array — matching the
 /// surface of `Array.prototype[@@iterator]` from
 /// [ECMA-262 §23.1.5.1](https://tc39.es/ecma262/#sec-array.prototype-@@iterator).
 ///
@@ -4519,23 +4521,18 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// `this` value. Installed as the realm's iterator method per
 /// §22.1.3.34.
 fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let string = match ctx.this_value() {
-        Value::String(s) => *s,
-        Value::Object(obj) => match crate::object::string_data(*obj, ctx.heap()) {
-            Some(s) => s,
-            None => {
-                return Err(NativeError::TypeError {
-                    name: "String.prototype[Symbol.iterator]",
-                    reason: "this is not a String".to_string(),
-                });
-            }
-        },
-        _ => {
-            return Err(NativeError::TypeError {
-                name: "String.prototype[Symbol.iterator]",
-                reason: "this is not a String".to_string(),
-            });
-        }
+    let this = ctx.this_value();
+    let string = if let Some(s) = this.as_string() {
+        *s
+    } else if let Some(obj) = this.as_object()
+        && let Some(s) = crate::object::string_data(obj, ctx.heap())
+    {
+        s
+    } else {
+        return Err(NativeError::TypeError {
+            name: "String.prototype[Symbol.iterator]",
+            reason: "this is not a String".to_string(),
+        });
     };
     let state = IteratorState::String { string, index: 0 };
     Ok(Value::iterator(ctx.alloc_iterator_state(
@@ -4551,10 +4548,13 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     global: crate::object::JsObject,
     well_known: &symbol::WellKnownSymbols,
 ) -> Result<(), crate::js_surface::JsSurfaceError> {
-    let Some(Value::Object(string_ctor)) = crate::object::get(global, heap, "String") else {
+    let Some(string_ctor) = crate::object::get(global, heap, "String").and_then(|v| v.as_object())
+    else {
         return Ok(());
     };
-    let Some(Value::Object(prototype)) = crate::object::get(string_ctor, heap, "prototype") else {
+    let Some(prototype) =
+        crate::object::get(string_ctor, heap, "prototype").and_then(|v| v.as_object())
+    else {
         return Ok(());
     };
     let global_root = Value::object(global);
@@ -4573,7 +4573,7 @@ pub(crate) fn install_string_iterator_post_bootstrap(
         heap,
         &sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(getter)),
+            value: Some(Value::native_function(getter)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -4613,14 +4613,11 @@ fn array_iterator_factory_call(
     _: &[Value],
     captures: &[Value],
 ) -> Result<Value, NativeError> {
-    let array = match captures.first() {
-        Some(Value::Array(array)) => *array,
-        _ => {
-            return Err(NativeError::TypeError {
-                name: "Array[Symbol.iterator]",
-                reason: "missing traced array capture".to_string(),
-            });
-        }
+    let Some(array) = captures.first().and_then(|v| v.as_array()) else {
+        return Err(NativeError::TypeError {
+            name: "Array[Symbol.iterator]",
+            reason: "missing traced array capture".to_string(),
+        });
     };
     let state = IteratorState::Array {
         array,
@@ -4651,12 +4648,19 @@ pub enum GeneratorResumeKind {
 /// inputs raise a RangeError-equivalent (surfaced here as
 /// `TypeMismatch`).
 fn take_drop_count(arg: Option<&Value>) -> Result<u64, VmError> {
-    let n = match arg {
-        None | Some(Value::Undefined) => return Err(VmError::TypeMismatch),
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        _ => return Err(VmError::TypeMismatch),
+    let Some(v) = arg else {
+        return Err(VmError::TypeMismatch);
+    };
+    let n = if v.is_undefined() {
+        return Err(VmError::TypeMismatch);
+    } else if let Some(num) = v.as_number() {
+        num.as_f64()
+    } else if let Some(b) = v.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if v.is_null() {
+        0.0
+    } else {
+        return Err(VmError::TypeMismatch);
     };
     if n.is_nan() {
         return Err(VmError::TypeMismatch);
@@ -4737,7 +4741,7 @@ fn step_iterator(
                         *index += 1;
                     }
                 });
-                Some(Value::Number(crate::number::NumberValue::from_f64(
+                Some(Value::number(crate::number::NumberValue::from_f64(
                     index as f64,
                 )))
             }
@@ -4770,7 +4774,7 @@ fn step_iterator(
                         *index += 1;
                     }
                 });
-                Some(Value::Array(pair))
+                Some(Value::array(pair))
             }
         }
         FastIteratorSnapshot::String(string, index) => {
@@ -4790,7 +4794,7 @@ fn step_iterator(
                         *index += advance;
                     }
                 });
-                Some(Value::String(s))
+                Some(Value::string(s))
             } else {
                 None
             }
@@ -4831,7 +4835,7 @@ fn step_iterator(
                             elements.push(key);
                             elements.push(value);
                         });
-                        Value::Array(pair)
+                        Value::array(pair)
                     }
                 })
             } else {
@@ -4872,7 +4876,7 @@ fn step_iterator(
                             elements.push(value);
                             elements.push(value);
                         });
-                        Value::Array(pair)
+                        Value::array(pair)
                     }
                 })
             } else {
@@ -4886,7 +4890,7 @@ fn step_iterator(
         Some(value) => Ok((value, false)),
         None => {
             gc_heap.with_payload(iter, |state| *state = IteratorState::Exhausted);
-            Ok((Value::Undefined, true))
+            Ok((Value::undefined(), true))
         }
     }
 }
@@ -4894,45 +4898,17 @@ fn step_iterator(
 /// Whether a constructor return value is an ECMAScript object and
 /// therefore replaces the freshly-created receiver.
 fn constructor_return_is_object(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Promise(_)
-            | Value::Iterator(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Temporal(_)
-            | Value::Intl(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-            | Value::Proxy(_)
-    )
+    value.is_object_like()
 }
 
 /// `true` when `value` is a `JsObject` whose internal native
-/// call slot carries a `Value::NativeFunction`, i.e. it is
+/// call slot carries a native function, i.e. it is
 /// callable even though it is not a plain function value.
 fn object_has_call_slot(value: &Value, heap: &otter_gc::GcHeap) -> bool {
-    let Value::Object(obj) = value else {
+    let Some(obj) = value.as_object() else {
         return false;
     };
-    matches!(
-        crate::object::call_native(*obj, heap),
-        Some(Value::NativeFunction(_))
-    )
+    crate::object::call_native(obj, heap).is_some_and(|v| v.is_native_function())
 }
 
 /// `true` when `value` is a VM constructor. This is intentionally
@@ -4943,30 +4919,23 @@ fn is_constructor_runtime(
     context: &ExecutionContext,
     heap: &otter_gc::GcHeap,
 ) -> bool {
-    match value {
-        Value::BoundFunction(bound) => {
-            let (target, _, _) = bound.parts(heap);
-            is_constructor_runtime(&target, context, heap)
-        }
-        _ => {
-            abstract_ops::is_constructor(value, context, heap)
-                || object_has_construct_slot(value, heap)
-        }
+    if let Some(bound) = value.as_bound_function() {
+        let (target, _, _) = bound.parts(heap);
+        is_constructor_runtime(&target, context, heap)
+    } else {
+        abstract_ops::is_constructor(value, context, heap) || object_has_construct_slot(value, heap)
     }
 }
 
 /// `true` when `value` is a `JsObject` whose internal native
-/// constructor slot carries a `Value::NativeFunction`, i.e. it is
+/// constructor slot carries a native function, i.e. it is
 /// admissible as a `new` callee even though it is not a plain
 /// function value.
 fn object_has_construct_slot(value: &Value, heap: &otter_gc::GcHeap) -> bool {
-    let Value::Object(obj) = value else {
+    let Some(obj) = value.as_object() else {
         return false;
     };
-    matches!(
-        crate::object::constructor_native(*obj, heap),
-        Some(Value::NativeFunction(_))
-    )
+    crate::object::constructor_native(obj, heap).is_some_and(|v| v.is_native_function())
 }
 
 fn is_restricted_function_property(name: &str) -> bool {

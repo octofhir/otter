@@ -28,16 +28,13 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> L
 }
 
 fn require_payload(args: &IntrinsicArgs<'_>) -> Result<ListFormatPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::ListFormat(p) => Ok(p),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.ListFormat",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.ListFormat",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.ListFormat",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::ListFormat(p) => Ok(p),
+        _ => Err(bad()),
     }
 }
 
@@ -73,30 +70,29 @@ fn collect_items(
     value: Option<&Value>,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<Vec<String>, IntrinsicError> {
-    match value {
-        Some(Value::Array(arr)) => {
-            let values = crate::array::with_elements(*arr, gc_heap, |elements| elements.to_vec());
-            let mut out: Vec<String> = Vec::with_capacity(values.len());
-            for v in values {
-                match v {
-                    Value::String(s) => out.push(s.to_lossy_string(gc_heap)),
-                    Value::Number(n) => out.push(n.to_display_string()),
-                    Value::Boolean(b) => out.push((if b { "true" } else { "false" }).to_string()),
-                    _ => {
-                        return Err(IntrinsicError::BadArgument {
-                            index: 0,
-                            reason: "list elements must be strings",
-                        });
-                    }
-                }
-            }
-            Ok(out)
-        }
-        _ => Err(IntrinsicError::BadArgument {
+    let Some(arr) = value.and_then(|v| v.as_array()) else {
+        return Err(IntrinsicError::BadArgument {
             index: 0,
             reason: "argument must be an Array",
-        }),
+        });
+    };
+    let values = crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
+    let mut out: Vec<String> = Vec::with_capacity(values.len());
+    for v in values {
+        if let Some(s) = v.as_string() {
+            out.push(s.to_lossy_string(gc_heap));
+        } else if let Some(n) = v.as_number() {
+            out.push(n.to_display_string());
+        } else if let Some(b) = v.as_boolean() {
+            out.push((if b { "true" } else { "false" }).to_string());
+        } else {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "list elements must be strings",
+            });
+        }
     }
+    Ok(out)
 }
 
 /// §13.5.3 `format(list)`.

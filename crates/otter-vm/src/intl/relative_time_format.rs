@@ -31,16 +31,13 @@ pub fn resolve(
 }
 
 fn require_payload(args: &IntrinsicArgs<'_>) -> Result<RelativeTimeFormatPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::RelativeTimeFormat(p) => Ok(p),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.RelativeTimeFormat",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.RelativeTimeFormat",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.RelativeTimeFormat",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::RelativeTimeFormat(p) => Ok(p),
+        _ => Err(bad()),
     }
 }
 
@@ -102,21 +99,23 @@ fn format_number(n: f64) -> String {
 /// §17.5.3 `format(value, unit)`.
 fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let value = match args.args.first() {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) | None => 0.0,
-        _ => f64::NAN,
+    let first = args.args.first();
+    let value = if let Some(n) = first.and_then(|v| v.as_number()) {
+        n.as_f64()
+    } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
+        if b { 1.0 } else { 0.0 }
+    } else if first.is_none() || first.is_some_and(|v| v.is_null()) {
+        0.0
+    } else {
+        f64::NAN
     };
-    let unit = match args.args.get(1) {
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 1,
-                reason: "must be a string unit",
-            });
-        }
+    let Some(unit_str) = args.args.get(1).and_then(|v| v.as_string()) else {
+        return Err(IntrinsicError::BadArgument {
+            index: 1,
+            reason: "must be a string unit",
+        });
     };
+    let unit = unit_str.to_lossy_string(args.gc_heap);
     let rendered = render_format(value, &unit, &payload);
     Ok(Value::string(crate::string::JsString::from_str(
         &rendered,

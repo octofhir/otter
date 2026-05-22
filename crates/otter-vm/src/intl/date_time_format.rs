@@ -58,24 +58,23 @@ pub fn resolve(
 }
 
 fn require_date_time(args: &IntrinsicArgs<'_>) -> Result<DateTimeFormatPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::DateTimeFormat(d) => Ok(d),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.DateTimeFormat",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.DateTimeFormat",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.DateTimeFormat",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::DateTimeFormat(d) => Ok(d),
+        _ => Err(bad()),
     }
 }
 
 fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_date_time(args)?;
-    let formatted = match args.args.first() {
-        Some(Value::Number(n)) => format_epoch_ms(n.as_f64() as i64, &payload),
-        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+    let first = args.args.first();
+    let formatted = if let Some(n) = first.and_then(|v| v.as_number()) {
+        format_epoch_ms(n.as_f64() as i64, &payload)
+    } else if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDateTime(pdt) => format_pdt(&pdt, &payload),
             TemporalPayload::PlainDate(pd) => format_pd(&pd, &payload),
             TemporalPayload::Instant(inst) => format_epoch_ms(inst.epoch_milliseconds(), &payload),
@@ -85,21 +84,18 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                     reason: "must be a Number, Temporal.Instant, Temporal.PlainDate, or Temporal.PlainDateTime",
                 });
             }
-        },
-        // No argument → use Date.now() epoch ms equivalent.
-        None | Some(Value::Undefined) => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            format_epoch_ms(now, &payload)
         }
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a Number or Temporal value",
-            });
-        }
+    } else if first.is_none() || first.is_some_and(|v| v.is_undefined()) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        format_epoch_ms(now, &payload)
+    } else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a Number or Temporal value",
+        });
     };
     js_string(&formatted, args.gc_heap).map_err(intl_to_intrinsic)
 }

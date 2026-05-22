@@ -123,6 +123,7 @@ mod value_kind;
 // migrates to the accessor surface in [`value::Value`], the enum below
 // disappears and `pub use value::Value as Value` becomes the canonical
 // export. See `docs/architecture-refactor-plan-2026-05.md` §Phase 1.
+pub mod upvalue;
 pub mod value;
 pub mod weak_refs;
 
@@ -1121,93 +1122,9 @@ impl BoundFunction {
     }
 }
 
-/// One captured-variable cell. Cloning shares the same heap slot
-/// so multiple closures + the original outer scope all see
-/// mutations through it.
-///
-/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for
-/// [`UpvalueCellBody`].
-pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
-
-/// GC-allocated payload backing every [`UpvalueCell`] handle.
-///
-/// Holds a single captured `Value`. Mutation flows through
-/// [`store_upvalue`]; reads through [`read_upvalue`]; allocation
-/// through [`alloc_upvalue`].
-///
-/// # Layout
-///
-/// One `Value` field. After task 76 the body is the only place
-/// the captured value lives — every closure handle stores a
-/// `Gc<UpvalueCellBody>` (4-byte compressed offset) instead of
-/// the previous ref-counted mutable cell (8-byte pointer +
-/// allocation overhead).
-///
-/// # Spec
-///
-/// Captured-binding semantics — ECMA-262
-/// §9.1.1.1.4 (CreateMutableBinding) + §9.1.1.1.5
-/// (InitializeBinding); the closure spine that holds these
-/// cells is built by `Op::MakeClosure` per §15.2.5
-/// (FunctionDeclarationInstantiation). Upvalue migration
-/// rationale lives in the mdBook GC API chapter.
-pub struct UpvalueCellBody {
-    /// Captured `Value`. Phase 1: arbitrary `Value`; once
-    /// `Value` carries `Gc<…>` variants (tasks 77+),
-    /// [`store_upvalue`] fires
-    /// [`otter_gc::GcHeap::write_barrier`] for every store
-    /// whose RHS holds a GC handle.
-    pub value: Value,
-}
-
-impl otter_gc::SafeTraceable for UpvalueCellBody {
-    const TYPE_TAG: u8 = UPVALUE_CELL_TYPE_TAG;
-
-    /// Walk the inner `Value` for any outgoing GC reference.
-    ///
-    /// Phase 1: `Value` carries no direct `Gc<…>` variants yet,
-    /// but [`Value::Closure`] holds an `Rc<[UpvalueCell]>` whose
-    /// elements are GC handles — those slots get yielded via
-    /// [`Value::trace_value_slots`]. Each subsequent migration
-    /// task (77–83) adds its variant arm there and the trace
-    /// here picks it up automatically.
-    fn trace_slots_safe(&self, v: &mut SlotVisitor<'_>) {
-        self.value.trace_value_slots(v);
-    }
-}
-
-/// Compressed handle to an [`UpvalueCellBody`] — replaces the
-/// pre-task-76 ref-counted mutable cell. `Copy + Eq + Hash`
-/// (inherited from [`otter_gc::Gc`]); identity comparison via
-/// `cell == other`.
-pub type UpvalueCell = otter_gc::Gc<UpvalueCellBody>;
-
-/// Allocate a fresh [`UpvalueCell`] pre-populated with
-/// `value` on the GC heap.
-///
-/// Routes through [`otter_gc::GcHeap::alloc_old`] so the body
-/// is allocated directly in old-space — Phase-1 closure spines
-/// (`Rc<[UpvalueCell]>`) cannot yet be rewritten by the
-/// scavenger, and old-space objects do not move. Phase 2 may
-/// switch back to [`otter_gc::GcHeap::alloc`] once the
-/// scavenger walks every closure spine slot.
-///
-/// # Errors
-///
-/// Surfaces [`otter_gc::OutOfMemory`] verbatim; runtime callers
-/// translate it into [`VmError::OutOfMemory`].
-pub fn alloc_upvalue(
-    heap: &mut otter_gc::GcHeap,
-    value: Value,
-) -> Result<UpvalueCell, otter_gc::OutOfMemory> {
-    heap.alloc_old(UpvalueCellBody { value })
-}
-
-/// Read the captured value of `cell` (clones the payload).
-#[must_use]
-pub fn read_upvalue(heap: &otter_gc::GcHeap, cell: UpvalueCell) -> Value {
-    heap.read_payload(cell, |body| body.value)
-}
+pub use upvalue::{
+    UPVALUE_CELL_TYPE_TAG, UpvalueCell, UpvalueCellBody, alloc_upvalue, read_upvalue, store_upvalue,
+};
 
 /// Map an [`otter_gc::OutOfMemory`] from a GC body allocation into the
 /// runtime-shaped [`VmError::OutOfMemory`]. Used by every value-model
@@ -1218,22 +1135,6 @@ pub fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {
         requested_bytes: err.requested_bytes(),
         heap_limit_bytes: err.heap_limit_bytes(),
     }
-}
-
-/// Write `value` into `cell`, firing the generational write
-/// barrier so the scavenger sees any newly-established
-/// old → young pointer.
-///
-/// Phase 1: the barrier call is structurally present but
-/// semantically a no-op for non-`Gc`-bearing `Value` variants.
-/// As tasks 77+ add `Gc<…>` arms to [`Value`], the barrier
-/// becomes load-bearing without changes to this call site.
-pub fn store_upvalue(heap: &mut otter_gc::GcHeap, cell: UpvalueCell, value: Value) {
-    let barrier_value = value;
-    heap.with_payload(cell, |body| {
-        body.value = value;
-    });
-    heap.record_write(cell, &barrier_value);
 }
 
 impl Value {

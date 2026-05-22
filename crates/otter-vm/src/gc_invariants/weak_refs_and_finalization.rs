@@ -53,7 +53,7 @@ fn empty_context() -> ExecutionContext {
 fn weak_ref_does_not_keep_target_alive() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
     let target = alloc_old_object(&mut heap).expect("target");
-    let weak_ref = alloc_weak_ref(&mut heap, &Value::Object(target)).expect("weak ref");
+    let weak_ref = alloc_weak_ref(&mut heap, &Value::object(target)).expect("weak ref");
     assert_eq!(weak_ref_deref(weak_ref, &heap), Value::Object(target));
 
     let mut weak_root = weak_ref.raw();
@@ -70,7 +70,7 @@ fn weak_ref_does_not_keep_target_alive() {
 fn weak_ref_returns_target_while_strongly_rooted() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
     let target = alloc_old_object(&mut heap).expect("target");
-    let weak_ref = alloc_weak_ref(&mut heap, &Value::Object(target)).expect("weak ref");
+    let weak_ref = alloc_weak_ref(&mut heap, &Value::object(target)).expect("weak ref");
 
     let mut weak_root = weak_ref.raw();
     let mut target_root = target.raw();
@@ -87,7 +87,7 @@ fn weak_ref_returns_target_while_strongly_rooted() {
 fn weak_ref_target_becomes_unavailable_after_force_gc() {
     let mut interp = Interpreter::new();
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
-    let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::Object(target)).expect("weak ref");
+    let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::object(target)).expect("weak ref");
     let global = *interp.global_this();
     crate::object::set(global, interp.gc_heap_mut(), "wr", Value::WeakRef(weak_ref));
 
@@ -128,7 +128,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
     finalization_registry_register(
         registry,
         interp.gc_heap_mut(),
-        &Value::Object(target),
+        &Value::object(target),
         Value::Boolean(true),
         None,
     )
@@ -166,7 +166,7 @@ fn dropped_finalization_registry_self_cycle_is_reaped() {
     finalization_registry_register(
         registry,
         &mut heap,
-        &Value::Object(target),
+        &Value::object(target),
         Value::FinalizationRegistry(registry),
         None,
     )
@@ -208,7 +208,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
     finalization_registry_register(
         registry,
         interp.gc_heap_mut(),
-        &Value::Object(target),
+        &Value::object(target),
         Value::Boolean(true),
         None,
     )
@@ -266,11 +266,11 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
     };
     let registry = alloc_finalization_registry(interp.gc_heap_mut(), callback).expect("registry");
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
-    let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::Object(target)).expect("weak ref");
+    let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::object(target)).expect("weak ref");
     finalization_registry_register(
         registry,
         interp.gc_heap_mut(),
-        &Value::Object(target),
+        &Value::object(target),
         Value::WeakRef(weak_ref),
         None,
     )
@@ -312,7 +312,7 @@ fn finalization_cleanup_job_carries_registry_context() {
     finalization_registry_register(
         registry,
         interp.gc_heap_mut(),
-        &Value::Object(target),
+        &Value::object(target),
         Value::Undefined,
         None,
     )
@@ -353,11 +353,11 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
     };
     let registry = alloc_finalization_registry(interp.gc_heap_mut(), callback).expect("registry");
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
-    let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::Object(target)).expect("weak ref");
+    let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::object(target)).expect("weak ref");
     finalization_registry_register(
         registry,
         interp.gc_heap_mut(),
-        &Value::Object(target),
+        &Value::object(target),
         Value::WeakRef(weak_ref),
         None,
     )
@@ -397,7 +397,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
     finalization_registry_register(
         registry,
         interp.gc_heap_mut(),
-        &Value::Object(target),
+        &Value::object(target),
         Value::Boolean(true),
         None,
     )
@@ -432,14 +432,14 @@ fn finalization_registry_unregister_token_removes_cells() {
     finalization_registry_register(
         registry,
         &mut heap,
-        &Value::Object(target),
+        &Value::object(target),
         Value::Boolean(false),
         Some(&Value::Object(token)),
     )
     .expect("register");
     assert_eq!(finalization_registry_cell_count(registry, &heap), 1);
     assert!(
-        finalization_registry_unregister(registry, &mut heap, &Value::Object(token))
+        finalization_registry_unregister(registry, &mut heap, &Value::object(token))
             .expect("unregister")
     );
     assert_eq!(finalization_registry_cell_count(registry, &heap), 0);
@@ -450,7 +450,7 @@ fn weak_finalization_registry_prunes_dead_handles_and_keeps_lazy_flag() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
     assert!(!heap.has_finalization_registries());
     let target = alloc_old_object(&mut heap).expect("target");
-    let _weak_ref = alloc_weak_ref(&mut heap, &Value::Object(target)).expect("weak ref");
+    let _weak_ref = alloc_weak_ref(&mut heap, &Value::object(target)).expect("weak ref");
     assert_eq!(heap.weak_ref_count(), 1);
     assert_eq!(
         heap.gc_stats().by_type[WEAK_REF_BODY_TYPE_TAG as usize].alloc_count_total,

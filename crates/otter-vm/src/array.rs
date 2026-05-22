@@ -1348,7 +1348,7 @@ mod tests {
         let mut heap = fresh_heap();
         let a = from_elements_old_for_fixture(
             &mut heap,
-            [Value::Boolean(true), Value::Null, Value::Boolean(false)],
+            [Value::boolean(true), Value::Null, Value::Boolean(false)],
         )
         .unwrap();
         assert_eq!(len(a, &heap), 3);
@@ -1481,7 +1481,7 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(&b"[[]]"[..]);
         let outer = from_elements_with_source_old_for_fixture(
             &mut heap,
-            [Value::Array(inner)],
+            [Value::array(inner)],
             Arc::clone(&bytes),
         )
         .unwrap();

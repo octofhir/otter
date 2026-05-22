@@ -2361,8 +2361,8 @@ impl Interpreter {
                         Value::Null => break,
                         Value::Object(candidate) => {
                             if abstract_ops::same_value(
-                                &Value::Object(*candidate),
-                                &Value::Object(obj),
+                                &Value::object(*candidate),
+                                &Value::object(obj),
                                 &self.gc_heap,
                             ) {
                                 return Ok(false);

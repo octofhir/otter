@@ -679,7 +679,7 @@ impl Interpreter {
                 let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
                 if !self.define_own_property_value(
                     context,
-                    &Value::Object(obj),
+                    &Value::object(obj),
                     &key,
                     descriptor,
                 )? {

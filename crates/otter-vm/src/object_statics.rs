@@ -261,7 +261,7 @@ fn native_group_by_rooted(
         };
         let value_root = *item;
         let arr_value = Value::array(group);
-        let roots = [&value_root, &arr_value, &Value::Object(result)];
+        let roots = [&value_root, &arr_value, &Value::object(result)];
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for v in &roots {
                 v.trace_value_slots(visitor);

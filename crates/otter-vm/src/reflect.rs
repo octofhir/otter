@@ -351,7 +351,7 @@ fn set_data_on_receiver(
                 value: Some(value),
                 ..Default::default()
             };
-            interp.define_own_property_value(context, &Value::Object(recv_obj), key, partial)
+            interp.define_own_property_value(context, &Value::object(recv_obj), key, partial)
         }
         crate::object::PropertyLookup::Absent => {
             // §10.1.9 step 5.f — CreateDataProperty on receiver.
@@ -362,7 +362,7 @@ fn set_data_on_receiver(
                 configurable: Some(true),
                 ..Default::default()
             };
-            interp.define_own_property_value(context, &Value::Object(recv_obj), key, descriptor)
+            interp.define_own_property_value(context, &Value::object(recv_obj), key, descriptor)
         }
     }
 }
@@ -763,7 +763,7 @@ mod tests {
             &mut interp,
             &context,
             ReflectMethod::GetOwnPropertyDescriptor,
-            &[Value::Object(target), key],
+            &[Value::object(target), key],
         )
         .expect("descriptor");
 
@@ -788,7 +788,7 @@ mod tests {
             &mut interp,
             &context,
             ReflectMethod::OwnKeys,
-            &[Value::Object(target)],
+            &[Value::object(target)],
         )
         .expect("ownKeys");
 

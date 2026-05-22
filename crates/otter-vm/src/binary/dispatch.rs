@@ -562,7 +562,7 @@ mod tests {
     #[test]
     fn array_buffer_constructor_with_roots_accounts_backing_store() {
         let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
-        let args = [Value::Number(NumberValue::from_i32(64))];
+        let args = [Value::number(NumberValue::from_i32(64))];
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
 
         let before = heap.tracked_bytes();
@@ -592,7 +592,7 @@ mod tests {
     #[test]
     fn typed_array_constructor_with_roots_accounts_backing_store() {
         let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
-        let args = [Value::Number(NumberValue::from_i32(4))];
+        let args = [Value::number(NumberValue::from_i32(4))];
         let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
 
         let before = heap.tracked_bytes();
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn shared_array_buffer_constructor_uses_rooted_dispatch_boundary() {
         let mut heap = otter_gc::GcHeap::with_max_heap_bytes(1024 * 1024).expect("heap");
-        let args = [Value::Number(NumberValue::from_i32(64))];
+        let args = [Value::number(NumberValue::from_i32(64))];
         let mut visited_roots = false;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             visited_roots = true;

@@ -1028,7 +1028,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let separator_owned: JsString;
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => {
-            let singleton = [Value::String(recv)];
+            let singleton = [Value::string(recv)];
             return Ok(Value::array(args.array_from_elements_rooted(
                 singleton.iter().cloned(),
                 &[],
@@ -2182,7 +2182,7 @@ mod tests {
         let entry = lookup("concat").unwrap();
         let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
-            args: &[Value::Number(NumberValue::from_i32(3))],
+            args: &[Value::number(NumberValue::from_i32(3))],
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
@@ -2207,7 +2207,7 @@ mod tests {
         let entry = lookup("repeat").unwrap();
         let err = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
-            args: &[Value::Number(NumberValue::from_i32(-1))],
+            args: &[Value::number(NumberValue::from_i32(-1))],
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
@@ -2272,7 +2272,7 @@ mod tests {
         let entry = lookup("codePointAt").unwrap();
         let r = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
-            args: &[Value::Number(NumberValue::from_i32(0))],
+            args: &[Value::number(NumberValue::from_i32(0))],
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })
@@ -2281,7 +2281,7 @@ mod tests {
         // Index 1 is the trailing surrogate alone.
         let r2 = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
-            args: &[Value::Number(NumberValue::from_i32(1))],
+            args: &[Value::number(NumberValue::from_i32(1))],
             gc_heap: &mut gc_heap,
             allocation_roots: &[],
         })

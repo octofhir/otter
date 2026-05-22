@@ -2636,7 +2636,7 @@ mod tests {
             first,
             interp.gc_heap_mut(),
             key,
-            &Value::Boolean(true),
+            &Value::boolean(true),
         )
         .expect("transition install");
 
@@ -2826,7 +2826,7 @@ mod tests {
         let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
 
         assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::Boolean(false)),
+            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::boolean(false)),
             Some(())
         );
         assert_eq!(
@@ -2837,7 +2837,7 @@ mod tests {
         set(o, &mut heap, "y", Value::Null);
 
         assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::Boolean(true)),
+            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::boolean(true)),
             None
         );
     }
@@ -2853,7 +2853,7 @@ mod tests {
             "x",
         );
         let transition =
-            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(true))
+            capture_store_property_transition(first, &mut heap, key, &Value::boolean(true))
                 .expect("transition install");
         assert!(matches!(
             transition.kind,
@@ -2869,7 +2869,7 @@ mod tests {
                 &mut heap,
                 key,
                 &transition,
-                &Value::Boolean(false),
+                &Value::boolean(false),
             ),
             None
         );
@@ -2887,7 +2887,7 @@ mod tests {
             "x",
         );
         let transition =
-            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(true))
+            capture_store_property_transition(first, &mut heap, key, &Value::boolean(true))
                 .expect("transition install");
         set(proto, &mut heap, "x", Value::Null);
 
@@ -2900,7 +2900,7 @@ mod tests {
                 &mut heap,
                 key,
                 &transition,
-                &Value::Boolean(false),
+                &Value::boolean(false),
             ),
             None
         );
@@ -2917,7 +2917,7 @@ mod tests {
             "x",
         );
         let transition =
-            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(true))
+            capture_store_property_transition(first, &mut heap, key, &Value::boolean(true))
                 .expect("transition install");
         let deep_proto = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(proto, &mut heap, Some(deep_proto));
@@ -2931,7 +2931,7 @@ mod tests {
                 &mut heap,
                 key,
                 &transition,
-                &Value::Boolean(false),
+                &Value::boolean(false),
             ),
             None
         );
@@ -2949,7 +2949,7 @@ mod tests {
             "x",
         );
         let transition =
-            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(false))
+            capture_store_property_transition(first, &mut heap, key, &Value::boolean(false))
                 .expect("transition install");
         assert!(matches!(
             transition.kind,
@@ -2979,7 +2979,7 @@ mod tests {
             "x",
         );
         let transition =
-            capture_store_property_transition(first, &mut heap, key, &Value::Boolean(false))
+            capture_store_property_transition(first, &mut heap, key, &Value::boolean(false))
                 .expect("transition install");
         assert!(define_own_property(
             proto,

@@ -791,7 +791,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let set = collections::alloc_set(&mut gc_heap).expect("set");
         let receiver = Value::set(set);
-        let args = [Value::Number(NumberValue::from_i32(3))];
+        let args = [Value::number(NumberValue::from_i32(3))];
         let before = gc_heap.stats().reserved_bytes;
 
         let result = impl_set_add(&mut IntrinsicArgs {

@@ -138,7 +138,7 @@ fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsic
         crate::object::set(part, heap, "value", s);
     }
     Ok(Value::array(args.array_from_elements_rooted(
-        [Value::Object(part)],
+        [Value::object(part)],
         &[],
         &[],
     )?))

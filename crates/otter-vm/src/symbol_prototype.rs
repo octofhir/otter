@@ -106,7 +106,7 @@ mod tests {
         let sym = JsSymbol::new(&mut gc_heap, Some(desc)).unwrap();
         let entry = lookup("toString").unwrap();
         let result = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &Value::Symbol(sym),
+            receiver: &Value::symbol(sym),
             args: &[],
             gc_heap: &mut gc_heap,
             allocation_roots: &[],

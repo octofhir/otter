@@ -1154,7 +1154,7 @@ mod tests {
         let call = native.call_target(interp.gc_heap());
         let mut ctx = NativeCtx::new(&mut interp);
         let r = call
-            .invoke(&mut ctx, &[Value::Number(NumberValue::from_i32(7))])
+            .invoke(&mut ctx, &[Value::number(NumberValue::from_i32(7))])
             .unwrap();
         assert_eq!(r.display_string(ctx.heap()), "7");
     }

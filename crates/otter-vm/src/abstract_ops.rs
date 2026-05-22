@@ -653,8 +653,8 @@ mod tests {
     #[test]
     fn cross_kind_rejected() {
         let heap = fresh_heap();
-        assert!(!same_value(&n(1.0), &Value::Boolean(true), &heap));
-        assert!(!same_value_zero(&n(1.0), &Value::Boolean(true), &heap));
+        assert!(!same_value(&n(1.0), &Value::boolean(true), &heap));
+        assert!(!same_value_zero(&n(1.0), &Value::boolean(true), &heap));
         assert!(!same_value(&Value::Null, &Value::Undefined, &heap));
     }
 
@@ -674,13 +674,13 @@ mod tests {
         assert!(same_value(&Value::Undefined, &Value::Undefined, &heap));
         assert!(same_value(&Value::Null, &Value::Null, &heap));
         assert!(same_value(
-            &Value::Boolean(true),
-            &Value::Boolean(true),
+            &Value::boolean(true),
+            &Value::boolean(true),
             &heap
         ));
         assert!(!same_value(
-            &Value::Boolean(true),
-            &Value::Boolean(false),
+            &Value::boolean(true),
+            &Value::boolean(false),
             &heap
         ));
     }

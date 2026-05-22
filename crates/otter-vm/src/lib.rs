@@ -5816,7 +5816,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(7))],
+            [Value::number(NumberValue::from_i32(7))],
         )
         .unwrap();
 
@@ -5868,7 +5868,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(5))],
+            [Value::number(NumberValue::from_i32(5))],
         )
         .unwrap();
         let mapper =
@@ -5908,12 +5908,12 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(1))],
+            [Value::number(NumberValue::from_i32(1))],
         )
         .unwrap();
         let mapped = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(99))],
+            [Value::number(NumberValue::from_i32(99))],
         )
         .unwrap();
         let mapper = native_value_with_captures(
@@ -5979,7 +5979,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(12))],
+            [Value::number(NumberValue::from_i32(12))],
         )
         .unwrap();
         let mapper =
@@ -6027,7 +6027,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(21))],
+            [Value::number(NumberValue::from_i32(21))],
         )
         .unwrap();
 
@@ -6072,7 +6072,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(NumberValue::from_i32(21))],
+            [Value::number(NumberValue::from_i32(21))],
         )
         .unwrap();
         let factory = make_array_iterator_factory(source, interp.gc_heap_mut()).unwrap();
@@ -6178,7 +6178,7 @@ mod tests {
         )
         .unwrap();
         let seed =
-            crate::array::from_elements_old_for_fixture(interp.gc_heap_mut(), [Value::Array(pair)])
+            crate::array::from_elements_old_for_fixture(interp.gc_heap_mut(), [Value::array(pair)])
                 .unwrap();
         let module = BytecodeModule {
             module: "test.ts".to_string(),
@@ -6219,7 +6219,7 @@ mod tests {
             crate::collections::map_get(
                 map,
                 interp.gc_heap(),
-                &Value::Number(NumberValue::from_i32(1))
+                &Value::number(NumberValue::from_i32(1))
             ),
             Some(Value::Number(NumberValue::from_i32(10)))
         );
@@ -6323,7 +6323,7 @@ mod tests {
             .alloc_host_object_with_roots(&[], &[])
             .expect("host object allocation");
         let host_root = Value::object(host);
-        let elements = [Value::Number(NumberValue::from_i32(1))];
+        let elements = [Value::number(NumberValue::from_i32(1))];
         let array = interp
             .array_from_elements_host_rooted(
                 elements.iter().cloned(),

@@ -393,7 +393,7 @@ fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Resul
         Value::ClassConstructor(class) => callable_name(ctx, &class.ctor(ctx.gc_heap)),
         Value::Object(obj) => match object::constructor_native(*obj, ctx.gc_heap) {
             Some(Value::NativeFunction(native)) => {
-                callable_name(ctx, &Value::NativeFunction(native))
+                callable_name(ctx, &Value::native_function(native))
             }
             _ => Ok(String::new()),
         },
@@ -444,7 +444,7 @@ fn callable_length(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Res
         Value::ClassConstructor(class) => callable_length(ctx, &class.ctor(ctx.gc_heap)),
         Value::Object(obj) => match object::constructor_native(*obj, ctx.gc_heap) {
             Some(Value::NativeFunction(native)) => {
-                callable_length(ctx, &Value::NativeFunction(native))
+                callable_length(ctx, &Value::native_function(native))
             }
             _ => Ok(0.0),
         },

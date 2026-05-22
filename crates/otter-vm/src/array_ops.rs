@@ -326,14 +326,14 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::Number(crate::NumberValue::from_i32(7))],
+            [Value::number(crate::NumberValue::from_i32(7))],
         )
         .expect("source");
         let context = empty_context();
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = interp
-            .array_from_sync(&context, &[Value::Array(source)])
+            .array_from_sync(&context, &[Value::array(source)])
             .expect("Array.from");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
@@ -383,7 +383,7 @@ mod tests {
         let before_reserved = interp.gc_heap().stats().reserved_bytes;
 
         let result = interp
-            .array_construct_stack_rooted(&stack, &[Value::Number(crate::NumberValue::from_i32(8))])
+            .array_construct_stack_rooted(&stack, &[Value::number(crate::NumberValue::from_i32(8))])
             .expect("Array constructor");
 
         let after_alloc = interp.gc_heap().stats().new_allocated_bytes;

@@ -464,7 +464,7 @@ fn modify_op(
         };
         let new_b = op_big(&prev_b, &v_b);
         let handle = BigIntValue::from_inner(heap, new_b).map_err(oom_to_err)?;
-        ta.set(heap, idx, &Value::BigInt(handle));
+        ta.set(heap, idx, &Value::big_int(handle));
     } else {
         let prev_n = match &prev {
             Value::Number(n) => n.as_f64() as i64,
@@ -478,7 +478,7 @@ fn modify_op(
         ta.set(
             heap,
             idx,
-            &Value::Number(NumberValue::from_f64(new_n as f64)),
+            &Value::number(NumberValue::from_f64(new_n as f64)),
         );
     }
     Ok(prev)

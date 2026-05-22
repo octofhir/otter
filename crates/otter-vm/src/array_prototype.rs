@@ -2157,7 +2157,7 @@ mod tests {
         let r = call(
             "push",
             arr,
-            &[Value::Number(NumberValue::from_i32(3))],
+            &[Value::number(NumberValue::from_i32(3))],
             &mut gc_heap,
         );
         assert_eq!(r.display_string(&gc_heap), "3");
@@ -2227,13 +2227,13 @@ mod tests {
         let yes = call(
             "includes",
             arr,
-            &[Value::Number(NumberValue::from_i32(20))],
+            &[Value::number(NumberValue::from_i32(20))],
             &mut gc_heap,
         );
         let no = call(
             "includes",
             arr,
-            &[Value::Number(NumberValue::from_i32(99))],
+            &[Value::number(NumberValue::from_i32(99))],
             &mut gc_heap,
         );
         assert_eq!(yes, Value::Boolean(true));
@@ -2241,7 +2241,7 @@ mod tests {
         let idx = call(
             "indexOf",
             arr,
-            &[Value::Number(NumberValue::from_i32(30))],
+            &[Value::number(NumberValue::from_i32(30))],
             &mut gc_heap,
         );
         assert_eq!(idx.display_string(&gc_heap), "2");

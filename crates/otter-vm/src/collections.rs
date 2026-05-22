@@ -1386,17 +1386,17 @@ mod tests {
         assert_ne!(a.handle(), b.handle(), "test setup: handles must differ");
 
         map_set(m, &mut heap, Value::String(a), n(1)).unwrap();
-        assert!(map_has(m, &heap, &Value::String(b)));
-        assert_eq!(map_get(m, &heap, &Value::String(b)), Some(n(1)));
+        assert!(map_has(m, &heap, &Value::string(b)));
+        assert_eq!(map_get(m, &heap, &Value::string(b)), Some(n(1)));
 
         // Update should hit the existing slot, not append.
         map_set(m, &mut heap, Value::String(b), n(2)).unwrap();
         assert_eq!(map_len(m, &heap), 1);
-        assert_eq!(map_get(m, &heap, &Value::String(a)), Some(n(2)));
+        assert_eq!(map_get(m, &heap, &Value::string(a)), Some(n(2)));
 
         // Mismatched content stays distinct.
         let c = crate::string::JsString::from_str("world", &mut heap).unwrap();
-        assert!(!map_has(m, &heap, &Value::String(c)));
+        assert!(!map_has(m, &heap, &Value::string(c)));
     }
 
     #[test]
@@ -1408,7 +1408,7 @@ mod tests {
         set_add(s, &mut heap, Value::String(a)).unwrap();
         set_add(s, &mut heap, Value::String(b)).unwrap();
         assert_eq!(set_len(s, &heap), 1);
-        assert!(set_has(s, &heap, &Value::String(b)));
+        assert!(set_has(s, &heap, &Value::string(b)));
     }
 
     #[test]
@@ -1422,7 +1422,7 @@ mod tests {
             n(7),
         )
         .unwrap();
-        let v = map_get(m, &heap, &Value::Number(NumberValue::from_f64(0.0)));
+        let v = map_get(m, &heap, &Value::number(NumberValue::from_f64(0.0)));
         assert_eq!(v, Some(n(7)));
     }
 
@@ -1437,7 +1437,7 @@ mod tests {
             n(9),
         )
         .unwrap();
-        let v = map_get(m, &heap, &Value::Number(NumberValue::from_f64(f64::NAN)));
+        let v = map_get(m, &heap, &Value::number(NumberValue::from_f64(f64::NAN)));
         assert_eq!(v, Some(n(9)));
     }
 

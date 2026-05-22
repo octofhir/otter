@@ -1941,7 +1941,7 @@ mod tests {
         let miss = call(
             "exec",
             &re,
-            &[Value::String(
+            &[Value::string(
                 JsString::from_str("zz", &mut gc_heap).unwrap(),
             )],
             &mut gc_heap,

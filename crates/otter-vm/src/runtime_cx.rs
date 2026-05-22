@@ -886,7 +886,7 @@ mod tests {
                 NativeCallInfo::call(Value::Number(NumberValue::from_i32(7))),
             );
             let array = ctx
-                .array_from_elements([Value::Number(NumberValue::from_i32(1))])
+                .array_from_elements([Value::number(NumberValue::from_i32(1))])
                 .expect("native array allocation");
             ctx.array_push(array, Value::Number(NumberValue::from_i32(2)))
                 .expect("native array growth");
@@ -1001,7 +1001,7 @@ mod tests {
                 NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
             );
             let registry = ctx.interp_mut().error_classes_clone();
-            let errors = [Value::Number(NumberValue::from_i32(1))];
+            let errors = [Value::number(NumberValue::from_i32(1))];
             let error = registry
                 .make_aggregate_instance_native_rooted(
                     &mut ctx,

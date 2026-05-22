@@ -126,7 +126,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
     let mut interp = Interpreter::new();
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     let array =
-        crate::test_support::array_from_elements_old(interp.gc_heap_mut(), [Value::Object(object)])
+        crate::test_support::array_from_elements_old(interp.gc_heap_mut(), [Value::object(object)])
             .expect("array");
     let iter = interp
         .gc_heap_mut()

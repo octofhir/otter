@@ -742,7 +742,7 @@ mod tests {
             first,
             &mut heap,
             key("x"),
-            &Value::Boolean(false),
+            &Value::boolean(false),
         )
         .expect("store transition");
         let ic = StorePropertyIc::transition(transition);

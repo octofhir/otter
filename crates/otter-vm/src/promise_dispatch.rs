@@ -3154,7 +3154,7 @@ mod tests {
     #[test]
     fn promise_static_resolve_uses_runtime_rooted_young_allocation() {
         let mut interp = Interpreter::new();
-        let args = [Value::Number(NumberValue::from_i32(7))];
+        let args = [Value::number(NumberValue::from_i32(7))];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let constructor = Value::undefined();

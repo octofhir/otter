@@ -69,7 +69,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
         heap: &mut otter_gc::GcHeap,
         global: crate::object::JsObject,
     ) -> Result<(), crate::js_surface::JsSurfaceError> {
-        let global_root = crate::Value::Object(global);
+        let global_root = crate::Value::object(global);
         let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
             heap,
             &MATH_SPEC,
@@ -81,7 +81,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
             global,
             heap,
             <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-            crate::Value::Object(namespace),
+            crate::Value::object(namespace),
         );
         Ok(())
     }
@@ -216,7 +216,7 @@ pub fn load_constant(name: &str) -> Option<Value> {
         "SQRT2" => SQRT2,
         _ => return None,
     };
-    Some(Value::Number(NumberValue::from_f64(v)))
+    Some(Value::number(NumberValue::from_f64(v)))
 }
 
 /// Dispatch a `Math.<method>(args...)` call. Routes via the
@@ -341,38 +341,39 @@ fn coerce_all(
 ) -> Result<Vec<NumberValue>, MathError> {
     let mut out = Vec::with_capacity(args.len());
     for (idx, v) in args.iter().enumerate() {
-        let n = match v {
-            Value::Number(n) => *n,
-            Value::Boolean(true) => NumberValue::Smi(1),
-            Value::Boolean(false) | Value::Null => NumberValue::Smi(0),
-            Value::Undefined => NumberValue::Double(f64::NAN),
-            // §7.1.4 ToNumber on String → parse numeric literal,
-            // NaN on failure.
-            Value::String(s) => {
-                crate::number::parse::to_number_from_string(&s.to_lossy_string(heap))
+        let n = if let Some(n) = v.as_number() {
+            n
+        } else if let Some(b) = v.as_boolean() {
+            if b {
+                NumberValue::Smi(1)
+            } else {
+                NumberValue::Smi(0)
             }
-            // §7.1.4 ToNumber on BigInt / Symbol throws.
-            Value::BigInt(_) => {
-                return Err(MathError::BadArgument {
-                    name,
-                    index: idx as u16,
-                    reason: "cannot convert a BigInt to a number",
-                });
-            }
-            Value::Symbol(_) => {
-                return Err(MathError::BadArgument {
-                    name,
-                    index: idx as u16,
-                    reason: "cannot convert a Symbol to a number",
-                });
-            }
+        } else if v.is_null() {
+            NumberValue::Smi(0)
+        } else if v.is_undefined() {
+            NumberValue::Double(f64::NAN)
+        } else if let Some(s) = v.as_string() {
+            // §7.1.4 ToNumber on String.
+            crate::number::parse::to_number_from_string(&s.to_lossy_string(heap))
+        } else if v.is_big_int() {
+            return Err(MathError::BadArgument {
+                name,
+                index: idx as u16,
+                reason: "cannot convert a BigInt to a number",
+            });
+        } else if v.is_symbol() {
+            return Err(MathError::BadArgument {
+                name,
+                index: idx as u16,
+                reason: "cannot convert a Symbol to a number",
+            });
+        } else {
             // Non-primitive operands should have been routed through
             // `Interpreter::math_coerce_args` before reaching this
-            // table. Anything that lands here is a bytecode path
-            // that bypassed the coercion (or a residual type we
-            // don't model); surface a soft NaN so Math.max / Math.min
-            // still produce the §21.3.2.{24,25} step 3 NaN result.
-            _ => NumberValue::Double(f64::NAN),
+            // table. Soft NaN so Math.max / Math.min produce the
+            // §21.3.2.{24,25} step 3 NaN result.
+            NumberValue::Double(f64::NAN)
         };
         out.push(n);
     }

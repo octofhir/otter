@@ -52,7 +52,7 @@ impl Interpreter {
             Some(setter) if abstract_ops::is_callable(&setter) => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(*value);
-                self.run_callable_sync(context, &setter, Value::Array(arr), args)?;
+                self.run_callable_sync(context, &setter, Value::array(arr), args)?;
             }
             _ => {
                 Self::failed_set_result(
@@ -121,27 +121,25 @@ impl Interpreter {
         // arms unchanged; `Boolean` / `Null` / `Undefined` /
         // `BigInt` flatten to their display-string form so the
         // downstream match treats them as string keys.
-        match &value {
-            Value::String(_) | Value::Symbol(_) | Value::Number(_) => return Ok(value),
-            Value::Boolean(b) => {
-                let s = if *b { "true" } else { "false" };
-                let js = JsString::from_str(s, self.gc_heap_mut())?;
-                return Ok(Value::string(js));
-            }
-            Value::Null => {
-                let js = JsString::null_str(self.gc_heap_mut())?;
-                return Ok(Value::string(js));
-            }
-            Value::Undefined | Value::Hole => {
-                let js = JsString::undefined_str(self.gc_heap_mut())?;
-                return Ok(Value::string(js));
-            }
-            Value::BigInt(b) => {
-                let js =
-                    JsString::from_str(&b.to_decimal_string(&self.gc_heap), self.gc_heap_mut())?;
-                return Ok(Value::string(js));
-            }
-            _ => {}
+        if value.is_string() || value.is_symbol() || value.is_number() {
+            return Ok(value);
+        }
+        if let Some(b) = value.as_boolean() {
+            let s = if b { "true" } else { "false" };
+            let js = JsString::from_str(s, self.gc_heap_mut())?;
+            return Ok(Value::string(js));
+        }
+        if value.is_null() {
+            let js = JsString::null_str(self.gc_heap_mut())?;
+            return Ok(Value::string(js));
+        }
+        if value.is_undefined() || value.is_hole() {
+            let js = JsString::undefined_str(self.gc_heap_mut())?;
+            return Ok(Value::string(js));
+        }
+        if let Some(b) = value.as_big_int() {
+            let js = JsString::from_str(&b.to_decimal_string(&self.gc_heap), self.gc_heap_mut())?;
+            return Ok(Value::string(js));
         }
         let key = self.to_property_key_sync(context, value)?;
         match key {
@@ -176,9 +174,7 @@ impl Interpreter {
                 )?)),
                 None => Ok(Value::undefined()),
             },
-            None if name == "length" => {
-                Ok(Value::number(NumberValue::from_i32(string.len() as i32)))
-            }
+            None if name == "length" => Ok(Value::number_i32(string.len() as i32)),
             None => self.load_from_constructor_prototype(context, "String", receiver, name),
         }
     }
@@ -208,19 +204,16 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let lhs = *read_register(frame, lhs)?;
         let rhs = *read_register(frame, rhs)?;
-        let result = match (&lhs, &rhs) {
-            (Value::Object(a), Value::Object(target)) => {
-                match crate::object::get(*target, &self.gc_heap, "prototype") {
-                    Some(Value::Object(proto)) => {
-                        crate::object::has_in_proto_chain(*a, &self.gc_heap, proto)
-                    }
-                    _ => crate::object::has_in_proto_chain(*a, &self.gc_heap, *target),
-                }
+        let result = if let (Some(a), Some(target)) = (lhs.as_object(), rhs.as_object()) {
+            match crate::object::get(target, &self.gc_heap, "prototype").and_then(|v| v.as_object())
+            {
+                Some(proto) => crate::object::has_in_proto_chain(a, &self.gc_heap, proto),
+                None => crate::object::has_in_proto_chain(a, &self.gc_heap, target),
             }
-            (Value::Object(a), Value::ClassConstructor(c)) => {
-                crate::object::has_in_proto_chain(*a, &self.gc_heap, c.prototype(&self.gc_heap))
-            }
-            _ => false,
+        } else if let (Some(a), Some(c)) = (lhs.as_object(), rhs.as_class_constructor()) {
+            crate::object::has_in_proto_chain(a, &self.gc_heap, c.prototype(&self.gc_heap))
+        } else {
+            false
         };
         write_register(frame, dst, Value::boolean(result))?;
         frame.pc += 1;
@@ -237,90 +230,85 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let lhs = *read_register(frame, lhs)?;
         let rhs = *read_register(frame, rhs)?;
-        let key_name = match &lhs {
-            Value::String(s) => Some(s.to_lossy_string(&self.gc_heap)),
-            Value::Number(n) => Some(n.to_display_string()),
-            Value::Boolean(b) => Some(if *b { "true" } else { "false" }.to_string()),
-            Value::Null => Some("null".to_string()),
-            Value::Undefined => Some("undefined".to_string()),
-            Value::BigInt(b) => Some(b.to_decimal_string(&self.gc_heap)),
-            Value::Symbol(_) => None,
-            _ => None,
+        let key_name = if let Some(s) = lhs.as_string() {
+            Some(s.to_lossy_string(&self.gc_heap))
+        } else if let Some(n) = lhs.as_number() {
+            Some(n.to_display_string())
+        } else if let Some(b) = lhs.as_boolean() {
+            Some(if b { "true" } else { "false" }.to_string())
+        } else if lhs.is_null() {
+            Some("null".to_string())
+        } else if lhs.is_undefined() {
+            Some("undefined".to_string())
+        } else if let Some(b) = lhs.as_big_int() {
+            Some(b.to_decimal_string(&self.gc_heap))
+        } else {
+            None
         };
-        let present = match &rhs {
-            Value::Object(obj) => has_object_property(self, *obj, &lhs),
-            Value::Array(arr) => has_array_property(self, *arr, &lhs),
-            Value::ClassConstructor(c) => has_class_static_property(self, c, &lhs),
-            // §10.2.1 Function exotic — own descriptor table covers
-            // `length` / `name` / `prototype` (the latter is absent on
-            // methods / arrows); Function.prototype hosts the
-            // canonical `call` / `apply` / `bind` / `toString` shims.
-            // Lookups for symbol keys fall through to `false` because
-            // the foundation Function layout has no symbol slot.
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                if let Some(name) = key_name.as_deref() {
-                    let bag_has = self
-                        .function_user_props
-                        .get(function_id)
-                        .copied()
-                        .is_some_and(|bag| {
-                            crate::object::with_properties(bag, &self.gc_heap, |p| {
-                                p.keys().any(|k| k == name)
-                            })
-                        });
-                    let metadata_has = self
-                        .ordinary_function_own_property_descriptor(None, *function_id, name)
-                        .ok()
-                        .flatten()
-                        .is_some();
-                    // §10.2.4 ordinary functions expose `prototype` as
-                    // an own data property unless arrow / method /
-                    // explicit deletion.
-                    let prototype_implicit = name == "prototype"
-                        && !context.function_is_arrow(*function_id)
-                        && !self
-                            .function_deleted_metadata
-                            .contains(&(*function_id, "prototype"));
-                    bag_has
-                        || metadata_has
-                        || prototype_implicit
-                        || matches!(name, "call" | "apply" | "bind" | "toString")
-                } else {
-                    false
-                }
+        let present = if let Some(obj) = rhs.as_object() {
+            has_object_property(self, obj, &lhs)
+        } else if let Some(arr) = rhs.as_array() {
+            has_array_property(self, arr, &lhs)
+        } else if let Some(c) = rhs.as_class_constructor() {
+            has_class_static_property(self, &c, &lhs)
+        } else if let Some(function_id) = rhs
+            .as_function()
+            .or_else(|| rhs.as_closure().map(|c| c.cached_function_id))
+        {
+            if let Some(name) = key_name.as_deref() {
+                let bag_has = self
+                    .function_user_props
+                    .get(&function_id)
+                    .copied()
+                    .is_some_and(|bag| {
+                        crate::object::with_properties(bag, &self.gc_heap, |p| {
+                            p.keys().any(|k| k == name)
+                        })
+                    });
+                let metadata_has = self
+                    .ordinary_function_own_property_descriptor(None, function_id, name)
+                    .ok()
+                    .flatten()
+                    .is_some();
+                let prototype_implicit = name == "prototype"
+                    && !context.function_is_arrow(function_id)
+                    && !self
+                        .function_deleted_metadata
+                        .contains(&(function_id, "prototype"));
+                bag_has
+                    || metadata_has
+                    || prototype_implicit
+                    || matches!(name, "call" | "apply" | "bind" | "toString")
+            } else {
+                false
             }
-            Value::NativeFunction(native) => {
-                if let Some(name) = key_name.as_deref() {
-                    native
-                        .own_property_descriptor(&mut self.gc_heap, name)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                        || matches!(name, "call" | "apply" | "bind" | "toString")
-                } else if let Value::Symbol(sym) = &lhs {
-                    native
-                        .own_symbol_property_descriptor(&self.gc_heap, sym)
-                        .is_some()
-                } else {
-                    false
-                }
+        } else if let Some(native) = rhs.as_native_function() {
+            if let Some(name) = key_name.as_deref() {
+                native
+                    .own_property_descriptor(&mut self.gc_heap, name)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                    || matches!(name, "call" | "apply" | "bind" | "toString")
+            } else if let Some(sym) = lhs.as_symbol() {
+                native
+                    .own_symbol_property_descriptor(&self.gc_heap, sym)
+                    .is_some()
+            } else {
+                false
             }
-            Value::BoundFunction(bound) => {
-                if let Some(name) = key_name.as_deref() {
-                    function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                        || matches!(name, "call" | "apply" | "bind" | "toString")
-                } else {
-                    false
-                }
+        } else if let Some(bound) = rhs.as_bound_function() {
+            if let Some(name) = key_name.as_deref() {
+                function_metadata::bound_own_property_descriptor(&bound, &mut self.gc_heap, name)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                    || matches!(name, "call" | "apply" | "bind" | "toString")
+            } else {
+                false
             }
-            _ => return Err(VmError::TypeMismatch),
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         write_register(frame, dst, Value::boolean(present))?;
         frame.pc += 1;
@@ -337,56 +325,47 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = key.name();
         let receiver = *read_register(frame, obj_reg)?;
-        let removed = match &receiver {
-            Value::Object(o) => crate::object::delete(*o, &mut self.gc_heap, name),
-            // §10.4.2 [[Delete]] for Array exotic objects: integer
-            // index keys delete the dense/sparse slot (and the spec
-            // protects `length` from deletion); named keys route
-            // through the array exotic's named-property store.
-            Value::Array(arr) => crate::array::delete_named_property(*arr, &mut self.gc_heap, name),
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => self.ordinary_function_delete_own_property(*function_id, name),
-            Value::NativeFunction(native) => native.delete_own_property(&mut self.gc_heap, name),
-            Value::BoundFunction(bound) => {
-                function_metadata::bound_delete_own_property(bound, &mut self.gc_heap, name)
-            }
-            // §10.4.5.5 [[Delete]] — canonical-numeric-index keys
-            // reject in-range elements; other keys probe the lazy
-            // expando bag.
-            Value::TypedArray(t) => {
-                if let Some(n) = canonical_numeric_index_string(name) {
-                    if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
-                        true
-                    } else {
-                        !(n.is_finite()
-                            && n.fract() == 0.0
-                            && n >= 0.0
-                            && (n as usize) < t.length(&self.gc_heap))
-                    }
-                } else if let Some(bag) = t.expando(&self.gc_heap) {
-                    crate::object::delete(bag, &mut self.gc_heap, name)
-                } else {
+        let removed = if let Some(o) = receiver.as_object() {
+            crate::object::delete(o, &mut self.gc_heap, name)
+        } else if let Some(arr) = receiver.as_array() {
+            crate::array::delete_named_property(arr, &mut self.gc_heap, name)
+        } else if let Some(function_id) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            self.ordinary_function_delete_own_property(function_id, name)
+        } else if let Some(native) = receiver.as_native_function() {
+            native.delete_own_property(&mut self.gc_heap, name)
+        } else if let Some(bound) = receiver.as_bound_function() {
+            function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)
+        } else if let Some(t) = receiver.as_typed_array() {
+            if let Some(n) = canonical_numeric_index_string(name) {
+                if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
                     true
-                }
-            }
-            Value::Promise(promise) => {
-                if let Some(bag) = promise.expando(&self.gc_heap) {
-                    crate::object::delete(bag, &mut self.gc_heap, name)
                 } else {
-                    true
+                    !(n.is_finite()
+                        && n.fract() == 0.0
+                        && n >= 0.0
+                        && (n as usize) < t.length(&self.gc_heap))
                 }
+            } else if let Some(bag) = t.expando(&self.gc_heap) {
+                crate::object::delete(bag, &mut self.gc_heap, name)
+            } else {
+                true
             }
-            other => {
-                return Err(VmError::TypeError {
-                    message: format!(
-                        "Cannot delete property '{name}' of {}",
-                        value_kind_name(other)
-                    ),
-                });
+        } else if let Some(promise) = receiver.as_promise() {
+            if let Some(bag) = promise.expando(&self.gc_heap) {
+                crate::object::delete(bag, &mut self.gc_heap, name)
+            } else {
+                true
             }
+        } else {
+            return Err(VmError::TypeError {
+                message: format!(
+                    "Cannot delete property '{name}' of {}",
+                    value_kind_name(&receiver)
+                ),
+            });
         };
         // §13.5.1.2 step 5.c — when the result of `[[Delete]]` is
         // `false` in strict mode, throw a TypeError.
@@ -410,81 +389,76 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let receiver = *read_register(frame, obj_reg)?;
         let idx = *read_register(frame, idx_reg)?;
-        let removed = match (&receiver, idx) {
-            (Value::Object(obj), Value::Symbol(sym)) => {
-                crate::object::delete_symbol(*obj, &mut self.gc_heap, &sym)
-            }
-            (Value::Object(obj), Value::String(s)) => {
+        let removed = if let Some(obj) = receiver.as_object() {
+            if let Some(sym) = idx.as_symbol() {
+                crate::object::delete_symbol(obj, &mut self.gc_heap, sym)
+            } else if let Some(s) = idx.as_string() {
                 let name = s.to_lossy_string(&self.gc_heap);
-                crate::object::delete(*obj, &mut self.gc_heap, &name)
-            }
-            (Value::Object(obj), Value::Number(n)) => match n.as_smi() {
-                Some(v) if v >= 0 => crate::object::delete(*obj, &mut self.gc_heap, &v.to_string()),
-                _ => crate::object::delete(*obj, &mut self.gc_heap, &n.to_display_string()),
-            },
-            // §10.4.2 Array exotic [[Delete]]: number / string index
-            // keys both flow through `delete_named_property`, which
-            // handles dense / sparse / named storage and protects
-            // `length`.
-            (Value::Array(arr), Value::Number(n)) => match n.as_smi() {
-                Some(v) if v >= 0 => {
-                    crate::array::delete_named_property(*arr, &mut self.gc_heap, &v.to_string())
+                crate::object::delete(obj, &mut self.gc_heap, &name)
+            } else if let Some(n) = idx.as_number() {
+                match n.as_smi() {
+                    Some(v) if v >= 0 => {
+                        crate::object::delete(obj, &mut self.gc_heap, &v.to_string())
+                    }
+                    _ => crate::object::delete(obj, &mut self.gc_heap, &n.to_display_string()),
                 }
-                _ => crate::array::delete_named_property(
-                    *arr,
-                    &mut self.gc_heap,
-                    &n.to_display_string(),
-                ),
-            },
-            (Value::Array(arr), Value::String(s)) => {
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(arr) = receiver.as_array() {
+            if let Some(n) = idx.as_number() {
+                match n.as_smi() {
+                    Some(v) if v >= 0 => {
+                        crate::array::delete_named_property(arr, &mut self.gc_heap, &v.to_string())
+                    }
+                    _ => crate::array::delete_named_property(
+                        arr,
+                        &mut self.gc_heap,
+                        &n.to_display_string(),
+                    ),
+                }
+            } else if let Some(s) = idx.as_string() {
                 let name = s.to_lossy_string(&self.gc_heap);
-                crate::array::delete_named_property(*arr, &mut self.gc_heap, &name)
+                crate::array::delete_named_property(arr, &mut self.gc_heap, &name)
+            } else if let Some(sym) = idx.as_symbol() {
+                crate::array::delete_symbol_property(arr, &mut self.gc_heap, sym)
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            (Value::Array(arr), Value::Symbol(sym)) => {
-                crate::array::delete_symbol_property(*arr, &mut self.gc_heap, &sym)
-            }
-            // §10.4.3 String exotic objects expose a non-configurable
-            // own property at every valid character index; integer
-            // indices in `[0, length)` therefore reject deletion,
-            // while out-of-range integer indices and non-integer
-            // keys succeed (the wrapper has no such own property and
-            // ordinary [[Delete]] succeeds vacuously).
-            // <https://tc39.es/ecma262/#sec-string-exotic-objects-delete-p>
-            (Value::String(s), Value::Number(n)) => {
+        } else if let Some(s) = receiver.as_string() {
+            if let Some(n) = idx.as_number() {
                 !matches!(n.as_smi(), Some(v) if v >= 0 && (v as u32) < s.len())
+            } else {
+                true
             }
-            (Value::String(_), _) => true,
-            (
-                Value::Function { function_id }
-                | Value::Closure(crate::closure::JsClosure {
-                    cached_function_id: function_id,
-                    ..
-                }),
-                Value::String(s),
-            ) => {
+        } else if let Some(function_id) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            if let Some(s) = idx.as_string() {
                 let name = s.to_lossy_string(&self.gc_heap);
-                self.ordinary_function_delete_own_property(*function_id, &name)
+                self.ordinary_function_delete_own_property(function_id, &name)
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            (Value::NativeFunction(native), Value::Symbol(sym)) => {
-                native.delete_own_symbol_property(&mut self.gc_heap, &sym)
-            }
-            (Value::NativeFunction(native), Value::String(s)) => {
+        } else if let Some(native) = receiver.as_native_function() {
+            if let Some(sym) = idx.as_symbol() {
+                native.delete_own_symbol_property(&mut self.gc_heap, sym)
+            } else if let Some(s) = idx.as_string() {
                 let name = s.to_lossy_string(&self.gc_heap);
                 native.delete_own_property(&mut self.gc_heap, &name)
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            (Value::BoundFunction(bound), Value::String(s)) => {
+        } else if let Some(bound) = receiver.as_bound_function() {
+            if let Some(s) = idx.as_string() {
                 let name = s.to_lossy_string(&self.gc_heap);
-                function_metadata::bound_delete_own_property(bound, &mut self.gc_heap, &name)
+                function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, &name)
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            // §10.4.5.5 IntegerIndexedExoticObject [[Delete]]:
-            // canonical-numeric-index strings reject deletion only
-            // when the index resolves to a valid in-range element
-            // (and the buffer is attached). Out-of-range indices,
-            // non-integer canonical numerics, and arbitrary
-            // non-canonical keys all succeed vacuously — the
-            // TypedArray exotic has no expando own properties.
-            // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-delete-p>
-            (Value::TypedArray(t), Value::String(s)) => {
+        } else if let Some(t) = receiver.as_typed_array() {
+            if let Some(s) = idx.as_string() {
                 let name = s.to_lossy_string(&self.gc_heap);
                 match canonical_numeric_index_string(&name) {
                     Some(n) => {
@@ -505,19 +479,20 @@ impl Interpreter {
                         }
                     }
                 }
-            }
-            (Value::TypedArray(t), Value::Number(n)) => {
+            } else if let Some(n) = idx.as_number() {
                 t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                     || !matches!(n.as_smi(), Some(v) if v >= 0 && (v as usize) < t.length(&self.gc_heap))
-            }
-            (Value::TypedArray(t), Value::Symbol(sym)) => {
+            } else if let Some(sym) = idx.as_symbol() {
                 if let Some(bag) = t.expando(&self.gc_heap) {
-                    crate::object::delete_symbol(bag, &mut self.gc_heap, &sym)
+                    crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
                 } else {
                     true
                 }
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            _ => return Err(VmError::TypeMismatch),
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         if !removed && strict {
             return Err(VmError::TypeError {
@@ -660,7 +635,7 @@ impl Interpreter {
                             _ => None,
                         };
                         match walked {
-                            Some(v) if !matches!(v, Value::Undefined) => v,
+                            Some(v) if !v.is_undefined() => v,
                             _ if name == "name" || name == "length" => {
                                 let ctor = c.ctor(&self.gc_heap);
                                 match &ctor {
@@ -688,7 +663,7 @@ impl Interpreter {
                 }
             }
             Value::String(s) => self.load_string_primitive_property(context, &receiver, s, name)?,
-            v @ Value::Array(_) => {
+            v if v.is_array() => {
                 let direct = if let Value::Array(a) = v {
                     if let Some((getter, _setter)) =
                         crate::array::get_accessor(*a, &self.gc_heap, name)
@@ -766,7 +741,7 @@ impl Interpreter {
                         .unwrap_or(Value::undefined()),
                 }
             }
-            v @ Value::RegExp(_) => {
+            v if v.is_regexp() => {
                 let r = if let Value::RegExp(r) = v {
                     *r
                 } else {
@@ -801,7 +776,7 @@ impl Interpreter {
             // surfaces correctly because the native methods take
             // their receiver from `ctx.this_value()` rather than
             // synthesized captures.
-            v @ Value::Iterator(_) => {
+            v if v.is_iterator() => {
                 self.load_from_constructor_prototype(context, "Iterator", v, name)?
             }
             v @ (Value::WeakRef(_) | Value::FinalizationRegistry(_)) => {
@@ -812,7 +787,7 @@ impl Interpreter {
                 };
                 self.load_from_constructor_prototype(context, proto_name, v, name)?
             }
-            v @ Value::Promise(_) => {
+            v if v.is_promise() => {
                 // §27.2.5 — user-installed own properties
                 // (`promise.then = fn`) live in a lazy expando bag;
                 // honour them before the prototype walk.
@@ -838,7 +813,7 @@ impl Interpreter {
                         Some(proto) => proto,
                         None => self.constructor_prototype_value("Promise")?,
                     };
-                    if matches!(proto, Value::Null | Value::Undefined) {
+                    if proto.is_nullish() {
                         Value::Undefined
                     } else {
                         let key = VmPropertyKey::String(name);
@@ -1527,7 +1502,7 @@ impl Interpreter {
                     _ => unreachable!(),
                 };
                 let proto = self.constructor_prototype_value(ctor_name)?;
-                if matches!(proto, Value::Null | Value::Undefined) {
+                if proto.is_nullish() {
                     Value::Undefined
                 } else {
                     match self.ordinary_get_value(context, proto, recv, &key, 0)? {

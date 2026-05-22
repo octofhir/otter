@@ -98,32 +98,26 @@ impl MapKey {
     ///    traced slot. This keeps identity stable across young-generation
     ///    relocation.
     pub fn from_value(value: &Value) -> Self {
-        match value {
-            Value::Undefined => MapKey::Undefined,
-            Value::Null => MapKey::Null,
-            Value::Boolean(b) => MapKey::Boolean(*b),
-            Value::Number(n) => {
-                let f = n.as_f64();
-                // SameValueZero: collapse −0 to +0; preserve NaN
-                // bits — equality below treats any NaN as equal.
-                let normalised = if f == 0.0 { 0.0 } else { f };
-                MapKey::Number(normalised)
-            }
-            Value::BigInt(b) => MapKey::BigInt(*b),
-            Value::String(s) => MapKey::String(*s),
-            Value::Symbol(s) => MapKey::Symbol(*s),
-            Value::Object(_)
-            | Value::Array(_)
-            | Value::RegExp(_)
-            | Value::Promise(_)
-            | Value::Iterator(_)
-            | Value::Generator(_)
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_) => MapKey::ObjectValue(*value),
-            // Functions, closures, class constructors, and other reference
-            // wrappers compare via the originating `Value`'s `PartialEq`,
-            // which is identity on every callable shape.
-            _ => MapKey::ObjectValue(*value),
+        if value.is_undefined() {
+            MapKey::Undefined
+        } else if value.is_null() {
+            MapKey::Null
+        } else if let Some(b) = value.as_boolean() {
+            MapKey::Boolean(b)
+        } else if let Some(n) = value.as_number() {
+            let f = n.as_f64();
+            // SameValueZero: collapse −0 to +0; preserve NaN bits.
+            let normalised = if f == 0.0 { 0.0 } else { f };
+            MapKey::Number(normalised)
+        } else if let Some(b) = value.as_big_int() {
+            MapKey::BigInt(b)
+        } else if let Some(s) = value.as_string() {
+            MapKey::String(*s)
+        } else if let Some(s) = value.as_symbol() {
+            MapKey::Symbol(*s)
+        } else {
+            // Object-shaped values map to ObjectValue (identity).
+            MapKey::ObjectValue(*value)
         }
     }
 }
@@ -1214,10 +1208,12 @@ fn weak_collection_key(value: &Value) -> Result<WeakCollectionKey, CollectionErr
     if let Some(raw) = value.as_gc_raw() {
         return Ok(WeakCollectionKey::Object(raw));
     }
-    match value {
-        Value::Symbol(symbol) if !symbol.is_registered() => Ok(WeakCollectionKey::Symbol(*symbol)),
-        _ => Err(CollectionError::NonObjectKey),
+    if let Some(symbol) = value.as_symbol()
+        && !symbol.is_registered()
+    {
+        return Ok(WeakCollectionKey::Symbol(*symbol));
     }
+    Err(CollectionError::NonObjectKey)
 }
 
 fn trace_map_key(key: &MapKey, visitor: &mut SlotVisitor<'_>) {
@@ -1352,21 +1348,21 @@ mod tests {
     use crate::number::NumberValue;
 
     fn n(i: i32) -> Value {
-        Value::Number(NumberValue::from_i32(i))
+        Value::number(NumberValue::from_i32(i))
     }
 
     fn young_object_value(heap: &mut otter_gc::GcHeap) -> Value {
         let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        Value::Object(crate::object::alloc_object_with_roots(heap, &mut no_roots).unwrap())
+        Value::object(crate::object::alloc_object_with_roots(heap, &mut no_roots).unwrap())
     }
 
     #[test]
     fn map_insertion_order_preserved() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let m = alloc_map(&mut heap).unwrap();
-        map_set(m, &mut heap, n(1), Value::Boolean(true)).unwrap();
-        map_set(m, &mut heap, n(2), Value::Boolean(false)).unwrap();
-        map_set(m, &mut heap, n(1), Value::Boolean(false)).unwrap(); // update
+        map_set(m, &mut heap, n(1), Value::boolean(true)).unwrap();
+        map_set(m, &mut heap, n(2), Value::boolean(false)).unwrap();
+        map_set(m, &mut heap, n(1), Value::boolean(false)).unwrap(); // update
         let keys = map_keys(m, &heap);
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].as_number().unwrap().as_smi(), Some(1));
@@ -1385,12 +1381,12 @@ mod tests {
         let b = crate::string::JsString::from_str("hello", &mut heap).unwrap();
         assert_ne!(a.handle(), b.handle(), "test setup: handles must differ");
 
-        map_set(m, &mut heap, Value::String(a), n(1)).unwrap();
+        map_set(m, &mut heap, Value::string(a), n(1)).unwrap();
         assert!(map_has(m, &heap, &Value::string(b)));
         assert_eq!(map_get(m, &heap, &Value::string(b)), Some(n(1)));
 
         // Update should hit the existing slot, not append.
-        map_set(m, &mut heap, Value::String(b), n(2)).unwrap();
+        map_set(m, &mut heap, Value::string(b), n(2)).unwrap();
         assert_eq!(map_len(m, &heap), 1);
         assert_eq!(map_get(m, &heap, &Value::string(a)), Some(n(2)));
 
@@ -1405,8 +1401,8 @@ mod tests {
         let s = alloc_set(&mut heap).unwrap();
         let a = crate::string::JsString::from_str("k", &mut heap).unwrap();
         let b = crate::string::JsString::from_str("k", &mut heap).unwrap();
-        set_add(s, &mut heap, Value::String(a)).unwrap();
-        set_add(s, &mut heap, Value::String(b)).unwrap();
+        set_add(s, &mut heap, Value::string(a)).unwrap();
+        set_add(s, &mut heap, Value::string(b)).unwrap();
         assert_eq!(set_len(s, &heap), 1);
         assert!(set_has(s, &heap, &Value::string(b)));
     }
@@ -1418,7 +1414,7 @@ mod tests {
         map_set(
             m,
             &mut heap,
-            Value::Number(NumberValue::from_f64(-0.0)),
+            Value::number(NumberValue::from_f64(-0.0)),
             n(7),
         )
         .unwrap();
@@ -1433,7 +1429,7 @@ mod tests {
         map_set(
             m,
             &mut heap,
-            Value::Number(NumberValue::from_f64(f64::NAN)),
+            Value::number(NumberValue::from_f64(f64::NAN)),
             n(9),
         )
         .unwrap();
@@ -1498,7 +1494,7 @@ mod tests {
     fn weakmap_rejects_primitive_keys() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let wm = alloc_weak_map(&mut heap).unwrap();
-        let err = weak_map_set(wm, &mut heap, n(1), Value::Boolean(true)).unwrap_err();
+        let err = weak_map_set(wm, &mut heap, n(1), Value::boolean(true)).unwrap_err();
         assert!(matches!(err, CollectionError::NonObjectKey));
     }
 

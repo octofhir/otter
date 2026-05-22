@@ -34,6 +34,48 @@ use crate::{
     write_register,
 };
 
+/// Object-shaped values that need §7.1.1 `ToPrimitive` coercion before
+/// numeric / string arithmetic. Mirrors the matches! variant list
+/// repeated through static-call arg preambles: every callable object
+/// shape plus `RegExp`.
+fn needs_to_primitive(v: &Value) -> bool {
+    v.is_object()
+        || v.is_array()
+        || v.is_function()
+        || v.is_closure()
+        || v.is_native_function()
+        || v.is_bound_function()
+        || v.is_class_constructor()
+        || v.is_proxy()
+        || v.is_regexp()
+}
+
+/// Full property-bearing object-like family used by Object.* and
+/// Reflect.* static dispatchers. Excludes Iterator / Generator /
+/// Temporal / Intl which the existing dispatchers route through
+/// separate intrinsic tables.
+fn is_property_bearing_object(v: &Value) -> bool {
+    v.is_object()
+        || v.is_array()
+        || v.is_proxy()
+        || v.is_function()
+        || v.is_closure()
+        || v.is_native_function()
+        || v.is_bound_function()
+        || v.is_class_constructor()
+        || v.is_regexp()
+        || v.is_map()
+        || v.is_set()
+        || v.is_weak_map()
+        || v.is_weak_set()
+        || v.is_weak_ref()
+        || v.is_finalization_registry()
+        || v.is_array_buffer()
+        || v.is_data_view()
+        || v.is_typed_array()
+        || v.is_promise()
+}
+
 impl Interpreter {
     pub(crate) fn run_static_call_operands(
         &mut self,
@@ -71,7 +113,7 @@ impl Interpreter {
                 let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
                 if matches!(method, method_id::JsonMethod::Parse)
                     && let Some(slot) = coerced.first_mut()
-                    && !matches!(slot, Value::String(_))
+                    && !slot.is_string()
                 {
                     let primitive = if crate::abstract_ops::is_primitive(slot) {
                         *slot
@@ -82,18 +124,17 @@ impl Interpreter {
                             crate::abstract_ops::ToPrimitiveHint::String,
                         )?
                     };
-                    let s = match primitive {
-                        Value::String(s) => s,
-                        Value::Symbol(_) => {
-                            return Err(VmError::TypeError {
-                                message: "JSON.parse: cannot convert a Symbol to a string"
-                                    .to_string(),
-                            });
-                        }
-                        other => crate::string::JsString::from_str(
-                            &other.display_string(&self.gc_heap),
+                    let s = if let Some(s) = primitive.as_string() {
+                        *s
+                    } else if primitive.is_symbol() {
+                        return Err(VmError::TypeError {
+                            message: "JSON.parse: cannot convert a Symbol to a string".to_string(),
+                        });
+                    } else {
+                        crate::string::JsString::from_str(
+                            &primitive.display_string(&self.gc_heap),
                             self.gc_heap_mut(),
-                        )?,
+                        )?
                     };
                     *slot = Value::string(s);
                 }
@@ -114,16 +155,17 @@ impl Interpreter {
                 // here. Empty arrays surface as `""` (→ 0n).
                 let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
                 for slot in coerced.iter_mut() {
-                    if let Value::Array(arr) = slot {
+                    if let Some(arr) = slot.as_array() {
                         let parts: Vec<String> =
-                            crate::array::with_elements(*arr, &self.gc_heap, |elements| {
+                            crate::array::with_elements(arr, &self.gc_heap, |elements| {
                                 elements
                                     .iter()
-                                    .map(|v| match v {
-                                        Value::Undefined | Value::Null | Value::Hole => {
+                                    .map(|v| {
+                                        if v.is_undefined() || v.is_null() || v.is_hole() {
                                             String::new()
+                                        } else {
+                                            v.display_string(&self.gc_heap)
                                         }
-                                        other => other.display_string(&self.gc_heap),
                                     })
                                     .collect()
                             });
@@ -229,18 +271,7 @@ impl Interpreter {
     ) -> Result<SmallVec<[Value; 4]>, VmError> {
         let mut out: SmallVec<[Value; 4]> = SmallVec::with_capacity(args.len());
         for arg in args {
-            if matches!(
-                arg,
-                Value::Object(_)
-                    | Value::Array(_)
-                    | Value::Function { .. }
-                    | Value::Closure(_)
-                    | Value::NativeFunction(_)
-                    | Value::BoundFunction(_)
-                    | Value::ClassConstructor(_)
-                    | Value::Proxy(_)
-                    | Value::RegExp(_)
-            ) {
+            if needs_to_primitive(&arg) {
                 out.push(self.evaluate_to_primitive(
                     context,
                     &arg,
@@ -272,7 +303,7 @@ impl Interpreter {
         let args: SmallVec<[Value; 4]> = if matches!(method, method_id::JsonMethod::Parse) {
             let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
             if let Some(slot) = coerced.first_mut()
-                && !matches!(slot, Value::String(_))
+                && !slot.is_string()
             {
                 let primitive = if crate::abstract_ops::is_primitive(slot) {
                     *slot
@@ -287,17 +318,17 @@ impl Interpreter {
                         message: "JSON.parse argument 0 must be a string".to_string(),
                     });
                 };
-                let s = match primitive {
-                    Value::String(s) => s,
-                    Value::Symbol(_) => {
-                        return Err(VmError::TypeError {
-                            message: "JSON.parse: cannot convert a Symbol to a string".to_string(),
-                        });
-                    }
-                    other => crate::string::JsString::from_str(
-                        &other.display_string(&self.gc_heap),
+                let s = if let Some(s) = primitive.as_string() {
+                    *s
+                } else if primitive.is_symbol() {
+                    return Err(VmError::TypeError {
+                        message: "JSON.parse: cannot convert a Symbol to a string".to_string(),
+                    });
+                } else {
+                    crate::string::JsString::from_str(
+                        &primitive.display_string(&self.gc_heap),
                         self.gc_heap_mut(),
-                    )?,
+                    )?
                 };
                 *slot = Value::string(s);
             }
@@ -366,7 +397,9 @@ impl Interpreter {
             // entirely (§21.4.2.2 step 3.a) so subclass instances
             // copy the underlying time value verbatim.
             let slot = &mut args[0];
-            let is_date_instance = matches!(slot, Value::Object(o) if crate::object::date_data(*o, &self.gc_heap).is_some());
+            let is_date_instance = slot
+                .as_object()
+                .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some());
             if !is_date_instance {
                 let primitive = self.coerce_to_primitive(
                     context,
@@ -379,10 +412,10 @@ impl Interpreter {
         // Resolve `%Date.prototype%` so the freshly allocated
         // instance inherits the right method bag. Cheap lookup —
         // two property reads on the realm globals.
-        let date_prototype = match self.constructor_prototype_value("Date").ok() {
-            Some(Value::Object(o)) => Some(o),
-            _ => None,
-        };
+        let date_prototype = self
+            .constructor_prototype_value("Date")
+            .ok()
+            .and_then(|v| v.as_object());
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -538,10 +571,7 @@ impl Interpreter {
                 // context-aware `ToPropertyKey(P)` path below: null /
                 // undefined receivers must throw before key coercion
                 // can invoke user code.
-                if matches!(
-                    args.first(),
-                    None | Some(Value::Null) | Some(Value::Undefined)
-                ) {
+                if args.first().is_none_or(|v| v.is_nullish()) {
                     return Err(VmError::TypeError {
                         message: "Object static method called on null or undefined".to_string(),
                     });
@@ -554,15 +584,12 @@ impl Interpreter {
                 // Number / Boolean / Null / Undefined primitive
                 // that the free coercion handles directly.
                 let key_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-                let needs_coercion = !matches!(
-                    &key_arg,
-                    Value::String(_)
-                        | Value::Number(_)
-                        | Value::Boolean(_)
-                        | Value::Null
-                        | Value::Undefined
-                        | Value::Symbol(_)
-                );
+                let needs_coercion = !(key_arg.is_string()
+                    || key_arg.is_number()
+                    || key_arg.is_boolean()
+                    || key_arg.is_null()
+                    || key_arg.is_undefined()
+                    || key_arg.is_symbol());
                 if needs_coercion {
                     let coerced_key = self.evaluate_to_property_key(context, &key_arg)?;
                     let coerced_value = match &coerced_key {
@@ -645,10 +672,12 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::undefined());
-        let proto_value = match proto {
-            Value::Object(_) | Value::Iterator(_) => Some(proto),
-            Value::Null => None,
-            _ => return Err(VmError::TypeMismatch),
+        let proto_value = if proto.is_object() || proto.is_iterator() {
+            Some(proto)
+        } else if proto.is_null() {
+            None
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         let obj = self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?;
         if !object::set_prototype_value(obj, &mut self.gc_heap, proto_value) {
@@ -657,7 +686,7 @@ impl Interpreter {
             });
         }
         if let Some(props_arg) = args.get(1)
-            && !matches!(props_arg, Value::Undefined)
+            && !props_arg.is_undefined()
         {
             // §20.1.2.2 step 5 — enumerate own enumerable property
             // keys of `properties`, then `Get` each through the
@@ -731,7 +760,7 @@ impl Interpreter {
         // form which has no own enumerable string-keyed
         // properties (except `String`, where the code units
         // surface as indexed slots).
-        if matches!(props_value, Value::Null | Value::Undefined) {
+        if props_value.is_nullish() {
             return Err(VmError::TypeError {
                 message: "Object.defineProperties properties must be an object".to_string(),
             });
@@ -790,86 +819,54 @@ impl Interpreter {
         // resulting object as `target`, so Array / RegExp / Map / etc.
         // exotics pass straight through; only Null / Undefined throw
         // and only primitives go through the wrapper-boxing path.
-        let target_value: Value = match &target_input {
-            Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Promise(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Proxy(_) => target_input,
-            Value::Null | Value::Undefined => {
-                return Err(VmError::TypeError {
-                    message: "Object.assign called on null or undefined".to_string(),
-                });
-            }
-            _ => {
-                let arg_slice = args;
-                self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[arg_slice])?
-            }
+        let target_value: Value = if is_property_bearing_object(&target_input) {
+            target_input
+        } else if target_input.is_nullish() {
+            return Err(VmError::TypeError {
+                message: "Object.assign called on null or undefined".to_string(),
+            });
+        } else {
+            let arg_slice = args;
+            self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[arg_slice])?
         };
         // Cache the object form when applicable so the existing
         // `ordinary_set_with_callable_setter` fast path keeps working
         // unchanged for plain-object targets. Exotic targets fall
         // through the value-level `[[Set]]` helper below.
-        let target_object: Option<crate::object::JsObject> = match &target_value {
-            Value::Object(o) => Some(*o),
-            _ => None,
-        };
+        let target_object: Option<crate::object::JsObject> = target_value.as_object();
         for src in args.iter().skip(1) {
-            match src {
-                Value::Undefined | Value::Null => continue,
-                Value::String(s) => {
-                    // §22.1.4 — String exotic exposes its code units
-                    // as own indexed properties plus a `length`. The
-                    // latter is read-only on the wrapper, so we copy
-                    // only the indexed slots.
-                    let lossy = s.to_lossy_string(&self.gc_heap);
-                    for (idx, ch) in lossy.chars().enumerate() {
-                        let mut buf = [0u16; 2];
-                        let units = ch.encode_utf16(&mut buf);
-                        let unit_string =
-                            crate::string::JsString::from_utf16_units(units, self.gc_heap_mut())
-                                .map_err(|_| VmError::TypeMismatch)?;
-                        assign_set_string(
-                            self,
-                            context,
-                            &target_value,
-                            target_object,
-                            &idx.to_string(),
-                            Value::String(unit_string),
-                        )?;
-                    }
-                }
-                source if assign_source_uses_own_property_keys(source) => {
-                    assign_copy_source_keys(
+            if src.is_nullish() {
+                continue;
+            }
+            if let Some(s) = src.as_string() {
+                // §22.1.4 — String exotic exposes its code units
+                // as own indexed properties plus a `length`. The
+                // latter is read-only on the wrapper, so we copy
+                // only the indexed slots.
+                let lossy = s.to_lossy_string(&self.gc_heap);
+                for (idx, ch) in lossy.chars().enumerate() {
+                    let mut buf = [0u16; 2];
+                    let units = ch.encode_utf16(&mut buf);
+                    let unit_string =
+                        crate::string::JsString::from_utf16_units(units, self.gc_heap_mut())
+                            .map_err(|_| VmError::TypeMismatch)?;
+                    assign_set_string(
                         self,
                         context,
                         &target_value,
                         target_object,
-                        source,
-                        args,
+                        &idx.to_string(),
+                        Value::string(unit_string),
                     )?;
                 }
-                _ => {
-                    // Primitive Boolean / Number / Symbol / BigInt
-                    // wrappers have no enumerable own properties in
-                    // this VM slice, so ToObject(source) contributes
-                    // an empty key list.
-                    continue;
-                }
+            } else if assign_source_uses_own_property_keys(src) {
+                assign_copy_source_keys(self, context, &target_value, target_object, src, args)?;
+            } else {
+                // Primitive Boolean / Number / Symbol / BigInt
+                // wrappers have no enumerable own properties in
+                // this VM slice, so ToObject(source) contributes
+                // an empty key list.
+                continue;
             }
         }
         Ok(target_value)
@@ -912,21 +909,31 @@ impl Interpreter {
                     // BigInt wrappers expose no own enumerable
                     // string keys; String wrappers carry indexed
                     // code-unit slots.
-                    Some(Value::Boolean(_))
-                    | Some(Value::Number(_))
-                    | Some(Value::Symbol(_))
-                    | Some(Value::BigInt(_)) => Vec::new(),
-                    Some(Value::String(s)) => {
+                    None => {
+                        return Err(VmError::TypeError {
+                            message: "Object.keys called on null or undefined".to_string(),
+                        });
+                    }
+                    Some(target) if target.is_nullish() => {
+                        return Err(VmError::TypeError {
+                            message: "Object.keys called on null or undefined".to_string(),
+                        });
+                    }
+                    Some(target)
+                        if target.is_boolean()
+                            || target.is_number()
+                            || target.is_symbol()
+                            || target.is_big_int() =>
+                    {
+                        Vec::new()
+                    }
+                    Some(target) if target.is_string() => {
+                        let s = target.as_string().expect("guarded");
                         let len = s.len() as usize;
                         (0..len).map(|i| i.to_string()).collect()
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
                         self.enumerable_own_string_keys_for_value(context, *target, 0)?
-                    }
-                    Some(Value::Null) | Some(Value::Undefined) | None => {
-                        return Err(VmError::TypeError {
-                            message: "Object.keys called on null or undefined".to_string(),
-                        });
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
@@ -944,17 +951,32 @@ impl Interpreter {
             }
             M::Values => {
                 let values: Vec<Value> = match args.first() {
-                    Some(Value::Boolean(_))
-                    | Some(Value::Number(_))
-                    | Some(Value::Symbol(_))
-                    | Some(Value::BigInt(_)) => Vec::new(),
-                    Some(Value::String(s)) => {
+                    None => {
+                        return Err(VmError::TypeError {
+                            message: "Object.values called on null or undefined".to_string(),
+                        });
+                    }
+                    Some(target) if target.is_nullish() => {
+                        return Err(VmError::TypeError {
+                            message: "Object.values called on null or undefined".to_string(),
+                        });
+                    }
+                    Some(target)
+                        if target.is_boolean()
+                            || target.is_number()
+                            || target.is_symbol()
+                            || target.is_big_int() =>
+                    {
+                        Vec::new()
+                    }
+                    Some(target) if target.is_string() => {
+                        let s = target.as_string().expect("guarded");
                         let units = s.to_utf16_vec(&self.gc_heap);
                         units
                             .into_iter()
                             .map(|u| {
                                 crate::string::JsString::from_utf16_units(&[u], self.gc_heap_mut())
-                                    .map(Value::String)
+                                    .map(Value::string)
                                     .unwrap_or(Value::undefined())
                             })
                             .collect()
@@ -964,11 +986,6 @@ impl Interpreter {
                             .into_iter()
                             .map(|(_, value)| value)
                             .collect()
-                    }
-                    Some(Value::Null) | Some(Value::Undefined) | None => {
-                        return Err(VmError::TypeError {
-                            message: "Object.values called on null or undefined".to_string(),
-                        });
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
@@ -982,11 +999,26 @@ impl Interpreter {
             }
             M::Entries => {
                 let raw: Vec<(String, Value)> = match args.first() {
-                    Some(Value::Boolean(_))
-                    | Some(Value::Number(_))
-                    | Some(Value::Symbol(_))
-                    | Some(Value::BigInt(_)) => Vec::new(),
-                    Some(Value::String(s)) => {
+                    None => {
+                        return Err(VmError::TypeError {
+                            message: "Object.entries called on null or undefined".to_string(),
+                        });
+                    }
+                    Some(target) if target.is_nullish() => {
+                        return Err(VmError::TypeError {
+                            message: "Object.entries called on null or undefined".to_string(),
+                        });
+                    }
+                    Some(target)
+                        if target.is_boolean()
+                            || target.is_number()
+                            || target.is_symbol()
+                            || target.is_big_int() =>
+                    {
+                        Vec::new()
+                    }
+                    Some(target) if target.is_string() => {
+                        let s = target.as_string().expect("guarded");
                         let units = s.to_utf16_vec(&self.gc_heap);
                         units
                             .into_iter()
@@ -996,7 +1028,7 @@ impl Interpreter {
                                     &[u],
                                     self.gc_heap_mut(),
                                 )
-                                .map(Value::String)
+                                .map(Value::string)
                                 .unwrap_or(Value::undefined());
                                 (i.to_string(), v)
                             })
@@ -1004,11 +1036,6 @@ impl Interpreter {
                     }
                     Some(target) if enumerable_own_names_uses_internal_methods(target) => {
                         enumerable_own_string_entries(self, context, target, args)?
-                    }
-                    Some(Value::Null) | Some(Value::Undefined) | None => {
-                        return Err(VmError::TypeError {
-                            message: "Object.entries called on null or undefined".to_string(),
-                        });
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
@@ -1037,7 +1064,7 @@ impl Interpreter {
                 // the AddEntriesFromIterable analogue used in step 4.
                 // <https://tc39.es/ecma262/#sec-object.fromentries>
                 let iter = args.first().cloned().unwrap_or(Value::undefined());
-                if matches!(iter, Value::Undefined | Value::Null) {
+                if iter.is_nullish() {
                     return Err(VmError::TypeError {
                         message: "Object.fromEntries: iterable must not be null or undefined"
                             .to_string(),
@@ -1046,7 +1073,7 @@ impl Interpreter {
                 // §20.1.2.7 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
                 let object_proto = self.constructor_prototype_value("Object").ok();
                 let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
-                if let Some(Value::Object(proto_obj)) = object_proto {
+                if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
                     object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
                 }
 
@@ -1111,12 +1138,24 @@ impl Interpreter {
             }
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
-                let desc = match args.first() {
-                    Some(target @ (Value::Object(_) | Value::String(_))) => self
-                        .ordinary_get_own_property_descriptor_value_stack_rooted(
-                            context, stack, *target, &key, 0,
-                        )?,
-                    Some(Value::ClassConstructor(class)) => match &key {
+                let Some(target) = args.first() else {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyDescriptor called on null or undefined"
+                            .to_string(),
+                    });
+                };
+                if target.is_nullish() {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyDescriptor called on null or undefined"
+                            .to_string(),
+                    });
+                }
+                let desc = if target.is_object() || target.is_string() {
+                    self.ordinary_get_own_property_descriptor_value_stack_rooted(
+                        context, stack, *target, &key, 0,
+                    )?
+                } else if let Some(class) = target.as_class_constructor() {
+                    match &key {
                         VmPropertyKey::Symbol(sym) => object::get_own_symbol_descriptor(
                             class.statics(self.gc_heap()),
                             self.gc_heap(),
@@ -1128,8 +1167,9 @@ impl Interpreter {
                             key.string_name()
                                 .expect("non-symbol property key has string spelling"),
                         ),
-                    },
-                    Some(Value::NativeFunction(native)) => match &key {
+                    }
+                } else if let Some(native) = target.as_native_function() {
+                    match &key {
                         VmPropertyKey::Symbol(sym) => {
                             native.own_symbol_property_descriptor(self.gc_heap(), sym)
                         }
@@ -1139,12 +1179,13 @@ impl Interpreter {
                                 .expect("non-symbol property key has string spelling");
                             native.own_property_descriptor(self.gc_heap_mut(), key)?
                         }
-                    },
+                    }
+                } else if let Some(t) = target.as_typed_array() {
                     // §10.4.5.1 IntegerIndexedExoticObject
                     // [[GetOwnProperty]] — canonical-numeric-index
                     // strings produce a data descriptor for in-range
                     // elements; everything else returns no descriptor.
-                    Some(Value::TypedArray(t)) => match &key {
+                    match &key {
                         VmPropertyKey::Symbol(sym) => t.expando(&self.gc_heap).and_then(|bag| {
                             crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), sym)
                         }),
@@ -1177,23 +1218,18 @@ impl Interpreter {
                                 None
                             }
                         }
-                    },
-                    Some(Value::Boolean(_))
-                    | Some(Value::Number(_))
-                    | Some(Value::Symbol(_))
-                    | Some(Value::BigInt(_)) => None,
-                    Some(Value::Null) | Some(Value::Undefined) | None => {
-                        return Err(VmError::TypeError {
-                            message: "Object.getOwnPropertyDescriptor called on null or undefined"
-                                .to_string(),
-                        });
                     }
-                    _ => {
-                        return Err(VmError::TypeError {
-                            message: "Object.getOwnPropertyDescriptor target must be an object"
-                                .to_string(),
-                        });
-                    }
+                } else if target.is_boolean()
+                    || target.is_number()
+                    || target.is_symbol()
+                    || target.is_big_int()
+                {
+                    None
+                } else {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyDescriptor target must be an object"
+                            .to_string(),
+                    });
                 };
                 match desc {
                     Some(desc) => {
@@ -1201,7 +1237,7 @@ impl Interpreter {
                             self.descriptor_to_object_stack_rooted(stack, &desc, &[], args)?;
                         Ok(Some(Value::object(obj)))
                     }
-                    None => Ok(Some(Value::Undefined)),
+                    None => Ok(Some(Value::undefined())),
                 }
             }
             M::GetOwnPropertyDescriptors => {
@@ -1216,149 +1252,147 @@ impl Interpreter {
                 // step 2 (`OrdinaryObjectCreate(%Object.prototype%)`).
                 let object_proto = self.constructor_prototype_value("Object").ok();
                 let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
-                if let Some(Value::Object(proto_obj)) = object_proto {
+                if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
                     object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
                 }
-                match args.first() {
-                    Some(Value::Null) | Some(Value::Undefined) | None => {
-                        return Err(VmError::TypeError {
-                            message: "Object.getOwnPropertyDescriptors called on null or undefined"
-                                .to_string(),
-                        });
-                    }
-                    Some(Value::Boolean(_))
-                    | Some(Value::Number(_))
-                    | Some(Value::Symbol(_))
-                    | Some(Value::BigInt(_)) => {
-                        // Empty result; primitive wrapper carries no
-                        // own keys reachable through the foundation
-                        // surface.
-                    }
-                    Some(Value::String(s)) => {
-                        let units = s.to_utf16_vec(&self.gc_heap);
-                        let result_root = Value::object(result);
-                        for (i, u) in units.iter().enumerate() {
-                            let key = i.to_string();
-                            let unit = crate::string::JsString::from_utf16_units(
-                                &[*u],
-                                self.gc_heap_mut(),
-                            )
-                            .map_err(|_| VmError::TypeMismatch)?;
-                            let desc = crate::object::PropertyDescriptor::data(
-                                Value::String(unit),
-                                false,
-                                true,
-                                false,
-                            );
-                            let desc_obj = self.descriptor_to_object_stack_rooted(
-                                stack,
-                                &desc,
-                                &[&result_root],
-                                args,
-                            )?;
-                            self.set_property(result, &key, Value::Object(desc_obj))?;
-                        }
-                        let length_desc = crate::object::PropertyDescriptor::data(
-                            Value::Number(crate::number::NumberValue::from_f64(units.len() as f64)),
+                let Some(target) = args.first() else {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyDescriptors called on null or undefined"
+                            .to_string(),
+                    });
+                };
+                if target.is_nullish() {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyDescriptors called on null or undefined"
+                            .to_string(),
+                    });
+                }
+                if target.is_boolean()
+                    || target.is_number()
+                    || target.is_symbol()
+                    || target.is_big_int()
+                {
+                    // Empty result; primitive wrapper carries no
+                    // own keys reachable through the foundation surface.
+                } else if let Some(s) = target.as_string() {
+                    let units = s.to_utf16_vec(&self.gc_heap);
+                    let result_root = Value::object(result);
+                    for (i, u) in units.iter().enumerate() {
+                        let key = i.to_string();
+                        let unit =
+                            crate::string::JsString::from_utf16_units(&[*u], self.gc_heap_mut())
+                                .map_err(|_| VmError::TypeMismatch)?;
+                        let desc = crate::object::PropertyDescriptor::data(
+                            Value::string(unit),
                             false,
-                            false,
+                            true,
                             false,
                         );
-                        let length_obj = self.descriptor_to_object_stack_rooted(
+                        let desc_obj = self.descriptor_to_object_stack_rooted(
                             stack,
-                            &length_desc,
+                            &desc,
                             &[&result_root],
                             args,
                         )?;
-                        self.set_property(result, "length", Value::Object(length_obj))?;
+                        self.set_property(result, &key, Value::object(desc_obj))?;
                     }
-                    Some(target) if own_property_descriptors_uses_internal_methods(target) => {
-                        // §20.1.2.10.1 step 3 — drive the spec
-                        // ladder via `own_property_keys_value`, then
-                        // read each descriptor through the target's
-                        // `[[GetOwnProperty]]`. This keeps RegExp
-                        // `lastIndex`, callable metadata, proxies, and
-                        // expando bags on the same reflective path.
-                        let target_value = *target;
-                        let result_root = Value::object(result);
-                        let keys = self.own_property_keys_value(context, &target_value)?;
-                        for key in keys {
-                            let vm_key = match &key {
-                                Value::String(s) => crate::VmPropertyKey::OwnedString(
-                                    s.to_lossy_string(&self.gc_heap),
-                                ),
-                                Value::Symbol(sym) => crate::VmPropertyKey::Symbol(*sym),
-                                _ => continue,
-                            };
-                            let desc = self
-                                .ordinary_get_own_property_descriptor_value_stack_rooted(
-                                    context,
-                                    stack,
-                                    target_value,
-                                    &vm_key,
-                                    0,
-                                )?;
-                            let Some(desc) = desc else {
-                                continue;
-                            };
-                            let desc_obj = self.descriptor_to_object_stack_rooted(
-                                stack,
-                                &desc,
-                                &[&target_value, &result_root],
-                                args,
+                    let length_desc = crate::object::PropertyDescriptor::data(
+                        Value::number_f64(units.len() as f64),
+                        false,
+                        false,
+                        false,
+                    );
+                    let length_obj = self.descriptor_to_object_stack_rooted(
+                        stack,
+                        &length_desc,
+                        &[&result_root],
+                        args,
+                    )?;
+                    self.set_property(result, "length", Value::object(length_obj))?;
+                } else if own_property_descriptors_uses_internal_methods(target) {
+                    // §20.1.2.10.1 step 3 — drive the spec
+                    // ladder via `own_property_keys_value`, then
+                    // read each descriptor through the target's
+                    // `[[GetOwnProperty]]`.
+                    let target_value = *target;
+                    let result_root = Value::object(result);
+                    let keys = self.own_property_keys_value(context, &target_value)?;
+                    for key in keys {
+                        let vm_key = if let Some(s) = key.as_string() {
+                            crate::VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+                        } else if let Some(sym) = key.as_symbol() {
+                            crate::VmPropertyKey::Symbol(*sym)
+                        } else {
+                            continue;
+                        };
+                        let desc = self.ordinary_get_own_property_descriptor_value_stack_rooted(
+                            context,
+                            stack,
+                            target_value,
+                            &vm_key,
+                            0,
+                        )?;
+                        let Some(desc) = desc else {
+                            continue;
+                        };
+                        let desc_obj = self.descriptor_to_object_stack_rooted(
+                            stack,
+                            &desc,
+                            &[&target_value, &result_root],
+                            args,
+                        )?;
+                        if let Some(s) = key.as_string() {
+                            self.set_property(
+                                result,
+                                &s.to_lossy_string(&self.gc_heap),
+                                Value::object(desc_obj),
                             )?;
-                            match &key {
-                                Value::String(s) => {
-                                    self.set_property(
-                                        result,
-                                        &s.to_lossy_string(&self.gc_heap),
-                                        Value::Object(desc_obj),
-                                    )?;
-                                }
-                                Value::Symbol(sym)
-                                    if !object::set_symbol(
-                                        result,
-                                        &mut self.gc_heap,
-                                        *sym,
-                                        Value::Object(desc_obj),
-                                    ) =>
-                                {
-                                    return Err(VmError::TypeMismatch);
-                                }
-                                _ => {}
-                            }
+                        } else if let Some(sym) = key.as_symbol()
+                            && !object::set_symbol(
+                                result,
+                                &mut self.gc_heap,
+                                *sym,
+                                Value::object(desc_obj),
+                            )
+                        {
+                            return Err(VmError::TypeMismatch);
                         }
                     }
-                    _ => return Err(VmError::TypeMismatch),
+                } else {
+                    return Err(VmError::TypeMismatch);
                 }
                 Ok(Some(Value::object(result)))
             }
             M::GetOwnPropertyNames => {
-                let owned: Vec<String> = match args.first() {
-                    Some(
-                        Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_),
-                    ) => Vec::new(),
-                    Some(Value::String(s)) => {
-                        let mut keys: Vec<String> =
-                            (0..s.len()).map(|idx| idx.to_string()).collect();
-                        keys.push("length".to_string());
-                        keys
-                    }
-                    Some(target) if own_property_names_uses_internal_methods(target) => self
-                        .own_property_keys_value(context, target)?
+                let Some(target) = args.first() else {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyNames called on null or undefined"
+                            .to_string(),
+                    });
+                };
+                if target.is_nullish() {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertyNames called on null or undefined"
+                            .to_string(),
+                    });
+                }
+                let owned: Vec<String> = if target.is_boolean()
+                    || target.is_number()
+                    || target.is_symbol()
+                    || target.is_big_int()
+                {
+                    Vec::new()
+                } else if let Some(s) = target.as_string() {
+                    let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
+                    keys.push("length".to_string());
+                    keys
+                } else if own_property_names_uses_internal_methods(target) {
+                    self.own_property_keys_value(context, target)?
                         .into_iter()
-                        .filter_map(|key| match key {
-                            Value::String(name) => Some(name.to_lossy_string(&self.gc_heap)),
-                            _ => None,
-                        })
-                        .collect(),
-                    Some(Value::Null) | Some(Value::Undefined) | None => {
-                        return Err(VmError::TypeError {
-                            message: "Object.getOwnPropertyNames called on null or undefined"
-                                .to_string(),
-                        });
-                    }
-                    _ => return Err(VmError::TypeMismatch),
+                        .filter_map(|key| key.as_string().map(|s| s.to_lossy_string(&self.gc_heap)))
+                        .collect()
+                } else {
+                    return Err(VmError::TypeMismatch);
                 };
                 let mut names = Vec::with_capacity(owned.len());
                 for key in owned {
@@ -1373,26 +1407,32 @@ impl Interpreter {
                 Ok(Some(Value::array(array)))
             }
             M::GetOwnPropertySymbols => {
-                let syms: Vec<Value> = match args.first() {
-                    Some(
-                        Value::Boolean(_)
-                        | Value::Number(_)
-                        | Value::Symbol(_)
-                        | Value::BigInt(_)
-                        | Value::String(_),
-                    ) => Vec::new(),
-                    Some(target) if own_property_names_uses_internal_methods(target) => self
-                        .own_property_keys_value(context, target)?
+                let Some(target) = args.first() else {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertySymbols called on null or undefined"
+                            .to_string(),
+                    });
+                };
+                if target.is_nullish() {
+                    return Err(VmError::TypeError {
+                        message: "Object.getOwnPropertySymbols called on null or undefined"
+                            .to_string(),
+                    });
+                }
+                let syms: Vec<Value> = if target.is_boolean()
+                    || target.is_number()
+                    || target.is_symbol()
+                    || target.is_big_int()
+                    || target.is_string()
+                {
+                    Vec::new()
+                } else if own_property_names_uses_internal_methods(target) {
+                    self.own_property_keys_value(context, target)?
                         .into_iter()
-                        .filter(|key| matches!(key, Value::Symbol(_)))
-                        .collect(),
-                    Some(Value::Null) | Some(Value::Undefined) | None => {
-                        return Err(VmError::TypeError {
-                            message: "Object.getOwnPropertySymbols called on null or undefined"
-                                .to_string(),
-                        });
-                    }
-                    _ => return Err(VmError::TypeMismatch),
+                        .filter(|key| key.is_symbol())
+                        .collect()
+                } else {
+                    return Err(VmError::TypeMismatch);
                 };
                 let target_root = args.first().cloned().unwrap_or(Value::undefined());
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
@@ -1421,7 +1461,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let items = args.first().cloned().unwrap_or(Value::undefined());
         let callback = args.get(1).cloned().unwrap_or(Value::undefined());
-        if matches!(items, Value::Undefined | Value::Null) {
+        if items.is_nullish() {
             return Err(VmError::TypeError {
                 message: "Object.groupBy: items must be iterable".to_string(),
             });
@@ -1442,25 +1482,25 @@ impl Interpreter {
             cb_args.push(Value::number(crate::number::NumberValue::from_f64(
                 idx as f64,
             )));
-            let key = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
+            let key = self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
             let key_pk = self.to_property_key_sync(context, key)?;
             let key_str = match key_pk {
                 crate::VmPropertyKey::Symbol(sym) => {
                     let existing = crate::object::get_symbol(result, &self.gc_heap, &sym);
                     let group = match existing {
-                        Some(Value::Array(arr)) => arr,
+                        Some(v) if v.is_array() => v.as_array().expect("guarded"),
                         _ => {
                             let arr = self.alloc_stack_rooted_array_from_values_with_root_slices(
                                 stack,
                                 Vec::new(),
-                                &[&Value::Object(result), item],
+                                &[&Value::object(result), item],
                                 &[args],
                             )?;
                             crate::object::set_symbol(
                                 result,
                                 &mut self.gc_heap,
                                 sym,
-                                Value::Array(arr),
+                                Value::array(arr),
                             );
                             arr
                         }
@@ -1489,15 +1529,15 @@ impl Interpreter {
             };
             let existing = crate::object::get(result, &self.gc_heap, &key_str);
             let group = match existing {
-                Some(Value::Array(arr)) => arr,
+                Some(v) if v.is_array() => v.as_array().expect("guarded"),
                 _ => {
                     let arr = self.alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
                         Vec::new(),
-                        &[&Value::Object(result), item],
+                        &[&Value::object(result), item],
                         &[args],
                     )?;
-                    self.set_property(result, &key_str, Value::Array(arr))?;
+                    self.set_property(result, &key_str, Value::array(arr))?;
                     arr
                 }
             };
@@ -1540,21 +1580,21 @@ impl Interpreter {
         let object_proto = self.constructor_prototype_value("Object").ok();
         let result =
             self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
-        if let Some(Value::Object(proto_obj)) = object_proto {
+        if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
             object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
         }
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
                 self.set_property(result, "value", *value)?;
-                self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
+                self.set_property(result, "writable", Value::boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
                 self.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
                 self.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
             }
         }
-        self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
-        self.set_property(result, "configurable", Value::Boolean(desc.configurable()))?;
+        self.set_property(result, "enumerable", Value::boolean(desc.enumerable()))?;
+        self.set_property(result, "configurable", Value::boolean(desc.configurable()))?;
         Ok(result)
     }
 
@@ -1629,7 +1669,7 @@ impl Interpreter {
                     smallvec::smallvec![proxy_value],
                     &mut external_visit,
                     move |ctx, _, captures| {
-                        if let Some(Value::Proxy(proxy)) = captures.first() {
+                        if let Some(proxy) = captures.first().and_then(|v| v.as_proxy()) {
                             proxy.revoke(ctx.heap_mut());
                         }
                         Ok(Value::undefined())
@@ -1658,61 +1698,64 @@ impl Interpreter {
             M::Construct => Err(VmError::TypeMismatch),
             M::From => {
                 let value = args.first().cloned().unwrap_or(Value::undefined());
-                let state = match value {
-                    Value::Iterator(rc) => return Ok(Value::iterator(rc)),
-                    Value::Generator(handle) => IteratorState::Generator { handle },
-                    Value::Array(arr) => IteratorState::Array {
+                let state = if let Some(rc) = value.as_iterator() {
+                    return Ok(Value::iterator(rc));
+                } else if let Some(handle) = value.as_generator() {
+                    IteratorState::Generator { handle }
+                } else if let Some(arr) = value.as_array() {
+                    IteratorState::Array {
                         array: arr,
                         index: 0,
                         origin: crate::BuiltinIteratorOrigin::Array,
-                    },
-                    Value::String(s) => IteratorState::String {
-                        string: s,
+                    }
+                } else if let Some(s) = value.as_string() {
+                    IteratorState::String {
+                        string: *s,
                         index: 0,
-                    },
-                    Value::Set(s) => {
-                        let value_root = Value::set(s);
-                        let snap: SmallVec<[Value; 4]> = collections::set_values(s, self.gc_heap())
-                            .into_iter()
-                            .collect();
-                        let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                            stack,
-                            snap,
-                            &[&value_root],
-                            &[args],
-                        )?;
-                        IteratorState::Array {
-                            array,
-                            index: 0,
-                            origin: crate::BuiltinIteratorOrigin::Set,
-                        }
                     }
-                    Value::Map(m) => {
-                        let value_root = Value::map(m);
-                        let mut entries: Vec<Value> = Vec::new();
-                        for (k, v) in collections::map_entries(m, self.gc_heap()) {
-                            let pair = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                                stack,
-                                [k, v],
-                                &[&value_root],
-                                &[args, entries.as_slice()],
-                            )?;
-                            entries.push(Value::array(pair));
-                        }
-                        let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                            stack,
-                            entries,
-                            &[&value_root],
-                            &[args],
-                        )?;
-                        IteratorState::Array {
-                            array,
-                            index: 0,
-                            origin: crate::BuiltinIteratorOrigin::Map,
-                        }
+                } else if let Some(s) = value.as_set() {
+                    let value_root = Value::set(s);
+                    let snap: SmallVec<[Value; 4]> = collections::set_values(s, self.gc_heap())
+                        .into_iter()
+                        .collect();
+                    let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        snap,
+                        &[&value_root],
+                        &[args],
+                    )?;
+                    IteratorState::Array {
+                        array,
+                        index: 0,
+                        origin: crate::BuiltinIteratorOrigin::Set,
                     }
-                    Value::Object(_) => IteratorState::User { iterator: value },
-                    _ => return Err(VmError::TypeMismatch),
+                } else if let Some(m) = value.as_map() {
+                    let value_root = Value::map(m);
+                    let mut entries: Vec<Value> = Vec::new();
+                    for (k, v) in collections::map_entries(m, self.gc_heap()) {
+                        let pair = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                            stack,
+                            [k, v],
+                            &[&value_root],
+                            &[args, entries.as_slice()],
+                        )?;
+                        entries.push(Value::array(pair));
+                    }
+                    let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+                        stack,
+                        entries,
+                        &[&value_root],
+                        &[args],
+                    )?;
+                    IteratorState::Array {
+                        array,
+                        index: 0,
+                        origin: crate::BuiltinIteratorOrigin::Map,
+                    }
+                } else if value.is_object() {
+                    IteratorState::User { iterator: value }
+                } else {
+                    return Err(VmError::TypeMismatch);
                 };
                 let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[], &[args])?;
                 Ok(Value::iterator(iter))
@@ -1731,82 +1774,80 @@ fn own_enumerable_keys_for_define(
     context: &ExecutionContext,
     props: &Value,
 ) -> Result<Vec<VmPropertyKey<'static>>, VmError> {
-    match props {
-        Value::Null | Value::Undefined => Err(VmError::TypeMismatch),
-        Value::Object(_)
-        | Value::ClassConstructor(_)
-        | Value::Function { .. }
-        | Value::Closure(_)
-        | Value::NativeFunction(_)
-        | Value::BoundFunction(_)
-        | Value::RegExp(_)
-        | Value::Proxy(_) => {
-            let keys = interp.own_property_keys_value(context, props)?;
-            let mut out = Vec::new();
-            for key in keys {
-                let vm_key = value_to_static_property_key(&key, interp.gc_heap())?;
-                let desc =
-                    interp.get_own_property_descriptor_for_value(context, *props, Some(&key))?;
-                if desc.is_some_and(|desc| desc.enumerable()) {
-                    out.push(vm_key);
-                }
-            }
-            Ok(out)
-        }
-        Value::Array(arr) => {
-            // §22.1.3.3 EnumerableOwnPropertyNames for Array — indices
-            // in storage order, then any named props that were
-            // installed enumerable on the array exotic (including
-            // accessor-shaped own properties hung via
-            // `Object.defineProperty`).
-            let mut out: Vec<String> = Vec::new();
-            let dense_len = array::with_elements(*arr, interp.gc_heap(), |els| els.len());
-            for idx in 0..dense_len {
-                out.push(idx.to_string());
-            }
-            let (named, accessor_keys): (Vec<String>, Vec<String>) =
-                interp.gc_heap().read_payload(*arr, |body| {
-                    let named = body
-                        .named_properties
-                        .as_ref()
-                        .map_or_else(Vec::new, |m| m.keys().cloned().collect());
-                    let accessors = body.accessors.as_ref().map_or_else(Vec::new, |m| {
-                        m.keys()
-                            .filter(|k| k.parse::<usize>().is_err())
-                            .cloned()
-                            .collect()
-                    });
-                    (named, accessors)
-                });
-            out.extend(named);
-            for key in accessor_keys {
-                if !out.contains(&key) {
-                    out.push(key);
-                }
-            }
-            Ok(out.into_iter().map(VmPropertyKey::OwnedString).collect())
-        }
-        Value::String(s) => {
-            let units = s.to_utf16_vec(interp.gc_heap());
-            Ok((0..units.len())
-                .map(|i| VmPropertyKey::OwnedString(i.to_string()))
-                .collect())
-        }
-        _ => Ok(Vec::new()),
+    if props.is_nullish() {
+        return Err(VmError::TypeMismatch);
     }
+    if props.is_object()
+        || props.is_class_constructor()
+        || props.is_function()
+        || props.is_closure()
+        || props.is_native_function()
+        || props.is_bound_function()
+        || props.is_regexp()
+        || props.is_proxy()
+    {
+        let keys = interp.own_property_keys_value(context, props)?;
+        let mut out = Vec::new();
+        for key in keys {
+            let vm_key = value_to_static_property_key(&key, interp.gc_heap())?;
+            let desc = interp.get_own_property_descriptor_for_value(context, *props, Some(&key))?;
+            if desc.is_some_and(|desc| desc.enumerable()) {
+                out.push(vm_key);
+            }
+        }
+        return Ok(out);
+    }
+    if let Some(arr) = props.as_array() {
+        // §22.1.3.3 EnumerableOwnPropertyNames for Array.
+        let mut out: Vec<String> = Vec::new();
+        let dense_len = array::with_elements(arr, interp.gc_heap(), |els| els.len());
+        for idx in 0..dense_len {
+            out.push(idx.to_string());
+        }
+        let (named, accessor_keys): (Vec<String>, Vec<String>) =
+            interp.gc_heap().read_payload(arr, |body| {
+                let named = body
+                    .named_properties
+                    .as_ref()
+                    .map_or_else(Vec::new, |m| m.keys().cloned().collect());
+                let accessors = body.accessors.as_ref().map_or_else(Vec::new, |m| {
+                    m.keys()
+                        .filter(|k| k.parse::<usize>().is_err())
+                        .cloned()
+                        .collect()
+                });
+                (named, accessors)
+            });
+        out.extend(named);
+        for key in accessor_keys {
+            if !out.contains(&key) {
+                out.push(key);
+            }
+        }
+        return Ok(out.into_iter().map(VmPropertyKey::OwnedString).collect());
+    }
+    if let Some(s) = props.as_string() {
+        let units = s.to_utf16_vec(interp.gc_heap());
+        return Ok((0..units.len())
+            .map(|i| VmPropertyKey::OwnedString(i.to_string()))
+            .collect());
+    }
+    Ok(Vec::new())
 }
 
 fn value_to_static_property_key(
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    match value {
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(*sym)),
-        _ => Err(VmError::TypeError {
-            message: "property key must be a string or symbol".to_string(),
-        }),
+    if let Some(s) = value.as_string() {
+        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
+    if let Some(sym) = value.as_symbol() {
+        return Ok(VmPropertyKey::Symbol(*sym));
+    }
+    Err(VmError::TypeError {
+        message: "property key must be a string or symbol".to_string(),
+    })
 }
 
 fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> String {
@@ -1870,57 +1911,30 @@ fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), 
 }
 
 fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool {
-    matches!(
-        target,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Proxy(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Promise(_)
-    )
+    is_property_bearing_object(target)
 }
 
 fn own_property_names_uses_internal_methods(target: &Value) -> bool {
-    matches!(
-        target,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Proxy(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-    )
+    target.is_object()
+        || target.is_array()
+        || target.is_proxy()
+        || target.is_function()
+        || target.is_closure()
+        || target.is_native_function()
+        || target.is_bound_function()
+        || target.is_class_constructor()
 }
 
 fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
-    matches!(
-        target,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Proxy(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::RegExp(_)
-    )
+    target.is_object()
+        || target.is_array()
+        || target.is_proxy()
+        || target.is_function()
+        || target.is_closure()
+        || target.is_native_function()
+        || target.is_bound_function()
+        || target.is_class_constructor()
+        || target.is_regexp()
 }
 
 fn enumerable_own_string_entries(
@@ -1932,7 +1946,7 @@ fn enumerable_own_string_entries(
     let keys = interp.own_property_keys_value(context, target)?;
     let mut entries = Vec::new();
     for key_value in &keys {
-        let Value::String(name) = key_value else {
+        let Some(name) = key_value.as_string() else {
             continue;
         };
         let key_name = name.to_lossy_string(interp.gc_heap());
@@ -1963,28 +1977,7 @@ fn enumerable_own_string_entries(
 }
 
 fn assign_source_uses_own_property_keys(source: &Value) -> bool {
-    matches!(
-        source,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Proxy(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Promise(_)
-    )
+    is_property_bearing_object(source)
 }
 
 fn assign_copy_source_keys(
@@ -1997,14 +1990,14 @@ fn assign_copy_source_keys(
 ) -> Result<(), VmError> {
     let keys = interp.own_property_keys_value(context, source)?;
     for key_value in &keys {
-        let key = match key_value {
-            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap())),
-            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-            _ => {
-                return Err(VmError::TypeError {
-                    message: "Object.assign source ownKeys returned non-property key".to_string(),
-                });
-            }
+        let key = if let Some(s) = key_value.as_string() {
+            VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap()))
+        } else if let Some(sym) = key_value.as_symbol() {
+            VmPropertyKey::Symbol(*sym)
+        } else {
+            return Err(VmError::TypeError {
+                message: "Object.assign source ownKeys returned non-property key".to_string(),
+            });
         };
         let desc = interp.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
@@ -2077,42 +2070,36 @@ fn assign_set_string(
         }
         return interp.ordinary_set_with_callable_setter(context, obj, key, value, true);
     }
-    match target_value {
-        Value::Array(arr) => {
-            let arr = *arr;
-            if key == "length" {
-                let number_len = crate::coerce::to_number_or_throw(interp, context, &value)?;
-                let new_len = crate::number::bitwise::to_uint32(number_len);
-                if (new_len as f64) != number_len.as_f64() {
-                    return Err(VmError::RangeError {
-                        message: "Invalid array length".to_string(),
-                    });
-                }
-                crate::array::set_length(arr, &mut interp.gc_heap, new_len as usize)
-                    .map_err(|_| VmError::TypeMismatch)?;
-                return Ok(());
+    if let Some(arr) = target_value.as_array() {
+        if key == "length" {
+            let number_len = crate::coerce::to_number_or_throw(interp, context, &value)?;
+            let new_len = crate::number::bitwise::to_uint32(number_len);
+            if (new_len as f64) != number_len.as_f64() {
+                return Err(VmError::RangeError {
+                    message: "Invalid array length".to_string(),
+                });
             }
-            if let Some(idx) = crate::object::array_index_property_name(key) {
-                crate::array::set(arr, &mut interp.gc_heap, idx as usize, value)
-                    .map_err(|_| VmError::TypeMismatch)?;
-                return Ok(());
-            }
-            crate::array::set_named_property(arr, &mut interp.gc_heap, key, value)
+            crate::array::set_length(arr, &mut interp.gc_heap, new_len as usize)
                 .map_err(|_| VmError::TypeMismatch)?;
-            Ok(())
+            return Ok(());
         }
-        // For other exotic value kinds, surface failure rather than
-        // silently dropping the assign step — the spec routes through
-        // the receiver's [[Set]] which would TypeError on non-writable
-        // / non-extensible / unsupported keys. Foundation: emit a
-        // descriptive TypeError so callers can iterate.
-        _ => Err(VmError::TypeError {
-            message: format!(
-                "Object.assign: cannot set '{key}' on {}",
-                crate::value_kind_name(target_value)
-            ),
-        }),
+        if let Some(idx) = crate::object::array_index_property_name(key) {
+            crate::array::set(arr, &mut interp.gc_heap, idx as usize, value)
+                .map_err(|_| VmError::TypeMismatch)?;
+            return Ok(());
+        }
+        crate::array::set_named_property(arr, &mut interp.gc_heap, key, value)
+            .map_err(|_| VmError::TypeMismatch)?;
+        return Ok(());
     }
+    // For other exotic value kinds, surface failure rather than
+    // silently dropping the assign step.
+    Err(VmError::TypeError {
+        message: format!(
+            "Object.assign: cannot set '{key}' on {}",
+            crate::value_kind_name(target_value)
+        ),
+    })
 }
 
 fn assign_set_symbol(
@@ -2126,18 +2113,16 @@ fn assign_set_symbol(
     if let Some(obj) = target_object {
         return interp.ordinary_set_symbol_with_callable_setter(context, obj, sym, value, true);
     }
-    match target_value {
-        Value::Array(arr) => {
-            crate::array::set_symbol_property(*arr, &mut interp.gc_heap, sym, value);
-            Ok(())
-        }
-        _ => Err(VmError::TypeError {
-            message: format!(
-                "Object.assign: cannot set symbol on {}",
-                crate::value_kind_name(target_value)
-            ),
-        }),
+    if let Some(arr) = target_value.as_array() {
+        crate::array::set_symbol_property(arr, &mut interp.gc_heap, sym, value);
+        return Ok(());
     }
+    Err(VmError::TypeError {
+        message: format!(
+            "Object.assign: cannot set symbol on {}",
+            crate::value_kind_name(target_value)
+        ),
+    })
 }
 
 /// §7.3.2 `Get(target, name)` for indexed-string entry probing in

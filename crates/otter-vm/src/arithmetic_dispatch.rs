@@ -80,10 +80,10 @@ impl Interpreter {
         // `Op::ToPrimitive(default)` ahead of `Op::Add`). If either
         // primitive is a String, concatenate; otherwise apply ToNumeric
         // to each primitive and fold via the numeric / BigInt rules.
-        let result = if matches!(lhs, Value::String(_)) || matches!(rhs, Value::String(_)) {
+        let result = if lhs.is_string() || rhs.is_string() {
             let l_str = conversion::to_js_string_primitive(&lhs, self.gc_heap_mut())?;
             let r_str = conversion::to_js_string_primitive(&rhs, self.gc_heap_mut())?;
-            Value::String(JsString::concat(&l_str, &r_str, self.gc_heap_mut())?)
+            Value::string(JsString::concat(&l_str, &r_str, self.gc_heap_mut())?)
         } else {
             let lk =
                 abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
@@ -91,13 +91,13 @@ impl Interpreter {
                 abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
             match (lk, rk) {
                 (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-                    Value::Number(number::add(a, b))
+                    Value::number(number::add(a, b))
                 }
                 (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
                     let sum = bigint::ops::add(&a, &b);
                     let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, sum)
                         .map_err(oom_to_vm)?;
-                    Value::BigInt(handle)
+                    Value::big_int(handle)
                 }
                 // §6.1.6.2 Numeric Type Conversion forbids mixing
                 // Number and BigInt operands without an explicit
@@ -137,7 +137,7 @@ impl Interpreter {
         let rk = abstract_ops::to_numeric_kind(&rhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;
         let result = match (lk, rk) {
             (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-                Value::Number(number::shr_logical(a, b))
+                Value::number(number::shr_logical(a, b))
             }
             _ => return Err(VmError::TypeMismatch),
         };
@@ -160,7 +160,7 @@ impl Interpreter {
                     let neg = bigint::ops::neg(&b);
                     let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, neg)
                         .map_err(oom_to_vm)?;
-                    Value::BigInt(handle)
+                    Value::big_int(handle)
                 }
             };
         write_register(frame, dst, value)?;
@@ -182,7 +182,7 @@ impl Interpreter {
                     let notted = bigint::ops::bitwise_not(&b);
                     let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, notted)
                         .map_err(oom_to_vm)?;
-                    Value::BigInt(handle)
+                    Value::big_int(handle)
                 }
             };
         write_register(frame, dst, value)?;
@@ -303,12 +303,12 @@ fn run_numeric_values(
     let rnum = abstract_ops::to_numeric_kind(&rhs, heap).ok_or(VmError::TypeMismatch)?;
     let result = match (lnum, rnum) {
         (abstract_ops::NumericKind::Num(a), abstract_ops::NumericKind::Num(b)) => {
-            Value::Number(op(a, b))
+            Value::number(op(a, b))
         }
         (abstract_ops::NumericKind::Big(a), abstract_ops::NumericKind::Big(b)) => {
             let folded = bigint_op(&a, &b).map_err(bigint_to_vm_error)?;
             let handle = bigint::BigIntValue::from_inner(heap, folded).map_err(oom_to_vm)?;
-            Value::BigInt(handle)
+            Value::big_int(handle)
         }
         _ => return Err(VmError::TypeMismatch),
     };
@@ -328,7 +328,7 @@ fn run_compare_values(
     // §7.2.14 step 3.b — relational comparison applies ToNumeric
     // after ToPrimitive(number). Symbols cannot be converted to a
     // numeric value, so all four relational operators throw.
-    if matches!(lhs, Value::Symbol(_)) || matches!(rhs, Value::Symbol(_)) {
+    if lhs.is_symbol() || rhs.is_symbol() {
         return Err(VmError::TypeMismatch);
     }
     let truthy = match op {

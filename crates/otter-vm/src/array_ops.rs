@@ -219,7 +219,7 @@ impl Interpreter {
             if has_map {
                 let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                 cb_args.push(value);
-                cb_args.push(Value::Number(number::NumberValue::from_i32(index as i32)));
+                cb_args.push(Value::number(number::NumberValue::from_i32(index as i32)));
                 let mapped_value = self.run_callable_sync(context, &map_fn, this_arg, cb_args)?;
                 mapped.push(mapped_value);
             } else {

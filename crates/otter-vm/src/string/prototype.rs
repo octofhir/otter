@@ -1058,7 +1058,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if sep_units.is_empty() {
         let mut out: Vec<Value> = Vec::with_capacity((limit as usize).min(recv_units.len()));
         for &u in recv_units.iter().take(limit as usize) {
-            out.push(Value::String(JsString::from_utf16_units(
+            out.push(Value::string(JsString::from_utf16_units(
                 &[u],
                 args.gc_heap,
             )?));
@@ -1076,7 +1076,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         match find_substr(&recv_units, &sep_units, start) {
             Some(pos) => {
                 let part = JsString::from_utf16_units(&recv_units[start..pos], args.gc_heap)?;
-                out.push(Value::String(part));
+                out.push(Value::string(part));
                 start = pos + sep_units.len();
             }
             None => break,
@@ -1084,7 +1084,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
     if (out.len() as u32) < limit {
         let part = JsString::from_utf16_units(&recv_units[start..], args.gc_heap)?;
-        out.push(Value::String(part));
+        out.push(Value::string(part));
     }
     Ok(Value::Array(args.array_from_elements_rooted(
         out.iter().cloned(),
@@ -1204,12 +1204,12 @@ fn regex_split(
             continue;
         }
         let part = JsString::from_utf16_units(&recv_units[cursor..m.range.start], args.gc_heap)?;
-        out.push(Value::String(part));
+        out.push(Value::string(part));
         cursor = m.range.end;
     }
     if (out.len() as u32) < limit {
         let part = JsString::from_utf16_units(&recv_units[cursor..], args.gc_heap)?;
-        out.push(Value::String(part));
+        out.push(Value::string(part));
     }
     Ok(Value::Array(args.array_from_elements_rooted(
         out.iter().cloned(),
@@ -1298,7 +1298,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let mut out: Vec<Value> = Vec::with_capacity(matches.len());
         for m in &matches {
             let s = JsString::from_utf16_units(&recv_units[m.range.clone()], args.gc_heap)?;
-            out.push(Value::String(s));
+            out.push(Value::string(s));
         }
         return Ok(Value::Array(args.array_from_elements_rooted(
             out.iter().cloned(),
@@ -1371,7 +1371,7 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
             &[],
             &[out.as_slice()],
         )?;
-        out.push(Value::Array(arr));
+        out.push(Value::array(arr));
     }
     // §22.1.3.14 step 7 — `Invoke(rx, @@matchAll, « S »)` returns a
     // `RegExp String Iterator`. The foundation lowers it to a

@@ -228,8 +228,8 @@ fn native_constructor_static_with_roots(
 fn class_entry_roots(entries: &[(ErrorKind, ClassEntry)]) -> Vec<Value> {
     let mut roots = Vec::with_capacity(entries.len() * 2);
     for (_, entry) in entries {
-        roots.push(Value::Object(entry.prototype));
-        roots.push(Value::Object(entry.constructor));
+        roots.push(Value::object(entry.prototype));
+        roots.push(Value::object(entry.constructor));
     }
     roots
 }
@@ -789,7 +789,7 @@ impl ErrorClassRegistry {
             ErrorKind::AggregateError,
         ] {
             let mut roots = class_entry_roots(&entries);
-            roots.push(Value::Object(error_proto));
+            roots.push(Value::object(error_proto));
             let root_refs: Vec<&Value> = roots.iter().collect();
             let proto = alloc_registry_object(gc_heap, root_refs.as_slice())?;
             let proto_root = Value::object(proto);
@@ -811,7 +811,7 @@ impl ErrorClassRegistry {
                 PropertyDescriptor::data(Value::String(empty), true, false, true),
             );
             let mut roots = class_entry_roots(&entries);
-            roots.push(Value::Object(error_proto));
+            roots.push(Value::object(error_proto));
             roots.push(proto_root);
             let root_refs: Vec<&Value> = roots.iter().collect();
             let ctor = alloc_registry_object(gc_heap, root_refs.as_slice())?;
@@ -847,7 +847,7 @@ impl ErrorClassRegistry {
                 ErrorKind::AggregateError => ctor_aggregate,
             };
             let mut roots = class_entry_roots(&entries);
-            roots.push(Value::Object(error_proto));
+            roots.push(Value::object(error_proto));
             roots.push(proto_root);
             roots.push(ctor_root);
             let root_refs: Vec<&Value> = roots.iter().collect();

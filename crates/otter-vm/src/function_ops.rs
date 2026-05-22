@@ -1167,7 +1167,7 @@ impl Interpreter {
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Frozen,
                     )?;
-                    return Ok(Some(Value::Boolean(frozen)));
+                    return Ok(Some(Value::boolean(frozen)));
                 }
                 M::IsSealed => {
                     let sealed = self.test_integrity_level_value(
@@ -1175,7 +1175,7 @@ impl Interpreter {
                         &target,
                         crate::object_internal_ops::ObjectIntegrityLevel::Sealed,
                     )?;
-                    return Ok(Some(Value::Boolean(sealed)));
+                    return Ok(Some(Value::boolean(sealed)));
                 }
                 _ => unreachable!("integrity methods are matched above"),
             }
@@ -1265,7 +1265,7 @@ impl Interpreter {
                 let keys = self.enumerable_own_string_keys_for_value(context, target, 0)?;
                 let mut values = Vec::with_capacity(keys.len());
                 for key in keys {
-                    values.push(Value::String(
+                    values.push(Value::string(
                         JsString::from_str(&key, self.gc_heap_mut())
                             .map_err(|_| VmError::TypeMismatch)?,
                     ));
@@ -1279,7 +1279,7 @@ impl Interpreter {
             }
             let desc = self.get_own_property_descriptor_for_value(context, target, args.get(1))?;
             if matches!(method, M::HasOwn) {
-                return Ok(Some(Value::Boolean(desc.is_some())));
+                return Ok(Some(Value::boolean(desc.is_some())));
             }
             return match desc {
                 Some(desc) => Ok(Some(Value::Object(
@@ -1447,7 +1447,7 @@ impl Interpreter {
                     }
                     _ => return Ok(None),
                 };
-                Ok(Some(Value::Boolean(present)))
+                Ok(Some(Value::boolean(present)))
             }
             // §20.1.2.14 / §20.1.2.18 — ordinary functions keep
             // expando storage outside `ObjectBody`, so handle their

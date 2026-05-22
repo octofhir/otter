@@ -1039,7 +1039,7 @@ impl Interpreter {
                     _ => Ok(None),
                 }
             }
-            Value::ClassConstructor(c) => Ok(Some(Value::Object(c.prototype(&self.gc_heap)))),
+            Value::ClassConstructor(c) => Ok(Some(Value::object(c.prototype(&self.gc_heap)))),
             Value::Object(obj) => Ok(match crate::object::get(*obj, &self.gc_heap, "prototype") {
                 Some(proto) if constructor_return_is_object(&proto) => Some(proto),
                 _ => None,
@@ -1074,7 +1074,7 @@ impl Interpreter {
                     _ => Ok(None),
                 }
             }
-            Value::ClassConstructor(c) => Ok(Some(Value::Object(c.prototype(&self.gc_heap)))),
+            Value::ClassConstructor(c) => Ok(Some(Value::object(c.prototype(&self.gc_heap)))),
             Value::Object(obj) => Ok(match crate::object::get(*obj, &self.gc_heap, "prototype") {
                 Some(proto) if constructor_return_is_object(&proto) => Some(proto),
                 _ => None,

@@ -620,7 +620,7 @@ fn impl_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     for i in 0..len {
         let element = t.get(args.gc_heap, i).map_err(intrinsic_oom)?;
         let pair = args.array_from_elements_rooted([smi(i as i32), element], &[], &[&pairs])?;
-        pairs.push(Value::Array(pair));
+        pairs.push(Value::array(pair));
     }
     wrap_iterator(args, pairs).map_err(intrinsic_oom)
 }

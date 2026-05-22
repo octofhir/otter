@@ -177,12 +177,12 @@ pub(crate) fn build_match_result(
 ) -> Result<JsArray, IntrinsicError> {
     let full = JsString::from_utf16_units(&units[m.range.clone()], args.gc_heap)?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-    out.push(Value::String(full));
+    out.push(Value::string(full));
     for cap in &m.captures {
         match cap {
             Some(r) => {
                 let s = JsString::from_utf16_units(&units[r.clone()], args.gc_heap)?;
-                out.push(Value::String(s));
+                out.push(Value::string(s));
             }
             None => out.push(Value::Undefined),
         }
@@ -328,12 +328,12 @@ pub(crate) fn build_match_result_native(
 ) -> Result<JsArray, IntrinsicError> {
     let full = JsString::from_utf16_units(&units[m.range.clone()], ctx.heap_mut())?;
     let mut out: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
-    out.push(Value::String(full));
+    out.push(Value::string(full));
     for cap in &m.captures {
         match cap {
             Some(r) => {
                 let s = JsString::from_utf16_units(&units[r.clone()], ctx.heap_mut())?;
-                out.push(Value::String(s));
+                out.push(Value::string(s));
             }
             None => out.push(Value::Undefined),
         }
@@ -621,7 +621,7 @@ pub fn native_regexp_symbol_match(
                 name: "RegExp.prototype[@@match]",
                 reason: "out of memory".to_string(),
             })?;
-        matches_out.push(Value::String(match_str));
+        matches_out.push(Value::string(match_str));
         if m.range.start == m.range.end {
             cursor = advance_string_index(&units, m.range.end, full_unicode);
         } else {
@@ -944,7 +944,7 @@ fn regexp_exec_runtime(
             reason: "missing execution context".to_string(),
         })?;
         let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        args.push(Value::String(*s));
+        args.push(Value::string(*s));
         let result = interp
             .run_callable_sync(&exec_ctx, &exec_fn, *rx, args)
             .map_err(vm_err_to_native(name))?;
@@ -1147,15 +1147,15 @@ pub fn native_regexp_symbol_replace(
 
         let replacement: Vec<u16> = if functional_replace {
             let mut replacer_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-            replacer_args.push(Value::String(matched_str));
+            replacer_args.push(Value::string(matched_str));
             for cap in &captures {
                 replacer_args.push(match cap {
                     Some(s) => Value::string(*s),
                     None => Value::undefined(),
                 });
             }
-            replacer_args.push(Value::Number(NumberValue::from_f64(position as f64)));
-            replacer_args.push(Value::String(s));
+            replacer_args.push(Value::number(NumberValue::from_f64(position as f64)));
+            replacer_args.push(Value::string(s));
             if let Some(nc) = &named_captures_obj {
                 replacer_args.push(*nc);
             }
@@ -1354,7 +1354,7 @@ pub fn native_regexp_symbol_match_all(
     let matcher = {
         let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         ctor_args.push(receiver);
-        ctor_args.push(Value::String(flags_js));
+        ctor_args.push(Value::string(flags_js));
         let (interp, exec_ctx) = ctx.interp_mut_and_context();
         let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
             name,
@@ -1464,7 +1464,7 @@ pub fn native_regexp_symbol_split(
     let splitter = {
         let mut ctor_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         ctor_args.push(receiver);
-        ctor_args.push(Value::String(new_flags_js));
+        ctor_args.push(Value::string(new_flags_js));
         let (interp, exec_ctx) = ctx.interp_mut_and_context();
         let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
             name,
@@ -1532,7 +1532,7 @@ pub fn native_regexp_symbol_split(
                 })?;
             return Ok(Value::Array(arr));
         }
-        out_elements.push(Value::String(s));
+        out_elements.push(Value::string(s));
         let arr = ctx
             .array_from_elements_with_roots(
                 out_elements.iter().cloned(),
@@ -1574,7 +1574,7 @@ pub fn native_regexp_symbol_split(
                 name,
                 reason: "out of memory".to_string(),
             })?;
-        out_elements.push(Value::String(part));
+        out_elements.push(Value::string(part));
         if out_elements.len() as u32 == lim {
             let arr = ctx
                 .array_from_elements_with_roots(
@@ -1620,7 +1620,7 @@ pub fn native_regexp_symbol_split(
             reason: "out of memory".to_string(),
         },
     )?;
-    out_elements.push(Value::String(tail));
+    out_elements.push(Value::string(tail));
     let arr = ctx
         .array_from_elements_with_roots(
             out_elements.iter().cloned(),

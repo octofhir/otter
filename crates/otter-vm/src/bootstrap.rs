@@ -3211,7 +3211,7 @@ fn iterator_proto_for_each(
         }
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
         ctx.cx
             .interp
             .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)
@@ -3269,7 +3269,7 @@ fn iterator_proto_reduce(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(acc);
         cb_args.push(v);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
         acc = ctx
             .cx
             .interp
@@ -3331,7 +3331,7 @@ fn iterator_proto_find(
         }
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
         let kept = ctx
             .cx
             .interp
@@ -3548,7 +3548,7 @@ fn iterator_predicate_drain(
         }
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(idx)));
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
         let kept = ctx
             .cx
             .interp

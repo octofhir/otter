@@ -25,7 +25,7 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
         interp.gc_heap_mut(),
         Value::Object(target),
         Value::Object(bound_this),
-        smallvec![Value::Object(arg)],
+        smallvec![Value::object(arg)],
     )
     .expect("bound function");
 
@@ -62,7 +62,7 @@ fn native_function_captures_root_gc_values_when_rooted() {
     let native = native_value_with_captures(
         interp.gc_heap_mut(),
         "capture-root",
-        smallvec![Value::Object(captured)],
+        smallvec![Value::object(captured)],
         |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
@@ -129,7 +129,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         interp.gc_heap_mut(),
         Value::Object(bound_object),
         Value::Object(bound_object),
-        smallvec![Value::Object(bound_object)],
+        smallvec![Value::object(bound_object)],
     )
     .expect("bound");
     crate::object::set(
@@ -144,7 +144,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
     let native = native_value_with_captures(
         interp.gc_heap_mut(),
         "cycle-native",
-        smallvec![Value::Object(native_object)],
+        smallvec![Value::object(native_object)],
         |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");

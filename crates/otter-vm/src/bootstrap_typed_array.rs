@@ -528,7 +528,7 @@ fn ta_invoke_callback(
         })?;
     let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
     cb_args.push(*value);
-    cb_args.push(Value::Number(crate::number::NumberValue::from_i32(
+    cb_args.push(Value::number(crate::number::NumberValue::from_i32(
         index as i32,
     )));
     cb_args.push(*ta);
@@ -746,7 +746,7 @@ fn ta_proto_reduce_dir(
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(acc);
         cb_args.push(value);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_i32(
+        cb_args.push(Value::number(crate::number::NumberValue::from_i32(
             i as i32,
         )));
         cb_args.push(ta_value);
@@ -1186,7 +1186,7 @@ fn ta_ctor_dispatch(
                         reason: "out of memory while allocating array".to_string(),
                     })?;
                 let mut out: SmallVec<[Value; 4]> = SmallVec::new();
-                out.push(Value::Array(arr));
+                out.push(Value::array(arr));
                 for v in args.iter().skip(1) {
                     out.push(*v);
                 }

@@ -348,7 +348,7 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(*item);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(
             idx as f64,
         )));
         let key = ctx

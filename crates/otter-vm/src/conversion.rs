@@ -177,7 +177,7 @@ impl Interpreter {
         }
         let hint = JsString::from_str("number", self.gc_heap_mut())?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-        args.push(Value::String(hint));
+        args.push(Value::string(hint));
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)
@@ -547,7 +547,7 @@ impl Interpreter {
                         Some(callee) if self.is_callable_runtime(&callee) => {
                             let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                            args.push(Value::String(hint_str));
+                            args.push(Value::string(hint_str));
                             // §7.1.1 step 5.d. The resume guard
                             // upstream validates the result is a
                             // primitive — if not, that branch lands

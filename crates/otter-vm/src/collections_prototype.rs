@@ -668,7 +668,7 @@ pub fn make_map_iterator_factory(
     crate::native_value_with_captures(
         heap,
         "Map[Symbol.iterator]",
-        smallvec::smallvec![Value::Map(map)],
+        smallvec::smallvec![Value::map(map)],
         |ctx, _, captures| {
             let map = match captures.first() {
                 Some(Value::Map(map)) => *map,
@@ -694,7 +694,7 @@ pub fn make_set_iterator_factory(
     crate::native_value_with_captures(
         heap,
         "Set[Symbol.iterator]",
-        smallvec::smallvec![Value::Set(set)],
+        smallvec::smallvec![Value::set(set)],
         |ctx, _, captures| {
             let set = match captures.first() {
                 Some(Value::Set(set)) => *set,

@@ -228,7 +228,7 @@ fn native_group_by_rooted(
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(*item);
-        cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(
             idx as f64,
         )));
         let key =
@@ -430,7 +430,7 @@ fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
             &[&target_root],
             &[args, pairs.as_slice()],
         )?;
-        pairs.push(Value::Array(pair));
+        pairs.push(Value::array(pair));
     }
     Ok(Value::Array(ctx.array_from_elements_with_roots(
         pairs,
@@ -2689,7 +2689,7 @@ pub fn call(
                 let key = string_value(&k, gc_heap)?;
                 let pair: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![key, v];
                 let target_root = Value::object(target);
-                pairs.push(Value::Array(rooted_array_from_elements(
+                pairs.push(Value::array(rooted_array_from_elements(
                     gc_heap,
                     pair,
                     &[&target_root],

@@ -196,7 +196,7 @@ pub(crate) fn install_timer_globals(
     let mut builder = ObjectBuilder::from_object_with_value_roots(
         heap,
         global_this,
-        vec![Value::Object(global_this)],
+        vec![Value::object(global_this)],
     );
     for (name, length, call) in TIMER_NATIVES {
         builder.method(

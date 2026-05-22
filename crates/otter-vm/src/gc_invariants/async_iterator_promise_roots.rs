@@ -100,7 +100,7 @@ fn pending_promise_microtask_payload_roots_until_drained() {
     interp.microtasks_mut().enqueue(crate::Microtask {
         callee: Value::Undefined,
         this_value: Value::Undefined,
-        args: smallvec![Value::Object(payload)],
+        args: smallvec![Value::object(payload)],
         context: None,
         result_capability: None,
         kind: crate::MicrotaskKind::Call,

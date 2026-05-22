@@ -452,9 +452,9 @@ fn from_static_with_roots(
                 if kind.is_bigint() {
                     let h = crate::bigint::BigIntValue::from_i32(gc_heap, c as i32)
                         .map_err(oom_to_vm)?;
-                    chars.push(Value::BigInt(h));
+                    chars.push(Value::big_int(h));
                 } else {
-                    chars.push(Value::Number(crate::number::NumberValue::from_i32(
+                    chars.push(Value::number(crate::number::NumberValue::from_i32(
                         c as i32,
                     )));
                 }

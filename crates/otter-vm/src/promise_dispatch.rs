@@ -2881,7 +2881,7 @@ fn make_resolve_native_runtime_rooted(
         interp,
         "",
         1,
-        smallvec![Value::Promise(promise)],
+        smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
         move |ctx, args, _captures| resolve_native_body(ctx, args, promise, &captured_context),
@@ -2902,7 +2902,7 @@ fn make_resolve_native_stack_rooted(
         stack,
         "",
         1,
-        smallvec![Value::Promise(promise)],
+        smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
         move |ctx, args, _captures| resolve_native_body(ctx, args, promise, &captured_context),
@@ -2921,7 +2921,7 @@ fn make_resolve_native_native_rooted(
         ctx,
         "",
         1,
-        smallvec![Value::Promise(promise)],
+        smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
         move |ctx, args, _captures| resolve_native_body(ctx, args, promise, &captured_context),
@@ -3021,7 +3021,7 @@ fn make_reject_native_runtime_rooted(
         interp,
         "",
         1,
-        smallvec![Value::Promise(promise)],
+        smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
         move |ctx, args, _captures| {
@@ -3048,7 +3048,7 @@ fn make_reject_native_stack_rooted(
         stack,
         "",
         1,
-        smallvec![Value::Promise(promise)],
+        smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
         move |ctx, args, _captures| {
@@ -3073,7 +3073,7 @@ fn make_reject_native_native_rooted(
         ctx,
         "",
         1,
-        smallvec![Value::Promise(promise)],
+        smallvec![Value::promise(promise)],
         value_roots,
         slice_roots,
         move |ctx, args, _captures| {
@@ -3104,7 +3104,7 @@ mod tests {
     fn aggregate_error_runtime_builder_uses_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let registry = interp.error_classes_clone();
-        let errors = vec![Value::Number(NumberValue::from_i32(1))];
+        let errors = vec![Value::number(NumberValue::from_i32(1))];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = make_aggregate_error_runtime_rooted(&mut interp, &registry, errors)
@@ -3128,7 +3128,7 @@ mod tests {
     fn aggregate_error_native_builder_uses_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let registry = interp.error_classes_clone();
-        let errors = vec![Value::Number(NumberValue::from_i32(2))];
+        let errors = vec![Value::number(NumberValue::from_i32(2))];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = {

@@ -1375,7 +1375,7 @@ impl Interpreter {
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                     cb_args.push(acc);
                     cb_args.push(elements[i as usize]);
-                    cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
+                    cb_args.push(Value::number(NumberValue::from_i32(i as i32)));
                     cb_args.push(arr_value);
                     acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     i += step;
@@ -1717,7 +1717,7 @@ impl Interpreter {
                     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                     cb_args.push(acc);
                     cb_args.push(value);
-                    cb_args.push(Value::Number(NumberValue::from_i32(i as i32)));
+                    cb_args.push(Value::number(NumberValue::from_i32(i as i32)));
                     cb_args.push(ta_value);
                     acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
                     i += step;

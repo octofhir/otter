@@ -113,7 +113,7 @@ fn construct_and_fill(
 ) -> Result<Value, VmError> {
     let len = args.len();
     let mut ctor_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(1);
-    ctor_args.push(Value::Number(NumberValue::from_i32(len as i32)));
+    ctor_args.push(Value::number(NumberValue::from_i32(len as i32)));
     let receiver = {
         let (interp, exec) = ctx.interp_mut_and_context();
         let exec = exec.ok_or(VmError::InvalidOperand)?;

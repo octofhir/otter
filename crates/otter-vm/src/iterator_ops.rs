@@ -48,7 +48,7 @@ fn string_iterator_values(
         };
         let advance = units.len() as u32;
         let value = JsString::from_utf16_units(&units, heap)?;
-        out.push(Value::String(value));
+        out.push(Value::string(value));
         index += advance;
     }
     Ok(out)
@@ -129,7 +129,7 @@ impl Interpreter {
                         &[&value],
                         &[entry_values.as_slice(), snap.as_slice()],
                     )?;
-                    snap.push(Value::Array(pair_array));
+                    snap.push(Value::array(pair_array));
                 }
                 IteratorState::Array {
                     array: self.alloc_stack_rooted_array_from_values_with_root_slices(
@@ -940,7 +940,7 @@ impl Interpreter {
                         &[iterable, &k, &v],
                         &[out.as_slice()],
                     )?;
-                    out.push(Value::Array(entry));
+                    out.push(Value::array(entry));
                 }
                 return Ok(out);
             }

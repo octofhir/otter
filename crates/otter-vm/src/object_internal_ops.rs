@@ -1726,7 +1726,7 @@ impl Interpreter {
             }
             let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(Value::String(hint_str));
+            args.push(Value::string(hint_str));
             let result = self.run_callable_sync(context, &exotic, *input, args)?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);
@@ -1949,7 +1949,7 @@ impl Interpreter {
                     keys.reserve(value.len() as usize + 1);
                     for idx in 0..value.len() {
                         let key = idx.to_string();
-                        keys.push(Value::String(
+                        keys.push(Value::string(
                             string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
@@ -1981,24 +1981,24 @@ impl Interpreter {
                     }
                     for index in indexed {
                         let key = index.to_string();
-                        keys.push(Value::String(
+                        keys.push(Value::string(
                             string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
                     }
-                    keys.push(Value::String(
+                    keys.push(Value::string(
                         string::JsString::from_str("length", &mut self.gc_heap)
                             .map_err(VmError::from)?,
                     ));
                     for key in non_index_strings {
-                        keys.push(Value::String(
+                        keys.push(Value::string(
                             string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
                     }
                 } else {
                     for key in ordinary_strings {
-                        keys.push(Value::String(
+                        keys.push(Value::string(
                             string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
@@ -2039,23 +2039,23 @@ impl Interpreter {
                     let key = idx.to_string();
                     let s = string::JsString::from_str(&key, &mut self.gc_heap)
                         .map_err(VmError::from)?;
-                    keys.push(Value::String(s));
+                    keys.push(Value::string(s));
                 }
                 // §10.4.2 Array exotic objects always expose `length`.
-                keys.push(Value::String(
+                keys.push(Value::string(
                     string::JsString::from_str("length", &mut self.gc_heap)
                         .map_err(VmError::from)?,
                 ));
                 for key in string_keys {
                     let s = string::JsString::from_str(&key, &mut self.gc_heap)
                         .map_err(VmError::from)?;
-                    keys.push(Value::String(s));
+                    keys.push(Value::string(s));
                 }
                 // §10.4.2 — own symbol-keyed properties follow the
                 // string keys per §7.3.22 OrdinaryOwnPropertyKeys
                 // ordering.
                 for sym in array::own_symbol_keys(*arr, &self.gc_heap) {
-                    keys.push(Value::Symbol(sym));
+                    keys.push(Value::symbol(sym));
                 }
                 Ok(keys)
             }
@@ -2069,7 +2069,7 @@ impl Interpreter {
                 for n in names {
                     let s =
                         string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::String(s));
+                    keys.push(Value::string(s));
                 }
                 Ok(keys)
             }
@@ -2079,7 +2079,7 @@ impl Interpreter {
                 for n in names {
                     let s =
                         string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::String(s));
+                    keys.push(Value::string(s));
                 }
                 Ok(keys)
             }
@@ -2089,7 +2089,7 @@ impl Interpreter {
                 for n in names {
                     let s =
                         string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::String(s));
+                    keys.push(Value::string(s));
                 }
                 Ok(keys)
             }
@@ -2099,13 +2099,13 @@ impl Interpreter {
                 for n in names {
                     let s =
                         string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::String(s));
+                    keys.push(Value::string(s));
                 }
                 Ok(keys)
             }
             Value::RegExp(regexp) => {
                 let mut keys = Vec::new();
-                keys.push(Value::String(
+                keys.push(Value::string(
                     string::JsString::from_str("lastIndex", &mut self.gc_heap)
                         .map_err(VmError::from)?,
                 ));
@@ -2118,7 +2118,7 @@ impl Interpreter {
                             )
                         });
                     for key in strings {
-                        keys.push(Value::String(
+                        keys.push(Value::string(
                             string::JsString::from_str(&key, &mut self.gc_heap)
                                 .map_err(VmError::from)?,
                         ));
@@ -2515,7 +2515,7 @@ impl Interpreter {
                 }
             }
             Value::ClassConstructor(class) => {
-                Ok(Some(Value::Object(class.prototype(&self.gc_heap))))
+                Ok(Some(Value::object(class.prototype(&self.gc_heap))))
             }
             Value::NativeFunction(native) => {
                 let desc = native
@@ -2600,7 +2600,7 @@ impl Interpreter {
                 }
             }
             Value::ClassConstructor(class) => {
-                Ok(Some(Value::Object(class.prototype(&self.gc_heap))))
+                Ok(Some(Value::object(class.prototype(&self.gc_heap))))
             }
             Value::NativeFunction(native) => {
                 let desc = native
@@ -3475,16 +3475,16 @@ impl Interpreter {
             M::IsFrozen => {
                 let frozen =
                     self.test_integrity_level_value(context, target, ObjectIntegrityLevel::Frozen)?;
-                Ok(Some(Value::Boolean(frozen)))
+                Ok(Some(Value::boolean(frozen)))
             }
             M::IsSealed => {
                 let sealed =
                     self.test_integrity_level_value(context, target, ObjectIntegrityLevel::Sealed)?;
-                Ok(Some(Value::Boolean(sealed)))
+                Ok(Some(Value::boolean(sealed)))
             }
             M::IsExtensible => {
                 let ext = self.is_extensible_value(context, target)?;
-                Ok(Some(Value::Boolean(ext)))
+                Ok(Some(Value::boolean(ext)))
             }
             M::PreventExtensions => {
                 let ok = self.prevent_extensions_value(context, target)?;
@@ -3535,7 +3535,7 @@ impl Interpreter {
                         &[args],
                     )?,
                 };
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             M::GetOwnPropertySymbols => {
                 let target_clone = *target;
@@ -3557,7 +3557,7 @@ impl Interpreter {
                         &[args],
                     )?,
                 };
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             _ => Ok(None),
         }
@@ -3633,7 +3633,7 @@ impl Interpreter {
         {
             let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-            args.push(Value::String(hint_str));
+            args.push(Value::string(hint_str));
             let result = self.run_callable_sync(context, &callee, value, args)?;
             if abstract_ops::is_primitive(&result) {
                 return Ok(result);

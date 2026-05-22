@@ -904,7 +904,7 @@ impl Interpreter {
                     &[],
                     &[args],
                 )?;
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             M::Keys => {
                 let owned: Vec<String> = match args.first() {
@@ -940,7 +940,7 @@ impl Interpreter {
                     &[],
                     &[args],
                 )?;
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             M::Values => {
                 let values: Vec<Value> = match args.first() {
@@ -978,7 +978,7 @@ impl Interpreter {
                     &[],
                     &[args],
                 )?;
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             M::Entries => {
                 let raw: Vec<(String, Value)> = match args.first() {
@@ -1021,7 +1021,7 @@ impl Interpreter {
                         &[],
                         &[args, pairs.as_slice()],
                     )?;
-                    pairs.push(Value::Array(pair));
+                    pairs.push(Value::array(pair));
                 }
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
@@ -1029,7 +1029,7 @@ impl Interpreter {
                     &[],
                     &[args],
                 )?;
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             M::FromEntries => {
                 // §20.1.2.7 Object.fromEntries(iterable). Spec iterator
@@ -1107,7 +1107,7 @@ impl Interpreter {
                     }
                 }
 
-                Ok(Some(Value::Object(result)))
+                Ok(Some(Value::object(result)))
             }
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
@@ -1199,7 +1199,7 @@ impl Interpreter {
                     Some(desc) => {
                         let obj =
                             self.descriptor_to_object_stack_rooted(stack, &desc, &[], args)?;
-                        Ok(Some(Value::Object(obj)))
+                        Ok(Some(Value::object(obj)))
                     }
                     None => Ok(Some(Value::Undefined)),
                 }
@@ -1331,7 +1331,7 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::TypeMismatch),
                 }
-                Ok(Some(Value::Object(result)))
+                Ok(Some(Value::object(result)))
             }
             M::GetOwnPropertyNames => {
                 let owned: Vec<String> = match args.first() {
@@ -1370,7 +1370,7 @@ impl Interpreter {
                     &[],
                     &[args],
                 )?;
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             M::GetOwnPropertySymbols => {
                 let syms: Vec<Value> = match args.first() {
@@ -1401,7 +1401,7 @@ impl Interpreter {
                     &[&target_root],
                     &[args],
                 )?;
-                Ok(Some(Value::Array(array)))
+                Ok(Some(Value::array(array)))
             }
             // §20.1.2.7 `Object.groupBy(items, callbackfn)` — groups
             // an iterable into a null-prototype object keyed by the
@@ -1439,7 +1439,7 @@ impl Interpreter {
         for (idx, item) in items_snapshot.iter().enumerate() {
             let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
             cb_args.push(*item);
-            cb_args.push(Value::Number(crate::number::NumberValue::from_f64(
+            cb_args.push(Value::number(crate::number::NumberValue::from_f64(
                 idx as f64,
             )));
             let key = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
@@ -1697,7 +1697,7 @@ impl Interpreter {
                                 &[&value_root],
                                 &[args, entries.as_slice()],
                             )?;
-                            entries.push(Value::Array(pair));
+                            entries.push(Value::array(pair));
                         }
                         let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                             stack,

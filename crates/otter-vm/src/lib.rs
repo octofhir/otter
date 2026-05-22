@@ -4314,7 +4314,7 @@ fn object_prototype_intercept(
                 object::lookup_own(*obj, gc_heap, &key),
                 object::PropertyLookup::Absent
             );
-            Ok(Some(Value::Boolean(present)))
+            Ok(Some(Value::boolean(present)))
         }
         // §20.1.3.4 Object.prototype.propertyIsEnumerable(V)
         // <https://tc39.es/ecma262/#sec-object.prototype.propertyisenumerable>
@@ -4325,7 +4325,7 @@ fn object_prototype_intercept(
                 object::PropertyLookup::Accessor { flags, .. } => flags.enumerable(),
                 object::PropertyLookup::Absent => false,
             };
-            Ok(Some(Value::Boolean(result)))
+            Ok(Some(Value::boolean(result)))
         }
         // §20.1.3.3 Object.prototype.isPrototypeOf(V)
         // <https://tc39.es/ecma262/#sec-object.prototype.isprototypeof>
@@ -4333,7 +4333,7 @@ fn object_prototype_intercept(
             let result = args.first().is_some_and(|value| {
                 value_has_prototype_in_chain(value, *obj, gc_heap, function_prototype)
             });
-            Ok(Some(Value::Boolean(result)))
+            Ok(Some(Value::boolean(result)))
         }
         // §20.1.3.6 / §20.5.3.4 — `toString()`. Error instances
         // override Object.prototype.toString to return
@@ -4359,11 +4359,11 @@ fn object_prototype_intercept(
                 "[object Object]".to_string()
             };
             let s = JsString::from_str(&display, gc_heap).map_err(|_| VmError::TypeMismatch)?;
-            Ok(Some(Value::String(s)))
+            Ok(Some(Value::string(s)))
         }
         // §20.1.3.7 Object.prototype.valueOf() — returns the receiver.
         // <https://tc39.es/ecma262/#sec-object.prototype.valueof>
-        "valueOf" => Ok(Some(Value::Object(*obj))),
+        "valueOf" => Ok(Some(Value::object(*obj))),
         _ => Ok(None),
     }
 }
@@ -4416,9 +4416,9 @@ fn native_function_object_prototype_intercept(
         }
         "propertyIsEnumerable" => {
             let _key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::Boolean(false)))
+            Ok(Some(Value::boolean(false)))
         }
-        "isPrototypeOf" => Ok(Some(Value::Boolean(false))),
+        "isPrototypeOf" => Ok(Some(Value::boolean(false))),
         _ => Ok(None),
     }
 }
@@ -4442,7 +4442,7 @@ fn bound_function_object_prototype_intercept(
                 function_metadata::bound_own_property_is_enumerable(bound, gc_heap, &key),
             )))
         }
-        "isPrototypeOf" => Ok(Some(Value::Boolean(false))),
+        "isPrototypeOf" => Ok(Some(Value::boolean(false))),
         _ => Ok(None),
     }
 }
@@ -4537,7 +4537,7 @@ fn require_callable(arg: Option<&Value>) -> Result<Value, VmError> {
 fn build_array_cb_args(value: &Value, index: usize, arr: &Value) -> SmallVec<[Value; 8]> {
     let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
     cb_args.push(*value);
-    cb_args.push(Value::Number(NumberValue::from_i32(index as i32)));
+    cb_args.push(Value::number(NumberValue::from_i32(index as i32)));
     cb_args.push(*arr);
     cb_args
 }
@@ -4646,7 +4646,7 @@ fn make_array_iterator_factory(
     native_value_with_captures(
         heap,
         "Array[Symbol.iterator]",
-        smallvec::smallvec![Value::Array(array)],
+        smallvec::smallvec![Value::array(array)],
         array_iterator_factory_call,
     )
 }
@@ -4657,7 +4657,7 @@ pub(crate) fn make_array_iterator_factory_runtime_rooted(
 ) -> Result<Value, otter_gc::OutOfMemory> {
     interp.native_value_with_captures_runtime_rooted(
         "Array[Symbol.iterator]",
-        smallvec::smallvec![Value::Array(array)],
+        smallvec::smallvec![Value::array(array)],
         &[],
         &[],
         array_iterator_factory_call,
@@ -5919,7 +5919,7 @@ mod tests {
         let mapper = native_value_with_captures(
             interp.gc_heap_mut(),
             "returnCapturedArray",
-            smallvec::smallvec![Value::Array(mapped)],
+            smallvec::smallvec![Value::array(mapped)],
             |_ctx, _args, captures| Ok(captures.first().cloned().unwrap_or(Value::undefined())),
         )
         .unwrap();
@@ -7748,7 +7748,7 @@ mod tests {
         )
         .unwrap();
         let entries =
-            array::from_elements_old_for_fixture(interp.gc_heap_mut(), vec![Value::Array(pair)])
+            array::from_elements_old_for_fixture(interp.gc_heap_mut(), vec![Value::array(pair)])
                 .unwrap();
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
@@ -8257,7 +8257,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::Number(NumberValue::Smi(13))];
+        let args: SmallVec<[Value; 8]> = smallvec::smallvec![Value::number(NumberValue::Smi(13))];
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
         let result = interp
@@ -8269,7 +8269,7 @@ mod tests {
             panic!("proxy construct trap should return the synthesized argv array");
         };
         let elements = array::with_elements(argv, interp.gc_heap(), |elements| elements.to_vec());
-        assert_eq!(elements, vec![Value::Number(NumberValue::Smi(13))]);
+        assert_eq!(elements, vec![Value::number(NumberValue::Smi(13))]);
         assert!(
             after > before,
             "run_construct_sync proxy argv array should allocate in young space"

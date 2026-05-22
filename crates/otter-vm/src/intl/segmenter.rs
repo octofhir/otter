@@ -135,7 +135,7 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         if granularity_word {
             crate::object::set(obj, heap, "isWordLike", Value::Boolean(*wordlike));
         }
-        elements.push(Value::Object(obj));
+        elements.push(Value::object(obj));
     }
     Ok(Value::Array(args.array_from_elements_rooted(
         elements,

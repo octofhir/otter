@@ -18,7 +18,7 @@
 //! `Interpreter::ordinary_*_value` helpers so the same `[[Get]]`,
 //! `[[Set]]`, `[[HasProperty]]`, `[[GetOwnProperty]]`, `[[Delete]]`,
 //! and `[[GetPrototypeOf]]` paths cover ordinary objects, arrays,
-//! callables, and `Value::Proxy` (which walks handler traps).
+//! callables, and proxies (which walk handler traps).
 //!
 //! # Contents
 //! - [`call`] — typed dispatcher keyed by [`ReflectMethod`].
@@ -27,7 +27,7 @@
 //! # Invariants
 //! - Type-of-Object checks accept any heap-bound value
 //!   ([`is_type_object`]) so Reflect mirrors the spec's `Object`
-//!   type, not just `Value::Object`.
+//!   type, not just plain objects.
 //! - Property-key coercion (§7.1.19 ToPropertyKey) is shallow at
 //!   this slice: primitive keys are stringified, symbols pass
 //!   through, and non-primitive keys raise `TypeMismatch`. A future
@@ -159,7 +159,7 @@ pub fn call(
                             interp.set_property(
                                 obj,
                                 "writable",
-                                Value::Boolean(flags.writable()),
+                                Value::boolean(flags.writable()),
                             )?;
                         }
                         crate::object::DescriptorKind::Accessor { .. } => {
@@ -189,11 +189,11 @@ pub fn call(
                             )?;
                         }
                     }
-                    interp.set_property(obj, "enumerable", Value::Boolean(flags.enumerable()))?;
+                    interp.set_property(obj, "enumerable", Value::boolean(flags.enumerable()))?;
                     interp.set_property(
                         obj,
                         "configurable",
-                        Value::Boolean(flags.configurable()),
+                        Value::boolean(flags.configurable()),
                     )?;
                     Ok(Value::object(obj))
                 }
@@ -247,15 +247,15 @@ pub fn call(
             // object targets. Proxy / non-ordinary targets route
             // through `ordinary_set_data_value` (which dispatches the
             // `set` trap + falls through).
-            if let Value::Object(obj) = &target {
+            if let Some(obj) = target.as_object() {
                 let outcome = {
                     let heap = interp.gc_heap();
                     match &key {
                         VmPropertyKey::Symbol(sym) => {
-                            crate::object::resolve_symbol_set(*obj, heap, sym)
+                            crate::object::resolve_symbol_set(obj, heap, sym)
                         }
                         _ => crate::object::resolve_set(
-                            *obj,
+                            obj,
                             heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
@@ -292,10 +292,8 @@ pub fn call(
         M::SetPrototypeOf => {
             let target = expect_object_value(args.first())?;
             let proto = match args.get(1) {
-                Some(Value::Object(_)) | Some(Value::Proxy(_)) | Some(Value::Null) => {
-                    args.get(1).cloned().unwrap_or(Value::null())
-                }
                 None => Value::null(),
+                Some(v) if v.is_object() || v.is_proxy() || v.is_null() => *v,
                 _ => return Err(VmError::TypeMismatch),
             };
             let ok = interp.set_prototype_value_proxy_aware(context, &target, &proto)?;
@@ -322,11 +320,10 @@ fn set_data_on_receiver(
     value: Value,
     receiver: &Value,
 ) -> Result<bool, VmError> {
-    let Value::Object(recv_obj) = receiver else {
+    let Some(recv_obj) = receiver.as_object() else {
         // §10.1.9 step 5.b — non-object receiver rejects.
         return Ok(false);
     };
-    let recv_obj = *recv_obj;
     let existing = {
         let heap = interp.gc_heap();
         match key {
@@ -371,17 +368,14 @@ fn set_data_on_receiver(
 /// allocated on the heap. Mirrors §6.1.7. Primitives (Undefined, Null,
 /// Boolean, Number, BigInt, String, Symbol, Hole) return `false`.
 fn is_type_object(value: &Value) -> bool {
-    !matches!(
-        value,
-        Value::Undefined
-            | Value::Null
-            | Value::Boolean(_)
-            | Value::Number(_)
-            | Value::BigInt(_)
-            | Value::String(_)
-            | Value::Symbol(_)
-            | Value::Hole
-    )
+    !(value.is_undefined()
+        || value.is_null()
+        || value.is_boolean()
+        || value.is_number()
+        || value.is_big_int()
+        || value.is_string()
+        || value.is_symbol()
+        || value.is_hole())
 }
 
 /// Accept any value of spec type Object (§6.1.7). Used by every
@@ -403,60 +397,63 @@ fn coerce_property_key(
     context: &ExecutionContext,
     arg: Option<&Value>,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    match arg {
-        Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(
+    let Some(v) = arg else {
+        return Ok(VmPropertyKey::String("undefined"));
+    };
+    if let Some(s) = v.as_string() {
+        return Ok(VmPropertyKey::OwnedString(
             s.to_lossy_string(interp.gc_heap()),
-        )),
-        Some(Value::Number(n)) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
-        Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
-        Some(Value::Null) => Ok(VmPropertyKey::String("null")),
-        Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined")),
-        Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(*sym)),
-        Some(v) => interp.evaluate_to_property_key(context, v),
+        ));
     }
+    if let Some(n) = v.as_number() {
+        return Ok(VmPropertyKey::OwnedString(n.to_display_string()));
+    }
+    if let Some(b) = v.as_boolean() {
+        return Ok(VmPropertyKey::String(if b { "true" } else { "false" }));
+    }
+    if v.is_null() {
+        return Ok(VmPropertyKey::String("null"));
+    }
+    if v.is_undefined() {
+        return Ok(VmPropertyKey::String("undefined"));
+    }
+    if let Some(sym) = v.as_symbol() {
+        return Ok(VmPropertyKey::Symbol(*sym));
+    }
+    // Fall through to general coercion path.
+    interp.evaluate_to_property_key(context, v)
 }
 
 /// §7.3.18 CreateListFromArrayLike for the array-like arguments that
 /// `Reflect.apply` / `Reflect.construct` pass through. Accepts:
-/// `undefined`, `null` (empty), `Value::Array`, and ordinary array-likes
+/// `undefined`, `null` (empty), arrays, and ordinary array-likes
 /// with `length` + indexed properties via the shared interpreter helper.
 fn create_list_from_array_like(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     arg: Option<&Value>,
 ) -> Result<SmallVec<[Value; 8]>, VmError> {
-    match arg {
-        // §7.3.18 step 4–5 — when the source is a real Array the
-        // dense fast path bypasses ordinary Get walks, but it must
-        // still substitute holes (the internal `Value::Hole`
-        // sentinel) with the spec-mandated `undefined` from
-        // ArrayPrototype's `[[Get]]` fall-through. Without this,
-        // `Reflect.apply(fn, null, ['a', , null])` leaks `Hole`
-        // through `arguments` and trips later equality / typeof
-        // ladders.
-        Some(Value::Array(arr)) => Ok(crate::array::with_elements(
-            *arr,
+    if let Some(arr) = arg.and_then(|v| v.as_array()) {
+        // §7.3.18 step 4–5 — substitute holes with `undefined`.
+        return Ok(crate::array::with_elements(
+            arr,
             interp.gc_heap(),
             |elements| {
                 elements
                     .iter()
-                    .map(|v| match v {
-                        Value::Hole => Value::undefined(),
-                        other => *other,
-                    })
+                    .map(|v| if v.is_hole() { Value::undefined() } else { *v })
                     .collect()
             },
-        )),
-        Some(v) if is_type_object(v) => {
-            // §7.3.18 CreateListFromArrayLike: probe `length` then
-            // walk indexed properties.
-            interp.create_list_from_array_like(context, *v)
-        }
-        // §7.3.18 step 1 — non-Object argumentsList throws TypeError.
-        _ => Err(VmError::TypeError {
-            message: "argumentsList must be an object".to_string(),
-        }),
+        ));
     }
+    if let Some(v) = arg
+        && is_type_object(v)
+    {
+        return interp.create_list_from_array_like(context, *v);
+    }
+    Err(VmError::TypeError {
+        message: "argumentsList must be an object".to_string(),
+    })
 }
 
 /// Static namespace spec installed by bootstrap.
@@ -486,16 +483,17 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
         heap: &mut otter_gc::GcHeap,
         global: crate::object::JsObject,
     ) -> Result<(), crate::js_surface::JsSurfaceError> {
-        let global_root = crate::Value::Object(global);
+        let global_root = crate::Value::object(global);
         let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
             heap,
             &REFLECT_SPEC,
             vec![global_root],
         )?
         .build()?;
-        if let Some(crate::Value::Object(object_ctor)) = crate::object::get(global, heap, "Object")
-            && let Some(crate::Value::Object(object_proto)) =
-                crate::object::get(object_ctor, heap, "prototype")
+        if let Some(object_ctor) =
+            crate::object::get(global, heap, "Object").and_then(|v| v.as_object())
+            && let Some(object_proto) =
+                crate::object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
         {
             crate::object::set_prototype(namespace, heap, Some(object_proto));
         }
@@ -503,7 +501,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
             global,
             heap,
             <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-            crate::Value::Object(namespace),
+            crate::Value::object(namespace),
         );
         Ok(())
     }
@@ -684,22 +682,18 @@ fn vm_to_native(err: VmError) -> NativeError {
 }
 
 fn is_callable(value: &Value, heap: &otter_gc::GcHeap) -> bool {
-    match value {
-        Value::Object(obj) => matches!(
-            crate::object::call_native(*obj, heap),
-            Some(Value::NativeFunction(_))
-        ),
-        _ => crate::abstract_ops::is_callable(value),
+    if let Some(obj) = value.as_object() {
+        crate::object::call_native(obj, heap).is_some_and(|v| v.is_native_function())
+    } else {
+        crate::abstract_ops::is_callable(value)
     }
 }
 
 fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc::GcHeap) -> bool {
-    match value {
-        Value::Object(obj) => matches!(
-            crate::object::constructor_native(*obj, heap),
-            Some(Value::NativeFunction(_))
-        ),
-        _ => crate::abstract_ops::is_constructor(value, context, heap),
+    if let Some(obj) = value.as_object() {
+        crate::object::constructor_native(obj, heap).is_some_and(|v| v.is_native_function())
+    } else {
+        crate::abstract_ops::is_constructor(value, context, heap)
     }
 }
 
@@ -752,11 +746,11 @@ mod tests {
             target,
             interp.gc_heap_mut(),
             "answer",
-            Value::Number(crate::NumberValue::from_i32(42)),
+            Value::number(crate::NumberValue::from_i32(42)),
         );
         let context = empty_context();
         let key =
-            Value::String(crate::JsString::from_str("answer", interp.gc_heap_mut()).expect("key"));
+            Value::string(crate::JsString::from_str("answer", interp.gc_heap_mut()).expect("key"));
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = call(
@@ -772,7 +766,7 @@ mod tests {
             after > before,
             "Reflect.getOwnPropertyDescriptor should allocate descriptor objects in young space"
         );
-        assert!(matches!(result, Value::Object(_)));
+        assert!(result.is_object());
     }
 
     #[test]
@@ -780,7 +774,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let target =
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("target");
-        crate::object::set(target, interp.gc_heap_mut(), "a", Value::Boolean(true));
+        crate::object::set(target, interp.gc_heap_mut(), "a", Value::boolean(true));
         let context = empty_context();
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
@@ -797,6 +791,6 @@ mod tests {
             after > before,
             "Reflect.ownKeys should allocate the key array in young space"
         );
-        assert!(matches!(result, Value::Array(_)));
+        assert!(result.is_array());
     }
 }

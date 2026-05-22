@@ -15,7 +15,7 @@ fn assert_array_self_reference_reaped() {
     let baseline = interp.gc_heap_mut().gc_stats().by_type[ARRAY_BODY_TYPE_TAG as usize].live_bytes;
 
     let arr = crate::test_support::alloc_old_array(interp.gc_heap_mut()).expect("alloc array");
-    crate::array::push(arr, interp.gc_heap_mut(), Value::Array(arr)).expect("push self");
+    crate::array::push(arr, interp.gc_heap_mut(), Value::array(arr)).expect("push self");
 
     let with_array =
         interp.gc_heap_mut().gc_stats().by_type[ARRAY_BODY_TYPE_TAG as usize].live_bytes;
@@ -35,7 +35,7 @@ fn assert_array_self_reference_reaped() {
 
 fn assert_array_dense_storage_cap_kicks_in() {
     let mut heap = otter_gc::GcHeap::with_max_heap_bytes(4 * 1024 * 1024).expect("gc heap");
-    let values = std::iter::repeat_n(Value::Undefined, 1 << 20);
+    let values = std::iter::repeat_n(Value::undefined(), 1 << 20);
     let err = crate::test_support::array_from_elements_old(&mut heap, values)
         .expect_err("array must exceed cap");
     assert!(
@@ -51,13 +51,8 @@ fn assert_array_sparse_power_indices_do_not_dense_allocate() {
     let mut k = 1_usize;
     for _ in 0..32 {
         k *= 2;
-        crate::array::set(
-            arr,
-            &mut heap,
-            k - 2,
-            Value::Number(crate::NumberValue::from_f64(k as f64)),
-        )
-        .expect("sparse power-of-two write must not exhaust dense storage");
+        crate::array::set(arr, &mut heap, k - 2, Value::number_f64(k as f64))
+            .expect("sparse power-of-two write must not exhaust dense storage");
     }
 
     k = 1;
@@ -65,7 +60,7 @@ fn assert_array_sparse_power_indices_do_not_dense_allocate() {
         k *= 2;
         assert_eq!(
             crate::array::get(arr, &heap, k - 2),
-            Value::Number(crate::NumberValue::from_f64(k as f64))
+            Value::number_f64(k as f64)
         );
     }
 }

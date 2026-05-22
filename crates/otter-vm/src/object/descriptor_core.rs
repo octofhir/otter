@@ -217,18 +217,10 @@ pub(super) fn validate_and_apply_partial(
             SlotBody::Data { .. } => (None, None),
         };
         if let Some(g) = &incoming.get {
-            getter = if matches!(g, Value::Undefined) {
-                None
-            } else {
-                Some(*g)
-            };
+            getter = if g.is_undefined() { None } else { Some(*g) };
         }
         if let Some(s) = &incoming.set {
-            setter = if matches!(s, Value::Undefined) {
-                None
-            } else {
-                Some(*s)
-            };
+            setter = if s.is_undefined() { None } else { Some(*s) };
         }
         DescriptorKind::Accessor { getter, setter }
     } else {
@@ -335,7 +327,7 @@ fn optional_value_eq(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc::GcHe
     // `Value::Undefined`. Anything else falls back to SameValue.
     match (a, b) {
         (None, None) => true,
-        (None, Some(v)) | (Some(v), None) => matches!(v, Value::Undefined),
+        (None, Some(v)) | (Some(v), None) => v.is_undefined(),
         (Some(x), Some(y)) => same_value(x, y, heap),
     }
 }

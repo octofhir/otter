@@ -246,10 +246,10 @@ mod tests {
     #[test]
     fn allocates_closure_with_upvalues_and_bound_this() {
         let mut heap = GcHeap::new().expect("heap");
-        let cell_a = alloc_upvalue(&mut heap, Value::Undefined).expect("cell");
-        let cell_b = alloc_upvalue(&mut heap, Value::Undefined).expect("cell");
+        let cell_a = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
+        let cell_b = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
         let upvalues = vec![cell_a, cell_b];
-        let closure = alloc_closure(&mut heap, 42, upvalues, Some(Value::Null)).expect("alloc");
+        let closure = alloc_closure(&mut heap, 42, upvalues, Some(Value::null())).expect("alloc");
         assert_eq!(closure.function_id(), 42);
         assert_eq!(closure.upvalue_count(&heap), 2);
         heap.read_payload(closure.handle(), |body| {

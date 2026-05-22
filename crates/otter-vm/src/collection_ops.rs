@@ -71,10 +71,7 @@ impl Interpreter {
                     &mut external_visit,
                 )?;
                 for entry in &seed_entries {
-                    let pair = match entry {
-                        Value::Array(a) => *a,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
+                    let pair = entry.as_array().ok_or(VmError::TypeMismatch)?;
                     if crate::array::len(pair, &self.gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
@@ -129,10 +126,7 @@ impl Interpreter {
                     &mut external_visit,
                 )?;
                 for entry in &seed_entries {
-                    let pair = match entry {
-                        Value::Array(a) => *a,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
+                    let pair = entry.as_array().ok_or(VmError::TypeMismatch)?;
                     if crate::array::len(pair, &self.gc_heap) < 2 {
                         return Err(VmError::TypeMismatch);
                     }
@@ -182,16 +176,14 @@ impl Interpreter {
 }
 
 fn seed_is_present(v: &Value) -> bool {
-    !matches!(v, Value::Undefined | Value::Null)
+    !v.is_undefined() && !v.is_null()
 }
 
 fn seed_array(seed: &Value, gc_heap: &otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
-    match seed {
-        Value::Array(a) => Ok(crate::array::with_elements(*a, gc_heap, |elements| {
-            elements.to_vec()
-        })),
-        _ => Err(VmError::TypeMismatch),
-    }
+    let arr = seed.as_array().ok_or(VmError::TypeMismatch)?;
+    Ok(crate::array::with_elements(arr, gc_heap, |elements| {
+        elements.to_vec()
+    }))
 }
 
 fn weak_collection_to_vm_error(err: crate::collections::CollectionError) -> VmError {

@@ -18,8 +18,8 @@ fn assert_map_self_value_reaped() {
     crate::collections::map_set(
         map,
         interp.gc_heap_mut(),
-        Value::Number(crate::NumberValue::Smi(1)),
-        Value::Map(map),
+        Value::number_i32(1),
+        Value::map(map),
     )
     .expect("map self value");
 
@@ -45,7 +45,7 @@ fn assert_set_self_value_reaped() {
     let baseline = interp.gc_heap_mut().gc_stats().by_type[SET_BODY_TYPE_TAG as usize].live_bytes;
 
     let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("alloc set");
-    crate::collections::set_add(set, interp.gc_heap_mut(), Value::Set(set))
+    crate::collections::set_add(set, interp.gc_heap_mut(), Value::set(set))
         .expect("set self value");
 
     let with_set = interp.gc_heap_mut().gc_stats().by_type[SET_BODY_TYPE_TAG as usize].live_bytes;

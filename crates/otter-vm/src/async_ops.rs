@@ -93,11 +93,13 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        let promise = match awaited {
-            Value::Promise(p) => p,
-            other => promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .fulfilled_stack_rooted(self, stack, other, &[], &[])?,
-        };
+        let promise =
+            if let Some(p) = awaited.as_promise() {
+                p
+            } else {
+                promise_dispatch::PromiseBuilder::with_context(context.clone())
+                    .fulfilled_stack_rooted(self, stack, awaited, &[], &[])?
+            };
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
@@ -135,11 +137,13 @@ impl Interpreter {
             .pc
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
-        let promise = match awaited {
-            Value::Promise(p) => p,
-            other => promise_dispatch::PromiseBuilder::with_context(context.clone())
-                .fulfilled_stack_rooted(self, stack, other, &[], &[])?,
-        };
+        let promise =
+            if let Some(p) = awaited.as_promise() {
+                p
+            } else {
+                promise_dispatch::PromiseBuilder::with_context(context.clone())
+                    .fulfilled_stack_rooted(self, stack, awaited, &[], &[])?
+            };
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
@@ -198,7 +202,7 @@ impl Interpreter {
                     if let Err(error) = self.run_callable_sync(
                         &request_context,
                         &req.reject,
-                        Value::Undefined,
+                        Value::undefined(),
                         smallvec::smallvec![value],
                     ) {
                         return Err(RunError {
@@ -231,7 +235,7 @@ impl Interpreter {
                     if let Err(error) = self.run_callable_sync(
                         &request_context,
                         &req.resolve,
-                        Value::Undefined,
+                        Value::undefined(),
                         smallvec::smallvec![record],
                     ) {
                         return Err(RunError {

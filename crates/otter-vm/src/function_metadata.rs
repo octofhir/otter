@@ -89,7 +89,7 @@ pub(crate) fn ordinary_function_intrinsic_property(
     function_id: u32,
     key: &str,
 ) -> Result<Value, VmError> {
-    callable_intrinsic_property(ctx, &Value::Function { function_id }, key)
+    callable_intrinsic_property(ctx, &Value::function(function_id), key)
 }
 
 /// Return the own descriptor for a bound function metadata property.
@@ -317,14 +317,14 @@ pub(crate) fn bound_create_metadata_from_values(
     bound_arg_count: usize,
     heap: &otter_gc::GcHeap,
 ) -> BoundFunctionCreateMetadata {
-    let target_name = match target_name {
-        Value::String(s) => s.to_lossy_string(heap),
-        _ => String::new(),
-    };
-    let target_len = match target_length {
-        Value::Number(n) => to_integer_or_infinity(n.as_f64()),
-        _ => 0.0,
-    };
+    let target_name = target_name
+        .as_string()
+        .map(|s| s.to_lossy_string(heap))
+        .unwrap_or_default();
+    let target_len = target_length
+        .as_number()
+        .map(|n| to_integer_or_infinity(n.as_f64()))
+        .unwrap_or(0.0);
     let length = (target_len - bound_arg_count as f64).max(0.0);
     BoundFunctionCreateMetadata {
         name: format!("bound {target_name}"),
@@ -340,116 +340,112 @@ fn callable_metadata_value(
     match key {
         "name" => callable_name(ctx, callee).and_then(|name| {
             JsString::from_str(&name, ctx.gc_heap)
-                .map(Value::String)
+                .map(Value::string)
                 .map(Some)
                 .map_err(VmError::from)
         }),
         "length" => callable_length(ctx, callee)
-            .map(|value| Some(Value::Number(number_from_length_value(value)))),
+            .map(|value| Some(Value::number(number_from_length_value(value)))),
         _ => Ok(None),
     }
 }
 
 fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Result<String, VmError> {
-    match callee {
-        Value::Function { function_id }
-        | Value::Closure(crate::closure::JsClosure {
-            cached_function_id: function_id,
-            ..
-        }) => {
-            if let Some(value) = ordinary_function_user_property(ctx, *function_id, "name") {
-                return Ok(match value {
-                    Value::String(s) => s.to_lossy_string(ctx.heap()),
-                    _ => String::new(),
-                });
-            }
-            if ordinary_function_metadata_deleted(ctx, *function_id, "name") {
-                return Ok(String::new());
-            }
-            let function = ctx
-                .context
-                .function(*function_id)
-                .ok_or(VmError::InvalidOperand)?;
-            Ok(function.name.clone())
+    if let Some(fid) = callee
+        .as_function()
+        .or_else(|| callee.as_closure().map(|c| c.cached_function_id))
+    {
+        if let Some(value) = ordinary_function_user_property(ctx, fid, "name") {
+            return Ok(value
+                .as_string()
+                .map(|s| s.to_lossy_string(ctx.heap()))
+                .unwrap_or_default());
         }
-        Value::NativeFunction(native) => {
-            match native.own_property_descriptor(ctx.gc_heap, "name")? {
-                Some(desc) => Ok(match descriptor_value(&desc) {
-                    Value::String(s) => s.to_lossy_string(ctx.heap()),
-                    _ => String::new(),
-                }),
-                None => Ok(String::new()),
-            }
+        if ordinary_function_metadata_deleted(ctx, fid, "name") {
+            return Ok(String::new());
         }
-        Value::BoundFunction(bound) => {
-            match bound_own_property_descriptor(bound, ctx.gc_heap, "name")? {
-                Some(desc) => Ok(match descriptor_value(&desc) {
-                    Value::String(s) => s.to_lossy_string(ctx.heap()),
-                    _ => String::new(),
-                }),
-                None => Ok(String::new()),
-            }
-        }
-        Value::ClassConstructor(class) => callable_name(ctx, &class.ctor(ctx.gc_heap)),
-        Value::Object(obj) => match object::constructor_native(*obj, ctx.gc_heap) {
-            Some(Value::NativeFunction(native)) => {
-                callable_name(ctx, &Value::native_function(native))
-            }
-            _ => Ok(String::new()),
-        },
-        _ => Ok(String::new()),
+        let function = ctx.context.function(fid).ok_or(VmError::InvalidOperand)?;
+        return Ok(function.name.clone());
     }
+    if let Some(native) = callee.as_native_function() {
+        return match native.own_property_descriptor(ctx.gc_heap, "name")? {
+            Some(desc) => Ok(descriptor_value(&desc)
+                .as_string()
+                .map(|s| s.to_lossy_string(ctx.heap()))
+                .unwrap_or_default()),
+            None => Ok(String::new()),
+        };
+    }
+    if let Some(bound) = callee.as_bound_function() {
+        return match bound_own_property_descriptor(&bound, ctx.gc_heap, "name")? {
+            Some(desc) => Ok(descriptor_value(&desc)
+                .as_string()
+                .map(|s| s.to_lossy_string(ctx.heap()))
+                .unwrap_or_default()),
+            None => Ok(String::new()),
+        };
+    }
+    if let Some(class) = callee.as_class_constructor() {
+        return callable_name(ctx, &class.ctor(ctx.gc_heap));
+    }
+    if let Some(obj) = callee.as_object() {
+        if let Some(native) =
+            object::constructor_native(obj, ctx.gc_heap).and_then(|v| v.as_native_function())
+        {
+            return callable_name(ctx, &Value::native_function(native));
+        }
+        return Ok(String::new());
+    }
+    Ok(String::new())
 }
 
 fn callable_length(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Result<f64, VmError> {
-    match callee {
-        Value::Function { function_id }
-        | Value::Closure(crate::closure::JsClosure {
-            cached_function_id: function_id,
-            ..
-        }) => {
-            if let Some(value) = ordinary_function_user_property(ctx, *function_id, "length") {
-                return Ok(match value {
-                    Value::Number(n) => to_integer_or_infinity(n.as_f64()),
-                    _ => 0.0,
-                });
-            }
-            if ordinary_function_metadata_deleted(ctx, *function_id, "length") {
-                return Ok(0.0);
-            }
-            let function = ctx
-                .context
-                .function(*function_id)
-                .ok_or(VmError::InvalidOperand)?;
-            Ok(f64::from(function.param_count))
+    if let Some(fid) = callee
+        .as_function()
+        .or_else(|| callee.as_closure().map(|c| c.cached_function_id))
+    {
+        if let Some(value) = ordinary_function_user_property(ctx, fid, "length") {
+            return Ok(value
+                .as_number()
+                .map(|n| to_integer_or_infinity(n.as_f64()))
+                .unwrap_or(0.0));
         }
-        Value::NativeFunction(native) => {
-            match native.own_property_descriptor(ctx.gc_heap, "length")? {
-                Some(desc) => Ok(match descriptor_value(&desc) {
-                    Value::Number(n) => to_integer_or_infinity(n.as_f64()),
-                    _ => 0.0,
-                }),
-                None => Ok(0.0),
-            }
+        if ordinary_function_metadata_deleted(ctx, fid, "length") {
+            return Ok(0.0);
         }
-        Value::BoundFunction(bound) => {
-            match bound_own_property_descriptor(bound, ctx.gc_heap, "length")? {
-                Some(desc) => Ok(match descriptor_value(&desc) {
-                    Value::Number(n) => to_integer_or_infinity(n.as_f64()),
-                    _ => 0.0,
-                }),
-                None => Ok(0.0),
-            }
-        }
-        Value::ClassConstructor(class) => callable_length(ctx, &class.ctor(ctx.gc_heap)),
-        Value::Object(obj) => match object::constructor_native(*obj, ctx.gc_heap) {
-            Some(Value::NativeFunction(native)) => {
-                callable_length(ctx, &Value::native_function(native))
-            }
-            _ => Ok(0.0),
-        },
-        _ => Ok(0.0),
+        let function = ctx.context.function(fid).ok_or(VmError::InvalidOperand)?;
+        return Ok(f64::from(function.param_count));
     }
+    if let Some(native) = callee.as_native_function() {
+        return match native.own_property_descriptor(ctx.gc_heap, "length")? {
+            Some(desc) => Ok(descriptor_value(&desc)
+                .as_number()
+                .map(|n| to_integer_or_infinity(n.as_f64()))
+                .unwrap_or(0.0)),
+            None => Ok(0.0),
+        };
+    }
+    if let Some(bound) = callee.as_bound_function() {
+        return match bound_own_property_descriptor(&bound, ctx.gc_heap, "length")? {
+            Some(desc) => Ok(descriptor_value(&desc)
+                .as_number()
+                .map(|n| to_integer_or_infinity(n.as_f64()))
+                .unwrap_or(0.0)),
+            None => Ok(0.0),
+        };
+    }
+    if let Some(class) = callee.as_class_constructor() {
+        return callable_length(ctx, &class.ctor(ctx.gc_heap));
+    }
+    if let Some(obj) = callee.as_object() {
+        if let Some(native) =
+            object::constructor_native(obj, ctx.gc_heap).and_then(|v| v.as_native_function())
+        {
+            return callable_length(ctx, &Value::native_function(native));
+        }
+        return Ok(0.0);
+    }
+    Ok(0.0)
 }
 
 fn ordinary_function_user_property(

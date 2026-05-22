@@ -827,6 +827,213 @@ impl Value {
         }
     }
 
+    /// `JsObject` handle when this value is an ordinary object.
+    #[must_use]
+    pub fn as_object(&self) -> Option<JsObject> {
+        match self {
+            Value::Object(o) => Some(*o),
+            _ => None,
+        }
+    }
+
+    /// `JsArray` handle when this value is an array.
+    #[must_use]
+    pub fn as_array(&self) -> Option<JsArray> {
+        match self {
+            Value::Array(a) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// `BigIntValue` when this value is a BigInt.
+    #[must_use]
+    pub fn as_big_int(&self) -> Option<bigint::BigIntValue> {
+        match self {
+            Value::BigInt(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// `JsClosure` when this value is a closure.
+    #[must_use]
+    pub fn as_closure(&self) -> Option<crate::closure::JsClosure> {
+        match self {
+            Value::Closure(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// `BoundFunction` when this value is a bound function.
+    #[must_use]
+    pub fn as_bound_function(&self) -> Option<BoundFunction> {
+        match self {
+            Value::BoundFunction(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// `NativeFunction` when this value is a host-implemented callable.
+    #[must_use]
+    pub fn as_native_function(&self) -> Option<NativeFunction> {
+        match self {
+            Value::NativeFunction(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// `IteratorHandle` when this value is an iterator state.
+    #[must_use]
+    pub fn as_iterator(&self) -> Option<IteratorHandle> {
+        match self {
+            Value::Iterator(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// `JsRegExp` when this value is a compiled regexp.
+    #[must_use]
+    pub fn as_regexp(&self) -> Option<JsRegExp> {
+        match self {
+            Value::RegExp(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// `JsPromiseHandle` when this value is a promise.
+    #[must_use]
+    pub fn as_promise(&self) -> Option<JsPromiseHandle> {
+        match self {
+            Value::Promise(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// `JsMap` when this value is a Map.
+    #[must_use]
+    pub fn as_map(&self) -> Option<JsMap> {
+        match self {
+            Value::Map(m) => Some(*m),
+            _ => None,
+        }
+    }
+
+    /// `JsSet` when this value is a Set.
+    #[must_use]
+    pub fn as_set(&self) -> Option<JsSet> {
+        match self {
+            Value::Set(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// `JsWeakMap` when this value is a WeakMap.
+    #[must_use]
+    pub fn as_weak_map(&self) -> Option<JsWeakMap> {
+        match self {
+            Value::WeakMap(m) => Some(*m),
+            _ => None,
+        }
+    }
+
+    /// `JsWeakSet` when this value is a WeakSet.
+    #[must_use]
+    pub fn as_weak_set(&self) -> Option<JsWeakSet> {
+        match self {
+            Value::WeakSet(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// `JsWeakRef` when this value is a WeakRef.
+    #[must_use]
+    pub fn as_weak_ref(&self) -> Option<JsWeakRef> {
+        match self {
+            Value::WeakRef(w) => Some(*w),
+            _ => None,
+        }
+    }
+
+    /// `JsFinalizationRegistry` when this value is a FinalizationRegistry.
+    #[must_use]
+    pub fn as_finalization_registry(&self) -> Option<JsFinalizationRegistry> {
+        match self {
+            Value::FinalizationRegistry(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// `JsIntl` when this value is an Intl.* instance.
+    #[must_use]
+    pub fn as_intl(&self) -> Option<JsIntl> {
+        match self {
+            Value::Intl(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// `JsProxy` when this value is a Proxy.
+    #[must_use]
+    pub fn as_proxy(&self) -> Option<crate::proxy::JsProxy> {
+        match self {
+            Value::Proxy(p) => Some(*p),
+            _ => None,
+        }
+    }
+
+    /// `JsDataView` when this value is a DataView.
+    #[must_use]
+    pub fn as_data_view(&self) -> Option<crate::binary::JsDataView> {
+        match self {
+            Value::DataView(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// `JsTypedArray` when this value is a TypedArray.
+    #[must_use]
+    pub fn as_typed_array(&self) -> Option<crate::binary::JsTypedArray> {
+        match self {
+            Value::TypedArray(t) => Some(*t),
+            _ => None,
+        }
+    }
+
+    /// `JsArrayBuffer` when this value is an ArrayBuffer / SharedArrayBuffer.
+    #[must_use]
+    pub fn as_array_buffer(&self) -> Option<crate::binary::JsArrayBuffer> {
+        match self {
+            Value::ArrayBuffer(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// `JsGenerator` when this value is a generator.
+    #[must_use]
+    pub fn as_generator(&self) -> Option<crate::generator::JsGenerator> {
+        match self {
+            Value::Generator(g) => Some(*g),
+            _ => None,
+        }
+    }
+
+    /// `ClassConstructor` when this value is a class.
+    #[must_use]
+    pub fn as_class_constructor(&self) -> Option<ClassConstructor> {
+        match self {
+            Value::ClassConstructor(c) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// Bytecode function id when this value is `Value::Function`.
+    #[must_use]
+    pub fn as_function(&self) -> Option<u32> {
+        match self {
+            Value::Function { function_id } => Some(*function_id),
+            _ => None,
+        }
+    }
+
     /// Spec [`typeof`](https://tc39.es/ecma262/#sec-typeof-operator)
     /// — return the JS-visible type tag string.
     #[must_use]

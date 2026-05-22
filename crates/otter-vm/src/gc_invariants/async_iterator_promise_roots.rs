@@ -32,9 +32,9 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     let retained = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     let capability = crate::PromiseCapability {
-        promise: Value::Object(retained),
-        resolve: Value::Undefined,
-        reject: Value::Undefined,
+        promise: Value::object(retained),
+        resolve: Value::undefined(),
+        reject: Value::undefined(),
         context: None,
     };
     promise.perform_then(interp.gc_heap_mut(), None, None, capability);
@@ -44,7 +44,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
         global,
         interp.gc_heap_mut(),
         "promise",
-        Value::Promise(promise),
+        Value::promise(promise),
     );
     let _ = retained;
     interp.force_gc();
@@ -52,7 +52,7 @@ fn promise_reaction_graph_survives_force_gc_when_rooted() {
     let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "promise")
         .expect("promise root survives force_gc");
-    let Value::Promise(promise) = rooted else {
+    let Some(promise) = rooted.as_promise() else {
         panic!("expected rooted promise after force_gc")
     };
     assert!(
@@ -71,9 +71,9 @@ fn deep_promise_chain_is_reaped_when_unrooted() {
     for _ in 0..10_000 {
         let next = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
         let capability = crate::PromiseCapability {
-            promise: Value::Promise(next),
-            resolve: Value::Undefined,
-            reject: Value::Undefined,
+            promise: Value::promise(next),
+            resolve: Value::undefined(),
+            reject: Value::undefined(),
             context: None,
         };
         current.perform_then(interp.gc_heap_mut(), None, None, capability);
@@ -98,8 +98,8 @@ fn pending_promise_microtask_payload_roots_until_drained() {
     let mut interp = Interpreter::new();
     let payload = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     interp.microtasks_mut().enqueue(crate::Microtask {
-        callee: Value::Undefined,
-        this_value: Value::Undefined,
+        callee: Value::undefined(),
+        this_value: Value::undefined(),
         args: smallvec![Value::object(payload)],
         context: None,
         result_capability: None,
@@ -115,7 +115,7 @@ fn pending_promise_microtask_payload_roots_until_drained() {
         .expect("outer drain batch");
     let task = batch.tasks.pop_front().expect("queued task");
     assert!(
-        matches!(task.args.first(), Some(Value::Object(_))),
+        task.args.first().is_some_and(|v| v.is_object()),
         "pending microtask payload must root object"
     );
     interp.microtasks_mut().end_drain();
@@ -137,7 +137,7 @@ fn iterator_state_holding_array_object_survives_force_gc() {
         })
         .expect("iterator");
     let global = *interp.global_this();
-    crate::object::set(global, interp.gc_heap_mut(), "iter", Value::Iterator(iter));
+    crate::object::set(global, interp.gc_heap_mut(), "iter", Value::iterator(iter));
 
     let _ = object;
     let _ = array;
@@ -146,17 +146,14 @@ fn iterator_state_holding_array_object_survives_force_gc() {
 
     let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "iter").expect("iter");
-    let Value::Iterator(iter) = rooted else {
+    let Some(iter) = rooted.as_iterator() else {
         panic!("expected iterator root")
     };
     let array = interp.gc_heap().read_payload(iter, |state| match state {
         IteratorState::Array { array, .. } => *array,
         other => panic!("expected array iterator, got {other:?}"),
     });
-    assert!(matches!(
-        crate::array::get(array, interp.gc_heap(), 0),
-        Value::Object(_)
-    ));
+    assert!(crate::array::get(array, interp.gc_heap(), 0).is_object());
 }
 
 #[test]
@@ -173,7 +170,7 @@ fn generator_and_parked_frame_roots_register_values() {
         global,
         interp.gc_heap_mut(),
         "generator",
-        Value::Generator(generator),
+        Value::generator(generator),
     );
 
     let _ = object;
@@ -181,12 +178,12 @@ fn generator_and_parked_frame_roots_register_values() {
     let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "generator")
         .expect("generator root survives force_gc");
-    let Value::Generator(generator) = rooted else {
+    let Some(generator) = rooted.as_generator() else {
         panic!("expected rooted generator after force_gc")
     };
     generator.with_body(interp.gc_heap(), |body| {
         let frame = body.frame.as_ref().expect("saved frame");
-        assert!(matches!(frame.registers[0], Value::Object(_)));
+        assert!(frame.registers[0].is_object());
     });
 
     let mut parked_frame =
@@ -198,9 +195,9 @@ fn generator_and_parked_frame_roots_register_values() {
         crate::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame).expect("park");
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     let capability = crate::PromiseCapability {
-        promise: Value::Undefined,
-        resolve: Value::Undefined,
-        reject: Value::Undefined,
+        promise: Value::undefined(),
+        resolve: Value::undefined(),
+        reject: Value::undefined(),
         context: None,
     };
     promise.perform_async_resume_then(interp.gc_heap_mut(), parked, 0, capability, None);
@@ -208,7 +205,7 @@ fn generator_and_parked_frame_roots_register_values() {
         global,
         interp.gc_heap_mut(),
         "awaitPromise",
-        Value::Promise(promise),
+        Value::promise(promise),
     );
 
     let _ = parked_object;
@@ -216,7 +213,7 @@ fn generator_and_parked_frame_roots_register_values() {
     let global = *interp.global_this();
     let rooted = crate::object::get(global, interp.gc_heap(), "awaitPromise")
         .expect("await promise root survives force_gc");
-    let Value::Promise(promise) = rooted else {
+    let Some(promise) = rooted.as_promise() else {
         panic!("expected rooted await promise after force_gc")
     };
     let reaction_count = promise_fulfill_reaction_count(promise, interp.gc_heap());
@@ -237,7 +234,7 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     let gen_baseline = live_bytes(&mut interp, GENERATOR_BODY_TYPE_TAG);
 
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
-    promise.fulfill(interp.gc_heap_mut(), Value::Promise(promise));
+    promise.fulfill(interp.gc_heap_mut(), Value::promise(promise));
 
     let iter = interp
         .gc_heap_mut()
@@ -246,7 +243,7 @@ fn promise_iterator_generator_cycles_reclaimed_when_unrooted() {
     interp.gc_heap_mut().with_payload(iter, |state| {
         *state = IteratorState::FlatMap {
             source: iter,
-            mapper: Value::Undefined,
+            mapper: Value::undefined(),
             inner: Some(iter),
         };
     });

@@ -146,7 +146,7 @@ pub(crate) fn install_typed_array_entry(
         heap,
         "BYTES_PER_ELEMENT",
         PropertyDescriptor::data(
-            Value::Number(NumberValue::from_i32(bpe)),
+            Value::number(NumberValue::from_i32(bpe)),
             false,
             false,
             false,
@@ -173,7 +173,7 @@ pub(crate) fn install_typed_array_entry(
     ctor.set_prototype_override(heap, Some(Value::native_function(abstract_ctor)));
     // Also expose BYTES_PER_ELEMENT on the constructor (§23.2.6.1).
     let bpe_desc = PropertyDescriptor::data(
-        Value::Number(NumberValue::from_i32(bpe)),
+        Value::number(NumberValue::from_i32(bpe)),
         false,
         false,
         false,
@@ -309,7 +309,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
                 abstract_proto,
                 heap,
                 name,
-                PropertyDescriptor::accessor(Some(Value::NativeFunction(f)), None, false, true),
+                PropertyDescriptor::accessor(Some(Value::native_function(f)), None, false, true),
             );
             Ok(())
         };
@@ -340,7 +340,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
             heap,
             &tag_sym,
             PartialPropertyDescriptor {
-                get: Some(Value::NativeFunction(getter)),
+                get: Some(Value::native_function(getter)),
                 enumerable: Some(false),
                 configurable: Some(true),
                 ..Default::default()
@@ -421,26 +421,24 @@ fn drain_iterable_into_values(
             name: "TypedArray",
             reason: e.to_string(),
         })?;
-    let handle = match iter_obj {
-        Value::Iterator(h) => h,
-        Value::Generator(g) => {
-            let gen_value = Value::generator(g);
-            let state = crate::IteratorState::Generator { handle: g };
-            ctx.alloc_iterator_state(state, &[&gen_value], &[])
-                .map_err(|_| NativeError::TypeError {
-                    name: "TypedArray",
-                    reason: "iterator allocation failed".to_string(),
-                })?
-        }
-        other => {
-            let other_root = other;
-            let state = crate::IteratorState::User { iterator: other };
-            ctx.alloc_iterator_state(state, &[&other_root], &[])
-                .map_err(|_| NativeError::TypeError {
-                    name: "TypedArray",
-                    reason: "iterator allocation failed".to_string(),
-                })?
-        }
+    let handle = if let Some(h) = iter_obj.as_iterator() {
+        h
+    } else if let Some(g) = iter_obj.as_generator() {
+        let gen_value = Value::generator(g);
+        let state = crate::IteratorState::Generator { handle: g };
+        ctx.alloc_iterator_state(state, &[&gen_value], &[])
+            .map_err(|_| NativeError::TypeError {
+                name: "TypedArray",
+                reason: "iterator allocation failed".to_string(),
+            })?
+    } else {
+        let other_root = iter_obj;
+        let state = crate::IteratorState::User { iterator: iter_obj };
+        ctx.alloc_iterator_state(state, &[&other_root], &[])
+            .map_err(|_| NativeError::TypeError {
+                name: "TypedArray",
+                reason: "iterator allocation failed".to_string(),
+            })?
     };
     let mut collected: Vec<Value> = Vec::new();
     loop {
@@ -468,13 +466,12 @@ fn ta_callback_receiver(
     ctx: &NativeCtx<'_>,
     method: &'static str,
 ) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
-    match ctx.this_value() {
-        Value::TypedArray(t) => Ok(*t),
-        _ => Err(NativeError::TypeError {
+    ctx.this_value()
+        .as_typed_array()
+        .ok_or_else(|| NativeError::TypeError {
             name: method,
             reason: "this is not a TypedArray".to_string(),
-        }),
-    }
+        })
 }
 
 fn ta_callback_snapshot(
@@ -753,7 +750,7 @@ fn ta_proto_reduce_dir(
         acc = ctx
             .cx
             .interp
-            .run_callable_sync(&exec_ctx, &callee, Value::Undefined, cb_args)
+            .run_callable_sync(&exec_ctx, &callee, Value::undefined(), cb_args)
             .map_err(|e| NativeError::TypeError {
                 name: method,
                 reason: e.to_string(),
@@ -832,67 +829,59 @@ fn ta_build_result(
 /// receiver's [[ViewedArrayBuffer]] or raise TypeError on
 /// non-TypedArray receivers.
 fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    match ctx.this_value() {
-        Value::TypedArray(t) => {
-            let t = *t;
-            Ok(Value::array_buffer(t.buffer(ctx.heap())))
-        }
-        _ => Err(NativeError::TypeError {
+    let t = ctx
+        .this_value()
+        .as_typed_array()
+        .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.buffer",
             reason: "this is not a TypedArray".to_string(),
-        }),
-    }
+        })?;
+    Ok(Value::array_buffer(t.buffer(ctx.heap())))
 }
 
 /// §22.2.6.2 `get %TypedArray%.prototype.byteLength`.
 fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    match ctx.this_value() {
-        Value::TypedArray(t) => {
-            let t = *t;
-            let n = t.byte_length(ctx.heap());
-            Ok(Value::number(crate::number::NumberValue::from_f64(
-                n as f64,
-            )))
-        }
-        _ => Err(NativeError::TypeError {
+    let t = ctx
+        .this_value()
+        .as_typed_array()
+        .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.byteLength",
             reason: "this is not a TypedArray".to_string(),
-        }),
-    }
+        })?;
+    let n = t.byte_length(ctx.heap());
+    Ok(Value::number(crate::number::NumberValue::from_f64(
+        n as f64,
+    )))
 }
 
 /// §22.2.6.3 `get %TypedArray%.prototype.byteOffset`.
 fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    match ctx.this_value() {
-        Value::TypedArray(t) => {
-            let t = *t;
-            let n = t.byte_offset(ctx.heap());
-            Ok(Value::number(crate::number::NumberValue::from_f64(
-                n as f64,
-            )))
-        }
-        _ => Err(NativeError::TypeError {
+    let t = ctx
+        .this_value()
+        .as_typed_array()
+        .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.byteOffset",
             reason: "this is not a TypedArray".to_string(),
-        }),
-    }
+        })?;
+    let n = t.byte_offset(ctx.heap());
+    Ok(Value::number(crate::number::NumberValue::from_f64(
+        n as f64,
+    )))
 }
 
 /// §22.2.6.18 `get %TypedArray%.prototype.length`.
 fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    match ctx.this_value() {
-        Value::TypedArray(t) => {
-            let t = *t;
-            let n = t.length(ctx.heap());
-            Ok(Value::number(crate::number::NumberValue::from_f64(
-                n as f64,
-            )))
-        }
-        _ => Err(NativeError::TypeError {
+    let t = ctx
+        .this_value()
+        .as_typed_array()
+        .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.length",
             reason: "this is not a TypedArray".to_string(),
-        }),
-    }
+        })?;
+    let n = t.length(ctx.heap());
+    Ok(Value::number(crate::number::NumberValue::from_f64(
+        n as f64,
+    )))
 }
 
 /// §22.2.6.15 `get %TypedArray%.prototype [ @@toStringTag ]` — return
@@ -902,10 +891,10 @@ fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype-%symbol.tostringtag%>
 fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let kind_name = match this_value {
-        Value::TypedArray(t) => t.kind().name(),
-        _ => return Ok(Value::undefined()),
+    let Some(t) = this_value.as_typed_array() else {
+        return Ok(Value::undefined());
     };
+    let kind_name = t.kind().name();
 
     Ok(Value::string(
         crate::string::JsString::from_str(kind_name, ctx.heap_mut()).map_err(|_| {
@@ -948,7 +937,9 @@ fn ensure_abstract_typed_array_constructor(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<crate::native_function::NativeFunction, JsSurfaceError> {
-    if let Some(Value::NativeFunction(nf)) = object::get(global, heap, ABSTRACT_CTOR_SLOT) {
+    if let Some(nf) =
+        object::get(global, heap, ABSTRACT_CTOR_SLOT).and_then(|v| v.as_native_function())
+    {
         return Ok(nf);
     }
     let abstract_proto = ensure_abstract_typed_array_prototype(heap, global)?;
@@ -990,14 +981,15 @@ fn ensure_abstract_typed_array_prototype(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<JsObject, JsSurfaceError> {
-    if let Some(Value::Object(obj)) = object::get(global, heap, ABSTRACT_PROTO_SLOT) {
+    if let Some(obj) = object::get(global, heap, ABSTRACT_PROTO_SLOT).and_then(|v| v.as_object()) {
         return Ok(obj);
     }
     let global_root = Value::object(global);
     let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
     // Chain to %Object.prototype% per §23.2.3.
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(proto, heap, Some(object_proto));
     }
@@ -1027,10 +1019,7 @@ fn get_abstract_typed_array_prototype(
     global: JsObject,
     heap: &otter_gc::GcHeap,
 ) -> Option<JsObject> {
-    match object::get(global, heap, ABSTRACT_PROTO_SLOT) {
-        Some(Value::Object(obj)) => Some(obj),
-        _ => None,
-    }
+    object::get(global, heap, ABSTRACT_PROTO_SLOT).and_then(|v| v.as_object())
 }
 
 // ---------------------------------------------------------------
@@ -1168,56 +1157,55 @@ fn ta_ctor_dispatch(
     // the per-kind dispatcher's array-like path collects the
     // yielded values rather than reading the (probably-undefined)
     // `length` own slot.
-    let iter_pre: Option<SmallVec<[Value; 4]>> =
-        if let (Some(Value::Object(src_obj)), Some(exec)) = (args.first(), exec.as_ref()) {
-            let iter_sym = ctx
-                .cx
-                .interp
-                .well_known_symbols()
-                .get(crate::symbol::WellKnown::Iterator);
-            let has_iter = crate::object::get_symbol(*src_obj, ctx.heap(), &iter_sym).is_some();
-            if has_iter {
-                let src_value = Value::object(*src_obj);
-                let drained = drain_iterable_into_values(ctx, exec, &src_value)?;
-                let arr = ctx
-                    .array_from_elements(drained)
-                    .map_err(|_| NativeError::TypeError {
-                        name: typed_array_name(kind),
-                        reason: "out of memory while allocating array".to_string(),
-                    })?;
-                let mut out: SmallVec<[Value; 4]> = SmallVec::new();
-                out.push(Value::array(arr));
-                for v in args.iter().skip(1) {
-                    out.push(*v);
-                }
-                Some(out)
-            } else {
-                None
+    let iter_pre: Option<SmallVec<[Value; 4]>> = if let (Some(src_obj), Some(exec)) =
+        (args.first().and_then(|v| v.as_object()), exec.as_ref())
+    {
+        let iter_sym = ctx
+            .cx
+            .interp
+            .well_known_symbols()
+            .get(crate::symbol::WellKnown::Iterator);
+        let has_iter = crate::object::get_symbol(src_obj, ctx.heap(), &iter_sym).is_some();
+        if has_iter {
+            let src_value = Value::object(src_obj);
+            let drained = drain_iterable_into_values(ctx, exec, &src_value)?;
+            let arr = ctx
+                .array_from_elements(drained)
+                .map_err(|_| NativeError::TypeError {
+                    name: typed_array_name(kind),
+                    reason: "out of memory while allocating array".to_string(),
+                })?;
+            let mut out: SmallVec<[Value; 4]> = SmallVec::new();
+            out.push(Value::array(arr));
+            for v in args.iter().skip(1) {
+                out.push(*v);
             }
+            Some(out)
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
     let coerced: SmallVec<[Value; 4]> = if let Some(pre) = iter_pre {
         pre
-    } else if matches!(args.first(), Some(Value::ArrayBuffer(_))) {
+    } else if args.first().is_some_and(|v| v.is_array_buffer()) {
         if let Some(exec) = &exec {
             let mut out: SmallVec<[Value; 4]> = args.iter().cloned().collect();
             for idx in 1..=2 {
                 let Some(slot) = out.get_mut(idx) else {
                     continue;
                 };
-                if !matches!(
-                    slot,
-                    Value::Object(_)
-                        | Value::Array(_)
-                        | Value::Function { .. }
-                        | Value::Closure(_)
-                        | Value::NativeFunction(_)
-                        | Value::BoundFunction(_)
-                        | Value::ClassConstructor(_)
-                        | Value::Proxy(_)
-                        | Value::RegExp(_)
-                ) {
+                let object_like = slot.is_object()
+                    || slot.is_array()
+                    || slot.is_function()
+                    || slot.is_closure()
+                    || slot.is_native_function()
+                    || slot.is_bound_function()
+                    || slot.is_class_constructor()
+                    || slot.is_proxy()
+                    || slot.is_regexp();
+                if !object_like {
                     continue;
                 }
                 let interp = ctx.interp_mut();
@@ -1263,7 +1251,7 @@ fn ta_ctor_dispatch(
     // array receives `Subclass.prototype` as its observable
     // [[Prototype]].
     // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    let needs_proto_override = !ctx.new_target().is_some_and(|v| v.is_native_function());
     if needs_proto_override
         && let Some(proto) =
             crate::bootstrap::native_new_target_prototype(ctx, typed_array_name(kind))?

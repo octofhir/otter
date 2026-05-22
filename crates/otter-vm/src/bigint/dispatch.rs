@@ -63,42 +63,51 @@ pub fn call(
 /// §7.1.13 ToBigInt — Number must be a safe integer; String parses
 /// as integer literal; Boolean → 0n / 1n; BigInt passes through.
 fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
-    match value {
-        Value::BigInt(b) => Ok(b.clone_inner(heap)),
-        Value::Boolean(true) => Ok(BigInt::from(1)),
-        Value::Boolean(false) => Ok(BigInt::from(0)),
-        // §21.2.1.1 step 3.a — `Number → NumberToBigInt`. The spec
-        // throws **RangeError** on non-integer / non-finite values
-        // and otherwise produces the matching integer.
-        Value::Number(n) => {
-            let f = n.as_f64();
-            if !f.is_finite() || f.fract() != 0.0 {
-                return Err(VmError::RangeError {
-                    message: "The number is not a safe integer for BigInt".to_string(),
-                });
-            }
-            Ok(BigInt::from(f as i128))
-        }
-        Value::String(s) => string_to_bigint(&s.to_lossy_string(heap)),
-        // §7.1.13 step 7 — Symbol → TypeError.
-        Value::Symbol(_) => Err(VmError::TypeError {
-            message: "Cannot convert a Symbol value to a BigInt".to_string(),
-        }),
-        // §7.1.13 step 4 — ToPrimitive(value, "number") then
-        // recursive ToBigInt. The caller (`bigint_ctor_call`) has
-        // already run `coerce_bigint_call_args` so we should see a
-        // primitive here. A remaining Object reaches the wildcard
-        // and surfaces as TypeError.
-        Value::Array(_) => Err(VmError::TypeError {
-            message: "Cannot convert Array to a BigInt".to_string(),
-        }),
-        Value::Null | Value::Undefined => Err(VmError::TypeError {
-            message: "Cannot convert null or undefined to a BigInt".to_string(),
-        }),
-        _ => Err(VmError::TypeError {
-            message: "Cannot convert value to a BigInt".to_string(),
-        }),
+    if let Some(b) = value.as_big_int() {
+        return Ok(b.clone_inner(heap));
     }
+    if let Some(b) = value.as_boolean() {
+        return Ok(BigInt::from(if b { 1 } else { 0 }));
+    }
+    // §21.2.1.1 step 3.a — `Number → NumberToBigInt`. The spec
+    // throws **RangeError** on non-integer / non-finite values
+    // and otherwise produces the matching integer.
+    if let Some(n) = value.as_number() {
+        let f = n.as_f64();
+        if !f.is_finite() || f.fract() != 0.0 {
+            return Err(VmError::RangeError {
+                message: "The number is not a safe integer for BigInt".to_string(),
+            });
+        }
+        return Ok(BigInt::from(f as i128));
+    }
+    if let Some(s) = value.as_string() {
+        return string_to_bigint(&s.to_lossy_string(heap));
+    }
+    // §7.1.13 step 7 — Symbol → TypeError.
+    if value.is_symbol() {
+        return Err(VmError::TypeError {
+            message: "Cannot convert a Symbol value to a BigInt".to_string(),
+        });
+    }
+    // §7.1.13 step 4 — ToPrimitive(value, "number") then
+    // recursive ToBigInt. The caller (`bigint_ctor_call`) has
+    // already run `coerce_bigint_call_args` so we should see a
+    // primitive here. A remaining Object reaches the wildcard
+    // and surfaces as TypeError.
+    if value.is_array() {
+        return Err(VmError::TypeError {
+            message: "Cannot convert Array to a BigInt".to_string(),
+        });
+    }
+    if value.is_null() || value.is_undefined() {
+        return Err(VmError::TypeError {
+            message: "Cannot convert null or undefined to a BigInt".to_string(),
+        });
+    }
+    Err(VmError::TypeError {
+        message: "Cannot convert value to a BigInt".to_string(),
+    })
 }
 
 fn string_to_bigint(text: &str) -> Result<BigInt, VmError> {
@@ -142,34 +151,35 @@ fn parse_radix_literal(input: &str) -> Option<BigInt> {
 /// **TypeError**, negatives and overflow with **RangeError**, and
 /// returning `0` for NaN / undefined per the spec.
 fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
-    let n = match arg {
-        None | Some(Value::Undefined) => return Ok(0),
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Null) => 0.0,
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) => 0.0,
-        Some(Value::String(s)) => {
-            crate::number::parse::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
-        }
-        Some(Value::Symbol(_)) => {
-            return Err(VmError::TypeError {
-                message: "Cannot convert a Symbol value to a number".to_string(),
-            });
-        }
-        Some(Value::BigInt(_)) => {
-            return Err(VmError::TypeError {
-                message: "Cannot convert a BigInt value to a number".to_string(),
-            });
-        }
+    let Some(v) = arg else {
+        return Ok(0);
+    };
+    let n = if v.is_undefined() {
+        return Ok(0);
+    } else if let Some(num) = v.as_number() {
+        num.as_f64()
+    } else if v.is_null() {
+        0.0
+    } else if let Some(b) = v.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if let Some(s) = v.as_string() {
+        crate::number::parse::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
+    } else if v.is_symbol() {
+        return Err(VmError::TypeError {
+            message: "Cannot convert a Symbol value to a number".to_string(),
+        });
+    } else if v.is_big_int() {
+        return Err(VmError::TypeError {
+            message: "Cannot convert a BigInt value to a number".to_string(),
+        });
+    } else {
         // Object operands should have been pre-coerced by the
         // dispatcher's `coerce_bigint_call_args` ladder. Anything
         // else is treated as a non-primitive that fails the
         // ToNumber arm.
-        Some(_) => {
-            return Err(VmError::TypeError {
-                message: "Cannot convert value to a number".to_string(),
-            });
-        }
+        return Err(VmError::TypeError {
+            message: "Cannot convert value to a number".to_string(),
+        });
     };
     // §7.1.5 ToIntegerOrInfinity — NaN collapses to 0, infinities
     // stay; §7.1.22 ToIndex then rejects negatives / overflows.

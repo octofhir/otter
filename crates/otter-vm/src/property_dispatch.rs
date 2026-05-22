@@ -2322,38 +2322,30 @@ impl Interpreter {
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
-        let key = match &key_value {
-            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap)),
-            Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
-            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-            _ => return Ok(false),
+        let key = if let Some(s) = key_value.as_string() {
+            VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+        } else if let Some(n) = key_value.as_number() {
+            VmPropertyKey::OwnedString(n.to_display_string())
+        } else if let Some(sym) = key_value.as_symbol() {
+            VmPropertyKey::Symbol(*sym)
+        } else {
+            return Ok(false);
         };
 
-        // Heap values that walk a prototype chain in `ordinary_get_value`.
-        // `Array` / `TypedArray` / primitive wrappers / `BoundFunction` /
-        // function callables keep their own legacy fast paths below; the
-        // arms listed here previously fell through to a TypeMismatch on
-        // symbol / numeric keys because the slow `run_load_element_regs`
-        // path had no matching arm. Routing them through the common
-        // `[[Get]]` substrate gives Generator / Iterator / Map / Set /
-        // WeakRef / Promise / ArrayBuffer / DataView consistent symbol
-        // and numeric-key behaviour (notably `@@toStringTag`).
-        let prototype_routed = matches!(
-            receiver,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Generator(_)
-                | Value::Iterator(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-        );
+        // Heap values that walk a prototype chain via `ordinary_get_value`.
+        let prototype_routed = receiver.is_object()
+            || receiver.is_proxy()
+            || receiver.is_generator()
+            || receiver.is_iterator()
+            || receiver.is_map()
+            || receiver.is_set()
+            || receiver.is_weak_map()
+            || receiver.is_weak_set()
+            || receiver.is_weak_ref()
+            || receiver.is_finalization_registry()
+            || receiver.is_promise()
+            || receiver.is_array_buffer()
+            || receiver.is_data_view();
         if prototype_routed {
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2364,14 +2356,15 @@ impl Interpreter {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &getter, receiver, args, dst)?;
                     } else {
-                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                        write_register(&mut stack[top_idx], dst, Value::undefined())?;
                     }
                 }
             }
             return Ok(true);
         }
 
-        if let (Value::BoundFunction(bound), Some(key)) = (&receiver, key.string_name()) {
+        if let (Some(bound), Some(key)) = (receiver.as_bound_function(), key.string_name()) {
+            let bound = &bound;
             match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, key)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { getter, .. },
@@ -2421,32 +2414,30 @@ impl Interpreter {
             }
         }
 
-        let obj = match &receiver {
-            Value::Object(obj) => *obj,
-            Value::ClassConstructor(class) => {
-                if key.string_name().is_some_and(|key| key == "prototype") {
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    write_register(
-                        &mut stack[top_idx],
-                        dst,
-                        Value::Object(class.prototype(&self.gc_heap)),
-                    )?;
-                    return Ok(true);
-                }
-                class.statics(&self.gc_heap)
+        let obj = if let Some(o) = receiver.as_object() {
+            o
+        } else if let Some(class) = receiver.as_class_constructor() {
+            if key.string_name().is_some_and(|key| key == "prototype") {
+                let pc = stack[top_idx].pc;
+                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                write_register(
+                    &mut stack[top_idx],
+                    dst,
+                    Value::object(class.prototype(&self.gc_heap)),
+                )?;
+                return Ok(true);
             }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let Some(bag) = self.function_user_props.get(function_id).copied() else {
-                    return Ok(false);
-                };
-                bag
-            }
-            _ => return Ok(false),
+            class.statics(&self.gc_heap)
+        } else if let Some(fid) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            let Some(bag) = self.function_user_props.get(&fid).copied() else {
+                return Ok(false);
+            };
+            bag
+        } else {
+            return Ok(false);
         };
         let lookup = match &key {
             VmPropertyKey::Symbol(sym) => crate::object::lookup_symbol(obj, &self.gc_heap, sym),
@@ -2473,7 +2464,7 @@ impl Interpreter {
                         self.invoke(stack, context, &callee, receiver, args, dst)?;
                     }
                     _ => {
-                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                        write_register(&mut stack[top_idx], dst, Value::undefined())?;
                     }
                 }
                 Ok(true)
@@ -2557,8 +2548,8 @@ impl Interpreter {
                 break;
             }
             hops += 1;
-            match proto {
-                Value::Object(obj) => {
+            if let Some(obj) = proto.as_object() {
+                {
                     let lookup = match &key {
                         VmPropertyKey::Symbol(sym) => {
                             object::lookup_own_symbol(obj, &self.gc_heap, sym)
@@ -2615,7 +2606,8 @@ impl Interpreter {
                         }
                     }
                 }
-                Value::Proxy(proxy) => {
+            } else if let Some(proxy) = proto.as_proxy() {
+                {
                     let key_value = self.vm_property_key_to_value(&key)?;
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         proxy.target(&self.gc_heap),
@@ -2629,7 +2621,7 @@ impl Interpreter {
                     match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                         Some(_) => {}
                         None => {
-                            let Value::Object(target) = proxy.target(&self.gc_heap) else {
+                            let Some(target) = proxy.target(&self.gc_heap).as_object() else {
                                 return Err(VmError::TypeMismatch);
                             };
                             match &key {
@@ -2687,7 +2679,8 @@ impl Interpreter {
                     }
                     return Ok(true);
                 }
-                _ => break,
+            } else {
+                break;
             }
         }
 
@@ -2725,17 +2718,19 @@ impl Interpreter {
             String(String),
             Symbol(crate::symbol::JsSymbol),
         }
-        let key = match &key_value {
-            Value::String(s) => ComputedPropertyKey::String(s.to_lossy_string(&self.gc_heap)),
-            Value::Number(n) => ComputedPropertyKey::String(n.to_display_string()),
-            Value::Symbol(sym) => ComputedPropertyKey::Symbol(*sym),
-            _ => return Ok(false),
+        let key = if let Some(s) = key_value.as_string() {
+            ComputedPropertyKey::String(s.to_lossy_string(&self.gc_heap))
+        } else if let Some(n) = key_value.as_number() {
+            ComputedPropertyKey::String(n.to_display_string())
+        } else if let Some(sym) = key_value.as_symbol() {
+            ComputedPropertyKey::Symbol(*sym)
+        } else {
+            return Ok(false);
         };
-        if let Value::Proxy(p) = &receiver {
-            let proxy = *p;
+        if let Some(proxy) = receiver.as_proxy() {
             let key_arg = match &key {
                 ComputedPropertyKey::String(key) => {
-                    Value::String(JsString::from_str(key, &mut self.gc_heap)?)
+                    Value::string(JsString::from_str(key, &mut self.gc_heap)?)
                 }
                 ComputedPropertyKey::Symbol(sym) => Value::symbol(*sym),
             };
@@ -2743,7 +2738,7 @@ impl Interpreter {
                 proxy.target(&self.gc_heap),
                 key_arg,
                 value,
-                Value::Proxy(proxy),
+                Value::proxy(proxy),
             ];
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2751,7 +2746,7 @@ impl Interpreter {
                 Some(_) => {}
                 None => {
                     let target_value = proxy.target(&self.gc_heap);
-                    let Value::Object(target) = target_value else {
+                    let Some(target) = target_value.as_object() else {
                         let vm_key = match &key {
                             ComputedPropertyKey::String(key) => {
                                 VmPropertyKey::OwnedString(key.clone())
@@ -2763,7 +2758,7 @@ impl Interpreter {
                             target_value,
                             &vm_key,
                             value,
-                            Value::Proxy(proxy),
+                            Value::proxy(proxy),
                             0,
                         )? {
                             Self::failed_set_result(strict, "Cannot assign to property")?;
@@ -2805,7 +2800,7 @@ impl Interpreter {
                                     stack,
                                     context,
                                     &setter,
-                                    Value::Proxy(proxy),
+                                    Value::proxy(proxy),
                                     args,
                                     scratch_reg,
                                 )?;
@@ -2819,7 +2814,10 @@ impl Interpreter {
             }
             return Ok(true);
         }
-        if let (Value::BoundFunction(bound), ComputedPropertyKey::String(key)) = (&receiver, &key) {
+        if let (Some(bound), ComputedPropertyKey::String(key)) =
+            (receiver.as_bound_function(), &key)
+        {
+            let bound = &bound;
             match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, key)? {
                 Some(object::PropertyDescriptor {
                     kind: object::DescriptorKind::Accessor { setter, .. },
@@ -2869,7 +2867,8 @@ impl Interpreter {
                 }
             }
         }
-        if let (Value::NativeFunction(native), ComputedPropertyKey::Symbol(sym)) = (&receiver, &key)
+        if let (Some(native), ComputedPropertyKey::Symbol(sym)) =
+            (receiver.as_native_function(), &key)
         {
             let obj = native.own_properties_object(&self.gc_heap);
             match object::resolve_symbol_set(obj, &self.gc_heap, sym) {
@@ -2909,21 +2908,20 @@ impl Interpreter {
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
         }
-        if matches!(
-            receiver,
-            Value::Boolean(_)
-                | Value::Number(_)
-                | Value::String(_)
-                | Value::Symbol(_)
-                | Value::BigInt(_)
-        ) {
+        if receiver.is_boolean()
+            || receiver.is_number()
+            || receiver.is_string()
+            || receiver.is_symbol()
+            || receiver.is_big_int()
+        {
             let key = match key {
                 ComputedPropertyKey::String(key) => VmPropertyKey::OwnedString(key),
                 ComputedPropertyKey::Symbol(sym) => VmPropertyKey::Symbol(sym),
             };
             return self.store_to_primitive_base(stack, context, receiver, key, value, scratch_reg);
         }
-        if let Value::RegExp(r) = &receiver {
+        if let Some(r) = receiver.as_regexp() {
+            let r = &r;
             match &key {
                 ComputedPropertyKey::String(key) if key == "lastIndex" => {
                     regexp_prototype::store_property(r, &mut self.gc_heap, key, value);
@@ -2976,61 +2974,54 @@ impl Interpreter {
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
         }
-        let obj = match &receiver {
-            Value::Object(obj) => *obj,
-            Value::ClassConstructor(class) => class.statics(&self.gc_heap),
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                match &key {
-                    ComputedPropertyKey::String(key) => {
-                        if function_metadata::ordinary_function_metadata_key(key).is_some()
-                            && let Some(desc) = self.ordinary_function_own_property_descriptor(
-                                Some(context),
-                                *function_id,
-                                key,
-                            )?
-                            && !desc.writable()
-                        {
-                            return Self::finish_failed_set(
-                                stack,
-                                context,
-                                format!("Cannot assign to read-only property '{key}' of function"),
-                            );
-                        }
-                        let has_own = self
-                            .ordinary_function_has_own_string_property_for_extensibility(
-                                context,
-                                *function_id,
-                                key,
-                            )?;
-                        if !has_own && !self.ordinary_function_is_extensible(*function_id) {
-                            return Self::finish_failed_set(
-                                stack,
-                                context,
-                                format!("Cannot add property '{key}' to non-extensible function"),
-                            );
-                        }
+        let obj = if let Some(obj) = receiver.as_object() {
+            obj
+        } else if let Some(class) = receiver.as_class_constructor() {
+            class.statics(&self.gc_heap)
+        } else if let Some(fid) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            match &key {
+                ComputedPropertyKey::String(key) => {
+                    if function_metadata::ordinary_function_metadata_key(key).is_some()
+                        && let Some(desc) =
+                            self.ordinary_function_own_property_descriptor(Some(context), fid, key)?
+                        && !desc.writable()
+                    {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            format!("Cannot assign to read-only property '{key}' of function"),
+                        );
                     }
-                    ComputedPropertyKey::Symbol(sym) => {
-                        if !self.ordinary_function_has_own_symbol_property_for_extensibility(
-                            *function_id,
-                            sym,
-                        ) && !self.ordinary_function_is_extensible(*function_id)
-                        {
-                            return Self::finish_failed_set(
-                                stack,
-                                context,
-                                "Cannot add symbol property to non-extensible function",
-                            );
-                        }
+                    let has_own = self
+                        .ordinary_function_has_own_string_property_for_extensibility(
+                            context, fid, key,
+                        )?;
+                    if !has_own && !self.ordinary_function_is_extensible(fid) {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            format!("Cannot add property '{key}' to non-extensible function"),
+                        );
                     }
                 }
-                self.function_user_bag_stack_rooted(stack, *function_id, &[&receiver, &value])?
+                ComputedPropertyKey::Symbol(sym) => {
+                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(fid, sym)
+                        && !self.ordinary_function_is_extensible(fid)
+                    {
+                        return Self::finish_failed_set(
+                            stack,
+                            context,
+                            "Cannot add symbol property to non-extensible function",
+                        );
+                    }
+                }
             }
-            _ => return Ok(false),
+            self.function_user_bag_stack_rooted(stack, fid, &[&receiver, &value])?
+        } else {
+            return Ok(false);
         };
         let outcome = match &key {
             ComputedPropertyKey::String(key) => crate::object::resolve_set(obj, &self.gc_heap, key),

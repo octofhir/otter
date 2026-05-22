@@ -522,14 +522,14 @@ pub fn abstract_relational_comparison(
     heap: &otter_gc::GcHeap,
 ) -> RelationalOutcome {
     // Step 1: both String → lexicographic.
-    if let (Value::String(a), Value::String(b)) = (x, y) {
+    if let (Some(a), Some(b)) = (x.as_string(), y.as_string()) {
         return match a.compare_lex(b, heap) {
             std::cmp::Ordering::Less => RelationalOutcome::LessThan,
             _ => RelationalOutcome::NotLessThan,
         };
     }
     // Step 2 / 3: BigInt x String.
-    if let (Value::BigInt(big), Value::String(s)) = (x, y) {
+    if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string()) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(b, &parsed)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
@@ -538,7 +538,7 @@ pub fn abstract_relational_comparison(
             None => RelationalOutcome::Undefined,
         };
     }
-    if let (Value::String(s), Value::BigInt(big)) = (x, y) {
+    if let (Some(s), Some(big)) = (x.as_string(), y.as_big_int()) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(&parsed, b)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
@@ -607,18 +607,26 @@ pub enum NumericKind {
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-tonumeric>
 pub fn to_numeric_kind(value: &Value, heap: &otter_gc::GcHeap) -> Option<NumericKind> {
-    match value {
-        Value::Number(n) => Some(NumericKind::Num(*n)),
-        Value::BigInt(b) => Some(NumericKind::Big(b.clone_inner(heap))),
-        Value::String(s) => Some(NumericKind::Num(number::to_number_from_string(
+    if let Some(n) = value.as_number() {
+        Some(NumericKind::Num(n))
+    } else if let Some(b) = value.as_big_int() {
+        Some(NumericKind::Big(b.clone_inner(heap)))
+    } else if let Some(s) = value.as_string() {
+        Some(NumericKind::Num(number::to_number_from_string(
             &s.to_lossy_string(heap),
-        ))),
-        Value::Boolean(true) => Some(NumericKind::Num(NumberValue::from_i32(1))),
-        Value::Boolean(false) => Some(NumericKind::Num(NumberValue::from_i32(0))),
-        Value::Null => Some(NumericKind::Num(NumberValue::from_i32(0))),
-        Value::Undefined => Some(NumericKind::Num(NumberValue::Double(f64::NAN))),
-        Value::Symbol(_) => None,
-        _ => None,
+        )))
+    } else if let Some(b) = value.as_boolean() {
+        Some(NumericKind::Num(NumberValue::from_i32(if b {
+            1
+        } else {
+            0
+        })))
+    } else if value.is_null() {
+        Some(NumericKind::Num(NumberValue::from_i32(0)))
+    } else if value.is_undefined() {
+        Some(NumericKind::Num(NumberValue::Double(f64::NAN)))
+    } else {
+        None
     }
 }
 
@@ -633,11 +641,11 @@ mod tests {
     use crate::string::JsString;
 
     fn n(v: f64) -> Value {
-        Value::Number(NumberValue::Double(v))
+        Value::number(NumberValue::Double(v))
     }
 
     fn s(v: &str, heap: &mut otter_gc::GcHeap) -> Value {
-        Value::String(JsString::from_str(v, heap).expect("foundation heap fits the literal"))
+        Value::string(JsString::from_str(v, heap).expect("foundation heap fits the literal"))
     }
 
     fn fresh_heap() -> otter_gc::GcHeap {
@@ -664,7 +672,7 @@ mod tests {
         let heap = fresh_heap();
         assert!(!same_value(&n(1.0), &Value::boolean(true), &heap));
         assert!(!same_value_zero(&n(1.0), &Value::boolean(true), &heap));
-        assert!(!same_value(&Value::Null, &Value::Undefined, &heap));
+        assert!(!same_value(&Value::null(), &Value::undefined(), &heap));
     }
 
     #[test]
@@ -680,8 +688,8 @@ mod tests {
     #[test]
     fn primitives_match() {
         let heap = fresh_heap();
-        assert!(same_value(&Value::Undefined, &Value::Undefined, &heap));
-        assert!(same_value(&Value::Null, &Value::Null, &heap));
+        assert!(same_value(&Value::undefined(), &Value::undefined(), &heap));
+        assert!(same_value(&Value::null(), &Value::null(), &heap));
         assert!(same_value(
             &Value::boolean(true),
             &Value::boolean(true),
@@ -697,22 +705,22 @@ mod tests {
     #[test]
     fn is_array_recognises_array_only() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        assert!(is_array(&Value::Array(
+        assert!(is_array(&Value::array(
             crate::array::alloc_array_old_for_fixture(&mut heap).unwrap()
         )));
-        assert!(!is_array(&Value::Object(
+        assert!(!is_array(&Value::object(
             crate::object::alloc_object_old_for_fixture(&mut heap).unwrap()
         )));
-        assert!(!is_array(&Value::Undefined));
+        assert!(!is_array(&Value::undefined()));
     }
 
     #[test]
     fn is_callable_recognises_call_shapes() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
-        assert!(is_callable(&Value::Function { function_id: 0 }));
-        assert!(!is_callable(&Value::Object(
+        assert!(is_callable(&Value::function(0)));
+        assert!(!is_callable(&Value::object(
             crate::object::alloc_object_old_for_fixture(&mut heap).unwrap()
         )));
-        assert!(!is_callable(&Value::Undefined));
+        assert!(!is_callable(&Value::undefined()));
     }
 }

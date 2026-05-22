@@ -167,55 +167,51 @@ impl TypedArrayKind {
                     let handle = BigIntValue::from_inner(heap, BigInt::from(0))?;
                     Ok(Value::big_int(handle))
                 }
-                _ => Ok(Value::number(NumberValue::from_i32(0))),
+                _ => Ok(Value::number_i32(0)),
             };
         }
         let slice = &bytes[offset..offset + bpe];
         Ok(match self {
-            Self::Int8 => {
-                Value::Number(NumberValue::from_i32(i8::from_le_bytes([slice[0]]) as i32))
-            }
-            Self::Uint8 | Self::Uint8Clamped => {
-                Value::Number(NumberValue::from_i32(slice[0] as i32))
-            }
+            Self::Int8 => Value::number_i32(i8::from_le_bytes([slice[0]]) as i32),
+            Self::Uint8 | Self::Uint8Clamped => Value::number_i32(slice[0] as i32),
             Self::Int16 => {
                 let v = i16::from_le_bytes([slice[0], slice[1]]);
-                Value::Number(NumberValue::from_i32(v as i32))
+                Value::number_i32(v as i32)
             }
             Self::Uint16 => {
                 let v = u16::from_le_bytes([slice[0], slice[1]]);
-                Value::Number(NumberValue::from_i32(v as i32))
+                Value::number_i32(v as i32)
             }
             Self::Int32 => {
                 let v = i32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-                Value::Number(NumberValue::from_i32(v))
+                Value::number_i32(v)
             }
             Self::Uint32 => {
                 let v = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-                Value::Number(NumberValue::from_f64(v as f64))
+                Value::number_f64(v as f64)
             }
             Self::Float32 => {
                 let v = f32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-                Value::Number(NumberValue::from_f64(v as f64))
+                Value::number_f64(v as f64)
             }
             Self::Float64 => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slice);
-                Value::Number(NumberValue::from_f64(f64::from_le_bytes(buf)))
+                Value::number_f64(f64::from_le_bytes(buf))
             }
             Self::BigInt64 => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slice);
                 let v = i64::from_le_bytes(buf);
                 let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
-                Value::BigInt(handle)
+                Value::big_int(handle)
             }
             Self::BigUint64 => {
                 let mut buf = [0u8; 8];
                 buf.copy_from_slice(slice);
                 let v = u64::from_le_bytes(buf);
                 let handle = BigIntValue::from_inner(heap, BigInt::from(v))?;
-                Value::BigInt(handle)
+                Value::big_int(handle)
             }
         })
     }
@@ -318,26 +314,34 @@ fn to_uint8_clamp(value: &Value, heap: &otter_gc::GcHeap) -> u8 {
 /// Coerce a JS value to a Number per §7.1.4 ToNumber. BigInt → drop
 /// to NaN (the per-kind path handles BigInt arrays separately).
 fn value_to_number(value: &Value, heap: &otter_gc::GcHeap) -> NumberValue {
-    match value {
-        Value::Number(n) => *n,
-        Value::Boolean(true) => NumberValue::from_i32(1),
-        Value::Boolean(false) | Value::Null => NumberValue::from_i32(0),
-        Value::Undefined => NumberValue::from_f64(f64::NAN),
-        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string(heap)),
-        Value::BigInt(_) => NumberValue::from_f64(f64::NAN),
-        _ => NumberValue::from_f64(f64::NAN),
+    if let Some(n) = value.as_number() {
+        return n;
     }
+    if let Some(b) = value.as_boolean() {
+        return NumberValue::from_i32(if b { 1 } else { 0 });
+    }
+    if value.is_null() {
+        return NumberValue::from_i32(0);
+    }
+    if value.is_undefined() {
+        return NumberValue::from_f64(f64::NAN);
+    }
+    if let Some(s) = value.as_string() {
+        return crate::number::to_number_from_string(&s.to_lossy_string(heap));
+    }
+    NumberValue::from_f64(f64::NAN)
 }
 
 /// §6.1.6.2.4 `BigInt::toInt64` — wrap to signed 64-bit. Non-BigInt
 /// values fall through `ToBigInt` (here approximated by 0 for
 /// non-coercible inputs; the dispatcher rejects bad types upstream).
 fn value_to_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
-    let big = match value {
-        Value::BigInt(b) => b.clone_inner(heap),
-        Value::Boolean(true) => BigInt::from(1),
-        Value::Boolean(false) => BigInt::from(0),
-        _ => return 0,
+    let big = if let Some(b) = value.as_big_int() {
+        b.clone_inner(heap)
+    } else if let Some(b) = value.as_boolean() {
+        BigInt::from(if b { 1 } else { 0 })
+    } else {
+        return 0;
     };
     let modulus: BigInt = BigInt::from(1u64) << 64;
     let mut wrapped: BigInt = &big % &modulus;
@@ -354,11 +358,12 @@ fn value_to_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
 
 /// §6.1.6.2.5 `BigInt::toUint64`.
 fn value_to_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
-    let big = match value {
-        Value::BigInt(b) => b.clone_inner(heap),
-        Value::Boolean(true) => BigInt::from(1),
-        Value::Boolean(false) => BigInt::from(0),
-        _ => return 0,
+    let big = if let Some(b) = value.as_big_int() {
+        b.clone_inner(heap)
+    } else if let Some(b) = value.as_boolean() {
+        BigInt::from(if b { 1 } else { 0 })
+    } else {
+        return 0;
     };
     let modulus: BigInt = BigInt::from(1u64) << 64;
     let mut wrapped: BigInt = &big % &modulus;

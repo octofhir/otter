@@ -220,18 +220,13 @@ fn ctor_prototype(
     heap: &mut otter_gc::GcHeap,
     ctor_name: &str,
 ) -> Option<JsObject> {
-    let ctor = object::get(global, heap, ctor_name)?;
-    let Value::NativeFunction(f) = ctor else {
-        return None;
-    };
+    let f = object::get(global, heap, ctor_name)?.as_native_function()?;
     let descriptor = f
         .own_property_descriptor(&mut *heap, "prototype")
         .ok()
         .flatten()?;
     match descriptor.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(obj),
-        } => Some(obj),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }
 }
@@ -246,8 +241,9 @@ fn install_collection(
     // Prototype Object — ordinary object linked to %Object.prototype%.
     let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -316,7 +312,7 @@ fn install_collection(
 fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let items = args.first().cloned().unwrap_or(Value::undefined());
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
-    if matches!(items, Value::Undefined | Value::Null) {
+    if items.is_undefined() || items.is_null() {
         return Err(NativeError::TypeError {
             name: "Map.groupBy",
             reason: "items must be iterable".to_string(),
@@ -354,29 +350,29 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         let key = ctx
             .cx
             .interp
-            .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)
+            .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
             .map_err(map_group_by_vm_error)?;
         let existing = crate::collections::map_get(result, ctx.heap(), &key);
-        let group_arr = match existing {
-            Some(Value::Array(arr)) => arr,
-            _ => {
-                let arr = ctx
-                    .array_from_elements_with_roots(
-                        std::iter::empty(),
-                        &[&result_value, &key, item],
-                        &[items_snapshot.as_slice()],
-                    )
-                    .map_err(|_| NativeError::TypeError {
-                        name: "Map.groupBy",
-                        reason: "out of memory".to_string(),
-                    })?;
-                crate::collections::map_set(result, ctx.heap_mut(), key, Value::Array(arr))
-                    .map_err(|_| NativeError::TypeError {
-                        name: "Map.groupBy",
-                        reason: "out of memory".to_string(),
-                    })?;
-                arr
-            }
+        let group_arr = if let Some(arr) = existing.and_then(|v| v.as_array()) {
+            arr
+        } else {
+            let arr = ctx
+                .array_from_elements_with_roots(
+                    std::iter::empty(),
+                    &[&result_value, &key, item],
+                    &[items_snapshot.as_slice()],
+                )
+                .map_err(|_| NativeError::TypeError {
+                    name: "Map.groupBy",
+                    reason: "out of memory".to_string(),
+                })?;
+            crate::collections::map_set(result, ctx.heap_mut(), key, Value::array(arr)).map_err(
+                |_| NativeError::TypeError {
+                    name: "Map.groupBy",
+                    reason: "out of memory".to_string(),
+                },
+            )?;
+            arr
         };
         let arr_value = Value::array(group_arr);
         let len = crate::array::len(group_arr, ctx.heap());
@@ -689,7 +685,7 @@ fn construct_collection(
     let target = alloc_collection(ctx, kind)?;
     apply_collection_new_target_prototype(ctx, &target, kind)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
-    if matches!(iterable, Value::Undefined | Value::Null) {
+    if iterable.is_undefined() || iterable.is_null() {
         return Ok(target);
     }
     add_entries_from_iterable(ctx, &target, &iterable, kind)?;
@@ -699,15 +695,15 @@ fn construct_collection(
 fn alloc_collection(ctx: &mut NativeCtx<'_>, kind: CollectionKind) -> Result<Value, NativeError> {
     let name = kind.name();
     match kind {
-        CollectionKind::Map => ctx.alloc_map().map(Value::Map).map_err(|_| oom(name)),
-        CollectionKind::Set => ctx.alloc_set().map(Value::Set).map_err(|_| oom(name)),
+        CollectionKind::Map => ctx.alloc_map().map(Value::map).map_err(|_| oom(name)),
+        CollectionKind::Set => ctx.alloc_set().map(Value::set).map_err(|_| oom(name)),
         CollectionKind::WeakMap => ctx
             .alloc_weak_map()
-            .map(Value::WeakMap)
+            .map(Value::weak_map)
             .map_err(|_| oom(name)),
         CollectionKind::WeakSet => ctx
             .alloc_weak_set()
-            .map(Value::WeakSet)
+            .map(Value::weak_set)
             .map_err(|_| oom(name)),
     }
 }
@@ -720,40 +716,34 @@ fn apply_collection_new_target_prototype(
     let Some(new_target) = ctx.new_target().cloned() else {
         return Ok(());
     };
-    let proto = match new_target {
-        Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
-        Value::Object(obj) => object::get(obj, ctx.heap(), "prototype").filter(|value| {
-            constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
-        }),
-        Value::NativeFunction(native) => native
+    let proto = if let Some(class) = new_target.as_class_constructor() {
+        Some(Value::object(class.prototype(ctx.heap())))
+    } else if let Some(obj) = new_target.as_object() {
+        object::get(obj, ctx.heap(), "prototype")
+            .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+    } else if let Some(native) = new_target.as_native_function() {
+        native
             .own_property_descriptor(ctx.heap_mut(), "prototype")
             .map_err(|err| NativeError::TypeError {
                 name: kind.name(),
                 reason: err.to_string(),
             })?
             .map(|descriptor| descriptor_value(&descriptor))
-            .filter(|value| {
-                constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
-            }),
-        _ => None,
+            .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+    } else {
+        None
     };
     let Some(proto) = proto else {
         return Ok(());
     };
-    match target {
-        Value::Map(map) => {
-            collections::set_map_prototype_override(*map, ctx.heap_mut(), Some(proto))
-        }
-        Value::Set(set) => {
-            collections::set_set_prototype_override(*set, ctx.heap_mut(), Some(proto))
-        }
-        Value::WeakMap(map) => {
-            collections::set_weak_map_prototype_override(*map, ctx.heap_mut(), Some(proto))
-        }
-        Value::WeakSet(set) => {
-            collections::set_weak_set_prototype_override(*set, ctx.heap_mut(), Some(proto))
-        }
-        _ => {}
+    if let Some(map) = target.as_map() {
+        collections::set_map_prototype_override(map, ctx.heap_mut(), Some(proto));
+    } else if let Some(set) = target.as_set() {
+        collections::set_set_prototype_override(set, ctx.heap_mut(), Some(proto));
+    } else if let Some(map) = target.as_weak_map() {
+        collections::set_weak_map_prototype_override(map, ctx.heap_mut(), Some(proto));
+    } else if let Some(set) = target.as_weak_set() {
+        collections::set_weak_set_prototype_override(set, ctx.heap_mut(), Some(proto));
     }
     Ok(())
 }
@@ -825,10 +815,11 @@ fn add_entries_from_iterable(
 /// [`crate::Interpreter::iterator_to_list_sync`]'s fast-path
 /// branches.
 fn iterable_uses_fast_materialization(iterable: &Value) -> bool {
-    matches!(
-        iterable,
-        Value::Array(_) | Value::String(_) | Value::Map(_) | Value::Set(_) | Value::Generator(_)
-    )
+    iterable.is_array()
+        || iterable.is_string()
+        || iterable.is_map()
+        || iterable.is_set()
+        || iterable.is_generator()
 }
 
 fn add_entries_eager(
@@ -1568,49 +1559,41 @@ fn weak_set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 // ---------------------------------------------------------------
 
 fn receiver_map(ctx: &NativeCtx<'_>, name: &'static str) -> Result<crate::JsMap, NativeError> {
-    match ctx.this_value() {
-        Value::Map(m) => Ok(*m),
-        _ => Err(NativeError::TypeError {
-            name,
-            reason: "this is not a Map".to_string(),
-        }),
-    }
+    ctx.this_value().as_map().ok_or(NativeError::TypeError {
+        name,
+        reason: "this is not a Map".to_string(),
+    })
 }
 
 fn receiver_set(ctx: &NativeCtx<'_>, name: &'static str) -> Result<crate::JsSet, NativeError> {
-    match ctx.this_value() {
-        Value::Set(s) => Ok(*s),
-        _ => Err(NativeError::TypeError {
-            name,
-            reason: "this is not a Set".to_string(),
-        }),
-    }
+    ctx.this_value().as_set().ok_or(NativeError::TypeError {
+        name,
+        reason: "this is not a Set".to_string(),
+    })
 }
 
 fn receiver_weak_map(
     ctx: &NativeCtx<'_>,
     name: &'static str,
 ) -> Result<crate::JsWeakMap, NativeError> {
-    match ctx.this_value() {
-        Value::WeakMap(m) => Ok(*m),
-        _ => Err(NativeError::TypeError {
+    ctx.this_value()
+        .as_weak_map()
+        .ok_or(NativeError::TypeError {
             name,
             reason: "this is not a WeakMap".to_string(),
-        }),
-    }
+        })
 }
 
 fn receiver_weak_set(
     ctx: &NativeCtx<'_>,
     name: &'static str,
 ) -> Result<crate::JsWeakSet, NativeError> {
-    match ctx.this_value() {
-        Value::WeakSet(s) => Ok(*s),
-        _ => Err(NativeError::TypeError {
+    ctx.this_value()
+        .as_weak_set()
+        .ok_or(NativeError::TypeError {
             name,
             reason: "this is not a WeakSet".to_string(),
-        }),
-    }
+        })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1699,16 +1682,21 @@ fn get_set_record(
     other: Value,
     name: &'static str,
 ) -> Result<SetRecord, NativeError> {
-    match other {
-        Value::Set(set) => Ok(SetRecord::Set {
+    if let Some(set) = other.as_set() {
+        return Ok(SetRecord::Set {
             set,
             size: collections::set_len(set, ctx.heap()) as f64,
-        }),
-        Value::Map(map) => Ok(SetRecord::Map {
+        });
+    }
+    if let Some(map) = other.as_map() {
+        return Ok(SetRecord::Map {
             map,
             size: collections::map_len(map, ctx.heap()) as f64,
-        }),
-        value => {
+        });
+    }
+    let value = other;
+    {
+        {
             if !value_is_object_like(&value) {
                 return Err(NativeError::TypeError {
                     name,
@@ -1791,10 +1779,10 @@ fn set_record_keys(
                 .interp_mut()
                 .run_callable_sync(context, keys, *set, SmallVec::new())
                 .map_err(|err| vm_to_native(err, name))?;
-            if let Value::Generator(handle) = iterator {
+            if let Some(handle) = iterator.as_generator() {
                 return Ok(SetRecordKeys::Generator { handle });
             }
-            if matches!(iterator, Value::Iterator(_)) {
+            if iterator.is_iterator() {
                 let values = ctx
                     .interp_mut()
                     .iterator_to_list_sync(context, &iterator)
@@ -1849,10 +1837,10 @@ fn set_record_next_key(
                 .resume_generator(
                     context,
                     handle,
-                    crate::GeneratorResumeKind::Next(Value::Undefined),
+                    crate::GeneratorResumeKind::Next(Value::undefined()),
                 )
                 .map_err(|err| vm_to_native(err, name))?;
-            let Value::Object(record) = result else {
+            let Some(record) = result.as_object() else {
                 return Err(NativeError::TypeError {
                     name,
                     reason: "generator next did not return an object".to_string(),
@@ -1955,8 +1943,11 @@ fn iterator_has_callable_iterator(
             .run_callable_sync(context, &getter, *target, SmallVec::new())
             .map_err(|err| vm_to_native(err, name))?,
     };
-    Ok(!matches!(method, Value::Undefined | Value::Null)
-        && ctx.interp_mut().is_callable_runtime(&method))
+    Ok(
+        !method.is_undefined()
+            && !method.is_null()
+            && ctx.interp_mut().is_callable_runtime(&method),
+    )
 }
 
 fn to_number_runtime(
@@ -1972,51 +1963,27 @@ fn to_number_runtime(
             .evaluate_to_primitive(context, value, crate::abstract_ops::ToPrimitiveHint::Number)
             .map_err(|err| vm_to_native(err, name))?
     };
-    match primitive {
-        Value::Symbol(_) | Value::BigInt(_) => Err(NativeError::TypeError {
+    if primitive.is_symbol() || primitive.is_big_int() {
+        return Err(NativeError::TypeError {
             name,
             reason: "cannot convert value to number".to_string(),
-        }),
-        value => Ok(crate::number::to_number_value(&value, ctx.heap())),
+        });
     }
+    Ok(crate::number::to_number_value(&primitive, ctx.heap()))
 }
 
 fn normalize_set_key(value: Value) -> Value {
-    match value {
-        Value::Number(crate::NumberValue::Double(n)) if n == 0.0 && n.is_sign_negative() => {
-            Value::Number(crate::NumberValue::from_i32(0))
-        }
-        value => value,
+    if let Some(crate::NumberValue::Double(d)) = value.as_number()
+        && d == 0.0
+        && d.is_sign_negative()
+    {
+        return Value::number_i32(0);
     }
+    value
 }
 
 fn value_is_object_like(v: &Value) -> bool {
-    matches!(
-        v,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Promise(_)
-            | Value::Iterator(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Temporal(_)
-            | Value::Intl(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-            | Value::Proxy(_)
-    )
+    v.is_object_like()
 }
 
 fn oom(name: &'static str) -> NativeError {
@@ -2081,23 +2048,18 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Interpreter, NativeCallInfo, NumberValue};
+    use crate::{Interpreter, NativeCallInfo};
 
     #[test]
     fn native_set_iterator_uses_rooted_iterator_state_allocation() {
         let mut interp = Interpreter::new();
         let set = collections::alloc_set(interp.gc_heap_mut()).expect("set");
-        collections::set_add(
-            set,
-            interp.gc_heap_mut(),
-            Value::Number(NumberValue::from_i32(1)),
-        )
-        .expect("seed");
+        collections::set_add(set, interp.gc_heap_mut(), Value::number_i32(1)).expect("seed");
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = {
             let mut ctx =
-                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::Set(set)));
+                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::set(set)));
             set_proto_values(&mut ctx, &[]).expect("set values")
         };
 
@@ -2106,7 +2068,7 @@ mod tests {
             after > before,
             "Set iterator native path should allocate snapshot array and iterator state in young space"
         );
-        assert!(matches!(result, Value::Iterator(_)));
+        assert!(result.is_iterator());
     }
 
     #[test]
@@ -2116,15 +2078,15 @@ mod tests {
         collections::map_set(
             map,
             interp.gc_heap_mut(),
-            Value::Number(NumberValue::from_i32(1)),
-            Value::Number(NumberValue::from_i32(2)),
+            Value::number_i32(1),
+            Value::number_i32(2),
         )
         .expect("seed");
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = {
             let mut ctx =
-                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::Map(map)));
+                NativeCtx::new_with_call_info(&mut interp, NativeCallInfo::call(Value::map(map)));
             make_map_iterator(&mut ctx, map, MapIterKind::Entries).expect("map entries")
         };
 
@@ -2133,6 +2095,6 @@ mod tests {
             after > before,
             "Map iterator native path should allocate snapshot arrays and iterator state in young space"
         );
-        assert!(matches!(result, Value::Iterator(_)));
+        assert!(result.is_iterator());
     }
 }

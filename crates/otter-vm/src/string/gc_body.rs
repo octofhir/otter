@@ -574,18 +574,26 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
     if a == b {
         return true;
     }
-    let a_len = heap.read_payload(a, |body| body.len);
-    let b_len = heap.read_payload(b, |body| body.len);
+    let (a_len, a_hash, a_is_cons) = heap.read_payload(a, |body| {
+        (body.len, body.hash, matches!(body.repr, JsStringBodyRepr::Cons { .. }))
+    });
+    let (b_len, b_hash, b_is_cons) = heap.read_payload(b, |body| {
+        (body.len, body.hash, matches!(body.repr, JsStringBodyRepr::Cons { .. }))
+    });
     if a_len != b_len {
         return false;
     }
     if a_len == 0 {
         return true;
     }
-    // Cannot short-circuit on `body.hash` mismatch: cons-rope bodies
-    // carry a placeholder hash (see `fnv_combine`) that does not
-    // match the FNV-1a of the flattened content. Walk both bodies'
-    // UTF-16 representations to settle equality.
+    // `body.hash` matches the FNV-1a of the flattened content only
+    // when neither side is a cons rope: cons bodies carry a
+    // placeholder hash (see `fnv_combine`). When both sides are
+    // non-cons, mismatched hashes are a fast reject; otherwise fall
+    // through to the body walk.
+    if !a_is_cons && !b_is_cons && a_hash != b_hash {
+        return false;
+    }
     to_utf16_vec(heap, a) == to_utf16_vec(heap, b)
 }
 

@@ -37,41 +37,7 @@ enum BindMetadataGet {
 }
 
 // Mirrors the matches! variant list used by `OrdinaryHasInstance` and
-// `function_metadata` callers: ordinary-object shapes excluding
-// Iterator / Generator / Temporal / Intl (which are not treated as
-// instance-target candidates by the existing dispatchers).
-fn is_instance_object_value(v: &Value) -> bool {
-    v.is_object()
-        || v.is_proxy()
-        || v.is_array()
-        || v.is_function()
-        || v.is_closure()
-        || v.is_native_function()
-        || v.is_bound_function()
-        || v.is_class_constructor()
-        || v.is_regexp()
-        || v.is_map()
-        || v.is_set()
-        || v.is_weak_map()
-        || v.is_weak_set()
-        || v.is_weak_ref()
-        || v.is_finalization_registry()
-        || v.is_promise()
-        || v.is_array_buffer()
-        || v.is_data_view()
-        || v.is_typed_array()
-}
 
-// Callable-or-object shapes used by the bind / metadata helpers.
-fn is_callable_or_object_value(v: &Value) -> bool {
-    v.is_object()
-        || v.is_proxy()
-        || v.is_function()
-        || v.is_closure()
-        || v.is_native_function()
-        || v.is_bound_function()
-        || v.is_class_constructor()
-}
 
 impl Interpreter {
     pub(crate) fn run_make_function_reg(
@@ -476,7 +442,7 @@ impl Interpreter {
             let (target, _, _) = bound.parts(&self.gc_heap);
             return self.instanceof_operator(context, o, &target);
         }
-        if !is_instance_object_value(o) {
+        if !o.is_object_type() {
             return Ok(false);
         }
         let Some(prototype) = self.instanceof_target_prototype(context, c)? else {
@@ -505,7 +471,7 @@ impl Interpreter {
             let (target, _, _) = bound.parts(&self.gc_heap);
             return self.instanceof_operator_stack_rooted(context, stack, o, &target);
         }
-        if !is_instance_object_value(o) {
+        if !o.is_object_type() {
             return Ok(false);
         }
         let Some(prototype) = self.instanceof_target_prototype_stack_rooted(context, stack, c)?
@@ -531,7 +497,7 @@ impl Interpreter {
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
-        if !is_callable_or_object_value(target) {
+        if !target.is_object_type() {
             return Err(VmError::TypeError {
                 message: "Right-hand side of instanceof is not an object".to_string(),
             });
@@ -578,7 +544,7 @@ impl Interpreter {
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
-        if !is_callable_or_object_value(target) {
+        if !target.is_object_type() {
             return Err(VmError::TypeError {
                 message: "Right-hand side of instanceof is not an object".to_string(),
             });
@@ -630,7 +596,7 @@ impl Interpreter {
         // per spec), plus the exotic objects with their own
         // `[[Get]]` ladder (RegExp, ArrayBuffer, DataView,
         // TypedArray, collections, etc.).
-        if !is_instance_object_value(&value) {
+        if !value.is_object_type() {
             return Err(VmError::TypeError {
                 message: "Function.prototype.apply argument list must be object-like".to_string(),
             });

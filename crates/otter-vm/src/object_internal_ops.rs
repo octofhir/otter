@@ -41,28 +41,6 @@ pub(crate) enum ObjectIntegrityLevel {
 /// Full object-shaped family used by §10 internal-method dispatchers
 /// (excluding the Object/Proxy ordinary fast paths the callers handle
 /// directly).
-fn is_extended_object_value(v: &Value) -> bool {
-    v.is_object()
-        || v.is_array()
-        || v.is_native_function()
-        || v.is_function()
-        || v.is_closure()
-        || v.is_bound_function()
-        || v.is_class_constructor()
-        || v.is_regexp()
-        || v.is_map()
-        || v.is_set()
-        || v.is_weak_map()
-        || v.is_weak_set()
-        || v.is_weak_ref()
-        || v.is_finalization_registry()
-        || v.is_promise()
-        || v.is_array_buffer()
-        || v.is_data_view()
-        || v.is_typed_array()
-        || v.is_iterator()
-        || v.is_generator()
-}
 
 /// Convert an already-primitive value to a [`VmPropertyKey`] per
 /// §7.1.19 step 2-3: Symbol values pass through unchanged; every
@@ -773,7 +751,7 @@ impl Interpreter {
                 ),
             };
         }
-        if is_extended_object_value(&value) {
+        if value.is_object_type() {
             return self.get_prototype_for_op(&value);
         }
         Err(VmError::TypeMismatch)
@@ -1738,7 +1716,7 @@ impl Interpreter {
         // Step 1 — `Type(Obj) is not Object → throw TypeError`. We
         // gate via the broader "type Object" check that includes
         // proxies / exotic value kinds.
-        if !is_extended_object_value(attributes) {
+        if !attributes.is_object_type() {
             return Err(VmError::TypeError {
                 message: "ToPropertyDescriptor argument must be an Object".to_string(),
             });

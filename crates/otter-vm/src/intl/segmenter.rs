@@ -28,16 +28,13 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> S
 }
 
 fn require_payload(args: &IntrinsicArgs<'_>) -> Result<SegmenterPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::Segmenter(p) => Ok(p),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.Segmenter",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.Segmenter",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.Segmenter",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::Segmenter(p) => Ok(p),
+        _ => Err(bad()),
     }
 }
 
@@ -96,16 +93,18 @@ fn segment(text: &str, granularity: &str) -> Vec<(usize, String)> {
 /// existing iterator-protocol path.
 fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let text = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        Some(Value::Number(n)) => n.to_display_string(),
-        Some(Value::Boolean(b)) => (if *b { "true" } else { "false" }).to_string(),
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a string",
-            });
-        }
+    let first = args.args.first();
+    let text = if let Some(s) = first.and_then(|v| v.as_string()) {
+        s.to_lossy_string(args.gc_heap)
+    } else if let Some(n) = first.and_then(|v| v.as_number()) {
+        n.to_display_string()
+    } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
+        (if b { "true" } else { "false" }).to_string()
+    } else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a string",
+        });
     };
     let segments = segment(&text, &payload.granularity);
     let input_value = Value::string(crate::string::JsString::from_str(&text, args.gc_heap)?);
@@ -125,15 +124,10 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             args.alloc_object_rooted(&[seg_str, &input_value], &[&prepared_values, &elements])?;
         let heap = &mut *args.gc_heap;
         crate::object::set(obj, heap, "segment", *seg_str);
-        crate::object::set(
-            obj,
-            heap,
-            "index",
-            Value::Number(crate::number::NumberValue::from_i32(*idx)),
-        );
+        crate::object::set(obj, heap, "index", Value::number_i32(*idx));
         crate::object::set(obj, heap, "input", input_value);
         if granularity_word {
-            crate::object::set(obj, heap, "isWordLike", Value::Boolean(*wordlike));
+            crate::object::set(obj, heap, "isWordLike", Value::boolean(*wordlike));
         }
         elements.push(Value::object(obj));
     }
@@ -221,6 +215,6 @@ mod tests {
             after > before,
             "Intl.Segmenter.prototype.segment should allocate segment objects and result array in young space"
         );
-        assert!(matches!(result, Value::Array(_)));
+        assert!(result.is_array());
     }
 }

@@ -59,8 +59,9 @@ fn parse_arg(
     index: u16,
     method: &'static str,
 ) -> Result<temporal_rs::PlainDate, TemporalError> {
-    match args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+    let arg = args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(gc_heap) {
             TemporalPayload::PlainDate(v) => Ok(v),
             _ => Err(TemporalError::BadArgument {
                 class: "PlainDate",
@@ -68,22 +69,22 @@ fn parse_arg(
                 index,
                 reason: "must be a Temporal.PlainDate",
             }),
-        },
-        Some(Value::String(s)) => {
-            temporal_rs::PlainDate::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
-                TemporalError::Engine {
-                    class: "PlainDate",
-                    method,
-                    message: e.to_string(),
-                }
-            })
         }
-        _ => Err(TemporalError::BadArgument {
+    } else if let Some(s) = arg.and_then(|v| v.as_string()) {
+        temporal_rs::PlainDate::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
+            TemporalError::Engine {
+                class: "PlainDate",
+                method,
+                message: e.to_string(),
+            }
+        })
+    } else {
+        Err(TemporalError::BadArgument {
             class: "PlainDate",
             method,
             index,
             reason: "must be a Temporal.PlainDate or ISO string",
-        }),
+        })
     }
 }
 
@@ -92,17 +93,17 @@ fn parse_arg(
 pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     let pd = match temporal.payload_clone(gc_heap) {
         TemporalPayload::PlainDate(v) => v,
-        _ => return Value::Undefined,
+        _ => return Value::undefined(),
     };
     match name {
-        "year" => Value::number(NumberValue::from_i32(pd.year())),
-        "month" => Value::number(NumberValue::from_i32(pd.month() as i32)),
-        "day" => Value::number(NumberValue::from_i32(pd.day() as i32)),
-        "dayOfWeek" => Value::number(NumberValue::from_i32(pd.day_of_week() as i32)),
-        "dayOfYear" => Value::number(NumberValue::from_i32(pd.day_of_year() as i32)),
-        "daysInMonth" => Value::number(NumberValue::from_i32(pd.days_in_month() as i32)),
-        "daysInYear" => Value::number(NumberValue::from_i32(pd.days_in_year() as i32)),
-        "monthsInYear" => Value::number(NumberValue::from_i32(pd.months_in_year() as i32)),
+        "year" => Value::number_i32(pd.year()),
+        "month" => Value::number_i32(pd.month() as i32),
+        "day" => Value::number_i32(pd.day() as i32),
+        "dayOfWeek" => Value::number_i32(pd.day_of_week() as i32),
+        "dayOfYear" => Value::number_i32(pd.day_of_year() as i32),
+        "daysInMonth" => Value::number_i32(pd.days_in_month() as i32),
+        "daysInYear" => Value::number_i32(pd.days_in_year() as i32),
+        "monthsInYear" => Value::number_i32(pd.months_in_year() as i32),
         "inLeapYear" => Value::boolean(pd.in_leap_year()),
         _ => Value::undefined(),
     }
@@ -132,8 +133,9 @@ fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 
 fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
-    let other = match args.args.first() {
-        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+    let first = args.args.first();
+    let other = if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDate(v) => v,
             _ => {
                 return Err(IntrinsicError::BadArgument {
@@ -141,17 +143,15 @@ fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                     reason: "must be a Temporal.PlainDate",
                 });
             }
-        },
-        Some(Value::String(s)) => {
-            temporal_rs::PlainDate::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
-                .map_err(temporal_err)?
         }
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a Temporal.PlainDate or ISO string",
-            });
-        }
+    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+        temporal_rs::PlainDate::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
+            .map_err(temporal_err)?
+    } else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a Temporal.PlainDate or ISO string",
+        });
     };
     Ok(Value::boolean(
         pd.compare_iso(&other) == std::cmp::Ordering::Equal,
@@ -162,25 +162,24 @@ fn duration_arg(
     args: &IntrinsicArgs<'_>,
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
-    match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+    let bad = || IntrinsicError::BadArgument {
+        index,
+        reason: "must be a Temporal.Duration",
+    };
+    let arg = args.args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
-            _ => Err(IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration",
-            }),
-        },
-        Some(Value::Object(obj)) => {
-            let heap = &*args.gc_heap;
-            partial_from_object(obj, heap).map_err(|_| IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration partial",
-            })
+            _ => Err(bad()),
         }
-        _ => Err(IntrinsicError::BadArgument {
+    } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
+        let heap = &*args.gc_heap;
+        partial_from_object(&obj, heap).map_err(|_| IntrinsicError::BadArgument {
             index,
-            reason: "must be a Temporal.Duration",
-        }),
+            reason: "must be a Temporal.Duration partial",
+        })
+    } else {
+        Err(bad())
     }
 }
 

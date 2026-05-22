@@ -52,27 +52,28 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> P
 }
 
 fn require_payload(args: &IntrinsicArgs<'_>) -> Result<PluralRulesPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::PluralRules(p) => Ok(p),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.PluralRules",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.PluralRules",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.PluralRules",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::PluralRules(p) => Ok(p),
+        _ => Err(bad()),
     }
 }
 
 /// §15.5.4 — `Intl.PluralRules.prototype.select(value)`.
 fn impl_select(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let n = match args.args.first() {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        _ => f64::NAN,
+    let first = args.args.first();
+    let n = if let Some(n) = first.and_then(|v| v.as_number()) {
+        n.as_f64()
+    } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
+        if b { 1.0 } else { 0.0 }
+    } else if first.is_some_and(|v| v.is_null()) {
+        0.0
+    } else {
+        f64::NAN
     };
     Ok(Value::string(crate::string::JsString::from_str(
         plural_category_en(n, &payload.kind),
@@ -92,24 +93,9 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let heap = &mut *args.gc_heap;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
-    crate::object::set(
-        obj,
-        heap,
-        "minimumIntegerDigits",
-        Value::Number(crate::number::NumberValue::from_i32(mid)),
-    );
-    crate::object::set(
-        obj,
-        heap,
-        "minimumFractionDigits",
-        Value::Number(crate::number::NumberValue::from_i32(mfd)),
-    );
-    crate::object::set(
-        obj,
-        heap,
-        "maximumFractionDigits",
-        Value::Number(crate::number::NumberValue::from_i32(xfd)),
-    );
+    crate::object::set(obj, heap, "minimumIntegerDigits", Value::number_i32(mid));
+    crate::object::set(obj, heap, "minimumFractionDigits", Value::number_i32(mfd));
+    crate::object::set(obj, heap, "maximumFractionDigits", Value::number_i32(xfd));
     Ok(Value::object(obj))
 }
 

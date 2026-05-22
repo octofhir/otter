@@ -56,8 +56,9 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     // Prototype object linked to %Object.prototype%.
     let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -105,7 +106,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     }
 
     // §27.2.4 — static methods.
-    let ctor_roots = vec![global_root, Value::Object(prototype)];
+    let ctor_roots = vec![global_root, Value::object(prototype)];
     define_ctor_method(
         heap,
         ctor,
@@ -164,7 +165,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         global,
         heap,
         <Intrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-        Value::NativeFunction(ctor),
+        Value::native_function(ctor),
     );
     Ok(())
 }
@@ -181,7 +182,8 @@ pub fn install_promise_well_knowns_post_bootstrap(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "Promise") else {
+    let Some(ctor) = object::get(global, heap, "Promise").and_then(|v| v.as_native_function())
+    else {
         return Ok(());
     };
     let global_root = Value::object(global);
@@ -198,7 +200,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
         heap,
         &well_known.get(WellKnown::Species),
         PartialPropertyDescriptor {
-            get: Some(Value::NativeFunction(species_getter)),
+            get: Some(Value::native_function(species_getter)),
             enumerable: Some(false),
             configurable: Some(true),
             ..Default::default()
@@ -213,9 +215,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
@@ -228,7 +228,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
         heap,
         &well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
-            value: Some(Value::String(tag)),
+            value: Some(Value::string(tag)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -290,7 +290,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let invoke_args: SmallVec<[Value; 8]> = smallvec::smallvec![resolve, reject];
     let invoke_result =
         ctx.interp_mut()
-            .run_callable_sync(&context, &executor, Value::Undefined, invoke_args);
+            .run_callable_sync(&context, &executor, Value::undefined(), invoke_args);
     if let Err(err) = invoke_result {
         // §27.2.1.4 step 3 — wrap the abrupt completion's value,
         // route it through the captured native `reject`. The
@@ -300,7 +300,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         let _ = ctx.interp_mut().run_callable_sync(
             &context,
             &reject,
-            Value::Undefined,
+            Value::undefined(),
             smallvec::smallvec![reason],
         );
     }
@@ -376,9 +376,9 @@ fn invoke_static(
 // ---------------------------------------------------------------
 
 fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let promise = match ctx.this_value() {
-        Value::Promise(p) => *p,
-        _ => {
+    let promise = match ctx.this_value().as_promise() {
+        Some(p) => p,
+        None => {
             return Err(NativeError::TypeError {
                 name: "Promise.prototype.then",
                 reason: "`this` is not a Promise".to_string(),
@@ -403,7 +403,7 @@ fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let on_rejected = args.first().cloned().unwrap_or(Value::undefined());
-    promise_dispatch::invoke_then(ctx, this_value, Value::Undefined, on_rejected)
+    promise_dispatch::invoke_then(ctx, this_value, Value::undefined(), on_rejected)
 }
 
 fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -438,7 +438,7 @@ fn define_ctor_method(
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let attrs = Attr::builtin_function();
     let desc = PropertyDescriptor::data(
-        Value::NativeFunction(func),
+        Value::native_function(func),
         attrs.writable,
         attrs.enumerable,
         attrs.configurable,
@@ -457,7 +457,7 @@ fn oom(name: &'static str) -> NativeError {
 }
 
 fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Value {
-    Value::String(
+    Value::string(
         crate::JsString::from_str(&err.to_string(), heap).unwrap_or_else(|_| {
             crate::JsString::from_str("", heap).expect("empty string allocates")
         }),

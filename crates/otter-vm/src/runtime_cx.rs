@@ -133,7 +133,7 @@ impl NativeCallInfo {
     /// Foundation default for legacy callers.
     #[must_use]
     pub fn default_call() -> Self {
-        Self::call(Value::Undefined)
+        Self::call(Value::undefined())
     }
 }
 
@@ -819,7 +819,7 @@ impl<'rt> NativeCtx<'rt> {
         })?;
         self.cx.interp.microtasks_mut().enqueue(crate::Microtask {
             callee,
-            this_value: Value::Undefined,
+            this_value: Value::undefined(),
             args: args.into_iter().collect(),
             context: Some(context),
             result_capability: None,
@@ -857,9 +857,7 @@ pub(crate) fn visit_native_roots(
 #[cfg(test)]
 mod tests {
     use super::{NativeCallInfo, NativeCtx};
-    use crate::{
-        Interpreter, NativeError, NumberValue, Value, error_classes::ErrorKind, native_value_static,
-    };
+    use crate::{Interpreter, NativeError, Value, error_classes::ErrorKind, native_value_static};
 
     #[test]
     fn native_ctx_object_allocation_uses_young_space() {
@@ -883,12 +881,12 @@ mod tests {
         {
             let mut ctx = NativeCtx::new_with_call_info(
                 &mut interp,
-                NativeCallInfo::call(Value::Number(NumberValue::from_i32(7))),
+                NativeCallInfo::call(Value::number_i32(7)),
             );
             let array = ctx
-                .array_from_elements([Value::number(NumberValue::from_i32(1))])
+                .array_from_elements([Value::number_i32(1)])
                 .expect("native array allocation");
-            ctx.array_push(array, Value::Number(NumberValue::from_i32(2)))
+            ctx.array_push(array, Value::number_i32(2))
                 .expect("native array growth");
         }
         let after = interp.gc_heap().stats().new_allocated_bytes;
@@ -905,20 +903,13 @@ mod tests {
         {
             let mut ctx = NativeCtx::new_with_call_info(
                 &mut interp,
-                NativeCallInfo::construct(
-                    Value::Undefined,
-                    Some(Value::Number(NumberValue::from_i32(1))),
-                ),
+                NativeCallInfo::construct(Value::undefined(), Some(Value::number_i32(1))),
             );
             let mut map = ctx.alloc_map().expect("native map allocation");
-            ctx.map_set(
-                &mut map,
-                Value::Number(NumberValue::from_i32(1)),
-                Value::Number(NumberValue::from_i32(2)),
-            )
-            .expect("native map insert");
+            ctx.map_set(&mut map, Value::number_i32(1), Value::number_i32(2))
+                .expect("native map insert");
             let mut set = ctx.alloc_set().expect("native set allocation");
-            ctx.set_add(&mut set, Value::Number(NumberValue::from_i32(3)))
+            ctx.set_add(&mut set, Value::number_i32(3))
                 .expect("native set insert");
             let weak_key = Value::object(ctx.alloc_object().expect("native weak key"));
             let weak_value = Value::object(ctx.alloc_object().expect("native weak value"));
@@ -949,7 +940,7 @@ mod tests {
         {
             let mut ctx = NativeCtx::new_with_call_info(
                 &mut interp,
-                NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
+                NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
             );
             let target = Value::object(ctx.alloc_object().expect("target"));
             let _weak_ref = ctx
@@ -973,16 +964,15 @@ mod tests {
         {
             let mut ctx = NativeCtx::new_with_call_info(
                 &mut interp,
-                NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
+                NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
             );
             let registry = ctx.interp_mut().error_classes_clone();
             let error = registry
                 .make_instance_native_rooted(&mut ctx, ErrorKind::TypeError, Some("boom"), &[], &[])
                 .expect("native error allocation");
-            assert!(matches!(
-                crate::object::get(error, ctx.heap(), "message"),
-                Some(Value::String(_))
-            ));
+            assert!(
+                crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string())
+            );
         }
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(
@@ -998,10 +988,10 @@ mod tests {
         {
             let mut ctx = NativeCtx::new_with_call_info(
                 &mut interp,
-                NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
+                NativeCallInfo::construct(Value::undefined(), Some(Value::undefined())),
             );
             let registry = ctx.interp_mut().error_classes_clone();
-            let errors = [Value::number(NumberValue::from_i32(1))];
+            let errors = [Value::number_i32(1)];
             let error = registry
                 .make_aggregate_instance_native_rooted(
                     &mut ctx,
@@ -1011,10 +1001,7 @@ mod tests {
                     &[],
                 )
                 .expect("native aggregate error allocation");
-            assert!(matches!(
-                crate::object::get(error, ctx.heap(), "errors"),
-                Some(Value::Array(_))
-            ));
+            assert!(crate::object::get(error, ctx.heap(), "errors").is_some_and(|v| v.is_array()));
         }
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(

@@ -38,6 +38,22 @@ use crate::{
     symbol_prototype, temporal, weak_refs, write_register,
 };
 
+/// Object-like family that needs §7.1.1 `ToPrimitive` coercion before
+/// numeric / string arithmetic. Mirrors the matches! variant list used
+/// throughout `CallMethodValue` arg-coercion preambles: every object-
+/// shaped value plus `RegExp` (which carries an expando bag).
+fn needs_to_primitive(v: &Value) -> bool {
+    v.is_object()
+        || v.is_array()
+        || v.is_function()
+        || v.is_closure()
+        || v.is_native_function()
+        || v.is_bound_function()
+        || v.is_class_constructor()
+        || v.is_proxy()
+        || v.is_regexp()
+}
+
 impl Interpreter {
     /// Handle `Op::CallMethodValue`: the universal method-call op.
     /// Branches by receiver kind:
@@ -79,8 +95,8 @@ impl Interpreter {
         // expando overrides (`p.then = fn`) take priority and
         // route through the ordinary callable path so test262
         // can observe Symbol.species / custom-then plumbing.
-        if let Value::Promise(p) = &recv_value {
-            let promise = *p;
+        if let Some(p) = recv_value.as_promise() {
+            let promise = p;
             if let Some(bag) = promise.expando(&self.gc_heap)
                 && let Some(method) = crate::object::get(bag, &self.gc_heap, name)
                 && self.is_callable_runtime(&method)
@@ -108,7 +124,7 @@ impl Interpreter {
         // `forEach` on a collection requires a callback dispatch
         // that pushes a frame; lives outside the static intrinsic
         // table so it can drive `self.invoke`.
-        if name == "forEach" && matches!(&recv_value, Value::Map(_) | Value::Set(_)) {
+        if name == "forEach" && (recv_value.is_map() || recv_value.is_set()) {
             return self.do_collection_for_each(stack, context, &recv_value, &arg_values, dst);
         }
 
@@ -117,7 +133,7 @@ impl Interpreter {
         // through the native context path instead of the synchronous
         // intrinsic table, which has no interpreter re-entry handle.
         // <https://tc39.es/ecma262/#sec-getsetrecord>
-        if matches!(&recv_value, Value::Set(_)) && bootstrap_collections::is_set_method_name(name) {
+        if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
             let result = {
                 let mut ctx = NativeCtx::new_with_call_info_and_context(
                     self,
@@ -137,8 +153,8 @@ impl Interpreter {
         // value, route through the dedicated dispatcher that builds
         // lazy wrappers / drains for terminals.
         // <https://tc39.es/proposal-iterator-helpers/>
-        if let Value::Iterator(rc) = &recv_value {
-            let iter_rc = *rc;
+        if let Some(rc) = recv_value.as_iterator() {
+            let iter_rc = rc;
             if self.iterator_helper_dispatch(stack, context, &iter_rc, name, &arg_values, dst)? {
                 return Ok(());
             }
@@ -149,7 +165,7 @@ impl Interpreter {
         // resume helper drives a sub-dispatch until the next Yield
         // or completion.
         // <https://tc39.es/ecma262/#sec-generator-objects>
-        if let Value::Generator(g) = &recv_value {
+        if let Some(g) = recv_value.as_generator() {
             let kind = match name {
                 "next" => Some(GeneratorResumeKind::Next(
                     arg_values.first().cloned().unwrap_or(Value::undefined()),
@@ -163,7 +179,6 @@ impl Interpreter {
                 _ => None,
             };
             if let Some(kind) = kind {
-                let g = *g;
                 let is_async_gen = g.is_async(&self.gc_heap);
                 if is_async_gen {
                     // §27.6.3 — async-generator method calls always
@@ -199,7 +214,7 @@ impl Interpreter {
                                     self.run_callable_sync(
                                         &request_context,
                                         &req.reject,
-                                        Value::Undefined,
+                                        Value::undefined(),
                                         smallvec::smallvec![thrown],
                                     )?;
                                 }
@@ -247,23 +262,24 @@ impl Interpreter {
         // prototype slot. Found methods invoke with the Generator
         // as the receiver so the foundation's
         // `iterator_receiver` wraps it on entry.
-        if matches!(&recv_value, Value::Generator(_)) {
-            let iterator_proto =
-                match crate::object::get(self.global_this, &self.gc_heap, "Iterator") {
-                    Some(Value::Object(ctor)) => {
-                        crate::object::get(ctor, &self.gc_heap, "prototype")
-                    }
-                    Some(Value::NativeFunction(ctor)) => ctor
-                        .own_property_descriptor(&mut self.gc_heap, "prototype")
+        if recv_value.is_generator() {
+            let iterator_proto = {
+                let v = crate::object::get(self.global_this, &self.gc_heap, "Iterator");
+                if let Some(ctor) = v.and_then(|v| v.as_object()) {
+                    crate::object::get(ctor, &self.gc_heap, "prototype")
+                } else if let Some(ctor) = v.and_then(|v| v.as_native_function()) {
+                    ctor.own_property_descriptor(&mut self.gc_heap, "prototype")
                         .ok()
                         .flatten()
                         .and_then(|d| match d.kind {
                             crate::object::DescriptorKind::Data { value } => Some(value),
                             _ => None,
-                        }),
-                    _ => None,
-                };
-            if let Some(Value::Object(proto)) = iterator_proto
+                        })
+                } else {
+                    None
+                }
+            };
+            if let Some(proto) = iterator_proto.and_then(|v| v.as_object())
                 && let Some(method) = crate::object::get(proto, &self.gc_heap, name)
                 && self.is_callable_runtime(&method)
             {
@@ -280,7 +296,7 @@ impl Interpreter {
         // matches its ECMA-262 algorithm with sloppy edge handling
         // (sparse holes, throwing comparators, length mutation
         // mid-walk) deferred to follow-ups.
-        if let Value::Array(arr) = &recv_value
+        if let Some(arr) = recv_value.as_array()
             && matches!(
                 name,
                 "forEach"
@@ -295,7 +311,7 @@ impl Interpreter {
                     | "flatMap"
                     | "sort"
             )
-            && self.array_callback_dispatch(stack, context, arr, name, &arg_values, dst)?
+            && self.array_callback_dispatch(stack, context, &arr, name, &arg_values, dst)?
         {
             return Ok(());
         }
@@ -304,7 +320,7 @@ impl Interpreter {
         // but routed through a TypedArray-specific dispatcher so
         // map / filter / etc. allocate a new TypedArray of the
         // receiver's kind instead of a plain Array.
-        if let Value::TypedArray(t) = &recv_value
+        if let Some(t) = recv_value.as_typed_array()
             && matches!(
                 name,
                 "forEach"
@@ -319,7 +335,7 @@ impl Interpreter {
                     | "reduce"
                     | "reduceRight"
             )
-            && self.typed_array_callback_dispatch(stack, context, t, name, &arg_values, dst)?
+            && self.typed_array_callback_dispatch(stack, context, &t, name, &arg_values, dst)?
         {
             return Ok(());
         }
@@ -333,18 +349,18 @@ impl Interpreter {
         // Wrapper objects (`new String("…")`) also reach this arm —
         // unwrap their `[[StringData]]` so the receiver flows in as
         // a primitive string for the callable-replace bridge.
-        let string_recv: Option<Value> = match &recv_value {
-            Value::String(_) => Some(recv_value),
-            Value::Object(obj) => {
-                crate::object::string_data(*obj, &self.gc_heap).map(Value::String)
-            }
-            _ => None,
+        let string_recv: Option<Value> = if recv_value.is_string() {
+            Some(recv_value)
+        } else if let Some(obj) = recv_value.as_object() {
+            crate::object::string_data(obj, &self.gc_heap).map(Value::string)
+        } else {
+            None
         };
         if let Some(string_recv) = string_recv
             && (name == "replace" || name == "replaceAll")
             && arg_values.len() >= 2
             && self.is_callable_runtime(&arg_values[1])
-            && !matches!(arg_values.first(), Some(Value::RegExp(_)))
+            && !arg_values.first().is_some_and(|v| v.is_regexp())
         {
             let recv_value = string_recv;
             // §22.1.3.18 step 7 — `searchString = ? ToString(searchValue)`.
@@ -352,52 +368,58 @@ impl Interpreter {
             // objects with `toString`) before handing the args to the
             // callable-replace bridge.
             let mut coerced_args = arg_values.clone();
-            let needs_coerce = !matches!(coerced_args.first(), Some(Value::String(_)));
+            let needs_coerce = !coerced_args.first().is_some_and(|v| v.is_string());
             if needs_coerce {
                 let original = coerced_args.first().cloned().unwrap_or(Value::undefined());
-                let coerced = match &original {
-                    Value::Undefined => "undefined".to_string(),
-                    Value::Null => "null".to_string(),
-                    Value::Boolean(true) => "true".to_string(),
-                    Value::Boolean(false) => "false".to_string(),
-                    Value::Number(n) => n.to_display_string(),
-                    Value::BigInt(b) => b.to_decimal_string(&self.gc_heap),
-                    Value::Symbol(_) => {
+                let coerced = if original.is_undefined() {
+                    "undefined".to_string()
+                } else if original.is_null() {
+                    "null".to_string()
+                } else if let Some(b) = original.as_boolean() {
+                    if b { "true" } else { "false" }.to_string()
+                } else if let Some(n) = original.as_number() {
+                    n.to_display_string()
+                } else if let Some(b) = original.as_big_int() {
+                    b.to_decimal_string(&self.gc_heap)
+                } else if original.is_symbol() {
+                    return Err(VmError::TypeError {
+                        message: "Cannot convert a Symbol value to a string".to_string(),
+                    });
+                } else if original.is_object()
+                    || original.is_array()
+                    || original.is_function()
+                    || original.is_closure()
+                    || original.is_native_function()
+                    || original.is_bound_function()
+                    || original.is_class_constructor()
+                    || original.is_proxy()
+                {
+                    let primitive = self.evaluate_to_primitive(
+                        context,
+                        &original,
+                        crate::abstract_ops::ToPrimitiveHint::String,
+                    )?;
+                    if let Some(s) = primitive.as_string() {
+                        s.to_lossy_string(&self.gc_heap)
+                    } else if let Some(n) = primitive.as_number() {
+                        n.to_display_string()
+                    } else if let Some(b) = primitive.as_boolean() {
+                        if b { "true" } else { "false" }.to_string()
+                    } else if primitive.is_null() {
+                        "null".to_string()
+                    } else if primitive.is_undefined() {
+                        "undefined".to_string()
+                    } else if let Some(b) = primitive.as_big_int() {
+                        b.to_decimal_string(&self.gc_heap)
+                    } else if primitive.is_symbol() {
                         return Err(VmError::TypeError {
                             message: "Cannot convert a Symbol value to a string".to_string(),
                         });
+                    } else {
+                        return Err(VmError::TypeMismatch);
                     }
-                    Value::Object(_)
-                    | Value::Array(_)
-                    | Value::Function { .. }
-                    | Value::Closure(_)
-                    | Value::NativeFunction(_)
-                    | Value::BoundFunction(_)
-                    | Value::ClassConstructor(_)
-                    | Value::Proxy(_) => {
-                        let primitive = self.evaluate_to_primitive(
-                            context,
-                            &original,
-                            crate::abstract_ops::ToPrimitiveHint::String,
-                        )?;
-                        match primitive {
-                            Value::String(s) => s.to_lossy_string(&self.gc_heap),
-                            Value::Number(n) => n.to_display_string(),
-                            Value::Boolean(true) => "true".to_string(),
-                            Value::Boolean(false) => "false".to_string(),
-                            Value::Null => "null".to_string(),
-                            Value::Undefined => "undefined".to_string(),
-                            Value::BigInt(b) => b.to_decimal_string(&self.gc_heap),
-                            Value::Symbol(_) => {
-                                return Err(VmError::TypeError {
-                                    message: "Cannot convert a Symbol value to a string"
-                                        .to_string(),
-                                });
-                            }
-                            _ => return Err(VmError::TypeMismatch),
-                        }
-                    }
-                    _ => return Err(VmError::TypeMismatch),
+                } else {
+                    return Err(VmError::TypeMismatch);
                 };
                 if let Some(slot) = coerced_args.first_mut() {
                     *slot = Value::string(JsString::from_str(&coerced, self.gc_heap_mut())?);
@@ -419,34 +441,54 @@ impl Interpreter {
         }
         // Primitive prototypes go through the intrinsic table —
         // synchronous, no frame push, advance pc and write directly.
-        let intrinsic = match &recv_value {
-            Value::String(_) => string_prototype::lookup(name),
-            Value::Array(_) => array_prototype::lookup(name),
-            Value::Number(_) => number::prototype_lookup(name),
-            Value::Boolean(_) => boolean_prototype::lookup(name),
-            Value::BigInt(_) => bigint::prototype::lookup(name),
+        let intrinsic = if recv_value.is_string() {
+            string_prototype::lookup(name)
+        } else if recv_value.is_array() {
+            array_prototype::lookup(name)
+        } else if recv_value.is_number() {
+            number::prototype_lookup(name)
+        } else if recv_value.is_boolean() {
+            boolean_prototype::lookup(name)
+        } else if recv_value.is_big_int() {
+            bigint::prototype::lookup(name)
+        } else if recv_value
+            .as_object()
+            .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
+        {
             // Date instances are ordinary objects with a
             // `[[DateValue]]` internal slot — when the receiver
             // is an Object we probe `crate::object::date_data` to
             // brand-check and route through the Date intrinsic
             // table.
-            Value::Object(o) if crate::object::date_data(*o, &self.gc_heap).is_some() => {
-                date::prototype::lookup(name)
-            }
-            Value::RegExp(_) => regexp_prototype::lookup(name),
-            Value::Symbol(_) => symbol_prototype::lookup(name),
-            Value::Map(_) => collections_prototype::lookup_map(name),
-            Value::Set(_) => collections_prototype::lookup_set(name),
-            Value::WeakMap(_) => collections_prototype::lookup_weak_map(name),
-            Value::WeakSet(_) => collections_prototype::lookup_weak_set(name),
-            Value::WeakRef(_) => weak_refs::lookup_weak_ref(name),
-            Value::FinalizationRegistry(_) => weak_refs::lookup_finalization_registry(name),
-            Value::Temporal(_) => temporal::lookup_prototype(&recv_value, name),
-            Value::Intl(_) => intl::lookup_prototype(&recv_value, name),
-            Value::ArrayBuffer(_) => binary::array_buffer_prototype::lookup(name),
-            Value::DataView(_) => binary::data_view_prototype::lookup(name),
-            Value::TypedArray(_) => binary::typed_array_prototype::lookup(name),
-            _ => None,
+            date::prototype::lookup(name)
+        } else if recv_value.is_regexp() {
+            regexp_prototype::lookup(name)
+        } else if recv_value.is_symbol() {
+            symbol_prototype::lookup(name)
+        } else if recv_value.is_map() {
+            collections_prototype::lookup_map(name)
+        } else if recv_value.is_set() {
+            collections_prototype::lookup_set(name)
+        } else if recv_value.is_weak_map() {
+            collections_prototype::lookup_weak_map(name)
+        } else if recv_value.is_weak_set() {
+            collections_prototype::lookup_weak_set(name)
+        } else if recv_value.is_weak_ref() {
+            weak_refs::lookup_weak_ref(name)
+        } else if recv_value.is_finalization_registry() {
+            weak_refs::lookup_finalization_registry(name)
+        } else if recv_value.is_temporal() {
+            temporal::lookup_prototype(&recv_value, name)
+        } else if recv_value.is_intl() {
+            intl::lookup_prototype(&recv_value, name)
+        } else if recv_value.is_array_buffer() {
+            binary::array_buffer_prototype::lookup(name)
+        } else if recv_value.is_data_view() {
+            binary::data_view_prototype::lookup(name)
+        } else if recv_value.is_typed_array() {
+            binary::typed_array_prototype::lookup(name)
+        } else {
+            None
         };
         if let Some(entry) = intrinsic {
             // §21.1.3.{3,4,5} — `Number.prototype.{toFixed,
@@ -458,22 +500,10 @@ impl Interpreter {
             // intrinsic so the spec ladder fires and Symbol / BigInt
             // surface the correct error class.
             let mut small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
-            if matches!(&recv_value, Value::Number(_))
-                && matches!(name, "toFixed" | "toExponential" | "toPrecision")
+            if recv_value.is_number() && matches!(name, "toFixed" | "toExponential" | "toPrecision")
             {
                 for slot in small_args.iter_mut() {
-                    if matches!(
-                        slot,
-                        Value::Object(_)
-                            | Value::Array(_)
-                            | Value::Function { .. }
-                            | Value::Closure(_)
-                            | Value::NativeFunction(_)
-                            | Value::BoundFunction(_)
-                            | Value::ClassConstructor(_)
-                            | Value::Proxy(_)
-                            | Value::RegExp(_)
-                    ) {
+                    if needs_to_primitive(slot) {
                         let primitive = self.evaluate_to_primitive(
                             context,
                             slot,
@@ -507,25 +537,12 @@ impl Interpreter {
                 "at" => &[0],
                 _ => &[],
             };
-            if !int_coerce_indices.is_empty()
-                && matches!(&recv_value, Value::Array(_) | Value::Object(_))
-            {
+            if !int_coerce_indices.is_empty() && (recv_value.is_array() || recv_value.is_object()) {
                 for &idx in int_coerce_indices {
                     let Some(slot) = small_args.get_mut(idx) else {
                         continue;
                     };
-                    if !matches!(
-                        slot,
-                        Value::Object(_)
-                            | Value::Array(_)
-                            | Value::Function { .. }
-                            | Value::Closure(_)
-                            | Value::NativeFunction(_)
-                            | Value::BoundFunction(_)
-                            | Value::ClassConstructor(_)
-                            | Value::Proxy(_)
-                            | Value::RegExp(_)
-                    ) {
+                    if !needs_to_primitive(slot) {
                         continue;
                     }
                     let primitive = self.evaluate_to_primitive(
@@ -575,7 +592,7 @@ impl Interpreter {
             // setter `value`) through `ToPrimitive(Number)` so user
             // `@@toPrimitive` / `valueOf` / `toString` fire before
             // the intrinsic's strict numeric guard.
-            if matches!(&recv_value, Value::DataView(_)) {
+            if recv_value.is_data_view() {
                 let dv_int_coerce: &[usize] = if name.starts_with("get") {
                     &[0]
                 } else if name.starts_with("set") {
@@ -587,18 +604,7 @@ impl Interpreter {
                     let Some(slot) = small_args.get_mut(idx) else {
                         continue;
                     };
-                    if !matches!(
-                        slot,
-                        Value::Object(_)
-                            | Value::Array(_)
-                            | Value::Function { .. }
-                            | Value::Closure(_)
-                            | Value::NativeFunction(_)
-                            | Value::BoundFunction(_)
-                            | Value::ClassConstructor(_)
-                            | Value::Proxy(_)
-                            | Value::RegExp(_)
-                    ) {
+                    if !needs_to_primitive(slot) {
                         continue;
                     }
                     let primitive = self.evaluate_to_primitive(
@@ -609,7 +615,7 @@ impl Interpreter {
                     *slot = primitive;
                 }
             }
-            if matches!(&recv_value, Value::String(_))
+            if recv_value.is_string()
                 && (!string_int_coerce.is_empty() || !string_str_coerce.is_empty())
             {
                 // §22.1.3.{13,14,15} `match` / `matchAll` / `search`
@@ -619,17 +625,15 @@ impl Interpreter {
                 let regexp_pass_through =
                     matches!(name, "match" | "matchAll" | "search" | "normalize");
                 let is_non_primitive = |v: &Value| {
-                    matches!(
-                        v,
-                        Value::Object(_)
-                            | Value::Array(_)
-                            | Value::Function { .. }
-                            | Value::Closure(_)
-                            | Value::NativeFunction(_)
-                            | Value::BoundFunction(_)
-                            | Value::ClassConstructor(_)
-                            | Value::Proxy(_)
-                    ) || (!regexp_pass_through && matches!(v, Value::RegExp(_)))
+                    v.is_object()
+                        || v.is_array()
+                        || v.is_function()
+                        || v.is_closure()
+                        || v.is_native_function()
+                        || v.is_bound_function()
+                        || v.is_class_constructor()
+                        || v.is_proxy()
+                        || (!regexp_pass_through && v.is_regexp())
                 };
                 for &idx in string_int_coerce {
                     let Some(slot) = small_args.get_mut(idx) else {
@@ -646,10 +650,11 @@ impl Interpreter {
                     // intrinsic body recognises (`undefined` is the
                     // "absent" sentinel that some §B.2.3.1 substr-
                     // style methods key on; let the impl decide).
-                    if matches!(
-                        slot,
-                        Value::Number(_) | Value::Boolean(_) | Value::Null | Value::Undefined
-                    ) {
+                    if slot.is_number()
+                        || slot.is_boolean()
+                        || slot.is_null()
+                        || slot.is_undefined()
+                    {
                         continue;
                     }
                     let coerced = self.coerce_to_number(context, slot)?;
@@ -680,8 +685,8 @@ impl Interpreter {
             // component math operate on the captured value. The
             // intrinsic's final assignment in step 12 then overwrites
             // any in-callback mutation.
-            if let Value::Object(obj) = &recv_value
-                && let Some(captured_t) = crate::object::date_data(*obj, &self.gc_heap)
+            if let Some(obj) = recv_value.as_object()
+                && let Some(captured_t) = crate::object::date_data(obj, &self.gc_heap)
                 && name.starts_with("set")
             {
                 for slot in small_args.iter_mut() {
@@ -718,7 +723,7 @@ impl Interpreter {
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     return Ok(());
                 }
-                crate::object::set_date_data(*obj, &mut self.gc_heap, captured_t);
+                crate::object::set_date_data(obj, &mut self.gc_heap, captured_t);
             }
             let result = {
                 let allocation_roots = self.collect_allocation_roots(stack);
@@ -736,15 +741,15 @@ impl Interpreter {
             return Ok(());
         }
 
-        if let Value::Object(obj) = &recv_value
-            && self.object_prototype_object_opt() != Some(*obj)
+        if let Some(obj) = recv_value.as_object()
+            && self.object_prototype_object_opt() != Some(obj)
             && matches!(
-                crate::object::lookup(*obj, &self.gc_heap, name),
+                crate::object::lookup(obj, &self.gc_heap, name),
                 crate::object::PropertyLookup::Absent
             )
             && let Some(result) = {
                 let fn_proto = self.function_prototype_object().ok();
-                object_prototype_intercept(obj, name, &arg_values, &mut self.gc_heap, fn_proto)
+                object_prototype_intercept(&obj, name, &arg_values, &mut self.gc_heap, fn_proto)
             }?
         {
             let frame = &mut stack[top_idx];
@@ -756,11 +761,10 @@ impl Interpreter {
         // Functions / closures inherit Object.prototype-style
         // methods. Foundation routes the call through the user-
         // properties bag attached to the compiled function.
-        if let Value::Function { function_id }
-        | Value::Closure(crate::closure::JsClosure {
-            cached_function_id: function_id,
-            ..
-        }) = &recv_value
+        let fn_id_for_proto = recv_value
+            .as_function()
+            .or_else(|| recv_value.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fn_id_for_proto
             && matches!(
                 name,
                 "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
@@ -770,11 +774,11 @@ impl Interpreter {
                 "hasOwnProperty" => {
                     let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
                     if key == "prototype" {
-                        let _ = self.function_property_get(context, *function_id, "prototype")?;
+                        let _ = self.function_property_get(context, function_id, "prototype")?;
                     }
                     self.ordinary_function_own_property_descriptor(
                         Some(context),
-                        *function_id,
+                        function_id,
                         &key,
                     )?
                     .is_some()
@@ -782,11 +786,11 @@ impl Interpreter {
                 "propertyIsEnumerable" => {
                     let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
                     if key == "prototype" {
-                        let _ = self.function_property_get(context, *function_id, "prototype")?;
+                        let _ = self.function_property_get(context, function_id, "prototype")?;
                     }
                     self.ordinary_function_own_property_descriptor(
                         Some(context),
-                        *function_id,
+                        function_id,
                         &key,
                     )?
                     .is_some_and(|desc| desc.enumerable())
@@ -799,9 +803,9 @@ impl Interpreter {
             frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(());
         }
-        if let Value::NativeFunction(native) = &recv_value
+        if let Some(native) = recv_value.as_native_function()
             && let Some(result) = native_function_object_prototype_intercept(
-                native,
+                &native,
                 name,
                 &arg_values,
                 &mut self.gc_heap,
@@ -812,9 +816,9 @@ impl Interpreter {
             frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(());
         }
-        if let Value::BoundFunction(bound) = &recv_value
+        if let Some(bound) = recv_value.as_bound_function()
             && let Some(result) =
-                bound_function_object_prototype_intercept(bound, name, &arg_values, &self.gc_heap)?
+                bound_function_object_prototype_intercept(&bound, name, &arg_values, &self.gc_heap)?
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
@@ -832,31 +836,28 @@ impl Interpreter {
         if matches!(
             name,
             "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
-        ) && matches!(
-            &recv_value,
-            Value::String(_)
-                | Value::Number(_)
-                | Value::Boolean(_)
-                | Value::Symbol(_)
-                | Value::BigInt(_)
-        ) {
+        ) && (recv_value.is_string()
+            || recv_value.is_number()
+            || recv_value.is_boolean()
+            || recv_value.is_symbol()
+            || recv_value.is_big_int())
+        {
             let result = match name {
                 "hasOwnProperty" | "propertyIsEnumerable" => {
                     let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
-                    match &recv_value {
-                        Value::String(s) => {
-                            if key == "length" {
-                                // propertyIsEnumerable is false for
-                                // String wrapper's `length`; hasOwn
-                                // is true.
-                                name == "hasOwnProperty"
-                            } else if let Ok(idx) = key.parse::<u32>() {
-                                idx < s.len()
-                            } else {
-                                false
-                            }
+                    if let Some(s) = recv_value.as_string() {
+                        if key == "length" {
+                            // propertyIsEnumerable is false for
+                            // String wrapper's `length`; hasOwn
+                            // is true.
+                            name == "hasOwnProperty"
+                        } else if let Ok(idx) = key.parse::<u32>() {
+                            idx < s.len()
+                        } else {
+                            false
                         }
-                        _ => false,
+                    } else {
+                        false
                     }
                 }
                 "isPrototypeOf" => false,
@@ -898,43 +899,39 @@ impl Interpreter {
         // dispatch with `this = recv`; missing or non-callable
         // properties surface as `NotCallable` so callers see the
         // same error as `obj.notFn()`.
-        let lookup_via_property = match &recv_value {
-            // Property-bearing exotic receivers all route through
+        let is_property_bearing = recv_value.is_object()
+            || recv_value.is_proxy()
+            || recv_value.is_array()
+            || recv_value.is_regexp()
+            || recv_value.is_map()
+            || recv_value.is_set()
+            || recv_value.is_weak_map()
+            || recv_value.is_weak_set()
+            || recv_value.is_weak_ref()
+            || recv_value.is_finalization_registry()
+            || recv_value.is_promise()
+            || recv_value.is_array_buffer()
+            || recv_value.is_data_view()
+            || recv_value.is_typed_array()
+            || recv_value.is_iterator();
+        let lookup_via_property: Option<Value> = if is_property_bearing {
+            // Property-bearing exotic receivers route through
             // `ordinary_get_value` so user-installed own properties
-            // (e.g. `arr.getClass = Object.prototype.toString`)
-            // shadow the intrinsic-table miss path and surface a
-            // callable for the dispatch ladder.
-            Value::Object(_)
-            | Value::Proxy(_)
-            | Value::Array(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Promise(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Iterator(_) => {
-                let key = VmPropertyKey::String(name);
-                match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
-                    VmGetOutcome::Value(value) => Some(value),
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        Some(self.run_callable_sync(context, &getter, recv_value, args)?)
-                    }
+            // shadow the intrinsic-table miss path.
+            let key = VmPropertyKey::String(name);
+            match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+                VmGetOutcome::Value(value) => Some(value),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let args: SmallVec<[Value; 8]> = SmallVec::new();
+                    Some(self.run_callable_sync(context, &getter, recv_value, args)?)
                 }
             }
-            Value::ClassConstructor(c) => Some(if name == "prototype" {
-                Value::Object(c.prototype(&self.gc_heap))
+        } else if let Some(c) = recv_value.as_class_constructor() {
+            Some(if name == "prototype" {
+                Value::object(c.prototype(&self.gc_heap))
             } else {
                 // Go through the full `[[Get]]` ladder so accessor
-                // descriptors on static members (`static get foo()`
-                // / `static set foo(v)`) invoke their getter rather
-                // than yielding `undefined`.
+                // descriptors on static members invoke their getter.
                 let statics = Value::object(c.statics(&self.gc_heap));
                 let key = VmPropertyKey::String(name);
                 match self.ordinary_get_value(context, statics, statics, &key, 0)? {
@@ -944,48 +941,39 @@ impl Interpreter {
                         self.run_callable_sync(context, &getter, statics, args)?
                     }
                 }
-            }),
+            })
+        } else if let Some(fid) = recv_value
+            .as_function()
+            .or_else(|| recv_value.as_closure().map(|c| c.cached_function_id))
+        {
             // §10.1.8 OrdinaryGet on a callable receiver — user
-            // properties (e.g. `assert.sameValue = function(){}`)
-            // resolve via the function-properties side table; the
-            // fallback to `Function.prototype.{call,apply,bind}`
-            // happens below if we hand back `Undefined`.
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let fid = *function_id;
-                Some(self.function_property_get_stack_rooted(context, stack, fid, name)?)
-            }
-            // Native callable receiver (e.g. global `Promise` /
-            // `Map` constructors). Look up `name` on the function
-            // object's own-property table so `Promise.all(...)`,
-            // `Map.groupBy(...)`, etc. dispatch through ordinary
-            // method invocation.
-            Value::NativeFunction(native) => native
+            // properties resolve via the function-properties side table.
+            Some(self.function_property_get_stack_rooted(context, stack, fid, name)?)
+        } else if let Some(native) = recv_value.as_native_function() {
+            // Native callable receiver — look up `name` on the function
+            // object's own-property table.
+            native
                 .own_property_descriptor(&mut self.gc_heap, name)?
-                .map(|desc| descriptor_value(&desc)),
+                .map(|desc| descriptor_value(&desc))
+        } else if recv_value.is_boolean()
+            || recv_value.is_number()
+            || recv_value.is_symbol()
+            || recv_value.is_big_int()
+        {
             // §7.1.18 ToObject — primitive receivers walk the
             // constructor's prototype to surface inherited
-            // `Object.prototype.*` methods (e.g.
-            // `true.toLocaleString()`). Method-table lookups above
-            // already resolved Number / Boolean / Symbol /
-            // BigInt-specific intrinsics; reaching this arm means
-            // the call is hitting an inherited Object.prototype
-            // (or user-monkey-patched constructor.prototype) method.
-            Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_) => {
-                let key = VmPropertyKey::String(name);
-                match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
-                    VmGetOutcome::Value(value) if !matches!(value, Value::Undefined) => Some(value),
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        Some(self.run_callable_sync(context, &getter, recv_value, args)?)
-                    }
-                    _ => None,
+            // `Object.prototype.*` methods.
+            let key = VmPropertyKey::String(name);
+            match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+                VmGetOutcome::Value(value) if !value.is_undefined() => Some(value),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let args: SmallVec<[Value; 8]> = SmallVec::new();
+                    Some(self.run_callable_sync(context, &getter, recv_value, args)?)
                 }
+                _ => None,
             }
-            _ => None,
+        } else {
+            None
         };
         if let Some(method) = lookup_via_property {
             if !self.is_callable_runtime(&method) {
@@ -1031,16 +1019,13 @@ impl Interpreter {
         args: &SmallVec<[Value; 8]>,
         replace_all: bool,
     ) -> Result<Value, VmError> {
-        use crate::number::NumberValue;
         use crate::string::JsString;
-        let recv = match receiver {
-            Value::String(s) => *s,
-            _ => return Err(VmError::TypeMismatch),
-        };
-        let needle = match args.first() {
-            Some(Value::String(s)) => *s,
-            _ => return Err(VmError::TypeMismatch),
-        };
+        let recv = receiver.as_string().copied().ok_or(VmError::TypeMismatch)?;
+        let needle = args
+            .first()
+            .and_then(|v| v.as_string())
+            .copied()
+            .ok_or(VmError::TypeMismatch)?;
         let callback = args.get(1).cloned().unwrap_or(Value::undefined());
         let recv_units = recv.to_utf16_vec(&self.gc_heap);
         let needle_units = needle.to_utf16_vec(&self.gc_heap);
@@ -1055,17 +1040,17 @@ impl Interpreter {
             };
             for pos in positions {
                 let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    Value::String(needle),
-                    Value::Number(NumberValue::from_f64(pos as f64)),
+                    Value::string(needle),
+                    Value::number_f64(pos as f64),
                     recv_value,
                 ];
-                let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
-                let raw_string = match raw {
-                    Value::String(s) => s,
-                    other => {
-                        JsString::from_str(&other.display_string(&self.gc_heap), &mut self.gc_heap)
-                            .map_err(|_| VmError::TypeMismatch)?
-                    }
+                let raw =
+                    self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
+                let raw_string = if let Some(s) = raw.as_string() {
+                    *s
+                } else {
+                    JsString::from_str(&raw.display_string(&self.gc_heap), &mut self.gc_heap)
+                        .map_err(|_| VmError::TypeMismatch)?
                 };
                 out.extend_from_slice(&raw_string.to_utf16_vec(&self.gc_heap));
                 if pos < recv_units.len() {
@@ -1086,17 +1071,17 @@ impl Interpreter {
         while cursor <= last_start {
             if recv_units[cursor..cursor + needle_len] == needle_units[..] {
                 let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                    Value::String(needle),
-                    Value::Number(NumberValue::from_f64(cursor as f64)),
+                    Value::string(needle),
+                    Value::number_f64(cursor as f64),
                     recv_value,
                 ];
-                let raw = self.run_callable_sync(context, &callback, Value::Undefined, cb_args)?;
-                let raw_string = match raw {
-                    Value::String(s) => s,
-                    other => {
-                        JsString::from_str(&other.display_string(&self.gc_heap), &mut self.gc_heap)
-                            .map_err(|_| VmError::TypeMismatch)?
-                    }
+                let raw =
+                    self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
+                let raw_string = if let Some(s) = raw.as_string() {
+                    *s
+                } else {
+                    JsString::from_str(&raw.display_string(&self.gc_heap), &mut self.gc_heap)
+                        .map_err(|_| VmError::TypeMismatch)?
                 };
                 out.extend_from_slice(&raw_string.to_utf16_vec(&self.gc_heap));
                 cursor += needle_len;
@@ -1155,7 +1140,7 @@ impl Interpreter {
         // bind it as the callback's `this`; otherwise let
         // `OrdinaryCallBindThis` default to undefined / globalObject.
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-        if !matches!(recv, Value::Map(_) | Value::Set(_)) {
+        if !(recv.is_map() || recv.is_set()) {
             return Err(VmError::TypeMismatch);
         }
         // Advance pc *before* invoking the callbacks so each
@@ -1169,43 +1154,39 @@ impl Interpreter {
         // Write `undefined` into the dst slot — `forEach` returns
         // `undefined` synchronously, even if the callback chain
         // produces values.
-        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+        write_register(&mut stack[top_idx], dst, Value::undefined())?;
         let recv_for_callback = *recv;
-        match recv {
-            Value::Map(m) => {
-                let mut index = 0;
-                while index < crate::collections::map_raw_len(*m, &self.gc_heap) {
-                    let Some((key, value)) =
-                        crate::collections::map_entry_at(*m, &self.gc_heap, index)
-                    else {
-                        index += 1;
-                        continue;
-                    };
+        if let Some(m) = recv.as_map() {
+            let mut index = 0;
+            while index < crate::collections::map_raw_len(m, &self.gc_heap) {
+                let Some((key, value)) = crate::collections::map_entry_at(m, &self.gc_heap, index)
+                else {
                     index += 1;
-                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(value);
-                    cb_args.push(key);
-                    cb_args.push(recv_for_callback);
-                    self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                }
+                    continue;
+                };
+                index += 1;
+                let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                cb_args.push(value);
+                cb_args.push(key);
+                cb_args.push(recv_for_callback);
+                self.run_callable_sync(context, &callee, this_arg, cb_args)?;
             }
-            Value::Set(s) => {
-                let mut index = 0;
-                while index < crate::collections::set_raw_len(*s, &self.gc_heap) {
-                    let Some(value) = crate::collections::set_value_at(*s, &self.gc_heap, index)
-                    else {
-                        index += 1;
-                        continue;
-                    };
+        } else if let Some(s) = recv.as_set() {
+            let mut index = 0;
+            while index < crate::collections::set_raw_len(s, &self.gc_heap) {
+                let Some(value) = crate::collections::set_value_at(s, &self.gc_heap, index) else {
                     index += 1;
-                    let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                    cb_args.push(value);
-                    cb_args.push(value);
-                    cb_args.push(recv_for_callback);
-                    self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                }
+                    continue;
+                };
+                index += 1;
+                let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                cb_args.push(value);
+                cb_args.push(value);
+                cb_args.push(recv_for_callback);
+                self.run_callable_sync(context, &callee, this_arg, cb_args)?;
             }
-            _ => unreachable!(),
+        } else {
+            unreachable!();
         }
         Ok(())
     }
@@ -1245,7 +1226,7 @@ impl Interpreter {
         // `sort` without a comparator falls through to the intrinsic
         // table's lexicographic path. Comparator-driven sort is
         // handled here.
-        if name == "sort" && matches!(args.first(), None | Some(Value::Undefined)) {
+        if name == "sort" && args.first().is_none_or(|v| v.is_undefined()) {
             return Ok(false);
         }
 
@@ -1277,13 +1258,13 @@ impl Interpreter {
             "forEach" => {
                 let callee = require_callable(args.first())?;
                 for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
+                    if value.is_hole() {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
-                Value::Undefined
+                Value::undefined()
             }
             "map" => {
                 // §23.1.3.21: callback NOT invoked for holes; the
@@ -1291,8 +1272,8 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut out: Vec<Value> = Vec::with_capacity(len);
                 for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
-                        out.push(Value::Hole);
+                    if value.is_hole() {
+                        out.push(Value::hole());
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
@@ -1304,13 +1285,13 @@ impl Interpreter {
                     &[&arr_value, &callee],
                     &[args.as_slice(), out.as_slice()],
                 )?;
-                Value::Array(result)
+                Value::array(result)
             }
             "filter" => {
                 let callee = require_callable(args.first())?;
                 let mut out: Vec<Value> = Vec::new();
                 for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
+                    if value.is_hole() {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
@@ -1325,7 +1306,7 @@ impl Interpreter {
                     &[&arr_value, &callee],
                     &[args.as_slice(), out.as_slice()],
                 )?;
-                Value::Array(result)
+                Value::array(result)
             }
             "reduce" | "reduceRight" => {
                 // §23.1.3.24 / §23.1.3.25: skip holes; if no
@@ -1333,7 +1314,11 @@ impl Interpreter {
                 // TypeError.
                 let callee = require_callable(args.first())?;
                 let has_init = args.len() >= 2;
-                let initial = if has_init { args[1] } else { Value::Undefined };
+                let initial = if has_init {
+                    args[1]
+                } else {
+                    Value::undefined()
+                };
                 let reverse = name == "reduceRight";
                 let mut acc;
                 let start_idx: i64;
@@ -1349,14 +1334,14 @@ impl Interpreter {
                     let mut seed_idx: Option<usize> = None;
                     if reverse {
                         for i in (0..len).rev() {
-                            if !matches!(elements[i], Value::Hole) {
+                            if !elements[i].is_hole() {
                                 seed_idx = Some(i);
                                 break;
                             }
                         }
                     } else {
                         for (i, value) in elements.iter().enumerate() {
-                            if !matches!(value, Value::Hole) {
+                            if !value.is_hole() {
                                 seed_idx = Some(i);
                                 break;
                             }
@@ -1368,7 +1353,7 @@ impl Interpreter {
                 }
                 let mut i = start_idx;
                 while i >= 0 && (i as usize) < len {
-                    if matches!(elements[i as usize], Value::Hole) {
+                    if elements[i as usize].is_hole() {
                         i += step;
                         continue;
                     }
@@ -1377,7 +1362,7 @@ impl Interpreter {
                     cb_args.push(elements[i as usize]);
                     cb_args.push(Value::number(NumberValue::from_i32(i as i32)));
                     cb_args.push(arr_value);
-                    acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                    acc = self.run_callable_sync(context, &callee, Value::undefined(), cb_args)?;
                     i += step;
                 }
                 acc
@@ -1388,8 +1373,8 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut found = Value::undefined();
                 for (i, value) in elements.into_iter().enumerate() {
-                    let elem = if matches!(value, Value::Hole) {
-                        Value::Undefined
+                    let elem = if value.is_hole() {
+                        Value::undefined()
                     } else {
                         value
                     };
@@ -1407,8 +1392,8 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut idx: i32 = -1;
                 for (i, value) in elements.into_iter().enumerate() {
-                    let elem = if matches!(value, Value::Hole) {
-                        Value::Undefined
+                    let elem = if value.is_hole() {
+                        Value::undefined()
                     } else {
                         value
                     };
@@ -1419,14 +1404,14 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::Number(NumberValue::from_i32(idx))
+                Value::number_i32(idx)
             }
             "every" => {
                 // §23.1.3.6: callback NOT invoked for holes.
                 let callee = require_callable(args.first())?;
                 let mut all = true;
                 for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
+                    if value.is_hole() {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
@@ -1436,14 +1421,14 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::Boolean(all)
+                Value::boolean(all)
             }
             "some" => {
                 // §23.1.3.27: callback NOT invoked for holes.
                 let callee = require_callable(args.first())?;
                 let mut any = false;
                 for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
+                    if value.is_hole() {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
@@ -1453,7 +1438,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::Boolean(any)
+                Value::boolean(any)
             }
             "flatMap" => {
                 // §23.1.3.12: callback NOT invoked for holes; the
@@ -1462,18 +1447,17 @@ impl Interpreter {
                 let callee = require_callable(args.first())?;
                 let mut out: Vec<Value> = Vec::with_capacity(len);
                 for (i, value) in elements.into_iter().enumerate() {
-                    if matches!(value, Value::Hole) {
+                    if value.is_hole() {
                         continue;
                     }
                     let cb_args = build_array_cb_args(&value, i, &arr_value);
                     let mapped = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    match mapped {
-                        Value::Array(inner) => {
-                            crate::array::with_elements(inner, &self.gc_heap, |elements| {
-                                out.extend(elements.iter().cloned());
-                            });
-                        }
-                        other => out.push(other),
+                    if let Some(inner) = mapped.as_array() {
+                        crate::array::with_elements(inner, &self.gc_heap, |elements| {
+                            out.extend(elements.iter().cloned());
+                        });
+                    } else {
+                        out.push(mapped);
                     }
                 }
                 let result = self.alloc_stack_rooted_array_from_values_with_root_slices(
@@ -1482,7 +1466,7 @@ impl Interpreter {
                     &[&arr_value, &callee],
                     &[args.as_slice(), out.as_slice()],
                 )?;
-                Value::Array(result)
+                Value::array(result)
             }
             "sort" => {
                 // §23.1.3.30: SortIndexedProperties sorts only
@@ -1493,7 +1477,7 @@ impl Interpreter {
                 let mut buffer: Vec<Value> = Vec::with_capacity(elements.len());
                 let mut hole_count: usize = 0;
                 for v in elements {
-                    if matches!(v, Value::Hole) {
+                    if v.is_hole() {
                         hole_count += 1;
                     } else {
                         buffer.push(v);
@@ -1511,11 +1495,8 @@ impl Interpreter {
                         cmp_args.push(buffer[j - 1]);
                         cmp_args.push(buffer[j]);
                         let outcome =
-                            self.run_callable_sync(context, &callee, Value::Undefined, cmp_args)?;
-                        let order = match outcome {
-                            Value::Number(n) => n.as_f64(),
-                            _ => 0.0,
-                        };
+                            self.run_callable_sync(context, &callee, Value::undefined(), cmp_args)?;
+                        let order = outcome.as_number().map_or(0.0, |n| n.as_f64());
                         if order > 0.0 {
                             buffer.swap(j - 1, j);
                             j -= 1;
@@ -1529,7 +1510,7 @@ impl Interpreter {
                         elements.clear();
                         elements.extend(buffer);
                         for _ in 0..hole_count {
-                            elements.push(Value::Hole);
+                            elements.push(Value::hole());
                         }
                     });
                 }
@@ -1588,7 +1569,7 @@ impl Interpreter {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
-                Value::Undefined
+                Value::undefined()
             }
             "map" => {
                 let callee = require_callable(args.first())?;
@@ -1641,7 +1622,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::Number(NumberValue::from_i32(idx))
+                Value::number_i32(idx)
             }
             "findLast" => {
                 let callee = require_callable(args.first())?;
@@ -1669,7 +1650,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::Number(NumberValue::from_i32(idx))
+                Value::number_i32(idx)
             }
             "every" => {
                 let callee = require_callable(args.first())?;
@@ -1682,7 +1663,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::Boolean(all)
+                Value::boolean(all)
             }
             "some" => {
                 let callee = require_callable(args.first())?;
@@ -1695,7 +1676,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::Boolean(any)
+                Value::boolean(any)
             }
             "reduce" | "reduceRight" => {
                 let callee = require_callable(args.first())?;
@@ -1719,7 +1700,7 @@ impl Interpreter {
                     cb_args.push(value);
                     cb_args.push(Value::number(NumberValue::from_i32(i as i32)));
                     cb_args.push(ta_value);
-                    acc = self.run_callable_sync(context, &callee, Value::Undefined, cb_args)?;
+                    acc = self.run_callable_sync(context, &callee, Value::undefined(), cb_args)?;
                     i += step;
                 }
                 acc
@@ -1808,7 +1789,8 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
-                    None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
+                    None => SmallVec::new(),
+                    Some(v) if v.is_nullish() => SmallVec::new(),
                     Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
                 };
                 stack[top_idx].pc = stack[top_idx]

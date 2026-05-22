@@ -348,7 +348,7 @@ mod tests {
             4,
         );
 
-        assert_eq!(run_module(module), Value::Boolean(true));
+        assert_eq!(run_module(module), Value::boolean(true));
     }
 
     #[test]
@@ -384,7 +384,7 @@ mod tests {
 
         let (value, interp) = run_module_with_interpreter(module);
 
-        assert_eq!(value, Value::Boolean(true));
+        assert_eq!(value, Value::boolean(true));
         assert_eq!(interp.load_property_ic_count(), 1);
     }
 
@@ -421,7 +421,7 @@ mod tests {
 
         let (value, interp) = run_module_with_interpreter(module);
 
-        assert_eq!(value, Value::Boolean(true));
+        assert_eq!(value, Value::boolean(true));
         assert_eq!(interp.store_property_ic_count(), 1);
     }
 
@@ -459,11 +459,11 @@ mod tests {
 
         assert_eq!(
             interp.run(&context).expect("first run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             interp.run(&context).expect("second run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
 
         let stats = interp.property_ic_stats();
@@ -512,11 +512,11 @@ mod tests {
 
         assert_eq!(
             interp.run(&context).expect("first run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             interp.run(&context).expect("second run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
 
         let stats = interp.property_ic_stats();
@@ -564,11 +564,11 @@ mod tests {
 
         assert_eq!(
             interp.run(&context).expect("first run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             interp.run(&context).expect("second run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
 
         let stats = interp.property_ic_stats();
@@ -622,11 +622,11 @@ mod tests {
 
         assert_eq!(
             interp.run(&context).expect("first run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             interp.run(&context).expect("second run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
 
         let stats = interp.property_ic_stats();
@@ -671,11 +671,11 @@ mod tests {
 
         assert_eq!(
             interp.run(&context).expect("first run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             interp.run(&context).expect("second run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         let stats = interp.property_ic_stats();
         assert_eq!(stats.store_hits, 1);
@@ -736,11 +736,11 @@ mod tests {
 
         assert_eq!(
             interp.run(&context).expect("first run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             interp.run(&context).expect("second run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
 
         let stats = interp.property_ic_stats();
@@ -801,11 +801,11 @@ mod tests {
 
         assert_eq!(
             interp.run(&context).expect("first run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             interp.run(&context).expect("second run"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
 
         assert_eq!(interp.load_property_ic_count(), 0);
@@ -861,7 +861,7 @@ mod tests {
             7,
         );
 
-        assert_eq!(run_module(module), Value::Boolean(true));
+        assert_eq!(run_module(module), Value::boolean(true));
     }
 
     #[test]
@@ -900,6 +900,6 @@ mod tests {
             5,
         );
 
-        assert_eq!(run_module(module), Value::Boolean(true));
+        assert_eq!(run_module(module), Value::boolean(true));
     }
 }

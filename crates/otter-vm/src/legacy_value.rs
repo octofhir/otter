@@ -442,6 +442,39 @@ impl Value {
         matches!(self, Value::Object(_))
     }
 
+    /// `true` if `self` has object identity (any object-like variant).
+    /// Matches the spec `Type(value) is Object` classification.
+    #[inline]
+    #[must_use]
+    pub const fn is_object_like(&self) -> bool {
+        matches!(
+            self,
+            Value::Object(_)
+                | Value::Array(_)
+                | Value::Function { .. }
+                | Value::Closure(_)
+                | Value::NativeFunction(_)
+                | Value::BoundFunction(_)
+                | Value::ClassConstructor(_)
+                | Value::Promise(_)
+                | Value::Iterator(_)
+                | Value::RegExp(_)
+                | Value::Map(_)
+                | Value::Set(_)
+                | Value::WeakMap(_)
+                | Value::WeakSet(_)
+                | Value::WeakRef(_)
+                | Value::FinalizationRegistry(_)
+                | Value::Temporal(_)
+                | Value::Intl(_)
+                | Value::ArrayBuffer(_)
+                | Value::DataView(_)
+                | Value::TypedArray(_)
+                | Value::Generator(_)
+                | Value::Proxy(_)
+        )
+    }
+
     /// `true` if `self` is an array.
     #[inline]
     #[must_use]

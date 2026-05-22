@@ -573,10 +573,10 @@ impl Interpreter {
         // Bootstrap can't see `WellKnownSymbols`, so we wire the
         // realm-local @@hasInstance after both Function.prototype
         // and the symbol table exist.
-        let function_prototype_handle = if let Some(Value::Object(function_ctor)) =
-            object::get(global_this, &gc_heap, "Function")
-            && let Some(Value::Object(function_proto)) =
-                object::get(function_ctor, &gc_heap, "prototype")
+        let function_prototype_handle = if let Some(function_ctor) =
+            object::get(global_this, &gc_heap, "Function").and_then(|v| v.as_object())
+            && let Some(function_proto) =
+                object::get(function_ctor, &gc_heap, "prototype").and_then(|v| v.as_object())
         {
             let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
             let global_root = Value::object(global_this);
@@ -597,9 +597,10 @@ impl Interpreter {
         // chains and surface every error constructor on `globalThis`
         // as a writable, non-enumerable, configurable data property.
         if let Some(function_prototype) = function_prototype_handle
-            && let Some(Value::Object(object_ctor)) = object::get(global_this, &gc_heap, "Object")
-            && let Some(Value::Object(object_prototype)) =
-                object::get(object_ctor, &gc_heap, "prototype")
+            && let Some(object_ctor) =
+                object::get(global_this, &gc_heap, "Object").and_then(|v| v.as_object())
+            && let Some(object_prototype) =
+                object::get(object_ctor, &gc_heap, "prototype").and_then(|v| v.as_object())
         {
             error_classes.finalize_after_bootstrap(
                 &mut gc_heap,
@@ -659,7 +660,9 @@ impl Interpreter {
         // logic; this site only caches the resulting handles so
         // `intrinsic_prototype_object_for(Value::Iterator(_))` can
         // route without a global lookup per access.
-        if let Ok(Value::Object(iter_proto)) = interp.constructor_prototype_value("Iterator") {
+        if let Ok(iter_proto_value) = interp.constructor_prototype_value("Iterator")
+            && let Some(iter_proto) = iter_proto_value.as_object()
+        {
             let shape_root = interp.shape_runtime.root();
             let protos = bootstrap::build_builtin_iterator_prototypes_post_bootstrap(
                 &mut interp.gc_heap,
@@ -965,12 +968,15 @@ impl Interpreter {
     }
 
     fn non_gc_exotic_prototype_override_key(value: &Value) -> Option<usize> {
-        match value {
-            Value::ArrayBuffer(buffer) => Some(buffer.identity_addr() as usize),
-            Value::DataView(view) => Some(view.identity_addr() as usize),
-            Value::TypedArray(array) => Some(array.identity_addr() as usize),
-            _ => None,
+        if let Some(buffer) = value.as_array_buffer() {
+            return Some(buffer.identity_addr() as usize);
         }
+        if let Some(view) = value.as_data_view() {
+            return Some(view.identity_addr() as usize);
+        }
+        value
+            .as_typed_array()
+            .map(|array| array.identity_addr() as usize)
     }
 
     /// Store the allocation-time `[[Prototype]]` selected by
@@ -1014,220 +1020,161 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
     pub(crate) fn get_prototype_for_op(&mut self, value: &Value) -> Result<Value, VmError> {
-        match value {
-            Value::Object(obj) => {
-                let stored = object::prototype_value(*obj, &self.gc_heap);
-                let has_construct = object_has_construct_slot(&Value::Object(*obj), &self.gc_heap);
-                if has_construct {
-                    let function_proto = self.function_prototype_object().ok();
-                    let object_proto = self.object_prototype_object_opt();
-                    match &stored {
-                        // No stored proto on a callable Object →
-                        // foundation fallback to %Function.prototype%.
-                        None => {
-                            if let Some(fp) = function_proto {
-                                return Ok(Value::object(fp));
-                            }
+        let intrinsic_or_null =
+            |this: &mut Self, v: &Value| match this.intrinsic_prototype_object_for(v) {
+                Some(o) => Value::object(o),
+                None => Value::null(),
+            };
+        if let Some(obj) = value.as_object() {
+            let stored = object::prototype_value(obj, &self.gc_heap);
+            let has_construct = object_has_construct_slot(&Value::object(obj), &self.gc_heap);
+            if has_construct {
+                let function_proto = self.function_prototype_object().ok();
+                let object_proto = self.object_prototype_object_opt();
+                match &stored {
+                    None => {
+                        if let Some(fp) = function_proto {
+                            return Ok(Value::object(fp));
                         }
-                        // Stored proto is %Object.prototype% — the
-                        // bootstrap installers use it as a default;
-                        // hoist to %Function.prototype% to keep the
-                        // observable spec shape on built-ins like
-                        // `Number`, `Boolean`, `Date`, `Array`, etc.
-                        Some(Value::Object(p)) if object_proto.is_some_and(|op| op == *p) => {
-                            if let Some(fp) = function_proto {
-                                return Ok(Value::object(fp));
-                            }
-                        }
-                        _ => {}
                     }
-                }
-                Ok(stored.unwrap_or(Value::null()))
-            }
-            Value::NativeFunction(nf) => {
-                if let Some(over) = nf.prototype_override(&self.gc_heap) {
-                    return Ok(over);
-                }
-                Ok(Value::object(self.function_prototype_object()?))
-            }
-            Value::Array(arr) => {
-                if let Some(over) = array::prototype_override(*arr, &self.gc_heap) {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
+                    Some(p_val) if p_val.as_object().is_some_and(|p| object_proto == Some(p)) => {
+                        if let Some(fp) = function_proto {
+                            return Ok(Value::object(fp));
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Value::Map(map) => {
-                if let Some(over) = crate::collections::map_prototype_override(*map, &self.gc_heap)
-                {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::Set(set) => {
-                if let Some(over) = crate::collections::set_prototype_override(*set, &self.gc_heap)
-                {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::WeakMap(map) => {
-                if let Some(over) =
-                    crate::collections::weak_map_prototype_override(*map, &self.gc_heap)
-                {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::WeakSet(set) => {
-                if let Some(over) =
-                    crate::collections::weak_set_prototype_override(*set, &self.gc_heap)
-                {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::Promise(promise) => {
-                if let Some(over) = promise.prototype_override(&self.gc_heap) {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::RegExp(regexp) => {
-                if let Some(over) = regexp.prototype_override(&self.gc_heap) {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::WeakRef(weak_ref) => {
-                if let Some(over) =
-                    crate::weak_refs::weak_ref_prototype_override(*weak_ref, &self.gc_heap)
-                {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::FinalizationRegistry(registry) => {
-                if let Some(over) = crate::weak_refs::finalization_registry_prototype_override(
-                    *registry,
-                    &self.gc_heap,
-                ) {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_) => Ok(Value::object(self.function_prototype_object()?)),
-            // §10.4 exotic objects (Array, Map, Set, WeakMap,
-            // WeakSet, WeakRef, FinalizationRegistry, Promise,
-            // ArrayBuffer, SharedArrayBuffer, DataView, TypedArray,
-            // RegExp) carry their own per-class realm prototype.
-            // Route through `intrinsic_prototype_object_for` so
-            // `Object.getPrototypeOf(buf)` / `__proto__` walks
-            // hit `%<Kind>.prototype%` instead of `TypeError:
-            // operand type mismatch`. Spec: §10.1.1 [[GetPrototypeOf]]
-            // is "OrdinaryGetPrototypeOf", which reads the slot the
-            // class set at allocation time.
-            // <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
-            Value::ArrayBuffer(_) | Value::DataView(_) | Value::TypedArray(_) => {
-                if let Some(over) = self.non_gc_exotic_prototype_override(value) {
-                    return Ok(over);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::Generator(generator) => {
-                if let Some(proto) = generator.prototype_override(&self.gc_heap) {
-                    return Ok(proto);
-                }
-                match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::object(o)),
-                    None => Ok(Value::null()),
-                }
-            }
-            Value::Iterator(_) => match self.intrinsic_prototype_object_for(value) {
-                Some(o) => Ok(Value::object(o)),
-                None => Ok(Value::null()),
-            },
-            // §20.1.2.10 Object.getPrototypeOf: when applied to a
-            // primitive value, the spec performs `ToObject(value)`
-            // first (§7.1.18) and then walks the resulting wrapper's
-            // `[[Prototype]]`. The wrapper's prototype is the
-            // constructor's `%X.prototype%`, so we read it directly
-            // via `intrinsic_prototype_object_for` without materialising
-            // a transient wrapper object.
-            Value::Symbol(_)
-            | Value::String(_)
-            | Value::Number(_)
-            | Value::Boolean(_)
-            | Value::BigInt(_) => match self.intrinsic_prototype_object_for(value) {
-                Some(o) => Ok(Value::object(o)),
-                None => Ok(Value::null()),
-            },
-            other => Err(VmError::TypeMismatchAt {
-                op: "Object.getPrototypeOf",
-                kind: value_kind_name(other),
-            }),
+            return Ok(stored.unwrap_or(Value::null()));
         }
+        if let Some(nf) = value.as_native_function() {
+            if let Some(over) = nf.prototype_override(&self.gc_heap) {
+                return Ok(over);
+            }
+            return Ok(Value::object(self.function_prototype_object()?));
+        }
+        if let Some(arr) = value.as_array() {
+            if let Some(over) = array::prototype_override(arr, &self.gc_heap) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(map) = value.as_map() {
+            if let Some(over) = crate::collections::map_prototype_override(map, &self.gc_heap) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(set) = value.as_set() {
+            if let Some(over) = crate::collections::set_prototype_override(set, &self.gc_heap) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(map) = value.as_weak_map() {
+            if let Some(over) = crate::collections::weak_map_prototype_override(map, &self.gc_heap)
+            {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(set) = value.as_weak_set() {
+            if let Some(over) = crate::collections::weak_set_prototype_override(set, &self.gc_heap)
+            {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(promise) = value.as_promise() {
+            if let Some(over) = promise.prototype_override(&self.gc_heap) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(regexp) = value.as_regexp() {
+            if let Some(over) = regexp.prototype_override(&self.gc_heap) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(weak_ref) = value.as_weak_ref() {
+            if let Some(over) =
+                crate::weak_refs::weak_ref_prototype_override(weak_ref, &self.gc_heap)
+            {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(registry) = value.as_finalization_registry() {
+            if let Some(over) =
+                crate::weak_refs::finalization_registry_prototype_override(registry, &self.gc_heap)
+            {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if value.is_function()
+            || value.is_closure()
+            || value.is_bound_function()
+            || value.is_class_constructor()
+        {
+            return Ok(Value::object(self.function_prototype_object()?));
+        }
+        // §10.4 exotic objects (ArrayBuffer / SharedArrayBuffer /
+        // DataView / TypedArray) — per-class realm prototype.
+        // <https://tc39.es/ecma262/#sec-ordinarygetprototypeof>
+        if value.is_array_buffer() || value.is_data_view() || value.is_typed_array() {
+            if let Some(over) = self.non_gc_exotic_prototype_override(value) {
+                return Ok(over);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if let Some(generator) = value.as_generator() {
+            if let Some(proto) = generator.prototype_override(&self.gc_heap) {
+                return Ok(proto);
+            }
+            return Ok(intrinsic_or_null(self, value));
+        }
+        if value.is_iterator() {
+            return Ok(intrinsic_or_null(self, value));
+        }
+        // §20.1.2.10 / §7.1.18 — primitives ToObject then walk
+        // wrapper's [[Prototype]].
+        if value.is_symbol()
+            || value.is_string()
+            || value.is_number()
+            || value.is_boolean()
+            || value.is_big_int()
+        {
+            return Ok(intrinsic_or_null(self, value));
+        }
+        Err(VmError::TypeMismatchAt {
+            op: "Object.getPrototypeOf",
+            kind: value_kind_name(value),
+        })
     }
 
     pub(crate) fn object_prototype_object_opt(&self) -> Option<JsObject> {
-        match object::get(self.global_this, &self.gc_heap, "Object") {
-            Some(Value::Object(ctor)) => match object::get(ctor, &self.gc_heap, "prototype") {
-                Some(Value::Object(p)) => Some(p),
-                _ => None,
-            },
-            _ => None,
-        }
+        let ctor =
+            object::get(self.global_this, &self.gc_heap, "Object").and_then(|v| v.as_object())?;
+        object::get(ctor, &self.gc_heap, "prototype").and_then(|v| v.as_object())
     }
 
     pub(crate) fn function_prototype_object(&self) -> Result<JsObject, VmError> {
-        let function_ctor = match object::get(self.global_this, &self.gc_heap, "Function") {
-            Some(Value::Object(obj)) => obj,
-            _ => return Err(VmError::TypeMismatch),
-        };
-        match object::get(function_ctor, &self.gc_heap, "prototype") {
-            Some(Value::Object(obj)) => Ok(obj),
-            _ => Err(VmError::TypeMismatch),
-        }
+        let function_ctor = object::get(self.global_this, &self.gc_heap, "Function")
+            .and_then(|v| v.as_object())
+            .ok_or(VmError::TypeMismatch)?;
+        object::get(function_ctor, &self.gc_heap, "prototype")
+            .and_then(|v| v.as_object())
+            .ok_or(VmError::TypeMismatch)
     }
 
     fn is_callable_runtime(&self, value: &Value) -> bool {
         is_callable(value) || object_has_call_slot(value, &self.gc_heap)
     }
 
-    /// Resolve a property read on a `Value::Function` /
-    /// `Value::Closure`. Honours user-installed properties via the
+    /// Resolve property read on function / closure. Honours user
+    /// props via `function_user_props`, lazily allocates
     /// `function_user_props` side table, lazily allocates
     /// `Function.prototype` on first access (§9.2.10
     /// MakeConstructor), and falls back to `name` / `length`

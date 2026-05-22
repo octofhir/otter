@@ -282,7 +282,8 @@ pub fn finalization_registry_register(
     }
     let barrier_held_value = held_value;
     let unregister_token = match unregister_token {
-        Some(Value::Undefined) | None => None,
+        None => None,
+        Some(v) if v.is_undefined() => None,
         Some(value) => Some(weak_target_raw(value)?),
     };
     heap.with_payload(registry, |body| {
@@ -397,44 +398,42 @@ fn weak_target_raw(value: &Value) -> Result<RawGc, crate::VmError> {
 
 fn raw_to_value(heap: &otter_gc::GcHeap, raw: RawGc) -> Option<Value> {
     match heap.raw_type_tag(raw)? {
-        OBJECT_BODY_TYPE_TAG => heap.cast_raw_if_type::<ObjectBody>(raw).map(Value::Object),
-        ARRAY_BODY_TYPE_TAG => heap.cast_raw_if_type::<ArrayBody>(raw).map(Value::Array),
-        MAP_BODY_TYPE_TAG => heap.cast_raw_if_type::<MapBody>(raw).map(Value::Map),
-        SET_BODY_TYPE_TAG => heap.cast_raw_if_type::<SetBody>(raw).map(Value::Set),
+        OBJECT_BODY_TYPE_TAG => heap.cast_raw_if_type::<ObjectBody>(raw).map(Value::object),
+        ARRAY_BODY_TYPE_TAG => heap.cast_raw_if_type::<ArrayBody>(raw).map(Value::array),
+        MAP_BODY_TYPE_TAG => heap.cast_raw_if_type::<MapBody>(raw).map(Value::map),
+        SET_BODY_TYPE_TAG => heap.cast_raw_if_type::<SetBody>(raw).map(Value::set),
         WEAK_MAP_BODY_TYPE_TAG => heap
             .cast_raw_if_type::<WeakMapBody>(raw)
-            .map(Value::WeakMap),
+            .map(Value::weak_map),
         WEAK_SET_BODY_TYPE_TAG => heap
             .cast_raw_if_type::<WeakSetBody>(raw)
-            .map(Value::WeakSet),
+            .map(Value::weak_set),
         WEAK_REF_BODY_TYPE_TAG => heap
             .cast_raw_if_type::<WeakRefBody>(raw)
-            .map(Value::WeakRef),
+            .map(Value::weak_ref),
         FINALIZATION_REGISTRY_BODY_TYPE_TAG => heap
             .cast_raw_if_type::<FinalizationRegistryBody>(raw)
-            .map(Value::FinalizationRegistry),
+            .map(Value::finalization_registry),
         _ => None,
     }
 }
 
 fn receiver_weak_ref(args: &IntrinsicArgs<'_>) -> Result<JsWeakRef, IntrinsicError> {
-    match args.receiver {
-        Value::WeakRef(w) => Ok(*w),
-        _ => Err(IntrinsicError::BadReceiver {
+    args.receiver
+        .as_weak_ref()
+        .ok_or(IntrinsicError::BadReceiver {
             expected: "WeakRef",
-        }),
-    }
+        })
 }
 
 fn receiver_finalization_registry(
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<JsFinalizationRegistry, IntrinsicError> {
-    match args.receiver {
-        Value::FinalizationRegistry(r) => Ok(*r),
-        _ => Err(IntrinsicError::BadReceiver {
+    args.receiver
+        .as_finalization_registry()
+        .ok_or(IntrinsicError::BadReceiver {
             expected: "FinalizationRegistry",
-        }),
-    }
+        })
 }
 
 fn impl_weak_ref_deref(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

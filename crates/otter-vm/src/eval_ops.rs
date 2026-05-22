@@ -79,12 +79,12 @@ impl Interpreter {
     /// - [`VmError::SyntaxError`] when no eval hook is installed or
     ///   parsing / compilation fail.
     pub(crate) fn run_eval(&mut self, value: &Value, force_strict: bool) -> Result<Value, VmError> {
-        let source = match value {
-            Value::String(s) => s.to_lossy_string(&self.gc_heap),
+        let Some(s) = value.as_string() else {
             // Per §19.4.1.1 step 4, eval'd non-strings are returned
             // unchanged — `eval(42) === 42`.
-            _ => return Ok(*value),
+            return Ok(*value);
         };
+        let source = s.to_lossy_string(&self.gc_heap);
         let module = self.compile_eval_source(&source, EvalCompileOptions { force_strict })?;
         let context = ExecutionContext::from_module(module);
         let main = context.exec_main();
@@ -92,9 +92,9 @@ impl Interpreter {
         let upvalues =
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())?;
         let entry_this = if main.is_module || main.is_strict {
-            Value::Undefined
+            Value::undefined()
         } else {
-            Value::Object(self.global_this)
+            Value::object(self.global_this)
         };
         let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
         let entry_is_async = main.is_async;
@@ -194,7 +194,7 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
-        if !matches!(value, Value::Function { .. } | Value::Closure(_)) {
+        if !value.is_function() && !value.is_closure() {
             return Ok(value);
         }
         let mut metadata_ctx = function_metadata::FunctionMetadataContext::new(
@@ -207,32 +207,30 @@ impl Interpreter {
             function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "name")?;
         let length_value =
             function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "length")?;
-        let prototype_value = match &value {
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let mut roots = Vec::with_capacity(value_roots.len() + 1);
-                roots.push(&value);
-                roots.extend_from_slice(value_roots);
-                match stack_roots {
-                    Some(stack) => self.function_property_get_stack_rooted(
-                        &function_context,
-                        stack,
-                        *function_id,
-                        "prototype",
-                    )?,
-                    None => self.function_property_get_runtime_rooted(
-                        &function_context,
-                        *function_id,
-                        "prototype",
-                        &roots,
-                        slice_roots,
-                    )?,
-                }
+        let function_id_opt = value
+            .as_function()
+            .or_else(|| value.as_closure().map(|c| c.cached_function_id));
+        let prototype_value = if let Some(function_id) = function_id_opt {
+            let mut roots = Vec::with_capacity(value_roots.len() + 1);
+            roots.push(&value);
+            roots.extend_from_slice(value_roots);
+            match stack_roots {
+                Some(stack) => self.function_property_get_stack_rooted(
+                    &function_context,
+                    stack,
+                    function_id,
+                    "prototype",
+                )?,
+                None => self.function_property_get_runtime_rooted(
+                    &function_context,
+                    function_id,
+                    "prototype",
+                    &roots,
+                    slice_roots,
+                )?,
             }
-            _ => Value::undefined(),
+        } else {
+            Value::undefined()
         };
         let target_capture = value;
         let callback_context = function_context.clone();
@@ -301,14 +299,14 @@ impl Interpreter {
         )
         .map_err(VmError::from)?;
 
-        if let Value::NativeFunction(native) = &wrapper {
+        if let Some(native) = wrapper.as_native_function() {
             let name = object::PropertyDescriptor::data(name_value, false, false, true);
             let _ = native.define_own_property(&mut self.gc_heap, "name", name);
             let length = object::PropertyDescriptor::data(length_value, false, false, true);
             let _ = native.define_own_property(&mut self.gc_heap, "length", length);
             let prototype = object::PropertyDescriptor::data(prototype_value, true, false, false);
             let _ = native.define_own_property(&mut self.gc_heap, "prototype", prototype);
-            if let Value::Object(proto) = prototype_value {
+            if let Some(proto) = prototype_value.as_object() {
                 let constructor = object::PropertyDescriptor::data(wrapper, true, false, true);
                 let _ = object::define_own_property(
                     proto,
@@ -327,19 +325,20 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<String, VmError> {
-        let primitive = match value {
-            Value::Object(_) | Value::Proxy(_) => {
-                self.to_primitive_string_hint_sync(context, *value)?
-            }
-            other => *other,
+        let primitive = if value.is_object() || value.is_proxy() {
+            self.to_primitive_string_hint_sync(context, *value)?
+        } else {
+            *value
         };
-        match primitive {
-            Value::String(s) => Ok(s.to_lossy_string(&self.gc_heap)),
-            Value::Symbol(_) => Err(VmError::TypeError {
-                message: "Cannot convert a Symbol value to a string".to_string(),
-            }),
-            other => Ok(other.display_string(&self.gc_heap)),
+        if let Some(s) = primitive.as_string() {
+            return Ok(s.to_lossy_string(&self.gc_heap));
         }
+        if primitive.is_symbol() {
+            return Err(VmError::TypeError {
+                message: "Cannot convert a Symbol value to a string".to_string(),
+            });
+        }
+        Ok(primitive.display_string(&self.gc_heap))
     }
 
     // `to_*` mirrors the spec abstract operation `ToPrimitive` (§7.1.1).

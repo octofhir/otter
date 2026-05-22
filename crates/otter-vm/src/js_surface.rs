@@ -427,7 +427,7 @@ impl<'rt> ObjectBuilder<'rt> {
             self.object,
             self.heap,
             name,
-            Value::NativeFunction(native),
+            Value::native_function(native),
             attrs,
         )?;
         Ok(self)
@@ -445,7 +445,7 @@ impl<'rt> ObjectBuilder<'rt> {
         roots.push(&object_root);
         roots.extend(self.value_roots.iter());
         let getter = match &spec.get {
-            Some(call) => Some(Value::NativeFunction(native_from_call_with_raw_roots(
+            Some(call) => Some(Value::native_function(native_from_call_with_raw_roots(
                 self.heap,
                 spec.name,
                 0,
@@ -462,7 +462,7 @@ impl<'rt> ObjectBuilder<'rt> {
         setter_roots.push(&getter_root);
         setter_roots.extend(self.value_roots.iter());
         let setter = match &spec.set {
-            Some(call) => Some(Value::NativeFunction(native_from_call_with_raw_roots(
+            Some(call) => Some(Value::native_function(native_from_call_with_raw_roots(
                 self.heap,
                 spec.name,
                 1,
@@ -578,7 +578,7 @@ impl<'rt> ConstructorBuilder<'rt> {
             ctor,
             self.heap,
             "prototype",
-            Value::Object(proto),
+            Value::object(proto),
             Attr::data(),
         )?;
         let mut builder_roots = Vec::with_capacity(self.value_roots.len() + 3);
@@ -952,9 +952,9 @@ mod tests {
         assert!(!pi.configurable());
 
         let method = object::get(ns, &heap, "one").expect("one");
-        let Value::NativeFunction(native) = method else {
-            panic!("method should be native")
-        };
+        let native = method
+            .as_native_function()
+            .expect("method should be native");
         assert!(native.is_static_call(&heap));
         assert_eq!(native.length(&heap), 0);
         assert!(matches!(
@@ -969,35 +969,34 @@ mod tests {
         let class = ClassBuilder::from_spec(&mut heap, &CLASS_SPEC)
             .build()
             .expect("build");
-        let Value::ClassConstructor(class) = class else {
-            panic!("class builder should produce a class constructor value")
-        };
+        let class = class
+            .as_class_constructor()
+            .expect("class builder should produce a class constructor value");
 
-        let Value::NativeFunction(ctor) = &class.ctor(&heap) else {
-            panic!("class constructor should use a native function")
-        };
+        let ctor = class
+            .ctor(&heap)
+            .as_native_function()
+            .expect("class constructor should use a native function");
         assert!(ctor.is_static_call(&heap));
         assert_eq!(ctor.length(&heap), 1);
 
-        let Value::NativeFunction(static_method) =
-            object::get(class.statics(&heap), &heap, "from").expect("static method")
-        else {
-            panic!("static method should be native")
-        };
+        let static_method = object::get(class.statics(&heap), &heap, "from")
+            .expect("static method")
+            .as_native_function()
+            .expect("static method should be native");
         assert!(static_method.is_static_call(&heap));
         assert_eq!(static_method.length(&heap), 1);
 
-        let Value::NativeFunction(proto_method) =
-            object::get(class.prototype(&heap), &heap, "valueOf").expect("prototype method")
-        else {
-            panic!("prototype method should be native")
-        };
+        let proto_method = object::get(class.prototype(&heap), &heap, "valueOf")
+            .expect("prototype method")
+            .as_native_function()
+            .expect("prototype method should be native");
         assert!(proto_method.is_static_call(&heap));
         assert_eq!(proto_method.length(&heap), 0);
 
         let constructor = object::get(class.prototype(&heap), &heap, "constructor")
             .expect("prototype constructor backlink");
-        assert!(matches!(constructor, Value::ClassConstructor(_)));
+        assert!(constructor.is_class_constructor());
         let accessor = object::get_own_descriptor(class.prototype(&heap), &heap, "answer")
             .expect("prototype accessor");
         assert!(accessor.is_accessor());

@@ -23,8 +23,8 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
     let arg = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("arg");
     let bound = BoundFunction::new(
         interp.gc_heap_mut(),
-        Value::Object(target),
-        Value::Object(bound_this),
+        Value::object(target),
+        Value::object(bound_this),
         smallvec![Value::object(arg)],
     )
     .expect("bound function");
@@ -34,7 +34,7 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
         global,
         interp.gc_heap_mut(),
         "__gc_bound_function",
-        Value::BoundFunction(bound),
+        Value::bound_function(bound),
     );
 
     let _ = target;
@@ -45,13 +45,13 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
 
     let rooted = crate::object::get(global, interp.gc_heap(), "__gc_bound_function")
         .expect("bound function survives");
-    let Value::BoundFunction(bound) = rooted else {
+    let Some(bound) = rooted.as_bound_function() else {
         panic!("expected bound function root");
     };
     let (target, bound_this, args) = bound.parts(interp.gc_heap());
-    assert!(matches!(target, Value::Object(_)));
-    assert!(matches!(bound_this, Value::Object(_)));
-    assert!(matches!(args.first(), Some(Value::Object(_))));
+    assert!(target.is_object());
+    assert!(bound_this.is_object());
+    assert!(args.first().is_some_and(|v| v.is_object()));
 }
 
 #[test]
@@ -74,13 +74,13 @@ fn native_function_captures_root_gc_values_when_rooted() {
 
     let rooted = crate::object::get(global, interp.gc_heap(), "__gc_native_function")
         .expect("native function survives");
-    let Value::NativeFunction(native) = rooted else {
+    let Some(native) = rooted.as_native_function() else {
         panic!("expected native value after force_gc");
     };
     assert_eq!(native.name(interp.gc_heap()), "capture-root");
     let captures = native_function_captures(native, interp.gc_heap());
     assert!(
-        matches!(captures.first(), Some(Value::Object(_))),
+        captures.first().is_some_and(|v| v.is_object()),
         "rooted native function must trace explicit captures"
     );
 }
@@ -96,14 +96,14 @@ fn regexp_body_survives_force_gc_when_rooted() {
         global,
         interp.gc_heap_mut(),
         "__gc_regexp",
-        Value::RegExp(re),
+        Value::regexp(re),
     );
     let _ = re;
     interp.force_gc();
 
     let rooted =
         crate::object::get(global, interp.gc_heap(), "__gc_regexp").expect("regexp survives");
-    let Value::RegExp(re) = rooted else {
+    let Some(re) = rooted.as_regexp() else {
         panic!("expected regexp root");
     };
     let haystack: Vec<u16> = "abbbc".encode_utf16().collect();
@@ -127,8 +127,8 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
     let bound_object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     let bound = BoundFunction::new(
         interp.gc_heap_mut(),
-        Value::Object(bound_object),
-        Value::Object(bound_object),
+        Value::object(bound_object),
+        Value::object(bound_object),
         smallvec![Value::object(bound_object)],
     )
     .expect("bound");
@@ -136,7 +136,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         bound_object,
         interp.gc_heap_mut(),
         "back",
-        Value::BoundFunction(bound),
+        Value::bound_function(bound),
     );
 
     let native_object =
@@ -162,7 +162,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         regexp_object,
         interp.gc_heap_mut(),
         "regexp",
-        Value::RegExp(re),
+        Value::regexp(re),
     );
 
     let _ = bound_object;

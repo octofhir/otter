@@ -1685,6 +1685,32 @@ impl Value {
             _ => OtherFamilyKind::Unknown,
         })
     }
+
+    // -----------------------------------------------------------------------
+    // GC tracing
+    // -----------------------------------------------------------------------
+
+    /// Walk every `Gc<…>` slot held directly inside `self` and yield
+    /// its slot pointer to `visitor`.
+    ///
+    /// On tagged `Value`, every pointer-tagged variant packs exactly
+    /// one 32-bit GC offset in the low 32 bits of `self.0`. The low
+    /// 32 bits live at byte offset `0..4` on little-endian targets,
+    /// so `&self.0` cast to `*mut RawGc` is a valid slot pointer:
+    /// the collector may rewrite those 4 bytes in place during
+    /// relocation without touching bits 32..48 (reserved zero) or
+    /// the top-16 tag.
+    ///
+    /// Immediate variants (`undefined`, `null`, `hole`, booleans,
+    /// numbers, function ids) hold no GC slot and are skipped.
+    #[allow(dead_code)] // Wired up at Phase-1 swap; ~150 call sites flip over from legacy::Value.
+    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        let tag = top_tag(self.0);
+        if (TAG_PTR_OBJECT..=TAG_PTR_OTHER).contains(&tag) {
+            let slot = &self.0 as *const u64 as *mut otter_gc::raw::RawGc;
+            visitor(slot);
+        }
+    }
 }
 
 /// Default to `undefined`.

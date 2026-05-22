@@ -91,10 +91,10 @@ impl CapabilityExecutorState {
         }
         let resolve = args.first().cloned().unwrap_or(Value::undefined());
         let reject = args.get(1).cloned().unwrap_or(Value::undefined());
-        if !matches!(resolve, Value::Undefined) {
+        if !resolve.is_undefined() {
             *self.resolve.borrow_mut() = Some(resolve);
         }
-        if !matches!(reject, Value::Undefined) {
+        if !reject.is_undefined() {
             *self.reject.borrow_mut() = Some(reject);
         }
         Ok(Value::undefined())
@@ -154,16 +154,16 @@ impl PromiseSlots {
     fn trace(&self, visitor: &mut SlotVisitor<'_>) {
         self.array_value().trace_value_slots(visitor);
         if let Some(keys) = self.keys {
-            Value::Array(keys).trace_value_slots(visitor);
+            Value::array(keys).trace_value_slots(visitor);
         }
     }
 
     fn array_value(&self) -> Value {
-        Value::Array(self.values)
+        Value::array(self.values)
     }
 
     fn keys_value(&self) -> Option<Value> {
-        self.keys.map(Value::Array)
+        self.keys.map(Value::array)
     }
 
     fn reserve_slot(
@@ -179,7 +179,7 @@ impl PromiseSlots {
         let len = crate::array::push_with_roots(
             self.values,
             interp.gc_heap_mut(),
-            Value::Hole,
+            Value::hole(),
             &mut external_visit,
         )
         .map_err(|_| oom_native("Promise combinator"))?;
@@ -217,7 +217,7 @@ impl PromiseSlots {
         let len = crate::array::push_with_roots(
             self.values,
             interp.gc_heap_mut(),
-            Value::Hole,
+            Value::hole(),
             &mut external_visit,
         )
         .map_err(|_| oom_native("Promise keyed combinator"))?;
@@ -230,7 +230,7 @@ impl PromiseSlots {
             let Some(slot) = elements.get_mut(index) else {
                 return false;
             };
-            if !matches!(slot, Value::Hole) {
+            if !slot.is_hole() {
                 return false;
             }
             *slot = value;
@@ -255,8 +255,8 @@ impl PromiseSlots {
             elements
                 .iter()
                 .map(|slot| {
-                    if matches!(slot, Value::Hole) {
-                        Value::Undefined
+                    if slot.is_hole() {
+                        Value::undefined()
                     } else {
                         *slot
                     }
@@ -500,7 +500,7 @@ impl PromiseBuilder {
         let (handle, resolve, reject) =
             self.construct_runtime_rooted(interp, value_roots, slice_roots)?;
         Ok(PromiseCapability {
-            promise: Value::Promise(handle),
+            promise: Value::promise(handle),
             resolve,
             reject,
             context: self.context.clone(),
@@ -517,7 +517,7 @@ impl PromiseBuilder {
         let (handle, resolve, reject) =
             self.construct_stack_rooted(interp, stack, value_roots, slice_roots)?;
         Ok(PromiseCapability {
-            promise: Value::Promise(handle),
+            promise: Value::promise(handle),
             resolve,
             reject,
             context: self.context.clone(),
@@ -790,7 +790,7 @@ pub fn prototype_call(
         "finally" => method_finally_value(
             interp,
             context,
-            Value::Promise(*promise),
+            Value::promise(*promise),
             args.first().cloned().unwrap_or(Value::undefined()),
         ),
         other => Err(NativeError::TypeError {
@@ -930,7 +930,7 @@ fn make_then_finally(
                     .run_callable_sync(
                         &exec_for_call,
                         &on_finally,
-                        Value::Undefined,
+                        Value::undefined(),
                         SmallVec::new(),
                     )
                     .map_err(|err| promise_vm_error("Promise.prototype.finally", err))?
@@ -941,7 +941,7 @@ fn make_then_finally(
                 call_promise_resolve(interp, &exec_for_call, &resolve_fn, &c, result)?
             };
             let value_thunk = make_value_thunk(ctx, value)?;
-            invoke_then(ctx, resolved, value_thunk, Value::Undefined)
+            invoke_then(ctx, resolved, value_thunk, Value::undefined())
         },
     )
     .map_err(|_| oom_native("Promise.prototype.finally"))
@@ -980,7 +980,7 @@ fn make_catch_finally(
                     .run_callable_sync(
                         &exec_for_call,
                         &on_finally,
-                        Value::Undefined,
+                        Value::undefined(),
                         SmallVec::new(),
                     )
                     .map_err(|err| promise_vm_error("Promise.prototype.finally", err))?
@@ -991,7 +991,7 @@ fn make_catch_finally(
                 call_promise_resolve(interp, &exec_for_call, &resolve_fn, &c, result)?
             };
             let thrower = make_thrower(ctx, reason)?;
-            invoke_then(ctx, resolved, thrower, Value::Undefined)
+            invoke_then(ctx, resolved, thrower, Value::undefined())
         },
     )
     .map_err(|_| oom_native("Promise.prototype.finally"))
@@ -1055,10 +1055,9 @@ fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeE
 // -- statics --------------------------------------------------------
 
 fn is_builtin_promise_constructor(interp: &Interpreter, constructor: &Value) -> bool {
-    matches!(
-        constructor,
-        Value::NativeFunction(native) if native.name(interp.gc_heap()) == "Promise"
-    )
+    constructor
+        .as_native_function()
+        .is_some_and(|native| native.name(interp.gc_heap()) == "Promise")
 }
 
 fn builtin_promise_constructor(interp: &Interpreter) -> Result<Value, NativeError> {
@@ -1174,7 +1173,7 @@ fn call_capability_function(
         reason: "missing execution context".to_string(),
     })?;
     interp
-        .run_callable_sync(exec, function, Value::Undefined, smallvec![value])
+        .run_callable_sync(exec, function, Value::undefined(), smallvec![value])
         .map_err(|err| promise_vm_error("Promise", err))?;
     Ok(())
 }
@@ -1288,7 +1287,7 @@ fn species_constructor_runtime(
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let c = get_property_runtime(interp, context, *obj, "constructor", name)?;
-    if matches!(c, Value::Undefined) {
+    if c.is_undefined() {
         return Ok(*default_ctor);
     }
     if !is_object_like(&c) {
@@ -1301,7 +1300,7 @@ fn species_constructor_runtime(
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Species);
     let s = get_symbol_property_runtime(interp, context, c, &species_sym, name)?;
-    if matches!(s, Value::Undefined | Value::Null) {
+    if s.is_undefined() || s.is_null() {
         return Ok(c);
     }
     if crate::is_constructor_runtime(&s, context, interp.gc_heap()) {
@@ -1314,29 +1313,7 @@ fn species_constructor_runtime(
 }
 
 fn is_object_like(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Proxy(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Promise(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-    )
+    value.is_object_like()
 }
 
 fn get_callable_property(
@@ -1411,15 +1388,15 @@ fn static_resolve(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let value = args.first().cloned().unwrap_or(Value::undefined());
-    if let Value::Promise(p) = &value {
+    if let Some(p) = value.as_promise() {
         if let Some(exec) = context.as_ref() {
             let value_constructor =
                 get_property_runtime(interp, exec, value, "constructor", "Promise.resolve")?;
             if crate::abstract_ops::same_value(&value_constructor, &constructor, interp.gc_heap()) {
-                return Ok(Value::promise(*p));
+                return Ok(Value::promise(p));
             }
         } else {
-            return Ok(Value::promise(*p));
+            return Ok(Value::promise(p));
         }
     }
     Ok(Value::promise(
@@ -1499,7 +1476,7 @@ fn static_try_generic(
         &[&callbackfn],
         &[args],
     )?;
-    let call_result = interp.run_callable_sync(&exec, &callbackfn, Value::Undefined, forwarded);
+    let call_result = interp.run_callable_sync(&exec, &callbackfn, Value::undefined(), forwarded);
     match call_result {
         Ok(value) => {
             call_capability_resolve(interp, &cap, value)?;
@@ -1720,11 +1697,13 @@ fn vm_property_key_from_value(
     key: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Option<crate::VmPropertyKey<'static>> {
-    match key {
-        Value::String(s) => Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Some(crate::VmPropertyKey::Symbol(*sym)),
-        _ => None,
+    if let Some(s) = key.as_string() {
+        return Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
+    if let Some(sym) = key.as_symbol() {
+        return Some(crate::VmPropertyKey::Symbol(*sym));
+    }
+    None
 }
 
 fn keyed_get(
@@ -1858,13 +1837,13 @@ fn define_keyed_result_properties(
 ) -> Result<(), NativeError> {
     for (key, value) in keys.iter().zip(values.iter()) {
         let desc = crate::object::PropertyDescriptor::data(*value, true, true, true);
-        let ok = match key {
-            Value::String(s) => {
-                let key = s.to_lossy_string(heap);
-                crate::object::define_own_property(obj, heap, &key, desc)
-            }
-            Value::Symbol(sym) => crate::object::define_own_symbol_property(obj, heap, sym, desc),
-            _ => true,
+        let ok = if let Some(s) = key.as_string() {
+            let key = s.to_lossy_string(heap);
+            crate::object::define_own_property(obj, heap, &key, desc)
+        } else if let Some(sym) = key.as_symbol() {
+            crate::object::define_own_symbol_property(obj, heap, sym, desc)
+        } else {
+            true
         };
         if !ok {
             return Err(NativeError::TypeError {
@@ -1997,7 +1976,7 @@ fn static_all_generic(
                             &[collected.as_slice()],
                         )?;
                         let interp = ctx.interp_mut();
-                        call_capability_resolve(interp, &cap_for_fulfill, Value::Array(arr))?;
+                        call_capability_resolve(interp, &cap_for_fulfill, Value::array(arr))?;
                     }
                     Ok(Value::undefined())
                 },
@@ -2029,7 +2008,7 @@ fn static_all_generic(
                     &[args, collected.as_slice()],
                 )
                 .map_err(|_| oom_native("Promise.all"))?;
-            if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
+            if let Err(err) = call_capability_resolve(interp, &cap, Value::array(arr)) {
                 return reject_capability_error(interp, &cap, err);
             }
         }
@@ -2231,7 +2210,7 @@ fn static_all_settled_generic(
                                 &[collected.as_slice()],
                             )?;
                             let interp = ctx.interp_mut();
-                            call_capability_resolve(interp, &cap, Value::Array(arr))?;
+                            call_capability_resolve(interp, &cap, Value::array(arr))?;
                         }
                         Ok(Value::undefined())
                     },
@@ -2281,7 +2260,7 @@ fn static_all_settled_generic(
                                 &[collected.as_slice()],
                             )?;
                             let interp = ctx.interp_mut();
-                            call_capability_resolve(interp, &cap, Value::Array(arr))?;
+                            call_capability_resolve(interp, &cap, Value::array(arr))?;
                         }
                         Ok(Value::undefined())
                     },
@@ -2314,7 +2293,7 @@ fn static_all_settled_generic(
                     &[args, collected.as_slice()],
                 )
                 .map_err(|_| oom_native("Promise.allSettled"))?;
-            if let Err(err) = call_capability_resolve(interp, &cap, Value::Array(arr)) {
+            if let Err(err) = call_capability_resolve(interp, &cap, Value::array(arr)) {
                 return reject_capability_error(interp, &cap, err);
             }
         }
@@ -2341,7 +2320,7 @@ fn build_settled_record(
         name: "Promise",
         reason: "out of memory".to_string(),
     })?;
-    ctx.set_property_with_roots(obj, "status", Value::String(status), &[&payload], &[])
+    ctx.set_property_with_roots(obj, "status", Value::string(status), &[&payload], &[])
         .map_err(|err| NativeError::TypeError {
             name: "Promise",
             reason: err.to_string(),
@@ -2391,7 +2370,7 @@ fn make_aggregate_error_runtime_rooted(
         )
         .map_err(|_| oom_native("Promise.any"))?;
     interp
-        .set_property(obj, "errors", Value::Array(arr))
+        .set_property(obj, "errors", Value::array(arr))
         .map_err(|err| NativeError::TypeError {
             name: "Promise",
             reason: err.to_string(),
@@ -2425,7 +2404,7 @@ fn make_aggregate_error_native_rooted(
     let arr = ctx
         .array_from_elements_with_roots(errors.iter().cloned(), &[&obj_value], &[errors.as_slice()])
         .map_err(|_| oom_native("Promise.any"))?;
-    ctx.set_property(obj, "errors", Value::Array(arr))
+    ctx.set_property(obj, "errors", Value::array(arr))
         .map_err(|err| NativeError::TypeError {
             name: "Promise",
             reason: err.to_string(),
@@ -2458,8 +2437,12 @@ fn alloc_object_result_with_object_proto(
     slice_roots: &[&[Value]],
 ) -> Result<crate::object::JsObject, NativeError> {
     match interp.constructor_prototype_value("Object") {
-        Ok(Value::Object(proto)) => interp
-            .alloc_runtime_rooted_object_with_proto(proto, value_roots, slice_roots)
+        Ok(v) if v.is_object() => interp
+            .alloc_runtime_rooted_object_with_proto(
+                v.as_object().unwrap(),
+                value_roots,
+                slice_roots,
+            )
             .map_err(|_| oom_native(name)),
         _ => interp
             .alloc_runtime_rooted_object_with_roots(value_roots, slice_roots)
@@ -2818,7 +2801,7 @@ fn perform_then_with_handlers(
         .capability_runtime_rooted(interp, &value_roots, &[])
     {
         Ok(cap) => cap,
-        Err(_) => return Value::Undefined,
+        Err(_) => return Value::undefined(),
     };
     let outcome: PromiseThenOutcome = promise.perform_then_with_context(
         interp.gc_heap_mut(),
@@ -2947,7 +2930,7 @@ fn resolve_native_body(
     }
 
     let value = args.first().cloned().unwrap_or(Value::undefined());
-    if let Value::Promise(inner) = value {
+    if let Some(inner) = value.as_promise() {
         let value_root = Value::promise(inner);
         let (on_fulfill, on_reject) =
             make_resolve_adoption_handlers_native_rooted(ctx, promise, &[&value_root], &[args])?;
@@ -3104,7 +3087,7 @@ mod tests {
     fn aggregate_error_runtime_builder_uses_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let registry = interp.error_classes_clone();
-        let errors = vec![Value::number(NumberValue::from_i32(1))];
+        let errors = vec![Value::number_i32(1)];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = make_aggregate_error_runtime_rooted(&mut interp, &registry, errors)
@@ -3115,20 +3098,17 @@ mod tests {
             after > before,
             "Promise.any AggregateError runtime path should allocate object and errors array in young space"
         );
-        let Value::Object(obj) = result else {
+        let Some(obj) = result.as_object() else {
             panic!("expected object");
         };
-        assert!(matches!(
-            crate::object::get(obj, interp.gc_heap(), "errors"),
-            Some(Value::Array(_))
-        ));
+        assert!(crate::object::get(obj, interp.gc_heap(), "errors").is_some_and(|v| v.is_array()));
     }
 
     #[test]
     fn aggregate_error_native_builder_uses_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let registry = interp.error_classes_clone();
-        let errors = vec![Value::number(NumberValue::from_i32(2))];
+        let errors = vec![Value::number_i32(2)];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = {
@@ -3142,19 +3122,16 @@ mod tests {
             after > before,
             "Promise.any AggregateError native path should allocate object and errors array in young space"
         );
-        let Value::Object(obj) = result else {
+        let Some(obj) = result.as_object() else {
             panic!("expected object");
         };
-        assert!(matches!(
-            crate::object::get(obj, interp.gc_heap(), "errors"),
-            Some(Value::Array(_))
-        ));
+        assert!(crate::object::get(obj, interp.gc_heap(), "errors").is_some_and(|v| v.is_array()));
     }
 
     #[test]
     fn promise_static_resolve_uses_runtime_rooted_young_allocation() {
         let mut interp = Interpreter::new();
-        let args = [Value::number(NumberValue::from_i32(7))];
+        let args = [Value::number_i32(7)];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let constructor = Value::undefined();
@@ -3166,13 +3143,14 @@ mod tests {
             after > before,
             "Promise.resolve should allocate non-promise results through runtime-rooted young allocation"
         );
-        let Value::Promise(promise) = promise_value else {
+        let Some(promise) = promise_value.as_promise() else {
             panic!("expected promise");
         };
-        assert!(matches!(
-            promise.state(interp.gc_heap()),
-            PromiseState::Fulfilled(Value::Number(_))
-        ));
+        let state = promise.state(interp.gc_heap());
+        match state {
+            PromiseState::Fulfilled(v) => assert!(v.is_number()),
+            _ => panic!("expected fulfilled with number, got {state:?}"),
+        }
     }
 
     #[test]
@@ -3198,7 +3176,7 @@ mod tests {
     fn promise_constructor_builder_uses_native_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        let executor = Value::number(NumberValue::from_i32(17));
+        let executor = Value::number_i32(17);
         let args = vec![executor];
 
         let (handle, resolve, reject) = {

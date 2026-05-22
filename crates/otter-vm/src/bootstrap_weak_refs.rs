@@ -80,7 +80,7 @@ fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         global,
         heap,
         <WeakRefIntrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-        Value::NativeFunction(ctor),
+        Value::native_function(ctor),
     );
     Ok(())
 }
@@ -144,7 +144,7 @@ fn install_finalization_registry(
         global,
         heap,
         <FinalizationRegistryIntrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-        Value::NativeFunction(ctor),
+        Value::native_function(ctor),
     );
     Ok(())
 }
@@ -173,7 +173,7 @@ pub fn install_weak_well_knowns_post_bootstrap(
             heap,
             &tag_sym,
             PartialPropertyDescriptor {
-                value: Some(Value::String(tag)),
+                value: Some(Value::string(tag)),
                 writable: Some(false),
                 enumerable: Some(false),
                 configurable: Some(true),
@@ -285,8 +285,9 @@ fn fr_proto_unregister(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 // ---------------------------------------------------------------
 
 fn link_object_prototype(heap: &mut otter_gc::GcHeap, prototype: JsObject, global: JsObject) {
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -297,72 +298,40 @@ fn ctor_prototype(
     heap: &mut otter_gc::GcHeap,
     ctor_name: &str,
 ) -> Option<JsObject> {
-    let Some(Value::NativeFunction(f)) = object::get(global, heap, ctor_name) else {
-        return None;
-    };
+    let f = object::get(global, heap, ctor_name).and_then(|v| v.as_native_function())?;
     let descriptor = f
         .own_property_descriptor(&mut *heap, "prototype")
         .ok()
         .flatten()?;
     match descriptor.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }
 }
 
 fn receiver_weak_ref(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsWeakRef, NativeError> {
-    match ctx.this_value() {
-        Value::WeakRef(w) => Ok(*w),
-        _ => Err(NativeError::TypeError {
+    ctx.this_value()
+        .as_weak_ref()
+        .ok_or_else(|| NativeError::TypeError {
             name,
             reason: "this is not a WeakRef".to_string(),
-        }),
-    }
+        })
 }
 
 fn receiver_finalization_registry(
     ctx: &NativeCtx<'_>,
     name: &'static str,
 ) -> Result<JsFinalizationRegistry, NativeError> {
-    match ctx.this_value() {
-        Value::FinalizationRegistry(r) => Ok(*r),
-        _ => Err(NativeError::TypeError {
+    ctx.this_value()
+        .as_finalization_registry()
+        .ok_or_else(|| NativeError::TypeError {
             name,
             reason: "this is not a FinalizationRegistry".to_string(),
-        }),
-    }
+        })
 }
 
 fn target_can_be_weak(v: &Value) -> bool {
-    matches!(
-        v,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Promise(_)
-            | Value::Iterator(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Temporal(_)
-            | Value::Intl(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-            | Value::Proxy(_)
-            | Value::Symbol(_)
-    )
+    v.is_object_like() || v.is_symbol()
 }
 
 fn oom(name: &'static str) -> NativeError {

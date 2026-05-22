@@ -408,7 +408,7 @@ impl Frame {
         }
         let mut cells: Vec<UpvalueCell> = Vec::with_capacity(own + parent_upvalues.len());
         for _ in 0..own {
-            cells.push(alloc_upvalue(heap, Value::Undefined)?);
+            cells.push(alloc_upvalue(heap, Value::undefined())?);
         }
         cells.extend(parent_upvalues.iter().copied());
         Ok(std::rc::Rc::from(cells))
@@ -432,7 +432,7 @@ impl Frame {
             .saturating_add(function.locals)
             .saturating_add(function.scratch) as usize;
         let mut registers: SmallVec<[Value; 8]> = SmallVec::with_capacity(total);
-        registers.resize(total, Value::Undefined);
+        registers.resize(total, Value::undefined());
         debug_assert!(
             upvalues.len() >= function.own_upvalue_count as usize,
             "frame upvalues must include the function's own cells"
@@ -469,7 +469,7 @@ impl Frame {
     ) -> Self {
         let mut registers: SmallVec<[Value; 8]> =
             SmallVec::with_capacity(function.register_count as usize);
-        registers.resize(function.register_count as usize, Value::Undefined);
+        registers.resize(function.register_count as usize, Value::undefined());
         debug_assert!(
             upvalues.len() >= function.own_upvalue_count as usize,
             "frame upvalues must include the function's own cells"

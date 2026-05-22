@@ -32,22 +32,20 @@ pub const DEFAULT_LOCALE: &str = "en-US";
 /// # See also
 /// - <https://tc39.es/ecma402/#sec-canonicalizelocalelist>
 pub fn coerce_locale(arg: Option<&Value>, gc_heap: &otter_gc::GcHeap) -> String {
-    match arg {
-        None | Some(Value::Undefined) => DEFAULT_LOCALE.to_string(),
-        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
-        Some(Value::Array(_)) => DEFAULT_LOCALE.to_string(),
-        _ => DEFAULT_LOCALE.to_string(),
+    let Some(v) = arg else {
+        return DEFAULT_LOCALE.to_string();
+    };
+    if let Some(s) = v.as_string() {
+        return s.to_lossy_string(gc_heap);
     }
+    DEFAULT_LOCALE.to_string()
 }
 
 /// Optional `options` object — second positional argument to every
 /// `Intl.*` constructor.
 #[must_use]
 pub fn options_object(arg: Option<&Value>) -> Option<JsObject> {
-    match arg {
-        Some(Value::Object(obj)) => Some(*obj),
-        _ => None,
-    }
+    arg.and_then(|v| v.as_object())
 }
 
 /// Read an optional string field with default fallback.
@@ -58,10 +56,8 @@ pub fn read_string_option(
     gc_heap: &otter_gc::GcHeap,
 ) -> String {
     options
-        .and_then(|o| match crate::object::get(*o, gc_heap, name) {
-            Some(Value::String(s)) => Some(s.to_lossy_string(gc_heap)),
-            _ => None,
-        })
+        .and_then(|o| crate::object::get(*o, gc_heap, name))
+        .and_then(|v| v.as_string().map(|s| s.to_lossy_string(gc_heap)))
         .unwrap_or_else(|| default.to_string())
 }
 
@@ -73,10 +69,8 @@ pub fn read_bool_option(
     gc_heap: &otter_gc::GcHeap,
 ) -> bool {
     options
-        .and_then(|o| match crate::object::get(*o, gc_heap, name) {
-            Some(Value::Boolean(b)) => Some(b),
-            _ => None,
-        })
+        .and_then(|o| crate::object::get(*o, gc_heap, name))
+        .and_then(|v| v.as_boolean())
         .unwrap_or(default)
 }
 
@@ -90,10 +84,8 @@ pub fn read_u8_option(
     gc_heap: &otter_gc::GcHeap,
 ) -> u8 {
     let v = options
-        .and_then(|o| match crate::object::get(*o, gc_heap, name) {
-            Some(Value::Number(n)) => Some(n.as_f64() as i64),
-            _ => None,
-        })
+        .and_then(|o| crate::object::get(*o, gc_heap, name))
+        .and_then(|v| v.as_number().map(|n| n.as_f64() as i64))
         .unwrap_or(default as i64);
     v.clamp(lo as i64, hi as i64) as u8
 }

@@ -302,29 +302,34 @@ pub(crate) fn render_error_to_string_spec(
                 interp.run_callable_sync(context, &getter, *receiver, args)?
             }
         };
-        match value {
-            Value::Undefined => Ok(default.to_string()),
-            Value::Symbol(_) => Err(crate::VmError::TypeError {
+        if value.is_undefined() {
+            return Ok(default.to_string());
+        }
+        if value.is_symbol() {
+            return Err(crate::VmError::TypeError {
                 message: format!("Cannot convert a Symbol value to a string ('{key}')"),
-            }),
-            Value::String(s) => Ok(s.to_lossy_string(interp.gc_heap())),
-            Value::Null | Value::Boolean(_) | Value::Number(_) | Value::BigInt(_) => {
-                Ok(value.display_string(interp.gc_heap()))
-            }
-            _ => {
-                let primitive = interp.evaluate_to_primitive(
-                    context,
-                    &value,
-                    crate::abstract_ops::ToPrimitiveHint::String,
-                )?;
-                match primitive {
-                    Value::Symbol(_) => Err(crate::VmError::TypeError {
-                        message: format!("Cannot convert a Symbol value to a string ('{key}')"),
-                    }),
-                    Value::String(s) => Ok(s.to_lossy_string(interp.gc_heap())),
-                    other => Ok(other.display_string(interp.gc_heap())),
-                }
-            }
+            });
+        }
+        if let Some(s) = value.as_string() {
+            return Ok(s.to_lossy_string(interp.gc_heap()));
+        }
+        if value.is_null() || value.is_boolean() || value.is_number() || value.is_big_int() {
+            return Ok(value.display_string(interp.gc_heap()));
+        }
+        let primitive = interp.evaluate_to_primitive(
+            context,
+            &value,
+            crate::abstract_ops::ToPrimitiveHint::String,
+        )?;
+        if primitive.is_symbol() {
+            return Err(crate::VmError::TypeError {
+                message: format!("Cannot convert a Symbol value to a string ('{key}')"),
+            });
+        }
+        if let Some(s) = primitive.as_string() {
+            Ok(s.to_lossy_string(interp.gc_heap()))
+        } else {
+            Ok(primitive.display_string(interp.gc_heap()))
         }
     }
 
@@ -343,24 +348,25 @@ pub(crate) fn render_error_to_string_spec(
 /// `@@toPrimitive`; callers that need the spec semantics should use
 /// [`render_error_to_string_spec`].
 pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
-    let Value::Object(obj) = value else {
+    let Some(obj) = value.as_object() else {
         return value.display_string(gc_heap);
     };
-    // §20.5.3.4 defaults: `name` falls back to `"Error"` when
-    // missing / `undefined`; `message` falls back to the empty
-    // string. The synchronous render path (used by the unwind
-    // diagnostic) cannot invoke accessors / `@@toPrimitive` —
-    // `Error.prototype.toString` itself goes through
-    // [`render_error_to_string_spec`] for that.
-    let name = match crate::object::get(*obj, gc_heap, "name") {
-        Some(Value::Undefined) | None => "Error".to_string(),
-        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
-        Some(other) => other.display_string(gc_heap),
+    // §20.5.3.4 defaults: name → "Error", message → "" when absent/undefined.
+    let name = match crate::object::get(obj, gc_heap, "name") {
+        None => "Error".to_string(),
+        Some(v) if v.is_undefined() => "Error".to_string(),
+        Some(v) => v
+            .as_string()
+            .map(|s| s.to_lossy_string(gc_heap))
+            .unwrap_or_else(|| v.display_string(gc_heap)),
     };
-    let message = match crate::object::get(*obj, gc_heap, "message") {
-        Some(Value::String(s)) => s.to_lossy_string(gc_heap),
-        Some(Value::Undefined) | None => String::new(),
-        Some(other) => other.display_string(gc_heap),
+    let message = match crate::object::get(obj, gc_heap, "message") {
+        None => String::new(),
+        Some(v) if v.is_undefined() => String::new(),
+        Some(v) => v
+            .as_string()
+            .map(|s| s.to_lossy_string(gc_heap))
+            .unwrap_or_else(|| v.display_string(gc_heap)),
     };
     match (name.is_empty(), message.is_empty()) {
         (true, true) => String::new(),
@@ -451,12 +457,12 @@ impl ErrorClassRegistry {
         ) -> Result<Value, NativeError> {
             let receiver = *ctx.this_value();
             // §20.5.3.4 step 2 — Type(O) is not Object → TypeError.
-            let Value::Object(_) = &receiver else {
+            if !receiver.is_object() {
                 return Err(NativeError::TypeError {
                     name: "Error.prototype.toString",
                     reason: "receiver must be an Object".to_string(),
                 });
-            };
+            }
 
             let context =
                 ctx.execution_context()
@@ -538,7 +544,7 @@ impl ErrorClassRegistry {
                 gc_heap,
                 "length",
                 PropertyDescriptor::data(
-                    Value::Number(NumberValue::from_i32(length)),
+                    Value::number(NumberValue::from_i32(length)),
                     false,
                     false,
                     true,
@@ -564,16 +570,21 @@ impl ErrorClassRegistry {
             // `msg = ? ToString(message)`. Foundation: handle the
             // common primitive cases inline; full ToString
             // (with `Symbol.toPrimitive`) lands in a follow-up.
-            let message = match args.first() {
-                None | Some(Value::Undefined) => None,
-                Some(Value::String(s)) => Some(s.to_lossy_string(ctx.heap())),
-                Some(Value::Symbol(_)) => {
+            let message = if let Some(v) = args.first() {
+                if v.is_undefined() {
+                    None
+                } else if let Some(s) = v.as_string() {
+                    Some(s.to_lossy_string(ctx.heap()))
+                } else if v.is_symbol() {
                     return Err(NativeError::TypeError {
                         name: kind.class_name(),
                         reason: "Cannot convert a Symbol value to a string".to_string(),
                     });
+                } else {
+                    Some(v.display_string(ctx.heap()))
                 }
-                Some(v) => Some(v.display_string(ctx.heap())),
+            } else {
+                None
             };
             // §20.5.6.1.1 step 4 — install cause from
             // `options[1]` (or `options[2]` for AggregateError).
@@ -609,13 +620,7 @@ impl ErrorClassRegistry {
         /// `options` is missing / non-object, or when `cause` is
         /// not an own / inherited property of the options bag.
         fn read_options_cause(options: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<Value> {
-            let opt_obj = match options? {
-                Value::Object(obj) => *obj,
-                _ => return None,
-            };
-            // `get` walks the prototype chain, matching
-            // HasProperty's behaviour per spec. A hole or missing
-            // entry returns `None`.
+            let opt_obj = options?.as_object()?;
             object::get(opt_obj, heap, "cause")
         }
 
@@ -660,16 +665,21 @@ impl ErrorClassRegistry {
         ///   - `message` is arg 1,
         ///   - `options.cause` lives at arg 2.
         fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
-            let message = match a.get(1) {
-                None | Some(Value::Undefined) => None,
-                Some(Value::String(s)) => Some(s.to_lossy_string(c.heap())),
-                Some(Value::Symbol(_)) => {
+            let message = if let Some(v) = a.get(1) {
+                if v.is_undefined() {
+                    None
+                } else if let Some(s) = v.as_string() {
+                    Some(s.to_lossy_string(c.heap()))
+                } else if v.is_symbol() {
                     return Err(NativeError::TypeError {
                         name: "AggregateError",
                         reason: "Cannot convert a Symbol value to a string".to_string(),
                     });
+                } else {
+                    Some(v.display_string(c.heap()))
                 }
-                Some(v) => Some(v.display_string(c.heap())),
+            } else {
+                None
             };
             let errors_arg = a.first().cloned().unwrap_or(Value::undefined());
             let cause = read_options_cause(a.get(2), c.heap());
@@ -720,20 +730,20 @@ impl ErrorClassRegistry {
             ctx: &mut NativeCtx<'_>,
             value: &Value,
         ) -> Result<Vec<Value>, NativeError> {
-            match value {
-                Value::Undefined | Value::Null => Err(NativeError::TypeError {
+            if value.is_undefined() || value.is_null() {
+                return Err(NativeError::TypeError {
                     name: "AggregateError",
                     reason: "errors argument is not iterable".to_string(),
-                }),
-                Value::Array(arr) => {
-                    let heap = ctx.heap();
-                    Ok(crate::array::with_elements(*arr, heap, <[Value]>::to_vec))
-                }
-                _ => Err(NativeError::TypeError {
-                    name: "AggregateError",
-                    reason: "errors argument must be an Array (foundation slice)".to_string(),
-                }),
+                });
             }
+            if let Some(arr) = value.as_array() {
+                let heap = ctx.heap();
+                return Ok(crate::array::with_elements(arr, heap, <[Value]>::to_vec));
+            }
+            Err(NativeError::TypeError {
+                name: "AggregateError",
+                reason: "errors argument must be an Array (foundation slice)".to_string(),
+            })
         }
 
         let mut entries: Vec<(ErrorKind, ClassEntry)> = Vec::with_capacity(7);
@@ -766,7 +776,7 @@ impl ErrorClassRegistry {
             ctor_error,
             &[&error_proto_root, &error_ctor_root],
         )?;
-        object::set_constructor_native(error_ctor, gc_heap, Value::NativeFunction(error_call));
+        object::set_constructor_native(error_ctor, gc_heap, Value::native_function(error_call));
         install_ctor_metadata(error_ctor, "Error", 1, gc_heap)?;
         entries.push((
             ErrorKind::Error,
@@ -858,7 +868,7 @@ impl ErrorClassRegistry {
                 dispatcher,
                 root_refs.as_slice(),
             )?;
-            object::set_constructor_native(ctor, gc_heap, Value::NativeFunction(native));
+            object::set_constructor_native(ctor, gc_heap, Value::native_function(native));
             install_ctor_metadata(ctor, kind.class_name(), length, gc_heap)?;
             entries.push((
                 kind,
@@ -1075,7 +1085,7 @@ impl ErrorClassRegistry {
                 requested_bytes: 0,
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),
             })?;
-        ctx.set_property(obj, "errors", Value::Array(arr))
+        ctx.set_property(obj, "errors", Value::array(arr))
             .map_err(|_| otter_gc::OutOfMemory::HeapCapExceeded {
                 requested_bytes: 0,
                 heap_limit_bytes: ctx.heap().max_heap_bytes(),

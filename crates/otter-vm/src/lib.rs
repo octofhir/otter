@@ -1357,23 +1357,22 @@ impl Interpreter {
     fn primitive_wrapper_prototype(&mut self, constructor_name: &str) -> Result<JsObject, VmError> {
         let constructor = object::get(self.global_this, &self.gc_heap, constructor_name)
             .ok_or(VmError::InvalidOperand)?;
-        let prototype = match &constructor {
-            Value::Object(ctor) => object::get(*ctor, &self.gc_heap, "prototype"),
-            Value::NativeFunction(native) => {
-                let desc = native
-                    .own_property_descriptor(&mut self.gc_heap, "prototype")
-                    .map_err(|_| VmError::InvalidOperand)?;
-                desc.and_then(|d| match d.kind {
-                    object::DescriptorKind::Data { value } => Some(value),
-                    _ => None,
-                })
-            }
-            _ => None,
+        let prototype = if let Some(ctor) = constructor.as_object() {
+            object::get(ctor, &self.gc_heap, "prototype")
+        } else if let Some(native) = constructor.as_native_function() {
+            let desc = native
+                .own_property_descriptor(&mut self.gc_heap, "prototype")
+                .map_err(|_| VmError::InvalidOperand)?;
+            desc.and_then(|d| match d.kind {
+                object::DescriptorKind::Data { value } => Some(value),
+                _ => None,
+            })
+        } else {
+            None
         };
-        match prototype {
-            Some(Value::Object(p)) => Ok(p),
-            _ => Err(VmError::InvalidOperand),
-        }
+        prototype
+            .and_then(|v| v.as_object())
+            .ok_or(VmError::InvalidOperand)
     }
 
     fn box_sloppy_this_primitive_runtime_rooted(
@@ -1381,58 +1380,38 @@ impl Interpreter {
         this_value: Value,
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
-        let object = match &this_value {
-            Value::Boolean(value) => {
-                let proto = self.primitive_wrapper_prototype("Boolean")?;
-                let obj = self.alloc_runtime_rooted_object_with_proto(
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_boolean_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            Value::Number(value) => {
-                let proto = self.primitive_wrapper_prototype("Number")?;
-                let obj = self.alloc_runtime_rooted_object_with_proto(
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_number_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            Value::String(value) => {
-                let proto = self.primitive_wrapper_prototype("String")?;
-                let obj = self.alloc_runtime_rooted_object_with_proto(
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_string_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            Value::Symbol(sym) => {
-                let proto = self.primitive_wrapper_prototype("Symbol")?;
-                let obj = self.alloc_runtime_rooted_object_with_proto(
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_symbol_data(obj, &mut self.gc_heap, *sym);
-                obj
-            }
-            Value::BigInt(value) => {
-                let proto = self.primitive_wrapper_prototype("BigInt")?;
-                let obj = self.alloc_runtime_rooted_object_with_proto(
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_bigint_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            _ => return Ok(this_value),
+        let object = if let Some(value) = this_value.as_boolean() {
+            let proto = self.primitive_wrapper_prototype("Boolean")?;
+            let obj =
+                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
+            object::set_boolean_data(obj, &mut self.gc_heap, value);
+            obj
+        } else if let Some(value) = this_value.as_number() {
+            let proto = self.primitive_wrapper_prototype("Number")?;
+            let obj =
+                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
+            object::set_number_data(obj, &mut self.gc_heap, value);
+            obj
+        } else if let Some(value) = this_value.as_string() {
+            let proto = self.primitive_wrapper_prototype("String")?;
+            let obj =
+                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
+            object::set_string_data(obj, &mut self.gc_heap, *value);
+            obj
+        } else if let Some(sym) = this_value.as_symbol() {
+            let proto = self.primitive_wrapper_prototype("Symbol")?;
+            let obj =
+                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
+            object::set_symbol_data(obj, &mut self.gc_heap, *sym);
+            obj
+        } else if let Some(value) = this_value.as_big_int() {
+            let proto = self.primitive_wrapper_prototype("BigInt")?;
+            let obj =
+                self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
+            object::set_bigint_data(obj, &mut self.gc_heap, value);
+            obj
+        } else {
+            return Ok(this_value);
         };
         Ok(Value::object(object))
     }
@@ -1443,63 +1422,58 @@ impl Interpreter {
         this_value: Value,
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
-        let object = match &this_value {
-            Value::Boolean(value) => {
-                let proto = self.primitive_wrapper_prototype("Boolean")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(
-                    stack,
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_boolean_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            Value::Number(value) => {
-                let proto = self.primitive_wrapper_prototype("Number")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(
-                    stack,
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_number_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            Value::String(value) => {
-                let proto = self.primitive_wrapper_prototype("String")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(
-                    stack,
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_string_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            Value::Symbol(sym) => {
-                let proto = self.primitive_wrapper_prototype("Symbol")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(
-                    stack,
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_symbol_data(obj, &mut self.gc_heap, *sym);
-                obj
-            }
-            Value::BigInt(value) => {
-                let proto = self.primitive_wrapper_prototype("BigInt")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(
-                    stack,
-                    proto,
-                    &[&this_value],
-                    slice_roots,
-                )?;
-                object::set_bigint_data(obj, &mut self.gc_heap, *value);
-                obj
-            }
-            _ => return Ok(this_value),
+        let object = if let Some(value) = this_value.as_boolean() {
+            let proto = self.primitive_wrapper_prototype("Boolean")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(
+                stack,
+                proto,
+                &[&this_value],
+                slice_roots,
+            )?;
+            object::set_boolean_data(obj, &mut self.gc_heap, value);
+            obj
+        } else if let Some(value) = this_value.as_number() {
+            let proto = self.primitive_wrapper_prototype("Number")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(
+                stack,
+                proto,
+                &[&this_value],
+                slice_roots,
+            )?;
+            object::set_number_data(obj, &mut self.gc_heap, value);
+            obj
+        } else if let Some(value) = this_value.as_string() {
+            let proto = self.primitive_wrapper_prototype("String")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(
+                stack,
+                proto,
+                &[&this_value],
+                slice_roots,
+            )?;
+            object::set_string_data(obj, &mut self.gc_heap, *value);
+            obj
+        } else if let Some(sym) = this_value.as_symbol() {
+            let proto = self.primitive_wrapper_prototype("Symbol")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(
+                stack,
+                proto,
+                &[&this_value],
+                slice_roots,
+            )?;
+            object::set_symbol_data(obj, &mut self.gc_heap, *sym);
+            obj
+        } else if let Some(value) = this_value.as_big_int() {
+            let proto = self.primitive_wrapper_prototype("BigInt")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(
+                stack,
+                proto,
+                &[&this_value],
+                slice_roots,
+            )?;
+            object::set_bigint_data(obj, &mut self.gc_heap, value);
+            obj
+        } else {
+            return Ok(this_value);
         };
         Ok(Value::object(object))
     }
@@ -1509,34 +1483,29 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         value: &Value,
     ) -> Result<Option<JsObject>, VmError> {
-        let object = match value {
-            Value::Boolean(v) => {
-                let proto = self.primitive_wrapper_prototype("Boolean")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
-                object::set_boolean_data(obj, &mut self.gc_heap, *v);
-                obj
-            }
-            Value::Number(v) => {
-                let proto = self.primitive_wrapper_prototype("Number")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
-                object::set_number_data(obj, &mut self.gc_heap, *v);
-                obj
-            }
-            Value::String(v) => {
-                let proto = self.primitive_wrapper_prototype("String")?;
-                let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
-                object::set_string_data(obj, &mut self.gc_heap, *v);
-                obj
-            }
-            Value::Symbol(_) => {
-                let proto = self.primitive_wrapper_prototype("Symbol")?;
-                self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
-            }
-            Value::BigInt(_) => {
-                let proto = self.primitive_wrapper_prototype("BigInt")?;
-                self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
-            }
-            _ => return Ok(None),
+        let object = if let Some(v) = value.as_boolean() {
+            let proto = self.primitive_wrapper_prototype("Boolean")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
+            object::set_boolean_data(obj, &mut self.gc_heap, v);
+            obj
+        } else if let Some(v) = value.as_number() {
+            let proto = self.primitive_wrapper_prototype("Number")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
+            object::set_number_data(obj, &mut self.gc_heap, v);
+            obj
+        } else if let Some(v) = value.as_string() {
+            let proto = self.primitive_wrapper_prototype("String")?;
+            let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
+            object::set_string_data(obj, &mut self.gc_heap, *v);
+            obj
+        } else if value.is_symbol() {
+            let proto = self.primitive_wrapper_prototype("Symbol")?;
+            self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
+        } else if value.is_big_int() {
+            let proto = self.primitive_wrapper_prototype("BigInt")?;
+            self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?
+        } else {
+            return Ok(None);
         };
         Ok(Some(object))
     }
@@ -1551,7 +1520,7 @@ impl Interpreter {
             return Ok(this_value);
         }
         match this_value {
-            Value::Undefined | Value::Null => Ok(Value::object(self.global_this)),
+            v if v.is_undefined() || v.is_null() => Ok(Value::object(self.global_this)),
             other => self.box_sloppy_this_primitive_runtime_rooted(other, slice_roots),
         }
     }

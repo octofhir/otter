@@ -129,7 +129,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
             heap,
             &to_string_tag,
             PartialPropertyDescriptor {
-                value: Some(Value::String(tag)),
+                value: Some(Value::string(tag)),
                 writable: Some(false),
                 enumerable: Some(false),
                 configurable: Some(true),
@@ -306,7 +306,7 @@ fn install_collection(
         }
     }
 
-    crate::bootstrap::define_global_value(global, heap, name, Value::NativeFunction(ctor));
+    crate::bootstrap::define_global_value(global, heap, name, Value::native_function(ctor));
     Ok(())
 }
 
@@ -640,7 +640,7 @@ fn install_prototype_methods(
             )
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
             let desc = PropertyDescriptor::accessor(
-                Some(Value::NativeFunction(getter)),
+                Some(Value::native_function(getter)),
                 None,
                 false,
                 true,

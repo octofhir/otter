@@ -12,7 +12,7 @@
 //!
 //! # Invariants
 //! - `new BigInt(x)` throws `TypeError` per §21.2.1.1 step 1.
-//! - `BigInt(x)` callable returns a `Value::BigInt` via
+//! - `BigInt(x)` callable returns a BigInt via
 //!   [`crate::bigint::dispatch::call`].
 //! - `asIntN` / `asUintN` flow through the same dispatcher.
 //!
@@ -43,8 +43,9 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -80,7 +81,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
-    let ctor_roots = vec![global_root, Value::Object(prototype)];
+    let ctor_roots = vec![global_root, Value::object(prototype)];
     define_static(heap, ctor, "asIntN", 2, bigint_static_as_int_n, &ctor_roots)?;
     define_static(
         heap,
@@ -100,7 +101,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         global,
         heap,
         <Intrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-        Value::NativeFunction(ctor),
+        Value::native_function(ctor),
     );
     Ok(())
 }
@@ -113,16 +114,15 @@ pub fn install_bigint_well_knowns_post_bootstrap(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "BigInt") else {
+    let Some(ctor) = object::get(global, heap, "BigInt").and_then(|v| v.as_native_function())
+    else {
         return Ok(());
     };
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
@@ -135,7 +135,7 @@ pub fn install_bigint_well_knowns_post_bootstrap(
         heap,
         &well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
-            value: Some(Value::String(tag)),
+            value: Some(Value::string(tag)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -197,59 +197,52 @@ fn coerce_bigint_call_args(
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     for slot in out.iter_mut() {
-        match slot {
-            Value::Array(arr) => {
-                let parts: Vec<String> = {
-                    let heap = ctx.heap();
-                    crate::array::with_elements(*arr, heap, |elements| {
-                        elements
-                            .iter()
-                            .map(|v| match v {
-                                Value::Undefined | Value::Null | Value::Hole => String::new(),
-                                other => other.display_string(heap),
-                            })
-                            .collect()
-                    })
-                };
-                let joined = parts.join(",");
-                *slot = Value::string(
-                    crate::string::JsString::from_str(&joined, ctx.heap_mut()).map_err(|_| {
-                        NativeError::TypeError {
-                            name,
-                            reason: "out of memory".to_string(),
-                        }
-                    })?,
-                );
-            }
-            // §7.1.1 ToPrimitive — object / function / proxy operands
-            // run through the spec ladder so user `Symbol.toPrimitive` /
-            // `valueOf` / `toString` is observable. The result is then
-            // re-coerced by the BigInt dispatcher.
-            Value::Object(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Proxy(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_) => {
-                let (interp, exec) = ctx.interp_mut_and_context();
-                let exec = exec.ok_or_else(|| NativeError::TypeError {
-                    name,
-                    reason: "missing execution context".to_string(),
-                })?;
-                let primitive = interp
-                    .evaluate_to_primitive(
-                        &exec,
-                        slot,
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    )
-                    .map_err(|e| vm_to_native(e, name))?;
-                *slot = primitive;
-            }
-            _ => {}
+        if let Some(arr) = slot.as_array() {
+            let parts: Vec<String> = {
+                let heap = ctx.heap();
+                crate::array::with_elements(arr, heap, |elements| {
+                    elements
+                        .iter()
+                        .map(|v| {
+                            if v.is_undefined() || v.is_null() || v.is_hole() {
+                                String::new()
+                            } else {
+                                v.display_string(heap)
+                            }
+                        })
+                        .collect()
+                })
+            };
+            let joined = parts.join(",");
+            *slot = Value::string(
+                crate::string::JsString::from_str(&joined, ctx.heap_mut()).map_err(|_| {
+                    NativeError::TypeError {
+                        name,
+                        reason: "out of memory".to_string(),
+                    }
+                })?,
+            );
+        } else if slot.is_object()
+            || slot.is_function()
+            || slot.is_closure()
+            || slot.is_native_function()
+            || slot.is_bound_function()
+            || slot.is_class_constructor()
+            || slot.is_proxy()
+            || slot.is_regexp()
+            || slot.is_map()
+            || slot.is_set()
+        {
+            // §7.1.1 ToPrimitive ladder for object-like operands.
+            let (interp, exec) = ctx.interp_mut_and_context();
+            let exec = exec.ok_or_else(|| NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+            let primitive = interp
+                .evaluate_to_primitive(&exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
+                .map_err(|e| vm_to_native(e, name))?;
+            *slot = primitive;
         }
     }
     Ok(out)
@@ -260,50 +253,48 @@ fn coerce_bigint_call_args(
 // ---------------------------------------------------------------
 
 fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let b = match ctx.this_value() {
-        Value::BigInt(b) => *b,
-        Value::Object(obj) => {
-            crate::object::bigint_data(*obj, ctx.heap()).ok_or_else(|| NativeError::TypeError {
-                name: "BigInt.prototype.toString",
-                reason: "this is not a BigInt".to_string(),
-            })?
-        }
-        _ => {
-            return Err(NativeError::TypeError {
-                name: "BigInt.prototype.toString",
-                reason: "this is not a BigInt".to_string(),
-            });
-        }
+    let this = ctx.this_value();
+    let b = if let Some(b) = this.as_big_int() {
+        b
+    } else if let Some(obj) = this.as_object() {
+        crate::object::bigint_data(obj, ctx.heap()).ok_or_else(|| NativeError::TypeError {
+            name: "BigInt.prototype.toString",
+            reason: "this is not a BigInt".to_string(),
+        })?
+    } else {
+        return Err(NativeError::TypeError {
+            name: "BigInt.prototype.toString",
+            reason: "this is not a BigInt".to_string(),
+        });
     };
     // §21.2.3.4 step 2 — `radix` defaults to 10 when `undefined`,
     // otherwise routes through `ToIntegerOrInfinity`. The spec
     // raises RangeError for `< 2` / `> 36`; non-coercible operands
     // raise TypeError.
-    let radix = match args.first() {
-        None | Some(Value::Undefined) => 10u32,
-        Some(Value::Symbol(_)) => {
+    let radix = if let Some(v) = args.first() {
+        if v.is_undefined() {
+            10u32
+        } else if v.is_symbol() {
             return Err(NativeError::TypeError {
                 name: "BigInt.prototype.toString",
                 reason: "Cannot convert a Symbol value to a number".to_string(),
             });
-        }
-        Some(Value::BigInt(_)) => {
+        } else if v.is_big_int() {
             return Err(NativeError::TypeError {
                 name: "BigInt.prototype.toString",
                 reason: "Cannot convert a BigInt value to a number".to_string(),
             });
-        }
-        Some(other) => {
-            let f = match other {
-                Value::Number(n) => n.as_f64(),
-                Value::Boolean(true) => 1.0,
-                Value::Boolean(false) => 0.0,
-                Value::Null => 0.0,
-                Value::String(s) => {
-                    crate::number::parse::to_number_from_string(&s.to_lossy_string(ctx.heap()))
-                        .as_f64()
-                }
-                _ => f64::NAN,
+        } else {
+            let f = if let Some(n) = v.as_number() {
+                n.as_f64()
+            } else if let Some(b) = v.as_boolean() {
+                if b { 1.0 } else { 0.0 }
+            } else if v.is_null() {
+                0.0
+            } else if let Some(s) = v.as_string() {
+                crate::number::parse::to_number_from_string(&s.to_lossy_string(ctx.heap())).as_f64()
+            } else {
+                f64::NAN
             };
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
@@ -314,6 +305,8 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             }
             trunc as u32
         }
+    } else {
+        10u32
     };
     let rendered = b.with_inner(ctx.heap(), |bi| bi.to_str_radix(radix));
 
@@ -323,18 +316,21 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 }
 
 fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    match ctx.this_value() {
-        Value::BigInt(b) => Ok(Value::big_int(*b)),
-        Value::Object(obj) => crate::object::bigint_data(*obj, ctx.heap())
-            .map(Value::BigInt)
+    let this = ctx.this_value();
+    if let Some(b) = this.as_big_int() {
+        Ok(Value::big_int(b))
+    } else if let Some(obj) = this.as_object() {
+        crate::object::bigint_data(obj, ctx.heap())
+            .map(Value::big_int)
             .ok_or_else(|| NativeError::TypeError {
                 name: "BigInt.prototype.valueOf",
                 reason: "this is not a BigInt".to_string(),
-            }),
-        _ => Err(NativeError::TypeError {
+            })
+    } else {
+        Err(NativeError::TypeError {
             name: "BigInt.prototype.valueOf",
             reason: "this is not a BigInt".to_string(),
-        }),
+        })
     }
 }
 
@@ -364,7 +360,7 @@ fn define_static(
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let attrs = Attr::builtin_function();
     let desc = PropertyDescriptor::data(
-        Value::NativeFunction(func),
+        Value::native_function(func),
         attrs.writable,
         attrs.enumerable,
         attrs.configurable,

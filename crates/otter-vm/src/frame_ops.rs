@@ -105,7 +105,7 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
     ) -> Result<(), VmError> {
-        write_register(frame, dst, Value::Undefined)?;
+        write_register(frame, dst, Value::undefined())?;
         frame.pc += 1;
         Ok(())
     }

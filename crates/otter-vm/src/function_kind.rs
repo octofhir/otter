@@ -62,7 +62,7 @@ impl FunctionKindPrototypes {
                 heap,
                 &tag_sym,
                 object::PartialPropertyDescriptor {
-                    value: Some(Value::String(tag_string)),
+                    value: Some(Value::string(tag_string)),
                     writable: Some(false),
                     enumerable: Some(false),
                     configurable: Some(true),

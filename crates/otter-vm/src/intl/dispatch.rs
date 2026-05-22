@@ -110,7 +110,7 @@ pub fn construct(
         }
         IntlKind::Segmenter => IntlPayload::Segmenter(segmenter::resolve(locale, options, gc_heap)),
     };
-    Ok(Value::Intl(JsIntl::new(gc_heap, payload).map_err(
+    Ok(Value::intl(JsIntl::new(gc_heap, payload).map_err(
         |_| IntlError::OutOfMemory {
             requested_bytes: 0,
             heap_limit_bytes: 0,

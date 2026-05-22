@@ -161,7 +161,7 @@ pub(crate) fn install(
         gc_heap,
         CONSOLE_SPEC.name,
         crate::object::PropertyDescriptor::data(
-            Value::Object(console),
+            Value::object(console),
             CONSOLE_SPEC.attrs.writable,
             CONSOLE_SPEC.attrs.enumerable,
             CONSOLE_SPEC.attrs.configurable,

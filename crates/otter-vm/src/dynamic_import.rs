@@ -141,7 +141,7 @@ impl DynamicImportRegistry {
     pub(crate) fn trace_gc_slots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
         for entry in self.entries.values() {
             // JsPromiseHandle exposes its body slot via Value::trace.
-            let value = crate::Value::Promise(entry.promise);
+            let value = crate::Value::promise(entry.promise);
             value.trace_value_slots(visitor);
         }
     }

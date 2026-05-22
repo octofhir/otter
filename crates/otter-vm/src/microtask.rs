@@ -325,8 +325,8 @@ mod tests {
 
     fn task_for(n: i32) -> Microtask {
         Microtask {
-            callee: Value::Number(NumberValue::from_i32(n)),
-            this_value: Value::Undefined,
+            callee: Value::number_i32(n),
+            this_value: Value::undefined(),
             args: SmallVec::new(),
             context: None,
             result_capability: None,

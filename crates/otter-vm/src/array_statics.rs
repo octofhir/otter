@@ -75,7 +75,7 @@ fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             name: "Array.of",
             reason: "out of memory while allocating array".to_string(),
         })?;
-    Ok(Value::Array(arr))
+    Ok(Value::array(arr))
 }
 
 /// §23.1.2.1 `Array.from(items, mapFn?, thisArg?)` JS-visible

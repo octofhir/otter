@@ -291,7 +291,7 @@ fn impl_push(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         for v in values {
             new_len = args.array_push_rooted(*arr, v)?;
         }
-        return Ok(Value::Number(NumberValue::from_i32(new_len as i32)));
+        return Ok(Value::number(NumberValue::from_i32(new_len as i32)));
     }
     if let Value::Object(obj) = args.receiver {
         let heap = &mut *args.gc_heap;
@@ -312,7 +312,7 @@ fn impl_push(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             "length",
             Value::Number(NumberValue::from_f64(new_len as f64)),
         );
-        return Ok(Value::Number(NumberValue::from_f64(new_len as f64)));
+        return Ok(Value::number(NumberValue::from_f64(new_len as f64)));
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -468,7 +468,7 @@ fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 "length",
                 Value::Number(NumberValue::from_f64(existing_len as f64)),
             );
-            return Ok(Value::Number(NumberValue::from_f64(existing_len as f64)));
+            return Ok(Value::number(NumberValue::from_f64(existing_len as f64)));
         }
         let entries = array_like_present_entries(args.receiver, args.gc_heap)
             .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
@@ -509,7 +509,7 @@ fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             "length",
             Value::Number(NumberValue::from_f64(new_len as f64)),
         );
-        return Ok(Value::Number(NumberValue::from_f64(new_len as f64)));
+        return Ok(Value::number(NumberValue::from_f64(new_len as f64)));
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -637,12 +637,12 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 .collect()
         });
         let joined = parts.join(&separator);
-        return Ok(Value::String(JsString::from_str(&joined, args.gc_heap)?));
+        return Ok(Value::string(JsString::from_str(&joined, args.gc_heap)?));
     }
     if let Value::Object(obj) = args.receiver {
         let len = read_array_like_length(*obj, &*args.gc_heap);
         if len == 0 {
-            return Ok(Value::String(JsString::from_str("", args.gc_heap)?));
+            return Ok(Value::string(JsString::from_str("", args.gc_heap)?));
         }
         // Materialise present indices into a sparse lookup; absent
         // slots produce empty-string parts so the final `join` keeps
@@ -662,7 +662,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             };
         }
         let joined = parts.join(&separator);
-        return Ok(Value::String(JsString::from_str(&joined, args.gc_heap)?));
+        return Ok(Value::string(JsString::from_str(&joined, args.gc_heap)?));
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -684,14 +684,14 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
                 other => crate::abstract_ops::same_value_zero(other, &needle, &*args.gc_heap),
             })
         });
-        return Ok(Value::Boolean(found));
+        return Ok(Value::boolean(found));
     }
     let entries = array_like_present_entries(args.receiver, args.gc_heap)
         .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
     let found = entries
         .iter()
         .any(|(_, v)| crate::abstract_ops::same_value_zero(v, &needle, args.gc_heap));
-    Ok(Value::Boolean(found))
+    Ok(Value::boolean(found))
 }
 
 fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -712,9 +712,9 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
                 .find_map(|(i, v)| if v == &needle { Some(i) } else { None })
         });
         if let Some(i) = found {
-            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+            return Ok(Value::number(NumberValue::from_i32(i as i32)));
         }
-        return Ok(Value::Number(NumberValue::from_i32(-1)));
+        return Ok(Value::number(NumberValue::from_i32(-1)));
     }
     let len = array_like_length(args.receiver, heap);
     let from = clamp_index(from_raw, len);
@@ -725,10 +725,10 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
             continue;
         }
         if v == needle {
-            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+            return Ok(Value::number(NumberValue::from_i32(i as i32)));
         }
     }
-    Ok(Value::Number(NumberValue::from_i32(-1)))
+    Ok(Value::number(NumberValue::from_i32(-1)))
 }
 
 /// §23.1.3.1 `Array.prototype.at(index)` — clamp negative indexing.
@@ -773,7 +773,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
         let from = if from_raw < 0 {
             let v = (len as i64) + from_raw;
             if v < 0 {
-                return Ok(Value::Number(NumberValue::from_i32(-1)));
+                return Ok(Value::number(NumberValue::from_i32(-1)));
             }
             v as usize
         } else if (from_raw as usize) >= len {
@@ -795,9 +795,9 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             None
         });
         if let Some(i) = found {
-            return Ok(Value::Number(NumberValue::from_i32(i)));
+            return Ok(Value::number(NumberValue::from_i32(i)));
         }
-        return Ok(Value::Number(NumberValue::from_i32(-1)));
+        return Ok(Value::number(NumberValue::from_i32(-1)));
     }
     let len = array_like_length(args.receiver, &*args.gc_heap);
     let from_default = (len as i64).saturating_sub(1);
@@ -805,7 +805,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     let from = if from_raw < 0 {
         let v = (len as i64) + from_raw;
         if v < 0 {
-            return Ok(Value::Number(NumberValue::from_i32(-1)));
+            return Ok(Value::number(NumberValue::from_i32(-1)));
         }
         v as usize
     } else if (from_raw as usize) >= len {
@@ -822,10 +822,10 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             continue;
         }
         if v == needle {
-            return Ok(Value::Number(NumberValue::from_i32(i as i32)));
+            return Ok(Value::number(NumberValue::from_i32(i as i32)));
         }
     }
-    Ok(Value::Number(NumberValue::from_i32(-1)))
+    Ok(Value::number(NumberValue::from_i32(-1)))
 }
 
 /// §23.1.3.27 `Array.prototype.reverse()` — in-place.
@@ -837,7 +837,7 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if let Value::Array(arr) = args.receiver {
         let heap = &mut *args.gc_heap;
         array::with_elements_mut(*arr, heap, |elements| elements.reverse());
-        return Ok(Value::Array(*arr));
+        return Ok(Value::array(*arr));
     }
     if let Value::Object(obj) = args.receiver {
         let heap_ref = &mut *args.gc_heap;
@@ -915,7 +915,7 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 }
             });
         }
-        return Ok(Value::Array(*arr));
+        return Ok(Value::array(*arr));
     }
     if let Value::Object(obj) = args.receiver {
         let len = read_array_like_length(*obj, &*args.gc_heap);
@@ -1195,7 +1195,7 @@ fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
                 *slot = v;
             }
         });
-        Ok(Value::Array(arr))
+        Ok(Value::array(arr))
     } else {
         // Comparator path — interpreter dispatches it. Returning the
         // BadArgument here surfaces as a clear diagnostic during
@@ -1239,7 +1239,7 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
                 elements[to + i] = v;
             }
         });
-        return Ok(Value::Array(*arr));
+        return Ok(Value::array(*arr));
     }
     if let Value::Object(obj) = args.receiver {
         // Snapshot the source range using only present indices so
@@ -1377,15 +1377,15 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     }
     // Try indexed first.
     let Some(key_string) = key_string else {
-        return Ok(Value::Boolean(false));
+        return Ok(Value::boolean(false));
     };
     if let Some(idx) = crate::object::array_index_property_name(&key_string) {
         let has_indexed_property = array::has_own_element(*arr, heap, idx as usize)
             || array::get_accessor(*arr, heap, &key_string).is_some();
-        return Ok(Value::Boolean(has_indexed_property));
+        return Ok(Value::boolean(has_indexed_property));
     }
     if key_string == "length" {
-        return Ok(Value::Boolean(true));
+        return Ok(Value::boolean(true));
     }
     let has_named = heap.read_payload(*arr, |body| {
         body.named_properties
@@ -1396,7 +1396,7 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
                 .as_ref()
                 .is_some_and(|m| m.contains_key(&key_string))
     });
-    Ok(Value::Boolean(has_named))
+    Ok(Value::boolean(has_named))
 }
 
 /// §20.1.3.4 — `Array.prototype.propertyIsEnumerable(V)`. Indexed
@@ -1409,28 +1409,28 @@ fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, In
     let key_string: String = match &key_value {
         Value::String(s) => s.to_lossy_string(&*args.gc_heap),
         Value::Number(n) => n.to_display_string(),
-        _ => return Ok(Value::Boolean(false)),
+        _ => return Ok(Value::boolean(false)),
     };
     let heap = &mut *args.gc_heap;
     if key_string == "length" {
-        return Ok(Value::Boolean(false));
+        return Ok(Value::boolean(false));
     }
     if let Some(idx) = crate::object::array_index_property_name(&key_string) {
         let has_indexed_property = array::has_own_element(*arr, heap, idx as usize)
             || array::get_accessor(*arr, heap, &key_string).is_some();
         if !has_indexed_property {
-            return Ok(Value::Boolean(false));
+            return Ok(Value::boolean(false));
         }
         let flags = array::get_property_flags(*arr, heap, &key_string)
             .unwrap_or_else(crate::object::PropertyFlags::data_default);
-        return Ok(Value::Boolean(flags.enumerable()));
+        return Ok(Value::boolean(flags.enumerable()));
     }
     let has_named = heap.read_payload(*arr, |body| {
         body.named_properties
             .as_ref()
             .is_some_and(|m| m.contains_key(&key_string))
     });
-    Ok(Value::Boolean(has_named))
+    Ok(Value::boolean(has_named))
 }
 
 /// §23.1.3.{18,35,8} — `Array.prototype.keys()` / `.values()` /
@@ -1452,7 +1452,7 @@ fn impl_keys_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         &[],
         &[],
     )?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn impl_values_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -1469,7 +1469,7 @@ fn impl_values_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         &[],
         &[],
     )?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn impl_entries_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -1485,7 +1485,7 @@ fn impl_entries_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
         &[],
         &[],
     )?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 /// §23.1.3.41 `Array.prototype.toSorted(compareFn?)` — non-mutating
@@ -2045,7 +2045,7 @@ fn array_callback_native_dispatch(
             crate::array::with_elements_mut(arr, heap, |elements| {
                 elements.extend(buf);
             });
-            Ok(Value::Array(arr))
+            Ok(Value::array(arr))
         }
         "filter" | "flatMap" => {
             let buf: Vec<Value> = out.into_iter().map(|(_, v)| v).collect();
@@ -2065,7 +2065,7 @@ fn array_callback_native_dispatch(
             crate::array::with_elements_mut(arr, heap, |elements| {
                 elements.extend(buf);
             });
-            Ok(Value::Array(arr))
+            Ok(Value::array(arr))
         }
         _ => Err(NativeError::TypeError {
             name: "Array.prototype callback",

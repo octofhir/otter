@@ -112,7 +112,7 @@ pub fn load_static(interp: &mut Interpreter, name: &str) -> Result<Value, Symbol
     // initialisation) — keeps the typed `Op::SymbolLoad` opcode
     // working before `install_symbol_well_knowns_post_bootstrap` runs.
     if let Some(tag) = WellKnown::from_name(name) {
-        return Ok(Value::Symbol(interp.well_known_symbols().get(tag)));
+        return Ok(Value::symbol(interp.well_known_symbols().get(tag)));
     }
     Err(SymbolError::UnknownMember(name.to_string()))
 }
@@ -168,7 +168,7 @@ fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, S
         }
     };
     let sym = JsSymbol::new(&mut interp.gc_heap, description)?;
-    Ok(Value::Symbol(sym))
+    Ok(Value::symbol(sym))
 }
 
 /// `Symbol.for(key)` — Spec §20.4.2.4. Coerces `key` to a string
@@ -176,7 +176,7 @@ fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, S
 fn symbol_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
     let key = key_argument(args, &interp.gc_heap, "for")?;
     let sym = interp.symbol_for_key(&key)?;
-    Ok(Value::Symbol(sym))
+    Ok(Value::symbol(sym))
 }
 
 /// `Symbol.keyFor(sym)` — Spec §20.4.2.6.
@@ -194,7 +194,7 @@ fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Sym
     match interp.symbol_registry().key_for(sym) {
         Some(key) => {
             let s = JsString::from_str(&key, interp.gc_heap_mut())?;
-            Ok(Value::String(s))
+            Ok(Value::string(s))
         }
         None => Ok(Value::undefined()),
     }

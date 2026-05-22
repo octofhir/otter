@@ -75,7 +75,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     } else {
         recv.with_inner(args.gc_heap, |b| b.to_str_radix(radix))
     };
-    Ok(Value::String(JsString::from_str(&rendered, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&rendered, args.gc_heap)?))
 }
 
 /// §21.2.3.5 `BigInt.prototype.valueOf()` — returns the receiver.
@@ -83,7 +83,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-bigint.prototype.valueof>
 fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::BigInt(receiver_bigint(args)?))
+    Ok(Value::big_int(receiver_bigint(args)?))
 }
 
 /// Declarative `BigInt.prototype` table.

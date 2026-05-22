@@ -149,7 +149,7 @@ impl Interpreter {
             Some(message.to_string()),
             &message_root,
         )?;
-        Ok(Value::Object(obj))
+        Ok(Value::object(obj))
     }
 
     /// `Error` instance. Returns `None` for variants that should

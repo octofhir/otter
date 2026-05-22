@@ -53,7 +53,7 @@ pub fn call(
                 },
                 _ => 0,
             };
-            Ok(Value::Number(number::parse_int(&s, radix)))
+            Ok(Value::number(number::parse_int(&s, radix)))
         }
         // §19.2.4 / §21.1.2.12 — same callable for both names.
         M::ParseFloat => Ok(Value::number(number::parse_float(&coerce_to_string(

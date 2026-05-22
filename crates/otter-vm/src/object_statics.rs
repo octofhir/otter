@@ -269,7 +269,7 @@ fn native_group_by_rooted(
         };
         crate::array::push_with_roots(group, ctx.heap_mut(), *item, &mut external_visit)?;
     }
-    Ok(Value::Object(result))
+    Ok(Value::object(result))
 }
 
 fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
@@ -307,7 +307,7 @@ fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
             }
         }
     }
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn native_keys_rooted(
@@ -370,7 +370,7 @@ fn native_keys_rooted(
             values
         };
         let array = ctx.array_from_elements_with_roots(values, &[&target], &[args])?;
-        return Ok(Value::Array(array));
+        return Ok(Value::array(array));
     }
 
     let owned: Vec<String> = match args.first() {
@@ -477,7 +477,7 @@ fn native_from_entries_rooted(
         };
         let entry = match stepped {
             Ok(Some(v)) => v,
-            Ok(None) => return Ok(Value::Object(result)),
+            Ok(None) => return Ok(Value::object(result)),
             // §7.4.6 step 1 — IteratorStep is itself a throw, do not
             // call IteratorClose (the iterator is already in an error
             // state per §7.4.8).
@@ -782,7 +782,7 @@ fn native_get_own_property_descriptors_rooted(
         crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
     }
     if !is_object_like_value(&target) {
-        return Ok(Value::Object(result));
+        return Ok(Value::object(result));
     }
     let Some(context) = context else {
         return Err(VmError::InvalidOperand);
@@ -827,7 +827,7 @@ fn native_get_own_property_descriptors_rooted(
             _ => {}
         }
     }
-    Ok(Value::Object(result))
+    Ok(Value::object(result))
 }
 
 fn native_get_own_property_names_rooted(
@@ -1076,7 +1076,7 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     }) = &target
         && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, *function_id)
     {
-        return Ok(Value::Object(proto));
+        return Ok(Value::object(proto));
     }
     interp
         .get_prototype_for_op(&target)
@@ -1192,7 +1192,7 @@ fn object_prototype_to_object(
         crate::object::set_prototype(wrapper, ctx.heap_mut(), Some(proto));
     }
     setter(wrapper, ctx.heap_mut(), &this_value);
-    Ok(Value::Object(wrapper))
+    Ok(Value::object(wrapper))
 }
 
 fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, value: &Value) {
@@ -1274,7 +1274,7 @@ fn native_prototype_has_own_property(
                 &[],
             )
             .map_err(|err| object_native_error("hasOwnProperty", err))?;
-        return Ok(Value::Boolean(desc.is_some()));
+        return Ok(Value::boolean(desc.is_some()));
     }
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
@@ -1309,7 +1309,7 @@ fn native_prototype_has_own_property(
         }
         _ => false,
     };
-    Ok(Value::Boolean(present))
+    Ok(Value::boolean(present))
 }
 
 fn native_prototype_property_is_enumerable(
@@ -1383,7 +1383,7 @@ fn native_prototype_property_is_enumerable(
         }
         _ => false,
     };
-    Ok(Value::Boolean(enumerable))
+    Ok(Value::boolean(enumerable))
 }
 
 fn native_prototype_is_prototype_of(
@@ -1393,7 +1393,7 @@ fn native_prototype_is_prototype_of(
     let this_value = *ctx.this_value();
     let target = args.first().cloned().unwrap_or(Value::undefined());
     if !is_object_like_value(&target) {
-        return Ok(Value::Boolean(false));
+        return Ok(Value::boolean(false));
     }
     if matches!(this_value, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
@@ -1402,7 +1402,7 @@ fn native_prototype_is_prototype_of(
         });
     }
     if !is_object_like_value(&this_value) {
-        return Ok(Value::Boolean(false));
+        return Ok(Value::boolean(false));
     }
     let exec_ctx = ctx
         .execution_context()
@@ -1419,14 +1419,14 @@ fn native_prototype_is_prototype_of(
             .ordinary_get_prototype_value(&exec_ctx, current, 0)
             .map_err(|err| object_native_error("isPrototypeOf", err))?;
         if matches!(proto, Value::Null) {
-            return Ok(Value::Boolean(false));
+            return Ok(Value::boolean(false));
         }
         if crate::abstract_ops::same_value(&this_value, &proto, ctx.heap()) {
-            return Ok(Value::Boolean(true));
+            return Ok(Value::boolean(true));
         }
         current = proto;
     }
-    Ok(Value::Boolean(false))
+    Ok(Value::boolean(false))
 }
 
 /// §B.2.2.1.1 `get Object.prototype.__proto__` — returns the
@@ -2088,7 +2088,7 @@ pub fn call(
                     }
                 }
             }
-            Ok(Value::Object(obj))
+            Ok(Value::object(obj))
         }
         // §20.1.2.4 Object.defineProperty(O, P, Attributes)
         // <https://tc39.es/ecma262/#sec-object.defineproperty>
@@ -2113,7 +2113,7 @@ pub fn call(
                             message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
-                    Ok(Value::Object(*target))
+                    Ok(Value::object(*target))
                 }
                 Some(Value::ClassConstructor(class)) => {
                     let ok = match &key {
@@ -2137,7 +2137,7 @@ pub fn call(
                             message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
-                    Ok(Value::ClassConstructor(*class))
+                    Ok(Value::class_constructor(*class))
                 }
                 Some(Value::NativeFunction(native)) => {
                     let ok = match &key {
@@ -2159,7 +2159,7 @@ pub fn call(
                             ),
                         });
                     }
-                    Ok(Value::NativeFunction(*native))
+                    Ok(Value::native_function(*native))
                 }
                 // RegExp instances expose `lastIndex` and the
                 // expando bag for ordinary defineProperty.
@@ -2194,7 +2194,7 @@ pub fn call(
                             message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
-                    Ok(Value::RegExp(r))
+                    Ok(Value::regexp(r))
                 }
                 // Promise instances also expose the lazy expando
                 // bag through Object.defineProperty.
@@ -2216,7 +2216,7 @@ pub fn call(
                             message: format!("Cannot define property '{}'", key.label(gc_heap)),
                         });
                     }
-                    Ok(Value::Promise(p))
+                    Ok(Value::promise(p))
                 }
                 // §10.4.5.3 IntegerIndexedExoticObject
                 // [[DefineOwnProperty]] — canonical-numeric-index
@@ -2289,7 +2289,7 @@ pub fn call(
                             }
                         }
                     }
-                    Ok(Value::TypedArray(t))
+                    Ok(Value::typed_array(t))
                 }
                 _ => Err(VmError::TypeError {
                     message: "Object.defineProperty target must be an object".to_string(),
@@ -2319,7 +2319,7 @@ pub fn call(
                     return Err(VmError::TypeMismatch);
                 }
             }
-            Ok(Value::Object(target))
+            Ok(Value::object(target))
         }
         // §20.1.2.10 Object.getOwnPropertyDescriptor(O, P)
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptor>
@@ -2485,7 +2485,7 @@ pub fn call(
                     }
                 }
             }
-            Ok(Value::Object(result))
+            Ok(Value::object(result))
         }
         // §20.1.2.6 Object.freeze(O)
         // <https://tc39.es/ecma262/#sec-object.freeze>
@@ -2550,7 +2550,7 @@ pub fn call(
                 | Value::Proxy(_) => false,
                 _ => true,
             };
-            Ok(Value::Boolean(result))
+            Ok(Value::boolean(result))
         }
         // §20.1.2.16 Object.isSealed(O)
         M::IsSealed => {
@@ -2590,7 +2590,7 @@ pub fn call(
                 | Value::Proxy(_) => false,
                 _ => true,
             };
-            Ok(Value::Boolean(result))
+            Ok(Value::boolean(result))
         }
         // §20.1.2.14 Object.isExtensible(O)
         M::IsExtensible => {
@@ -2626,7 +2626,7 @@ pub fn call(
                 | Value::Proxy(_) => true,
                 _ => false,
             };
-            Ok(Value::Boolean(result))
+            Ok(Value::boolean(result))
         }
         // §20.1.2.17 Object.keys(O) — enumerable own string keys.
         // <https://tc39.es/ecma262/#sec-object.keys>
@@ -2734,7 +2734,7 @@ pub fn call(
                     _ => return Err(VmError::TypeMismatch),
                 }
             }
-            Ok(Value::Object(target))
+            Ok(Value::object(target))
         }
         // §20.1.2.7 Object.fromEntries(iterable). Foundation accepts
         // an array of `[k, v]` pairs (the most common shape) and a
@@ -2763,7 +2763,7 @@ pub fn call(
                 }
                 _ => return Err(VmError::TypeMismatch),
             }
-            Ok(Value::Object(result))
+            Ok(Value::object(result))
         }
         // §20.1.2.13 Object.hasOwn(O, P) — Stage 4 ergonomic
         // alternative to `Object.prototype.hasOwnProperty.call`.
@@ -2775,7 +2775,7 @@ pub fn call(
                 _ => return Err(VmError::TypeMismatch),
             };
             let present = has_own_property(target, gc_heap, args.get(1))?;
-            Ok(Value::Boolean(present))
+            Ok(Value::boolean(present))
         }
         // §20.1.2.12 Object.getOwnPropertyNames(O) — every own
         // string-keyed property, regardless of enumerability.

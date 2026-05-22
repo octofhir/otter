@@ -464,7 +464,7 @@ fn impl_finalization_registry_unregister(
     let heap = &mut *args.gc_heap;
     let removed =
         finalization_registry_unregister(registry, heap, &token).map_err(vm_to_intrinsic)?;
-    Ok(Value::Boolean(removed))
+    Ok(Value::boolean(removed))
 }
 
 fn vm_to_intrinsic(err: crate::VmError) -> IntrinsicError {

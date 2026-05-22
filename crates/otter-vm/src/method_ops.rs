@@ -1079,7 +1079,7 @@ impl Interpreter {
         }
         if recv_units.len() < needle_len {
             // Needle longer than receiver — no match possible.
-            return Ok(Value::String(recv));
+            return Ok(Value::string(recv));
         }
         let last_start = recv_units.len() - needle_len;
         let mut cursor: usize = 0;
@@ -1780,7 +1780,7 @@ impl Interpreter {
         for (i, value) in values.iter().enumerate() {
             view.set(&mut self.gc_heap, i, value);
         }
-        Ok(Value::TypedArray(view))
+        Ok(Value::typed_array(view))
     }
 
     fn dispatch_function_method(

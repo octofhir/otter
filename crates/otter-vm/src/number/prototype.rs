@@ -116,7 +116,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         )?));
     }
     let rendered = super::dragon4::number_to_string_radix(recv.as_f64(), radix);
-    Ok(Value::String(JsString::from_str(&rendered, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&rendered, args.gc_heap)?))
 }
 
 /// `Number.prototype.toFixed(digits = 0)`.
@@ -227,7 +227,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-number.prototype.valueof>
 fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::Number(receiver_number(args)?))
+    Ok(Value::number(receiver_number(args)?))
 }
 
 /// Declarative `Number.prototype` table.

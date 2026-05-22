@@ -603,7 +603,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 reason: "out of memory while allocating proxy".to_string(),
             }
         })?;
-        Ok(Value::Proxy(proxy))
+        Ok(Value::proxy(proxy))
     }
 
     fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -641,7 +641,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
             })?;
         object::set(obj, ctx.heap_mut(), "proxy", proxy_value);
         object::set(obj, ctx.heap_mut(), "revoke", revoke);
-        Ok(Value::Object(obj))
+        Ok(Value::object(obj))
     }
 
     let global_root = Value::object(global);
@@ -731,7 +731,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 name: "Symbol",
                 reason: "out of memory".to_string(),
             })?;
-        Ok(Value::Symbol(sym))
+        Ok(Value::symbol(sym))
     }
 
     fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -771,7 +771,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 name: "Symbol.for",
                 reason: "out of memory".to_string(),
             })?;
-        Ok(Value::Symbol(sym))
+        Ok(Value::symbol(sym))
     }
 
     fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -791,7 +791,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                             reason: "out of memory".to_string(),
                         }
                     })?;
-                Ok(Value::String(value))
+                Ok(Value::string(value))
             }
             None => Ok(Value::undefined()),
         }
@@ -825,7 +825,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     name: "Symbol.prototype.toString",
                     reason: "out of memory".to_string(),
                 })?;
-        Ok(Value::String(s))
+        Ok(Value::string(s))
     }
 
     fn symbol_proto_value_of(
@@ -1375,7 +1375,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 }
             })?;
             apply_array_new_target_prototype(ctx, arr)?;
-            return Ok(Value::Array(arr));
+            return Ok(Value::array(arr));
         }
         let arr =
             ctx.array_from_elements(std::iter::empty())
@@ -1404,7 +1404,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                     })?;
             }
             apply_array_new_target_prototype(ctx, arr)?;
-            return Ok(Value::Array(arr));
+            return Ok(Value::array(arr));
         }
         unreachable!("non-numeric Array(...) arguments returned above")
     }
@@ -1525,7 +1525,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             let this = *ctx.this_value();
             if let Value::Object(obj) = this {
                 crate::object::set_number_data(obj, ctx.heap_mut(), value);
-                Ok(Value::Object(obj))
+                Ok(Value::object(obj))
             } else {
                 Err(NativeError::TypeError {
                     name: "Number",
@@ -1533,7 +1533,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 })
             }
         } else {
-            Ok(Value::Number(value))
+            Ok(Value::number(value))
         }
     }
 
@@ -1650,28 +1650,28 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let result = matches!(args.first(), Some(Value::Number(n)) if n.as_f64().is_nan());
-        Ok(Value::Boolean(result))
+        Ok(Value::boolean(result))
     }
     fn number_is_finite_native(
         _ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let result = matches!(args.first(), Some(Value::Number(n)) if n.as_f64().is_finite());
-        Ok(Value::Boolean(result))
+        Ok(Value::boolean(result))
     }
     fn number_is_integer_native(
         _ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let v = args.first().cloned().unwrap_or(Value::undefined());
-        Ok(Value::Boolean(crate::number::parse::is_integer(&v)))
+        Ok(Value::boolean(crate::number::parse::is_integer(&v)))
     }
     fn number_is_safe_integer_native(
         _ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let v = args.first().cloned().unwrap_or(Value::undefined());
-        Ok(Value::Boolean(crate::number::parse::is_safe_integer(&v)))
+        Ok(Value::boolean(crate::number::parse::is_safe_integer(&v)))
     }
     fn number_parse_int_native(
         ctx: &mut NativeCtx<'_>,
@@ -1690,7 +1690,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             Some(Value::Number(n)) => n.as_f64() as i32,
             _ => 0,
         };
-        Ok(Value::Number(crate::number::parse::parse_int(&s, radix)))
+        Ok(Value::number(crate::number::parse::parse_int(&s, radix)))
     }
     fn number_parse_float_native(
         ctx: &mut NativeCtx<'_>,
@@ -1705,7 +1705,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 )));
             }
         };
-        Ok(Value::Number(crate::number::parse::parse_float(&s)))
+        Ok(Value::number(crate::number::parse::parse_float(&s)))
     }
 
     {
@@ -2079,7 +2079,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                 if let Ok(Value::Object(proto)) = interp.constructor_prototype_value("Object") {
                     crate::object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
                 }
-                Ok(Value::Object(obj))
+                Ok(Value::object(obj))
             }
             Some(value) => {
                 // §7.1.18 ToObject — wrap a primitive with its
@@ -2106,7 +2106,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                                 reason: err.to_string(),
                             })?;
                         crate::object::set_boolean_data(obj, &mut interp.gc_heap, b);
-                        Ok(Value::Object(obj))
+                        Ok(Value::object(obj))
                     }
                     Value::Number(n) => {
                         let n = *n;
@@ -2125,7 +2125,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                                 reason: err.to_string(),
                             })?;
                         crate::object::set_number_data(obj, &mut interp.gc_heap, n);
-                        Ok(Value::Object(obj))
+                        Ok(Value::object(obj))
                     }
                     Value::String(s) => {
                         let s = *s;
@@ -2144,7 +2144,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                                 reason: err.to_string(),
                             })?;
                         crate::object::set_string_data(obj, &mut interp.gc_heap, s);
-                        Ok(Value::Object(obj))
+                        Ok(Value::object(obj))
                     }
                     Value::Symbol(sym) => {
                         let sym = *sym;
@@ -2163,7 +2163,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                                 reason: err.to_string(),
                             })?;
                         crate::object::set_symbol_data(obj, &mut interp.gc_heap, sym);
-                        Ok(Value::Object(obj))
+                        Ok(Value::object(obj))
                     }
                     Value::BigInt(bigint) => {
                         let bigint = *bigint;
@@ -2182,7 +2182,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                                 reason: err.to_string(),
                             })?;
                         crate::object::set_bigint_data(obj, &mut interp.gc_heap, bigint);
-                        Ok(Value::Object(obj))
+                        Ok(Value::object(obj))
                     }
                     _ => Ok(v),
                 }
@@ -2331,7 +2331,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
             // the `[[DateValue]]` internal slot and return it.
             if let Value::Object(obj) = *ctx.this_value() {
                 crate::object::set_date_data(obj, ctx.heap_mut(), time);
-                return Ok(Value::Object(obj));
+                return Ok(Value::object(obj));
             }
             return Err(NativeError::TypeError {
                 name: "Date",
@@ -2347,7 +2347,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
                 name: "Date",
                 reason: err.to_string(),
             })?;
-        Ok(Value::String(value))
+        Ok(Value::string(value))
     }
 
     let global_root = Value::object(global);
@@ -2602,7 +2602,7 @@ fn iterator_ctor_call(
     if let Some(Value::Object(proto_obj)) = proto {
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto_obj));
     }
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 /// `BuiltinIntrinsic` for the ES2025 `Iterator` constructor — the
@@ -3020,7 +3020,7 @@ fn iterator_proto_map(
             name: "Iterator.prototype.map",
             reason: "iterator allocation failed".to_string(),
         })?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn iterator_proto_filter(
@@ -3037,7 +3037,7 @@ fn iterator_proto_filter(
             name: "Iterator.prototype.filter",
             reason: "iterator allocation failed".to_string(),
         })?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn iterator_proto_take(
@@ -3057,7 +3057,7 @@ fn iterator_proto_take(
             name: "Iterator.prototype.take",
             reason: "iterator allocation failed".to_string(),
         })?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn iterator_proto_drop(
@@ -3074,7 +3074,7 @@ fn iterator_proto_drop(
             name: "Iterator.prototype.drop",
             reason: "iterator allocation failed".to_string(),
         })?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn iterator_proto_flat_map(
@@ -3095,7 +3095,7 @@ fn iterator_proto_flat_map(
             name: "Iterator.prototype.flatMap",
             reason: "iterator allocation failed".to_string(),
         })?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn iterator_arg_count_native(
@@ -3180,7 +3180,7 @@ fn iterator_proto_to_array(
             name: "Iterator.prototype.toArray",
             reason: "array allocation failed".to_string(),
         })?;
-    Ok(Value::Array(arr))
+    Ok(Value::array(arr))
 }
 
 fn iterator_proto_for_each(
@@ -3391,7 +3391,7 @@ fn iterator_proto_next(
             name: "Iterator.prototype.next",
             reason: e.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 /// §22.2.7.2 `%RegExpStringIteratorPrototype%.next`.
@@ -3456,7 +3456,7 @@ fn regexp_string_iterator_proto_next(
             name,
             reason: e.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 /// §27.1.5.1.3 `%IteratorPrototype%.return(value)` — mark the
@@ -3495,7 +3495,7 @@ fn iterator_proto_return(
             name: "Iterator.prototype.return",
             reason: e.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 /// §27.1.5.1.4 `%IteratorPrototype%.throw(value)` — propagate the
@@ -3544,7 +3544,7 @@ fn iterator_predicate_drain(
                 reason: e.to_string(),
             })?;
         if done {
-            return Ok(Value::Boolean(initial));
+            return Ok(Value::boolean(initial));
         }
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(v);
@@ -3558,7 +3558,7 @@ fn iterator_predicate_drain(
                 reason: e.to_string(),
             })?;
         if kept.to_boolean(ctx.heap()) == short_on_truthy {
-            return Ok(Value::Boolean(short_on_truthy));
+            return Ok(Value::boolean(short_on_truthy));
         }
         idx += 1.0;
     }
@@ -3592,7 +3592,7 @@ fn iterator_from_native(
                     name: "Iterator.from",
                     reason: "iterator allocation failed".to_string(),
                 })?;
-            Ok(Value::Iterator(handle))
+            Ok(Value::iterator(handle))
         }
         Value::Generator(g) => {
             let state = crate::IteratorState::Generator { handle: *g };
@@ -3602,7 +3602,7 @@ fn iterator_from_native(
                     name: "Iterator.from",
                     reason: "iterator allocation failed".to_string(),
                 })?;
-            Ok(Value::Iterator(handle))
+            Ok(Value::iterator(handle))
         }
         // §27.1.4.1 step 1 — `iterable` may also be an Object with
         // `@@iterator`; look up the method, call it, and wrap the
@@ -3677,7 +3677,7 @@ fn iterator_from_native(
                     name: "Iterator.from",
                     reason: "iterator allocation failed".to_string(),
                 })?;
-            Ok(Value::Iterator(handle))
+            Ok(Value::iterator(handle))
         }
         Value::String(s) => {
             let state = crate::IteratorState::String {
@@ -3690,7 +3690,7 @@ fn iterator_from_native(
                     name: "Iterator.from",
                     reason: "iterator allocation failed".to_string(),
                 })?;
-            Ok(Value::Iterator(handle))
+            Ok(Value::iterator(handle))
         }
         _ => Err(crate::NativeError::TypeError {
             name: "Iterator.from",

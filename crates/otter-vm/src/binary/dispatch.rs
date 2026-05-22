@@ -120,7 +120,7 @@ pub fn array_buffer_call_with_roots(
                         ),
                     })?,
             };
-            Ok(Value::ArrayBuffer(buf))
+            Ok(Value::array_buffer(buf))
         }
         M::IsView => {
             let v = args.first().cloned().unwrap_or(Value::undefined());
@@ -194,7 +194,7 @@ pub fn shared_array_buffer_call_with_roots(
                         ),
                     })?,
             };
-            Ok(Value::ArrayBuffer(buf))
+            Ok(Value::array_buffer(buf))
         }
     }
 }
@@ -243,7 +243,7 @@ pub fn data_view_call(
             };
             let view =
                 JsDataView::new(gc_heap, buffer, byte_offset, byte_length).map_err(oom_to_vm)?;
-            Ok(Value::DataView(view))
+            Ok(Value::data_view(view))
         }
     }
 }
@@ -301,7 +301,7 @@ fn typed_array_from_values_with_roots(
     for (i, value) in values.iter().enumerate() {
         view.set(gc_heap, i, value);
     }
-    Ok(Value::TypedArray(view))
+    Ok(Value::typed_array(view))
 }
 
 fn new_zeroed_typed_array_with_roots(
@@ -319,7 +319,7 @@ fn new_zeroed_typed_array_with_roots(
             ),
         })?;
     let view = JsTypedArray::new(gc_heap, new_buf, kind, 0, len).map_err(oom_to_vm)?;
-    Ok(Value::TypedArray(view))
+    Ok(Value::typed_array(view))
 }
 
 fn construct_typed_array_with_roots(
@@ -367,7 +367,7 @@ fn construct_typed_array_with_roots(
             };
             let view =
                 JsTypedArray::new(gc_heap, buf, kind, byte_offset, length).map_err(oom_to_vm)?;
-            Ok(Value::TypedArray(view))
+            Ok(Value::typed_array(view))
         }
         Some(Value::TypedArray(src)) => {
             if src.buffer(gc_heap).is_detached(gc_heap) {

@@ -138,7 +138,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
     crate::object::set(obj, heap, "style", style);
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {

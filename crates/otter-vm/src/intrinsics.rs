@@ -631,7 +631,7 @@ mod tests {
             }
         };
         let out = JsString::concat(recv, arg0, args.gc_heap)?;
-        Ok(Value::String(out))
+        Ok(Value::string(out))
     }
 
     static STRING_TABLE: IntrinsicTable = intrinsics!(

@@ -216,7 +216,7 @@ fn impl_get_bigint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
             i64::from_be_bytes(buf)
         };
         let handle = BigIntValue::from_inner(heap, BigInt::from(v)).map_err(dv_oom)?;
-        Ok(Value::BigInt(handle))
+        Ok(Value::big_int(handle))
     })
 }
 
@@ -230,7 +230,7 @@ fn impl_get_biguint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             u64::from_be_bytes(buf)
         };
         let handle = BigIntValue::from_inner(heap, BigInt::from(v)).map_err(dv_oom)?;
-        Ok(Value::BigInt(handle))
+        Ok(Value::big_int(handle))
     })
 }
 

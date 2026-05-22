@@ -70,7 +70,7 @@ pub fn call(
             if let Some(proto) = prototype {
                 object::set_prototype(obj, heap, Some(proto));
             }
-            Ok(Value::Object(obj))
+            Ok(Value::object(obj))
         }
         M::Now | M::Parse | M::UTC => call_static(method, args, heap),
     }
@@ -98,14 +98,14 @@ pub fn call_static(
         M::Parse => {
             let s = match args.first() {
                 Some(Value::String(s)) => s.to_lossy_string(heap),
-                _ => return Ok(Value::Number(NumberValue::from_f64(f64::NAN))),
+                _ => return Ok(Value::number(NumberValue::from_f64(f64::NAN))),
             };
-            Ok(Value::Number(NumberValue::from_f64(parse_date(&s))))
+            Ok(Value::number(NumberValue::from_f64(parse_date(&s))))
         }
         // §21.4.3.4 Date.UTC(year, month, day?, …).
         M::UTC => {
             if args.is_empty() {
-                return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+                return Ok(Value::number(NumberValue::from_f64(f64::NAN)));
             }
             let year = year_with_two_digit_rule(number_arg(args, 0));
             let month = number_or(args, 1, 0.0);

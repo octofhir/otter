@@ -624,7 +624,7 @@ fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
             )));
         }
     }
-    Ok(Value::Number(crate::number::NumberValue::from_i32(-1)))
+    Ok(Value::number(crate::number::NumberValue::from_i32(-1)))
 }
 
 fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -660,7 +660,7 @@ fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
             )));
         }
     }
-    Ok(Value::Number(crate::number::NumberValue::from_i32(-1)))
+    Ok(Value::number(crate::number::NumberValue::from_i32(-1)))
 }
 
 fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -673,10 +673,10 @@ fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     for (i, v) in elements.into_iter().enumerate() {
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if !hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::Boolean(false));
+            return Ok(Value::boolean(false));
         }
     }
-    Ok(Value::Boolean(true))
+    Ok(Value::boolean(true))
 }
 
 fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -689,10 +689,10 @@ fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     for (i, v) in elements.into_iter().enumerate() {
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::Boolean(true));
+            return Ok(Value::boolean(true));
         }
     }
-    Ok(Value::Boolean(false))
+    Ok(Value::boolean(false))
 }
 
 fn ta_proto_reduce(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -825,7 +825,7 @@ fn ta_build_result(
     for (i, v) in values.iter().enumerate() {
         view.set(ctx.heap_mut(), i, v);
     }
-    Ok(Value::TypedArray(view))
+    Ok(Value::typed_array(view))
 }
 
 /// §22.2.6.1 `get %TypedArray%.prototype.buffer` — return the
@@ -835,7 +835,7 @@ fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     match ctx.this_value() {
         Value::TypedArray(t) => {
             let t = *t;
-            Ok(Value::ArrayBuffer(t.buffer(ctx.heap())))
+            Ok(Value::array_buffer(t.buffer(ctx.heap())))
         }
         _ => Err(NativeError::TypeError {
             name: "TypedArray.prototype.buffer",

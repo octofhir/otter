@@ -398,7 +398,7 @@ fn find_substr(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
 
 fn impl_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    Ok(Value::Number(NumberValue::from_i32(recv.len() as i32)))
+    Ok(Value::number(NumberValue::from_i32(recv.len() as i32)))
 }
 
 fn impl_char_code_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -408,7 +408,7 @@ fn impl_char_code_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
         Some(unit) => NumberValue::from_i32(i32::from(unit)),
         None => NumberValue::Double(f64::NAN),
     };
-    Ok(Value::Number(value))
+    Ok(Value::number(value))
 }
 
 fn impl_char_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -418,7 +418,7 @@ fn impl_char_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     match unit {
         Some(u) => {
             let s = JsString::from_utf16_units(&[u], args.gc_heap)?;
-            Ok(Value::String(s))
+            Ok(Value::string(s))
         }
         None => Ok(Value::string(JsString::empty(args.gc_heap)?)),
     }
@@ -434,7 +434,7 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     };
     let length = end.saturating_sub(start);
     let out = recv.slice(start, length, args.gc_heap)?;
-    Ok(Value::String(out))
+    Ok(Value::string(out))
 }
 
 fn impl_substring(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -451,7 +451,7 @@ fn impl_substring(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     }
     let length = end - start;
     let out = recv.slice(start, length, args.gc_heap)?;
-    Ok(Value::String(out))
+    Ok(Value::string(out))
 }
 
 fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -468,7 +468,7 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
         Some(p) => NumberValue::from_i32(p as i32),
         None => NumberValue::from_i32(-1),
     };
-    Ok(Value::Number(value))
+    Ok(Value::number(value))
 }
 
 fn impl_starts_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -503,7 +503,7 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
             index: 0,
             reason: "interrupted",
         })?;
-    Ok(Value::Boolean(pos.is_some()))
+    Ok(Value::boolean(pos.is_some()))
 }
 
 fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -518,7 +518,7 @@ fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let piece = arg_to_string(args, i as u16)?;
         result = JsString::concat(&result, &piece, args.gc_heap)?;
     }
-    Ok(Value::String(result))
+    Ok(Value::string(result))
 }
 
 fn impl_repeat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -531,7 +531,7 @@ fn impl_repeat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         });
     }
     if count == 0 || recv.is_empty() {
-        return Ok(Value::String(JsString::empty(args.gc_heap)?));
+        return Ok(Value::string(JsString::empty(args.gc_heap)?));
     }
     let units = recv.to_utf16_vec(args.gc_heap);
     let total = (units.len() as u64).saturating_mul(count as u64);
@@ -563,7 +563,7 @@ fn pad_impl(args: &mut IntrinsicArgs<'_>, side: PadSide) -> Result<Value, Intrin
     let target = arg_int_or(args, 0, 0)?;
     let recv_len = recv.len() as i64;
     if target <= recv_len {
-        return Ok(Value::String(recv));
+        return Ok(Value::string(recv));
     }
     // §22.1.3.16 step 11 / §22.1.3.17 step 11 — `fillString` is
     // either `undefined` (single-space default) or the result of
@@ -575,7 +575,7 @@ fn pad_impl(args: &mut IntrinsicArgs<'_>, side: PadSide) -> Result<Value, Intrin
         _ => arg_to_string(args, 1)?.to_utf16_vec(args.gc_heap),
     };
     if pad_units.is_empty() {
-        return Ok(Value::String(recv));
+        return Ok(Value::string(recv));
     }
     let pad_count = (target - recv_len) as usize;
     let recv_units = recv.to_utf16_vec(args.gc_heap);
@@ -682,7 +682,7 @@ fn create_html(
     out.push_str("</");
     out.push_str(tag);
     out.push('>');
-    Ok(Value::String(JsString::from_str(&out, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&out, args.gc_heap)?))
 }
 
 /// §B.2.3.1 `String.prototype.substr(start, length)`.
@@ -712,16 +712,16 @@ fn impl_is_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         let u = units[i];
         if (0xD800..=0xDBFF).contains(&u) {
             if i + 1 >= units.len() || !(0xDC00..=0xDFFF).contains(&units[i + 1]) {
-                return Ok(Value::Boolean(false));
+                return Ok(Value::boolean(false));
             }
             i += 2;
         } else if (0xDC00..=0xDFFF).contains(&u) {
-            return Ok(Value::Boolean(false));
+            return Ok(Value::boolean(false));
         } else {
             i += 1;
         }
     }
-    Ok(Value::Boolean(true))
+    Ok(Value::boolean(true))
 }
 
 /// §22.1.3.11 `String.prototype.toWellFormed()`. Replaces every
@@ -773,7 +773,7 @@ fn impl_substr(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     };
     if int_length <= 0 {
-        return Ok(Value::String(JsString::empty(args.gc_heap)?));
+        return Ok(Value::string(JsString::empty(args.gc_heap)?));
     }
     Ok(Value::String(recv.slice(
         int_start as u32,
@@ -868,10 +868,10 @@ fn impl_code_point_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             .expect("idx+1 in range");
         if (0xDC00..=0xDFFF).contains(&cu2) {
             let cp = 0x10000u32 + ((u32::from(cu1) - 0xD800) << 10) + (u32::from(cu2) - 0xDC00);
-            return Ok(Value::Number(NumberValue::from_i32(cp as i32)));
+            return Ok(Value::number(NumberValue::from_i32(cp as i32)));
         }
     }
-    Ok(Value::Number(NumberValue::from_i32(i32::from(cu1))))
+    Ok(Value::number(NumberValue::from_i32(i32::from(cu1))))
 }
 
 fn map_ascii<F: Fn(u16) -> u16>(units: &[u16], f: F) -> Vec<u16> {
@@ -938,7 +938,7 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
     let pos = match find_substr(&recv_units, &needle_units, 0) {
         Some(p) => p,
-        None => return Ok(Value::String(recv)),
+        None => return Ok(Value::string(recv)),
     };
     let mut buf =
         Vec::with_capacity(recv_units.len() - needle_units.len() + replacement_units.len());
@@ -991,7 +991,7 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         )?));
     }
     if recv_units.len() < needle_units.len() {
-        return Ok(Value::String(recv));
+        return Ok(Value::string(recv));
     }
     let last_start = recv_units.len() - needle_units.len();
     let mut buf = Vec::with_capacity(recv_units.len());
@@ -1150,7 +1150,7 @@ fn regex_replace(
     let recv_units = recv.to_utf16_vec(gc_heap);
     let matches = collect_regex_matches(re, gc_heap, &recv_units);
     if matches.is_empty() {
-        return Ok(Value::String(*recv));
+        return Ok(Value::string(*recv));
     }
     let mut buf = Vec::with_capacity(recv_units.len());
     let mut cursor = 0;
@@ -1161,7 +1161,7 @@ fn regex_replace(
         cursor = m.range.end;
     }
     buf.extend_from_slice(&recv_units[cursor..]);
-    Ok(Value::String(JsString::from_utf16_units(&buf, gc_heap)?))
+    Ok(Value::string(JsString::from_utf16_units(&buf, gc_heap)?))
 }
 
 fn regex_split(
@@ -1327,7 +1327,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         &[],
         &[],
     )?;
-    Ok(Value::Array(arr))
+    Ok(Value::array(arr))
 }
 
 fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -1392,7 +1392,7 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
             reason: "iterator allocation failed",
         })?;
     let _ = arr_value;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -1417,7 +1417,7 @@ fn impl_search(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         .into_iter()
         .next()
         .map_or(-1, |m| m.range.start as i32);
-    Ok(Value::Number(NumberValue::from_i32(pos)))
+    Ok(Value::number(NumberValue::from_i32(pos)))
 }
 
 /// Declarative `String.prototype` table.
@@ -1521,7 +1521,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
         Some(p) => NumberValue::from_i32(p as i32),
         None => NumberValue::from_i32(-1),
     };
-    Ok(Value::Number(value))
+    Ok(Value::number(value))
 }
 
 /// §22.1.3.12 String.prototype.localeCompare. Foundation falls
@@ -1539,7 +1539,7 @@ fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    Ok(Value::Number(crate::number::NumberValue::from_i32(cmp)))
+    Ok(Value::number(crate::number::NumberValue::from_i32(cmp)))
 }
 
 /// §22.1.3.13 String.prototype.normalize(form?). Foundation accepts
@@ -1567,13 +1567,13 @@ fn impl_normalize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
             reason: "must be one of NFC / NFD / NFKC / NFKD",
         });
     }
-    Ok(Value::String(recv))
+    Ok(Value::string(recv))
 }
 
 /// §22.1.3.27 String.prototype.toString — returns the primitive.
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let recv = receiver_string(args)?;
-    Ok(Value::String(recv))
+    Ok(Value::string(recv))
 }
 
 /// Convenience accessor used by the dispatcher.

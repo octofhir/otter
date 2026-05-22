@@ -42,12 +42,12 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     } else {
         "false"
     };
-    Ok(Value::String(JsString::from_str(s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(s, args.gc_heap)?))
 }
 
 /// §20.3.3.3 Boolean.prototype.valueOf — returns the receiver.
 fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::Boolean(receiver_bool(args)?))
+    Ok(Value::boolean(receiver_bool(args)?))
 }
 
 /// Declarative `Boolean.prototype` table.

@@ -48,7 +48,7 @@ fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, Temporal
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    Ok(Value::Number(NumberValue::from_i32(n)))
+    Ok(Value::number(NumberValue::from_i32(n)))
 }
 
 fn parse_arg(

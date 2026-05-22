@@ -152,7 +152,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let heap = &mut *args.gc_heap;
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "granularity", granularity);
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {

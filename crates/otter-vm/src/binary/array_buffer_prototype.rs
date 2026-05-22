@@ -133,7 +133,7 @@ fn transfer_inner(args: &mut IntrinsicArgs<'_>, fixed: bool) -> Result<Value, In
         args.array_buffer_from_bytes_rooted(new_bytes, &[], &[])?
     };
     buf.detach(args.gc_heap);
-    Ok(Value::ArrayBuffer(new_buffer))
+    Ok(Value::array_buffer(new_buffer))
 }
 
 fn clamp_relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {

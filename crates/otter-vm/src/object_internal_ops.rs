@@ -208,9 +208,9 @@ impl Interpreter {
         key: &VmPropertyKey,
     ) -> Result<Value, VmError> {
         if let Some(key) = key.string_name() {
-            Ok(Value::String(JsString::from_str(key, &mut self.gc_heap)?))
+            Ok(Value::string(JsString::from_str(key, &mut self.gc_heap)?))
         } else if let VmPropertyKey::Symbol(sym) = key {
-            Ok(Value::Symbol(*sym))
+            Ok(Value::symbol(*sym))
         } else {
             unreachable!("every non-string property key is a symbol")
         }
@@ -400,7 +400,7 @@ impl Interpreter {
                 }
             }
             Some(Value::ClassConstructor(class)) => {
-                Ok(Value::Object(class.prototype(&self.gc_heap)))
+                Ok(Value::object(class.prototype(&self.gc_heap)))
             }
             _ => Err(VmError::InvalidOperand),
         }

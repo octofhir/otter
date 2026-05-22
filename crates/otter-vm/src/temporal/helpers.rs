@@ -99,7 +99,7 @@ pub fn make_temporal(
     payload: TemporalPayload,
 ) -> Result<Value, IntrinsicError> {
     let handle = JsTemporal::new(args.gc_heap, payload)?;
-    Ok(Value::Temporal(handle))
+    Ok(Value::temporal(handle))
 }
 
 /// `make_temporal` variant for the static-dispatch path
@@ -121,7 +121,7 @@ pub fn alloc_temporal_value(
             heap_limit_bytes: e.heap_limit_bytes(),
         }
     })?;
-    Ok(Value::Temporal(handle))
+    Ok(Value::temporal(handle))
 }
 
 /// Extract a [`temporal_rs::Instant`] from the receiver, or raise
@@ -222,5 +222,5 @@ pub fn js_string_value(
     value: String,
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
-    Ok(Value::String(JsString::from_str(&value, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&value, args.gc_heap)?))
 }

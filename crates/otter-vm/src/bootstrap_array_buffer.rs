@@ -286,7 +286,7 @@ fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 
 fn sab_growable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get SharedArrayBuffer.prototype.growable")?;
-    Ok(Value::Boolean(b.is_shared() && b.is_growable(ctx.heap())))
+    Ok(Value::boolean(b.is_shared() && b.is_growable(ctx.heap())))
 }
 
 /// Install `SharedArrayBuffer.prototype[@@toStringTag] = "SharedArrayBuffer"`.
@@ -492,7 +492,7 @@ fn install_accessor(
 fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.byteLength")?;
     if b.is_detached(ctx.heap()) {
-        return Ok(Value::Number(NumberValue::from_i32(0)));
+        return Ok(Value::number(NumberValue::from_i32(0)));
     }
     Ok(Value::Number(NumberValue::from_i32(
         b.byte_length(ctx.heap()) as i32,
@@ -508,12 +508,12 @@ fn ab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
 
 fn ab_resizable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.resizable")?;
-    Ok(Value::Boolean(b.is_resizable(ctx.heap())))
+    Ok(Value::boolean(b.is_resizable(ctx.heap())))
 }
 
 fn ab_detached(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.detached")?;
-    Ok(Value::Boolean(b.is_detached(ctx.heap())))
+    Ok(Value::boolean(b.is_detached(ctx.heap())))
 }
 
 fn receiver_ab(

@@ -165,7 +165,7 @@ impl TypedArrayKind {
             return match self {
                 Self::BigInt64 | Self::BigUint64 => {
                     let handle = BigIntValue::from_inner(heap, BigInt::from(0))?;
-                    Ok(Value::BigInt(handle))
+                    Ok(Value::big_int(handle))
                 }
                 _ => Ok(Value::number(NumberValue::from_i32(0))),
             };

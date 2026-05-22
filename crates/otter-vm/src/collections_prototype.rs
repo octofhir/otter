@@ -58,21 +58,21 @@ fn impl_map_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let value = args.args.get(1).cloned().unwrap_or(Value::undefined());
     args.map_set_rooted(&mut m, key, value)?;
-    Ok(Value::Map(m))
+    Ok(Value::map(m))
 }
 
 fn impl_map_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
-    Ok(Value::Boolean(collections::map_has(m, heap, &key)))
+    Ok(Value::boolean(collections::map_has(m, heap, &key)))
 }
 
 fn impl_map_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
     let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
-    Ok(Value::Boolean(collections::map_delete(m, heap, &key)))
+    Ok(Value::boolean(collections::map_delete(m, heap, &key)))
 }
 
 fn impl_map_clear(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -159,21 +159,21 @@ fn impl_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let mut s = receiver_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::undefined());
     args.set_add_rooted(&mut s, v)?;
-    Ok(Value::Set(s))
+    Ok(Value::set(s))
 }
 
 fn impl_set_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
-    Ok(Value::Boolean(collections::set_has(s, heap, &v)))
+    Ok(Value::boolean(collections::set_has(s, heap, &v)))
 }
 
 fn impl_set_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
     let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
-    Ok(Value::Boolean(collections::set_delete(s, heap, &v)))
+    Ok(Value::boolean(collections::set_delete(s, heap, &v)))
 }
 
 fn impl_set_clear(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -260,7 +260,7 @@ fn impl_set_union(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         }
         args.set_add_rooted(&mut new_set, v)?;
     }
-    Ok(Value::Set(new_set))
+    Ok(Value::set(new_set))
 }
 
 /// §24.2.4.5 `Set.prototype.intersection(other)` — values present in
@@ -298,7 +298,7 @@ fn impl_set_intersection(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         }
         args.set_add_rooted(&mut new_set, v)?;
     }
-    Ok(Value::Set(new_set))
+    Ok(Value::set(new_set))
 }
 
 /// §24.2.4.4 `Set.prototype.difference(other)` — values in `this`
@@ -325,7 +325,7 @@ fn impl_set_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         }
         args.set_add_rooted(&mut new_set, v)?;
     }
-    Ok(Value::Set(new_set))
+    Ok(Value::set(new_set))
 }
 
 /// §24.2.4.6 `Set.prototype.symmetricDifference(other)` — values in
@@ -363,7 +363,7 @@ fn impl_set_symmetric_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, 
         }
         args.set_add_rooted(&mut new_set, v)?;
     }
-    Ok(Value::Set(new_set))
+    Ok(Value::set(new_set))
 }
 
 /// §24.2.4.10 `Set.prototype.isSubsetOf(other)` — every value of
@@ -379,7 +379,7 @@ fn impl_set_is_subset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
             .iter()
             .any(|o| crate::abstract_ops::same_value_zero(o, v, &*args.gc_heap))
     });
-    Ok(Value::Boolean(all_in_other))
+    Ok(Value::boolean(all_in_other))
 }
 
 /// §24.2.4.11 `Set.prototype.isSupersetOf(other)` — every value of
@@ -392,7 +392,7 @@ fn impl_set_is_superset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrin
     let all_in_this = other_values
         .iter()
         .all(|v| collections::set_has(s, heap, v));
-    Ok(Value::Boolean(all_in_this))
+    Ok(Value::boolean(all_in_this))
 }
 
 /// §24.2.4.9 `Set.prototype.isDisjointFrom(other)` — no shared
@@ -405,7 +405,7 @@ fn impl_set_is_disjoint_from(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intr
     let any_shared = other_values
         .iter()
         .any(|v| collections::set_has(s, heap, v));
-    Ok(Value::Boolean(!any_shared))
+    Ok(Value::boolean(!any_shared))
 }
 
 /// `Set.prototype.entries` — yields `[v, v]` pairs per
@@ -463,7 +463,7 @@ fn impl_weak_map_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let value = args.args.get(1).cloned().unwrap_or(Value::undefined());
     args.weak_map_set_rooted(&mut m, key, value)
         .map_err(weak_collection_to_intrinsic)?;
-    Ok(Value::WeakMap(m))
+    Ok(Value::weak_map(m))
 }
 
 fn impl_weak_map_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -495,7 +495,7 @@ fn impl_weak_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let v = args.args.first().cloned().unwrap_or(Value::undefined());
     args.weak_set_add_rooted(&mut s, v)
         .map_err(weak_collection_to_intrinsic)?;
-    Ok(Value::WeakSet(s))
+    Ok(Value::weak_set(s))
 }
 
 fn impl_weak_set_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

@@ -215,11 +215,11 @@ fn read_step(
         b'"' => Ok(Value::string(read_string(cursor, gc_heap)?)),
         b't' => {
             consume_keyword(cursor, b"true")?;
-            Ok(Value::Boolean(true))
+            Ok(Value::boolean(true))
         }
         b'f' => {
             consume_keyword(cursor, b"false")?;
-            Ok(Value::Boolean(false))
+            Ok(Value::boolean(false))
         }
         b'n' => {
             consume_keyword(cursor, b"null")?;
@@ -367,7 +367,7 @@ fn finish_builder(
             for (k, v) in entries {
                 crate::object::set(obj, gc_heap, &k, v);
             }
-            Ok(Value::Object(obj))
+            Ok(Value::object(obj))
         }
     }
 }

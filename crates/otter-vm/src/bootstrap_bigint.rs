@@ -319,7 +319,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 
     let s = crate::string::JsString::from_str(&rendered, ctx.heap_mut())
         .map_err(|_| oom("BigInt.prototype.toString"))?;
-    Ok(Value::String(s))
+    Ok(Value::string(s))
 }
 
 fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {

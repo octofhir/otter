@@ -127,7 +127,7 @@ fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         let this = *ctx.this_value();
         if let Value::Object(obj) = this {
             crate::object::set_boolean_data(obj, ctx.heap_mut(), value);
-            Ok(Value::Object(obj))
+            Ok(Value::object(obj))
         } else {
             Err(NativeError::TypeError {
                 name: "Boolean",
@@ -135,6 +135,6 @@ fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
             })
         }
     } else {
-        Ok(Value::Boolean(value))
+        Ok(Value::boolean(value))
     }
 }

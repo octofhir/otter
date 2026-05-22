@@ -986,13 +986,13 @@ fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let value = args.get(1).cloned().unwrap_or(Value::undefined());
     ctx.map_set(&mut m, key, value)
         .map_err(|_| oom("Map.prototype.set"))?;
-    Ok(Value::Map(m))
+    Ok(Value::map(m))
 }
 
 fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.has")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
-    Ok(Value::Boolean(collections::map_has(m, ctx.heap(), &key)))
+    Ok(Value::boolean(collections::map_has(m, ctx.heap(), &key)))
 }
 
 fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1081,13 +1081,13 @@ fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let v = args.first().cloned().unwrap_or(Value::undefined());
     ctx.set_add(&mut s, v)
         .map_err(|_| oom("Set.prototype.add"))?;
-    Ok(Value::Set(s))
+    Ok(Value::set(s))
 }
 
 fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.has")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
-    Ok(Value::Boolean(collections::set_has(s, ctx.heap(), &v)))
+    Ok(Value::boolean(collections::set_has(s, ctx.heap(), &v)))
 }
 
 fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1124,7 +1124,7 @@ fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
             &[],
         )
         .map_err(|_| oom("Set.prototype.values"))?;
-    Ok(Value::Iterator(iter))
+    Ok(Value::iterator(iter))
 }
 
 fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1141,7 +1141,7 @@ fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
             &[],
         )
         .map_err(|_| oom("Set.prototype.entries"))?;
-    Ok(Value::Iterator(iter))
+    Ok(Value::iterator(iter))
 }
 
 /// §24.2.3.6 Set.prototype.forEach.
@@ -1249,7 +1249,7 @@ fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
         ctx.set_add(&mut result, normalize_set_key(value))
             .map_err(|_| oom("Set.prototype.union"))?;
     }
-    Ok(Value::Set(result))
+    Ok(Value::set(result))
 }
 
 /// §24.2.4.5 `Set.prototype.intersection`.
@@ -1296,7 +1296,7 @@ fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             }
         }
     }
-    Ok(Value::Set(result))
+    Ok(Value::set(result))
 }
 
 /// §24.2.4.4 `Set.prototype.difference`.
@@ -1336,7 +1336,7 @@ fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
             collections::set_delete(result, ctx.heap_mut(), &normalize_set_key(value));
         }
     }
-    Ok(Value::Set(result))
+    Ok(Value::set(result))
 }
 
 /// §24.2.4.6 `Set.prototype.symmetricDifference`.
@@ -1381,7 +1381,7 @@ fn set_proto_symmetric_difference(
                 .map_err(|_| oom("Set.prototype.symmetricDifference"))?;
         }
     }
-    Ok(Value::Set(result))
+    Ok(Value::set(result))
 }
 
 /// §24.2.4.10 `Set.prototype.isSubsetOf`.
@@ -1393,7 +1393,7 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.isSubsetOf")?;
     if (collections::set_len(this, ctx.heap()) as f64) > other_rec.size() {
-        return Ok(Value::Boolean(false));
+        return Ok(Value::boolean(false));
     }
     let context = execution_context(ctx, "Set.prototype.isSubsetOf")?;
     let mut index = 0;
@@ -1410,10 +1410,10 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             &value,
             "Set.prototype.isSubsetOf",
         )? {
-            return Ok(Value::Boolean(false));
+            return Ok(Value::boolean(false));
         }
     }
-    Ok(Value::Boolean(true))
+    Ok(Value::boolean(true))
 }
 
 /// §24.2.4.11 `Set.prototype.isSupersetOf`.
@@ -1425,7 +1425,7 @@ fn set_proto_is_superset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.isSupersetOf")?;
     if (collections::set_len(this, ctx.heap()) as f64) < other_rec.size() {
-        return Ok(Value::Boolean(false));
+        return Ok(Value::boolean(false));
     }
     let context = execution_context(ctx, "Set.prototype.isSupersetOf")?;
     let mut keys = set_record_keys(ctx, &context, &other_rec, "Set.prototype.isSupersetOf")?;
@@ -1435,10 +1435,10 @@ fn set_proto_is_superset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
         let value = normalize_set_key(value);
         if !collections::set_has(this, ctx.heap(), &value) {
             set_record_close(ctx, &context, &mut keys, "Set.prototype.isSupersetOf")?;
-            return Ok(Value::Boolean(false));
+            return Ok(Value::boolean(false));
         }
     }
-    Ok(Value::Boolean(true))
+    Ok(Value::boolean(true))
 }
 
 /// §24.2.4.9 `Set.prototype.isDisjointFrom`.
@@ -1468,7 +1468,7 @@ fn set_proto_is_disjoint_from(
                 &value,
                 "Set.prototype.isDisjointFrom",
             )? {
-                return Ok(Value::Boolean(false));
+                return Ok(Value::boolean(false));
             }
         }
     } else {
@@ -1479,11 +1479,11 @@ fn set_proto_is_disjoint_from(
             let value = normalize_set_key(value);
             if collections::set_has(this, ctx.heap(), &value) {
                 set_record_close(ctx, &context, &mut keys, "Set.prototype.isDisjointFrom")?;
-                return Ok(Value::Boolean(false));
+                return Ok(Value::boolean(false));
             }
         }
     }
-    Ok(Value::Boolean(true))
+    Ok(Value::boolean(true))
 }
 
 fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1512,7 +1512,7 @@ fn weak_map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let value = args.get(1).cloned().unwrap_or(Value::undefined());
     ctx.weak_map_set(&mut m, key, value)
         .map_err(|e| collection_to_native(e, "WeakMap.prototype.set"))?;
-    Ok(Value::WeakMap(m))
+    Ok(Value::weak_map(m))
 }
 
 fn weak_map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1542,7 +1542,7 @@ fn weak_set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let v = args.first().cloned().unwrap_or(Value::undefined());
     ctx.weak_set_add(&mut s, v)
         .map_err(|e| collection_to_native(e, "WeakSet.prototype.add"))?;
-    Ok(Value::WeakSet(s))
+    Ok(Value::weak_set(s))
 }
 
 fn weak_set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1687,7 +1687,7 @@ fn make_map_iterator(
             &[],
         )
         .map_err(|_| oom("Map iterator"))?;
-    Ok(Value::Iterator(iter))
+    Ok(Value::iterator(iter))
 }
 
 /// ECMA-262 `GetSetRecord` for the Set methods.

@@ -459,7 +459,7 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "RegExp")? {
         re.set_prototype_override(ctx.heap_mut(), Some(proto));
     }
-    Ok(Value::RegExp(re))
+    Ok(Value::regexp(re))
 }
 
 fn is_regexp_runtime(
@@ -542,7 +542,7 @@ fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let result = proto_exec(ctx, args)?;
-    Ok(Value::Boolean(!matches!(result, Value::Null)))
+    Ok(Value::boolean(!matches!(result, Value::Null)))
 }
 
 /// §B.2.4.1 `RegExp.prototype.compile(pattern, flags)` — native
@@ -594,7 +594,7 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             reason: "Cannot assign to read only property 'lastIndex'".to_string(),
         });
     }
-    Ok(Value::RegExp(re))
+    Ok(Value::regexp(re))
 }
 
 fn compile_flags_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
@@ -637,7 +637,7 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 
     let s = JsString::from_str(&rendered, ctx.heap_mut())
         .map_err(|_| oom("RegExp.prototype.toString"))?;
-    Ok(Value::String(s))
+    Ok(Value::string(s))
 }
 
 // ---------------------------------------------------------------
@@ -882,7 +882,7 @@ fn flag_bool(
 ) -> Result<Value, NativeError> {
     let re = receiver_regexp(ctx, name)?;
     let flags = re.flags(ctx.heap());
-    Ok(Value::Boolean(f(&flags)))
+    Ok(Value::boolean(f(&flags)))
 }
 
 // ---------------------------------------------------------------

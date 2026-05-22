@@ -68,7 +68,7 @@ fn smi(n: i32) -> Value {
 /// §21.4.4.10 / §21.4.4.44 — `getTime()` / `valueOf()` return the
 /// raw time value.
 fn impl_get_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::Number(NumberValue::from_f64(receiver_time(args)?)))
+    Ok(Value::number(NumberValue::from_f64(receiver_time(args)?)))
 }
 
 fn impl_get_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -160,7 +160,7 @@ fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
         index: 0,
         reason: "Invalid Date",
     })?;
-    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
 }
 
 /// §21.4.4.41 — `toJSON()`. Returns `toISOString()` for finite
@@ -179,7 +179,7 @@ fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let time = receiver_time(args)?;
     let s = to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
-    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
 }
 
 /// §21.4.4.27 / §21.4.4.43 / §21.4.4.40 — `toDateString` /
@@ -193,7 +193,7 @@ fn impl_to_date_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         Some(bd) => format!("{:04}-{:02}-{:02}", bd.year, bd.month + 1, bd.day),
         None => "Invalid Date".to_string(),
     };
-    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
 }
 
 fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -205,7 +205,7 @@ fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         ),
         None => "Invalid Date".to_string(),
     };
-    Ok(Value::String(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
 }
 
 /// Helper for `setX`-family methods. Reads each `args.args[idx]` as
@@ -245,7 +245,7 @@ fn impl_set_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let ms = read_primary_arg_number(args);
     object::set_date_data(obj, args.gc_heap, ms);
     let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
-    Ok(Value::Number(NumberValue::from_f64(written)))
+    Ok(Value::number(NumberValue::from_f64(written)))
 }
 
 /// Broken-down components packaged as a 7-tuple for the setter
@@ -277,7 +277,7 @@ fn finish_set(
     let new_ms = super::make_date(year, month, day, hour, minute, second, ms);
     object::set_date_data(obj, args.gc_heap, new_ms);
     let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
-    Ok(Value::Number(NumberValue::from_f64(written)))
+    Ok(Value::number(NumberValue::from_f64(written)))
 }
 
 fn impl_set_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -394,7 +394,7 @@ fn impl_set_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let y = read_primary_arg_number(args);
     if y.is_nan() {
         object::set_date_data(obj, args.gc_heap, f64::NAN);
-        return Ok(Value::Number(NumberValue::from_f64(f64::NAN)));
+        return Ok(Value::number(NumberValue::from_f64(f64::NAN)));
     }
     // §B.2.4.2 step 2: t = NaN → +0; else LocalTime(t) (== t under UTC).
     let base_time = if time.is_nan() { 0.0 } else { time };

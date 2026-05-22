@@ -289,7 +289,7 @@ fn schedule_timer_common(
             repeat_ms: repeat.then_some(delay_ms),
         },
     );
-    Ok(Value::Number(NumberValue::from_f64(token as f64)))
+    Ok(Value::number(NumberValue::from_f64(token as f64)))
 }
 
 fn cancel_timer_common(

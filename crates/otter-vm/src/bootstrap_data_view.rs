@@ -358,13 +358,13 @@ fn install_accessor(
 
 fn dv_get_buffer(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.buffer")?;
-    Ok(Value::ArrayBuffer(view.buffer(ctx.heap())))
+    Ok(Value::array_buffer(view.buffer(ctx.heap())))
 }
 
 fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteLength")?;
     if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
-        return Ok(Value::Number(crate::number::NumberValue::from_i32(0)));
+        return Ok(Value::number(crate::number::NumberValue::from_i32(0)));
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(
         view.byte_length(ctx.heap()) as i32,
@@ -374,7 +374,7 @@ fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
 fn dv_get_byte_offset(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteOffset")?;
     if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
-        return Ok(Value::Number(crate::number::NumberValue::from_i32(0)));
+        return Ok(Value::number(crate::number::NumberValue::from_i32(0)));
     }
     Ok(Value::Number(crate::number::NumberValue::from_i32(
         view.byte_offset(ctx.heap()) as i32,

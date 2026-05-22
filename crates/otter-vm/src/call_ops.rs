@@ -1368,7 +1368,7 @@ impl Interpreter {
             )?;
             gen_handle.set_async(&mut self.gc_heap, async_gen);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
-            return Ok(Value::Generator(gen_handle));
+            return Ok(Value::generator(gen_handle));
         }
         inner.push(new_frame);
         self.dispatch_loop(context, &mut inner)

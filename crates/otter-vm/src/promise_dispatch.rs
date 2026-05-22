@@ -1416,10 +1416,10 @@ fn static_resolve(
             let value_constructor =
                 get_property_runtime(interp, exec, value, "constructor", "Promise.resolve")?;
             if crate::abstract_ops::same_value(&value_constructor, &constructor, interp.gc_heap()) {
-                return Ok(Value::Promise(*p));
+                return Ok(Value::promise(*p));
             }
         } else {
-            return Ok(Value::Promise(*p));
+            return Ok(Value::promise(*p));
         }
     }
     Ok(Value::Promise(
@@ -1833,7 +1833,7 @@ fn create_keyed_result_runtime(
         .alloc_runtime_rooted_object_with_roots(value_roots, all_slice_roots.as_slice())
         .map_err(|_| oom_native(name))?;
     define_keyed_result_properties(obj, interp.gc_heap_mut(), keys, values, name)?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn create_keyed_result_native(
@@ -1846,7 +1846,7 @@ fn create_keyed_result_native(
         .alloc_object_with_roots(&[], &[keys, values])
         .map_err(|_| oom_native(name))?;
     define_keyed_result_properties(obj, ctx.heap_mut(), keys, values, name)?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn define_keyed_result_properties(
@@ -2351,7 +2351,7 @@ fn build_settled_record(
             name: "Promise",
             reason: err.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn make_aggregate_error_runtime_rooted(
@@ -2396,7 +2396,7 @@ fn make_aggregate_error_runtime_rooted(
             name: "Promise",
             reason: err.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn make_aggregate_error_native_rooted(
@@ -2430,7 +2430,7 @@ fn make_aggregate_error_native_rooted(
             name: "Promise",
             reason: err.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn aggregate_error_message(heap: &mut otter_gc::GcHeap) -> Result<Value, NativeError> {
@@ -2668,7 +2668,7 @@ fn static_with_resolvers(
             name: "Promise.withResolvers",
             reason: err.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn static_with_resolvers_generic(
@@ -2716,7 +2716,7 @@ fn static_with_resolvers_generic(
             name: "Promise.withResolvers",
             reason: err.to_string(),
         })?;
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 // -- prototype methods ---------------------------------------------

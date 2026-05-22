@@ -347,7 +347,7 @@ impl Interpreter {
         let obj = self.alloc_runtime_rooted_object_with_roots(&roots, slice_roots)?;
         self.set_property(obj, "value", value)?;
         self.set_property(obj, "done", Value::Boolean(done))?;
-        Ok(Value::Object(obj))
+        Ok(Value::object(obj))
     }
 
     pub(crate) fn alloc_stack_rooted_object(

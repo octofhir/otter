@@ -93,7 +93,7 @@ pub fn call(
             let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
             let descriptor = interp.evaluate_to_property_descriptor(context, &attributes)?;
             let ok = interp.define_own_property_value(context, &target, &key, descriptor)?;
-            Ok(Value::Boolean(ok))
+            Ok(Value::boolean(ok))
         }
         // §28.1.5 Reflect.deleteProperty(target, propertyKey)
         // <https://tc39.es/ecma262/#sec-reflect.deleteproperty>
@@ -101,7 +101,7 @@ pub fn call(
             let target = expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
             let removed = interp.ordinary_delete_value(context, target, &key, 0)?;
-            Ok(Value::Boolean(removed))
+            Ok(Value::boolean(removed))
         }
         // §28.1.6 Reflect.get(target, propertyKey[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.get>
@@ -195,7 +195,7 @@ pub fn call(
                         "configurable",
                         Value::Boolean(flags.configurable()),
                     )?;
-                    Ok(Value::Object(obj))
+                    Ok(Value::object(obj))
                 }
             }
         }
@@ -211,14 +211,14 @@ pub fn call(
             let target = expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
             let present = interp.ordinary_has_property_value(context, target, &key, 0)?;
-            Ok(Value::Boolean(present))
+            Ok(Value::boolean(present))
         }
         // §28.1.10 Reflect.isExtensible(target)
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>
         M::IsExtensible => {
             let target = expect_object_value(args.first())?;
             let ext = interp.is_extensible_value(context, &target)?;
-            Ok(Value::Boolean(ext))
+            Ok(Value::boolean(ext))
         }
         // §28.1.11 Reflect.ownKeys(target)
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
@@ -234,7 +234,7 @@ pub fn call(
         M::PreventExtensions => {
             let target = expect_object_value(args.first())?;
             let ok = interp.prevent_extensions_value(context, &target)?;
-            Ok(Value::Boolean(ok))
+            Ok(Value::boolean(ok))
         }
         // §28.1.13 Reflect.set(target, propertyKey, V[, receiver])
         // <https://tc39.es/ecma262/#sec-reflect.set>
@@ -265,14 +265,14 @@ pub fn call(
                 match outcome {
                     crate::object::SetOutcome::InvokeSetter { setter } => {
                         if !is_callable(&setter, interp.gc_heap()) {
-                            return Ok(Value::Boolean(false));
+                            return Ok(Value::boolean(false));
                         }
                         let argv: SmallVec<[Value; 8]> = smallvec::smallvec![value];
                         interp.run_callable_sync(context, &setter, receiver, argv)?;
-                        return Ok(Value::Boolean(true));
+                        return Ok(Value::boolean(true));
                     }
                     crate::object::SetOutcome::Reject { .. } => {
-                        return Ok(Value::Boolean(false));
+                        return Ok(Value::boolean(false));
                     }
                     crate::object::SetOutcome::AssignData => {
                         // §10.1.9 step 4 — data path. Honour receiver:
@@ -285,7 +285,7 @@ pub fn call(
                 }
             }
             let ok = interp.ordinary_set_data_value(context, target, &key, value, receiver, 0)?;
-            Ok(Value::Boolean(ok))
+            Ok(Value::boolean(ok))
         }
         // §28.1.14 Reflect.setPrototypeOf(target, prototype)
         // <https://tc39.es/ecma262/#sec-reflect.setprototypeof>
@@ -299,7 +299,7 @@ pub fn call(
                 _ => return Err(VmError::TypeMismatch),
             };
             let ok = interp.set_prototype_value_proxy_aware(context, &target, &proto)?;
-            Ok(Value::Boolean(ok))
+            Ok(Value::boolean(ok))
         }
     }
 }

@@ -266,7 +266,7 @@ pub fn call(
         M::Tanh => impl_tanh(&nums),
         M::Trunc => impl_trunc(&nums),
     };
-    Ok(Value::Number(value))
+    Ok(Value::number(value))
 }
 
 fn native_call(

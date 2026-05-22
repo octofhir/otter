@@ -86,7 +86,7 @@ fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, Temporal
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    Ok(Value::Number(NumberValue::from_i32(n)))
+    Ok(Value::number(NumberValue::from_i32(n)))
 }
 
 fn parse_instant_arg(
@@ -202,7 +202,7 @@ fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             });
         }
     };
-    Ok(Value::Boolean(inst.as_i128() == other.as_i128()))
+    Ok(Value::boolean(inst.as_i128() == other.as_i128()))
 }
 
 /// Coerce the argument at `index` to a [`temporal_rs::Duration`].

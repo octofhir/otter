@@ -36,21 +36,21 @@ fn receiver_symbol<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsSymbol, Intr
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
     let s = JsString::from_str(&sym.descriptive_string(args.gc_heap), args.gc_heap)?;
-    Ok(Value::String(s))
+    Ok(Value::string(s))
 }
 
 /// `Symbol.prototype.valueOf` — Spec §20.4.3.4. Returns the
 /// receiver symbol primitive.
 fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
-    Ok(Value::Symbol(*sym))
+    Ok(Value::symbol(*sym))
 }
 
 /// `Symbol.prototype[@@toPrimitive]` — Spec §20.4.3.5. The hint is
 /// ignored; the symbol primitive is returned for every hint.
 fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
-    Ok(Value::Symbol(*sym))
+    Ok(Value::symbol(*sym))
 }
 
 /// Read a non-method property off `Symbol.prototype`-bearing

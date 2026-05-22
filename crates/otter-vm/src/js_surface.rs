@@ -873,7 +873,7 @@ mod tests {
     use crate::{NativeError, native_function::NativeCallTarget};
 
     fn one(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Number(NumberValue::from_i32(1)))
+        Ok(Value::number(NumberValue::from_i32(1)))
     }
 
     fn construct(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {

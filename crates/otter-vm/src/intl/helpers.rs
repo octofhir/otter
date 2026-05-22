@@ -100,7 +100,7 @@ pub fn read_u8_option(
 
 /// Build a `Value::String` from a Rust string via the active heap.
 pub fn js_string(value: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, IntlError> {
-    Ok(Value::String(JsString::from_str(value, heap)?))
+    Ok(Value::string(JsString::from_str(value, heap)?))
 }
 
 /// Map an arbitrary error reason into an `IntlError::Engine`.

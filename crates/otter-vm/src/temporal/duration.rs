@@ -109,7 +109,7 @@ fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, Temporal
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    Ok(Value::Number(NumberValue::from_i32(n)))
+    Ok(Value::number(NumberValue::from_i32(n)))
 }
 
 fn expect_duration(
@@ -292,7 +292,7 @@ fn impl_total(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     })?;
     let total = dur.total(unit, None).map_err(temporal_err)?;
-    Ok(Value::Number(NumberValue::from_f64(total.as_inner())))
+    Ok(Value::number(NumberValue::from_f64(total.as_inner())))
 }
 
 /// Coerce arg `index` to a `temporal_rs::Duration`. Accepts a real

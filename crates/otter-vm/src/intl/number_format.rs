@@ -165,7 +165,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         Value::Number(NumberValue::from_i32(max_fd)),
     );
     crate::object::set(obj, heap, "useGrouping", Value::Boolean(use_grouping));
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

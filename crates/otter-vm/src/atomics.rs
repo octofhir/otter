@@ -298,7 +298,7 @@ fn coerce_element_value(
             Value::Boolean(b) => {
                 let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
                     .map_err(oom_to_err)?;
-                Ok(Value::BigInt(handle))
+                Ok(Value::big_int(handle))
             }
             Value::String(s) => {
                 let txt = s.to_lossy_string(heap);
@@ -307,7 +307,7 @@ fn coerce_element_value(
                     type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
                 })?;
                 let handle = BigIntValue::from_inner(heap, parsed).map_err(oom_to_err)?;
-                Ok(Value::BigInt(handle))
+                Ok(Value::big_int(handle))
             }
             Value::Number(_) => Err(type_err(
                 method_name,
@@ -338,7 +338,7 @@ fn coerce_element_value(
                 if n == 0.0 {
                     n = 0.0;
                 }
-                Ok(Value::Number(NumberValue::from_f64(n)))
+                Ok(Value::number(NumberValue::from_f64(n)))
             }
         }
     }
@@ -625,7 +625,7 @@ fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     }
     let n = to_integer_or_infinity(&primitive, ctx.heap());
     let supported = n.is_finite() && matches!(n as i64, 1 | 2 | 4 | 8) && (n as i64 as f64) == n;
-    Ok(Value::Boolean(supported))
+    Ok(Value::boolean(supported))
 }
 
 fn native_pause(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -767,9 +767,9 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
             .map_err(|e| type_err(method_name, e.to_string()))?;
         ctx.set_property(result, "value", promise_value)
             .map_err(|e| type_err(method_name, e.to_string()))?;
-        Ok(Value::Object(result))
+        Ok(Value::object(result))
     } else {
-        Ok(Value::String(label_str))
+        Ok(Value::string(label_str))
     }
 }
 
@@ -817,7 +817,7 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         Some(buf_id) => atomics_wait::notify_waiters(buf_id, idx, count),
         None => 0,
     };
-    Ok(Value::Number(NumberValue::from_f64(woken as f64)))
+    Ok(Value::number(NumberValue::from_f64(woken as f64)))
 }
 
 fn values_equal_strict(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {

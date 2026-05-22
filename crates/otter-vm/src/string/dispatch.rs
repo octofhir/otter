@@ -28,7 +28,7 @@ pub fn call(
         // §22.1.1 String(value) — coerce via §7.1.17 ToString.
         M::Construct => {
             let s = crate::conversion::string_constructor_js_string(args.first(), gc_heap)?;
-            Ok(Value::String(s))
+            Ok(Value::string(s))
         }
         // §22.1.2.1 String.fromCharCode(...codeUnits).
         M::FromCharCode => {

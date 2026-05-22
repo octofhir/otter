@@ -1026,7 +1026,7 @@ impl Interpreter {
                         // foundation fallback to %Function.prototype%.
                         None => {
                             if let Some(fp) = function_proto {
-                                return Ok(Value::Object(fp));
+                                return Ok(Value::object(fp));
                             }
                         }
                         // Stored proto is %Object.prototype% — the
@@ -1036,7 +1036,7 @@ impl Interpreter {
                         // `Number`, `Boolean`, `Date`, `Array`, etc.
                         Some(Value::Object(p)) if object_proto.is_some_and(|op| op == *p) => {
                             if let Some(fp) = function_proto {
-                                return Ok(Value::Object(fp));
+                                return Ok(Value::object(fp));
                             }
                         }
                         _ => {}
@@ -1048,7 +1048,7 @@ impl Interpreter {
                 if let Some(over) = nf.prototype_override(&self.gc_heap) {
                     return Ok(over);
                 }
-                Ok(Value::Object(self.function_prototype_object()?))
+                Ok(Value::object(self.function_prototype_object()?))
             }
             Value::Array(arr) => {
                 if let Some(over) = array::prototype_override(*arr, &self.gc_heap) {
@@ -1487,7 +1487,7 @@ impl Interpreter {
             }
             _ => return Ok(this_value),
         };
-        Ok(Value::Object(object))
+        Ok(Value::object(object))
     }
 
     fn box_sloppy_this_primitive_stack_rooted(
@@ -1554,7 +1554,7 @@ impl Interpreter {
             }
             _ => return Ok(this_value),
         };
-        Ok(Value::Object(object))
+        Ok(Value::object(object))
     }
 
     fn object_for_primitive_property_base_stack_rooted(
@@ -7563,7 +7563,7 @@ mod tests {
                     }
                 }
             }
-            Ok(Value::Number(NumberValue::Smi(sum)))
+            Ok(Value::number(NumberValue::Smi(sum)))
         }
 
         let module = module_with(vec![], 4);

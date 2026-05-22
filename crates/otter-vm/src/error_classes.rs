@@ -484,7 +484,7 @@ impl ErrorClassRegistry {
                     reason: err.to_string(),
                 }
             })?;
-            Ok(Value::String(s))
+            Ok(Value::string(s))
         }
         let to_string_native = native_static_with_roots(
             gc_heap,
@@ -601,7 +601,7 @@ impl ErrorClassRegistry {
             if let Some(cause) = cause {
                 install_error_cause(obj, cause, ctx.heap_mut());
             }
-            Ok(Value::Object(obj))
+            Ok(Value::object(obj))
         }
 
         /// §7.3.13 HasProperty + §7.3.2 Get for the `cause` field
@@ -704,7 +704,7 @@ impl ErrorClassRegistry {
             if let Some(cause) = cause {
                 install_error_cause(obj, cause, c.heap_mut());
             }
-            Ok(Value::Object(obj))
+            Ok(Value::object(obj))
         }
 
         /// IterableToList helper for AggregateError.

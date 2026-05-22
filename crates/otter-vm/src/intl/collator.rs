@@ -58,16 +58,16 @@ fn impl_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         Some(Value::Number(n)) => n.to_display_string(),
         Some(Value::Boolean(b)) => if *b { "true" } else { "false" }.to_string(),
-        _ => return Ok(Value::Number(NumberValue::from_i32(0))),
+        _ => return Ok(Value::number(NumberValue::from_i32(0))),
     };
     let y = match args.args.get(1) {
         Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
         Some(Value::Number(n)) => n.to_display_string(),
         Some(Value::Boolean(b)) => if *b { "true" } else { "false" }.to_string(),
-        _ => return Ok(Value::Number(NumberValue::from_i32(0))),
+        _ => return Ok(Value::number(NumberValue::from_i32(0))),
     };
     let n = compare_with_payload(&x, &y, &payload);
-    Ok(Value::Number(NumberValue::from_i32(n)))
+    Ok(Value::number(NumberValue::from_i32(n)))
 }
 
 fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -95,7 +95,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     );
     crate::object::set(obj, heap, "numeric", Value::Boolean(numeric));
     crate::object::set(obj, heap, "caseFirst", case_first);
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

@@ -208,7 +208,7 @@ fn weak_ref_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "WeakRef")? {
         weak_refs::set_weak_ref_prototype_override(weak_ref, ctx.heap_mut(), Some(proto));
     }
-    Ok(Value::WeakRef(weak_ref))
+    Ok(Value::weak_ref(weak_ref))
 }
 
 fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -237,7 +237,7 @@ fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
             Some(proto),
         );
     }
-    Ok(Value::FinalizationRegistry(registry))
+    Ok(Value::finalization_registry(registry))
 }
 
 // ---------------------------------------------------------------
@@ -277,7 +277,7 @@ fn fr_proto_unregister(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     let token = args.first().cloned().unwrap_or(Value::undefined());
     let removed = weak_refs::finalization_registry_unregister(registry, ctx.heap_mut(), &token)
         .map_err(|e| vm_to_native(e, "FinalizationRegistry.prototype.unregister"))?;
-    Ok(Value::Boolean(removed))
+    Ok(Value::boolean(removed))
 }
 
 // ---------------------------------------------------------------

@@ -126,20 +126,20 @@ impl Interpreter {
             Value::Boolean(b) => {
                 let s = if *b { "true" } else { "false" };
                 let js = JsString::from_str(s, self.gc_heap_mut())?;
-                return Ok(Value::String(js));
+                return Ok(Value::string(js));
             }
             Value::Null => {
                 let js = JsString::from_str("null", self.gc_heap_mut())?;
-                return Ok(Value::String(js));
+                return Ok(Value::string(js));
             }
             Value::Undefined | Value::Hole => {
                 let js = JsString::from_str("undefined", self.gc_heap_mut())?;
-                return Ok(Value::String(js));
+                return Ok(Value::string(js));
             }
             Value::BigInt(b) => {
                 let js =
                     JsString::from_str(&b.to_decimal_string(&self.gc_heap), self.gc_heap_mut())?;
-                return Ok(Value::String(js));
+                return Ok(Value::string(js));
             }
             _ => {}
         }
@@ -148,15 +148,15 @@ impl Interpreter {
             VmPropertyKey::Symbol(sym) => Ok(Value::symbol(sym)),
             VmPropertyKey::Atom(atom) => {
                 let s = JsString::from_str(atom.name(), self.gc_heap_mut())?;
-                Ok(Value::String(s))
+                Ok(Value::string(s))
             }
             VmPropertyKey::String(s) => {
                 let s = JsString::from_str(s, self.gc_heap_mut())?;
-                Ok(Value::String(s))
+                Ok(Value::string(s))
             }
             VmPropertyKey::OwnedString(s) => {
                 let s = JsString::from_str(&s, self.gc_heap_mut())?;
-                Ok(Value::String(s))
+                Ok(Value::string(s))
             }
         }
     }
@@ -177,7 +177,7 @@ impl Interpreter {
                 None => Ok(Value::undefined()),
             },
             None if name == "length" => {
-                Ok(Value::Number(NumberValue::from_i32(string.len() as i32)))
+                Ok(Value::number(NumberValue::from_i32(string.len() as i32)))
             }
             None => self.load_from_constructor_prototype(context, "String", receiver, name),
         }

@@ -393,7 +393,7 @@ impl Interpreter {
                     metadata,
                     &mut external_visit,
                 )?;
-                Ok(Value::BoundFunction(bound))
+                Ok(Value::bound_function(bound))
             }
             VmIntrinsicFunction::FunctionPrototypeToString => {
                 if !self.is_callable_runtime(&this_value) {
@@ -410,7 +410,7 @@ impl Interpreter {
                 };
                 let s = JsString::from_str(&display, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
-                Ok(Value::String(s))
+                Ok(Value::string(s))
             }
             VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance => {
                 // §20.2.3.6: Return ? OrdinaryHasInstance(F, V) where
@@ -418,7 +418,7 @@ impl Interpreter {
                 // <https://tc39.es/ecma262/#sec-function.prototype-@@hasinstance>
                 let v = args.into_iter().next().unwrap_or(Value::undefined());
                 let result = self.ordinary_has_instance(context, &this_value, &v)?;
-                Ok(Value::Boolean(result))
+                Ok(Value::boolean(result))
             }
         }
     }

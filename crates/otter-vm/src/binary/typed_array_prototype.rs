@@ -116,7 +116,7 @@ fn build_subarray(
     let byte_offset = t.byte_offset(heap) + start * bpe;
     let view =
         JsTypedArray::new(heap, buffer, t.kind(), byte_offset, len).map_err(intrinsic_oom)?;
-    Ok(Value::TypedArray(view))
+    Ok(Value::typed_array(view))
 }
 
 fn build_new_typed_array_rooted(
@@ -143,7 +143,7 @@ fn build_new_typed_array_rooted(
     for (i, v) in values.iter().enumerate() {
         view.set(args.gc_heap, i, v);
     }
-    Ok(Value::TypedArray(view))
+    Ok(Value::typed_array(view))
 }
 
 // ---- pure-functional methods --------------------------------------------
@@ -211,7 +211,7 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     }
     let view =
         JsTypedArray::new(args.gc_heap, new_buf, t.kind(), 0, new_len).map_err(intrinsic_oom)?;
-    Ok(Value::TypedArray(view))
+    Ok(Value::typed_array(view))
 }
 
 fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -238,7 +238,7 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     for i in s..e {
         t.set(args.gc_heap, i, &value);
     }
-    Ok(Value::TypedArray(t))
+    Ok(Value::typed_array(t))
 }
 
 fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -253,7 +253,7 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let final_end = end.clamp(start, len);
     let count = (final_end - from).min(len - to).max(0) as usize;
     if count == 0 {
-        return Ok(Value::TypedArray(t));
+        return Ok(Value::typed_array(t));
     }
     // Memmove by raw bytes through the backing buffer to handle
     // overlap correctly.
@@ -265,7 +265,7 @@ fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     buffer.with_bytes_mut(args.gc_heap, |buf| {
         buf.copy_within(src_off..src_off + byte_count, dst_off);
     });
-    Ok(Value::TypedArray(t))
+    Ok(Value::typed_array(t))
 }
 
 fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -284,7 +284,7 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             j -= 1;
         }
     }
-    Ok(Value::TypedArray(t))
+    Ok(Value::typed_array(t))
 }
 
 fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -349,10 +349,10 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     } as usize;
     for i in from..(len as usize) {
         if values_equal_zero(&t.get(args.gc_heap, i).map_err(intrinsic_oom)?, &target) {
-            return Ok(Value::Boolean(true));
+            return Ok(Value::boolean(true));
         }
     }
-    Ok(Value::Boolean(false))
+    Ok(Value::boolean(false))
 }
 
 fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -383,7 +383,7 @@ fn join_into_string(
             other => out.push_str(&other.display_string(gc_heap)),
         }
     }
-    Ok(Value::String(JsString::from_str(&out, gc_heap)?))
+    Ok(Value::string(JsString::from_str(&out, gc_heap)?))
 }
 
 fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -552,7 +552,7 @@ fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     for (i, v) in snapshot.iter().enumerate() {
         t.set(args.gc_heap, i, v);
     }
-    Ok(Value::TypedArray(t))
+    Ok(Value::typed_array(t))
 }
 
 fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

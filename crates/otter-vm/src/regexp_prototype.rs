@@ -526,7 +526,7 @@ fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re_clone = *receiver_regexp(args)?;
     let text = arg_to_string_primitive(args, 0)?;
     let result = exec_once(&re_clone, &text, args)?;
-    Ok(Value::Boolean(!matches!(result, Value::Null)))
+    Ok(Value::boolean(!matches!(result, Value::Null)))
 }
 
 /// §22.2.7.1 step 4 — `Let S be ? ToString(string)`. Coerces every
@@ -564,7 +564,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     let re = receiver_regexp(args)?;
     let heap = &*args.gc_heap;
     let rendered = format!("/{}/{}", re.source(heap), re.flags(heap).to_js_string());
-    Ok(Value::String(JsString::from_str(&rendered, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&rendered, args.gc_heap)?))
 }
 
 /// §22.2.6.8 `RegExp.prototype[@@match](string)` — invoked by
@@ -647,7 +647,7 @@ pub fn native_regexp_symbol_match(
             name: "RegExp.prototype[@@match]",
             reason: "array allocation failed".to_string(),
         })?;
-    Ok(Value::Array(arr))
+    Ok(Value::array(arr))
 }
 
 /// §22.2.6.10 `RegExp.prototype[@@search](string)` — returns the
@@ -1390,7 +1390,7 @@ pub fn native_regexp_symbol_match_all(
             name,
             reason: "iterator allocation failed".to_string(),
         })?;
-    Ok(Value::Iterator(handle))
+    Ok(Value::iterator(handle))
 }
 
 /// §22.2.6.14 `RegExp.prototype[@@split](string, limit)`.
@@ -1516,7 +1516,7 @@ pub fn native_regexp_symbol_split(
                 name,
                 reason: "array allocation failed".to_string(),
             })?;
-        return Ok(Value::Array(arr));
+        return Ok(Value::array(arr));
     }
 
     // Step 16 — empty S: one probe; if exec yields a match, return
@@ -1530,7 +1530,7 @@ pub fn native_regexp_symbol_split(
                     name,
                     reason: "array allocation failed".to_string(),
                 })?;
-            return Ok(Value::Array(arr));
+            return Ok(Value::array(arr));
         }
         out_elements.push(Value::string(s));
         let arr = ctx
@@ -1543,7 +1543,7 @@ pub fn native_regexp_symbol_split(
                 name,
                 reason: "array allocation failed".to_string(),
             })?;
-        return Ok(Value::Array(arr));
+        return Ok(Value::array(arr));
     }
 
     // Step 17-21 — main loop.
@@ -1586,7 +1586,7 @@ pub fn native_regexp_symbol_split(
                     name,
                     reason: "array allocation failed".to_string(),
                 })?;
-            return Ok(Value::Array(arr));
+            return Ok(Value::array(arr));
         }
         p = e;
         let length_val = get_property_runtime(ctx, &z, "length", name)?;
@@ -1607,7 +1607,7 @@ pub fn native_regexp_symbol_split(
                         name,
                         reason: "array allocation failed".to_string(),
                     })?;
-                return Ok(Value::Array(arr));
+                return Ok(Value::array(arr));
             }
         }
         q = p;
@@ -1631,7 +1631,7 @@ pub fn native_regexp_symbol_split(
             name,
             reason: "array allocation failed".to_string(),
         })?;
-    Ok(Value::Array(arr))
+    Ok(Value::array(arr))
 }
 
 /// §22.2.6.11.1 `GetSubstitution(matched, str, position, captures,

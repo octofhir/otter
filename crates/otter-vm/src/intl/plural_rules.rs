@@ -110,7 +110,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         "maximumFractionDigits",
         Value::Number(crate::number::NumberValue::from_i32(xfd)),
     );
-    Ok(Value::Object(obj))
+    Ok(Value::object(obj))
 }
 
 /// English plural-category fallback. `kind` is `"cardinal"` or

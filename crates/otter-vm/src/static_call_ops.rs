@@ -692,7 +692,7 @@ impl Interpreter {
                 }
             }
         }
-        Ok(Value::Object(obj))
+        Ok(Value::object(obj))
     }
 
     /// §20.1.2.3 Object.defineProperties(O, Properties).
@@ -1512,7 +1512,7 @@ impl Interpreter {
             };
             crate::array::push_with_roots(group, &mut self.gc_heap, *item, &mut external_visit)?;
         }
-        Ok(Value::Object(result))
+        Ok(Value::object(result))
     }
 
     fn descriptor_to_object_stack_rooted(
@@ -1602,7 +1602,7 @@ impl Interpreter {
                 let handler = coerce_proxy_target(args.get(1))?;
                 let proxy = crate::proxy::JsProxy::new(&mut self.gc_heap, target, handler)
                     .map_err(crate::oom_to_vm)?;
-                Ok(Value::Proxy(proxy))
+                Ok(Value::proxy(proxy))
             }
             M::Revocable => {
                 let target = coerce_proxy_target(args.first())?;
@@ -1642,7 +1642,7 @@ impl Interpreter {
                 )?;
                 self.set_property(obj, "proxy", proxy_value)?;
                 self.set_property(obj, "revoke", revoke)?;
-                Ok(Value::Object(obj))
+                Ok(Value::object(obj))
             }
         }
     }
@@ -1659,7 +1659,7 @@ impl Interpreter {
             M::From => {
                 let value = args.first().cloned().unwrap_or(Value::undefined());
                 let state = match value {
-                    Value::Iterator(rc) => return Ok(Value::Iterator(rc)),
+                    Value::Iterator(rc) => return Ok(Value::iterator(rc)),
                     Value::Generator(handle) => IteratorState::Generator { handle },
                     Value::Array(arr) => IteratorState::Array {
                         array: arr,
@@ -1715,7 +1715,7 @@ impl Interpreter {
                     _ => return Err(VmError::TypeMismatch),
                 };
                 let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[], &[args])?;
-                Ok(Value::Iterator(iter))
+                Ok(Value::iterator(iter))
             }
         }
     }

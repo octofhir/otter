@@ -287,7 +287,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         let this = *ctx.this_value();
         if let Value::Object(obj) = this {
             crate::object::set_string_data(obj, ctx.heap_mut(), string);
-            Ok(Value::Object(obj))
+            Ok(Value::object(obj))
         } else {
             Err(NativeError::TypeError {
                 name: "String",

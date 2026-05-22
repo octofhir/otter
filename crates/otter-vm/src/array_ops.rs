@@ -85,7 +85,7 @@ impl Interpreter {
                     &mut external_visit,
                 )?;
             }
-            return Ok(Value::Array(arr));
+            return Ok(Value::array(arr));
         }
         self.array_of_stack_rooted(stack, args)
     }

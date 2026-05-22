@@ -88,7 +88,7 @@ impl Interpreter {
                         &mut external_visit,
                     )?;
                 }
-                Ok(Value::Map(m))
+                Ok(Value::map(m))
             }
             "Set" => {
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -112,7 +112,7 @@ impl Interpreter {
                         &mut external_visit,
                     )?;
                 }
-                Ok(Value::Set(s))
+                Ok(Value::set(s))
             }
             "WeakMap" => {
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -147,7 +147,7 @@ impl Interpreter {
                     )
                     .map_err(weak_collection_to_vm_error)?;
                 }
-                Ok(Value::WeakMap(m))
+                Ok(Value::weak_map(m))
             }
             "WeakSet" => {
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -172,7 +172,7 @@ impl Interpreter {
                     )
                     .map_err(weak_collection_to_vm_error)?;
                 }
-                Ok(Value::WeakSet(s))
+                Ok(Value::weak_set(s))
             }
             _ => Err(VmError::UnknownIntrinsic {
                 name: format!("new {kind}"),

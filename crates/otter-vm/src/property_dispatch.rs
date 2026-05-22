@@ -97,16 +97,9 @@ impl Interpreter {
         ))
     }
 
-    /// §7.1.19 `ToPropertyKey(value)` — projection used by the
-    /// computed-key `LoadElement` / `StoreElement` opcode dispatch
-    /// before the per-receiver match runs. Primitive operands round
-    /// through their existing arms unchanged; objects, functions,
-    /// closures, arrays, and other non-primitives surface as a
-    /// `Value::String` (the `ToString` result) or `Value::Symbol`
-    /// (when `[Symbol.toPrimitive]` returns a Symbol). Bypassing
-    /// this step caused `obj[() => {}]` / `class { [() => {}](){} }`
-    /// to raise `TypeMismatch` even though the spec mandates a
-    /// successful ToString coercion of the key.
+    /// §7.1.19 `ToPropertyKey(value)` — primitives round through
+    /// unchanged; non-primitives surface as a string (the ToString
+    /// result) or a symbol (when `[Symbol.toPrimitive]` returns one).
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-topropertykey>
@@ -3103,10 +3096,9 @@ impl Interpreter {
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let value = *read_register(&stack[top_idx], src_reg)?;
         let strict = Self::current_frame_is_strict(stack, context);
-        if let Value::Object(obj) = &receiver
-            && object::supports_fast_property_ic(*obj, &self.gc_heap)
+        if let Some(obj) = receiver.as_object()
+            && object::supports_fast_property_ic(obj, &self.gc_heap)
         {
-            let obj = *obj;
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
@@ -3132,8 +3124,7 @@ impl Interpreter {
         }
         // §28.2.4.5 / §10.5.9 Proxy.[[Set]] — invoke the `set` trap
         // when present; otherwise delegate to the target.
-        if let Value::Proxy(p) = &receiver {
-            let proxy = *p;
+        if let Some(proxy) = receiver.as_proxy() {
             if proxy.is_revoked(&self.gc_heap) {
                 return Err(VmError::TypeError {
                     message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
@@ -3143,9 +3134,9 @@ impl Interpreter {
             let key_vm = VmPropertyKey::atom(atomized_key);
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
-                Value::String(key_str),
+                Value::string(key_str),
                 value,
-                Value::Proxy(proxy),
+                Value::proxy(proxy),
             ];
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -3202,13 +3193,13 @@ impl Interpreter {
                 }
                 None => {
                     let target_value = proxy.target(&self.gc_heap);
-                    let Value::Object(target) = target_value else {
+                    let Some(target) = target_value.as_object() else {
                         if !self.ordinary_set_data_value(
                             context,
                             target_value,
                             &key_vm,
                             value,
-                            Value::Proxy(proxy),
+                            Value::proxy(proxy),
                             0,
                         )? {
                             Self::failed_set_result(
@@ -3242,7 +3233,7 @@ impl Interpreter {
                                     stack,
                                     context,
                                     &setter,
-                                    Value::Proxy(proxy),
+                                    Value::proxy(proxy),
                                     args,
                                     scratch_reg,
                                 )?;
@@ -3259,7 +3250,8 @@ impl Interpreter {
             }
             return Ok(true);
         }
-        if let Value::BoundFunction(bound) = &receiver {
+        if let Some(bound) = receiver.as_bound_function() {
+            let bound = &bound;
             match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)?
             {
                 Some(object::PropertyDescriptor {
@@ -3310,14 +3302,12 @@ impl Interpreter {
                 }
             }
         }
-        if matches!(
-            receiver,
-            Value::Boolean(_)
-                | Value::Number(_)
-                | Value::String(_)
-                | Value::Symbol(_)
-                | Value::BigInt(_)
-        ) {
+        if receiver.is_boolean()
+            || receiver.is_number()
+            || receiver.is_string()
+            || receiver.is_symbol()
+            || receiver.is_big_int()
+        {
             return self.store_to_primitive_base(
                 stack,
                 context,
@@ -3327,39 +3317,38 @@ impl Interpreter {
                 scratch_reg,
             );
         }
-        let obj = match &receiver {
-            Value::Object(o) => *o,
-            Value::ClassConstructor(c) => c.statics(&self.gc_heap),
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let fid = *function_id;
-                if function_metadata::ordinary_function_metadata_key(name).is_some()
-                    && let Some(desc) =
-                        self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
-                    && !desc.writable()
-                {
-                    return Self::finish_failed_set(
-                        stack,
-                        context,
-                        format!("Cannot assign to read-only property '{name}' of function"),
-                    );
-                }
-                match self.function_user_props.get(&fid).copied() {
-                    Some(bag) => bag,
-                    None => {
-                        self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?
-                    }
+        let obj = if let Some(o) = receiver.as_object() {
+            o
+        } else if let Some(c) = receiver.as_class_constructor() {
+            c.statics(&self.gc_heap)
+        } else if let Some(fid) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            if function_metadata::ordinary_function_metadata_key(name).is_some()
+                && let Some(desc) =
+                    self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
+                && !desc.writable()
+            {
+                return Self::finish_failed_set(
+                    stack,
+                    context,
+                    format!("Cannot assign to read-only property '{name}' of function"),
+                );
+            }
+            match self.function_user_props.get(&fid).copied() {
+                Some(bag) => bag,
+                None => {
+                    self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?
                 }
             }
-            _ => return Ok(false),
+        } else {
+            return Ok(false);
         };
         let outcome = crate::object::resolve_set(obj, &self.gc_heap, name);
         match outcome {
             object::SetOutcome::AssignData => {
-                let transition = if matches!(receiver, Value::Object(_))
+                let transition = if receiver.is_object()
                     && object::supports_fast_property_ic(obj, &self.gc_heap)
                 {
                     self.capture_store_property_transition_with_stack_roots(
@@ -3378,7 +3367,7 @@ impl Interpreter {
                         format!("Cannot assign to property '{name}'"),
                     );
                 }
-                if matches!(receiver, Value::Object(_)) {
+                if receiver.is_object() {
                     let site = context
                         .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                         .ok_or(VmError::InvalidOperand)?;
@@ -3450,11 +3439,10 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let lhs = *read_register(&stack[top_idx], lhs_reg)?;
         let rhs = *read_register(&stack[top_idx], rhs_reg)?;
-        if !matches!(rhs, Value::Object(_) | Value::Proxy(_)) {
+        if !(rhs.is_object() || rhs.is_proxy()) {
             return Ok(false);
         };
-        if let (Value::Object(obj), Value::String(key_string)) = (&rhs, &lhs) {
-            let obj = *obj;
+        if let (Some(obj), Some(key_string)) = (rhs.as_object(), lhs.as_string()) {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
@@ -3465,7 +3453,7 @@ impl Interpreter {
                     Self::finish_property_fast_path_value(
                         &mut stack[top_idx],
                         dst,
-                        Value::Boolean(true),
+                        Value::boolean(true),
                     )?;
                     return Ok(true);
                 }
@@ -3489,17 +3477,19 @@ impl Interpreter {
                 Self::finish_property_fast_path_value(
                     &mut stack[top_idx],
                     dst,
-                    Value::Boolean(true),
+                    Value::boolean(true),
                 )?;
                 return Ok(true);
             }
             self.has_property_ics[site]
                 .disable_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
         }
-        let key = match &lhs {
-            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-            Value::String(s) => VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap)),
-            other => VmPropertyKey::OwnedString(other.display_string(&self.gc_heap)),
+        let key = if let Some(sym) = lhs.as_symbol() {
+            VmPropertyKey::Symbol(*sym)
+        } else if let Some(s) = lhs.as_string() {
+            VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+        } else {
+            VmPropertyKey::OwnedString(lhs.display_string(&self.gc_heap))
         };
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -3524,14 +3514,14 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let Value::Proxy(proxy) = receiver else {
+        let Some(proxy) = receiver.as_proxy() else {
             return Ok(false);
         };
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let removed = self.ordinary_delete_value(
             context,
-            Value::Proxy(proxy),
+            Value::proxy(proxy),
             &VmPropertyKey::atom(atomized_key),
             0,
         )?;
@@ -3552,7 +3542,7 @@ impl Interpreter {
         let idx_reg = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        if !matches!(receiver, Value::Proxy(_)) {
+        if !receiver.is_proxy() {
             return Ok(false);
         }
         let idx = *read_register(&stack[top_idx], idx_reg)?;
@@ -3582,7 +3572,7 @@ impl Interpreter {
         let src = register_operand(operands.get(1))?;
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src)?;
-        if !matches!(value, Value::Proxy(_)) {
+        if !value.is_proxy() {
             return Ok(false);
         };
         let pc = stack[top_idx].pc;
@@ -3604,14 +3594,16 @@ impl Interpreter {
         let proto_reg = register_operand(operands.get(1))?;
         let top_idx = stack.len() - 1;
         let recv = *read_register(&stack[top_idx], obj_reg)?;
-        let Value::Proxy(_) = &recv else {
+        if !recv.is_proxy() {
             return Ok(false);
         };
         let proto_val = *read_register(&stack[top_idx], proto_reg)?;
-        let proto_obj = match &proto_val {
-            Value::Object(_) | Value::Proxy(_) | Value::Null => proto_val,
-            Value::ClassConstructor(c) => Value::object(c.statics(&self.gc_heap)),
-            _ => return Err(VmError::TypeMismatch),
+        let proto_obj = if proto_val.is_object() || proto_val.is_proxy() || proto_val.is_null() {
+            proto_val
+        } else if let Some(c) = proto_val.as_class_constructor() {
+            Value::object(c.statics(&self.gc_heap))
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -3645,35 +3637,32 @@ fn string_index_property_name(key: &str) -> Option<u32> {
 }
 
 fn has_object_property(interpreter: &Interpreter, obj: JsObject, key: &Value) -> bool {
-    match key {
-        Value::Symbol(s) => crate::object::get_symbol(obj, &interpreter.gc_heap, s).is_some(),
-        Value::String(s) => {
-            let key = s.to_lossy_string(&interpreter.gc_heap);
-            !matches!(
-                crate::object::lookup(obj, &interpreter.gc_heap, &key),
-                object::PropertyLookup::Absent
-            )
-        }
-        Value::Number(n) => {
-            let key = n.to_display_string();
-            !matches!(
-                crate::object::lookup(obj, &interpreter.gc_heap, &key),
-                object::PropertyLookup::Absent
-            )
-        }
-        other => {
-            let key = other.display_string(&interpreter.gc_heap);
-            !matches!(
-                crate::object::lookup(obj, &interpreter.gc_heap, &key),
-                object::PropertyLookup::Absent
-            )
-        }
+    if let Some(s) = key.as_symbol() {
+        crate::object::get_symbol(obj, &interpreter.gc_heap, s).is_some()
+    } else if let Some(s) = key.as_string() {
+        let k = s.to_lossy_string(&interpreter.gc_heap);
+        !matches!(
+            crate::object::lookup(obj, &interpreter.gc_heap, &k),
+            object::PropertyLookup::Absent
+        )
+    } else if let Some(n) = key.as_number() {
+        let k = n.to_display_string();
+        !matches!(
+            crate::object::lookup(obj, &interpreter.gc_heap, &k),
+            object::PropertyLookup::Absent
+        )
+    } else {
+        let k = key.display_string(&interpreter.gc_heap);
+        !matches!(
+            crate::object::lookup(obj, &interpreter.gc_heap, &k),
+            object::PropertyLookup::Absent
+        )
     }
 }
 
 fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> bool {
-    match key {
-        Value::Number(n) => match n.as_smi() {
+    if let Some(n) = key.as_number() {
+        match n.as_smi() {
             Some(i) if i >= 0 => {
                 crate::array::has_own_element(arr, &interpreter.gc_heap, i as usize)
             }
@@ -3681,31 +3670,24 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
                 crate::array::get_named_property(arr, &interpreter.gc_heap, &n.to_display_string())
                     .is_some()
             }
-        },
-        Value::String(s) => {
-            let key = s.to_lossy_string(&interpreter.gc_heap);
-            if key == "length" {
-                return true;
-            }
-            if let Some(i) = crate::object::array_index_property_name(&key)
-                && crate::array::has_own_element(arr, &interpreter.gc_heap, i as usize)
-            {
-                return true;
-            }
-            // §22.1.4 — Array exotic surface user-installed extra
-            // string-keyed properties through the named-properties
-            // side table. `in` must consult it before falling through.
-            crate::array::get_named_property(arr, &interpreter.gc_heap, &key).is_some()
         }
-        // §22.1 Array exotic — symbol-keyed own properties live in a
-        // dedicated side table; surface them through the `in`
-        // operator so reflective probes
-        // (`Symbol.toStringTag in arr`,
-        // `Symbol.iterator in arr`) observe the installed values.
-        Value::Symbol(sym) => {
-            crate::array::get_symbol_property(arr, &interpreter.gc_heap, sym).is_some()
+    } else if let Some(s) = key.as_string() {
+        let k = s.to_lossy_string(&interpreter.gc_heap);
+        if k == "length" {
+            return true;
         }
-        _ => false,
+        if let Some(i) = crate::object::array_index_property_name(&k)
+            && crate::array::has_own_element(arr, &interpreter.gc_heap, i as usize)
+        {
+            return true;
+        }
+        // §22.1.4 — surface named-property side table for `in`.
+        crate::array::get_named_property(arr, &interpreter.gc_heap, &k).is_some()
+    } else if let Some(sym) = key.as_symbol() {
+        // §22.1 Array exotic — symbol-keyed own table.
+        crate::array::get_symbol_property(arr, &interpreter.gc_heap, sym).is_some()
+    } else {
+        false
     }
 }
 
@@ -3714,17 +3696,21 @@ fn has_class_static_property(
     class: &ClassConstructor,
     key: &Value,
 ) -> bool {
-    match key {
-        Value::String(s) if s.to_lossy_string(&interpreter.gc_heap) == "prototype" => true,
-        Value::String(s) => !matches!(
+    if let Some(s) = key.as_string() {
+        let k = s.to_lossy_string(&interpreter.gc_heap);
+        if k == "prototype" {
+            return true;
+        }
+        !matches!(
             crate::object::lookup(
                 class.statics(&interpreter.gc_heap),
                 &interpreter.gc_heap,
-                &s.to_lossy_string(&interpreter.gc_heap)
+                &k
             ),
             object::PropertyLookup::Absent
-        ),
-        _ => false,
+        )
+    } else {
+        false
     }
 }
 

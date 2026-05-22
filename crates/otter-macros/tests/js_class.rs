@@ -6,31 +6,31 @@ use otter_vm::{ClassBuilder, Interpreter, Value};
 
 #[js_class(name = "MacroClass", spec = MACRO_CLASS_SPEC)]
 mod macro_class {
-    use otter_vm::{NativeCtx, NativeError, NumberValue, Value};
+    use otter_vm::{NativeCtx, NativeError, Value};
 
     #[js_constructor(length = 1)]
     pub fn construct(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Undefined)
+        Ok(Value::undefined())
     }
 
     #[js_static_method(name = "from", length = 1)]
     pub fn from(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Number(NumberValue::from_i32(1)))
+        Ok(Value::number_i32(1))
     }
 
     #[js_method(name = "valueOf", length = 0)]
     pub fn value_of(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Number(NumberValue::from_i32(2)))
+        Ok(Value::number_i32(2))
     }
 
     #[js_getter(name = "answer")]
     pub fn get_answer(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Number(NumberValue::from_i32(42)))
+        Ok(Value::number_i32(42))
     }
 
     #[js_setter(name = "answer")]
     pub fn set_answer(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Undefined)
+        Ok(Value::undefined())
     }
 }
 

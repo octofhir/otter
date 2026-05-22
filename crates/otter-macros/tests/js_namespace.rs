@@ -10,7 +10,7 @@ mod macro_ns {
 
     #[js_fn(name = "one", length = 0)]
     pub fn one(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Number(NumberValue::from_i32(1)))
+        Ok(Value::number_i32(1))
     }
 
     #[js_fn(name = "addOne", length = 1)]
@@ -20,7 +20,7 @@ mod macro_ns {
             .and_then(Value::as_number)
             .map(NumberValue::as_f64)
             .unwrap_or(0.0);
-        Ok(Value::Number(NumberValue::from_f64(value + 1.0)))
+        Ok(Value::number_f64(value + 1.0))
     }
 }
 

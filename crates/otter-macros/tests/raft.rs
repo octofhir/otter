@@ -5,14 +5,14 @@ use otter_vm::object;
 use otter_vm::{Interpreter, NamespaceBuilder, Value};
 
 mod raft_ns {
-    use otter_vm::{NativeCtx, NativeError, NumberValue, Value};
+    use otter_vm::{NativeCtx, NativeError, Value};
 
     pub fn one(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Number(NumberValue::from_i32(1)))
+        Ok(Value::number_i32(1))
     }
 
     pub fn two(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Number(NumberValue::from_i32(2)))
+        Ok(Value::number_i32(2))
     }
 }
 

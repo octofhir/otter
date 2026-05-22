@@ -35,7 +35,6 @@ use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::number::NumberValue;
 use crate::object::{self, JsObject};
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, VmError, VmGetOutcome, VmPropertyKey};
@@ -44,10 +43,10 @@ use crate::{NativeCtx, NativeError, VmError, VmGetOutcome, VmPropertyKey};
 /// extract the `[[DateValue]]` slot. Returns the JsObject handle
 /// (for setters that need to write back) and the current time.
 fn receiver_handle(args: &IntrinsicArgs<'_>) -> Result<(JsObject, f64), IntrinsicError> {
-    if let Value::Object(o) = args.receiver
-        && let Some(time) = object::date_data(*o, args.gc_heap)
+    if let Some(o) = args.receiver.as_object()
+        && let Some(time) = object::date_data(o, args.gc_heap)
     {
-        return Ok((*o, time));
+        return Ok((o, time));
     }
     Err(IntrinsicError::BadReceiver { expected: "date" })
 }
@@ -58,17 +57,17 @@ fn receiver_time(args: &IntrinsicArgs<'_>) -> Result<f64, IntrinsicError> {
 }
 
 fn nan() -> Value {
-    Value::Number(NumberValue::from_f64(f64::NAN))
+    Value::number_f64(f64::NAN)
 }
 
 fn smi(n: i32) -> Value {
-    Value::Number(NumberValue::from_i32(n))
+    Value::number_i32(n)
 }
 
 /// §21.4.4.10 / §21.4.4.44 — `getTime()` / `valueOf()` return the
 /// raw time value.
 fn impl_get_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::number(NumberValue::from_f64(receiver_time(args)?)))
+    Ok(Value::number_f64(receiver_time(args)?))
 }
 
 fn impl_get_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -215,13 +214,21 @@ fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 /// component-from-time value supplied by `fallback` (§21.4.4.x
 /// "if X is present" branch).
 fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
-    match args.args.get(idx) {
-        None => fallback,
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        Some(Value::Undefined) => f64::NAN,
-        _ => f64::NAN,
+    let Some(v) = args.args.get(idx) else {
+        return fallback;
+    };
+    if let Some(n) = v.as_number() {
+        n.as_f64()
+    } else if v.is_boolean() {
+        if v.as_boolean() == Some(true) {
+            1.0
+        } else {
+            0.0
+        }
+    } else if v.is_null() {
+        0.0
+    } else {
+        f64::NAN
     }
 }
 
@@ -230,12 +237,21 @@ fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
 /// runs `ToNumber(value)`), so a missing arg becomes
 /// `ToNumber(undefined) = NaN` rather than the component fallback.
 fn read_primary_arg_number(args: &IntrinsicArgs<'_>) -> f64 {
-    match args.args.first() {
-        None | Some(Value::Undefined) => f64::NAN,
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        _ => f64::NAN,
+    let Some(v) = args.args.first() else {
+        return f64::NAN;
+    };
+    if let Some(n) = v.as_number() {
+        n.as_f64()
+    } else if v.is_boolean() {
+        if v.as_boolean() == Some(true) {
+            1.0
+        } else {
+            0.0
+        }
+    } else if v.is_null() {
+        0.0
+    } else {
+        f64::NAN
     }
 }
 
@@ -245,7 +261,7 @@ fn impl_set_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let ms = read_primary_arg_number(args);
     object::set_date_data(obj, args.gc_heap, ms);
     let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
-    Ok(Value::number(NumberValue::from_f64(written)))
+    Ok(Value::number_f64(written))
 }
 
 /// Broken-down components packaged as a 7-tuple for the setter
@@ -277,7 +293,7 @@ fn finish_set(
     let new_ms = super::make_date(year, month, day, hour, minute, second, ms);
     object::set_date_data(obj, args.gc_heap, new_ms);
     let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
-    Ok(Value::number(NumberValue::from_f64(written)))
+    Ok(Value::number_f64(written))
 }
 
 fn impl_set_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -394,7 +410,7 @@ fn impl_set_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let y = read_primary_arg_number(args);
     if y.is_nan() {
         object::set_date_data(obj, args.gc_heap, f64::NAN);
-        return Ok(Value::number(NumberValue::from_f64(f64::NAN)));
+        return Ok(Value::number_f64(f64::NAN));
     }
     // §B.2.4.2 step 2: t = NaN → +0; else LocalTime(t) (== t under UTC).
     let base_time = if time.is_nan() { 0.0 } else { time };
@@ -597,7 +613,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     const NAME: &str = "Date.prototype.toJSON";
     let receiver = *ctx.this_value();
     // §7.1.18 ToObject(undefined / null) → TypeError.
-    if matches!(receiver, Value::Undefined | Value::Null) {
+    if receiver.is_undefined() || receiver.is_null() {
         return Err(NativeError::TypeError {
             name: NAME,
             reason: "Cannot convert undefined or null to object".to_string(),
@@ -615,39 +631,42 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         .evaluate_to_primitive(&exec, &receiver, ToPrimitiveHint::Number)
         .map_err(|err| vm_to_native(NAME, err))?;
     // Step 3 — non-finite Number → null.
-    if let Value::Number(n) = &tv
+    if let Some(n) = tv.as_number()
         && !n.as_f64().is_finite()
     {
         return Ok(Value::null());
     }
 
     // Step 4 — Invoke(O, "toISOString").
-    let method = match &receiver {
-        Value::Number(_) | Value::Boolean(_) | Value::String(_) | Value::Symbol(_) => {
-            // Primitive: walk the per-realm wrapper prototype so
-            // `Number.prototype.toISOString` / similar resolve, but
-            // pass the primitive as the observable `this`.
-            let proto = interp
-                .intrinsic_prototype_object_for(&receiver)
-                .ok_or_else(|| NativeError::TypeError {
-                    name: NAME,
-                    reason: "no intrinsic prototype for receiver".to_string(),
-                })?;
-            interp.ordinary_get_value(
-                &exec,
-                Value::Object(proto),
-                receiver,
-                &VmPropertyKey::String("toISOString"),
-                0,
-            )
-        }
-        _ => interp.ordinary_get_value(
+    let receiver_is_primitive = receiver.is_number()
+        || receiver.is_boolean()
+        || receiver.is_string()
+        || receiver.is_symbol();
+    let method = if receiver_is_primitive {
+        // Primitive: walk the per-realm wrapper prototype so
+        // `Number.prototype.toISOString` / similar resolve, but
+        // pass the primitive as the observable `this`.
+        let proto = interp
+            .intrinsic_prototype_object_for(&receiver)
+            .ok_or_else(|| NativeError::TypeError {
+                name: NAME,
+                reason: "no intrinsic prototype for receiver".to_string(),
+            })?;
+        interp.ordinary_get_value(
+            &exec,
+            Value::object(proto),
+            receiver,
+            &VmPropertyKey::String("toISOString"),
+            0,
+        )
+    } else {
+        interp.ordinary_get_value(
             &exec,
             receiver,
             receiver,
             &VmPropertyKey::String("toISOString"),
             0,
-        ),
+        )
     }
     .map_err(|err| vm_to_native(NAME, err))?;
     let method = match method {

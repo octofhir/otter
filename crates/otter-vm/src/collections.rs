@@ -128,14 +128,18 @@ impl MapKey {
     }
 }
 
-impl PartialEq for MapKey {
-    fn eq(&self, other: &Self) -> bool {
+impl MapKey {
+    /// SameValueZero comparison for two projected keys. Strings
+    /// compare by code-unit content (heap-aware); other variants use
+    /// the same structural rules as the original `PartialEq` impl
+    /// (retired with Phase B because string equality could not be
+    /// expressed heap-free).
+    #[must_use]
+    pub fn matches(&self, other: &Self, heap: &otter_gc::GcHeap) -> bool {
         match (self, other) {
             (MapKey::Undefined, MapKey::Undefined) => true,
             (MapKey::Null, MapKey::Null) => true,
             (MapKey::Boolean(a), MapKey::Boolean(b)) => a == b,
-            // SameValueZero on numbers: `NaN == NaN`, sign-only
-            // differences on zero already normalised in `from_value`.
             (MapKey::Number(a), MapKey::Number(b)) => {
                 if a.is_nan() && b.is_nan() {
                     true
@@ -144,43 +148,15 @@ impl PartialEq for MapKey {
                 }
             }
             (MapKey::BigInt(a), MapKey::BigInt(b)) => a == b,
-            // Phase B: handle identity. Spec value-equality for Map
-            // keys is a regression pending interning; insertion sites
-            // that materialise distinct handles for identical text
-            // will store under separate slots.
-            (MapKey::String(a), MapKey::String(b)) => a == b,
+            (MapKey::String(a), MapKey::String(b)) => {
+                if a.cached_hash() != b.cached_hash() || a.len() != b.len() {
+                    return false;
+                }
+                a.equals(b, heap)
+            }
             (MapKey::Symbol(a), MapKey::Symbol(b)) => a.ptr_eq(b),
             (MapKey::ObjectValue(a), MapKey::ObjectValue(b)) => a == b,
             _ => false,
-        }
-    }
-}
-
-impl Eq for MapKey {}
-
-impl std::hash::Hash for MapKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            MapKey::Undefined | MapKey::Null => {}
-            MapKey::Boolean(b) => b.hash(state),
-            MapKey::Number(f) => {
-                // Canonicalise NaN bits so distinct NaN payloads
-                // hash identically (matching SameValueZero).
-                if f.is_nan() {
-                    f64::NAN.to_bits().hash(state);
-                } else {
-                    f.to_bits().hash(state);
-                }
-            }
-            MapKey::BigInt(b) => b.handle().offset().hash(state),
-            MapKey::String(s) => s.handle().offset().hash(state),
-            MapKey::Symbol(s) => s.identity_addr().hash(state),
-            MapKey::ObjectValue(_) => {
-                // Identity-based fallback: hash by discriminant alone
-                // and rely on `eq` to disambiguate. This intentionally avoids
-                // hashing moving heap addresses.
-            }
         }
     }
 }
@@ -248,8 +224,12 @@ impl MapEntry {
         }
     }
 
-    fn key_matches(&self, key: &MapKey) -> bool {
-        self.value.is_some() && self.key_hash.as_ref().is_some_and(|stored| stored == key)
+    fn key_matches(&self, key: &MapKey, heap: &otter_gc::GcHeap) -> bool {
+        self.value.is_some()
+            && self
+                .key_hash
+                .as_ref()
+                .is_some_and(|stored| stored.matches(key, heap))
     }
 
     fn pair(&self) -> Option<(Value, Value)> {
@@ -339,7 +319,7 @@ pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value
     heap.read_payload(map, |body| {
         body.entries
             .iter()
-            .find(|entry| entry.key_matches(&k))
+            .find(|entry| entry.key_matches(&k, heap))
             .and_then(|entry| entry.value.clone())
     })
 }
@@ -349,7 +329,7 @@ pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value
 pub fn map_has(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> bool {
     let k = MapKey::from_value(key);
     heap.read_payload(map, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k))
+        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     })
 }
 
@@ -364,10 +344,12 @@ pub fn map_set(
     let barrier_key = key.clone();
     let barrier_value = value.clone();
     let k = MapKey::from_value(&key);
-    let exists = heap.read_payload(map, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k))
+    let existing_idx = heap.read_payload(map, |body| {
+        body.entries
+            .iter()
+            .position(|entry| entry.key_matches(&k, heap))
     });
-    if !exists {
+    if existing_idx.is_none() {
         let target_len = heap.read_payload(map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             key.trace_value_slots(visitor);
@@ -375,13 +357,10 @@ pub fn map_set(
         };
         reserve_map_for_target_len_with_roots(&mut map, heap, target_len, &mut reserve_roots)?;
     }
-    let k = MapKey::from_value(&key);
-    heap.with_payload(map, |body| {
-        if let Some(slot) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
-            slot.value = Some(value);
-        } else {
-            body.entries.push(MapEntry::live(k, key, value));
-        }
+    let exists = existing_idx.is_some();
+    heap.with_payload(map, |body| match existing_idx {
+        Some(idx) => body.entries[idx].value = Some(value),
+        None => body.entries.push(MapEntry::live(k, key, value)),
     });
     if !exists {
         heap.record_write(map, &barrier_key);
@@ -401,10 +380,12 @@ pub(crate) fn map_set_with_roots(
     let barrier_key = key.clone();
     let barrier_value = value.clone();
     let k = MapKey::from_value(&key);
-    let exists = heap.read_payload(*map, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k))
+    let existing_idx = heap.read_payload(*map, |body| {
+        body.entries
+            .iter()
+            .position(|entry| entry.key_matches(&k, heap))
     });
-    if !exists {
+    if existing_idx.is_none() {
         let target_len = heap.read_payload(*map, |body| body.entries.len().saturating_add(1));
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
@@ -413,12 +394,10 @@ pub(crate) fn map_set_with_roots(
         };
         reserve_map_for_target_len_with_roots(map, heap, target_len, &mut reserve_roots)?;
     }
-    heap.with_payload(*map, |body| {
-        if let Some(slot) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
-            slot.value = Some(value);
-        } else {
-            body.entries.push(MapEntry::live(k, key, value));
-        }
+    let exists = existing_idx.is_some();
+    heap.with_payload(*map, |body| match existing_idx {
+        Some(idx) => body.entries[idx].value = Some(value),
+        None => body.entries.push(MapEntry::live(k, key, value)),
     });
     if !exists {
         heap.record_write(*map, &barrier_key);
@@ -431,14 +410,18 @@ pub(crate) fn map_set_with_roots(
 /// the entry existed.
 pub fn map_delete(map: JsMap, heap: &mut otter_gc::GcHeap, key: &Value) -> bool {
     let k = MapKey::from_value(key);
-    heap.with_payload(map, |body| {
-        if let Some(entry) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
-            entry.clear();
+    let idx = heap.read_payload(map, |body| {
+        body.entries
+            .iter()
+            .position(|entry| entry.key_matches(&k, heap))
+    });
+    match idx {
+        Some(idx) => {
+            heap.with_payload(map, |body| body.entries[idx].clear());
             true
-        } else {
-            false
         }
-    })
+        None => false,
+    }
 }
 
 /// `Map.prototype.clear` — Spec §24.1.3.2.
@@ -529,8 +512,12 @@ impl SetEntry {
         }
     }
 
-    fn key_matches(&self, key: &MapKey) -> bool {
-        self.value.is_some() && self.key_hash.as_ref().is_some_and(|stored| stored == key)
+    fn key_matches(&self, key: &MapKey, heap: &otter_gc::GcHeap) -> bool {
+        self.value.is_some()
+            && self
+                .key_hash
+                .as_ref()
+                .is_some_and(|stored| stored.matches(key, heap))
     }
 
     fn clear(&mut self) {
@@ -610,7 +597,7 @@ pub fn set_is_empty(set: JsSet, heap: &otter_gc::GcHeap) -> bool {
 pub fn set_has(set: JsSet, heap: &otter_gc::GcHeap, value: &Value) -> bool {
     let k = MapKey::from_value(value);
     heap.read_payload(set, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k))
+        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     })
 }
 
@@ -623,7 +610,7 @@ pub fn set_add(
     let barrier_value = value.clone();
     let k = MapKey::from_value(&value);
     let exists = heap.read_payload(set, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k))
+        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     });
     if !exists {
         let target_len = heap.read_payload(set, |body| body.entries.len().saturating_add(1));
@@ -632,13 +619,8 @@ pub fn set_add(
         };
         reserve_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
     }
-    let k = MapKey::from_value(&value);
-    heap.with_payload(set, |body| {
-        if !body.entries.iter().any(|entry| entry.key_matches(&k)) {
-            body.entries.push(SetEntry::live(k, value));
-        }
-    });
     if !exists {
+        heap.with_payload(set, |body| body.entries.push(SetEntry::live(k, value)));
         heap.record_write(set, &barrier_value);
     }
     Ok(())
@@ -654,7 +636,7 @@ pub(crate) fn set_add_with_roots(
     let barrier_value = value.clone();
     let k = MapKey::from_value(&value);
     let exists = heap.read_payload(*set, |body| {
-        body.entries.iter().any(|entry| entry.key_matches(&k))
+        body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     });
     if !exists {
         let target_len = heap.read_payload(*set, |body| body.entries.len().saturating_add(1));
@@ -664,12 +646,8 @@ pub(crate) fn set_add_with_roots(
         };
         reserve_set_for_target_len_with_roots(set, heap, target_len, &mut reserve_roots)?;
     }
-    heap.with_payload(*set, |body| {
-        if !body.entries.iter().any(|entry| entry.key_matches(&k)) {
-            body.entries.push(SetEntry::live(k, value));
-        }
-    });
     if !exists {
+        heap.with_payload(*set, |body| body.entries.push(SetEntry::live(k, value)));
         heap.record_write(*set, &barrier_value);
     }
     Ok(())
@@ -678,14 +656,18 @@ pub(crate) fn set_add_with_roots(
 /// `Set.prototype.delete` — Spec §24.2.3.4.
 pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> bool {
     let k = MapKey::from_value(value);
-    heap.with_payload(set, |body| {
-        if let Some(entry) = body.entries.iter_mut().find(|entry| entry.key_matches(&k)) {
-            entry.clear();
+    let idx = heap.read_payload(set, |body| {
+        body.entries
+            .iter()
+            .position(|entry| entry.key_matches(&k, heap))
+    });
+    match idx {
+        Some(idx) => {
+            heap.with_payload(set, |body| body.entries[idx].clear());
             true
-        } else {
-            false
         }
-    })
+        None => false,
+    }
 }
 
 /// `Set.prototype.clear` — Spec §24.2.3.3.
@@ -1397,6 +1379,43 @@ mod tests {
         assert_eq!(keys[0].as_number().unwrap().as_smi(), Some(1));
         assert_eq!(keys[1].as_number().unwrap().as_smi(), Some(2));
         assert_eq!(map_get(m, &heap, &n(1)), Some(Value::Boolean(false)));
+    }
+
+    #[test]
+    fn map_string_keys_compare_by_content() {
+        // Two distinct GC allocations of the same code units must
+        // collide as Map keys (SameValueZero). Regression for the
+        // Phase B handle-identity equality bug.
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let m = alloc_map(&mut heap).unwrap();
+        let a = crate::string::JsString::from_str("hello", &mut heap).unwrap();
+        let b = crate::string::JsString::from_str("hello", &mut heap).unwrap();
+        assert_ne!(a.handle(), b.handle(), "test setup: handles must differ");
+
+        map_set(m, &mut heap, Value::String(a), n(1)).unwrap();
+        assert!(map_has(m, &heap, &Value::String(b)));
+        assert_eq!(map_get(m, &heap, &Value::String(b)), Some(n(1)));
+
+        // Update should hit the existing slot, not append.
+        map_set(m, &mut heap, Value::String(b), n(2)).unwrap();
+        assert_eq!(map_len(m, &heap), 1);
+        assert_eq!(map_get(m, &heap, &Value::String(a)), Some(n(2)));
+
+        // Mismatched content stays distinct.
+        let c = crate::string::JsString::from_str("world", &mut heap).unwrap();
+        assert!(!map_has(m, &heap, &Value::String(c)));
+    }
+
+    #[test]
+    fn set_string_keys_compare_by_content() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let s = alloc_set(&mut heap).unwrap();
+        let a = crate::string::JsString::from_str("k", &mut heap).unwrap();
+        let b = crate::string::JsString::from_str("k", &mut heap).unwrap();
+        set_add(s, &mut heap, Value::String(a)).unwrap();
+        set_add(s, &mut heap, Value::String(b)).unwrap();
+        assert_eq!(set_len(s, &heap), 1);
+        assert!(set_has(s, &heap, &Value::String(b)));
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! GC-backed JavaScript string handle.
 //!
 //! Phase B of the JsString migration: the public [`JsString`] is now
-//! a 12-byte `Copy` value pairing a 4-byte [`JsStringHandle`]
-//! (`Gc<JsStringBody>`) with a `u32` cached length. All payload data
-//! — flat WTF-16, Latin-1, cons-rope, sliced views — lives on the GC
-//! heap inside [`JsStringBody`]; tracing reaches every body through
-//! the handle stored on the wrapper.
+//! a 16-byte `Copy` value pairing a 4-byte [`JsStringHandle`]
+//! (`Gc<JsStringBody>`) with a `u32` cached length and a `u32`
+//! truncated FNV-1a hash. All payload data — flat WTF-16, Latin-1,
+//! cons-rope, sliced views — lives on the GC heap inside
+//! [`JsStringBody`]; tracing reaches every body through the handle
+//! stored on the wrapper.
 //!
 //! # Contents
 //! - [`JsString`] — the public string handle (`Copy + Eq + Hash` by
@@ -93,8 +94,7 @@ const fn hash_to_u32(h: u64) -> u32 {
 
 impl JsString {
     fn from_handle(handle: JsStringHandle, heap: &GcHeap) -> Self {
-        let (cached_len, cached_hash) =
-            heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
+        let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
         Self {
             handle,
             cached_len,
@@ -207,8 +207,7 @@ impl JsString {
         }
         let mut roots = no_extra_roots;
         let handle = gc_body::concat_string_bodies(heap, left.handle, right.handle, &mut roots)?;
-        let (cached_len, cached_hash) =
-            heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
+        let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
         Ok(Self {
             handle,
             cached_len,
@@ -224,8 +223,7 @@ impl JsString {
     pub fn slice(self, start: u32, length: u32, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
         let mut roots = no_extra_roots;
         let handle = gc_body::slice_string_body(heap, self.handle, start, length, &mut roots)?;
-        let (cached_len, cached_hash) =
-            heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
+        let (cached_len, cached_hash) = heap.read_payload(handle, |b| (b.len, hash_to_u32(b.hash)));
         Ok(Self {
             handle,
             cached_len,

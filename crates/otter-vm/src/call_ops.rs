@@ -67,38 +67,36 @@ impl Interpreter {
         effective_this: Value,
         heap: &otter_gc::GcHeap,
     ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>, Value), VmError> {
-        match current {
-            Value::Function { function_id } => {
-                Ok((function_id, Frame::empty_upvalues(), effective_this))
-            }
-            Value::Closure(c) => {
-                let function_id = c.function_id();
-                let (upvalues, bound_this) = heap.read_payload(c.handle, |body| {
-                    let ups: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(&body.upvalues[..]);
-                    (ups, body.bound_this)
-                });
-                let this_value = bound_this.unwrap_or(effective_this);
-                Ok((function_id, upvalues, this_value))
-            }
-            _ => Err(VmError::NotCallable),
+        if let Some(function_id) = current.as_function() {
+            return Ok((function_id, Frame::empty_upvalues(), effective_this));
         }
+        if let Some(c) = current.as_closure() {
+            let function_id = c.function_id();
+            let (upvalues, bound_this) = heap.read_payload(c.handle, |body| {
+                let ups: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(&body.upvalues[..]);
+                (ups, body.bound_this)
+            });
+            let this_value = bound_this.unwrap_or(effective_this);
+            return Ok((function_id, upvalues, this_value));
+        }
+        Err(VmError::NotCallable)
     }
 
     fn bytecode_construct_target_parts(
         current: Value,
         heap: &otter_gc::GcHeap,
     ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>), VmError> {
-        match current {
-            Value::Function { function_id } => Ok((function_id, Frame::empty_upvalues())),
-            Value::Closure(c) => {
-                let function_id = c.function_id();
-                let upvalues = heap.read_payload(c.handle, |body| {
-                    std::rc::Rc::<[UpvalueCell]>::from(&body.upvalues[..])
-                });
-                Ok((function_id, upvalues))
-            }
-            _ => Err(VmError::NotCallable),
+        if let Some(function_id) = current.as_function() {
+            return Ok((function_id, Frame::empty_upvalues()));
         }
+        if let Some(c) = current.as_closure() {
+            let function_id = c.function_id();
+            let upvalues = heap.read_payload(c.handle, |body| {
+                std::rc::Rc::<[UpvalueCell]>::from(&body.upvalues[..])
+            });
+            return Ok((function_id, upvalues));
+        }
+        Err(VmError::NotCallable)
     }
 
     fn build_construct_bytecode_frame(
@@ -361,16 +359,17 @@ impl Interpreter {
                     limit: self.max_stack_depth,
                 });
             }
-            match current {
-                Value::ClassConstructor(cc) => {
-                    hops += 1;
-                    current = cc.ctor(&self.gc_heap);
-                }
-                Value::BoundFunction(_) => return Ok(false),
-                _ => break,
+            if let Some(cc) = current.as_class_constructor() {
+                hops += 1;
+                current = cc.ctor(&self.gc_heap);
+                continue;
             }
+            if current.is_bound_function() {
+                return Ok(false);
+            }
+            break;
         }
-        if !matches!(current, Value::Function { .. } | Value::Closure(_)) {
+        if !current.is_function() && !current.is_closure() {
             return Ok(false);
         }
         let (function_id, parent_upvalues, this_for_callee) =
@@ -433,9 +432,9 @@ impl Interpreter {
             args
         };
 
-        if let Value::Object(obj) = callee
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::call_native(*obj, &self.gc_heap)
+        if let Some(obj) = callee.as_object()
+            && let Some(native) =
+                crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
@@ -450,7 +449,7 @@ impl Interpreter {
             return Ok(true);
         }
 
-        if let Value::NativeFunction(native) = callee {
+        if let Some(native) = callee.as_native_function() {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(_) = call {
                 return Ok(false);
@@ -553,26 +552,26 @@ impl Interpreter {
                     limit: self.max_stack_depth,
                 });
             }
-            match current {
-                Value::BoundFunction(bound) => {
-                    hops += 1;
-                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                    let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                    combined.extend(bound_args);
-                    combined.extend(effective_args);
-                    effective_this = bound_this;
-                    effective_args = combined;
-                    current = target;
-                }
-                Value::ClassConstructor(cc) => {
-                    hops += 1;
-                    current = cc.ctor(&self.gc_heap);
-                }
-                _ => break,
+            if let Some(bound) = current.as_bound_function() {
+                hops += 1;
+                let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
+                let mut combined: SmallVec<[Value; 8]> =
+                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
+                combined.extend(bound_args);
+                combined.extend(effective_args);
+                effective_this = bound_this;
+                effective_args = combined;
+                current = target;
+                continue;
             }
+            if let Some(cc) = current.as_class_constructor() {
+                hops += 1;
+                current = cc.ctor(&self.gc_heap);
+                continue;
+            }
+            break;
         }
-        if matches!(current, Value::Function { .. } | Value::Closure(_)) {
+        if current.is_function() || current.is_closure() {
             let (function_id, parent_upvalues, this_for_callee) =
                 Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
             return self.push_bytecode_call_frame(
@@ -589,9 +588,9 @@ impl Interpreter {
         // the closure inline, write the result into the caller's
         // dst, and advance pc on the caller frame. No stack frame
         // is created — the closure cannot itself push frames.
-        if let Value::Object(obj) = &current
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::call_native(*obj, &self.gc_heap)
+        if let Some(obj) = current.as_object()
+            && let Some(native) =
+                crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
             let call_info = NativeCallInfo::call(effective_this);
@@ -605,7 +604,7 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
-        if let Value::NativeFunction(native) = &current {
+        if let Some(native) = current.as_native_function() {
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 let result =
@@ -628,8 +627,7 @@ impl Interpreter {
         // §28.2.4.13 Proxy.[[Call]] — delegate to the `apply`
         // trap when present; otherwise call through to the
         // target as a function.
-        if let Value::Proxy(p) = &current {
-            let proxy = *p;
+        if let Some(proxy) = current.as_proxy() {
             let argv_array = self.alloc_stack_rooted_array_from_values(
                 stack,
                 effective_args.iter().cloned(),
@@ -723,10 +721,10 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let mut current = callee;
         let effective_new_target = current;
-        if let Value::ClassConstructor(class) = &current {
+        if let Some(class) = current.as_class_constructor() {
             current = class.ctor(&self.gc_heap);
         }
-        if !matches!(current, Value::Function { .. } | Value::Closure(_)) {
+        if !current.is_function() && !current.is_closure() {
             return Ok(false);
         }
 
@@ -777,9 +775,8 @@ impl Interpreter {
             return Err(VmError::NotCallable);
         }
         let args_value = *read_register(&stack[top_idx], args_reg)?;
-        let arr = match args_value {
-            Value::Array(a) => a,
-            _ => return Err(VmError::TypeMismatch),
+        let Some(arr) = args_value.as_array() else {
+            return Err(VmError::TypeMismatch);
         };
         let args: SmallVec<[Value; 8]> =
             crate::array::with_elements(arr, &self.gc_heap, |elements| {
@@ -808,9 +805,8 @@ impl Interpreter {
         }
         let new_target = stack[top_idx].new_target.unwrap_or(callee);
         let args_value = *read_register(&stack[top_idx], args_reg)?;
-        let arr = match args_value {
-            Value::Array(a) => a,
-            _ => return Err(VmError::TypeMismatch),
+        let Some(arr) = args_value.as_array() else {
+            return Err(VmError::TypeMismatch);
         };
         let args: SmallVec<[Value; 8]> =
             crate::array::with_elements(arr, &self.gc_heap, |elements| {
@@ -848,7 +844,7 @@ impl Interpreter {
         let mut new_target = new_target;
         let mut args = args;
         let mut hops: u32 = 0;
-        while let Value::BoundFunction(bound) = &callee {
+        while let Some(bound) = callee.as_bound_function() {
             if hops >= self.max_stack_depth {
                 return Err(VmError::StackOverflow {
                     limit: self.max_stack_depth,
@@ -869,8 +865,7 @@ impl Interpreter {
         // §28.2.4.14 Proxy.[[Construct]] — `new <proxy>(args)`
         // routes through the `construct` trap when present;
         // otherwise delegates to the target.
-        if let Value::Proxy(p) = &callee {
-            let proxy = *p;
+        if let Some(proxy) = callee.as_proxy() {
             let argv_array = self.alloc_stack_rooted_array_from_values(
                 stack,
                 args.iter().cloned(),
@@ -945,9 +940,9 @@ impl Interpreter {
         // path so the JS-visible callee can also carry own
         // properties (statics + `prototype`) without leaking the
         // implementation slot through reflection.
-        if let Value::Object(obj) = &callee
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::constructor_native(*obj, &self.gc_heap)
+        if let Some(obj) = callee.as_object()
+            && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
+                .and_then(|v| v.as_native_function())
         {
             let constructed = self.invoke_native_construct(
                 context,
@@ -965,10 +960,10 @@ impl Interpreter {
         // (e.g. `new Number(x)`). The native callback inspects
         // `NativeCtx::is_construct_call()` to differentiate the
         // call shape.
-        if let Value::NativeFunction(native) = &callee {
+        if let Some(native) = callee.as_native_function() {
             let constructed = self.invoke_native_construct(
                 context,
-                *native,
+                native,
                 &this_value,
                 &new_target,
                 args.as_slice(),
@@ -977,12 +972,12 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, constructed)?;
             return Ok(());
         }
-        if let Value::ClassConstructor(class) = &callee
-            && let Value::NativeFunction(native) = &class.ctor(&self.gc_heap)
+        if let Some(class) = callee.as_class_constructor()
+            && let Some(native) = class.ctor(&self.gc_heap).as_native_function()
         {
             let constructed = self.invoke_native_construct(
                 context,
-                *native,
+                native,
                 &this_value,
                 &new_target,
                 args.as_slice(),
@@ -991,11 +986,12 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, constructed)?;
             return Ok(());
         }
-        let bytecode_callee = match &callee {
-            Value::ClassConstructor(class) => class.ctor(&self.gc_heap),
-            _ => callee,
+        let bytecode_callee = if let Some(class) = callee.as_class_constructor() {
+            class.ctor(&self.gc_heap)
+        } else {
+            callee
         };
-        if matches!(bytecode_callee, Value::Function { .. } | Value::Closure(_)) {
+        if bytecode_callee.is_function() || bytecode_callee.is_closure() {
             let frame = self.build_construct_bytecode_frame(
                 context,
                 bytecode_callee,
@@ -1023,31 +1019,36 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
-        match callee {
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                match self.function_property_get_stack_rooted(
-                    context,
-                    stack,
-                    *function_id,
-                    "prototype",
-                )? {
-                    proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
-                    _ => Ok(None),
-                }
-            }
-            Value::ClassConstructor(c) => Ok(Some(Value::object(c.prototype(&self.gc_heap)))),
-            Value::Object(obj) => Ok(match crate::object::get(*obj, &self.gc_heap, "prototype") {
+        let function_id = callee
+            .as_function()
+            .or_else(|| callee.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = function_id {
+            return match self.function_property_get_stack_rooted(
+                context,
+                stack,
+                function_id,
+                "prototype",
+            )? {
+                proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
+                _ => Ok(None),
+            };
+        }
+        if let Some(c) = callee.as_class_constructor() {
+            return Ok(Some(Value::object(c.prototype(&self.gc_heap))));
+        }
+        if let Some(obj) = callee.as_object() {
+            return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
                 Some(proto) if constructor_return_is_object(&proto) => Some(proto),
                 _ => None,
-            }),
-            Value::BoundFunction(_) => self.construct_prototype_via_get(context, callee),
-            Value::NativeFunction(_) => Ok(None),
-            _ => Ok(None),
+            });
         }
+        if callee.is_bound_function() {
+            return self.construct_prototype_via_get(context, callee);
+        }
+        if callee.is_native_function() {
+            return Ok(None);
+        }
+        Ok(None)
     }
 
     pub(crate) fn construct_prototype_for_callee_runtime_rooted(
@@ -1057,32 +1058,37 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Option<Value>, VmError> {
-        match callee {
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                match self.function_property_get_runtime_rooted(
-                    context,
-                    *function_id,
-                    "prototype",
-                    value_roots,
-                    slice_roots,
-                )? {
-                    proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
-                    _ => Ok(None),
-                }
-            }
-            Value::ClassConstructor(c) => Ok(Some(Value::object(c.prototype(&self.gc_heap)))),
-            Value::Object(obj) => Ok(match crate::object::get(*obj, &self.gc_heap, "prototype") {
+        let function_id = callee
+            .as_function()
+            .or_else(|| callee.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = function_id {
+            return match self.function_property_get_runtime_rooted(
+                context,
+                function_id,
+                "prototype",
+                value_roots,
+                slice_roots,
+            )? {
+                proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
+                _ => Ok(None),
+            };
+        }
+        if let Some(c) = callee.as_class_constructor() {
+            return Ok(Some(Value::object(c.prototype(&self.gc_heap))));
+        }
+        if let Some(obj) = callee.as_object() {
+            return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
                 Some(proto) if constructor_return_is_object(&proto) => Some(proto),
                 _ => None,
-            }),
-            Value::BoundFunction(_) => self.construct_prototype_via_get(context, callee),
-            Value::NativeFunction(_) => Ok(None),
-            _ => Ok(None),
+            });
         }
+        if callee.is_bound_function() {
+            return self.construct_prototype_via_get(context, callee);
+        }
+        if callee.is_native_function() {
+            return Ok(None);
+        }
+        Ok(None)
     }
 
     fn construct_prototype_via_get(
@@ -1290,9 +1296,9 @@ impl Interpreter {
                 _ => break,
             }
         }
-        if let Value::Object(obj) = &current
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::call_native(*obj, &self.gc_heap)
+        if let Some(obj) = current.as_object()
+            && let Some(native) =
+                crate::object::call_native(obj, &self.gc_heap).and_then(|v| v.as_native_function())
         {
             let call = native.call_target(&self.gc_heap);
             let call_info = NativeCallInfo::call(effective_this);

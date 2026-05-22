@@ -27,16 +27,14 @@ use crate::Value;
 use crate::VmError;
 use crate::array::JsArray;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
 use crate::regexp::JsRegExp;
 use crate::runtime_cx::NativeCtx;
 use crate::string::JsString;
 
-fn receiver_regexp<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsRegExp, IntrinsicError> {
-    match args.receiver {
-        Value::RegExp(r) => Ok(r),
-        _ => Err(IntrinsicError::BadReceiver { expected: "regexp" }),
-    }
+fn receiver_regexp(args: &IntrinsicArgs<'_>) -> Result<JsRegExp, IntrinsicError> {
+    args.receiver
+        .as_regexp()
+        .ok_or(IntrinsicError::BadReceiver { expected: "regexp" })
 }
 
 fn vm_shape_error_to_intrinsic(err: VmError) -> IntrinsicError {
@@ -184,7 +182,7 @@ pub(crate) fn build_match_result(
                 let s = JsString::from_utf16_units(&units[r.clone()], args.gc_heap)?;
                 out.push(Value::string(s));
             }
-            None => out.push(Value::Undefined),
+            None => out.push(Value::undefined()),
         }
     }
     let input_value = Value::string(*input);
@@ -200,7 +198,7 @@ pub(crate) fn build_match_result(
         arr,
         args.gc_heap,
         "index",
-        Value::Number(NumberValue::from_i32(m.range.start as i32)),
+        Value::number_i32(m.range.start as i32),
     )?;
     crate::array::set_named_property(arr, args.gc_heap, "input", input_value)?;
 
@@ -226,9 +224,9 @@ pub(crate) fn build_match_result(
             };
             crate::object::set(groups_obj, args.gc_heap, name, value);
         }
-        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::Object(groups_obj))?;
+        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::object(groups_obj))?;
     } else {
-        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::Undefined)?;
+        crate::array::set_named_property(arr, args.gc_heap, "groups", Value::undefined())?;
     }
 
     if has_indices {
@@ -250,7 +248,7 @@ pub(crate) fn build_match_result(
                     &[&input_value, &arr_value],
                     &[out.as_slice(), indices_elems.as_slice()],
                 )?),
-                None => indices_elems.push(Value::Undefined),
+                None => indices_elems.push(Value::undefined()),
             }
         }
         let mut roots = Vec::with_capacity(value_roots.len() + 2);
@@ -302,17 +300,17 @@ pub(crate) fn build_match_result(
                 indices_arr,
                 args.gc_heap,
                 "groups",
-                Value::Object(g_obj),
+                Value::object(g_obj),
             )?;
         } else {
             crate::array::set_named_property(
                 indices_arr,
                 args.gc_heap,
                 "groups",
-                Value::Undefined,
+                Value::undefined(),
             )?;
         }
-        crate::array::set_named_property(arr, args.gc_heap, "indices", Value::Array(indices_arr))?;
+        crate::array::set_named_property(arr, args.gc_heap, "indices", Value::array(indices_arr))?;
     }
     Ok(arr)
 }
@@ -335,7 +333,7 @@ pub(crate) fn build_match_result_native(
                 let s = JsString::from_utf16_units(&units[r.clone()], ctx.heap_mut())?;
                 out.push(Value::string(s));
             }
-            None => out.push(Value::Undefined),
+            None => out.push(Value::undefined()),
         }
     }
     let input_value = Value::string(*input);
@@ -351,7 +349,7 @@ pub(crate) fn build_match_result_native(
         arr,
         ctx.heap_mut(),
         "index",
-        Value::Number(NumberValue::from_i32(m.range.start as i32)),
+        Value::number_i32(m.range.start as i32),
     )?;
     crate::array::set_named_property(arr, ctx.heap_mut(), "input", input_value)?;
 
@@ -379,9 +377,9 @@ pub(crate) fn build_match_result_native(
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
                 .map_err(vm_shape_error_to_intrinsic)?;
         }
-        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::Object(groups_obj))?;
+        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::object(groups_obj))?;
     } else {
-        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::Undefined)?;
+        crate::array::set_named_property(arr, ctx.heap_mut(), "groups", Value::undefined())?;
     }
 
     if has_indices {
@@ -403,7 +401,7 @@ pub(crate) fn build_match_result_native(
                     &[&input_value, &arr_value],
                     &[out.as_slice(), indices_elems.as_slice()],
                 )?),
-                None => indices_elems.push(Value::Undefined),
+                None => indices_elems.push(Value::undefined()),
             }
         }
         let mut roots = Vec::with_capacity(value_roots.len() + 2);
@@ -460,21 +458,21 @@ pub(crate) fn build_match_result_native(
                 indices_arr,
                 ctx.heap_mut(),
                 "groups",
-                Value::Object(g_obj),
+                Value::object(g_obj),
             )?;
         } else {
             crate::array::set_named_property(
                 indices_arr,
                 ctx.heap_mut(),
                 "groups",
-                Value::Undefined,
+                Value::undefined(),
             )?;
         }
         crate::array::set_named_property(
             arr,
             ctx.heap_mut(),
             "indices",
-            Value::Array(indices_arr),
+            Value::array(indices_arr),
         )?;
     }
     Ok(arr)
@@ -491,8 +489,8 @@ fn pair_array(
 ) -> Result<Value, otter_gc::OutOfMemory> {
     Ok(Value::array(args.array_from_elements_rooted(
         [
-            Value::Number(NumberValue::from_i32(start as i32)),
-            Value::Number(NumberValue::from_i32(end as i32)),
+            Value::number_i32(start as i32),
+            Value::number_i32(end as i32),
         ],
         value_roots,
         slice_roots,
@@ -508,8 +506,8 @@ fn pair_array_native(
 ) -> Result<Value, otter_gc::OutOfMemory> {
     Ok(Value::array(ctx.array_from_elements_with_roots(
         [
-            Value::Number(NumberValue::from_i32(start as i32)),
-            Value::Number(NumberValue::from_i32(end as i32)),
+            Value::number_i32(start as i32),
+            Value::number_i32(end as i32),
         ],
         value_roots,
         slice_roots,
@@ -517,16 +515,16 @@ fn pair_array_native(
 }
 
 fn impl_exec(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let re_clone = *receiver_regexp(args)?;
+    let re_clone = receiver_regexp(args)?;
     let text = arg_to_string_primitive(args, 0)?;
     exec_once(&re_clone, &text, args)
 }
 
 fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let re_clone = *receiver_regexp(args)?;
+    let re_clone = receiver_regexp(args)?;
     let text = arg_to_string_primitive(args, 0)?;
     let result = exec_once(&re_clone, &text, args)?;
-    Ok(Value::boolean(!matches!(result, Value::Null)))
+    Ok(Value::boolean(!result.is_null()))
 }
 
 /// §22.2.7.1 step 4 — `Let S be ? ToString(string)`. Coerces every
@@ -541,21 +539,27 @@ fn arg_to_string_primitive(
     index: usize,
 ) -> Result<JsString, IntrinsicError> {
     let raw = args.args.get(index).cloned().unwrap_or(Value::undefined());
-    let text: String = match &raw {
-        Value::String(s) => return Ok(*s),
-        Value::Undefined => "undefined".to_string(),
-        Value::Null => "null".to_string(),
-        Value::Boolean(true) => "true".to_string(),
-        Value::Boolean(false) => "false".to_string(),
-        Value::Number(n) => n.to_display_string(),
-        Value::BigInt(b) => b.to_decimal_string(&*args.gc_heap),
-        Value::Symbol(_) => {
-            return Err(IntrinsicError::BadArgument {
-                index: index as u16,
-                reason: "cannot convert a Symbol to a string",
-            });
-        }
-        other => other.display_string(&*args.gc_heap),
+    if let Some(s) = raw.as_string() {
+        return Ok(*s);
+    }
+    if raw.is_symbol() {
+        return Err(IntrinsicError::BadArgument {
+            index: index as u16,
+            reason: "cannot convert a Symbol to a string",
+        });
+    }
+    let text: String = if raw.is_undefined() {
+        "undefined".to_string()
+    } else if raw.is_null() {
+        "null".to_string()
+    } else if let Some(b) = raw.as_boolean() {
+        if b { "true" } else { "false" }.to_string()
+    } else if let Some(n) = raw.as_number() {
+        n.to_display_string()
+    } else if let Some(bi) = raw.as_big_int() {
+        bi.to_decimal_string(&*args.gc_heap)
+    } else {
+        raw.display_string(&*args.gc_heap)
     };
     Ok(JsString::from_str(&text, args.gc_heap)?)
 }
@@ -592,7 +596,7 @@ pub fn native_regexp_symbol_match(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let receiver = *ctx.this_value();
-    let Value::RegExp(re) = receiver else {
+    let Some(re) = receiver.as_regexp() else {
         return Err(crate::NativeError::TypeError {
             name: "RegExp.prototype[@@match]",
             reason: "called on a non-RegExp receiver".to_string(),
@@ -661,7 +665,7 @@ pub fn native_regexp_symbol_search(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let receiver = *ctx.this_value();
-    let Value::RegExp(re) = receiver else {
+    let Some(re) = receiver.as_regexp() else {
         return Err(crate::NativeError::TypeError {
             name: "RegExp.prototype[@@search]",
             reason: "called on a non-RegExp receiver".to_string(),
@@ -675,8 +679,8 @@ pub fn native_regexp_symbol_search(
     let result = re.find_from_utf16(ctx.heap(), &units, 0).into_iter().next();
     re.set_last_index_value(ctx.heap_mut(), previous);
     Ok(match result {
-        Some(m) => Value::number(NumberValue::from_i32(m.range.start as i32)),
-        None => Value::number(NumberValue::from_i32(-1)),
+        Some(m) => Value::number_i32(m.range.start as i32),
+        None => Value::number_i32(-1),
     })
 }
 
@@ -704,21 +708,27 @@ fn string_arg_to_jsstring(
     method_name: &'static str,
 ) -> Result<JsString, crate::NativeError> {
     let raw = args.get(index).cloned().unwrap_or(Value::undefined());
-    let text: String = match &raw {
-        Value::String(s) => return Ok(*s),
-        Value::Undefined => "undefined".to_string(),
-        Value::Null => "null".to_string(),
-        Value::Boolean(true) => "true".to_string(),
-        Value::Boolean(false) => "false".to_string(),
-        Value::Number(n) => n.to_display_string(),
-        Value::BigInt(b) => b.to_decimal_string(ctx.heap()),
-        Value::Symbol(_) => {
-            return Err(crate::NativeError::TypeError {
-                name: method_name,
-                reason: "cannot convert a Symbol to a string".to_string(),
-            });
-        }
-        other => other.display_string(ctx.heap()),
+    if let Some(s) = raw.as_string() {
+        return Ok(*s);
+    }
+    if raw.is_symbol() {
+        return Err(crate::NativeError::TypeError {
+            name: method_name,
+            reason: "cannot convert a Symbol to a string".to_string(),
+        });
+    }
+    let text: String = if raw.is_undefined() {
+        "undefined".to_string()
+    } else if raw.is_null() {
+        "null".to_string()
+    } else if let Some(b) = raw.as_boolean() {
+        if b { "true" } else { "false" }.to_string()
+    } else if let Some(n) = raw.as_number() {
+        n.to_display_string()
+    } else if let Some(bi) = raw.as_big_int() {
+        bi.to_decimal_string(ctx.heap())
+    } else {
+        raw.display_string(ctx.heap())
     };
     JsString::from_str(&text, ctx.heap_mut()).map_err(|_| crate::NativeError::TypeError {
         name: method_name,
@@ -831,13 +841,13 @@ pub(crate) fn coerce_to_jsstring_runtime(
     value: &Value,
     name: &'static str,
 ) -> Result<JsString, crate::NativeError> {
-    if matches!(value, Value::Symbol(_)) {
+    if value.is_symbol() {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "cannot convert a Symbol to a string".to_string(),
         });
     }
-    if let Value::String(s) = value {
+    if let Some(s) = value.as_string() {
         return Ok(*s);
     }
     let primitive = if crate::abstract_ops::is_primitive(value) {
@@ -948,7 +958,7 @@ fn regexp_exec_runtime(
         let result = interp
             .run_callable_sync(&exec_ctx, &exec_fn, *rx, args)
             .map_err(vm_err_to_native(name))?;
-        if !matches!(result, Value::Null) && !crate::value_kind::is_object_like_value(&result) {
+        if !result.is_null() && !crate::value_kind::is_object_like_value(&result) {
             return Err(crate::NativeError::TypeError {
                 name,
                 reason: "exec did not return an Object or null".to_string(),
@@ -957,8 +967,8 @@ fn regexp_exec_runtime(
         return Ok(result);
     }
     // Fall back to builtin exec only when `rx` is actually a RegExp.
-    if let Value::RegExp(re) = rx {
-        return exec_once_native(re, s, ctx, &[]).map_err(intrinsic_to_native_error(name));
+    if let Some(re) = rx.as_regexp() {
+        return exec_once_native(&re, s, ctx, &[]).map_err(intrinsic_to_native_error(name));
     }
     Err(crate::NativeError::TypeError {
         name,
@@ -990,7 +1000,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     );
     let result =
         regexp_exec_runtime(&mut ctx, matcher, input, name).map_err(crate::native_to_vm_error)?;
-    if matches!(result, Value::Null) {
+    if result.is_null() {
         return Ok(None);
     }
     if global {
@@ -1009,7 +1019,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
                 &mut ctx,
                 matcher,
                 "lastIndex",
-                Value::Number(NumberValue::from_f64(next_index as f64)),
+                Value::number_f64(next_index as f64),
                 name,
             )
             .map_err(crate::native_to_vm_error)?;
@@ -1071,20 +1081,14 @@ pub fn native_regexp_symbol_replace(
 
     // Step 9 — if global, Set(rx, "lastIndex", 0, true).
     if global {
-        set_property_runtime(
-            ctx,
-            &receiver,
-            "lastIndex",
-            Value::Number(NumberValue::from_i32(0)),
-            name,
-        )?;
+        set_property_runtime(ctx, &receiver, "lastIndex", Value::number_i32(0), name)?;
     }
 
     // Step 10-12 — collect results.
     let mut results: Vec<Value> = Vec::new();
     loop {
         let result = regexp_exec_runtime(ctx, &receiver, &s, name)?;
-        if matches!(result, Value::Null) {
+        if result.is_null() {
             break;
         }
         results.push(result);
@@ -1103,7 +1107,7 @@ pub fn native_regexp_symbol_replace(
                 ctx,
                 &receiver,
                 "lastIndex",
-                Value::Number(NumberValue::from_f64(next_index as f64)),
+                Value::number_f64(next_index as f64),
                 name,
             )?;
         }
@@ -1131,7 +1135,7 @@ pub fn native_regexp_symbol_replace(
         for i in 1..=n_captures {
             let cap_key = i.to_string();
             let cap_val = get_property_runtime(ctx, result, &cap_key, name)?;
-            if matches!(cap_val, Value::Undefined) {
+            if cap_val.is_undefined() {
                 captures.push(None);
             } else {
                 captures.push(Some(coerce_to_jsstring_runtime(ctx, &cap_val, name)?));
@@ -1139,7 +1143,7 @@ pub fn native_regexp_symbol_replace(
         }
 
         let named_captures = get_property_runtime(ctx, result, "groups", name)?;
-        let named_captures_obj = if matches!(named_captures, Value::Undefined) {
+        let named_captures_obj = if named_captures.is_undefined() {
             None
         } else {
             Some(named_captures)
@@ -1154,7 +1158,7 @@ pub fn native_regexp_symbol_replace(
                     None => Value::undefined(),
                 });
             }
-            replacer_args.push(Value::number(NumberValue::from_f64(position as f64)));
+            replacer_args.push(Value::number_f64(position as f64));
             replacer_args.push(Value::string(s));
             if let Some(nc) = &named_captures_obj {
                 replacer_args.push(*nc);
@@ -1172,7 +1176,7 @@ pub fn native_regexp_symbol_replace(
                     .run_callable_sync(
                         &exec_ctx,
                         &replace_value_arg,
-                        Value::Undefined,
+                        Value::undefined(),
                         replacer_args,
                     )
                     .map_err(vm_err_to_native(name))?
@@ -1265,7 +1269,7 @@ fn species_constructor_runtime(
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
     let c = get_property_runtime(ctx, obj, "constructor", name)?;
-    if matches!(c, Value::Undefined) {
+    if c.is_undefined() {
         return Ok(*default_ctor);
     }
     if !crate::value_kind::is_object_like_value(&c) {
@@ -1280,7 +1284,7 @@ fn species_constructor_runtime(
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Species);
     let s = get_symbol_property_runtime(ctx, &c, &species_sym, name)?;
-    if matches!(s, Value::Undefined | Value::Null) {
+    if s.is_nullish() {
         return Ok(c);
     }
     let (interp, exec) = ctx.interp_mut_and_context();
@@ -1372,7 +1376,7 @@ pub fn native_regexp_symbol_match_all(
         ctx,
         &matcher,
         "lastIndex",
-        Value::Number(NumberValue::from_f64(last_index)),
+        Value::number_f64(last_index),
         name,
     )?;
 
@@ -1476,7 +1480,7 @@ pub fn native_regexp_symbol_split(
     };
 
     // Step 13 — lim = limit === undefined ? 2^32 - 1 : ToUint32(limit).
-    let lim: u32 = if matches!(limit_arg, Value::Undefined) {
+    let lim: u32 = if limit_arg.is_undefined() {
         u32::MAX
     } else {
         let primitive = if crate::abstract_ops::is_primitive(&limit_arg) {
@@ -1523,7 +1527,7 @@ pub fn native_regexp_symbol_split(
     // empty array, otherwise return `[S]`.
     if size == 0 {
         let z = regexp_exec_runtime(ctx, &splitter, &s, name)?;
-        if !matches!(z, Value::Null) {
+        if !z.is_null() {
             let arr = ctx
                 .array_from_elements_with_roots(out_elements, &[&splitter], &[])
                 .map_err(|_| crate::NativeError::TypeError {
@@ -1554,11 +1558,11 @@ pub fn native_regexp_symbol_split(
             ctx,
             &splitter,
             "lastIndex",
-            Value::Number(NumberValue::from_f64(q as f64)),
+            Value::number_f64(q as f64),
             name,
         )?;
         let z = regexp_exec_runtime(ctx, &splitter, &s, name)?;
-        if matches!(z, Value::Null) {
+        if z.is_null() {
             q = advance_string_index(&s_units, q, unicode_matching);
             continue;
         }
@@ -1756,7 +1760,7 @@ fn get_substitution(
                     }
                     Some(nc) => {
                         let val = get_property_runtime(ctx, nc, &group_name, name)?;
-                        if !matches!(val, Value::Undefined) {
+                        if !val.is_undefined() {
                             let coerced = coerce_to_jsstring_runtime(ctx, &val, name)?;
                             out.extend_from_slice(&coerced.to_utf16_vec(ctx.heap()));
                         }
@@ -1884,7 +1888,7 @@ mod tests {
 
     fn make(pattern: &str, flags: &str, gc_heap: &mut otter_gc::GcHeap) -> Value {
         let units: Vec<u16> = pattern.encode_utf16().collect();
-        Value::RegExp(JsRegExp::compile(gc_heap, &units, flags).unwrap())
+        Value::regexp(JsRegExp::compile(gc_heap, &units, flags).unwrap())
     }
 
     fn call(method: &str, recv: &Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
@@ -1905,12 +1909,12 @@ mod tests {
         let text = Value::string(JsString::from_str("abbbc", &mut gc_heap).unwrap());
         assert_eq!(
             call("test", &re, &[text], &mut gc_heap),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         let no = Value::string(JsString::from_str("xy", &mut gc_heap).unwrap());
         assert_eq!(
             call("test", &re, &[no], &mut gc_heap),
-            Value::Boolean(false)
+            Value::boolean(false)
         );
     }
 
@@ -1920,24 +1924,22 @@ mod tests {
         let re = make("(a)(b)", "", &mut gc_heap);
         let text = Value::string(JsString::from_str("ab", &mut gc_heap).unwrap());
         let r = call("exec", &re, &[text], &mut gc_heap);
-        match r {
-            Value::Array(arr) => {
-                assert_eq!(crate::array::len(arr, &gc_heap), 3);
-                assert_eq!(
-                    crate::array::get(arr, &gc_heap, 0).display_string(&gc_heap),
-                    "ab"
-                );
-                assert_eq!(
-                    crate::array::get(arr, &gc_heap, 1).display_string(&gc_heap),
-                    "a"
-                );
-                assert_eq!(
-                    crate::array::get(arr, &gc_heap, 2).display_string(&gc_heap),
-                    "b"
-                );
-            }
-            _ => panic!("expected array"),
-        }
+        let Some(arr) = r.as_array() else {
+            panic!("expected array");
+        };
+        assert_eq!(crate::array::len(arr, &gc_heap), 3);
+        assert_eq!(
+            crate::array::get(arr, &gc_heap, 0).display_string(&gc_heap),
+            "ab"
+        );
+        assert_eq!(
+            crate::array::get(arr, &gc_heap, 1).display_string(&gc_heap),
+            "a"
+        );
+        assert_eq!(
+            crate::array::get(arr, &gc_heap, 2).display_string(&gc_heap),
+            "b"
+        );
         let miss = call(
             "exec",
             &re,
@@ -1946,7 +1948,7 @@ mod tests {
             )],
             &mut gc_heap,
         );
-        assert_eq!(miss, Value::Null);
+        assert!(miss.is_null());
     }
 
     #[test]
@@ -1962,17 +1964,17 @@ mod tests {
             after > before,
             "RegExp exec result arrays, groups, and indices should allocate through intrinsic roots"
         );
-        let Value::Array(arr) = result else {
+        let Some(arr) = result.as_array() else {
             panic!("expected RegExp exec result array");
         };
-        assert!(matches!(
-            crate::array::get_named_property(arr, &gc_heap, "indices"),
-            Some(Value::Array(_))
-        ));
-        assert!(matches!(
-            crate::array::get_named_property(arr, &gc_heap, "groups"),
-            Some(Value::Object(_))
-        ));
+        assert!(
+            crate::array::get_named_property(arr, &gc_heap, "indices")
+                .is_some_and(|v| v.is_array())
+        );
+        assert!(
+            crate::array::get_named_property(arr, &gc_heap, "groups")
+                .is_some_and(|v| v.is_object())
+        );
     }
 
     #[test]
@@ -1982,25 +1984,23 @@ mod tests {
         let text = Value::string(JsString::from_str("abab", &mut gc_heap).unwrap());
         // First call → match at 0, lastIndex moves to 1.
         let r1 = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
-        match (&r1, &re) {
-            (Value::Array(arr), Value::RegExp(rx)) => {
-                assert_eq!(
-                    crate::array::get(*arr, &gc_heap, 0).display_string(&gc_heap),
-                    "a"
-                );
-                assert_eq!(rx.last_index(&gc_heap), 1);
-            }
-            _ => panic!(),
-        }
+        let (Some(arr), Some(rx)) = (r1.as_array(), re.as_regexp()) else {
+            panic!();
+        };
+        assert_eq!(
+            crate::array::get(arr, &gc_heap, 0).display_string(&gc_heap),
+            "a"
+        );
+        assert_eq!(rx.last_index(&gc_heap), 1);
         // Second call → match at 2, lastIndex → 3.
         call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
-        if let Value::RegExp(rx) = &re {
+        if let Some(rx) = re.as_regexp() {
             assert_eq!(rx.last_index(&gc_heap), 3);
         }
         // Third call → no match, lastIndex → 0.
         let r3 = call("exec", &re, &[text], &mut gc_heap);
-        assert_eq!(r3, Value::Null);
-        if let Value::RegExp(rx) = &re {
+        assert!(r3.is_null());
+        if let Some(rx) = re.as_regexp() {
             assert_eq!(rx.last_index(&gc_heap), 0);
         }
     }
@@ -2020,15 +2020,15 @@ mod tests {
         assert_eq!(flags.display_string(&gc_heap), "gi");
         assert_eq!(
             load_property(&re, &mut gc_heap, "global"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             load_property(&re, &mut gc_heap, "ignoreCase"),
-            Value::Boolean(true)
+            Value::boolean(true)
         );
         assert_eq!(
             load_property(&re, &mut gc_heap, "multiline"),
-            Value::Boolean(false)
+            Value::boolean(false)
         );
     }
 
@@ -2037,33 +2037,23 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re =
             JsRegExp::compile(&mut gc_heap, &"a".encode_utf16().collect::<Vec<_>>(), "g").unwrap();
-        store_property(
-            &re,
-            &mut gc_heap,
-            "lastIndex",
-            Value::Number(NumberValue::from_i32(7)),
-        );
+        store_property(&re, &mut gc_heap, "lastIndex", Value::number_i32(7));
         assert_eq!(re.last_index(&gc_heap), 7);
         // Numeric execution coercion clamps negative values to 0,
         // while the JS-visible property preserves the written value.
-        store_property(
-            &re,
-            &mut gc_heap,
-            "lastIndex",
-            Value::Number(NumberValue::from_i32(-3)),
-        );
+        store_property(&re, &mut gc_heap, "lastIndex", Value::number_i32(-3));
         assert_eq!(re.last_index(&gc_heap), 0);
         assert_eq!(
             load_property(&re, &mut gc_heap, "lastIndex"),
-            Value::Number(NumberValue::from_i32(-3))
+            Value::number_i32(-3)
         );
         // String writes are observable, and execution coerces them
         // numerically when needed.
         let written = JsString::from_str("9", &mut gc_heap).unwrap();
-        store_property(&re, &mut gc_heap, "lastIndex", Value::String(written));
+        store_property(&re, &mut gc_heap, "lastIndex", Value::string(written));
         assert_eq!(
             load_property(&re, &mut gc_heap, "lastIndex"),
-            Value::String(written)
+            Value::string(written)
         );
         assert_eq!(re.last_index(&gc_heap), 9);
         // Non-lastIndex names are silently ignored.

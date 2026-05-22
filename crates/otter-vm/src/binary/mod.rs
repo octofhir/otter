@@ -31,7 +31,7 @@ pub mod typed_array;
 pub mod typed_array_prototype;
 
 pub use array_buffer::{
-    JsArrayBuffer, LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG, LocalArrayBufferBodyGc,
+    BufferStorage, JsArrayBuffer, LOCAL_ARRAY_BUFFER_BODY_TYPE_TAG, LocalArrayBufferBodyGc,
     LocalArrayBufferHandle, SHARED_ARRAY_BUFFER_BODY_TYPE_TAG, SharedArrayBufferBodyGc,
     SharedArrayBufferHandle, alloc_local_array_buffer, alloc_shared_array_buffer,
 };

@@ -206,6 +206,19 @@ impl JsTemporal {
         self.inner
     }
 
+    /// Rebuild a [`JsTemporal`] from a pre-existing [`TemporalHandle`].
+    /// Reads the body once to recover the cached
+    /// [`TemporalKind`] discriminator.
+    #[inline]
+    #[must_use]
+    pub fn from_handle(heap: &otter_gc::GcHeap, handle: TemporalHandle) -> Self {
+        let kind = heap.read_payload(handle, |body| body.payload.kind());
+        Self {
+            inner: handle,
+            kind,
+        }
+    }
+
     /// Identity comparison — `===` follows compressed-offset equality.
     #[inline]
     #[must_use]

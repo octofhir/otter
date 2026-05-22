@@ -1316,6 +1316,268 @@ impl Value {
     }
 
     // -----------------------------------------------------------------------
+    // Wrapper-shaped constructors / extractors.
+    //
+    // Convenience layer over the `*_gc` handle-level surface for call
+    // sites that already hold (or want to recover) the legacy wrapper
+    // type (`JsString`, `BigIntValue`, `JsSymbol`, …). Constructors
+    // unwrap to the underlying handle; extractors rebuild the wrapper
+    // from the handle plus any side-cached state the wrapper carries.
+    //
+    // These are the call-site shapes the Phase C cut-over rewrites
+    // `Value::Variant(…)` patterns into.
+    // -----------------------------------------------------------------------
+
+    /// String wrapper constructor. Equivalent to legacy
+    /// `Value::String(s)`.
+    #[inline]
+    #[must_use]
+    pub fn string(s: crate::string::JsString) -> Self {
+        Self::string_gc(s.handle())
+    }
+
+    /// Wrapper-level string extractor. Returns the legacy
+    /// [`crate::string::JsString`] (handle + cached len/hash) when this
+    /// value is in the string family; reads the heap once to prime the
+    /// cached fields.
+    #[inline]
+    #[must_use]
+    pub fn as_string(self, heap: &otter_gc::GcHeap) -> Option<crate::string::JsString> {
+        let handle = self.as_string_gc()?;
+        crate::string::JsString::from_gc_handle(heap, handle).ok()
+    }
+
+    /// BigInt wrapper constructor. Equivalent to legacy
+    /// `Value::BigInt(b)`.
+    #[inline]
+    #[must_use]
+    pub fn big_int(b: crate::bigint::BigIntValue) -> Self {
+        Self::big_int_gc(b.handle())
+    }
+
+    /// BigInt wrapper extractor. Returns the legacy
+    /// [`crate::bigint::BigIntValue`] when this value carries a BigInt
+    /// body.
+    #[inline]
+    #[must_use]
+    pub fn as_big_int(self) -> Option<crate::bigint::BigIntValue> {
+        if !self.is_big_int_gc() {
+            return None;
+        }
+        Some(crate::bigint::BigIntValue::from_handle(
+            self.as_big_int_gc()?,
+        ))
+    }
+
+    /// Symbol wrapper constructor. Equivalent to legacy
+    /// `Value::Symbol(s)`.
+    #[inline]
+    #[must_use]
+    pub fn symbol(s: crate::symbol::JsSymbol) -> Self {
+        Self::symbol_gc(s.handle())
+    }
+
+    /// Symbol wrapper extractor. Rebuilds the [`crate::symbol::JsSymbol`]
+    /// wrapper (handle + cached description/well-known/registered) by
+    /// reading the body once.
+    #[inline]
+    #[must_use]
+    pub fn as_symbol(self, heap: &otter_gc::GcHeap) -> Option<crate::symbol::JsSymbol> {
+        let handle = self.as_symbol_gc()?;
+        Some(crate::symbol::JsSymbol::from_handle(heap, handle))
+    }
+
+    /// Temporal wrapper constructor. Equivalent to legacy
+    /// `Value::Temporal(t)`.
+    #[inline]
+    #[must_use]
+    pub fn temporal(t: crate::temporal::JsTemporal) -> Self {
+        Self::temporal_gc(t.handle())
+    }
+
+    /// Temporal wrapper extractor.
+    #[inline]
+    #[must_use]
+    pub fn as_temporal(self, heap: &otter_gc::GcHeap) -> Option<crate::temporal::JsTemporal> {
+        let handle = self.as_temporal_gc()?;
+        Some(crate::temporal::JsTemporal::from_handle(heap, handle))
+    }
+
+    /// Intl wrapper constructor. Equivalent to legacy `Value::Intl(i)`.
+    #[inline]
+    #[must_use]
+    pub fn intl(i: crate::intl::JsIntl) -> Self {
+        Self::intl_gc(i.handle())
+    }
+
+    /// Intl wrapper extractor.
+    #[inline]
+    #[must_use]
+    pub fn as_intl(self, heap: &otter_gc::GcHeap) -> Option<crate::intl::JsIntl> {
+        let handle = self.as_intl_gc()?;
+        Some(crate::intl::JsIntl::from_handle(heap, handle))
+    }
+
+    /// Proxy wrapper constructor. Equivalent to legacy
+    /// `Value::Proxy(p)`.
+    #[inline]
+    #[must_use]
+    pub fn proxy(p: crate::proxy::JsProxy) -> Self {
+        Self::proxy_gc(p.handle())
+    }
+
+    /// Proxy wrapper extractor.
+    #[inline]
+    #[must_use]
+    pub fn as_proxy(self) -> Option<crate::proxy::JsProxy> {
+        Some(crate::proxy::JsProxy::from_handle(self.as_proxy_gc()?))
+    }
+
+    /// DataView wrapper constructor. Equivalent to legacy
+    /// `Value::DataView(v)`.
+    #[inline]
+    #[must_use]
+    pub fn data_view(v: crate::binary::JsDataView) -> Self {
+        Self::data_view_gc(v.handle())
+    }
+
+    /// DataView wrapper extractor.
+    #[inline]
+    #[must_use]
+    pub fn as_data_view(self) -> Option<crate::binary::JsDataView> {
+        Some(crate::binary::JsDataView::from_handle(
+            self.as_data_view_gc()?,
+        ))
+    }
+
+    /// TypedArray wrapper constructor. Equivalent to legacy
+    /// `Value::TypedArray(t)`.
+    #[inline]
+    #[must_use]
+    pub fn typed_array(t: crate::binary::JsTypedArray) -> Self {
+        Self::typed_array_gc(t.handle())
+    }
+
+    /// TypedArray wrapper extractor. Reads the body once for the
+    /// cached element-kind discriminator.
+    #[inline]
+    #[must_use]
+    pub fn as_typed_array(self, heap: &otter_gc::GcHeap) -> Option<crate::binary::JsTypedArray> {
+        let handle = self.as_typed_array_gc()?;
+        Some(crate::binary::JsTypedArray::from_handle_with_heap(
+            heap, handle,
+        ))
+    }
+
+    /// ArrayBuffer wrapper constructor. Equivalent to legacy
+    /// `Value::ArrayBuffer(b)` — dispatches on `storage` to the
+    /// Local / Shared GC family.
+    #[inline]
+    #[must_use]
+    pub fn array_buffer(b: crate::binary::JsArrayBuffer) -> Self {
+        match b.storage() {
+            crate::binary::BufferStorage::Local(h) => Self::local_array_buffer_gc(h),
+            crate::binary::BufferStorage::Shared(h) => Self::shared_array_buffer_gc(h),
+        }
+    }
+
+    /// ArrayBuffer wrapper extractor. Recognises both Local and
+    /// Shared GC bodies and rebuilds the wrapper.
+    #[inline]
+    #[must_use]
+    pub fn as_array_buffer(self) -> Option<crate::binary::JsArrayBuffer> {
+        if let Some(h) = self.as_local_array_buffer_gc() {
+            return Some(crate::binary::JsArrayBuffer::from_local_handle(h));
+        }
+        if let Some(h) = self.as_shared_array_buffer_gc() {
+            return Some(crate::binary::JsArrayBuffer::from_shared_handle(h));
+        }
+        None
+    }
+
+    /// `true` when the value is in the BigInt body family.
+    #[inline]
+    #[must_use]
+    pub fn is_big_int(self) -> bool {
+        self.is_big_int_gc()
+    }
+
+    /// `true` when the value is in the Symbol body family.
+    #[inline]
+    #[must_use]
+    pub fn is_symbol(self) -> bool {
+        self.is_symbol_gc()
+    }
+
+    /// `true` when the value is in the Temporal body family.
+    #[inline]
+    #[must_use]
+    pub fn is_temporal(self) -> bool {
+        self.is_temporal_gc()
+    }
+
+    /// `true` when the value is in the Intl body family.
+    #[inline]
+    #[must_use]
+    pub fn is_intl(self) -> bool {
+        self.is_intl_gc()
+    }
+
+    /// `true` when the value is in the Proxy body family.
+    #[inline]
+    #[must_use]
+    pub fn is_proxy(self) -> bool {
+        self.is_proxy_gc()
+    }
+
+    /// `true` when the value is in the DataView body family.
+    #[inline]
+    #[must_use]
+    pub fn is_data_view(self) -> bool {
+        self.is_data_view_gc()
+    }
+
+    /// `true` when the value is in the TypedArray body family.
+    #[inline]
+    #[must_use]
+    pub fn is_typed_array(self) -> bool {
+        self.is_typed_array_gc()
+    }
+
+    /// `true` when the value is in either Local or Shared ArrayBuffer
+    /// body family.
+    #[inline]
+    #[must_use]
+    pub fn is_array_buffer(self) -> bool {
+        self.is_array_buffer_gc()
+    }
+
+    /// `true` when the value is a bytecode function reference.
+    /// Alias for [`Self::is_function_id`] matching the legacy
+    /// `Value::Function { function_id }` shape.
+    #[inline]
+    #[must_use]
+    pub fn is_function(self) -> bool {
+        self.is_function_id()
+    }
+
+    /// Convenience: bytecode function id (alias for
+    /// [`Self::as_function_id`]).
+    #[inline]
+    #[must_use]
+    pub fn as_function(self) -> Option<u32> {
+        self.as_function_id()
+    }
+
+    /// Convenience: build a `Value::Function { function_id }`
+    /// equivalent. Alias for [`Self::function_id`].
+    #[inline]
+    #[must_use]
+    pub const fn function(function_id: u32) -> Self {
+        Self::function_id(function_id)
+    }
+
+    // -----------------------------------------------------------------------
     // Coarse family-kind dispatch.
     //
     // Single match against `GcHeader::type_tag()` returning a typed

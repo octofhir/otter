@@ -234,6 +234,24 @@ impl JsSymbol {
         self.inner
     }
 
+    /// Rebuild a [`JsSymbol`] from a pre-existing [`SymbolHandle`].
+    /// Reads the body once to repopulate the wrapper-side cache
+    /// (description / well-known / registered) so subsequent accessor
+    /// calls stay heap-free.
+    #[inline]
+    #[must_use]
+    pub fn from_handle(heap: &otter_gc::GcHeap, handle: SymbolHandle) -> Self {
+        let (description, well_known, registered) = heap.read_payload(handle, |body| {
+            (body.description, body.well_known, body.registered)
+        });
+        Self {
+            inner: handle,
+            description,
+            well_known,
+            registered,
+        }
+    }
+
     /// Visit the embedded GC handle so the scavenger can rewrite the
     /// compressed offset in place if the body moves. Called from
     /// [`crate::Value::trace_value_slots`] and from

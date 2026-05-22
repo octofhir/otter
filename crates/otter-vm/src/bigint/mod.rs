@@ -132,6 +132,15 @@ impl BigIntValue {
         self.inner
     }
 
+    /// Rebuild a [`BigIntValue`] from a pre-existing
+    /// [`BigIntHandle`]. Heap-free; the wrapper carries no cached
+    /// fields beyond the handle.
+    #[inline]
+    #[must_use]
+    pub fn from_handle(handle: BigIntHandle) -> Self {
+        Self { inner: handle }
+    }
+
     /// Visit the embedded GC handle so the scavenger can rewrite the
     /// compressed offset in place if the body moves. Called from
     /// [`crate::Value::trace_value_slots`].

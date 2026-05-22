@@ -473,6 +473,18 @@ impl JsTypedArray {
         }
     }
 
+    /// Rewrap an existing handle by reading the element kind out of
+    /// the body once. Used by `Value::as_typed_array` and call sites
+    /// that recover the wrapper from a tagged `Value`.
+    #[must_use]
+    pub fn from_handle_with_heap(heap: &otter_gc::GcHeap, handle: TypedArrayHandle) -> Self {
+        let cached_kind = heap.read_payload(handle, |body| body.kind);
+        Self {
+            handle,
+            cached_kind,
+        }
+    }
+
     /// Underlying GC handle.
     #[must_use]
     pub fn handle(self) -> TypedArrayHandle {

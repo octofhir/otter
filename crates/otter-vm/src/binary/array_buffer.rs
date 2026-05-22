@@ -201,6 +201,22 @@ impl JsArrayBuffer {
         }
     }
 
+    /// Rewrap a pre-existing non-shared GC handle. Used by
+    /// `Value::as_array_buffer` and call sites that recover the
+    /// wrapper from a tagged `Value`.
+    #[must_use]
+    pub fn from_local_handle(handle: LocalArrayBufferHandle) -> Self {
+        Self::wrap_local(handle)
+    }
+
+    /// Rewrap a pre-existing shared GC handle. Used by
+    /// `Value::as_array_buffer` and call sites that recover the
+    /// wrapper from a tagged `Value`.
+    #[must_use]
+    pub fn from_shared_handle(handle: SharedArrayBufferHandle) -> Self {
+        Self::wrap_shared(handle)
+    }
+
     /// Allocate a fresh fixed-length buffer of `len` zero bytes
     /// (ECMA-262 §25.1.2.1). No external-memory accounting; intended
     /// for fixtures and infallible host-only callers that already

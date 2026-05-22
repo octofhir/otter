@@ -345,6 +345,18 @@ impl JsIntl {
         self.inner
     }
 
+    /// Rebuild a [`JsIntl`] from a pre-existing [`IntlHandle`]. Reads
+    /// the body once to recover the cached [`IntlKind`] discriminator.
+    #[inline]
+    #[must_use]
+    pub fn from_handle(heap: &otter_gc::GcHeap, handle: IntlHandle) -> Self {
+        let kind = heap.read_payload(handle, |body| body.payload.kind());
+        Self {
+            inner: handle,
+            kind,
+        }
+    }
+
     /// Identity comparison — `===` follows compressed-offset equality.
     #[inline]
     #[must_use]

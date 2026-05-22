@@ -26,17 +26,42 @@ use std::collections::BTreeSet;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, JsObject, JsString, NumberValue, Value, VmError,
-    VmGetOutcome, VmPropertyKey, abstract_ops, array, constructor_return_is_object,
-    descriptor_value, function_metadata, make_array_iterator_factory_runtime_rooted, object,
-    object_statics, proxy, regexp_prototype, string, symbol, to_length,
-    value_kind::is_object_like_value,
+    ExecutionContext, Frame, Interpreter, JsObject, JsString, Value, VmError, VmGetOutcome,
+    VmPropertyKey, abstract_ops, array, constructor_return_is_object, descriptor_value,
+    function_metadata, make_array_iterator_factory_runtime_rooted, object, object_statics, proxy,
+    regexp_prototype, string, symbol, to_length, value_kind::is_object_like_value,
 };
 
 #[derive(Clone, Copy)]
 pub(crate) enum ObjectIntegrityLevel {
     Sealed,
     Frozen,
+}
+
+/// Full object-shaped family used by §10 internal-method dispatchers
+/// (excluding the Object/Proxy ordinary fast paths the callers handle
+/// directly).
+fn is_extended_object_value(v: &Value) -> bool {
+    v.is_object()
+        || v.is_array()
+        || v.is_native_function()
+        || v.is_function()
+        || v.is_closure()
+        || v.is_bound_function()
+        || v.is_class_constructor()
+        || v.is_regexp()
+        || v.is_map()
+        || v.is_set()
+        || v.is_weak_map()
+        || v.is_weak_set()
+        || v.is_weak_ref()
+        || v.is_finalization_registry()
+        || v.is_promise()
+        || v.is_array_buffer()
+        || v.is_data_view()
+        || v.is_typed_array()
+        || v.is_iterator()
+        || v.is_generator()
 }
 
 /// Convert an already-primitive value to a [`VmPropertyKey`] per
@@ -46,30 +71,43 @@ fn primitive_to_property_key(
     value: Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    match value {
-        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(sym)),
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Number(n) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
-        Value::Boolean(true) => Ok(VmPropertyKey::String("true")),
-        Value::Boolean(false) => Ok(VmPropertyKey::String("false")),
-        Value::Null => Ok(VmPropertyKey::String("null")),
-        Value::Undefined => Ok(VmPropertyKey::String("undefined")),
-        Value::BigInt(b) => Ok(VmPropertyKey::OwnedString(b.to_decimal_string(heap))),
-        _ => Err(VmError::TypeMismatch),
+    if let Some(sym) = value.as_symbol() {
+        return Ok(VmPropertyKey::Symbol(*sym));
     }
+    if let Some(s) = value.as_string() {
+        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
+    }
+    if let Some(n) = value.as_number() {
+        return Ok(VmPropertyKey::OwnedString(n.to_display_string()));
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok(VmPropertyKey::String(if b { "true" } else { "false" }));
+    }
+    if value.is_null() {
+        return Ok(VmPropertyKey::String("null"));
+    }
+    if value.is_undefined() {
+        return Ok(VmPropertyKey::String("undefined"));
+    }
+    if let Some(b) = value.as_big_int() {
+        return Ok(VmPropertyKey::OwnedString(b.to_decimal_string(heap)));
+    }
+    Err(VmError::TypeMismatch)
 }
 
 fn property_key_value_to_vm_key(
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    match value {
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(*sym)),
-        _ => Err(VmError::TypeError {
-            message: "property key must be a string or symbol".to_string(),
-        }),
+    if let Some(s) = value.as_string() {
+        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
+    if let Some(sym) = value.as_symbol() {
+        return Ok(VmPropertyKey::Symbol(*sym));
+    }
+    Err(VmError::TypeError {
+        message: "property key must be a string or symbol".to_string(),
+    })
 }
 
 fn complete_partial_descriptor_against_current(
@@ -117,7 +155,7 @@ fn complete_partial_descriptor_against_current(
 }
 
 fn normalize_accessor_slot(value: Option<Value>) -> Option<Value> {
-    value.filter(|value| !matches!(value, Value::Undefined))
+    value.filter(|value| !value.is_undefined())
 }
 
 fn same_optional_value(
@@ -194,10 +232,12 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, handler, SmallVec::new())?
             }
         };
-        let trap_fn = match trap_value {
-            v if self.is_callable_runtime(&v) => v,
-            Value::Undefined | Value::Null => return Ok(None),
-            _ => return Err(VmError::TypeMismatch),
+        let trap_fn = if self.is_callable_runtime(&trap_value) {
+            trap_value
+        } else if trap_value.is_nullish() {
+            return Ok(None);
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         let result = self.run_callable_sync(context, &trap_fn, handler, args)?;
         Ok(Some(result))
@@ -245,9 +285,7 @@ impl Interpreter {
             return Ok(None);
         };
         if key == "length" {
-            return Ok(Some(Value::Number(NumberValue::from_i32(
-                value.len() as i32
-            ))));
+            return Ok(Some(Value::number_i32(value.len() as i32)));
         }
         let Ok(index) = key.parse::<u32>() else {
             return Ok(None);
@@ -255,7 +293,7 @@ impl Interpreter {
         let Some(unit) = value.char_code_at(index, &self.gc_heap) else {
             return Ok(None);
         };
-        Ok(Some(Value::String(JsString::from_utf16_units(
+        Ok(Some(Value::string(JsString::from_utf16_units(
             &[unit],
             &mut self.gc_heap,
         )?)))
@@ -273,10 +311,9 @@ impl Interpreter {
     }
 
     fn target_is_non_extensible_object(&self, target: &Value) -> bool {
-        match target {
-            Value::Object(obj) => !object::is_extensible(*obj, &self.gc_heap),
-            _ => false,
-        }
+        target
+            .as_object()
+            .is_some_and(|obj| !object::is_extensible(obj, &self.gc_heap))
     }
 
     pub(crate) fn validate_proxy_get_own_property_descriptor(
@@ -340,13 +377,11 @@ impl Interpreter {
         target: &Value,
         key: &VmPropertyKey,
     ) -> Option<object::PropertyDescriptor> {
-        let Value::Object(obj) = target else {
-            return None;
-        };
+        let obj = target.as_object()?;
         if let Some(key) = key.string_name() {
-            object::get_own_descriptor(*obj, &self.gc_heap, key)
+            object::get_own_descriptor(obj, &self.gc_heap, key)
         } else if let VmPropertyKey::Symbol(sym) = key {
-            object::get_own_symbol_descriptor(*obj, &self.gc_heap, sym)
+            object::get_own_symbol_descriptor(obj, &self.gc_heap, sym)
         } else {
             None
         }
@@ -372,7 +407,7 @@ impl Interpreter {
                     });
             }
             object::DescriptorKind::Accessor { getter: None, .. }
-                if !desc.configurable() && !matches!(trap_result, Value::Undefined) =>
+                if !desc.configurable() && !trap_result.is_undefined() =>
             {
                 return Err(VmError::TypeError {
                     message:
@@ -389,21 +424,24 @@ impl Interpreter {
         &mut self,
         constructor_name: &str,
     ) -> Result<Value, VmError> {
-        match object::get(self.global_this, &self.gc_heap, constructor_name) {
-            Some(Value::Object(constructor)) => {
-                Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::null()))
-            }
-            Some(Value::NativeFunction(ctor)) => {
-                match ctor.own_property_descriptor(&mut self.gc_heap, "prototype") {
-                    Ok(Some(descriptor)) => Ok(descriptor_value(&descriptor)),
-                    _ => Ok(Value::null()),
-                }
-            }
-            Some(Value::ClassConstructor(class)) => {
-                Ok(Value::object(class.prototype(&self.gc_heap)))
-            }
-            _ => Err(VmError::InvalidOperand),
+        let Some(v) = object::get(self.global_this, &self.gc_heap, constructor_name) else {
+            return Err(VmError::InvalidOperand);
+        };
+        if let Some(constructor) = v.as_object() {
+            return Ok(
+                object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::null())
+            );
         }
+        if let Some(ctor) = v.as_native_function() {
+            return match ctor.own_property_descriptor(&mut self.gc_heap, "prototype") {
+                Ok(Some(descriptor)) => Ok(descriptor_value(&descriptor)),
+                _ => Ok(Value::null()),
+            };
+        }
+        if let Some(class) = v.as_class_constructor() {
+            return Ok(Value::object(class.prototype(&self.gc_heap)));
+        }
+        Err(VmError::InvalidOperand)
     }
 
     pub(crate) fn ordinary_get_own_property_descriptor_value_stack_rooted(
@@ -455,248 +493,231 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(None);
         }
-        match target {
-            Value::Proxy(proxy) => {
-                let key_value = self.vm_property_key_to_value(key)?;
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
-                match self.invoke_proxy_trap(
-                    context,
-                    &proxy,
-                    "getOwnPropertyDescriptor",
-                    trap_args,
-                )? {
-                    Some(Value::Undefined) | Some(Value::Null) => {
-                        let target_desc = self
-                            .ordinary_get_own_property_descriptor_value_with_roots(
-                                context,
-                                proxy.target(&self.gc_heap),
-                                key,
-                                hops + 1,
-                                allocation_roots,
-                            )?;
-                        self.validate_proxy_get_own_property_descriptor(
-                            &proxy.target(&self.gc_heap),
-                            target_desc.as_ref(),
-                            None,
-                        )?;
-                        Ok(None)
-                    }
-                    Some(Value::Object(desc_obj)) => {
-                        let partial =
-                            object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
-                        let desc = partial.complete_for_new_property();
-                        let target_desc = self
-                            .ordinary_get_own_property_descriptor_value_with_roots(
-                                context,
-                                proxy.target(&self.gc_heap),
-                                key,
-                                hops + 1,
-                                allocation_roots,
-                            )?;
-                        self.validate_proxy_get_own_property_descriptor(
-                            &proxy.target(&self.gc_heap),
-                            target_desc.as_ref(),
-                            Some(&desc),
-                        )?;
-                        Ok(Some(desc))
-                    }
-                    Some(_) => Err(VmError::TypeError {
-                        message:
-                            "Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
-                                .to_string(),
-                    }),
-                    None => self.ordinary_get_own_property_descriptor_value_with_roots(
+        if let Some(proxy) = target.as_proxy() {
+            let key_value = self.vm_property_key_to_value(key)?;
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
+            return match self.invoke_proxy_trap(
+                context,
+                &proxy,
+                "getOwnPropertyDescriptor",
+                trap_args,
+            )? {
+                Some(v) if v.is_nullish() => {
+                    let target_desc = self.ordinary_get_own_property_descriptor_value_with_roots(
                         context,
                         proxy.target(&self.gc_heap),
                         key,
                         hops + 1,
                         allocation_roots,
-                    ),
+                    )?;
+                    self.validate_proxy_get_own_property_descriptor(
+                        &proxy.target(&self.gc_heap),
+                        target_desc.as_ref(),
+                        None,
+                    )?;
+                    Ok(None)
                 }
-            }
-            Value::Object(obj) => {
-                if let Some(desc) = self.string_object_exotic_descriptor(obj, key)? {
-                    return Ok(Some(desc));
+                Some(v) if v.is_object() => {
+                    let desc_obj = v.as_object().expect("guarded");
+                    let partial = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
+                    let desc = partial.complete_for_new_property();
+                    let target_desc = self.ordinary_get_own_property_descriptor_value_with_roots(
+                        context,
+                        proxy.target(&self.gc_heap),
+                        key,
+                        hops + 1,
+                        allocation_roots,
+                    )?;
+                    self.validate_proxy_get_own_property_descriptor(
+                        &proxy.target(&self.gc_heap),
+                        target_desc.as_ref(),
+                        Some(&desc),
+                    )?;
+                    Ok(Some(desc))
                 }
-                Ok(if let Some(key) = key.string_name() {
-                    object::get_own_descriptor(obj, &self.gc_heap, key)
-                } else if let VmPropertyKey::Symbol(sym) = key {
-                    object::get_own_symbol_descriptor(obj, &self.gc_heap, sym)
-                } else {
-                    None
-                })
+                Some(_) => Err(VmError::TypeError {
+                    message: "Proxy getOwnPropertyDescriptor trap returned non-object descriptor"
+                        .to_string(),
+                }),
+                None => self.ordinary_get_own_property_descriptor_value_with_roots(
+                    context,
+                    proxy.target(&self.gc_heap),
+                    key,
+                    hops + 1,
+                    allocation_roots,
+                ),
+            };
+        }
+        if let Some(obj) = target.as_object() {
+            if let Some(desc) = self.string_object_exotic_descriptor(obj, key)? {
+                return Ok(Some(desc));
             }
-            Value::String(value) => {
-                string::exotic::descriptor_for_key(&value, key, &mut self.gc_heap)
-            }
-            Value::Array(arr) => {
-                // §10.4.2 — own symbol-keyed properties live in a
-                // dedicated side table; surface their data
-                // descriptor before the string-keyed paths so
-                // `Object.getOwnPropertyDescriptor(arr, sym)` and
-                // `hasOwnProperty(sym)` observe the spec shape.
-                if let VmPropertyKey::Symbol(sym) = key {
-                    if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, sym) {
-                        return Ok(Some(object::PropertyDescriptor::data(
-                            value, true, true, true,
-                        )));
-                    }
-                    return Ok(None);
-                }
-                let Some(key) = key.string_name() else {
-                    return Ok(None);
-                };
-                if key == "length" {
-                    let flags = array::length_flags(arr, &self.gc_heap);
+            return Ok(if let Some(key) = key.string_name() {
+                object::get_own_descriptor(obj, &self.gc_heap, key)
+            } else if let VmPropertyKey::Symbol(sym) = key {
+                object::get_own_symbol_descriptor(obj, &self.gc_heap, sym)
+            } else {
+                None
+            });
+        }
+        if let Some(value) = target.as_string() {
+            return string::exotic::descriptor_for_key(value, key, &mut self.gc_heap);
+        }
+        if let Some(arr) = target.as_array() {
+            // §10.4.2 — own symbol-keyed properties live in a
+            // dedicated side table; surface their data
+            // descriptor before the string-keyed paths so
+            // `Object.getOwnPropertyDescriptor(arr, sym)` and
+            // `hasOwnProperty(sym)` observe the spec shape.
+            if let VmPropertyKey::Symbol(sym) = key {
+                if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, sym) {
                     return Ok(Some(object::PropertyDescriptor::data(
-                        Value::Number(NumberValue::from_f64(array::len(arr, &self.gc_heap) as f64)),
-                        flags.writable(),
-                        flags.enumerable(),
-                        flags.configurable(),
+                        value, true, true, true,
                     )));
                 }
-                // §10.4.2 — own accessor installed via
-                // `Object.defineProperty` lives in the per-array
-                // accessor side-table. Consult it before the
-                // dense / named slots so reflective probes
-                // (`Object.getOwnPropertyDescriptor(arr, "p")`) see
-                // the user-installed getter / setter.
-                if let Some((getter, setter)) = array::get_accessor(arr, &self.gc_heap, key) {
-                    let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                        .unwrap_or_else(|| object::PropertyFlags::new(false, true, true));
-                    return Ok(Some(object::PropertyDescriptor {
-                        kind: object::DescriptorKind::Accessor { getter, setter },
-                        flags,
-                    }));
-                }
-                if let Some(idx) = object::array_index_property_name(key) {
-                    let idx = idx as usize;
-                    if array::has_own_element(arr, &self.gc_heap, idx) {
-                        let flags = array::get_property_flags(arr, &self.gc_heap, key)
-                            .unwrap_or_else(object::PropertyFlags::data_default);
-                        return Ok(Some(object::PropertyDescriptor {
-                            kind: object::DescriptorKind::Data {
-                                value: array::get(arr, &self.gc_heap, idx),
-                            },
-                            flags,
-                        }));
-                    }
-                    return Ok(None);
-                }
-                // §10.4.2 — named own properties (`arr.foo = 1`)
-                // live in the per-array `named_properties` side
-                // table.
-                if let Some(value) = self.gc_heap.read_payload(arr, |body| {
-                    body.named_properties
-                        .as_ref()
-                        .and_then(|m| m.get(key).cloned())
-                }) {
+                return Ok(None);
+            }
+            let Some(key) = key.string_name() else {
+                return Ok(None);
+            };
+            if key == "length" {
+                let flags = array::length_flags(arr, &self.gc_heap);
+                return Ok(Some(object::PropertyDescriptor::data(
+                    Value::number_f64(array::len(arr, &self.gc_heap) as f64),
+                    flags.writable(),
+                    flags.enumerable(),
+                    flags.configurable(),
+                )));
+            }
+            // §10.4.2 — own accessor installed via
+            // `Object.defineProperty` lives in the per-array
+            // accessor side-table. Consult it before the
+            // dense / named slots so reflective probes
+            // (`Object.getOwnPropertyDescriptor(arr, "p")`) see
+            // the user-installed getter / setter.
+            if let Some((getter, setter)) = array::get_accessor(arr, &self.gc_heap, key) {
+                let flags = array::get_property_flags(arr, &self.gc_heap, key)
+                    .unwrap_or_else(|| object::PropertyFlags::new(false, true, true));
+                return Ok(Some(object::PropertyDescriptor {
+                    kind: object::DescriptorKind::Accessor { getter, setter },
+                    flags,
+                }));
+            }
+            if let Some(idx) = object::array_index_property_name(key) {
+                let idx = idx as usize;
+                if array::has_own_element(arr, &self.gc_heap, idx) {
                     let flags = array::get_property_flags(arr, &self.gc_heap, key)
                         .unwrap_or_else(object::PropertyFlags::data_default);
                     return Ok(Some(object::PropertyDescriptor {
-                        kind: object::DescriptorKind::Data { value },
+                        kind: object::DescriptorKind::Data {
+                            value: array::get(arr, &self.gc_heap, idx),
+                        },
                         flags,
                     }));
                 }
-                Ok(None)
+                return Ok(None);
             }
-            Value::RegExp(re) => {
-                if key.string_name().is_some_and(|key| key == "lastIndex") {
-                    return Ok(Some(object::PropertyDescriptor::data(
-                        re.last_index_value(&self.gc_heap),
-                        re.last_index_writable(&self.gc_heap),
-                        false,
-                        false,
-                    )));
-                }
-                // §22.2.6 — user-installed own properties
-                // (`re.foo = 1`) live in the lazy expando bag. Surface
-                // their full descriptor so reflective probes
-                // (`getOwnPropertyDescriptor`, `hasOwnProperty`,
-                // `ToPropertyDescriptor`) see the same shape ordinary
-                // objects expose.
-                if let Some(bag) = re.expando(&self.gc_heap) {
-                    if let Some(key) = key.string_name() {
-                        if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, key) {
-                            return Ok(Some(desc));
-                        }
-                    } else if let VmPropertyKey::Symbol(sym) = key
-                        && let Some(desc) =
-                            object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
-                    {
+            // §10.4.2 — named own properties (`arr.foo = 1`)
+            // live in the per-array `named_properties` side
+            // table.
+            if let Some(value) = self.gc_heap.read_payload(arr, |body| {
+                body.named_properties
+                    .as_ref()
+                    .and_then(|m| m.get(key).cloned())
+            }) {
+                let flags = array::get_property_flags(arr, &self.gc_heap, key)
+                    .unwrap_or_else(object::PropertyFlags::data_default);
+                return Ok(Some(object::PropertyDescriptor {
+                    kind: object::DescriptorKind::Data { value },
+                    flags,
+                }));
+            }
+            return Ok(None);
+        }
+        if let Some(re) = target.as_regexp() {
+            if key.string_name().is_some_and(|key| key == "lastIndex") {
+                return Ok(Some(object::PropertyDescriptor::data(
+                    re.last_index_value(&self.gc_heap),
+                    re.last_index_writable(&self.gc_heap),
+                    false,
+                    false,
+                )));
+            }
+            if let Some(bag) = re.expando(&self.gc_heap) {
+                if let Some(key) = key.string_name() {
+                    if let Some(desc) = object::get_own_descriptor(bag, &self.gc_heap, key) {
                         return Ok(Some(desc));
                     }
+                } else if let VmPropertyKey::Symbol(sym) = key
+                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
+                {
+                    return Ok(Some(desc));
                 }
-                Ok(None)
             }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => match key {
-                VmPropertyKey::Symbol(sym) => {
-                    let Some(bag) = self.function_user_props.get(&function_id).copied() else {
-                        return Ok(None);
-                    };
-                    Ok(object::get_own_symbol_descriptor(bag, &self.gc_heap, sym))
-                }
-                _ => {
-                    let key = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling");
-                    if key == "prototype" {
-                        let _ = match allocation_roots {
-                            DescriptorAllocationRoots::Runtime {
-                                value_roots,
-                                slice_roots,
-                            } => self.function_property_get_runtime_rooted(
-                                context,
-                                function_id,
-                                "prototype",
-                                value_roots,
-                                slice_roots,
-                            )?,
-                            DescriptorAllocationRoots::Stack(stack) => self
-                                .function_property_get_stack_rooted(
-                                    context,
-                                    stack,
-                                    function_id,
-                                    "prototype",
-                                )?,
-                        };
-                        let Some(bag) = self.function_user_props.get(&function_id).copied() else {
-                            return Ok(None);
-                        };
-                        Ok(object::get_own_descriptor(bag, &self.gc_heap, key))
-                    } else {
-                        self.ordinary_function_own_property_descriptor(
-                            Some(context),
-                            function_id,
-                            key,
-                        )
-                    }
-                }
-            },
-            Value::BoundFunction(bound) => {
-                let Some(key) = key.string_name() else {
+            return Ok(None);
+        }
+        let function_id = target
+            .as_function()
+            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = function_id {
+            if let VmPropertyKey::Symbol(sym) = key {
+                let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                     return Ok(None);
                 };
-                function_metadata::bound_own_property_descriptor(&bound, &mut self.gc_heap, key)
+                return Ok(object::get_own_symbol_descriptor(bag, &self.gc_heap, sym));
             }
-            Value::NativeFunction(native) => Ok(match key {
-                VmPropertyKey::Symbol(sym) => {
-                    native.own_symbol_property_descriptor(&self.gc_heap, sym)
-                }
-                _ => {
-                    let key = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling");
-                    native.own_property_descriptor(&mut self.gc_heap, key)?
-                }
-            }),
-            _ => Ok(None),
+            let key = key
+                .string_name()
+                .expect("non-symbol key has string spelling");
+            if key == "prototype" {
+                let _ = match allocation_roots {
+                    DescriptorAllocationRoots::Runtime {
+                        value_roots,
+                        slice_roots,
+                    } => self.function_property_get_runtime_rooted(
+                        context,
+                        function_id,
+                        "prototype",
+                        value_roots,
+                        slice_roots,
+                    )?,
+                    DescriptorAllocationRoots::Stack(stack) => self
+                        .function_property_get_stack_rooted(
+                            context,
+                            stack,
+                            function_id,
+                            "prototype",
+                        )?,
+                };
+                let Some(bag) = self.function_user_props.get(&function_id).copied() else {
+                    return Ok(None);
+                };
+                return Ok(object::get_own_descriptor(bag, &self.gc_heap, key));
+            }
+            return self.ordinary_function_own_property_descriptor(Some(context), function_id, key);
         }
+        if let Some(bound) = target.as_bound_function() {
+            let Some(key) = key.string_name() else {
+                return Ok(None);
+            };
+            return function_metadata::bound_own_property_descriptor(
+                &bound,
+                &mut self.gc_heap,
+                key,
+            );
+        }
+        if let Some(native) = target.as_native_function() {
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                native.own_symbol_property_descriptor(&self.gc_heap, sym)
+            } else {
+                let key = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                native.own_property_descriptor(&mut self.gc_heap, key)?
+            });
+        }
+        Ok(None)
     }
 
     fn proxy_get_prototype_invariant_target_proto(
@@ -704,10 +725,10 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let Value::Object(obj) = target else {
+        let Some(obj) = target.as_object() else {
             return Ok(None);
         };
-        if object::is_extensible(*obj, &self.gc_heap) {
+        if object::is_extensible(obj, &self.gc_heap) {
             return Ok(None);
         }
         Ok(Some(
@@ -724,90 +745,42 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(Value::null());
         }
-        match value {
-            Value::Proxy(proxy) => {
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap)];
-                match self.invoke_proxy_trap(context, &proxy, "getPrototypeOf", trap_args)? {
-                    Some(result) => {
-                        if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
-                            return Err(VmError::TypeError {
-                                message: "Proxy getPrototypeOf trap returned non-object"
-                                    .to_string(),
-                            });
-                        }
-                        if let Some(target_proto) = self
-                            .proxy_get_prototype_invariant_target_proto(
-                                context,
-                                &proxy.target(&self.gc_heap),
-                            )?
-                            && !abstract_ops::same_value(&result, &target_proto, &self.gc_heap)
-                        {
-                            return Err(VmError::TypeError {
-                                message:
-                                    "Proxy getPrototypeOf trap returned incompatible prototype"
-                                        .to_string(),
-                            });
-                        }
-                        Ok(result)
+        if let Some(proxy) = value.as_proxy() {
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
+            return match self.invoke_proxy_trap(context, &proxy, "getPrototypeOf", trap_args)? {
+                Some(result) => {
+                    if !Self::proxy_get_prototype_result_is_object_or_null(&result) {
+                        return Err(VmError::TypeError {
+                            message: "Proxy getPrototypeOf trap returned non-object".to_string(),
+                        });
                     }
-                    None => self.ordinary_get_prototype_value(
+                    if let Some(target_proto) = self.proxy_get_prototype_invariant_target_proto(
                         context,
-                        proxy.target(&self.gc_heap),
-                        hops + 1,
-                    ),
+                        &proxy.target(&self.gc_heap),
+                    )? && !abstract_ops::same_value(&result, &target_proto, &self.gc_heap)
+                    {
+                        return Err(VmError::TypeError {
+                            message: "Proxy getPrototypeOf trap returned incompatible prototype"
+                                .to_string(),
+                        });
+                    }
+                    Ok(result)
                 }
-            }
-            Value::Object(_)
-            | Value::Array(_)
-            | Value::NativeFunction(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Promise(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Iterator(_)
-            | Value::Generator(_) => self.get_prototype_for_op(&value),
-            _ => Err(VmError::TypeMismatch),
+                None => self.ordinary_get_prototype_value(
+                    context,
+                    proxy.target(&self.gc_heap),
+                    hops + 1,
+                ),
+            };
         }
+        if is_extended_object_value(&value) {
+            return self.get_prototype_for_op(&value);
+        }
+        Err(VmError::TypeMismatch)
     }
 
     fn proxy_get_prototype_result_is_object_or_null(value: &Value) -> bool {
-        matches!(
-            value,
-            Value::Null
-                | Value::Object(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::Promise(_)
-                | Value::Iterator(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-                | Value::Generator(_)
-                | Value::Proxy(_)
-        )
+        value.is_null() || value.is_object_like()
     }
 
     /// §10.5.3 / §10.1.3 — value-level `[[IsExtensible]]`.
@@ -819,46 +792,49 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<bool, VmError> {
-        match value {
-            Value::Proxy(proxy) => {
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: "Cannot perform 'isExtensible' on a proxy that has been revoked"
-                            .to_string(),
-                    });
-                }
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap)];
-                match self.invoke_proxy_trap(context, proxy, "isExtensible", trap_args)? {
-                    Some(result) => {
-                        let trap = result.to_boolean(&self.gc_heap);
-                        let target_ext =
-                            self.is_extensible_value(context, &proxy.target(&self.gc_heap))?;
-                        if trap != target_ext {
-                            return Err(VmError::TypeError {
-                                message:
-                                    "Proxy isExtensible trap returned value inconsistent with target"
-                                        .to_string(),
-                            });
-                        }
-                        Ok(trap)
-                    }
-                    None => self.is_extensible_value(context, &proxy.target(&self.gc_heap)),
-                }
+        if let Some(proxy) = value.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'isExtensible' on a proxy that has been revoked"
+                        .to_string(),
+                });
             }
-            Value::Object(obj) => Ok(object::is_extensible(*obj, &self.gc_heap)),
-            Value::Array(arr) => Ok(array::is_extensible(*arr, &self.gc_heap)),
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => Ok(self.ordinary_function_is_extensible(*function_id)),
-            Value::RegExp(regexp) => Ok(regexp.is_extensible(&self.gc_heap)),
-            // Per §10.1.3 every other ordinary heap value is extensible
-            // by default. Non-object primitives never reach this path
-            // (callers gate via `Type(O) is Object`).
-            _ => Ok(true),
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
+            return match self.invoke_proxy_trap(context, &proxy, "isExtensible", trap_args)? {
+                Some(result) => {
+                    let trap = result.to_boolean(&self.gc_heap);
+                    let target_ext =
+                        self.is_extensible_value(context, &proxy.target(&self.gc_heap))?;
+                    if trap != target_ext {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Proxy isExtensible trap returned value inconsistent with target"
+                                    .to_string(),
+                        });
+                    }
+                    Ok(trap)
+                }
+                None => self.is_extensible_value(context, &proxy.target(&self.gc_heap)),
+            };
         }
+        if let Some(obj) = value.as_object() {
+            return Ok(object::is_extensible(obj, &self.gc_heap));
+        }
+        if let Some(arr) = value.as_array() {
+            return Ok(array::is_extensible(arr, &self.gc_heap));
+        }
+        let fid = value
+            .as_function()
+            .or_else(|| value.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            return Ok(self.ordinary_function_is_extensible(function_id));
+        }
+        if let Some(regexp) = value.as_regexp() {
+            return Ok(regexp.is_extensible(&self.gc_heap));
+        }
+        // Per §10.1.3 every other ordinary heap value is extensible
+        // by default.
+        Ok(true)
     }
 
     /// §10.5.6 / §10.1.6 — value-level `[[DefineOwnProperty]]`.
@@ -872,303 +848,251 @@ impl Interpreter {
         key: &VmPropertyKey,
         descriptor: object::PartialPropertyDescriptor,
     ) -> Result<bool, VmError> {
-        match target {
-            Value::Proxy(proxy) => {
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: "Cannot perform 'defineProperty' on a proxy that has been revoked"
-                            .to_string(),
-                    });
-                }
-                let key_value = self.vm_property_key_to_value(key)?;
-                let target_value = proxy.target(&self.gc_heap);
-                let descriptor_object =
-                    self.partial_descriptor_to_object(&descriptor, &[&key_value, &target_value])?;
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![target_value, key_value, Value::Object(descriptor_object),];
-                match self.invoke_proxy_trap(context, proxy, "defineProperty", trap_args)? {
-                    Some(result) => {
-                        let ok = result.to_boolean(&self.gc_heap);
-                        if !ok {
-                            return Ok(false);
-                        }
-                        let descriptor_roots = partial_descriptor_value_roots(&descriptor);
-                        let mut value_roots = Vec::with_capacity(descriptor_roots.len() + 1);
-                        value_roots.push(&target_value);
-                        value_roots.extend(descriptor_roots.iter());
-                        let target_desc = self
-                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                context,
-                                target_value,
-                                key,
-                                0,
-                                value_roots.as_slice(),
-                                &[],
-                            )?;
-                        let extensible = self.is_extensible_value(context, &target_value)?;
-                        let setting_config_false = matches!(descriptor.configurable, Some(false))
-                            || (descriptor.configurable.is_none() && !descriptor.is_generic() && {
-                                // Defaults when adding (current undefined):
-                                // configurable=false. The non-generic clause
-                                // only matters when target_desc is None.
-                                target_desc.is_none()
-                            });
-                        match target_desc.as_ref() {
-                            None => {
-                                if !extensible {
-                                    return Err(VmError::TypeError {
+        if let Some(proxy) = target.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'defineProperty' on a proxy that has been revoked"
+                        .to_string(),
+                });
+            }
+            let key_value = self.vm_property_key_to_value(key)?;
+            let target_value = proxy.target(&self.gc_heap);
+            let descriptor_object =
+                self.partial_descriptor_to_object(&descriptor, &[&key_value, &target_value])?;
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![target_value, key_value, Value::object(descriptor_object),];
+            return match self.invoke_proxy_trap(context, &proxy, "defineProperty", trap_args)? {
+                Some(result) => {
+                    let ok = result.to_boolean(&self.gc_heap);
+                    if !ok {
+                        return Ok(false);
+                    }
+                    let descriptor_roots = partial_descriptor_value_roots(&descriptor);
+                    let mut value_roots = Vec::with_capacity(descriptor_roots.len() + 1);
+                    value_roots.push(&target_value);
+                    value_roots.extend(descriptor_roots.iter());
+                    let target_desc = self
+                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                            context,
+                            target_value,
+                            key,
+                            0,
+                            value_roots.as_slice(),
+                            &[],
+                        )?;
+                    let extensible = self.is_extensible_value(context, &target_value)?;
+                    let setting_config_false = matches!(descriptor.configurable, Some(false))
+                        || (descriptor.configurable.is_none() && !descriptor.is_generic() && {
+                            // Defaults when adding (current undefined):
+                            // configurable=false. The non-generic clause
+                            // only matters when target_desc is None.
+                            target_desc.is_none()
+                        });
+                    match target_desc.as_ref() {
+                        None => {
+                            if !extensible {
+                                return Err(VmError::TypeError {
                                         message:
                                             "Proxy defineProperty trap added a property on a non-extensible target"
                                                 .to_string(),
                                     });
-                                }
-                                if setting_config_false {
-                                    return Err(VmError::TypeError {
+                            }
+                            if setting_config_false {
+                                return Err(VmError::TypeError {
                                         message:
                                             "Proxy defineProperty trap added a non-configurable property absent on the target"
                                                 .to_string(),
                                     });
-                                }
                             }
-                            Some(target_desc) => {
-                                let target_configurable = target_desc.configurable();
-                                if !target_configurable
-                                    && matches!(descriptor.configurable, Some(true))
-                                {
-                                    return Err(VmError::TypeError {
+                        }
+                        Some(target_desc) => {
+                            let target_configurable = target_desc.configurable();
+                            if !target_configurable && matches!(descriptor.configurable, Some(true))
+                            {
+                                return Err(VmError::TypeError {
                                         message:
                                             "Proxy defineProperty trap relaxed a non-configurable target descriptor"
                                                 .to_string(),
                                     });
-                                }
-                                if target_configurable
-                                    && matches!(descriptor.configurable, Some(false))
-                                {
-                                    return Err(VmError::TypeError {
+                            }
+                            if target_configurable && matches!(descriptor.configurable, Some(false))
+                            {
+                                return Err(VmError::TypeError {
                                         message:
                                             "Proxy defineProperty trap demoted a configurable target descriptor"
                                                 .to_string(),
                                     });
-                                }
-                                if !target_configurable
-                                    && target_desc.is_data()
-                                    && target_desc.writable()
-                                    && matches!(descriptor.writable, Some(false))
-                                {
-                                    return Err(VmError::TypeError {
+                            }
+                            if !target_configurable
+                                && target_desc.is_data()
+                                && target_desc.writable()
+                                && matches!(descriptor.writable, Some(false))
+                            {
+                                return Err(VmError::TypeError {
                                         message:
                                             "Proxy defineProperty trap narrowed writable on a non-configurable data target"
                                                 .to_string(),
                                     });
-                                }
-                                if !is_compatible_partial_descriptor(
-                                    target_desc,
-                                    &descriptor,
-                                    &self.gc_heap,
-                                ) {
-                                    return Err(VmError::TypeError {
-                                        message:
-                                            "Proxy defineProperty trap returned incompatible descriptor"
-                                                .to_string(),
-                                    });
-                                }
+                            }
+                            if !is_compatible_partial_descriptor(
+                                target_desc,
+                                &descriptor,
+                                &self.gc_heap,
+                            ) {
+                                return Err(VmError::TypeError {
+                                    message:
+                                        "Proxy defineProperty trap returned incompatible descriptor"
+                                            .to_string(),
+                                });
                             }
                         }
-                        Ok(true)
                     }
-                    None => {
-                        // Trap missing — fall through to target.
-                        self.define_own_property_value(
-                            context,
-                            &proxy.target(&self.gc_heap),
-                            key,
-                            descriptor,
-                        )
-                    }
+                    Ok(true)
                 }
-            }
-            Value::Object(obj) => Ok(match key {
-                VmPropertyKey::Symbol(sym) => object::define_own_symbol_property_partial(
-                    *obj,
+                None => {
+                    // Trap missing — fall through to target.
+                    self.define_own_property_value(
+                        context,
+                        &proxy.target(&self.gc_heap),
+                        key,
+                        descriptor,
+                    )
+                }
+            };
+        }
+        if let Some(obj) = target.as_object() {
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(obj, &mut self.gc_heap, sym, descriptor)
+            } else {
+                if let Some(current) = self.string_object_exotic_descriptor(obj, key)? {
+                    return Ok(is_compatible_partial_descriptor(
+                        &current,
+                        &descriptor,
+                        &self.gc_heap,
+                    ));
+                }
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(obj, k, descriptor)?
+            });
+        }
+        if let Some(native) = target.as_native_function() {
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                native.define_own_symbol_property(&mut self.gc_heap, sym, descriptor)
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                native.define_own_property(
+                    &mut self.gc_heap,
+                    k,
+                    descriptor.complete_for_new_property(),
+                )
+            });
+        }
+        if let Some(class) = target.as_class_constructor() {
+            let statics = class.statics(&self.gc_heap);
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(
+                    statics,
                     &mut self.gc_heap,
                     sym,
                     descriptor,
-                ),
-                _ => {
-                    if let Some(current) = self.string_object_exotic_descriptor(*obj, key)? {
-                        return Ok(is_compatible_partial_descriptor(
-                            &current,
-                            &descriptor,
-                            &self.gc_heap,
-                        ));
-                    }
-                    let k = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling");
-                    self.define_own_property_partial(*obj, k, descriptor)?
-                }
-            }),
-            Value::NativeFunction(native) => Ok(match key {
-                VmPropertyKey::Symbol(sym) => {
-                    native.define_own_symbol_property(&mut self.gc_heap, sym, descriptor)
-                }
-                _ => {
-                    let k = key
-                        .string_name()
-                        .expect("non-symbol key has string spelling");
-                    native.define_own_property(
-                        &mut self.gc_heap,
-                        k,
-                        descriptor.complete_for_new_property(),
-                    )
-                }
-            }),
-            Value::ClassConstructor(class) => {
-                let statics = class.statics(&self.gc_heap);
-                Ok(match key {
-                    VmPropertyKey::Symbol(sym) => object::define_own_symbol_property_partial(
-                        statics,
-                        &mut self.gc_heap,
-                        sym,
-                        descriptor,
-                    ),
-                    _ => {
-                        let k = key
-                            .string_name()
-                            .expect("non-symbol key has string spelling");
-                        self.define_own_property_partial(statics, k, descriptor)?
-                    }
-                })
-            }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                if let VmPropertyKey::Symbol(sym) = key {
-                    let bag = self.function_user_bag_runtime_rooted(*function_id, &[], &[])?;
-                    return Ok(object::define_own_symbol_property_partial(
-                        bag,
-                        &mut self.gc_heap,
-                        sym,
-                        descriptor,
-                    ));
-                }
-                let Some(k) = key.string_name() else {
-                    return Ok(false);
-                };
-                let completed = match self.ordinary_function_own_property_descriptor(
-                    Some(context),
-                    *function_id,
-                    k,
-                )? {
-                    Some(current) => {
-                        complete_partial_descriptor_against_current(&current, &descriptor)
-                    }
-                    None => descriptor.complete_for_new_property(),
-                };
-                self.ordinary_function_define_own_property(
-                    Some(context),
-                    *function_id,
-                    k,
-                    None,
-                    completed,
                 )
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(statics, k, descriptor)?
+            });
+        }
+        let fid = target
+            .as_function()
+            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            if let VmPropertyKey::Symbol(sym) = key {
+                let bag = self.function_user_bag_runtime_rooted(function_id, &[], &[])?;
+                return Ok(object::define_own_symbol_property_partial(
+                    bag,
+                    &mut self.gc_heap,
+                    sym,
+                    descriptor,
+                ));
             }
-            Value::RegExp(regexp) => {
-                if key.string_name().is_some_and(|key| key == "lastIndex") {
-                    let current = object::PropertyDescriptor::data(
-                        regexp.last_index_value(&self.gc_heap),
-                        regexp.last_index_writable(&self.gc_heap),
-                        false,
-                        false,
-                    );
-                    let completed =
-                        complete_partial_descriptor_against_current(&current, &descriptor);
-                    let Some(updated) =
-                        object::validate_descriptor_update(&current, &completed, &self.gc_heap)
-                    else {
-                        return Ok(false);
-                    };
-                    let object::DescriptorKind::Data { value } = &updated.kind else {
-                        return Ok(false);
-                    };
-                    regexp.set_last_index_value(&mut self.gc_heap, *value);
-                    regexp.set_last_index_writable(&mut self.gc_heap, updated.writable());
-                    return Ok(true);
-                }
-                let bag =
-                    crate::property_dispatch::regexp_ensure_expando_pub(&mut self.gc_heap, regexp)?;
-                Ok(match key {
-                    VmPropertyKey::Symbol(sym) => object::define_own_symbol_property_partial(
-                        bag,
-                        &mut self.gc_heap,
-                        sym,
-                        descriptor,
-                    ),
-                    _ => {
-                        let k = key
-                            .string_name()
-                            .expect("non-symbol key has string spelling");
-                        self.define_own_property_partial(bag, k, descriptor)?
-                    }
-                })
-            }
-            // §10.4.2 ArrayExoticObject [[DefineOwnProperty]] —
-            // foundation surface handles indexed writes by routing to
-            // dense storage; descriptor attributes are not yet
-            // tracked on Array slots, so accessor descriptors reject.
-            // Non-indexed string keys fall through to the array's
-            // named-property side-table so user-defined own props on
-            // arrays (e.g. `arr.foo = 1`) still observe define-success
-            // — descriptor attribute enforcement on those slots is
-            // tracked separately.
-            Value::Array(arr) => {
-                // §10.4.2 — symbol-keyed defineProperty on an Array
-                // stores into the per-array symbol-property table.
-                // Accessor descriptors are currently flattened to
-                // data values; full descriptor attributes will land
-                // alongside the rest of the array attribute story.
-                if let VmPropertyKey::Symbol(sym) = key {
-                    let value = descriptor.value.unwrap_or(Value::undefined());
-                    array::set_symbol_property(*arr, &mut self.gc_heap, sym, value);
-                    return Ok(true);
-                }
-                let Some(k) = key.string_name() else {
+            let Some(k) = key.string_name() else {
+                return Ok(false);
+            };
+            let completed = match self.ordinary_function_own_property_descriptor(
+                Some(context),
+                function_id,
+                k,
+            )? {
+                Some(current) => complete_partial_descriptor_against_current(&current, &descriptor),
+                None => descriptor.complete_for_new_property(),
+            };
+            return self.ordinary_function_define_own_property(
+                Some(context),
+                function_id,
+                k,
+                None,
+                completed,
+            );
+        }
+        if let Some(regexp) = target.as_regexp() {
+            if key.string_name().is_some_and(|key| key == "lastIndex") {
+                let current = object::PropertyDescriptor::data(
+                    regexp.last_index_value(&self.gc_heap),
+                    regexp.last_index_writable(&self.gc_heap),
+                    false,
+                    false,
+                );
+                let completed = complete_partial_descriptor_against_current(&current, &descriptor);
+                let Some(updated) =
+                    object::validate_descriptor_update(&current, &completed, &self.gc_heap)
+                else {
                     return Ok(false);
                 };
-                if k == "length" {
-                    // §10.4.2.4 ArraySetLength. Length is a
-                    // non-configurable, non-enumerable data
-                    // property. Its value has the ToUint32/ToNumber
-                    // range check and shrinking must delete tail
-                    // elements, stopping at the first
-                    // non-configurable indexed property.
-                    if descriptor.is_accessor()
-                        || matches!(descriptor.configurable, Some(true))
-                        || matches!(descriptor.enumerable, Some(true))
-                    {
+                let object::DescriptorKind::Data { value } = &updated.kind else {
+                    return Ok(false);
+                };
+                regexp.set_last_index_value(&mut self.gc_heap, *value);
+                regexp.set_last_index_writable(&mut self.gc_heap, updated.writable());
+                return Ok(true);
+            }
+            let bag =
+                crate::property_dispatch::regexp_ensure_expando_pub(&mut self.gc_heap, &regexp)?;
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, sym, descriptor)
+            } else {
+                let k = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                self.define_own_property_partial(bag, k, descriptor)?
+            });
+        }
+        if let Some(arr) = target.as_array() {
+            if let VmPropertyKey::Symbol(sym) = key {
+                let value = descriptor.value.unwrap_or(Value::undefined());
+                array::set_symbol_property(arr, &mut self.gc_heap, sym, value);
+                return Ok(true);
+            }
+            let Some(k) = key.string_name() else {
+                return Ok(false);
+            };
+            if k == "length" {
+                if descriptor.is_accessor()
+                    || matches!(descriptor.configurable, Some(true))
+                    || matches!(descriptor.enumerable, Some(true))
+                {
+                    return Ok(false);
+                }
+                let old_len = array::len(arr, &self.gc_heap);
+                let length_writable = array::length_writable(arr, &self.gc_heap);
+                if !length_writable {
+                    if matches!(descriptor.writable, Some(true)) {
                         return Ok(false);
                     }
-                    let old_len = array::len(*arr, &self.gc_heap);
-                    let length_writable = array::length_writable(*arr, &self.gc_heap);
-                    if !length_writable {
-                        if matches!(descriptor.writable, Some(true)) {
-                            return Ok(false);
-                        }
-                        if let Some(v) = descriptor.value {
-                            let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
-                            let new_len = crate::number::bitwise::to_uint32(number_len);
-                            if (new_len as f64) != number_len.as_f64() {
-                                return Err(VmError::RangeError {
-                                    message: "Invalid array length".to_string(),
-                                });
-                            }
-                            return Ok(new_len as usize == old_len);
-                        }
-                        return Ok(true);
-                    }
-                    let new_writable = descriptor.writable.unwrap_or(true);
                     if let Some(v) = descriptor.value {
                         let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
                         let new_len = crate::number::bitwise::to_uint32(number_len);
@@ -1177,26 +1101,38 @@ impl Interpreter {
                                 message: "Invalid array length".to_string(),
                             });
                         }
-                        let delete_ok =
-                            array::set_length_checked(*arr, &mut self.gc_heap, new_len as usize)
-                                .map_err(|_| VmError::TypeMismatch)?;
-                        if !new_writable {
-                            array::set_length_writable(*arr, &mut self.gc_heap, false);
-                        }
-                        return Ok(delete_ok);
-                    }
-                    if !new_writable {
-                        array::set_length_writable(*arr, &mut self.gc_heap, false);
+                        return Ok(new_len as usize == old_len);
                     }
                     return Ok(true);
                 }
-                if let Some(idx) = object::array_index_property_name(k) {
-                    return self.define_array_index_property(*arr, k, idx as usize, descriptor);
+                let new_writable = descriptor.writable.unwrap_or(true);
+                if let Some(v) = descriptor.value {
+                    let number_len = crate::coerce::to_number_or_throw(self, context, &v)?;
+                    let new_len = crate::number::bitwise::to_uint32(number_len);
+                    if (new_len as f64) != number_len.as_f64() {
+                        return Err(VmError::RangeError {
+                            message: "Invalid array length".to_string(),
+                        });
+                    }
+                    let delete_ok =
+                        array::set_length_checked(arr, &mut self.gc_heap, new_len as usize)
+                            .map_err(|_| VmError::TypeMismatch)?;
+                    if !new_writable {
+                        array::set_length_writable(arr, &mut self.gc_heap, false);
+                    }
+                    return Ok(delete_ok);
                 }
-                self.define_array_named_property(*arr, k, descriptor)
+                if !new_writable {
+                    array::set_length_writable(arr, &mut self.gc_heap, false);
+                }
+                return Ok(true);
             }
-            _ => Ok(false),
+            if let Some(idx) = object::array_index_property_name(k) {
+                return self.define_array_index_property(arr, k, idx as usize, descriptor);
+            }
+            return self.define_array_named_property(arr, k, descriptor);
         }
+        Ok(false)
     }
 
     /// §7.3.15 `SetIntegrityLevel(O, level)`.
@@ -1669,7 +1605,7 @@ impl Interpreter {
             self.set_property(obj, "value", *v)?;
         }
         if let Some(w) = descriptor.writable {
-            self.set_property(obj, "writable", Value::Boolean(w))?;
+            self.set_property(obj, "writable", Value::boolean(w))?;
         }
         if let Some(g) = &descriptor.get {
             self.set_property(obj, "get", *g)?;
@@ -1678,10 +1614,10 @@ impl Interpreter {
             self.set_property(obj, "set", *s)?;
         }
         if let Some(e) = descriptor.enumerable {
-            self.set_property(obj, "enumerable", Value::Boolean(e))?;
+            self.set_property(obj, "enumerable", Value::boolean(e))?;
         }
         if let Some(c) = descriptor.configurable {
-            self.set_property(obj, "configurable", Value::Boolean(c))?;
+            self.set_property(obj, "configurable", Value::boolean(c))?;
         }
         Ok(obj)
     }
@@ -1718,7 +1654,7 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, *input, args)?
             }
         };
-        if !matches!(exotic, Value::Undefined | Value::Null) {
+        if !exotic.is_nullish() {
             if !self.is_callable_runtime(&exotic) {
                 return Err(VmError::TypeError {
                     message: "Symbol.toPrimitive method is not callable".to_string(),
@@ -1802,28 +1738,7 @@ impl Interpreter {
         // Step 1 — `Type(Obj) is not Object → throw TypeError`. We
         // gate via the broader "type Object" check that includes
         // proxies / exotic value kinds.
-        if !matches!(
-            attributes,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::BoundFunction(_)
-                | Value::NativeFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::RegExp(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-        ) {
+        if !is_extended_object_value(attributes) {
             return Err(VmError::TypeError {
                 message: "ToPropertyDescriptor argument must be an Object".to_string(),
             });
@@ -1863,7 +1778,7 @@ impl Interpreter {
         }
         // step 7 — get.
         if let Some(v) = read_field(self, "get")? {
-            if !matches!(v, Value::Undefined) && !self.is_callable_runtime(&v) {
+            if !v.is_undefined() && !self.is_callable_runtime(&v) {
                 return Err(VmError::TypeError {
                     message: "Property descriptor `get` is not callable".to_string(),
                 });
@@ -1872,7 +1787,7 @@ impl Interpreter {
         }
         // step 8 — set.
         if let Some(v) = read_field(self, "set")? {
-            if !matches!(v, Value::Undefined) && !self.is_callable_runtime(&v) {
+            if !v.is_undefined() && !self.is_callable_runtime(&v) {
                 return Err(VmError::TypeError {
                     message: "Property descriptor `set` is not callable".to_string(),
                 });
@@ -1901,8 +1816,8 @@ impl Interpreter {
     ) -> Result<VmPropertyKey<'static>, VmError> {
         let primitive =
             self.evaluate_to_primitive(context, input, abstract_ops::ToPrimitiveHint::String)?;
-        if let Value::Symbol(sym) = primitive {
-            return Ok(VmPropertyKey::Symbol(sym));
+        if let Some(sym) = primitive.as_symbol() {
+            return Ok(VmPropertyKey::Symbol(*sym));
         }
         Ok(VmPropertyKey::OwnedString(
             primitive.display_string(&self.gc_heap),
@@ -1923,212 +1838,202 @@ impl Interpreter {
         context: &ExecutionContext,
         target: &Value,
     ) -> Result<Vec<Value>, VmError> {
-        match target {
-            Value::Proxy(proxy) => {
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: "Cannot perform 'ownKeys' on a proxy that has been revoked"
-                            .to_string(),
-                    });
-                }
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap)];
-                match self.invoke_proxy_trap(context, proxy, "ownKeys", trap_args)? {
-                    Some(trap_result) => {
-                        let trap_keys =
-                            self.create_list_from_array_like_property_keys(context, trap_result)?;
-                        self.validate_proxy_own_keys(context, proxy, trap_keys)
-                    }
-                    None => self.own_property_keys_value(context, &proxy.target(&self.gc_heap)),
-                }
+        if let Some(proxy) = target.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'ownKeys' on a proxy that has been revoked"
+                        .to_string(),
+                });
             }
-            Value::Object(obj) => {
-                let mut keys: Vec<Value> = Vec::new();
-                let string_data = object::string_data(*obj, &self.gc_heap);
-                if let Some(value) = &string_data {
-                    keys.reserve(value.len() as usize + 1);
-                    for idx in 0..value.len() {
-                        let key = idx.to_string();
-                        keys.push(Value::string(
-                            string::JsString::from_str(&key, &mut self.gc_heap)
-                                .map_err(VmError::from)?,
-                        ));
-                    }
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
+            return match self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)? {
+                Some(trap_result) => {
+                    let trap_keys =
+                        self.create_list_from_array_like_property_keys(context, trap_result)?;
+                    self.validate_proxy_own_keys(context, &proxy, trap_keys)
                 }
-                let is_string_exotic = string_data.is_some();
-                let (ordinary_strings, symbols): (Vec<String>, Vec<Value>) =
-                    object::with_properties(*obj, &self.gc_heap, |p| {
-                        (
-                            p.keys().map(str::to_string).collect(),
-                            p.symbol_keys().map(Value::Symbol).collect(),
-                        )
-                    });
-                if is_string_exotic {
-                    let string_len = string_data.as_ref().map_or(0, |value| value.len());
-                    let mut indexed = BTreeSet::new();
-                    let mut non_index_strings = Vec::new();
-                    for key in ordinary_strings {
-                        if key == "length" {
-                            continue;
-                        }
-                        match object::array_index_property_name(&key) {
-                            Some(index) if index >= string_len => {
-                                indexed.insert(index);
-                            }
-                            Some(_) => {}
-                            None => non_index_strings.push(key),
-                        }
-                    }
-                    for index in indexed {
-                        let key = index.to_string();
-                        keys.push(Value::string(
-                            string::JsString::from_str(&key, &mut self.gc_heap)
-                                .map_err(VmError::from)?,
-                        ));
-                    }
+                None => self.own_property_keys_value(context, &proxy.target(&self.gc_heap)),
+            };
+        }
+        if let Some(obj) = target.as_object() {
+            let mut keys: Vec<Value> = Vec::new();
+            let string_data = object::string_data(obj, &self.gc_heap);
+            if let Some(value) = &string_data {
+                keys.reserve(value.len() as usize + 1);
+                for idx in 0..value.len() {
+                    let key = idx.to_string();
                     keys.push(Value::string(
-                        string::JsString::from_str("length", &mut self.gc_heap)
+                        string::JsString::from_str(&key, &mut self.gc_heap)
                             .map_err(VmError::from)?,
                     ));
-                    for key in non_index_strings {
-                        keys.push(Value::string(
-                            string::JsString::from_str(&key, &mut self.gc_heap)
-                                .map_err(VmError::from)?,
-                        ));
-                    }
-                } else {
-                    for key in ordinary_strings {
-                        keys.push(Value::string(
-                            string::JsString::from_str(&key, &mut self.gc_heap)
-                                .map_err(VmError::from)?,
-                        ));
-                    }
                 }
-                keys.extend(symbols);
-                Ok(keys)
             }
-            Value::Array(arr) => {
-                let (indices, string_keys) = self.gc_heap.read_payload(*arr, |body| {
-                    let mut indices = BTreeSet::new();
-                    for (idx, value) in body.elements.iter().enumerate() {
-                        if !matches!(value, Value::Hole) {
-                            indices.insert(idx);
-                        }
-                    }
-                    if let Some(sparse) = &body.sparse_elements {
-                        indices.extend(sparse.keys().copied());
-                    }
-                    let mut string_keys = Vec::new();
-                    if let Some(named) = &body.named_properties {
-                        string_keys.extend(named.keys().cloned());
-                    }
-                    if let Some(accessors) = &body.accessors {
-                        for key in accessors.keys() {
-                            if let Some(index) = object::array_index_property_name(key) {
-                                indices.insert(index as usize);
-                            } else if !string_keys.iter().any(|existing| existing == key) {
-                                string_keys.push(key.clone());
-                            }
-                        }
-                    }
-                    (indices, string_keys)
+            let is_string_exotic = string_data.is_some();
+            let (ordinary_strings, symbols): (Vec<String>, Vec<Value>) =
+                object::with_properties(obj, &self.gc_heap, |p| {
+                    (
+                        p.keys().map(str::to_string).collect(),
+                        p.symbol_keys().map(Value::symbol).collect(),
+                    )
                 });
-                let mut keys: Vec<Value> =
-                    Vec::with_capacity(indices.len() + string_keys.len() + 2);
-                for idx in indices {
-                    let key = idx.to_string();
-                    let s = string::JsString::from_str(&key, &mut self.gc_heap)
-                        .map_err(VmError::from)?;
-                    keys.push(Value::string(s));
+            if is_string_exotic {
+                let string_len = string_data.as_ref().map_or(0, |value| value.len());
+                let mut indexed = BTreeSet::new();
+                let mut non_index_strings = Vec::new();
+                for key in ordinary_strings {
+                    if key == "length" {
+                        continue;
+                    }
+                    match object::array_index_property_name(&key) {
+                        Some(index) if index >= string_len => {
+                            indexed.insert(index);
+                        }
+                        Some(_) => {}
+                        None => non_index_strings.push(key),
+                    }
                 }
-                // §10.4.2 Array exotic objects always expose `length`.
+                for index in indexed {
+                    let key = index.to_string();
+                    keys.push(Value::string(
+                        string::JsString::from_str(&key, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
+                }
                 keys.push(Value::string(
                     string::JsString::from_str("length", &mut self.gc_heap)
                         .map_err(VmError::from)?,
                 ));
-                for key in string_keys {
-                    let s = string::JsString::from_str(&key, &mut self.gc_heap)
-                        .map_err(VmError::from)?;
-                    keys.push(Value::string(s));
+                for key in non_index_strings {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&key, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
                 }
-                // §10.4.2 — own symbol-keyed properties follow the
-                // string keys per §7.3.22 OrdinaryOwnPropertyKeys
-                // ordering.
-                for sym in array::own_symbol_keys(*arr, &self.gc_heap) {
-                    keys.push(Value::symbol(sym));
+            } else {
+                for key in ordinary_strings {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&key, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
                 }
-                Ok(keys)
             }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let names = self.ordinary_function_own_property_keys(context, *function_id);
-                let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-                for n in names {
-                    let s =
-                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::string(s));
-                }
-                Ok(keys)
-            }
-            Value::NativeFunction(native) => {
-                let names = native.own_property_keys(&self.gc_heap);
-                let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-                for n in names {
-                    let s =
-                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::string(s));
-                }
-                Ok(keys)
-            }
-            Value::BoundFunction(bound) => {
-                let names = function_metadata::bound_own_property_keys(bound, &self.gc_heap);
-                let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-                for n in names {
-                    let s =
-                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::string(s));
-                }
-                Ok(keys)
-            }
-            Value::ClassConstructor(class) => {
-                let names = self.class_constructor_own_property_keys(Some(context), *class)?;
-                let mut keys: Vec<Value> = Vec::with_capacity(names.len());
-                for n in names {
-                    let s =
-                        string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
-                    keys.push(Value::string(s));
-                }
-                Ok(keys)
-            }
-            Value::RegExp(regexp) => {
-                let mut keys = Vec::new();
-                keys.push(Value::string(
-                    string::JsString::from_str("lastIndex", &mut self.gc_heap)
-                        .map_err(VmError::from)?,
-                ));
-                if let Some(expando) = regexp.expando(&self.gc_heap) {
-                    let (strings, symbols): (Vec<String>, Vec<Value>) =
-                        object::with_properties(expando, &self.gc_heap, |p| {
-                            (
-                                p.keys().map(str::to_string).collect(),
-                                p.symbol_keys().map(Value::Symbol).collect(),
-                            )
-                        });
-                    for key in strings {
-                        keys.push(Value::string(
-                            string::JsString::from_str(&key, &mut self.gc_heap)
-                                .map_err(VmError::from)?,
-                        ));
-                    }
-                    keys.extend(symbols);
-                }
-                Ok(keys)
-            }
-            _ => Ok(Vec::new()),
+            keys.extend(symbols);
+            return Ok(keys);
         }
+        if let Some(arr) = target.as_array() {
+            let (indices, string_keys) = self.gc_heap.read_payload(arr, |body| {
+                let mut indices = BTreeSet::new();
+                for (idx, value) in body.elements.iter().enumerate() {
+                    if !value.is_hole() {
+                        indices.insert(idx);
+                    }
+                }
+                if let Some(sparse) = &body.sparse_elements {
+                    indices.extend(sparse.keys().copied());
+                }
+                let mut string_keys = Vec::new();
+                if let Some(named) = &body.named_properties {
+                    string_keys.extend(named.keys().cloned());
+                }
+                if let Some(accessors) = &body.accessors {
+                    for key in accessors.keys() {
+                        if let Some(index) = object::array_index_property_name(key) {
+                            indices.insert(index as usize);
+                        } else if !string_keys.iter().any(|existing| existing == key) {
+                            string_keys.push(key.clone());
+                        }
+                    }
+                }
+                (indices, string_keys)
+            });
+            let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + string_keys.len() + 2);
+            for idx in indices {
+                let key = idx.to_string();
+                let s =
+                    string::JsString::from_str(&key, &mut self.gc_heap).map_err(VmError::from)?;
+                keys.push(Value::string(s));
+            }
+            // §10.4.2 Array exotic objects always expose `length`.
+            keys.push(Value::string(
+                string::JsString::from_str("length", &mut self.gc_heap).map_err(VmError::from)?,
+            ));
+            for key in string_keys {
+                let s =
+                    string::JsString::from_str(&key, &mut self.gc_heap).map_err(VmError::from)?;
+                keys.push(Value::string(s));
+            }
+            // §10.4.2 — own symbol-keyed properties follow the
+            // string keys per §7.3.22 OrdinaryOwnPropertyKeys
+            // ordering.
+            for sym in array::own_symbol_keys(arr, &self.gc_heap) {
+                keys.push(Value::symbol(sym));
+            }
+            return Ok(keys);
+        }
+        let fid = target
+            .as_function()
+            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            let names = self.ordinary_function_own_property_keys(context, function_id);
+            let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+            for n in names {
+                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
+                keys.push(Value::string(s));
+            }
+            return Ok(keys);
+        }
+        if let Some(native) = target.as_native_function() {
+            let names = native.own_property_keys(&self.gc_heap);
+            let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+            for n in names {
+                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
+                keys.push(Value::string(s));
+            }
+            return Ok(keys);
+        }
+        if let Some(bound) = target.as_bound_function() {
+            let names = function_metadata::bound_own_property_keys(&bound, &self.gc_heap);
+            let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+            for n in names {
+                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
+                keys.push(Value::string(s));
+            }
+            return Ok(keys);
+        }
+        if let Some(class) = target.as_class_constructor() {
+            let names = self.class_constructor_own_property_keys(Some(context), class)?;
+            let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+            for n in names {
+                let s = string::JsString::from_str(&n, &mut self.gc_heap).map_err(VmError::from)?;
+                keys.push(Value::string(s));
+            }
+            return Ok(keys);
+        }
+        if let Some(regexp) = target.as_regexp() {
+            let mut keys = Vec::new();
+            keys.push(Value::string(
+                string::JsString::from_str("lastIndex", &mut self.gc_heap)
+                    .map_err(VmError::from)?,
+            ));
+            if let Some(expando) = regexp.expando(&self.gc_heap) {
+                let (strings, symbols): (Vec<String>, Vec<Value>) =
+                    object::with_properties(expando, &self.gc_heap, |p| {
+                        (
+                            p.keys().map(str::to_string).collect(),
+                            p.symbol_keys().map(Value::symbol).collect(),
+                        )
+                    });
+                for key in strings {
+                    keys.push(Value::string(
+                        string::JsString::from_str(&key, &mut self.gc_heap)
+                            .map_err(VmError::from)?,
+                    ));
+                }
+                keys.extend(symbols);
+            }
+            return Ok(keys);
+        }
+        Ok(Vec::new())
     }
 
     /// §7.3.18 CreateListFromArrayLike with elementTypes set to
@@ -2139,10 +2044,7 @@ impl Interpreter {
         context: &ExecutionContext,
         list_value: Value,
     ) -> Result<Vec<Value>, VmError> {
-        if !matches!(
-            list_value,
-            Value::Object(_) | Value::Array(_) | Value::Proxy(_)
-        ) {
+        if !(list_value.is_object() || list_value.is_array() || list_value.is_proxy()) {
             return Err(VmError::TypeError {
                 message: "Proxy ownKeys trap result is not an Object".to_string(),
             });
@@ -2171,7 +2073,7 @@ impl Interpreter {
                     self.run_callable_sync(context, &getter, list_value, args)?
                 }
             };
-            if !matches!(element, Value::String(_) | Value::Symbol(_)) {
+            if !(element.is_string() || element.is_symbol()) {
                 return Err(VmError::TypeError {
                     message: "Proxy ownKeys trap result contains a non-property-key entry"
                         .to_string(),
@@ -2286,132 +2188,122 @@ impl Interpreter {
         target: &Value,
         proto: &Value,
     ) -> Result<bool, VmError> {
-        match target {
-            Value::Proxy(proxy) => {
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: "Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
-                            .to_string(),
-                    });
-                }
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), *proto];
-                match self.invoke_proxy_trap(context, proxy, "setPrototypeOf", trap_args)? {
-                    Some(result) => {
-                        let ok = result.to_boolean(&self.gc_heap);
-                        if !ok {
-                            return Ok(false);
-                        }
-                        // §10.5.7 invariant: when the trap reports
-                        // success and the target is non-extensible,
-                        // the requested prototype must equal the
-                        // target's current prototype.
-                        let target_value = proxy.target(&self.gc_heap);
-                        let target_extensible = self.is_extensible_value(context, &target_value)?;
-                        if !target_extensible {
-                            let target_proto =
-                                self.ordinary_get_prototype_value(context, target_value, 0)?;
-                            if !abstract_ops::same_value(proto, &target_proto, &self.gc_heap) {
-                                return Err(VmError::TypeError {
-                                    message:
-                                        "Proxy setPrototypeOf invariant violated: target is non-extensible and prototypes differ"
-                                            .to_string(),
-                                });
-                            }
-                        }
-                        Ok(true)
-                    }
-                    None => self.set_prototype_value_proxy_aware(
-                        context,
-                        &proxy.target(&self.gc_heap),
-                        proto,
-                    ),
-                }
+        if let Some(proxy) = target.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'setPrototypeOf' on a proxy that has been revoked"
+                        .to_string(),
+                });
             }
-            Value::Object(obj) => {
-                // §10.1.2 OrdinarySetPrototypeOf full algorithm.
-                let obj = *obj;
-                let current_proto =
-                    object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::null());
-                // §20.1.3 — %Object.prototype% is an
-                // immutable-prototype exotic object. It reports
-                // success only when the requested prototype is
-                // SameValue with its current [[Prototype]].
-                if self.object_prototype_object_opt() == Some(obj) {
-                    return Ok(abstract_ops::same_value(
-                        proto,
-                        &current_proto,
-                        &self.gc_heap,
-                    ));
-                }
-                if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
-                    return Ok(true);
-                }
-                if !object::is_extensible(obj, &self.gc_heap) {
-                    return Ok(false);
-                }
-                // Step 8 cycle check — walk the candidate chain looking
-                // for O itself. Only ordinary-object hops; the spec
-                // stops when an exotic [[GetPrototypeOf]] is hit.
-                let mut p = *proto;
-                let hard_cap = object::PROTO_CHAIN_HARD_CAP;
-                let mut hops = 0;
-                loop {
-                    match &p {
-                        Value::Null => break,
-                        Value::Object(candidate) => {
-                            if abstract_ops::same_value(
-                                &Value::object(*candidate),
-                                &Value::object(obj),
-                                &self.gc_heap,
-                            ) {
-                                return Ok(false);
-                            }
-                            if hops >= hard_cap {
-                                break;
-                            }
-                            hops += 1;
-                            p = object::prototype_value(*candidate, &self.gc_heap)
-                                .unwrap_or(Value::null());
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(&self.gc_heap), *proto];
+            return match self.invoke_proxy_trap(context, &proxy, "setPrototypeOf", trap_args)? {
+                Some(result) => {
+                    let ok = result.to_boolean(&self.gc_heap);
+                    if !ok {
+                        return Ok(false);
+                    }
+                    let target_value = proxy.target(&self.gc_heap);
+                    let target_extensible = self.is_extensible_value(context, &target_value)?;
+                    if !target_extensible {
+                        let target_proto =
+                            self.ordinary_get_prototype_value(context, target_value, 0)?;
+                        if !abstract_ops::same_value(proto, &target_proto, &self.gc_heap) {
+                            return Err(VmError::TypeError {
+                                message:
+                                    "Proxy setPrototypeOf invariant violated: target is non-extensible and prototypes differ"
+                                        .to_string(),
+                            });
                         }
-                        // Non-ordinary prototype links short-circuit
-                        // the cycle walk per §10.1.2 step 8.c.i.
-                        _ => break,
                     }
+                    Ok(true)
                 }
-                let proto_opt = match proto {
-                    Value::Null => None,
-                    v => Some(*v),
-                };
-                Ok(object::set_prototype_value(
-                    obj,
-                    &mut self.gc_heap,
-                    proto_opt,
-                ))
-            }
-            Value::Array(arr) => {
-                let current_proto = self.get_prototype_for_op(target)?;
-                if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
-                    return Ok(true);
-                }
-                if !array::is_extensible(*arr, &self.gc_heap) {
-                    return Ok(false);
-                }
-                if abstract_ops::same_value(proto, target, &self.gc_heap) {
-                    return Ok(false);
-                }
-                let proto_opt = match proto {
-                    Value::Null => None,
-                    v if constructor_return_is_object(v) || matches!(v, Value::Proxy(_)) => {
-                        Some(*v)
-                    }
-                    _ => return Ok(false),
-                };
-                array::set_prototype_override(*arr, &mut self.gc_heap, proto_opt);
-                Ok(true)
-            }
-            _ => Ok(true),
+                None => self.set_prototype_value_proxy_aware(
+                    context,
+                    &proxy.target(&self.gc_heap),
+                    proto,
+                ),
+            };
         }
+        if let Some(obj) = target.as_object() {
+            // §10.1.2 OrdinarySetPrototypeOf full algorithm.
+            let current_proto =
+                object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::null());
+            // §20.1.3 — %Object.prototype% is an
+            // immutable-prototype exotic object. It reports
+            // success only when the requested prototype is
+            // SameValue with its current [[Prototype]].
+            if self.object_prototype_object_opt() == Some(obj) {
+                return Ok(abstract_ops::same_value(
+                    proto,
+                    &current_proto,
+                    &self.gc_heap,
+                ));
+            }
+            if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
+                return Ok(true);
+            }
+            if !object::is_extensible(obj, &self.gc_heap) {
+                return Ok(false);
+            }
+            // Step 8 cycle check — walk the candidate chain looking
+            // for O itself. Only ordinary-object hops; the spec
+            // stops when an exotic [[GetPrototypeOf]] is hit.
+            let mut p = *proto;
+            let hard_cap = object::PROTO_CHAIN_HARD_CAP;
+            let mut hops = 0;
+            loop {
+                if p.is_null() {
+                    break;
+                }
+                if let Some(candidate) = p.as_object() {
+                    if abstract_ops::same_value(
+                        &Value::object(candidate),
+                        &Value::object(obj),
+                        &self.gc_heap,
+                    ) {
+                        return Ok(false);
+                    }
+                    if hops >= hard_cap {
+                        break;
+                    }
+                    hops += 1;
+                    p = object::prototype_value(candidate, &self.gc_heap).unwrap_or(Value::null());
+                } else {
+                    // Non-ordinary prototype links short-circuit per
+                    // §10.1.2 step 8.c.i.
+                    break;
+                }
+            }
+            let proto_opt = if proto.is_null() { None } else { Some(*proto) };
+            return Ok(object::set_prototype_value(
+                obj,
+                &mut self.gc_heap,
+                proto_opt,
+            ));
+        }
+        if let Some(arr) = target.as_array() {
+            let current_proto = self.get_prototype_for_op(target)?;
+            if abstract_ops::same_value(proto, &current_proto, &self.gc_heap) {
+                return Ok(true);
+            }
+            if !array::is_extensible(arr, &self.gc_heap) {
+                return Ok(false);
+            }
+            if abstract_ops::same_value(proto, target, &self.gc_heap) {
+                return Ok(false);
+            }
+            let proto_opt = if proto.is_null() {
+                None
+            } else if constructor_return_is_object(proto) || proto.is_proxy() {
+                Some(*proto)
+            } else {
+                return Ok(false);
+            };
+            array::set_prototype_override(arr, &mut self.gc_heap, proto_opt);
+            return Ok(true);
+        }
+        Ok(true)
     }
 
     /// §10.5.4 / §10.1.4 — value-level `[[PreventExtensions]]`.
@@ -2420,55 +2312,49 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<bool, VmError> {
-        match value {
-            Value::Proxy(proxy) => {
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message:
-                            "Cannot perform 'preventExtensions' on a proxy that has been revoked"
-                                .to_string(),
-                    });
-                }
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap)];
-                match self.invoke_proxy_trap(context, proxy, "preventExtensions", trap_args)? {
-                    Some(result) => {
-                        let ok = result.to_boolean(&self.gc_heap);
-                        if ok && self.is_extensible_value(context, &proxy.target(&self.gc_heap))? {
-                            return Err(VmError::TypeError {
-                                message:
-                                    "Proxy preventExtensions trap succeeded but target is still extensible"
-                                        .to_string(),
-                            });
-                        }
-                        Ok(ok)
+        if let Some(proxy) = value.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'preventExtensions' on a proxy that has been revoked"
+                        .to_string(),
+                });
+            }
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
+            return match self.invoke_proxy_trap(context, &proxy, "preventExtensions", trap_args)? {
+                Some(result) => {
+                    let ok = result.to_boolean(&self.gc_heap);
+                    if ok && self.is_extensible_value(context, &proxy.target(&self.gc_heap))? {
+                        return Err(VmError::TypeError {
+                            message:
+                                "Proxy preventExtensions trap succeeded but target is still extensible"
+                                    .to_string(),
+                        });
                     }
-                    None => self.prevent_extensions_value(context, &proxy.target(&self.gc_heap)),
+                    Ok(ok)
                 }
-            }
-            Value::Object(obj) => {
-                let heap = &mut self.gc_heap;
-                object::prevent_extensions(*obj, heap);
-                Ok(true)
-            }
-            Value::Array(arr) => {
-                array::prevent_extensions(*arr, &mut self.gc_heap);
-                Ok(true)
-            }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                self.ordinary_function_prevent_extensions(*function_id);
-                Ok(true)
-            }
-            Value::RegExp(regexp) => {
-                regexp.prevent_extensions(&mut self.gc_heap);
-                Ok(true)
-            }
-            _ => Ok(true),
+                None => self.prevent_extensions_value(context, &proxy.target(&self.gc_heap)),
+            };
         }
+        if let Some(obj) = value.as_object() {
+            object::prevent_extensions(obj, &mut self.gc_heap);
+            return Ok(true);
+        }
+        if let Some(arr) = value.as_array() {
+            array::prevent_extensions(arr, &mut self.gc_heap);
+            return Ok(true);
+        }
+        let fid = value
+            .as_function()
+            .or_else(|| value.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            self.ordinary_function_prevent_extensions(function_id);
+            return Ok(true);
+        }
+        if let Some(regexp) = value.as_regexp() {
+            regexp.prevent_extensions(&mut self.gc_heap);
+            return Ok(true);
+        }
+        Ok(true)
     }
 
     pub(crate) fn instanceof_target_prototype(
@@ -2480,8 +2366,8 @@ impl Interpreter {
             Value::Object(_) | Value::Proxy(_) => {
                 let key = VmPropertyKey::String("prototype");
                 match self.ordinary_get_value(context, *rhs, *rhs, &key, 0)? {
-                    VmGetOutcome::Value(Value::Undefined) => Ok(Some(*rhs)),
-                    VmGetOutcome::Value(value @ (Value::Object(_) | Value::Proxy(_))) => {
+                    VmGetOutcome::Value(v) if v.is_undefined() => Ok(Some(*rhs)),
+                    VmGetOutcome::Value(value) if value.is_object() || value.is_proxy() => {
                         Ok(Some(value))
                     }
                     VmGetOutcome::Value(_) => Err(VmError::TypeError {
@@ -2490,7 +2376,7 @@ impl Interpreter {
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         let value = self.run_callable_sync(context, &getter, *rhs, args)?;
-                        if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                        if value.is_object() || value.is_proxy() {
                             Ok(Some(value))
                         } else {
                             Err(VmError::TypeError {
@@ -2506,7 +2392,7 @@ impl Interpreter {
                 ..
             }) => {
                 let value = self.function_property_get(context, *function_id, "prototype")?;
-                if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                if value.is_object() || value.is_proxy() {
                     Ok(Some(value))
                 } else {
                     Err(VmError::TypeError {
@@ -2538,7 +2424,7 @@ impl Interpreter {
                     },
                     None => Value::undefined(),
                 };
-                if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                if value.is_object() || value.is_proxy() {
                     Ok(Some(value))
                 } else {
                     Err(VmError::TypeError {
@@ -2560,8 +2446,8 @@ impl Interpreter {
             Value::Object(_) | Value::Proxy(_) => {
                 let key = VmPropertyKey::String("prototype");
                 match self.ordinary_get_value(context, *rhs, *rhs, &key, 0)? {
-                    VmGetOutcome::Value(Value::Undefined) => Ok(Some(*rhs)),
-                    VmGetOutcome::Value(value @ (Value::Object(_) | Value::Proxy(_))) => {
+                    VmGetOutcome::Value(v) if v.is_undefined() => Ok(Some(*rhs)),
+                    VmGetOutcome::Value(value) if value.is_object() || value.is_proxy() => {
                         Ok(Some(value))
                     }
                     VmGetOutcome::Value(_) => Err(VmError::TypeError {
@@ -2570,7 +2456,7 @@ impl Interpreter {
                     VmGetOutcome::InvokeGetter { getter } => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         let value = self.run_callable_sync(context, &getter, *rhs, args)?;
-                        if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                        if value.is_object() || value.is_proxy() {
                             Ok(Some(value))
                         } else {
                             Err(VmError::TypeError {
@@ -2591,7 +2477,7 @@ impl Interpreter {
                     *function_id,
                     "prototype",
                 )?;
-                if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                if value.is_object() || value.is_proxy() {
                     Ok(Some(value))
                 } else {
                     Err(VmError::TypeError {
@@ -2623,7 +2509,7 @@ impl Interpreter {
                     },
                     None => Value::undefined(),
                 };
-                if matches!(value, Value::Object(_) | Value::Proxy(_)) {
+                if value.is_object() || value.is_proxy() {
                     Ok(Some(value))
                 } else {
                     Err(VmError::TypeError {
@@ -2644,7 +2530,7 @@ impl Interpreter {
         let mut current = lhs;
         for hops in 0..object::PROTO_CHAIN_HARD_CAP {
             current = self.ordinary_get_prototype_value(context, current, hops)?;
-            if matches!(current, Value::Null) {
+            if current.is_null() {
                 return Ok(false);
             }
             if abstract_ops::same_value(&current, target_proto, &self.gc_heap) {
@@ -2663,7 +2549,7 @@ impl Interpreter {
         hops: usize,
     ) -> Result<VmGetOutcome, VmError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
-            return Ok(VmGetOutcome::Value(Value::Undefined));
+            return Ok(VmGetOutcome::Value(Value::undefined()));
         }
         match base {
             Value::Object(obj) => {
@@ -2676,14 +2562,14 @@ impl Interpreter {
                         Some(getter) if abstract_ops::is_callable(&getter) => {
                             Ok(VmGetOutcome::InvokeGetter { getter })
                         }
-                        _ => Ok(VmGetOutcome::Value(Value::Undefined)),
+                        _ => Ok(VmGetOutcome::Value(Value::undefined())),
                     },
                     object::PropertyLookup::Absent => {
                         match object::prototype_value(obj, &self.gc_heap) {
                             Some(proto) => {
                                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
                             }
-                            None => Ok(VmGetOutcome::Value(Value::Undefined)),
+                            None => Ok(VmGetOutcome::Value(Value::undefined())),
                         }
                     }
                 }
@@ -2755,7 +2641,7 @@ impl Interpreter {
                                 Some(callable) if abstract_ops::is_callable(&callable) => {
                                     return Ok(VmGetOutcome::InvokeGetter { getter: callable });
                                 }
-                                _ => return Ok(VmGetOutcome::Value(Value::Undefined)),
+                                _ => return Ok(VmGetOutcome::Value(Value::undefined())),
                             }
                         }
                         match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
@@ -3057,7 +2943,7 @@ impl Interpreter {
                         // installed methods and accessors resolve.
                         let proto = self.constructor_prototype_value("RegExp")?;
                         if matches!(proto, Value::Null | Value::Undefined) {
-                            return Ok(VmGetOutcome::Value(Value::Undefined));
+                            return Ok(VmGetOutcome::Value(Value::undefined()));
                         }
                         self.ordinary_get_value(context, proto, receiver, key, hops + 1)
                     }
@@ -3080,7 +2966,7 @@ impl Interpreter {
                 };
                 let proto = self.constructor_prototype_value(proto_name)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3131,7 +3017,7 @@ impl Interpreter {
                     None => self.constructor_prototype_value("Promise")?,
                 };
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3141,7 +3027,7 @@ impl Interpreter {
             Value::BigInt(_) => {
                 let proto = self.constructor_prototype_value("BigInt")?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3160,7 +3046,7 @@ impl Interpreter {
                 };
                 let proto = self.constructor_prototype_value(proto_name)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3190,7 +3076,7 @@ impl Interpreter {
                 }
                 let proto = self.constructor_prototype_value("String")?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3204,7 +3090,7 @@ impl Interpreter {
                 };
                 let proto = self.constructor_prototype_value(proto_name)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3213,7 +3099,7 @@ impl Interpreter {
             Value::ArrayBuffer(_) | Value::DataView(_) => {
                 let proto = self.get_prototype_for_op(&base)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3227,7 +3113,7 @@ impl Interpreter {
             Value::Generator(_) | Value::Iterator(_) => {
                 let proto = self.get_prototype_for_op(&base)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3244,7 +3130,7 @@ impl Interpreter {
                             || n < 0.0
                             || (n as usize) >= t.length(&self.gc_heap)
                         {
-                            return Ok(VmGetOutcome::Value(Value::Undefined));
+                            return Ok(VmGetOutcome::Value(Value::undefined()));
                         }
                         return Ok(VmGetOutcome::Value(
                             t.get(&mut self.gc_heap, n as usize)
@@ -3266,7 +3152,7 @@ impl Interpreter {
                 let this_value = Value::typed_array(t);
                 let proto = self.get_prototype_for_op(&this_value)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
-                    return Ok(VmGetOutcome::Value(Value::Undefined));
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
                 }
                 self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
@@ -3452,7 +3338,7 @@ impl Interpreter {
             }
             return Ok(Some(*target));
         }
-        if !matches!(target, Value::Proxy(_)) {
+        if !target.is_proxy() {
             return Ok(None);
         }
         match method {
@@ -3812,7 +3698,7 @@ impl Interpreter {
         let mut out = Vec::new();
 
         for hops in 0..object::PROTO_CHAIN_HARD_CAP {
-            if matches!(current, Value::Null) {
+            if current.is_null() {
                 break;
             }
 

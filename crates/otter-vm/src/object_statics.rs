@@ -208,7 +208,7 @@ fn native_group_by_rooted(
 ) -> Result<Value, VmError> {
     let items = args.first().cloned().unwrap_or(Value::undefined());
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
-    if matches!(items, Value::Undefined | Value::Null) {
+    if items.is_nullish() {
         return Err(VmError::TypeError {
             message: "Object.groupBy: items must be iterable".to_string(),
         });
@@ -234,7 +234,7 @@ fn native_group_by_rooted(
         let key =
             ctx.cx
                 .interp
-                .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)?;
+                .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)?;
         let key_pk = ctx.cx.interp.to_property_key_sync(&exec_ctx, key)?;
         let key_str = match key_pk {
             crate::VmPropertyKey::Symbol(_) => {
@@ -247,15 +247,15 @@ fn native_group_by_rooted(
             crate::VmPropertyKey::OwnedString(s) => s,
         };
         let existing = crate::object::get(result, ctx.heap(), &key_str);
-        let group = match existing {
-            Some(Value::Array(arr)) => arr,
-            _ => {
+        let group = match existing.and_then(|v| v.as_array()) {
+            Some(arr) => arr,
+            None => {
                 let arr = ctx.array_from_elements_with_roots(
                     std::iter::empty(),
-                    &[&Value::Object(result), item],
+                    &[&Value::object(result), item],
                     &[args],
                 )?;
-                ctx.set_property(result, &key_str, Value::Array(arr))?;
+                ctx.set_property(result, &key_str, Value::array(arr))?;
                 arr
             }
         };
@@ -274,22 +274,21 @@ fn native_group_by_rooted(
 
 fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
     let proto = args.first().cloned().unwrap_or(Value::undefined());
-    let proto_value = match proto {
-        Value::Object(_) | Value::Iterator(_) => Some(proto),
-        Value::Null => None,
-        _ => return Err(VmError::TypeMismatch),
+    let proto_value = if proto.is_object() || proto.is_iterator() {
+        Some(proto)
+    } else if proto.is_null() {
+        None
+    } else {
+        return Err(VmError::TypeMismatch);
     };
     let obj = ctx.alloc_object_with_roots(&[&proto], &[args])?;
     if !crate::object::set_prototype_value(obj, ctx.heap_mut(), proto_value) {
         return Err(VmError::TypeMismatch);
     }
     if let Some(props_arg) = args.get(1)
-        && !matches!(props_arg, Value::Undefined)
+        && !props_arg.is_undefined()
     {
-        let props = match props_arg {
-            Value::Object(object) => *object,
-            _ => return Err(VmError::TypeMismatch),
-        };
+        let props = props_arg.as_object().ok_or(VmError::TypeMismatch)?;
         let entries: Vec<(String, Value)> =
             crate::object::with_properties(props, ctx.heap(), |p| {
                 p.enumerable_data_iter()
@@ -297,10 +296,7 @@ fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
                     .collect()
             });
         for (key, desc_value) in entries {
-            let desc_obj = match desc_value {
-                Value::Object(object) => object,
-                _ => return Err(VmError::TypeMismatch),
-            };
+            let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
             let descriptor = coerce_to_descriptor(&desc_obj, ctx.heap())?;
             if !crate::object::define_own_property_partial(obj, ctx.heap_mut(), &key, descriptor) {
                 return Err(VmError::TypeMismatch);
@@ -316,30 +312,30 @@ fn native_keys_rooted(
     args: &[Value],
 ) -> Result<Value, VmError> {
     let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
-    if matches!(
-        target,
-        Value::Proxy(_)
-            | Value::Array(_)
-            | Value::RegExp(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_)
-    ) {
+    if target.is_proxy()
+        || target.is_array()
+        || target.is_regexp()
+        || target.is_function()
+        || target.is_closure()
+        || target.is_bound_function()
+        || target.is_native_function()
+    {
         let Some(context) = context else {
             return Err(VmError::InvalidOperand);
         };
-        let values = if matches!(target, Value::Proxy(_)) {
+        let values = if target.is_proxy() {
             let trap_keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
             let mut values = Vec::with_capacity(trap_keys.len());
             for key in trap_keys {
-                let Value::String(_) = &key else { continue };
-                let vm_key = match &key {
-                    Value::String(s) => {
-                        crate::VmPropertyKey::OwnedString(s.to_lossy_string(ctx.heap()))
-                    }
-                    Value::Symbol(sym) => crate::VmPropertyKey::Symbol(*sym),
-                    _ => return Err(VmError::TypeMismatch),
+                if !key.is_string() {
+                    continue;
+                }
+                let vm_key = if let Some(s) = key.as_string() {
+                    crate::VmPropertyKey::OwnedString(s.to_lossy_string(ctx.heap()))
+                } else if let Some(sym) = key.as_symbol() {
+                    crate::VmPropertyKey::Symbol(*sym)
+                } else {
+                    return Err(VmError::TypeMismatch);
                 };
                 let desc = ctx
                     .cx
@@ -373,20 +369,21 @@ fn native_keys_rooted(
         return Ok(Value::array(array));
     }
 
-    let owned: Vec<String> = match args.first() {
-        Some(Value::Object(target)) => crate::object::with_properties(*target, ctx.heap(), |p| {
+    let owned: Vec<String> = if let Some(target) = args.first().and_then(|v| v.as_object()) {
+        crate::object::with_properties(target, ctx.heap(), |p| {
             p.enumerable_keys().map(|k| k.to_string()).collect()
-        }),
-        Some(Value::NativeFunction(native)) => native
+        })
+    } else if let Some(native) = args.first().and_then(|v| v.as_native_function()) {
+        native
             .enumerable_own_property_keys(ctx.heap())
             .into_iter()
-            .collect(),
-        Some(Value::BoundFunction(bound)) => {
-            crate::function_metadata::bound_enumerable_own_property_keys(bound, ctx.heap())
-                .into_iter()
-                .collect()
-        }
-        _ => return Err(VmError::TypeMismatch),
+            .collect()
+    } else if let Some(bound) = args.first().and_then(|v| v.as_bound_function()) {
+        crate::function_metadata::bound_enumerable_own_property_keys(&bound, ctx.heap())
+            .into_iter()
+            .collect()
+    } else {
+        return Err(VmError::TypeMismatch);
     };
 
     let mut names = Vec::with_capacity(owned.len());
@@ -455,7 +452,7 @@ fn native_from_entries_rooted(
     let iter = args.first().cloned().unwrap_or(Value::undefined());
     // §7.1.4 RequireObjectCoercible — undefined / null reject before
     // GetIterator.
-    if matches!(iter, Value::Undefined | Value::Null) {
+    if iter.is_nullish() {
         return Err(VmError::TypeError {
             message: "Object.fromEntries: iterable must not be null or undefined".to_string(),
         });
@@ -572,17 +569,13 @@ fn set_from_entries_key_heap(
     value: Value,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<(), VmError> {
-    match key {
-        Value::Symbol(sym) => {
-            crate::object::set_symbol(target, heap, *sym, value);
-            Ok(())
-        }
-        _ => {
-            let key_str = property_key_from_value(key, heap)?;
-            crate::object::set(target, heap, &key_str, value);
-            Ok(())
-        }
+    if let Some(sym) = key.as_symbol() {
+        crate::object::set_symbol(target, heap, *sym, value);
+        return Ok(());
     }
+    let key_str = property_key_from_value(key, heap)?;
+    crate::object::set(target, heap, &key_str, value);
+    Ok(())
 }
 
 /// §20.1.2.7 step 5.b — read indices `"0"` and `"1"` from an entry
@@ -594,46 +587,46 @@ fn read_entry_pair_heap(
     entry: &Value,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<(Value, Value), VmError> {
-    match entry {
-        Value::Array(pair) => Ok((
-            crate::array::get(*pair, heap, 0),
-            crate::array::get(*pair, heap, 1),
-        )),
-        Value::Object(obj) => {
-            if let Some(s) = crate::object::string_data(*obj, heap) {
-                let units = s.to_utf16_vec(heap);
-                let zero = units.first().copied().map_or(Value::Undefined, |u| {
-                    crate::string::JsString::from_utf16_units(&[u], heap)
-                        .map(Value::String)
-                        .unwrap_or(Value::undefined())
-                });
-                let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                    crate::string::JsString::from_utf16_units(&[u], heap)
-                        .map(Value::String)
-                        .unwrap_or(Value::undefined())
-                });
-                return Ok((zero, one));
-            }
-            let key = crate::object::get(*obj, heap, "0").unwrap_or(Value::undefined());
-            let value = crate::object::get(*obj, heap, "1").unwrap_or(Value::undefined());
-            Ok((key, value))
-        }
-        Value::String(s) => {
-            let units = s.to_utf16_vec(heap);
-            let zero = units.first().copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(&[u], heap)
-                    .map(Value::String)
-                    .unwrap_or(Value::undefined())
-            });
-            let one = units.get(1).copied().map_or(Value::Undefined, |u| {
-                crate::string::JsString::from_utf16_units(&[u], heap)
-                    .map(Value::String)
-                    .unwrap_or(Value::undefined())
-            });
-            Ok((zero, one))
-        }
-        _ => Err(VmError::TypeMismatch),
+    if let Some(pair) = entry.as_array() {
+        return Ok((
+            crate::array::get(pair, heap, 0),
+            crate::array::get(pair, heap, 1),
+        ));
     }
+    if let Some(obj) = entry.as_object() {
+        if let Some(s) = crate::object::string_data(obj, heap) {
+            let units = s.to_utf16_vec(heap);
+            let zero = units.first().copied().map_or(Value::undefined(), |u| {
+                crate::string::JsString::from_utf16_units(&[u], heap)
+                    .map(Value::string)
+                    .unwrap_or(Value::undefined())
+            });
+            let one = units.get(1).copied().map_or(Value::undefined(), |u| {
+                crate::string::JsString::from_utf16_units(&[u], heap)
+                    .map(Value::string)
+                    .unwrap_or(Value::undefined())
+            });
+            return Ok((zero, one));
+        }
+        let key = crate::object::get(obj, heap, "0").unwrap_or(Value::undefined());
+        let value = crate::object::get(obj, heap, "1").unwrap_or(Value::undefined());
+        return Ok((key, value));
+    }
+    if let Some(s) = entry.as_string() {
+        let units = s.to_utf16_vec(heap);
+        let zero = units.first().copied().map_or(Value::undefined(), |u| {
+            crate::string::JsString::from_utf16_units(&[u], heap)
+                .map(Value::string)
+                .unwrap_or(Value::undefined())
+        });
+        let one = units.get(1).copied().map_or(Value::undefined(), |u| {
+            crate::string::JsString::from_utf16_units(&[u], heap)
+                .map(Value::string)
+                .unwrap_or(Value::undefined())
+        });
+        return Ok((zero, one));
+    }
+    Err(VmError::TypeMismatch)
 }
 
 fn native_get_own_property_descriptor_rooted(
@@ -642,17 +635,17 @@ fn native_get_own_property_descriptor_rooted(
     args: &[Value],
 ) -> Result<Value, VmError> {
     let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
-    let uses_internal_get_own_property_descriptor = matches!(
-        target,
-        Value::Proxy(_)
-            | Value::Array(_)
-            | Value::RegExp(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_)
-            | Value::String(_)
-    ) || matches!(target, Value::Object(obj) if crate::object::string_data(obj, ctx.heap()).is_some());
+    let uses_internal_get_own_property_descriptor = target.is_proxy()
+        || target.is_array()
+        || target.is_regexp()
+        || target.is_function()
+        || target.is_closure()
+        || target.is_bound_function()
+        || target.is_native_function()
+        || target.is_string()
+        || target
+            .as_object()
+            .is_some_and(|obj| crate::object::string_data(obj, ctx.heap()).is_some());
     if uses_internal_get_own_property_descriptor {
         let Some(context) = context else {
             return Err(VmError::InvalidOperand);
@@ -673,32 +666,42 @@ fn native_get_own_property_descriptor_rooted(
     }
 
     let key = expect_property_key(args.get(1), ctx.heap())?;
-    let desc = match args.first() {
-        Some(Value::Object(target)) => match &key {
-            PropertyKey::String(key) => crate::object::get_own_descriptor(*target, ctx.heap(), key),
+    let Some(first) = args.first() else {
+        return Err(VmError::TypeError {
+            message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
+                .to_string(),
+        });
+    };
+    if first.is_nullish() {
+        return Err(VmError::TypeError {
+            message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
+                .to_string(),
+        });
+    }
+    let desc = if let Some(target) = first.as_object() {
+        match &key {
+            PropertyKey::String(key) => crate::object::get_own_descriptor(target, ctx.heap(), key),
             PropertyKey::Symbol(sym) => {
-                crate::object::get_own_symbol_descriptor(*target, ctx.heap(), sym)
+                crate::object::get_own_symbol_descriptor(target, ctx.heap(), sym)
             }
-        },
-        Some(Value::ClassConstructor(class)) => match &key {
+        }
+    } else if let Some(class) = first.as_class_constructor() {
+        match &key {
             PropertyKey::String(key) => {
                 crate::object::get_own_descriptor(class.statics(ctx.heap()), ctx.heap(), key)
             }
             PropertyKey::Symbol(sym) => {
                 crate::object::get_own_symbol_descriptor(class.statics(ctx.heap()), ctx.heap(), sym)
             }
-        },
-        Some(Value::NativeFunction(native)) => match &key {
+        }
+    } else if let Some(native) = first.as_native_function() {
+        match &key {
             PropertyKey::String(key) => native.own_property_descriptor(ctx.heap_mut(), key)?,
             PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
-        },
-        // §10.4.5.1 IntegerIndexedExoticObject [[GetOwnProperty]] —
-        // canonical-numeric-index string keys produce a data
-        // descriptor for the live element when in range, otherwise
-        // undefined. Symbol / non-numeric keys have no own
-        // descriptor on the bare TypedArray exotic.
-        // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-getownproperty-p>
-        Some(Value::TypedArray(target)) => match &key {
+        }
+    } else if let Some(target) = first.as_typed_array() {
+        // §10.4.5.1 IntegerIndexedExoticObject [[GetOwnProperty]].
+        match &key {
             PropertyKey::String(k) => {
                 if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(k) {
                     if target.buffer(ctx.heap()).is_detached(ctx.heap())
@@ -727,31 +730,19 @@ fn native_get_own_property_descriptor_rooted(
             PropertyKey::Symbol(sym) => target
                 .expando(ctx.heap())
                 .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, ctx.heap(), sym)),
-        },
-        // §20.1.2.7 — primitive operands are coerced via ToObject;
-        // the wrapper carries no own data property for arbitrary
-        // keys (except String which exposes indexed characters and
-        // `length`, handled in the dedicated arms above). Returning
-        // `Undefined` matches the spec's "no such own property"
-        // path without materialising a transient wrapper.
-        Some(
-            Value::Boolean(_)
-            | Value::Number(_)
-            | Value::String(_)
-            | Value::Symbol(_)
-            | Value::BigInt(_),
-        ) => None,
-        Some(Value::Null) | Some(Value::Undefined) | None => {
-            return Err(VmError::TypeError {
-                message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
-                    .to_string(),
-            });
         }
-        _ => {
-            return Err(VmError::TypeError {
-                message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
-            });
-        }
+    } else if first.is_boolean()
+        || first.is_number()
+        || first.is_string()
+        || first.is_symbol()
+        || first.is_big_int()
+    {
+        // §20.1.2.7 — primitive operands carry no own data property.
+        None
+    } else {
+        return Err(VmError::TypeError {
+            message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
+        });
     };
     match desc {
         Some(desc) => Ok(Value::object(native_descriptor_to_object_rooted(
@@ -770,7 +761,7 @@ fn native_get_own_property_descriptors_rooted(
     args: &[Value],
 ) -> Result<Value, VmError> {
     let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
-    if matches!(target, Value::Null | Value::Undefined) {
+    if target.is_nullish() {
         return Err(VmError::TypeError {
             message: "Object.getOwnPropertyDescriptors called on null or undefined".to_string(),
         });
@@ -778,7 +769,7 @@ fn native_get_own_property_descriptors_rooted(
     // §20.1.2.9 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
     let object_proto = ctx.cx.interp.constructor_prototype_value("Object").ok();
     let result = ctx.alloc_object_with_roots(&[&target], &[args])?;
-    if let Some(Value::Object(proto_obj)) = object_proto {
+    if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
         crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
     }
     if !is_object_like_value(&target) {
@@ -791,10 +782,12 @@ fn native_get_own_property_descriptors_rooted(
 
     let keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
     for key in keys {
-        let key_for_descriptor = match &key {
-            Value::String(s) => Value::string(*s),
-            Value::Symbol(sym) => Value::symbol(*sym),
-            _ => continue,
+        let key_for_descriptor = if let Some(s) = key.as_string() {
+            Value::string(*s)
+        } else if let Some(sym) = key.as_symbol() {
+            Value::symbol(*sym)
+        } else {
+            continue;
         };
         let Some(desc) = ctx.cx.interp.get_own_property_descriptor_for_value(
             context,
@@ -806,25 +799,16 @@ fn native_get_own_property_descriptors_rooted(
         };
         let desc_obj =
             native_descriptor_to_object_rooted(ctx, &desc, &[&target, &result_root], args)?;
-        match key {
-            Value::String(s) => {
-                ctx.set_property(
-                    result,
-                    &s.to_lossy_string(ctx.heap()),
-                    Value::Object(desc_obj),
-                )?;
-            }
-            Value::Symbol(sym)
-                if !crate::object::set_symbol(
-                    result,
-                    ctx.heap_mut(),
-                    sym,
-                    Value::Object(desc_obj),
-                ) =>
-            {
-                return Err(VmError::TypeMismatch);
-            }
-            _ => {}
+        if let Some(s) = key.as_string() {
+            ctx.set_property(
+                result,
+                &s.to_lossy_string(ctx.heap()),
+                Value::object(desc_obj),
+            )?;
+        } else if let Some(sym) = key.as_symbol()
+            && !crate::object::set_symbol(result, ctx.heap_mut(), *sym, Value::object(desc_obj))
+        {
+            return Err(VmError::TypeMismatch);
         }
     }
     Ok(Value::object(result))
@@ -835,48 +819,45 @@ fn native_get_own_property_names_rooted(
     context: Option<&crate::ExecutionContext>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    let values: Vec<Value> = match args.first() {
-        Some(target)
-            if matches!(
-                target,
-                Value::Object(_)
-                    | Value::Array(_)
-                    | Value::Proxy(_)
-                    | Value::Function { .. }
-                    | Value::Closure(_)
-                    | Value::NativeFunction(_)
-                    | Value::BoundFunction(_)
-            ) =>
-        {
-            let Some(context) = context else {
-                return Err(VmError::InvalidOperand);
-            };
-            let target = *target;
-            ctx.cx
-                .interp
-                .own_property_keys_value(context, &target)?
-                .into_iter()
-                .filter(|v| matches!(v, Value::String(_)))
-                .collect()
-        }
-        Some(Value::ClassConstructor(class)) => {
-            let keys = ctx
-                .cx
-                .interp
-                .class_constructor_own_property_keys(context, *class)?;
-            keys.into_iter()
-                .map(|key| string_value(&key, ctx.heap_mut()))
-                .collect::<Result<Vec<_>, _>>()?
-        }
-        Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
-        Some(Value::String(s)) => {
-            let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
-            keys.push("length".to_string());
-            keys.into_iter()
-                .map(|key| string_value(&key, ctx.heap_mut()))
-                .collect::<Result<Vec<_>, _>>()?
-        }
-        _ => return Err(VmError::TypeMismatch),
+    let Some(first) = args.first() else {
+        return Err(VmError::TypeMismatch);
+    };
+    let values: Vec<Value> = if first.is_object()
+        || first.is_array()
+        || first.is_proxy()
+        || first.is_function()
+        || first.is_closure()
+        || first.is_native_function()
+        || first.is_bound_function()
+    {
+        let Some(context) = context else {
+            return Err(VmError::InvalidOperand);
+        };
+        let target = *first;
+        ctx.cx
+            .interp
+            .own_property_keys_value(context, &target)?
+            .into_iter()
+            .filter(|v| v.is_string())
+            .collect()
+    } else if let Some(class) = first.as_class_constructor() {
+        let keys = ctx
+            .cx
+            .interp
+            .class_constructor_own_property_keys(context, class)?;
+        keys.into_iter()
+            .map(|key| string_value(&key, ctx.heap_mut()))
+            .collect::<Result<Vec<_>, _>>()?
+    } else if first.is_boolean() || first.is_number() || first.is_symbol() {
+        Vec::new()
+    } else if let Some(s) = first.as_string() {
+        let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
+        keys.push("length".to_string());
+        keys.into_iter()
+            .map(|key| string_value(&key, ctx.heap_mut()))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        return Err(VmError::TypeMismatch);
     };
     Ok(Value::array(ctx.array_from_elements_with_roots(
         values,
@@ -890,16 +871,16 @@ fn class_constructor_own_property_keys_without_context(
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<Vec<String>, VmError> {
     let ctor = class.ctor(gc_heap);
-    let mut keys = match ctor {
-        Value::NativeFunction(native) => native.own_property_keys(gc_heap),
-        Value::BoundFunction(bound) => {
-            crate::function_metadata::bound_own_property_keys(&bound, gc_heap)
-        }
-        Value::ClassConstructor(inner) => {
-            class_constructor_own_property_keys_without_context(&inner, gc_heap)?
-        }
-        Value::Function { .. } | Value::Closure(_) => return Err(VmError::InvalidOperand),
-        _ => Vec::new(),
+    let mut keys = if let Some(native) = ctor.as_native_function() {
+        native.own_property_keys(gc_heap)
+    } else if let Some(bound) = ctor.as_bound_function() {
+        crate::function_metadata::bound_own_property_keys(&bound, gc_heap)
+    } else if let Some(inner) = ctor.as_class_constructor() {
+        class_constructor_own_property_keys_without_context(&inner, gc_heap)?
+    } else if ctor.is_function() || ctor.is_closure() {
+        return Err(VmError::InvalidOperand);
+    } else {
+        Vec::new()
     };
     if !keys.iter().any(|key| key == "prototype") {
         keys.push("prototype".to_string());
@@ -919,17 +900,14 @@ fn native_get_own_property_symbols_rooted(
     context: Option<&crate::ExecutionContext>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    if let Some(target @ Value::Proxy(_)) = args.first() {
+    if args.first().is_some_and(|v| v.is_proxy()) {
         let Some(context) = context else {
             return Err(VmError::InvalidOperand);
         };
-        let target = *target;
+        let target = *args.first().expect("guarded");
 
         let trap_keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
-        let values: Vec<Value> = trap_keys
-            .into_iter()
-            .filter(|v| matches!(v, Value::Symbol(_)))
-            .collect();
+        let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_symbol()).collect();
         return Ok(Value::array(ctx.array_from_elements_with_roots(
             values,
             &[&target],
@@ -938,7 +916,7 @@ fn native_get_own_property_symbols_rooted(
     }
     let target = expect_object(args.first())?;
     let syms: Vec<Value> = crate::object::with_properties(target, ctx.heap(), |p| {
-        p.symbol_keys().map(Value::Symbol).collect()
+        p.symbol_keys().map(Value::symbol).collect()
     });
     let target_root = Value::object(target);
     Ok(Value::array(ctx.array_from_elements_with_roots(
@@ -973,21 +951,21 @@ fn native_descriptor_to_object_rooted(
     // `Object.getPrototypeOf(desc)`) observe a null-proto object.
     let object_proto = ctx.cx.interp.constructor_prototype_value("Object").ok();
     let result = ctx.alloc_object_with_roots(roots.as_slice(), &[args])?;
-    if let Some(Value::Object(proto_obj)) = object_proto {
+    if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
         crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
     }
     match &desc.kind {
         DescriptorKind::Data { value } => {
             ctx.set_property(result, "value", *value)?;
-            ctx.set_property(result, "writable", Value::Boolean(desc.writable()))?;
+            ctx.set_property(result, "writable", Value::boolean(desc.writable()))?;
         }
         DescriptorKind::Accessor { getter, setter } => {
             ctx.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
             ctx.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
         }
     }
-    ctx.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
-    ctx.set_property(result, "configurable", Value::Boolean(desc.configurable()))?;
+    ctx.set_property(result, "enumerable", Value::boolean(desc.enumerable()))?;
+    ctx.set_property(result, "configurable", Value::boolean(desc.configurable()))?;
     Ok(result)
 }
 
@@ -1069,12 +1047,11 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             reason: "missing execution context".to_string(),
         })?;
     let interp = ctx.interp_mut();
-    if let Value::Function { function_id }
-    | Value::Closure(crate::closure::JsClosure {
-        cached_function_id: function_id,
-        ..
-    }) = &target
-        && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, *function_id)
+    let function_id = target
+        .as_function()
+        .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+    if let Some(function_id) = function_id
+        && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, function_id)
     {
         return Ok(Value::object(proto));
     }
@@ -1089,13 +1066,13 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::undefined());
     let proto = args.get(1).cloned().unwrap_or(Value::undefined());
-    if matches!(target, Value::Null | Value::Undefined) {
+    if target.is_nullish() {
         return Err(NativeError::TypeError {
             name: "Object.setPrototypeOf",
             reason: "Object.setPrototypeOf called on null or undefined".to_string(),
         });
     }
-    if !matches!(proto, Value::Null) && !is_object_like_value(&proto) {
+    if !proto.is_null() && !is_object_like_value(&proto) {
         return Err(NativeError::TypeError {
             name: "Object.setPrototypeOf",
             reason: "Object.setPrototypeOf prototype must be an Object or null".to_string(),
@@ -1169,24 +1146,31 @@ fn object_prototype_to_object(
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let (proto_name, setter): (&str, fn(JsObject, &mut otter_gc::GcHeap, &Value)) =
-        match &this_value {
-            Value::Null | Value::Undefined => {
-                return Err(NativeError::TypeError {
-                    name: method_name,
-                    reason: "cannot convert null or undefined to object".to_string(),
-                });
-            }
-            Value::Boolean(_) => ("Boolean", set_primitive_wrapper_data),
-            Value::Number(_) => ("Number", set_primitive_wrapper_data),
-            Value::String(_) => ("String", set_primitive_wrapper_data),
-            Value::Symbol(_) => ("Symbol", set_primitive_wrapper_data),
-            Value::BigInt(_) => ("BigInt", set_primitive_wrapper_data),
-            _ => return Ok(this_value),
+        if this_value.is_nullish() {
+            return Err(NativeError::TypeError {
+                name: method_name,
+                reason: "cannot convert null or undefined to object".to_string(),
+            });
+        } else if this_value.is_boolean() {
+            ("Boolean", set_primitive_wrapper_data)
+        } else if this_value.is_number() {
+            ("Number", set_primitive_wrapper_data)
+        } else if this_value.is_string() {
+            ("String", set_primitive_wrapper_data)
+        } else if this_value.is_symbol() {
+            ("Symbol", set_primitive_wrapper_data)
+        } else if this_value.is_big_int() {
+            ("BigInt", set_primitive_wrapper_data)
+        } else {
+            return Ok(this_value);
         };
-    let proto = match ctx.cx.interp.constructor_prototype_value(proto_name).ok() {
-        Some(Value::Object(proto)) => Some(proto),
-        _ => ctx.cx.interp.object_prototype_object_opt(),
-    };
+    let proto = ctx
+        .cx
+        .interp
+        .constructor_prototype_value(proto_name)
+        .ok()
+        .and_then(|v| v.as_object())
+        .or_else(|| ctx.cx.interp.object_prototype_object_opt());
     let wrapper = ctx.alloc_object_with_roots(&[&this_value], &[])?;
     if let Some(proto) = proto {
         crate::object::set_prototype(wrapper, ctx.heap_mut(), Some(proto));
@@ -1196,13 +1180,16 @@ fn object_prototype_to_object(
 }
 
 fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, value: &Value) {
-    match value {
-        Value::Boolean(value) => crate::object::set_boolean_data(wrapper, heap, *value),
-        Value::Number(value) => crate::object::set_number_data(wrapper, heap, *value),
-        Value::String(value) => crate::object::set_string_data(wrapper, heap, *value),
-        Value::Symbol(value) => crate::object::set_symbol_data(wrapper, heap, *value),
-        Value::BigInt(value) => crate::object::set_bigint_data(wrapper, heap, *value),
-        _ => {}
+    if let Some(b) = value.as_boolean() {
+        crate::object::set_boolean_data(wrapper, heap, b);
+    } else if let Some(n) = value.as_number() {
+        crate::object::set_number_data(wrapper, heap, n);
+    } else if let Some(s) = value.as_string() {
+        crate::object::set_string_data(wrapper, heap, *s);
+    } else if let Some(sym) = value.as_symbol() {
+        crate::object::set_symbol_data(wrapper, heap, *sym);
+    } else if let Some(bi) = value.as_big_int() {
+        crate::object::set_bigint_data(wrapper, heap, bi);
     }
 }
 
@@ -1256,7 +1243,7 @@ fn native_prototype_has_own_property(
                 args.first().cloned().unwrap_or(Value::undefined()),
             )
             .map_err(|err| object_native_error("hasOwnProperty", err))?;
-        if matches!(this_value, Value::Null | Value::Undefined) {
+        if this_value.is_nullish() {
             return Err(NativeError::TypeError {
                 name: "hasOwnProperty",
                 reason: "cannot convert null or undefined to object".to_string(),
@@ -1276,38 +1263,33 @@ fn native_prototype_has_own_property(
             .map_err(|err| object_native_error("hasOwnProperty", err))?;
         return Ok(Value::boolean(desc.is_some()));
     }
-    if matches!(this_value, Value::Null | Value::Undefined) {
+    if this_value.is_nullish() {
         return Err(NativeError::TypeError {
             name: "hasOwnProperty",
             reason: "cannot convert null or undefined to object".to_string(),
         });
     }
     let this_kind = *ctx.this_value();
-    let present = match &this_kind {
-        Value::Object(obj) => has_own_property(*obj, ctx.heap(), args.first())
-            .map_err(|err| object_native_error("hasOwnProperty", err))?,
-        Value::NativeFunction(native) => {
-            let native = *native;
-            native_function_has_own(&native, ctx.heap_mut(), args.first())
+    let present = if let Some(obj) = this_kind.as_object() {
+        has_own_property(obj, ctx.heap(), args.first())
+            .map_err(|err| object_native_error("hasOwnProperty", err))?
+    } else if let Some(native) = this_kind.as_native_function() {
+        native_function_has_own(&native, ctx.heap_mut(), args.first())
+    } else if let Some(bound) = this_kind.as_bound_function() {
+        bound_function_has_own(&bound, ctx.heap(), args.first())
+    } else if let Some(class) = this_kind.as_class_constructor() {
+        let key = args.first();
+        let is_prototype_key = key
+            .and_then(|v| v.as_string())
+            .is_some_and(|s| s.to_lossy_string(ctx.heap()) == "prototype");
+        if is_prototype_key {
+            true
+        } else {
+            has_own_property(class.statics(ctx.heap()), ctx.heap(), key)
+                .map_err(|err| object_native_error("hasOwnProperty", err))?
         }
-        Value::BoundFunction(bound) => bound_function_has_own(bound, ctx.heap(), args.first()),
-        Value::ClassConstructor(class) => {
-            // The own-property surface for a `ClassConstructor` is
-            // its `statics` object plus the spec-mandated
-            // `prototype` property. Mirror the property-load path
-            // (which falls through to `statics`) so spec checks
-            // like `Number.hasOwnProperty("EPSILON")` see the
-            // installed statics.
-            let key = args.first();
-            if matches!(key, Some(Value::String(s)) if s.to_lossy_string(ctx.heap()) == "prototype")
-            {
-                true
-            } else {
-                has_own_property(class.statics(ctx.heap()), ctx.heap(), key)
-                    .map_err(|err| object_native_error("hasOwnProperty", err))?
-            }
-        }
-        _ => false,
+    } else {
+        false
     };
     Ok(Value::boolean(present))
 }
@@ -1317,7 +1299,7 @@ fn native_prototype_property_is_enumerable(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    if matches!(this_value, Value::Null | Value::Undefined) {
+    if this_value.is_nullish() {
         return Err(NativeError::TypeError {
             name: "propertyIsEnumerable",
             reason: "cannot convert null or undefined to object".to_string(),
@@ -1334,54 +1316,46 @@ fn native_prototype_property_is_enumerable(
         ));
     }
     let this_clone = *ctx.this_value();
-    let enumerable = match &this_clone {
-        Value::Object(obj) => {
-            let key = expect_property_key(args.first(), ctx.heap())
-                .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
-            match key {
-                PropertyKey::String(key) => {
-                    match crate::object::lookup_own(*obj, ctx.heap(), &key) {
-                        PropertyLookup::Data { flags, .. }
-                        | PropertyLookup::Accessor { flags, .. } => flags.enumerable(),
-                        PropertyLookup::Absent => false,
-                    }
+    let enumerable = if let Some(obj) = this_clone.as_object() {
+        let key = expect_property_key(args.first(), ctx.heap())
+            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        match key {
+            PropertyKey::String(key) => match crate::object::lookup_own(obj, ctx.heap(), &key) {
+                PropertyLookup::Data { flags, .. } | PropertyLookup::Accessor { flags, .. } => {
+                    flags.enumerable()
                 }
-                PropertyKey::Symbol(sym) => {
-                    match crate::object::lookup_own_symbol(*obj, ctx.heap(), &sym) {
-                        PropertyLookup::Data { flags, .. }
-                        | PropertyLookup::Accessor { flags, .. } => flags.enumerable(),
-                        PropertyLookup::Absent => false,
+                PropertyLookup::Absent => false,
+            },
+            PropertyKey::Symbol(sym) => {
+                match crate::object::lookup_own_symbol(obj, ctx.heap(), &sym) {
+                    PropertyLookup::Data { flags, .. } | PropertyLookup::Accessor { flags, .. } => {
+                        flags.enumerable()
                     }
+                    PropertyLookup::Absent => false,
                 }
             }
         }
-        Value::NativeFunction(native) => {
-            let native = *native;
-            let key_owned = expect_property_key(args.first(), ctx.heap())
-                .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
-            let desc = match key_owned {
-                PropertyKey::String(key) => native
-                    .own_property_descriptor(ctx.heap_mut(), &key)
-                    .map_err(|err| object_native_error("propertyIsEnumerable", err.into()))?,
-                PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), &sym),
-            };
-            desc.as_ref().is_some_and(PropertyDescriptor::enumerable)
-        }
-        Value::BoundFunction(bound) => {
-            let key = expect_property_key(args.first(), ctx.heap())
-                .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
-            match key {
-                PropertyKey::String(key) => {
-                    crate::function_metadata::bound_own_property_is_enumerable(
-                        bound,
-                        ctx.heap(),
-                        &key,
-                    )
-                }
-                PropertyKey::Symbol(_) => false,
+    } else if let Some(native) = this_clone.as_native_function() {
+        let key_owned = expect_property_key(args.first(), ctx.heap())
+            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        let desc = match key_owned {
+            PropertyKey::String(key) => native
+                .own_property_descriptor(ctx.heap_mut(), &key)
+                .map_err(|err| object_native_error("propertyIsEnumerable", err.into()))?,
+            PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), &sym),
+        };
+        desc.as_ref().is_some_and(PropertyDescriptor::enumerable)
+    } else if let Some(bound) = this_clone.as_bound_function() {
+        let key = expect_property_key(args.first(), ctx.heap())
+            .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
+        match key {
+            PropertyKey::String(key) => {
+                crate::function_metadata::bound_own_property_is_enumerable(&bound, ctx.heap(), &key)
             }
+            PropertyKey::Symbol(_) => false,
         }
-        _ => false,
+    } else {
+        false
     };
     Ok(Value::boolean(enumerable))
 }
@@ -1395,7 +1369,7 @@ fn native_prototype_is_prototype_of(
     if !is_object_like_value(&target) {
         return Ok(Value::boolean(false));
     }
-    if matches!(this_value, Value::Null | Value::Undefined) {
+    if this_value.is_nullish() {
         return Err(NativeError::TypeError {
             name: "isPrototypeOf",
             reason: "cannot convert null or undefined to object".to_string(),
@@ -1418,7 +1392,7 @@ fn native_prototype_is_prototype_of(
             .interp
             .ordinary_get_prototype_value(&exec_ctx, current, 0)
             .map_err(|err| object_native_error("isPrototypeOf", err))?;
-        if matches!(proto, Value::Null) {
+        if proto.is_null() {
             return Ok(Value::boolean(false));
         }
         if crate::abstract_ops::same_value(&this_value, &proto, ctx.heap()) {
@@ -1442,7 +1416,7 @@ pub fn native_prototype_proto_get(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    if matches!(this_value, Value::Null | Value::Undefined) {
+    if this_value.is_nullish() {
         return Err(NativeError::TypeError {
             name: "get __proto__",
             reason: "cannot convert null or undefined to object".to_string(),
@@ -1461,26 +1435,28 @@ pub fn native_prototype_proto_get(
         return Ok(result);
     }
     // Context-less fallback (sync embedders without a JS frame).
-    match this_value {
-        Value::Object(o) => {
-            Ok(crate::object::prototype_value(o, ctx.heap()).unwrap_or(Value::null()))
-        }
-        _ => {
-            let name = match ctx.this_value() {
-                Value::Boolean(_) => "Boolean",
-                Value::Number(_) => "Number",
-                Value::String(_) => "String",
-                Value::Symbol(_) => "Symbol",
-                Value::BigInt(_) => "BigInt",
-                _ => return Ok(Value::null()),
-            };
-            Ok(ctx
-                .cx
-                .interp
-                .constructor_prototype_value(name)
-                .unwrap_or(Value::null()))
-        }
+    if let Some(o) = this_value.as_object() {
+        return Ok(crate::object::prototype_value(o, ctx.heap()).unwrap_or(Value::null()));
     }
+    let recv = ctx.this_value();
+    let name = if recv.is_boolean() {
+        "Boolean"
+    } else if recv.is_number() {
+        "Number"
+    } else if recv.is_string() {
+        "String"
+    } else if recv.is_symbol() {
+        "Symbol"
+    } else if recv.is_big_int() {
+        "BigInt"
+    } else {
+        return Ok(Value::null());
+    };
+    Ok(ctx
+        .cx
+        .interp
+        .constructor_prototype_value(name)
+        .unwrap_or(Value::null()))
 }
 
 /// §B.2.2.1.2 `set Object.prototype.__proto__` — installs a new
@@ -1500,7 +1476,7 @@ pub fn native_prototype_proto_set(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    if matches!(this_value, Value::Null | Value::Undefined) {
+    if this_value.is_nullish() {
         return Err(NativeError::TypeError {
             name: "set __proto__",
             reason: "cannot convert null or undefined to object".to_string(),
@@ -1511,14 +1487,11 @@ pub fn native_prototype_proto_set(
     // honoured; everything else returns undefined without
     // mutating. Proxy-as-prototype is admissible via the broader
     // value lattice.
-    if !matches!(
-        &proto_value,
-        Value::Object(_) | Value::Null | Value::Proxy(_)
-    ) {
+    if !(proto_value.is_object() || proto_value.is_null() || proto_value.is_proxy()) {
         return Ok(Value::undefined());
     }
     // §B.2.2.1.2 step 3 — non-object receivers silently no-op.
-    if !matches!(this_value, Value::Object(_) | Value::Proxy(_)) {
+    if !this_value.is_object() || this_value.is_proxy() {
         return Ok(Value::undefined());
     }
     // §20.1.3 — `Object.prototype` is an immutable-prototype
@@ -1526,7 +1499,7 @@ pub fn native_prototype_proto_set(
     // current `[[Prototype]]` so
     // `Object.prototype.__proto__ = X` throws TypeError unless
     // `X` already matches.
-    if let Value::Object(obj) = this_value {
+    if let Some(obj) = this_value.as_object() {
         let object_proto = ctx.cx.interp.object_prototype_object_opt();
         if object_proto == Some(obj) {
             let current = crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::null());
@@ -1600,7 +1573,7 @@ fn define_accessor_helper(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    if matches!(this_value, Value::Null | Value::Undefined) {
+    if this_value.is_nullish() {
         return Err(NativeError::TypeError {
             name: method_name,
             reason: "cannot convert null or undefined to object".to_string(),
@@ -1647,7 +1620,7 @@ fn define_accessor_helper(
         return Ok(Value::undefined());
     }
 
-    let Value::Object(target) = this_value else {
+    let Some(target) = this_value.as_object() else {
         // §7.1.18 ToObject — primitives wrap. The accessor lands on
         // the transient wrapper which is discarded once the call
         // returns, mirroring V8/JSC.
@@ -1713,7 +1686,7 @@ fn lookup_accessor_helper(
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    if matches!(this_value, Value::Null | Value::Undefined) {
+    if this_value.is_nullish() {
         return Err(NativeError::TypeError {
             name: method_name,
             reason: "cannot convert null or undefined to object".to_string(),
@@ -1756,19 +1729,15 @@ fn lookup_accessor_helper(
                 .interp
                 .ordinary_get_prototype_value(&exec_ctx, value, 0)
                 .map_err(|err| object_native_error(method_name, err))?;
-            current = if matches!(proto, Value::Null) {
-                None
-            } else {
-                Some(proto)
-            };
+            current = if proto.is_null() { None } else { Some(proto) };
         }
         return Ok(Value::undefined());
     }
 
-    let mut current = match this_value {
-        Value::Object(o) => Some(o),
-        _ => return Ok(Value::undefined()),
+    let Some(start) = this_value.as_object() else {
+        return Ok(Value::undefined());
     };
+    let mut current = Some(start);
     while let Some(obj) = current {
         let lookup = match &key {
             PropertyKey::String(name) => crate::object::lookup_own(obj, ctx.heap(), name),
@@ -1802,76 +1771,84 @@ fn property_key_to_vm_key(key: &PropertyKey) -> crate::VmPropertyKey<'static> {
 /// `"Object"` and relies on a prototype-installed `@@toStringTag`
 /// for its kind-specific string.
 fn builtin_to_string_tag(ctx: &NativeCtx<'_>) -> String {
-    match ctx.this_value() {
-        Value::Undefined | Value::Hole => "Undefined",
-        Value::Null => "Null",
-        // Primitives outside the builtin-tag table — spec step 14
-        // promotes them to `"Object"`. Their wrapper prototype's
-        // `@@toStringTag` (e.g. `Symbol.prototype[@@toStringTag] =
-        // "Symbol"`) re-installs the kind-specific string before
-        // step 16 falls back here.
-        Value::Boolean(_) => "Boolean",
-        Value::Number(_) => "Number",
-        Value::String(_) => "String",
-        Value::BigInt(_) | Value::Symbol(_) => "Object",
-        // §20.1.3.6 step 14.a — `[[Call]]` slot.
-        Value::Function { .. } | Value::Closure(_) => "Function",
-        Value::BoundFunction(_) | Value::NativeFunction(_) | Value::ClassConstructor(_) => {
-            "Function"
-        }
-        // §20.1.3.6 step 14.i / §6.1.7.3 IsArray — Array exotic.
-        Value::Array(_) => "Array",
-        // §20.1.3.6 step 14.f / §22.2.7 — `[[RegExpMatcher]]` slot.
-        Value::RegExp(_) => "RegExp",
-        // All other exotic value kinds without a builtin-tag entry —
-        // the prototype-installed `@@toStringTag` carries the
-        // kind-specific name (`Map.prototype[@@toStringTag] =
-        // "Map"`, etc.). Tests like
-        // `delete Map.prototype[Symbol.toStringTag]; toString.call(
-        // new Map()) === "[object Object]"` require this fallback.
-        Value::Promise(_)
-        | Value::Map(_)
-        | Value::Set(_)
-        | Value::WeakMap(_)
-        | Value::WeakSet(_)
-        | Value::WeakRef(_)
-        | Value::FinalizationRegistry(_)
-        | Value::Generator(_)
-        | Value::Iterator(_)
-        | Value::Temporal(_)
-        | Value::Intl(_)
-        | Value::ArrayBuffer(_)
-        | Value::DataView(_)
-        | Value::TypedArray(_) => "Object",
-        // §20.1.3.6 step 14.c — `[[ParameterMap]]` (arguments
-        // exotic) bumps the builtin tag to `"Arguments"`.
-        Value::Object(obj) if crate::object::is_arguments_object(*obj, ctx.heap()) => "Arguments",
-        // §20.1.3.6 step 14.e — `[[DateValue]]` slot.
-        Value::Object(obj) if crate::object::date_data(*obj, ctx.heap()).is_some() => "Date",
-        // §20.1.3.6 step 14.a — `[[Call]]` slot on the boxed callable.
-        Value::Object(obj) if crate::object::call_native(*obj, ctx.heap()).is_some() => "Function",
-        // §20.1.3.6 step 14 internal-slot tags. Otter tags the boxed
-        // Boolean / Number / String wrappers via the per-kind
-        // internal-slot accessors so reflective probes
-        // (`Object.prototype.toString.call(new Number(1))`) and the
-        // spec-mandated `Number.prototype.toString` /
-        // `Boolean.prototype.toString` defaults pick up the right
-        // builtinTag.
-        Value::Object(obj) if crate::object::boolean_data(*obj, ctx.heap()).is_some() => "Boolean",
-        Value::Object(obj) if crate::object::number_data(*obj, ctx.heap()).is_some() => "Number",
-        Value::Object(obj) if crate::object::string_data(*obj, ctx.heap()).is_some() => "String",
-        // §20.1.3.6 step 14.b — if `O` has an `[[ErrorData]]` internal
-        // slot, the built-in tag is `"Error"`. Otter does not carry
-        // an explicit slot; treat any ordinary object whose prototype
-        // chain reaches one of the realm error prototypes as having
-        // the slot.
-        Value::Object(obj) if object_has_error_data(ctx, *obj) => "Error",
-        // §7.2.2 IsArray walks `[[ProxyTarget]]` recursively so a
-        // proxy whose target is an Array reports `[object Array]`.
-        Value::Proxy(_) => return proxy_builtin_tag(ctx.this_value(), ctx.heap()),
-        Value::Object(_) => "Object",
+    let v = ctx.this_value();
+    if v.is_undefined() || v.is_hole() {
+        return "Undefined".to_string();
     }
-    .to_string()
+    if v.is_null() {
+        return "Null".to_string();
+    }
+    if v.is_boolean() {
+        return "Boolean".to_string();
+    }
+    if v.is_number() {
+        return "Number".to_string();
+    }
+    if v.is_string() {
+        return "String".to_string();
+    }
+    if v.is_big_int() || v.is_symbol() {
+        return "Object".to_string();
+    }
+    if v.is_function()
+        || v.is_closure()
+        || v.is_bound_function()
+        || v.is_native_function()
+        || v.is_class_constructor()
+    {
+        return "Function".to_string();
+    }
+    if v.is_array() {
+        return "Array".to_string();
+    }
+    if v.is_regexp() {
+        return "RegExp".to_string();
+    }
+    if v.is_promise()
+        || v.is_map()
+        || v.is_set()
+        || v.is_weak_map()
+        || v.is_weak_set()
+        || v.is_weak_ref()
+        || v.is_finalization_registry()
+        || v.is_generator()
+        || v.is_iterator()
+        || v.is_temporal()
+        || v.is_intl()
+        || v.is_array_buffer()
+        || v.is_data_view()
+        || v.is_typed_array()
+    {
+        return "Object".to_string();
+    }
+    if v.is_proxy() {
+        return proxy_builtin_tag(v, ctx.heap());
+    }
+    if let Some(obj) = v.as_object() {
+        if crate::object::is_arguments_object(obj, ctx.heap()) {
+            return "Arguments".to_string();
+        }
+        if crate::object::date_data(obj, ctx.heap()).is_some() {
+            return "Date".to_string();
+        }
+        if crate::object::call_native(obj, ctx.heap()).is_some() {
+            return "Function".to_string();
+        }
+        if crate::object::boolean_data(obj, ctx.heap()).is_some() {
+            return "Boolean".to_string();
+        }
+        if crate::object::number_data(obj, ctx.heap()).is_some() {
+            return "Number".to_string();
+        }
+        if crate::object::string_data(obj, ctx.heap()).is_some() {
+            return "String".to_string();
+        }
+        if object_has_error_data(ctx, obj) {
+            return "Error".to_string();
+        }
+        return "Object".to_string();
+    }
+    "Object".to_string()
 }
 
 /// §7.2.2 IsArray + §7.2.4 IsCallable for a Proxy target. Walks the
@@ -1885,20 +1862,25 @@ fn proxy_builtin_tag(value: &Value, heap: &otter_gc::GcHeap) -> String {
             return "Object".to_string();
         }
         hops += 1;
-        match current {
-            Value::Proxy(p) => {
-                if p.is_revoked(heap) {
-                    return "Object".to_string();
-                }
-                current = p.target(heap);
+        if let Some(p) = current.as_proxy() {
+            if p.is_revoked(heap) {
+                return "Object".to_string();
             }
-            Value::Array(_) => return "Array".to_string(),
-            Value::Function { .. } | Value::Closure(_) => return "Function".to_string(),
-            Value::BoundFunction(_) | Value::NativeFunction(_) | Value::ClassConstructor(_) => {
-                return "Function".to_string();
-            }
-            _ => return "Object".to_string(),
+            current = p.target(heap);
+            continue;
         }
+        if current.is_array() {
+            return "Array".to_string();
+        }
+        if current.is_function()
+            || current.is_closure()
+            || current.is_bound_function()
+            || current.is_native_function()
+            || current.is_class_constructor()
+        {
+            return "Function".to_string();
+        }
+        return "Object".to_string();
     }
 }
 
@@ -1960,7 +1942,7 @@ fn explicit_to_string_tag_with_context(
     // ladder. The `Hole` sentinel never reaches user code, but if it
     // somehow does, behave like `undefined`.
     let this_value = *ctx.this_value();
-    if matches!(this_value, Value::Undefined | Value::Null | Value::Hole) {
+    if this_value.is_nullish() || this_value.is_hole() {
         return Ok(None);
     }
     let tag_symbol = ctx
@@ -1972,7 +1954,7 @@ fn explicit_to_string_tag_with_context(
     // `ordinary_get_value`; route the lookup through
     // `String.prototype` explicitly so user-installed
     // `String.prototype[@@toStringTag]` overrides surface.
-    let base: Value = if matches!(this_value, Value::String(_)) {
+    let base: Value = if this_value.is_string() {
         match ctx.cx.interp.constructor_prototype_value("String").ok() {
             Some(p) => p,
             None => return Ok(None),
@@ -2065,7 +2047,7 @@ pub fn call(
                 return Err(VmError::TypeMismatch);
             }
             if let Some(props_arg) = args.get(1)
-                && !matches!(props_arg, Value::Undefined)
+                && !props_arg.is_undefined()
             {
                 let props = match props_arg {
                     Value::Object(o) => *o,
@@ -2491,8 +2473,8 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.freeze>
         M::Freeze => {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
-            if let Value::Object(o) = &arg {
-                crate::object::freeze(*o, gc_heap);
+            if let Some(o) = arg.as_object() {
+                crate::object::freeze(o, gc_heap);
             }
             // Spec: returns the argument unchanged (non-objects pass
             // through).
@@ -2501,19 +2483,20 @@ pub fn call(
         // §20.1.2.20 Object.seal(O)
         M::Seal => {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
-            if let Value::Object(o) = &arg {
-                crate::object::seal(*o, gc_heap);
+            if let Some(o) = arg.as_object() {
+                crate::object::seal(o, gc_heap);
             }
             Ok(arg)
         }
         // §20.1.2.18 Object.preventExtensions(O)
         M::PreventExtensions => {
             let arg = args.first().cloned().unwrap_or(Value::undefined());
-            match &arg {
-                Value::Object(o) => crate::object::prevent_extensions(*o, gc_heap),
-                Value::Array(a) => crate::array::prevent_extensions(*a, gc_heap),
-                Value::RegExp(r) => r.prevent_extensions(gc_heap),
-                _ => {}
+            if let Some(o) = arg.as_object() {
+                crate::object::prevent_extensions(o, gc_heap);
+            } else if let Some(a) = arg.as_array() {
+                crate::array::prevent_extensions(a, gc_heap);
+            } else if let Some(r) = arg.as_regexp() {
+                r.prevent_extensions(gc_heap);
             }
             Ok(arg)
         }
@@ -2524,31 +2507,10 @@ pub fn call(
             // exotics default to extensible+configurable so they are
             // not frozen unless the foundation explicitly toggles
             // their `[[Extensible]]` slot.
-            let result = match arg {
-                Value::Object(o) => crate::object::is_frozen(o, gc_heap),
-                Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::BoundFunction(_)
-                | Value::NativeFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-                | Value::Iterator(_)
-                | Value::Generator(_)
-                | Value::Temporal(_)
-                | Value::Intl(_)
-                | Value::Proxy(_) => false,
-                _ => true,
+            let result = if let Some(o) = arg.as_object() {
+                crate::object::is_frozen(o, gc_heap)
+            } else {
+                !arg.is_object_like()
             };
             Ok(Value::boolean(result))
         }
@@ -2564,31 +2526,10 @@ pub fn call(
             // `false` because their elements / lazy expando bags
             // remain configurable until `preventExtensions` is
             // applied through the foundation surface.
-            let result = match arg {
-                Value::Object(o) => crate::object::is_sealed(o, gc_heap),
-                Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::BoundFunction(_)
-                | Value::NativeFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-                | Value::Iterator(_)
-                | Value::Generator(_)
-                | Value::Temporal(_)
-                | Value::Intl(_)
-                | Value::Proxy(_) => false,
-                _ => true,
+            let result = if let Some(o) = arg.as_object() {
+                crate::object::is_sealed(o, gc_heap)
+            } else {
+                !arg.is_object_like()
             };
             Ok(Value::boolean(result))
         }
@@ -2600,31 +2541,14 @@ pub fn call(
             // all default to extensible until a `preventExtensions`
             // / `seal` / `freeze` toggle landed. Primitives and the
             // null / undefined sentinels return false.
-            let result = match arg {
-                Value::Object(o) => crate::object::is_extensible(o, gc_heap),
-                Value::Array(arr) => crate::array::is_extensible(arr, gc_heap),
-                Value::RegExp(r) => r.is_extensible(gc_heap),
-                Value::Function { .. }
-                | Value::Closure(_)
-                | Value::BoundFunction(_)
-                | Value::NativeFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-                | Value::Iterator(_)
-                | Value::Generator(_)
-                | Value::Temporal(_)
-                | Value::Intl(_)
-                | Value::Proxy(_) => true,
-                _ => false,
+            let result = if let Some(o) = arg.as_object() {
+                crate::object::is_extensible(o, gc_heap)
+            } else if let Some(arr) = arg.as_array() {
+                crate::array::is_extensible(arr, gc_heap)
+            } else if let Some(r) = arg.as_regexp() {
+                r.is_extensible(gc_heap)
+            } else {
+                arg.is_object_like()
             };
             Ok(Value::boolean(result))
         }
@@ -2840,7 +2764,7 @@ pub fn call(
         M::GetOwnPropertySymbols => {
             let target = expect_object(args.first())?;
             let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
-                p.symbol_keys().map(Value::Symbol).collect()
+                p.symbol_keys().map(Value::symbol).collect()
             });
             let target_root = Value::object(target);
             Ok(Value::array(rooted_array_from_elements(
@@ -2996,7 +2920,7 @@ fn descriptor_to_object_with_roots(
     match &desc.kind {
         DescriptorKind::Data { value } => {
             crate::object::set(result, gc_heap, "value", *value);
-            crate::object::set(result, gc_heap, "writable", Value::Boolean(desc.writable()));
+            crate::object::set(result, gc_heap, "writable", Value::boolean(desc.writable()));
         }
         DescriptorKind::Accessor { getter, setter } => {
             crate::object::set(
@@ -3017,13 +2941,13 @@ fn descriptor_to_object_with_roots(
         result,
         gc_heap,
         "enumerable",
-        Value::Boolean(desc.enumerable()),
+        Value::boolean(desc.enumerable()),
     );
     crate::object::set(
         result,
         gc_heap,
         "configurable",
-        Value::Boolean(desc.configurable()),
+        Value::boolean(desc.configurable()),
     );
     Ok(result)
 }

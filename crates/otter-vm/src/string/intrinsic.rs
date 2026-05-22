@@ -93,7 +93,8 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     let constructor_root = Value::object(constructor);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(constructor, heap, Some(object_proto));
         object::set_prototype(prototype, heap, Some(object_proto));
@@ -111,7 +112,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &[&global_root, &constructor_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
+    object::set_constructor_native(constructor, heap, Value::native_function(ctor_native));
     // §22.1.2.3 — `String.prototype` is a non-writable, non-enumerable,
     // non-configurable data property.
     let _ = object::define_own_property(
@@ -126,12 +127,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         constructor,
         heap,
         "length",
-        crate::object::PropertyDescriptor::data(
-            Value::Number(crate::number::NumberValue::from_i32(1)),
-            false,
-            false,
-            true,
-        ),
+        crate::object::PropertyDescriptor::data(Value::number_i32(1), false, false, true),
     );
     // §22.1.2 — `String.name` is `"String"`, non-writable,
     // non-enumerable, configurable.
@@ -237,36 +233,36 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
                     reason: "string allocation failed".to_string(),
                 }
             })?;
-            Value::String(empty)
+            Value::string(empty)
         }
     };
-    let primitive = match &raw {
-        Value::Undefined
-        | Value::Null
-        | Value::Boolean(_)
-        | Value::Number(_)
-        | Value::BigInt(_)
-        | Value::String(_)
-        | Value::Symbol(_) => raw,
-        _ => {
-            let (interp, exec) = ctx.interp_mut_and_context();
-            let exec = exec.ok_or_else(|| NativeError::TypeError {
-                name: "String",
-                reason: "missing execution context".to_string(),
-            })?;
-            interp
-                .evaluate_to_primitive(&exec, &raw, crate::abstract_ops::ToPrimitiveHint::String)
-                .map_err(|e| match e {
-                    crate::VmError::Uncaught { value } => NativeError::Thrown {
-                        name: "String",
-                        message: value,
-                    },
-                    other => NativeError::TypeError {
-                        name: "String",
-                        reason: other.to_string(),
-                    },
-                })?
-        }
+    let is_primitive = raw.is_undefined()
+        || raw.is_null()
+        || raw.is_boolean()
+        || raw.is_number()
+        || raw.is_big_int()
+        || raw.is_string()
+        || raw.is_symbol();
+    let primitive = if is_primitive {
+        raw
+    } else {
+        let (interp, exec) = ctx.interp_mut_and_context();
+        let exec = exec.ok_or_else(|| NativeError::TypeError {
+            name: "String",
+            reason: "missing execution context".to_string(),
+        })?;
+        interp
+            .evaluate_to_primitive(&exec, &raw, crate::abstract_ops::ToPrimitiveHint::String)
+            .map_err(|e| match e {
+                crate::VmError::Uncaught { value } => NativeError::Thrown {
+                    name: "String",
+                    message: value,
+                },
+                other => NativeError::TypeError {
+                    name: "String",
+                    reason: other.to_string(),
+                },
+            })?
     };
     let value = crate::string::dispatch::call(
         otter_bytecode::method_id::StringMethod::Construct,
@@ -278,7 +274,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         reason: err.to_string(),
     })?;
     if ctx.is_construct_call() {
-        let Value::String(string) = value else {
+        let Some(string) = value.as_string().copied() else {
             return Err(NativeError::TypeError {
                 name: "String",
                 reason: "constructor did not return a string primitive".to_string(),

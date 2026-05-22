@@ -7,7 +7,6 @@ use std::sync::LazyLock;
 
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
@@ -33,34 +32,28 @@ pub fn dispatch_static(
 }
 
 fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
-    let pt = match args.first() {
-        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+    let bad = || TemporalError::BadArgument {
+        class: "PlainTime",
+        method: "from",
+        index: 0,
+        reason: "must be a Temporal.PlainTime or ISO string",
+    };
+    let first = args.first();
+    let pt = if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(gc_heap) {
             TemporalPayload::PlainTime(v) => v,
-            _ => {
-                return Err(TemporalError::BadArgument {
-                    class: "PlainTime",
-                    method: "from",
-                    index: 0,
-                    reason: "must be a Temporal.PlainTime or ISO string",
-                });
-            }
-        },
-        Some(Value::String(s)) => temporal_rs::PlainTime::from_utf8(
-            s.to_lossy_string(gc_heap).as_bytes(),
-        )
-        .map_err(|e| TemporalError::Engine {
-            class: "PlainTime",
-            method: "from",
-            message: e.to_string(),
-        })?,
-        _ => {
-            return Err(TemporalError::BadArgument {
+            _ => return Err(bad()),
+        }
+    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+        temporal_rs::PlainTime::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
+            TemporalError::Engine {
                 class: "PlainTime",
                 method: "from",
-                index: 0,
-                reason: "must be a Temporal.PlainTime or ISO string",
-            });
-        }
+                message: e.to_string(),
+            }
+        })?
+    } else {
+        return Err(bad());
     };
     alloc_temporal_value(gc_heap, TemporalPayload::PlainTime(pt))
 }
@@ -70,15 +63,15 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
 pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     let pt = match temporal.payload_clone(gc_heap) {
         TemporalPayload::PlainTime(v) => v,
-        _ => return Value::Undefined,
+        _ => return Value::undefined(),
     };
     match name {
-        "hour" => Value::number(NumberValue::from_i32(pt.hour() as i32)),
-        "minute" => Value::number(NumberValue::from_i32(pt.minute() as i32)),
-        "second" => Value::number(NumberValue::from_i32(pt.second() as i32)),
-        "millisecond" => Value::number(NumberValue::from_i32(pt.millisecond() as i32)),
-        "microsecond" => Value::number(NumberValue::from_i32(pt.microsecond() as i32)),
-        "nanosecond" => Value::number(NumberValue::from_i32(pt.nanosecond() as i32)),
+        "hour" => Value::number_i32(pt.hour() as i32),
+        "minute" => Value::number_i32(pt.minute() as i32),
+        "second" => Value::number_i32(pt.second() as i32),
+        "millisecond" => Value::number_i32(pt.millisecond() as i32),
+        "microsecond" => Value::number_i32(pt.microsecond() as i32),
+        "nanosecond" => Value::number_i32(pt.nanosecond() as i32),
         _ => Value::undefined(),
     }
 }
@@ -111,25 +104,24 @@ fn duration_arg(
     args: &IntrinsicArgs<'_>,
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
-    match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+    let bad = || IntrinsicError::BadArgument {
+        index,
+        reason: "must be a Temporal.Duration",
+    };
+    let arg = args.args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
-            _ => Err(IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration",
-            }),
-        },
-        Some(Value::Object(obj)) => {
-            let heap = &*args.gc_heap;
-            partial_from_object(obj, heap).map_err(|_| IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration partial",
-            })
+            _ => Err(bad()),
         }
-        _ => Err(IntrinsicError::BadArgument {
+    } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
+        let heap = &*args.gc_heap;
+        partial_from_object(&obj, heap).map_err(|_| IntrinsicError::BadArgument {
             index,
-            reason: "must be a Temporal.Duration",
-        }),
+            reason: "must be a Temporal.Duration partial",
+        })
+    } else {
+        Err(bad())
     }
 }
 

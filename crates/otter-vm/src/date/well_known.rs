@@ -35,10 +35,11 @@ pub fn install_date_well_knowns_post_bootstrap(
     global: JsObject,
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
-    let Some(Value::Object(date_ctor)) = object::get(global, heap, "Date") else {
+    let Some(date_ctor) = object::get(global, heap, "Date").and_then(|v| v.as_object()) else {
         return Ok(());
     };
-    let Some(Value::Object(prototype)) = object::get(date_ctor, heap, "prototype") else {
+    let Some(prototype) = object::get(date_ctor, heap, "prototype").and_then(|v| v.as_object())
+    else {
         return Ok(());
     };
 
@@ -60,7 +61,7 @@ pub fn install_date_well_knowns_post_bootstrap(
         heap,
         &to_primitive_sym,
         PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(to_prim_fn)),
+            value: Some(Value::native_function(to_prim_fn)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -82,31 +83,27 @@ pub fn install_date_well_knowns_post_bootstrap(
 fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     const NAME: &str = "Date.prototype[Symbol.toPrimitive]";
     let receiver = *ctx.this_value();
-    if !matches!(receiver, Value::Object(_)) {
+    if !receiver.is_object() {
         return Err(NativeError::TypeError {
             name: NAME,
             reason: "this value must be an Object".to_string(),
         });
     }
     let hint_value = args.first().cloned().unwrap_or(Value::undefined());
-    let try_first = match &hint_value {
-        Value::String(js) => {
-            let token = js.to_lossy_string(ctx.heap());
-            match token.as_str() {
-                "string" | "default" => ToPrimitiveHint::String,
-                "number" => ToPrimitiveHint::Number,
-                _ => {
-                    return Err(NativeError::TypeError {
-                        name: NAME,
-                        reason: format!("invalid hint {token:?}"),
-                    });
-                }
-            }
-        }
+    let Some(js) = hint_value.as_string() else {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "hint must be a string".to_string(),
+        });
+    };
+    let token = js.to_lossy_string(ctx.heap());
+    let try_first = match token.as_str() {
+        "string" | "default" => ToPrimitiveHint::String,
+        "number" => ToPrimitiveHint::Number,
         _ => {
             return Err(NativeError::TypeError {
                 name: NAME,
-                reason: "hint must be a string".to_string(),
+                reason: format!("invalid hint {token:?}"),
             });
         }
     };

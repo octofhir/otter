@@ -10,7 +10,7 @@
 //! - Low, contiguous indices live in `elements`.
 //! - Large sparse indices live in `sparse_elements` so Array-index
 //!   semantics do not force host-sized dense allocations.
-//! - Missing-index reads return `Value::Undefined`.
+//! - Missing-index reads return `undefined`.
 //! - Element growth goes through helpers that reserve off-slot
 //!   `SmallVec` capacity against the heap cap before resizing.
 //!
@@ -318,8 +318,8 @@ pub fn is_empty(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
 }
 
 /// Read element at `idx`. Out-of-range and array-hole slots both
-/// return [`Value::Undefined`] per ECMA-262 §10.4.2 OrdinaryGet —
-/// the internal [`Value::Hole`] sentinel never escapes the array.
+/// return `undefined` per ECMA-262 §10.4.2 OrdinaryGet —
+/// internal hole sentinel never escapes the array.
 #[must_use]
 pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
     heap.read_payload(arr, |body| {
@@ -333,15 +333,16 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
                     .and_then(|sparse| sparse.get(&idx).cloned())
             })
             .unwrap_or(Value::undefined());
-        match raw {
-            Value::Hole => Value::undefined(),
-            other => other,
+        if raw.is_hole() {
+            Value::undefined()
+        } else {
+            raw
         }
     })
 }
 
 /// Spec [HasProperty](https://tc39.es/ecma262/#sec-array-exotic-objects)
-/// for array-indexed slots: a missing dense element ([`Value::Hole`])
+/// for array-indexed slots: a missing dense element (hole)
 /// or an absent sparse entry returns `false`, even when the index
 /// is below `length`. Returns `true` only when an explicit value
 /// occupies the slot.
@@ -349,7 +350,7 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
 pub fn has_own_element(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> bool {
     heap.read_payload(arr, |body| {
         if let Some(slot) = body.elements.get(idx) {
-            return !matches!(slot, Value::Hole);
+            return !slot.is_hole();
         }
         body.sparse_elements
             .as_ref()
@@ -358,7 +359,7 @@ pub fn has_own_element(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> boo
 }
 
 /// Write element at `idx`, extending with the internal
-/// [`Value::Hole`] sentinel when `idx > len` so absent slots remain
+/// hole sentinel when `idx > len` so absent slots remain
 /// distinguishable from explicit `undefined` per ECMA-262 §10.4.2.
 ///
 /// # Errors
@@ -422,7 +423,7 @@ fn set_index_value(
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
         while body.elements.len() < idx {
-            body.elements.push(Value::Hole);
+            body.elements.push(Value::hole());
         }
         body.elements.push(value);
         body.length = body.length.max(target_len);
@@ -482,7 +483,7 @@ pub(crate) fn set_with_roots(
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
         while body.elements.len() < idx {
-            body.elements.push(Value::Hole);
+            body.elements.push(Value::hole());
         }
         body.elements.push(value);
         body.length = body.length.max(target_len);
@@ -510,7 +511,7 @@ pub fn push(
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
         while body.elements.len() + 1 < target_len {
-            body.elements.push(Value::Hole);
+            body.elements.push(Value::hole());
         }
         body.elements.push(value);
         body.length = target_len;
@@ -547,7 +548,7 @@ pub(crate) fn push_with_roots(
         body.elements
             .reserve_exact(target_len.saturating_sub(body.elements.len()));
         while body.elements.len() + 1 < target_len {
-            body.elements.push(Value::Hole);
+            body.elements.push(Value::hole());
         }
         body.elements.push(value);
         body.length = target_len;
@@ -562,7 +563,7 @@ pub(crate) fn push_with_roots(
 /// element storage backing `Array.prototype.length`. Shrinks below
 /// the current length by dropping dense and sparse slots whose index
 /// is ≥ `new_len`; grows above the current length by extending the
-/// dense vector with [`Value::Hole`] so absent indices remain
+/// dense vector with hole sentinel so absent indices remain
 /// distinguishable from explicit `undefined`.
 ///
 /// # See also
@@ -611,7 +612,7 @@ pub fn set_length(
             body.elements
                 .reserve_exact(new_len.saturating_sub(body.elements.len()));
             while body.elements.len() < new_len {
-                body.elements.push(Value::Hole);
+                body.elements.push(Value::hole());
             }
         }
         body.length = new_len;
@@ -639,10 +640,7 @@ pub(crate) fn set_length_checked(
     let ok = heap.with_payload(arr, |body| {
         for idx in (new_len..cur).rev() {
             let key = idx.to_string();
-            let exists = body
-                .elements
-                .get(idx)
-                .is_some_and(|slot| !matches!(slot, Value::Hole))
+            let exists = body.elements.get(idx).is_some_and(|slot| !slot.is_hole())
                 || body
                     .sparse_elements
                     .as_ref()
@@ -740,8 +738,8 @@ fn array_index_at_or_above(key: &str, limit: usize) -> bool {
     crate::object::array_index_property_name(key).is_some_and(|idx| idx as usize >= limit)
 }
 
-/// Pop from the tail. Returns `Value::Undefined` for an empty array
-/// and for slots that hold the internal [`Value::Hole`] sentinel.
+/// Pop from the tail. Returns `undefined` for an empty array
+/// and for slots that hold the internal hole sentinel.
 #[must_use]
 pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     heap.with_payload(arr, |body| {
@@ -758,8 +756,8 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
         };
         truncate_array_body_to(body, idx);
         match popped {
-            Some(Value::Hole) | None => Value::undefined(),
-            Some(other) => other,
+            Some(v) if !v.is_hole() => v,
+            _ => Value::undefined(),
         }
     })
 }
@@ -967,7 +965,7 @@ pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> O
         return heap.read_payload(arr, |body| {
             body.elements
                 .get(idx)
-                .filter(|v| !matches!(v, Value::Hole))
+                .filter(|v| !v.is_hole())
                 .cloned()
                 .or_else(|| {
                     body.sparse_elements
@@ -1199,10 +1197,7 @@ pub fn clean_source_bytes(arr: JsArray, heap: &otter_gc::GcHeap) -> Option<Arc<[
 /// whether a captured source slice is still safe to re-emit.
 #[inline]
 fn is_render_stable_primitive(v: &Value) -> bool {
-    matches!(
-        v,
-        Value::Null | Value::Boolean(_) | Value::Number(_) | Value::String(_)
-    )
+    v.is_null() || v.is_boolean() || v.is_number() || v.is_string()
 }
 
 /// Convert a numeric computed-property key to an Array index.
@@ -1348,33 +1343,33 @@ mod tests {
         let mut heap = fresh_heap();
         let a = from_elements_old_for_fixture(
             &mut heap,
-            [Value::boolean(true), Value::Null, Value::Boolean(false)],
+            [Value::boolean(true), Value::null(), Value::boolean(false)],
         )
         .unwrap();
         assert_eq!(len(a, &heap), 3);
-        assert_eq!(get(a, &heap, 0), Value::Boolean(true));
-        assert_eq!(get(a, &heap, 1), Value::Null);
-        assert_eq!(get(a, &heap, 2), Value::Boolean(false));
+        assert_eq!(get(a, &heap, 0), Value::boolean(true));
+        assert_eq!(get(a, &heap, 1), Value::null());
+        assert_eq!(get(a, &heap, 2), Value::boolean(false));
     }
 
     #[test]
     fn out_of_range_read_is_undefined() {
         let mut heap = fresh_heap();
         let a = alloc_array_old_for_fixture(&mut heap).unwrap();
-        assert_eq!(get(a, &heap, 0), Value::Undefined);
+        assert_eq!(get(a, &heap, 0), Value::undefined());
     }
 
     #[test]
     fn out_of_range_write_extends_with_holes() {
         let mut heap = fresh_heap();
         let a = alloc_array_old_for_fixture(&mut heap).unwrap();
-        set(a, &mut heap, 2, Value::Boolean(true)).unwrap();
+        set(a, &mut heap, 2, Value::boolean(true)).unwrap();
         assert_eq!(len(a, &heap), 3);
-        // Public reads observe `Value::Undefined` for absent slots,
-        // even though the body stores `Value::Hole` internally.
-        assert_eq!(get(a, &heap, 0), Value::Undefined);
-        assert_eq!(get(a, &heap, 1), Value::Undefined);
-        assert_eq!(get(a, &heap, 2), Value::Boolean(true));
+        // Public reads observe `Value::undefined()` for absent slots,
+        // even though the body stores `hole` internally.
+        assert_eq!(get(a, &heap, 0), Value::undefined());
+        assert_eq!(get(a, &heap, 1), Value::undefined());
+        assert_eq!(get(a, &heap, 2), Value::boolean(true));
         // `has_own_element` distinguishes the two: holes report `false`,
         // explicit values report `true`.
         assert!(!has_own_element(a, &heap, 0));
@@ -1387,22 +1382,22 @@ mod tests {
     #[test]
     fn explicit_undefined_distinguished_from_hole() {
         let mut heap = fresh_heap();
-        let a = from_elements_old_for_fixture(&mut heap, [Value::Undefined]).unwrap();
+        let a = from_elements_old_for_fixture(&mut heap, [Value::undefined()]).unwrap();
         // Explicit undefined is a real own element.
         assert!(has_own_element(a, &heap, 0));
-        assert_eq!(get(a, &heap, 0), Value::Undefined);
+        assert_eq!(get(a, &heap, 0), Value::undefined());
     }
 
     #[test]
     fn hole_does_not_escape_via_pop() {
         let mut heap = fresh_heap();
         let a = alloc_array_old_for_fixture(&mut heap).unwrap();
-        set(a, &mut heap, 1, Value::Boolean(true)).unwrap();
+        set(a, &mut heap, 1, Value::boolean(true)).unwrap();
         // Tail is the explicit value.
-        assert_eq!(pop(a, &mut heap), Value::Boolean(true));
+        assert_eq!(pop(a, &mut heap), Value::boolean(true));
         // Next pop pulls the leading hole — must surface as
         // `undefined`, never as the internal sentinel.
-        assert_eq!(pop(a, &mut heap), Value::Undefined);
+        assert_eq!(pop(a, &mut heap), Value::undefined());
         assert!(is_empty(a, &heap));
     }
 
@@ -1410,14 +1405,14 @@ mod tests {
     fn named_property_lookup_skips_holes() {
         let mut heap = fresh_heap();
         let a = alloc_array_old_for_fixture(&mut heap).unwrap();
-        set(a, &mut heap, 2, Value::Boolean(true)).unwrap();
+        set(a, &mut heap, 2, Value::boolean(true)).unwrap();
         // Hole index — own-property lookup returns `None` so
         // callers can fall back to the prototype chain.
         assert_eq!(get_named_property(a, &heap, "0"), None);
         // Filled index — own-property lookup returns the value.
         assert_eq!(
             get_named_property(a, &heap, "2"),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
     }
 
@@ -1425,11 +1420,11 @@ mod tests {
     fn push_and_pop() {
         let mut heap = fresh_heap();
         let a = alloc_array_old_for_fixture(&mut heap).unwrap();
-        assert_eq!(push(a, &mut heap, Value::Boolean(true)).unwrap(), 1);
-        assert_eq!(push(a, &mut heap, Value::Null).unwrap(), 2);
-        assert_eq!(pop(a, &mut heap), Value::Null);
-        assert_eq!(pop(a, &mut heap), Value::Boolean(true));
-        assert_eq!(pop(a, &mut heap), Value::Undefined);
+        assert_eq!(push(a, &mut heap, Value::boolean(true)).unwrap(), 1);
+        assert_eq!(push(a, &mut heap, Value::null()).unwrap(), 2);
+        assert_eq!(pop(a, &mut heap), Value::null());
+        assert_eq!(pop(a, &mut heap), Value::boolean(true));
+        assert_eq!(pop(a, &mut heap), Value::undefined());
         assert!(is_empty(a, &heap));
     }
 
@@ -1440,9 +1435,9 @@ mod tests {
         let a = from_elements_with_source_old_for_fixture(
             &mut heap,
             [
-                Value::Number(NumberValue::from_i32(1)),
-                Value::Number(NumberValue::from_i32(2)),
-                Value::Number(NumberValue::from_i32(3)),
+                Value::number(NumberValue::from_i32(1)),
+                Value::number(NumberValue::from_i32(2)),
+                Value::number(NumberValue::from_i32(3)),
             ],
             Arc::clone(&bytes),
         )
@@ -1459,14 +1454,14 @@ mod tests {
         let a = from_elements_with_source_old_for_fixture(
             &mut heap,
             [
-                Value::Number(NumberValue::from_i32(1)),
-                Value::Number(NumberValue::from_i32(2)),
-                Value::Number(NumberValue::from_i32(3)),
+                Value::number(NumberValue::from_i32(1)),
+                Value::number(NumberValue::from_i32(2)),
+                Value::number(NumberValue::from_i32(3)),
             ],
             Arc::clone(&bytes),
         )
         .unwrap();
-        push(a, &mut heap, Value::Number(NumberValue::from_i32(99))).unwrap();
+        push(a, &mut heap, Value::number(NumberValue::from_i32(99))).unwrap();
         assert!(clean_source_bytes(a, &heap).is_none());
     }
 
@@ -1493,8 +1488,8 @@ mod tests {
         let mut heap = fresh_heap();
         let a = alloc_array_old_for_fixture(&mut heap).unwrap();
         let b = a;
-        push(a, &mut heap, Value::Boolean(true)).unwrap();
+        push(a, &mut heap, Value::boolean(true)).unwrap();
         assert!(ptr_eq(a, b));
-        assert_eq!(get(b, &heap, 0), Value::Boolean(true));
+        assert_eq!(get(b, &heap, 0), Value::boolean(true));
     }
 }

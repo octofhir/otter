@@ -73,12 +73,12 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &s
         _ => return Value::Undefined,
     };
     match name {
-        "hour" => Value::Number(NumberValue::from_i32(pt.hour() as i32)),
-        "minute" => Value::Number(NumberValue::from_i32(pt.minute() as i32)),
-        "second" => Value::Number(NumberValue::from_i32(pt.second() as i32)),
-        "millisecond" => Value::Number(NumberValue::from_i32(pt.millisecond() as i32)),
-        "microsecond" => Value::Number(NumberValue::from_i32(pt.microsecond() as i32)),
-        "nanosecond" => Value::Number(NumberValue::from_i32(pt.nanosecond() as i32)),
+        "hour" => Value::number(NumberValue::from_i32(pt.hour() as i32)),
+        "minute" => Value::number(NumberValue::from_i32(pt.minute() as i32)),
+        "second" => Value::number(NumberValue::from_i32(pt.second() as i32)),
+        "millisecond" => Value::number(NumberValue::from_i32(pt.millisecond() as i32)),
+        "microsecond" => Value::number(NumberValue::from_i32(pt.microsecond() as i32)),
+        "nanosecond" => Value::number(NumberValue::from_i32(pt.nanosecond() as i32)),
         _ => Value::undefined(),
     }
 }

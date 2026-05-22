@@ -44,7 +44,7 @@ impl FunctionKindPrototypes {
         function_proto: JsObject,
         well_known: &crate::symbol::WellKnownSymbols,
     ) -> Result<Self, JsSurfaceError> {
-        let function_proto_value = Value::Object(function_proto);
+        let function_proto_value = Value::object(function_proto);
         let tag_sym = well_known.get(WellKnown::ToStringTag);
         let mut make = |tag: &'static str| -> Result<(JsObject, JsObject), JsSurfaceError> {
             let proto = {
@@ -70,7 +70,7 @@ impl FunctionKindPrototypes {
                 },
             );
 
-            let proto_value = Value::Object(proto);
+            let proto_value = Value::object(proto);
             let ctor = {
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);

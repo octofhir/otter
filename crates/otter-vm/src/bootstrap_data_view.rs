@@ -65,7 +65,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 
 /// §25.3 DataView — installer body, called through [`Intrinsic`].
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -102,7 +102,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &accessor_roots,
     )?;
 
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
         heap,
         "DataView",
@@ -342,7 +342,7 @@ fn install_accessor(
     call: crate::native_function::NativeFastFn,
     value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&prototype_root);
     roots.extend(value_roots.iter());

@@ -579,7 +579,7 @@ impl Interpreter {
                 object::get(function_ctor, &gc_heap, "prototype")
         {
             let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
-            let global_root = Value::Object(global_this);
+            let global_root = Value::object(global_this);
             function_prototype::install_symbol_has_instance(
                 &mut gc_heap,
                 function_proto,
@@ -1055,7 +1055,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1065,7 +1065,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1075,7 +1075,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1086,7 +1086,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1097,7 +1097,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1106,7 +1106,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1115,7 +1115,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1126,7 +1126,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1138,14 +1138,14 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
             Value::Function { .. }
             | Value::Closure(_)
             | Value::BoundFunction(_)
-            | Value::ClassConstructor(_) => Ok(Value::Object(self.function_prototype_object()?)),
+            | Value::ClassConstructor(_) => Ok(Value::object(self.function_prototype_object()?)),
             // §10.4 exotic objects (Array, Map, Set, WeakMap,
             // WeakSet, WeakRef, FinalizationRegistry, Promise,
             // ArrayBuffer, SharedArrayBuffer, DataView, TypedArray,
@@ -1162,7 +1162,7 @@ impl Interpreter {
                     return Ok(over);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
@@ -1171,12 +1171,12 @@ impl Interpreter {
                     return Ok(proto);
                 }
                 match self.intrinsic_prototype_object_for(value) {
-                    Some(o) => Ok(Value::Object(o)),
+                    Some(o) => Ok(Value::object(o)),
                     None => Ok(Value::null()),
                 }
             }
             Value::Iterator(_) => match self.intrinsic_prototype_object_for(value) {
-                Some(o) => Ok(Value::Object(o)),
+                Some(o) => Ok(Value::object(o)),
                 None => Ok(Value::null()),
             },
             // §20.1.2.10 Object.getPrototypeOf: when applied to a
@@ -1191,7 +1191,7 @@ impl Interpreter {
             | Value::Number(_)
             | Value::Boolean(_)
             | Value::BigInt(_) => match self.intrinsic_prototype_object_for(value) {
-                Some(o) => Ok(Value::Object(o)),
+                Some(o) => Ok(Value::object(o)),
                 None => Ok(Value::null()),
             },
             other => Err(VmError::TypeMismatchAt {
@@ -1604,7 +1604,7 @@ impl Interpreter {
             return Ok(this_value);
         }
         match this_value {
-            Value::Undefined | Value::Null => Ok(Value::Object(self.global_this)),
+            Value::Undefined | Value::Null => Ok(Value::object(self.global_this)),
             other => self.box_sloppy_this_primitive_runtime_rooted(other, slice_roots),
         }
     }
@@ -1620,7 +1620,7 @@ impl Interpreter {
             return Ok(this_value);
         }
         match this_value {
-            Value::Undefined | Value::Null => Ok(Value::Object(self.global_this)),
+            Value::Undefined | Value::Null => Ok(Value::object(self.global_this)),
             other => self.box_sloppy_this_primitive_stack_rooted(stack, other, slice_roots),
         }
     }
@@ -1632,7 +1632,7 @@ impl Interpreter {
     /// global mutation happen during one mutator turn.
     pub fn install_global_class(&mut self, spec: &'static ClassSpec) -> Result<(), JsSurfaceError> {
         let raw_roots = self.collect_runtime_roots();
-        let global_root = Value::Object(self.global_this);
+        let global_root = Value::object(self.global_this);
         let value = ClassBuilder::from_spec_with_raw_and_value_roots(
             &mut self.gc_heap,
             spec,
@@ -4198,7 +4198,7 @@ impl Interpreter {
         let popped = stack.pop().ok_or(VmError::InvalidOperand)?;
         let resolved = match popped.construct_target {
             Some(_) if constructor_return_is_object(&value) => value,
-            Some(target) => Value::Object(target),
+            Some(target) => Value::object(target),
             None => value,
         };
         if let Some(state) = popped.async_state {
@@ -4345,7 +4345,7 @@ fn object_prototype_intercept(
         // <https://tc39.es/ecma262/#sec-object.prototype.tostring>
         // <https://tc39.es/ecma262/#sec-error.prototype.tostring>
         "toString" => {
-            let recv_value = Value::Object(*obj);
+            let recv_value = Value::object(*obj);
             let has_error_shape = object::get(*obj, gc_heap, "name").is_some()
                 || object::get(*obj, gc_heap, "message").is_some();
             let display = if has_error_shape {
@@ -4613,8 +4613,8 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     let Some(Value::Object(prototype)) = crate::object::get(string_ctor, heap, "prototype") else {
         return Ok(());
     };
-    let global_root = Value::Object(global);
-    let prototype_root = Value::Object(prototype);
+    let global_root = Value::object(global);
+    let prototype_root = Value::object(prototype);
     let getter = crate::bootstrap::native_static_with_value_roots(
         heap,
         "[Symbol.iterator]",
@@ -4803,12 +4803,12 @@ fn step_iterator(
                 None
             } else {
                 let v = crate::array::get(array, gc_heap, index);
-                let index_val = Value::Number(crate::number::NumberValue::from_f64(index as f64));
+                let index_val = Value::number(crate::number::NumberValue::from_f64(index as f64));
                 // Materialise [index, value] dense array. Roots both
                 // operands via the visitor so a GC during allocation
                 // sees them.
                 let pair = {
-                    let array_root = Value::Array(array);
+                    let array_root = Value::array(array);
                     let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                         array_root.trace_value_slots(visit);
                         index_val.trace_value_slots(visit);
@@ -4874,7 +4874,7 @@ fn step_iterator(
                     MapIteratorKind::Value => value,
                     MapIteratorKind::Entry => {
                         let pair = {
-                            let map_root = Value::Map(map);
+                            let map_root = Value::map(map);
                             let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                                 map_root.trace_value_slots(visit);
                                 key.trace_value_slots(visit);
@@ -4916,7 +4916,7 @@ fn step_iterator(
                     SetIteratorKind::Value => value,
                     SetIteratorKind::Entry => {
                         let pair = {
-                            let set_root = Value::Set(set);
+                            let set_root = Value::set(set);
                             let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                                 set_root.trace_value_slots(visit);
                                 value.trace_value_slots(visit);
@@ -5552,7 +5552,7 @@ mod tests {
         let context = ExecutionContext::from_module(module);
         let mut interp = Interpreter::new();
         let target = Value::Function { function_id: 1 };
-        let arg = Value::String(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
+        let arg = Value::string(JsString::from_str("rooted-arg", interp.gc_heap_mut()).unwrap());
         let args = [arg];
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5582,7 +5582,7 @@ mod tests {
         let lhs = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("lhs");
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[1] = Value::Object(lhs);
+        frame.registers[1] = Value::object(lhs);
         frame.registers[2] = Value::Function { function_id: 1 };
         stack.push(frame);
         let operands = vec![
@@ -5637,7 +5637,7 @@ mod tests {
         let context = ExecutionContext::from_module(outer.clone());
         let mut interp = Interpreter::new();
         interp.set_eval_hook(Some(std::rc::Rc::new(move |_, _| Ok(compiled.clone()))));
-        let arg = Value::String(JsString::from_str("", interp.gc_heap_mut()).unwrap());
+        let arg = Value::string(JsString::from_str("", interp.gc_heap_mut()).unwrap());
         let args = [arg];
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&outer.functions[0]);
@@ -5698,7 +5698,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Map(map);
+        frame.registers[0] = Value::map(map);
         stack.push(frame);
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -5742,7 +5742,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Map(map);
+        frame.registers[0] = Value::map(map);
         stack.push(frame);
         let operands = vec![
             Operand::Register(1),
@@ -5788,7 +5788,7 @@ mod tests {
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.pc = 0;
         frame.pending_get_iterator = Some(PendingGetIterator { pc: 0, dst: 1 });
-        frame.registers[1] = Value::Object(iterator_obj);
+        frame.registers[1] = Value::object(iterator_obj);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
         let operands = vec![Operand::Register(1), Operand::Register(0)];
@@ -5822,7 +5822,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Array(source);
+        frame.registers[0] = Value::array(source);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
 
@@ -5877,7 +5877,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Array(source);
+        frame.registers[0] = Value::array(source);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
 
@@ -5926,7 +5926,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Array(source);
+        frame.registers[0] = Value::array(source);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
 
@@ -5988,7 +5988,7 @@ mod tests {
         let context = ExecutionContext::from_module(module.clone());
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Array(source);
+        frame.registers[0] = Value::array(source);
         frame.registers[1] = mapper;
         stack.push(frame);
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -6033,7 +6033,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Array(source);
+        frame.registers[0] = Value::array(source);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
 
@@ -6116,7 +6116,7 @@ mod tests {
             Value::Number(NumberValue::from_i32(30)),
         )
         .unwrap();
-        let map_value = Value::Map(map);
+        let map_value = Value::map(map);
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
         let entries = interp
@@ -6144,7 +6144,7 @@ mod tests {
     #[test]
     fn iterator_result_record_uses_runtime_rooted_young_allocation() {
         let mut interp = Interpreter::new();
-        let value = Value::Number(NumberValue::from_i32(44));
+        let value = Value::number(NumberValue::from_i32(44));
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
         let result = interp
@@ -6193,7 +6193,7 @@ mod tests {
         let context = ExecutionContext::from_module(module.clone());
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[1] = Value::Array(seed);
+        frame.registers[1] = Value::array(seed);
         stack.push(frame);
 
         let before_alloc = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -6322,7 +6322,7 @@ mod tests {
         let host = interp
             .alloc_host_object_with_roots(&[], &[])
             .expect("host object allocation");
-        let host_root = Value::Object(host);
+        let host_root = Value::object(host);
         let elements = [Value::Number(NumberValue::from_i32(1))];
         let array = interp
             .array_from_elements_host_rooted(
@@ -6348,7 +6348,7 @@ mod tests {
     fn json_parse_uses_stack_rooted_container_allocation() {
         let module = module_with(Vec::new(), 3);
         let mut interp = Interpreter::new();
-        let input = Value::String(
+        let input = Value::string(
             JsString::from_str("{\"items\":[1,{\"nested\":2}]}", interp.gc_heap_mut()).unwrap(),
         );
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
@@ -6565,7 +6565,7 @@ mod tests {
         generator.set_async(interp.gc_heap_mut(), true);
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&main);
-        frame.registers[0] = Value::Generator(generator);
+        frame.registers[0] = Value::generator(generator);
         stack.push(frame);
 
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -6803,7 +6803,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[1] = Value::Number(NumberValue::Smi(12));
+        frame.registers[1] = Value::number(NumberValue::Smi(12));
         stack.push(frame);
         let operands = vec![Operand::Register(0), Operand::Register(1)];
         let before = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -7534,7 +7534,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let callee = native_value_static(interp.gc_heap_mut(), "returnThis", 0, return_this)
             .expect("native");
-        let receiver = Value::Object(
+        let receiver = Value::object(
             crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap(),
         );
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
@@ -7573,8 +7573,8 @@ mod tests {
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = callee;
-        frame.registers[1] = Value::Number(NumberValue::Smi(8));
-        frame.registers[2] = Value::Number(NumberValue::Smi(13));
+        frame.registers[1] = Value::number(NumberValue::Smi(8));
+        frame.registers[2] = Value::number(NumberValue::Smi(13));
         stack.push(frame);
         let context = ExecutionContext::from_module(module.clone());
         let operands = vec![
@@ -7599,8 +7599,8 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Object(target);
-        frame.registers[1] = Value::Object(handler);
+        frame.registers[0] = Value::object(target);
+        frame.registers[1] = Value::object(handler);
         stack.push(frame);
         let operands = vec![
             Operand::Register(2),
@@ -7647,7 +7647,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Object(target);
+        frame.registers[0] = Value::object(target);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
         let operands = vec![
@@ -7701,7 +7701,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Object(target);
+        frame.registers[0] = Value::object(target);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
         let operands = vec![
@@ -7741,7 +7741,7 @@ mod tests {
     fn object_from_entries_uses_stack_rooted_result_allocation() {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
-        let key = Value::String(JsString::from_str("answer", interp.gc_heap_mut()).unwrap());
+        let key = Value::string(JsString::from_str("answer", interp.gc_heap_mut()).unwrap());
         let pair = array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
             vec![key, Value::Number(NumberValue::Smi(9))],
@@ -7753,7 +7753,7 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Array(entries);
+        frame.registers[0] = Value::array(entries);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
         let operands = vec![
@@ -7810,8 +7810,8 @@ mod tests {
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::Object(proto);
-        frame.registers[1] = Value::Object(props);
+        frame.registers[0] = Value::object(proto);
+        frame.registers[1] = Value::object(props);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
         let operands = vec![
@@ -7849,7 +7849,7 @@ mod tests {
     fn object_function_descriptor_uses_stack_rooted_result_allocation() {
         let module = module_with(vec![], 5);
         let mut interp = Interpreter::new();
-        let key = Value::String(JsString::from_str("name", interp.gc_heap_mut()).unwrap());
+        let key = Value::string(JsString::from_str("name", interp.gc_heap_mut()).unwrap());
 
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
@@ -7888,7 +7888,7 @@ mod tests {
     fn object_define_property_function_bag_uses_stack_rooted_allocation() {
         let module = module_with(vec![], 6);
         let mut interp = Interpreter::new();
-        let key = Value::String(JsString::from_str("custom", interp.gc_heap_mut()).unwrap());
+        let key = Value::string(JsString::from_str("custom", interp.gc_heap_mut()).unwrap());
         let desc = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("descriptor");
         object::set(
             desc,
@@ -7901,7 +7901,7 @@ mod tests {
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = Value::Function { function_id: 0 };
         frame.registers[1] = key;
-        frame.registers[2] = Value::Object(desc);
+        frame.registers[2] = Value::object(desc);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
         let operands = vec![
@@ -7946,7 +7946,7 @@ mod tests {
             Value::Number(NumberValue::Smi(42)),
         );
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        let proxy = Value::Proxy(
+        let proxy = Value::proxy(
             crate::proxy::JsProxy::new(
                 interp.gc_heap_mut(),
                 Value::Object(target),
@@ -8005,7 +8005,7 @@ mod tests {
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
-        let proxy = Value::Proxy(
+        let proxy = Value::proxy(
             crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::Object(handler))
                 .unwrap(),
         );
@@ -8013,8 +8013,8 @@ mod tests {
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.registers[0] = proxy;
-        frame.registers[1] = Value::Number(NumberValue::Smi(7));
-        frame.registers[2] = Value::Number(NumberValue::Smi(11));
+        frame.registers[1] = Value::number(NumberValue::Smi(7));
+        frame.registers[2] = Value::number(NumberValue::Smi(11));
         stack.push(frame);
         let context = ExecutionContext::from_module(module.clone());
         let operands = vec![
@@ -8083,7 +8083,7 @@ mod tests {
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_proxy_arg).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
-        let proxy = Value::Proxy(
+        let proxy = Value::proxy(
             crate::proxy::JsProxy::new(
                 interp.gc_heap_mut(),
                 Value::Function { function_id: 1 },
@@ -8134,7 +8134,7 @@ mod tests {
         let target = native_value_static(interp.gc_heap_mut(), "target", 0, target_noop).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "apply", apply);
-        let proxy = Value::Proxy(
+        let proxy = Value::proxy(
             crate::proxy::JsProxy::new(interp.gc_heap_mut(), target, Value::Object(handler))
                 .unwrap(),
         );
@@ -8249,7 +8249,7 @@ mod tests {
             native_value_static(interp.gc_heap_mut(), "construct", 3, return_argv_array).unwrap();
         let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         object::set(handler, interp.gc_heap_mut(), "construct", construct);
-        let proxy = Value::Proxy(
+        let proxy = Value::proxy(
             crate::proxy::JsProxy::new(
                 interp.gc_heap_mut(),
                 Value::Function { function_id: 1 },
@@ -8371,7 +8371,7 @@ mod tests {
             Some(Value::String(bound)),
         )
         .expect("closure alloc");
-        let closure = Value::Closure(closure_handle);
+        let closure = Value::closure(closure_handle);
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(Frame::for_function(&module.functions[0]));
         let context = ExecutionContext::from_module(module.clone());

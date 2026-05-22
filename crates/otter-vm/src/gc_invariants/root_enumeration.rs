@@ -436,7 +436,7 @@ fn parked_frame_keeps_alive() {
     };
     let mut frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
-    frame.registers[0] = Value::Object(object);
+    frame.registers[0] = Value::object(object);
 
     let parked =
         crate::generator::alloc_parked_frame(interp.gc_heap_mut(), frame).expect("parked frame");

@@ -537,8 +537,8 @@ impl Interpreter {
                         });
                     }
                 };
-                let iter_root = Value::Iterator(*iter);
-                let source_root = Value::Iterator(source);
+                let iter_root = Value::iterator(*iter);
+                let source_root = Value::iterator(source);
                 let mapper_root = mapper;
                 let new_inner = self.alloc_runtime_rooted_iterator_state(
                     inner_state,
@@ -573,7 +573,7 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         // Lazy helpers wrap the source in a new IteratorState; the
         // eager terminals drain via `iterator_next_full`.
-        let iter_value = Value::Iterator(*iter_rc);
+        let iter_value = Value::iterator(*iter_rc);
         let result = match name {
             "map" => {
                 let mapper = require_callable(args.first())?;

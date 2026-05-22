@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn to_string_default_radix_is_10() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::Number(NumberValue::Smi(255));
+        let recv = Value::number(NumberValue::Smi(255));
         let entry = lookup("toString").unwrap();
         let out = (entry.impl_fn)(&mut args(&recv, &[], &mut gc_heap)).unwrap();
         assert_eq!(out.display_string(&gc_heap), "255");
@@ -423,8 +423,8 @@ mod tests {
     #[test]
     fn to_string_hex_radix() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::Number(NumberValue::Smi(255));
-        let radix = Value::Number(NumberValue::Smi(16));
+        let recv = Value::number(NumberValue::Smi(255));
+        let radix = Value::number(NumberValue::Smi(16));
         let entry = lookup("toString").unwrap();
         let out =
             (entry.impl_fn)(&mut args(&recv, std::slice::from_ref(&radix), &mut gc_heap)).unwrap();
@@ -434,8 +434,8 @@ mod tests {
     #[test]
     fn to_fixed_two_decimals() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::Number(NumberValue::Double(1.75));
-        let two = Value::Number(NumberValue::Smi(2));
+        let recv = Value::number(NumberValue::Double(1.75));
+        let two = Value::number(NumberValue::Smi(2));
         let entry = lookup("toFixed").unwrap();
         let out =
             (entry.impl_fn)(&mut args(&recv, std::slice::from_ref(&two), &mut gc_heap)).unwrap();

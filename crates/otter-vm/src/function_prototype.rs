@@ -52,7 +52,7 @@ pub(crate) fn install_symbol_has_instance(
     well_known_has_instance: symbol::JsSymbol,
     value_roots: &[&Value],
 ) -> Result<(), JsSurfaceError> {
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&prototype_root);
     roots.extend_from_slice(value_roots);
@@ -98,7 +98,7 @@ pub(crate) fn install_restricted_accessors(
     prototype: JsObject,
     value_roots: &[&Value],
 ) -> Result<(), JsSurfaceError> {
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&prototype_root);
     roots.extend_from_slice(value_roots);
@@ -107,7 +107,7 @@ pub(crate) fn install_restricted_accessors(
             value.trace_value_slots(visitor);
         }
     };
-    let thrower = Value::NativeFunction(NativeFunction::throw_type_error_with_roots(
+    let thrower = Value::native_function(NativeFunction::throw_type_error_with_roots(
         heap,
         throw_restricted_function_property,
         &mut external_visit,

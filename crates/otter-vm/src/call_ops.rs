@@ -211,7 +211,7 @@ impl Interpreter {
                     &[&this_for_callee],
                     &[effective_args.as_slice()],
                 )?;
-            let promise_value = Value::Promise(result_promise);
+            let promise_value = Value::promise(result_promise);
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, promise_value)?;
             (None, Some(AsyncFrameState { result_promise }))
@@ -388,7 +388,7 @@ impl Interpreter {
         let (return_register, async_state) = if function.is_async {
             let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(self, stack, &[&this_for_callee], &[])?;
-            let promise_value = Value::Promise(result_promise);
+            let promise_value = Value::promise(result_promise);
             write_register(&mut stack[top_idx], dst, promise_value)?;
             (None, Some(AsyncFrameState { result_promise }))
         } else {
@@ -938,7 +938,7 @@ impl Interpreter {
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         }
-        let this_value = Value::Object(receiver);
+        let this_value = Value::object(receiver);
         // Built-in constructor objects (`Number`, `Boolean`, …)
         // surface as a `Value::Object` with an internal native
         // constructor slot. Promote to the native-function construct
@@ -1507,7 +1507,7 @@ impl Interpreter {
         if let Some(proto) = proto {
             crate::object::set_prototype_value(receiver, &mut self.gc_heap, Some(proto));
         }
-        let this_value = Value::Object(receiver);
+        let this_value = Value::object(receiver);
 
         if let Value::Object(obj) = &current
             && let Some(Value::NativeFunction(native)) =

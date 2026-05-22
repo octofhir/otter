@@ -95,7 +95,7 @@ impl Interpreter {
                             self.gc_heap_mut(),
                         )?,
                     };
-                    *slot = Value::String(s);
+                    *slot = Value::string(s);
                 }
                 let result =
                     json::call(method, &coerced, &mut self.gc_heap).map_err(json_to_vm_error)?;
@@ -128,7 +128,7 @@ impl Interpreter {
                                     .collect()
                             });
                         let joined = parts.join(",");
-                        *slot = Value::String(crate::string::JsString::from_str(
+                        *slot = Value::string(crate::string::JsString::from_str(
                             &joined,
                             self.gc_heap_mut(),
                         )?);
@@ -299,7 +299,7 @@ impl Interpreter {
                         self.gc_heap_mut(),
                     )?,
                 };
-                *slot = Value::String(s);
+                *slot = Value::string(s);
             }
             coerced
         } else {
@@ -355,7 +355,7 @@ impl Interpreter {
         if needs_to_number {
             for slot in args.iter_mut() {
                 let coerced = self.coerce_to_number(context, slot)?;
-                *slot = Value::Number(coerced);
+                *slot = Value::number(coerced);
             }
         } else if matches!(method, method_id::DateMethod::Construct) && args.len() == 1 {
             // §21.4.2.2 step 3.b — single-arg `new Date(value)` runs
@@ -566,8 +566,8 @@ impl Interpreter {
                 if needs_coercion {
                     let coerced_key = self.evaluate_to_property_key(context, &key_arg)?;
                     let coerced_value = match &coerced_key {
-                        crate::VmPropertyKey::Symbol(sym) => Value::Symbol(*sym),
-                        other => Value::String(crate::string::JsString::from_str(
+                        crate::VmPropertyKey::Symbol(sym) => Value::symbol(*sym),
+                        other => Value::string(crate::string::JsString::from_str(
                             other
                                 .string_name()
                                 .expect("non-symbol key has string spelling"),
@@ -1236,7 +1236,7 @@ impl Interpreter {
                     }
                     Some(Value::String(s)) => {
                         let units = s.to_utf16_vec(&self.gc_heap);
-                        let result_root = Value::Object(result);
+                        let result_root = Value::object(result);
                         for (i, u) in units.iter().enumerate() {
                             let key = i.to_string();
                             let unit = crate::string::JsString::from_utf16_units(
@@ -1280,7 +1280,7 @@ impl Interpreter {
                         // `lastIndex`, callable metadata, proxies, and
                         // expando bags on the same reflective path.
                         let target_value = *target;
-                        let result_root = Value::Object(result);
+                        let result_root = Value::object(result);
                         let keys = self.own_property_keys_value(context, &target_value)?;
                         for key in keys {
                             let vm_key = match &key {
@@ -1466,8 +1466,8 @@ impl Interpreter {
                         }
                     };
                     let value_root = *item;
-                    let arr_value = Value::Array(group);
-                    let res_root = Value::Object(result);
+                    let arr_value = Value::array(group);
+                    let res_root = Value::object(result);
                     let roots = [&value_root, &arr_value, &res_root];
                     let mut external_visit =
                         |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -1502,8 +1502,8 @@ impl Interpreter {
                 }
             };
             let value_root = *item;
-            let arr_value = Value::Array(group);
-            let res_root = Value::Object(result);
+            let arr_value = Value::array(group);
+            let res_root = Value::object(result);
             let roots = [&value_root, &arr_value, &res_root];
             let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                 for v in &roots {
@@ -1609,7 +1609,7 @@ impl Interpreter {
                 let handler = coerce_proxy_target(args.get(1))?;
                 let proxy = crate::proxy::JsProxy::new(&mut self.gc_heap, target, handler)
                     .map_err(crate::oom_to_vm)?;
-                let proxy_value = Value::Proxy(proxy);
+                let proxy_value = Value::proxy(proxy);
                 let target_root = target;
                 let handler_root = handler;
                 let roots = self.collect_allocation_roots(stack);
@@ -1671,7 +1671,7 @@ impl Interpreter {
                         index: 0,
                     },
                     Value::Set(s) => {
-                        let value_root = Value::Set(s);
+                        let value_root = Value::set(s);
                         let snap: SmallVec<[Value; 4]> = collections::set_values(s, self.gc_heap())
                             .into_iter()
                             .collect();
@@ -1688,7 +1688,7 @@ impl Interpreter {
                         }
                     }
                     Value::Map(m) => {
-                        let value_root = Value::Map(m);
+                        let value_root = Value::map(m);
                         let mut entries: Vec<Value> = Vec::new();
                         for (k, v) in collections::map_entries(m, self.gc_heap()) {
                             let pair = self.alloc_stack_rooted_array_from_values_with_root_slices(

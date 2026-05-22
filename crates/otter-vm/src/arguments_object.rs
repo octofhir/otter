@@ -44,7 +44,7 @@ pub(crate) fn initialize_unmapped(
         object::define_own_property(obj, heap, &key, descriptor);
     }
 
-    let length = Value::Number(NumberValue::from_i32(args.len() as i32));
+    let length = Value::number(NumberValue::from_i32(args.len() as i32));
     object::define_own_property(
         obj,
         heap,
@@ -75,7 +75,7 @@ pub(crate) fn initialize_mapped(
         object::define_own_property(obj, heap, &key, descriptor);
     }
 
-    let length = Value::Number(NumberValue::from_i32(args.len() as i32));
+    let length = Value::number(NumberValue::from_i32(args.len() as i32));
     object::define_own_property(
         obj,
         heap,

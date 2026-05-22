@@ -82,8 +82,8 @@ impl ClassConstructor {
         statics: JsObject,
         external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let prototype_root = Value::Object(prototype);
-        let statics_root = Value::Object(statics);
+        let prototype_root = Value::object(prototype);
+        let statics_root = Value::object(statics);
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             ctor.trace_value_slots(visitor);

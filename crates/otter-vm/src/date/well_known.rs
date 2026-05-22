@@ -42,9 +42,9 @@ pub fn install_date_well_knowns_post_bootstrap(
         return Ok(());
     };
 
-    let global_root = Value::Object(global);
-    let date_ctor_root = Value::Object(date_ctor);
-    let prototype_root = Value::Object(prototype);
+    let global_root = Value::object(global);
+    let date_ctor_root = Value::object(date_ctor);
+    let prototype_root = Value::object(prototype);
     let to_prim_fn = native_static_with_value_roots(
         heap,
         "[Symbol.toPrimitive]",

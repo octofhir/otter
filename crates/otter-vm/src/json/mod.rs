@@ -268,7 +268,7 @@ fn coerce_json_parse_args(
                 }
             }
         };
-        *slot = Value::String(s);
+        *slot = Value::string(s);
     }
     Ok(out)
 }
@@ -308,7 +308,7 @@ fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Valu
     let space = args.get(2).cloned().unwrap_or(Value::undefined());
     let opts = StringifyOptions::from_space_with_heap(&space, Some(gc_heap))?;
     match stringify_with_options(&value, &opts, gc_heap)? {
-        Some(text) => Ok(Value::String(JsString::from_str(&text, gc_heap)?)),
+        Some(text) => Ok(Value::string(JsString::from_str(&text, gc_heap)?)),
         None => Ok(Value::undefined()),
     }
 }
@@ -378,8 +378,8 @@ mod tests {
     #[test]
     fn stringify_nan_and_infinity_become_null() {
         let mut heap = make_heap();
-        let nan = Value::Number(NumberValue::Double(f64::NAN));
-        let inf = Value::Number(NumberValue::Double(f64::INFINITY));
+        let nan = Value::number(NumberValue::Double(f64::NAN));
+        let inf = Value::number(NumberValue::Double(f64::INFINITY));
         assert_eq!(stringify(&nan, &mut heap).unwrap().unwrap(), "null");
         assert_eq!(stringify(&inf, &mut heap).unwrap().unwrap(), "null");
     }
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn stringify_rejects_bigint() {
         let mut heap = make_heap();
-        let bi = Value::BigInt(
+        let bi = Value::big_int(
             crate::bigint::BigIntValue::from_decimal(&mut heap, "1")
                 .unwrap()
                 .unwrap(),
@@ -471,7 +471,7 @@ mod tests {
         );
 
         // BigInt.
-        let bi = Value::BigInt(
+        let bi = Value::big_int(
             crate::bigint::BigIntValue::from_decimal(&mut heap, "1")
                 .unwrap()
                 .unwrap(),

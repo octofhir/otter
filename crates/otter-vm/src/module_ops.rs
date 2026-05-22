@@ -84,7 +84,7 @@ impl Interpreter {
                 if let Some(ns) =
                     self.resolve_module_namespace(context, referrer.as_ref(), &specifier)
                 {
-                    let namespace_value = Value::Object(ns);
+                    let namespace_value = Value::object(ns);
                     promise_dispatch::PromiseBuilder::with_context(import_context.clone())
                         .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])?
                 } else if let Some(loader) = self.dynamic_import_loader.clone() {

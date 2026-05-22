@@ -3263,7 +3263,7 @@ impl Interpreter {
                 {
                     return Ok(VmGetOutcome::Value(v));
                 }
-                let this_value = Value::TypedArray(t);
+                let this_value = Value::typed_array(t);
                 let proto = self.get_prototype_for_op(&this_value)?;
                 if matches!(proto, Value::Null | Value::Undefined) {
                     return Ok(VmGetOutcome::Value(Value::Undefined));
@@ -3701,7 +3701,7 @@ impl Interpreter {
                         continue;
                     };
                     let name = name.to_lossy_string(&self.gc_heap);
-                    let proxy_root = Value::Proxy(proxy);
+                    let proxy_root = Value::proxy(proxy);
                     let slice_roots: [&[Value]; 1] = [keys.as_slice()];
                     let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                         context,
@@ -3731,7 +3731,7 @@ impl Interpreter {
                 Ok(keys)
             }
             Value::Array(arr) => {
-                let target = Value::Array(arr);
+                let target = Value::array(arr);
                 let own_keys = self.own_property_keys_value(context, &target)?;
                 let mut out = Vec::new();
                 for key_value in own_keys {

@@ -130,7 +130,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// full ICU integration.
 fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = impl_format(args)?;
-    let literal = Value::String(crate::string::JsString::from_str("literal", args.gc_heap)?);
+    let literal = Value::string(crate::string::JsString::from_str("literal", args.gc_heap)?);
     let part = args.alloc_object_rooted(&[&literal, &s], &[])?;
     {
         let heap = &mut *args.gc_heap;

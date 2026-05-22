@@ -386,7 +386,7 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
         // recursion as one step rather than re-entering this
         // function (avoids needing a fresh `Value`).
         (Value::Boolean(b), other) | (other, Value::Boolean(b)) => {
-            let coerced = Value::Number(NumberValue::from_i32(if *b { 1 } else { 0 }));
+            let coerced = Value::number(NumberValue::from_i32(if *b { 1 } else { 0 }));
             is_loosely_equal(&coerced, other, heap)
         }
 

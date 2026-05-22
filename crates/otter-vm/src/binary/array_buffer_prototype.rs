@@ -213,11 +213,11 @@ pub fn load_property(buf: JsArrayBuffer, heap: &otter_gc::GcHeap, name: &str) ->
     match name {
         "byteLength" => smi(buf.byte_length(heap) as i32),
         "maxByteLength" => smi(buf.max_byte_length(heap) as i32),
-        "resizable" => Value::Boolean(buf.is_resizable(heap)),
+        "resizable" => Value::boolean(buf.is_resizable(heap)),
         // §25.2.4.2 — `growable` for SAB; mirrors `resizable` on
         // ordinary ArrayBuffer.
-        "growable" => Value::Boolean(buf.is_growable(heap)),
-        "detached" => Value::Boolean(buf.is_detached(heap)),
+        "growable" => Value::boolean(buf.is_growable(heap)),
+        "detached" => Value::boolean(buf.is_detached(heap)),
         // Diagnostics-only: spec exposes byteLength as 0 when
         // detached but the foundation already does that inside
         // `byte_length`.

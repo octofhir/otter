@@ -121,7 +121,7 @@ pub(crate) fn install_typed_array_entry(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     // Look up this entry's kind + ctor fn from the static table.
     let (_, kind, ctor_call) = TYPED_ARRAY_CTORS
         .iter()
@@ -132,11 +132,11 @@ pub(crate) fn install_typed_array_entry(
     // Ensure %TypedArray%.prototype exists on the realm (allocated
     // lazily the first time we install a concrete TypedArray).
     let abstract_proto = ensure_abstract_typed_array_prototype(heap, global)?;
-    let abstract_proto_root = Value::Object(abstract_proto);
+    let abstract_proto_root = Value::object(abstract_proto);
 
     // Per-kind prototype linked to the abstract.
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &abstract_proto_root])?;
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     object::set_prototype(prototype, heap, Some(abstract_proto));
 
     // BYTES_PER_ELEMENT (read-only) on the per-kind prototype.
@@ -161,7 +161,7 @@ pub(crate) fn install_typed_array_entry(
         &[&global_root, &abstract_proto_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_root = Value::NativeFunction(ctor);
+    let ctor_root = Value::native_function(ctor);
     let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
@@ -188,7 +188,7 @@ pub(crate) fn install_typed_array_entry(
         .copied()
         .find(|(n, _, _)| *n == name)
     {
-        let abstract_ctor_value = Value::NativeFunction(abstract_ctor);
+        let abstract_ctor_value = Value::native_function(abstract_ctor);
         let from_native = crate::bootstrap::native_static_with_value_roots(
             heap,
             "from",
@@ -250,7 +250,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // `Function.prototype.call` / explicit-invoke fallback by
     // re-entering the same callback loop in the wrapper body.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
-        let abstract_proto_root = Value::Object(abstract_proto);
+        let abstract_proto_root = Value::object(abstract_proto);
         let install_method = |heap: &mut otter_gc::GcHeap,
                               name: &'static str,
                               length: u8,
@@ -291,7 +291,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // internal slot and reads the corresponding field. The
     // setter side is undefined per spec.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
-        let abstract_proto_root = Value::Object(abstract_proto);
+        let abstract_proto_root = Value::object(abstract_proto);
         let install_accessor = |heap: &mut otter_gc::GcHeap,
                                 name: &'static str,
                                 getter_name: &'static str,
@@ -326,7 +326,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // prototypes inherit the accessor; per-instance access walks
     // up to %TypedArray%.prototype and triggers the getter.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
-        let abstract_proto_root = Value::Object(abstract_proto);
+        let abstract_proto_root = Value::object(abstract_proto);
         let getter = crate::bootstrap::native_static_with_value_roots(
             heap,
             "[Symbol.toStringTag]",
@@ -424,7 +424,7 @@ fn drain_iterable_into_values(
     let handle = match iter_obj {
         Value::Iterator(h) => h,
         Value::Generator(g) => {
-            let gen_value = Value::Generator(g);
+            let gen_value = Value::generator(g);
             let state = crate::IteratorState::Generator { handle: g };
             ctx.alloc_iterator_state(state, &[&gen_value], &[])
                 .map_err(|_| NativeError::TypeError {
@@ -545,7 +545,7 @@ fn ta_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.forEach")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.forEach")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -558,7 +558,7 @@ fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.map")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.map")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     let kind = t.kind();
@@ -580,7 +580,7 @@ fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.filter")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.filter")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     let mut out: Vec<Value> = Vec::new();
@@ -597,7 +597,7 @@ fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.find")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.find")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -613,7 +613,7 @@ fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findIndex")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findIndex")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -631,7 +631,7 @@ fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLast")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findLast")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for i in (0..elements.len()).rev() {
@@ -648,7 +648,7 @@ fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLastIndex")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findLastIndex")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for i in (0..elements.len()).rev() {
@@ -667,7 +667,7 @@ fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.every")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.every")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -683,7 +683,7 @@ fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.some")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.some")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
@@ -725,7 +725,7 @@ fn ta_proto_reduce_dir(
             reason: "reduce of empty array with no initial value".to_string(),
         });
     }
-    let ta_value = Value::TypedArray(t);
+    let ta_value = Value::typed_array(t);
     let exec_ctx = ctx
         .execution_context()
         .cloned()
@@ -952,8 +952,8 @@ fn ensure_abstract_typed_array_constructor(
         return Ok(nf);
     }
     let abstract_proto = ensure_abstract_typed_array_prototype(heap, global)?;
-    let global_root = Value::Object(global);
-    let abstract_proto_root = Value::Object(abstract_proto);
+    let global_root = Value::object(global);
+    let abstract_proto_root = Value::object(abstract_proto);
     let ctor = native_constructor_static_with_value_roots(
         heap,
         "TypedArray",
@@ -993,7 +993,7 @@ fn ensure_abstract_typed_array_prototype(
     if let Some(Value::Object(obj)) = object::get(global, heap, ABSTRACT_PROTO_SLOT) {
         return Ok(obj);
     }
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
     // Chain to %Object.prototype% per §23.2.3.
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
@@ -1177,7 +1177,7 @@ fn ta_ctor_dispatch(
                 .get(crate::symbol::WellKnown::Iterator);
             let has_iter = crate::object::get_symbol(*src_obj, ctx.heap(), &iter_sym).is_some();
             if has_iter {
-                let src_value = Value::Object(*src_obj);
+                let src_value = Value::object(*src_obj);
                 let drained = drain_iterable_into_values(ctx, exec, &src_value)?;
                 let arr = ctx
                     .array_from_elements(drained)

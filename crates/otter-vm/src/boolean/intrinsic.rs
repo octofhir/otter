@@ -32,7 +32,7 @@ impl BuiltinIntrinsic for Intrinsic {
 }
 
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
     {
         let mut builder =
@@ -48,7 +48,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         object::set_prototype(prototype, heap, Some(object_proto));
     }
 
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor_native = native_static_with_value_roots(
         heap,
         "Boolean",
@@ -57,7 +57,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_native_root = Value::NativeFunction(ctor_native);
+    let ctor_native_root = Value::native_function(ctor_native);
     let statics =
         alloc_object_with_value_roots(heap, &[&global_root, &prototype_root, &ctor_native_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
@@ -90,7 +90,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     );
     // §20.3.2 — `Boolean.name` is `"Boolean"`, non-writable,
     // non-enumerable, configurable.
-    let name_value = Value::String(
+    let name_value = Value::string(
         crate::string::JsString::from_str("Boolean", heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
@@ -100,7 +100,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         "name",
         crate::object::PropertyDescriptor::data(name_value, false, false, true),
     );
-    let boolean_value = Value::Object(statics);
+    let boolean_value = Value::object(statics);
     let _ = object::define_own_property(
         prototype,
         heap,

@@ -448,7 +448,7 @@ impl PurePromise {
 
     /// Install (or replace) the lazy expando bag.
     pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
-        let barrier = Value::Object(expando);
+        let barrier = Value::object(expando);
         heap.with_payload(self.inner, |body| {
             body.expando = Some(expando);
         });

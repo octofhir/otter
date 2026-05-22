@@ -145,7 +145,7 @@ impl Interpreter {
         }
         let key = self.to_property_key_sync(context, value)?;
         match key {
-            VmPropertyKey::Symbol(sym) => Ok(Value::Symbol(sym)),
+            VmPropertyKey::Symbol(sym) => Ok(Value::symbol(sym)),
             VmPropertyKey::Atom(atom) => {
                 let s = JsString::from_str(atom.name(), self.gc_heap_mut())?;
                 Ok(Value::String(s))
@@ -170,7 +170,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         match string_index_property_name(name) {
             Some(index) => match string.char_code_at(index, &self.gc_heap) {
-                Some(unit) => Ok(Value::String(JsString::from_utf16_units(
+                Some(unit) => Ok(Value::string(JsString::from_utf16_units(
                     &[unit],
                     &mut self.gc_heap,
                 )?)),
@@ -553,7 +553,7 @@ impl Interpreter {
             Value::Object(_) | Value::Proxy(_) | Value::Iterator(_) | Value::Null => {
                 *read_register(frame, proto_reg)?
             }
-            Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
+            Value::ClassConstructor(c) => Value::object(c.statics(&self.gc_heap)),
             // §15.7.14 ClassDefinitionEvaluation step 6.b — `class D
             // extends C` sets D.[[Prototype]] (the static side) to
             // the parent constructor C verbatim, so static methods on
@@ -1580,11 +1580,11 @@ impl Interpreter {
                     },
                     Value::String(s) => match idx {
                         Some(idx) => match s.char_code_at(idx as u32, &self.gc_heap) {
-                            Some(unit) => Value::String(crate::JsString::from_utf16_units(
+                            Some(unit) => Value::string(crate::JsString::from_utf16_units(
                                 &[unit],
                                 &mut self.gc_heap,
                             )?),
-                            None => Value::String(crate::JsString::empty(self.gc_heap_mut())?),
+                            None => Value::string(crate::JsString::empty(self.gc_heap_mut())?),
                         },
                         None => Value::undefined(),
                     },
@@ -2867,7 +2867,7 @@ impl Interpreter {
                 ComputedPropertyKey::String(key) => {
                     Value::String(JsString::from_str(key, &mut self.gc_heap)?)
                 }
-                ComputedPropertyKey::Symbol(sym) => Value::Symbol(*sym),
+                ComputedPropertyKey::Symbol(sym) => Value::symbol(*sym),
             };
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
@@ -3749,7 +3749,7 @@ impl Interpreter {
         let proto_val = *read_register(&stack[top_idx], proto_reg)?;
         let proto_obj = match &proto_val {
             Value::Object(_) | Value::Proxy(_) | Value::Null => proto_val,
-            Value::ClassConstructor(c) => Value::Object(c.statics(&self.gc_heap)),
+            Value::ClassConstructor(c) => Value::object(c.statics(&self.gc_heap)),
             _ => return Err(VmError::TypeMismatch),
         };
         let pc = stack[top_idx].pc;
@@ -3901,7 +3901,7 @@ pub(crate) fn typed_array_ensure_expando_pub(
     if let Some(existing) = t.expando(heap) {
         return Ok(existing);
     }
-    let ta_root = Value::TypedArray(*t);
+    let ta_root = Value::typed_array(*t);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         ta_root.trace_value_slots(visitor);
     };
@@ -3939,7 +3939,7 @@ pub(crate) fn regexp_ensure_expando_pub(
     if let Some(existing) = r.expando(heap) {
         return Ok(existing);
     }
-    let recv = Value::RegExp(*r);
+    let recv = Value::regexp(*r);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         recv.trace_value_slots(visitor);
     };
@@ -3956,7 +3956,7 @@ pub(crate) fn promise_ensure_expando_pub(
     if let Some(existing) = p.expando(heap) {
         return Ok(existing);
     }
-    let recv = Value::Promise(*p);
+    let recv = Value::promise(*p);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         recv.trace_value_slots(visitor);
     };

@@ -96,7 +96,7 @@ impl Interpreter {
         message_value: &Value,
     ) -> Result<object::JsObject, VmError> {
         let proto = self.error_classes.prototype(kind);
-        let proto_value = Value::Object(proto);
+        let proto_value = Value::object(proto);
         let obj =
             self.alloc_stack_rooted_object_with_extra_roots(stack, &[message_value, &proto_value])?;
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));

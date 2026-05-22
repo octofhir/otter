@@ -501,7 +501,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             for (i, unit) in units.iter().enumerate() {
                 let ch = char::from_u32(*unit as u32).unwrap_or('\u{FFFD}');
                 let s_one = ch.to_string();
-                let v = Value::String(JsString::from_str(&s_one, args.gc_heap)?);
+                let v = Value::string(JsString::from_str(&s_one, args.gc_heap)?);
                 let coerced = coerce(kind, &v, args.gc_heap)?;
                 t.set(args.gc_heap, off + i, &coerced);
             }
@@ -585,7 +585,7 @@ fn wrap_iterator(
     snapshot: impl IntoIterator<Item = Value>,
 ) -> Result<Value, otter_gc::OutOfMemory> {
     let arr = args.array_from_elements_rooted(snapshot, &[], &[])?;
-    let arr_value = Value::Array(arr);
+    let arr_value = Value::array(arr);
     let state = crate::IteratorState::Array {
         array: arr,
         index: 0,
@@ -723,7 +723,7 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
 #[must_use]
 pub fn load_property(t: &JsTypedArray, heap: &otter_gc::GcHeap, name: &str) -> Value {
     match name {
-        "buffer" => Value::ArrayBuffer(t.buffer(heap)),
+        "buffer" => Value::array_buffer(t.buffer(heap)),
         "byteLength" => smi(t.byte_length(heap) as i32),
         "byteOffset" => smi(t.byte_offset(heap) as i32),
         "length" => smi(t.length(heap) as i32),
@@ -746,7 +746,7 @@ mod tests {
         let buffer = JsArrayBuffer::new(&mut gc_heap, 2).expect("array buffer");
         let view = JsTypedArray::new(&mut gc_heap, buffer, TypedArrayKind::Int8, 0, 2)
             .expect("typed array");
-        let receiver = Value::TypedArray(view);
+        let receiver = Value::typed_array(view);
         let before = gc_heap.stats().new_allocated_bytes;
 
         let result = impl_entries(&mut IntrinsicArgs {
@@ -773,7 +773,7 @@ mod tests {
             .expect("typed array");
         source.set(&mut gc_heap, 0, &smi(7));
         source.set(&mut gc_heap, 1, &smi(11));
-        let receiver = Value::TypedArray(source);
+        let receiver = Value::typed_array(source);
         let before = gc_heap.tracked_bytes();
 
         let result = impl_slice(&mut IntrinsicArgs {

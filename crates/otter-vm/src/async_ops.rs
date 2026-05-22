@@ -98,7 +98,7 @@ impl Interpreter {
             other => promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .fulfilled_stack_rooted(self, stack, other, &[], &[])?,
         };
-        let promise_value = Value::Promise(promise);
+        let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
         let parked = stack.pop().expect("top frame existed");
@@ -140,7 +140,7 @@ impl Interpreter {
             other => promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .fulfilled_stack_rooted(self, stack, other, &[], &[])?,
         };
-        let promise_value = Value::Promise(promise);
+        let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
         let parked = stack.pop().expect("top frame existed");

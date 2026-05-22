@@ -88,9 +88,9 @@ impl BuiltinIntrinsic for Intrinsic {
 /// - [`JsSurfaceError`] propagated from `ObjectBuilder` when
 ///   installing static method specs.
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let constructor_root = Value::Object(constructor);
+    let constructor_root = Value::object(constructor);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -102,7 +102,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
     crate::object::set_string_data(prototype, heap, empty_str);
 
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor_native = native_static_with_value_roots(
         heap,
         "String",
@@ -135,7 +135,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     );
     // §22.1.2 — `String.name` is `"String"`, non-writable,
     // non-enumerable, configurable.
-    let string_name_value = Value::String(
+    let string_name_value = Value::string(
         crate::JsString::from_str("String", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let _ = object::define_own_property(
@@ -187,7 +187,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         object::set(prototype, heap, "trimRight", end_fn);
     }
 
-    let string_value = Value::Object(constructor);
+    let string_value = Value::object(constructor);
     let _ = object::define_own_property(
         prototype,
         heap,

@@ -108,13 +108,13 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     };
     let segments = segment(&text, &payload.granularity);
-    let input_value = Value::String(crate::string::JsString::from_str(&text, args.gc_heap)?);
+    let input_value = Value::string(crate::string::JsString::from_str(&text, args.gc_heap)?);
     let granularity_word = payload.granularity == "word";
     // Pre-allocate JsString values; once gc_heap is borrowed we can
     // only call object:: APIs.
     let mut prepared: Vec<(Value, i32, bool)> = Vec::with_capacity(segments.len());
     for (idx, seg) in segments {
-        let seg_str = Value::String(crate::string::JsString::from_str(&seg, args.gc_heap)?);
+        let seg_str = Value::string(crate::string::JsString::from_str(&seg, args.gc_heap)?);
         let wordlike = granularity_word && seg.chars().any(char::is_alphanumeric);
         prepared.push((seg_str, idx as i32, wordlike));
     }
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn segment_uses_intrinsic_rooted_young_allocation() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let receiver = Value::Intl(
+        let receiver = Value::intl(
             JsIntl::new(
                 &mut gc_heap,
                 IntlPayload::Segmenter(SegmenterPayload {
@@ -204,7 +204,7 @@ mod tests {
             )
             .expect("intl"),
         );
-        let input = Value::String(JsString::from_str("alpha beta", &mut gc_heap).expect("input"));
+        let input = Value::string(JsString::from_str("alpha beta", &mut gc_heap).expect("input"));
         let args = [input];
         let before = gc_heap.stats().new_allocated_bytes;
 

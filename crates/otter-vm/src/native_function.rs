@@ -300,7 +300,7 @@ impl NativeFunction {
             };
             crate::object::alloc_object_with_roots(heap, &mut visit)?
         };
-        let own_properties_root = Value::Object(own_properties);
+        let own_properties_root = Value::object(own_properties);
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             own_properties_root.trace_value_slots(visitor);
@@ -1051,8 +1051,8 @@ fn native_builtin_descriptor(
     key: &str,
 ) -> Result<PropertyDescriptor, otter_gc::OutOfMemory> {
     let value = match key {
-        "name" => Value::String(JsString::from_str(body.name, heap)?),
-        "length" => Value::Number(crate::number::NumberValue::from_i32(body.length as i32)),
+        "name" => Value::string(JsString::from_str(body.name, heap)?),
+        "length" => Value::number(crate::number::NumberValue::from_i32(body.length as i32)),
         _ => Value::undefined(),
     };
     let configurable = match key {

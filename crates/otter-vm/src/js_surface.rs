@@ -112,8 +112,8 @@ impl ConstValue {
         match self {
             Self::Undefined => Value::undefined(),
             Self::Null => Value::null(),
-            Self::Boolean(v) => Value::Boolean(v),
-            Self::Number(v) => Value::Number(NumberValue::from_f64(v)),
+            Self::Boolean(v) => Value::boolean(v),
+            Self::Number(v) => Value::number(NumberValue::from_f64(v)),
         }
     }
 }
@@ -410,7 +410,7 @@ impl<'rt> ObjectBuilder<'rt> {
         call: NativeCall,
         attrs: Attr,
     ) -> Result<&mut Self, JsSurfaceError> {
-        let object_root = Value::Object(self.object);
+        let object_root = Value::object(self.object);
         let mut roots = Vec::with_capacity(self.value_roots.len() + 1);
         roots.push(&object_root);
         roots.extend(self.value_roots.iter());
@@ -440,7 +440,7 @@ impl<'rt> ObjectBuilder<'rt> {
 
     /// Define an accessor property.
     pub fn accessor_from_spec(&mut self, spec: &AccessorSpec) -> Result<&mut Self, JsSurfaceError> {
-        let object_root = Value::Object(self.object);
+        let object_root = Value::object(self.object);
         let mut roots = Vec::with_capacity(self.value_roots.len() + 1);
         roots.push(&object_root);
         roots.extend(self.value_roots.iter());
@@ -542,7 +542,7 @@ impl<'rt> ConstructorBuilder<'rt> {
             root_refs.as_slice(),
             &[],
         )?;
-        let ctor_root = Value::Object(ctor);
+        let ctor_root = Value::object(ctor);
         let mut proto_roots = Vec::with_capacity(root_refs.len() + 1);
         proto_roots.push(&ctor_root);
         proto_roots.extend(root_refs.iter().copied());
@@ -552,7 +552,7 @@ impl<'rt> ConstructorBuilder<'rt> {
             proto_roots.as_slice(),
             &[],
         )?;
-        let proto_root = Value::Object(proto);
+        let proto_root = Value::object(proto);
         let mut function_roots = Vec::with_capacity(root_refs.len() + 2);
         function_roots.push(&ctor_root);
         function_roots.push(&proto_root);
@@ -566,7 +566,7 @@ impl<'rt> ConstructorBuilder<'rt> {
             function_roots.as_slice(),
             &[],
         )?;
-        let function_root = Value::NativeFunction(function);
+        let function_root = Value::native_function(function);
         define_data(
             ctor,
             self.heap,
@@ -657,7 +657,7 @@ impl<'rt> ClassBuilder<'rt> {
             root_refs.as_slice(),
             &[],
         )?;
-        let prototype_root = Value::Object(prototype);
+        let prototype_root = Value::object(prototype);
         let mut statics_roots = Vec::with_capacity(root_refs.len() + 1);
         statics_roots.push(&prototype_root);
         statics_roots.extend(root_refs.iter().copied());
@@ -667,12 +667,12 @@ impl<'rt> ClassBuilder<'rt> {
             statics_roots.as_slice(),
             &[],
         )?;
-        let statics_root = Value::Object(statics);
+        let statics_root = Value::object(statics);
         let mut constructor_roots = Vec::with_capacity(root_refs.len() + 2);
         constructor_roots.push(&prototype_root);
         constructor_roots.push(&statics_root);
         constructor_roots.extend(root_refs.iter().copied());
-        let constructor = Value::NativeFunction(native_from_call_with_raw_roots(
+        let constructor = Value::native_function(native_from_call_with_raw_roots(
             self.heap,
             self.spec.constructor.name,
             self.spec.constructor.length,
@@ -723,7 +723,7 @@ impl<'rt> ClassBuilder<'rt> {
                 &[],
             );
         };
-        let class = Value::ClassConstructor(ClassConstructor::new_with_roots(
+        let class = Value::class_constructor(ClassConstructor::new_with_roots(
             self.heap,
             constructor,
             prototype,

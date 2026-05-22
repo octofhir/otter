@@ -527,9 +527,9 @@ fn install_placeholder(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let placeholder = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let placeholder_root = Value::Object(placeholder);
+    let placeholder_root = Value::object(placeholder);
     let proto = alloc_object_with_value_roots(heap, &[&global_root, &placeholder_root])?;
     object::set(placeholder, heap, "prototype", Value::Object(proto));
     define_global(global, heap, name, Value::Object(placeholder));
@@ -615,7 +615,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 reason: "out of memory while allocating proxy".to_string(),
             }
         })?;
-        let proxy_value = Value::Proxy(proxy);
+        let proxy_value = Value::proxy(proxy);
         let revoke = ctx
             .native_value_with_captures(
                 "revoke",
@@ -644,7 +644,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         Ok(Value::Object(obj))
     }
 
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let proxy_ctor = native_constructor_static_with_value_roots(
         heap,
         "Proxy",
@@ -653,7 +653,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         &[&global_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let proxy_ctor_root = Value::NativeFunction(proxy_ctor);
+    let proxy_ctor_root = Value::native_function(proxy_ctor);
     let revocable = native_static_with_value_roots(
         heap,
         "revocable",
@@ -833,7 +833,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _args: &[Value],
     ) -> Result<Value, NativeError> {
         match *ctx.this_value() {
-            Value::Symbol(sym) => Ok(Value::Symbol(sym)),
+            Value::Symbol(sym) => Ok(Value::symbol(sym)),
             Value::Object(obj) => {
                 let heap = ctx.interp_mut().gc_heap();
                 crate::object::symbol_data(obj, heap)
@@ -855,7 +855,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _args: &[Value],
     ) -> Result<Value, NativeError> {
         match *ctx.this_value() {
-            Value::Symbol(sym) => Ok(Value::Symbol(sym)),
+            Value::Symbol(sym) => Ok(Value::symbol(sym)),
             Value::Object(obj) => {
                 let heap = ctx.interp_mut().gc_heap();
                 crate::object::symbol_data(obj, heap)
@@ -873,7 +873,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
 
     // The Symbol constructor itself is a callable NativeFunction.
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let symbol_ctor = {
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             global_root.trace_value_slots(visitor);
@@ -889,7 +889,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     };
 
     // §20.4.3 Symbol.prototype — ordinary object linked to %Object.prototype%.
-    let symbol_ctor_root = Value::NativeFunction(symbol_ctor);
+    let symbol_ctor_root = Value::native_function(symbol_ctor);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &symbol_ctor_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -902,14 +902,14 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     ) -> Result<Value, NativeError> {
         match *ctx.this_value() {
             Value::Symbol(sym) => match sym.description() {
-                Some(s) => Ok(Value::String(*s)),
+                Some(s) => Ok(Value::string(*s)),
                 None => Ok(Value::undefined()),
             },
             Value::Object(obj) => {
                 let heap = ctx.interp_mut().gc_heap();
                 match crate::object::symbol_data(obj, heap) {
                     Some(sym) => match sym.description() {
-                        Some(s) => Ok(Value::String(*s)),
+                        Some(s) => Ok(Value::string(*s)),
                         None => Ok(Value::undefined()),
                     },
                     None => Err(NativeError::TypeError {
@@ -944,7 +944,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             Attr::builtin_function(),
         )?;
         // §20.4.3.2 Symbol.prototype.description — accessor.
-        let prototype_root = Value::Object(prototype);
+        let prototype_root = Value::object(prototype);
         let getter = native_static_with_value_roots(
             heap,
             "get description",
@@ -969,7 +969,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // [`install_symbol_well_knowns_post_bootstrap`] once the
     // per-interpreter `WellKnownSymbols` singleton table exists.
     // `for` / `keyFor` methods.
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let symbol_for_fn = native_static_with_value_roots(
         heap,
         "for",
@@ -978,7 +978,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         &[&global_root, &symbol_ctor_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let symbol_for_root = Value::NativeFunction(symbol_for_fn);
+    let symbol_for_root = Value::native_function(symbol_for_fn);
     let symbol_key_for_fn = native_static_with_value_roots(
         heap,
         "keyFor",
@@ -1039,7 +1039,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         _args: &[Value],
     ) -> Result<Value, crate::NativeError> {
         match *ctx.this_value() {
-            Value::Symbol(sym) => Ok(Value::Symbol(sym)),
+            Value::Symbol(sym) => Ok(Value::symbol(sym)),
             Value::Object(obj) => {
                 let heap = ctx.interp_mut().gc_heap();
                 crate::object::symbol_data(obj, heap)
@@ -1100,8 +1100,8 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let symbol_ctor_root = Value::NativeFunction(symbol_ctor);
-    let prototype_root = Value::Object(prototype);
+    let symbol_ctor_root = Value::native_function(symbol_ctor);
+    let prototype_root = Value::object(prototype);
     let to_prim_fn = native_static_with_value_roots(
         heap,
         "[Symbol.toPrimitive]",
@@ -1267,7 +1267,7 @@ fn install_constructor_species_accessor(
     let Some(ctor_value) = object::get(global, heap, ctor_name) else {
         return Ok(());
     };
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let ctor_root = ctor_value;
     let species_getter = native_static_with_value_roots(
         heap,
@@ -1316,9 +1316,9 @@ fn install_constructor_species_accessor(
 fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCtx, NativeError};
 
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let array = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let array_root = Value::Object(array);
+    let array_root = Value::object(array);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &array_root])?;
     // §23.1 — `Array.prototype` is itself an Array exotic object whose
     // `[[Prototype]]` is `%Object.prototype%`. Bootstrap order installs
@@ -1467,7 +1467,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
 fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCall, NativeCtx, NativeError};
 
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     // Number.prototype with all the formatter methods + the
     // hidden `[[NumberData]]` slot (= +0 per §21.1.3) so
     // `Number.prototype.toString()` recovers the value.
@@ -1537,7 +1537,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         }
     }
 
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor_native = native_static_with_value_roots(
         heap,
         "Number",
@@ -1546,7 +1546,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_native_root = Value::NativeFunction(ctor_native);
+    let ctor_native_root = Value::native_function(ctor_native);
     // The `Number` global itself is a GC-managed JsObject. Both the
     // constants/static methods and the `prototype` link sit on it
     // as ordinary properties; the callable+constructable surface is
@@ -1600,7 +1600,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     );
     // §21.1.2 — `Number.name` is `"Number"`, non-writable,
     // non-enumerable, configurable.
-    let number_name_value = Value::String(
+    let number_name_value = Value::string(
         crate::string::JsString::from_str("Number", heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
@@ -1709,9 +1709,9 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
 
     {
-        let global_root2 = Value::Object(global);
-        let statics_root = Value::Object(statics);
-        let prototype_root2 = Value::Object(prototype);
+        let global_root2 = Value::object(global);
+        let statics_root = Value::object(statics);
+        let prototype_root2 = Value::object(prototype);
         let mut builder = ObjectBuilder::from_object_with_value_roots(
             heap,
             statics,
@@ -1888,7 +1888,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         }
     }
 
-    let number_value = Value::Object(statics);
+    let number_value = Value::object(statics);
     // §21.1.3.1 `Number.prototype.constructor` points back at the
     // Number constructor.
     let _ = object::define_own_property(
@@ -1959,11 +1959,11 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         Ok(result)
     }
 
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let function = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let function_root = Value::Object(function);
+    let function_root = Value::object(function);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &function_root])?;
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
     {
@@ -1978,7 +1978,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         &[&global_root, &function_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_native_root = Value::NativeFunction(ctor_native);
+    let ctor_native_root = Value::native_function(ctor_native);
     object::set_constructor_native(function, heap, ctor_native_root);
     let prototype_call = native_static_with_value_roots(
         heap,
@@ -2001,7 +2001,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         true,
     );
     let _ = object::define_own_property(function, heap, "length", length);
-    let name_value = Value::String(
+    let name_value = Value::string(
         crate::string::JsString::from_str("Function", heap)
             .map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
@@ -2017,7 +2017,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         true,
     );
     let _ = object::define_own_property(prototype, heap, "length", prototype_length);
-    let prototype_name_value = Value::String(
+    let prototype_name_value = Value::string(
         crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
     );
     let prototype_name = PropertyDescriptor::data(prototype_name_value, false, false, true);
@@ -2190,11 +2190,11 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         }
     }
 
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let object = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let object_root = Value::Object(object);
+    let object_root = Value::object(object);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &object_root])?;
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor_native = native_static_with_value_roots(
         heap,
         "Object",
@@ -2239,7 +2239,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // §B.2.2.1 Object.prototype.__proto__ — accessor pair.
     // <https://tc39.es/ecma262/#sec-object.prototype.__proto__>
     {
-        let proto_root = Value::Object(prototype);
+        let proto_root = Value::object(prototype);
         let getter = native_static_with_value_roots(
             heap,
             "get __proto__",
@@ -2350,9 +2350,9 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         Ok(Value::String(value))
     }
 
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let constructor_root = Value::Object(constructor);
+    let constructor_root = Value::object(constructor);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -2360,7 +2360,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         object::set_prototype(constructor, heap, Some(object_proto));
         object::set_prototype(prototype, heap, Some(object_proto));
     }
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor_native = native_static_with_value_roots(
         heap,
         "Date",
@@ -2422,7 +2422,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         })?;
     }
 
-    let date_value = Value::Object(constructor);
+    let date_value = Value::object(constructor);
     let _ = object::define_own_property(
         prototype,
         heap,
@@ -2612,7 +2612,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
     const NAME: &'static str = "Iterator";
     const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
     fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        let global_root = Value::Object(global);
+        let global_root = Value::object(global);
         // Build the spec-compliant Iterator constructor (callable as
         // `new Iterator()` via subclass `super()`, throws when
         // invoked directly).
@@ -2628,7 +2628,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         // to %Object.prototype% and decorated with the iterator
         // helpers below.
         let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
-        let proto_value = Value::Object(proto);
+        let proto_value = Value::object(proto);
         let prototype_desc =
             crate::object::PropertyDescriptor::data(proto_value, false, false, false);
         if !ctor.define_own_property(heap, "prototype", prototype_desc) {
@@ -2644,7 +2644,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         );
         define_global_value(global, heap, Self::NAME, Value::NativeFunction(ctor));
         let iterator_ctor = ctor;
-        let ctor_root = Value::NativeFunction(iterator_ctor);
+        let ctor_root = Value::native_function(iterator_ctor);
         let from_fn =
             native_static_with_value_roots(heap, "from", 1, iterator_from_native, &[&ctor_root])
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
@@ -2662,7 +2662,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         // runtime via existing `IteratorState` wrappers so the
         // call-method fast path and reflective property access
         // share behaviour.
-        let proto_root = Value::Object(prototype);
+        let proto_root = Value::object(prototype);
         // §27.1.2: `%IteratorPrototype%.[[Prototype]]` is
         // `%Object.prototype%` so reflective walks
         // (`Object.getPrototypeOf(Iterator.prototype) === Object.prototype`)
@@ -2750,7 +2750,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
     let Some(prototype) = prototype else {
         return Ok(());
     };
-    let proto_root = Value::Object(prototype);
+    let proto_root = Value::object(prototype);
     let symbol_iter_fn = native_static_with_value_roots(
         heap,
         "[Symbol.iterator]",
@@ -2820,7 +2820,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<BuiltinIteratorPrototypes, JsSurfaceError> {
     use crate::symbol::WellKnown;
-    let parent_value = Value::Object(parent);
+    let parent_value = Value::object(parent);
     let tag_sym = well_known.get(WellKnown::ToStringTag);
     let mut make = |tag: &'static str| -> Result<JsObject, JsSurfaceError> {
         let proto = {
@@ -2891,7 +2891,7 @@ fn iterator_receiver(
         // `IteratorState::Generator` so the lazy combinators and
         // eager terminals share the iterator dispatch path.
         Value::Generator(g) => {
-            let gen_value = Value::Generator(g);
+            let gen_value = Value::generator(g);
             let state = crate::IteratorState::Generator { handle: g };
             ctx.alloc_iterator_state(state, &[&gen_value], &[])
                 .map_err(|_| crate::NativeError::TypeError {
@@ -2974,7 +2974,7 @@ fn iterator_receiver_builtin(
     match this_value {
         Value::Iterator(h) => Ok(h),
         Value::Generator(g) => {
-            let gen_value = Value::Generator(g);
+            let gen_value = Value::generator(g);
             let state = crate::IteratorState::Generator { handle: g };
             ctx.alloc_iterator_state(state, &[&gen_value], &[])
                 .map_err(|_| crate::NativeError::TypeError {
@@ -3012,7 +3012,7 @@ fn iterator_proto_map(
 ) -> Result<Value, crate::NativeError> {
     let source = iterator_receiver(ctx, "Iterator.prototype.map")?;
     let mapper = require_callable_arg(ctx, args, "Iterator.prototype.map", 0)?;
-    let source_value = Value::Iterator(source);
+    let source_value = Value::iterator(source);
     let state = crate::IteratorState::Map { source, mapper };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value, &mapper], &[])
@@ -3029,7 +3029,7 @@ fn iterator_proto_filter(
 ) -> Result<Value, crate::NativeError> {
     let source = iterator_receiver(ctx, "Iterator.prototype.filter")?;
     let predicate = require_callable_arg(ctx, args, "Iterator.prototype.filter", 0)?;
-    let source_value = Value::Iterator(source);
+    let source_value = Value::iterator(source);
     let state = crate::IteratorState::Filter { source, predicate };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value, &predicate], &[])
@@ -3046,7 +3046,7 @@ fn iterator_proto_take(
 ) -> Result<Value, crate::NativeError> {
     let source = iterator_receiver(ctx, "Iterator.prototype.take")?;
     let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.take")?;
-    let source_value = Value::Iterator(source);
+    let source_value = Value::iterator(source);
     let state = crate::IteratorState::Take {
         source,
         remaining: n,
@@ -3066,7 +3066,7 @@ fn iterator_proto_drop(
 ) -> Result<Value, crate::NativeError> {
     let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
     let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.drop")?;
-    let source_value = Value::Iterator(source);
+    let source_value = Value::iterator(source);
     let state = crate::IteratorState::Drop { source, to_drop: n };
     let handle = ctx
         .alloc_iterator_state(state, &[&source_value], &[])
@@ -3083,7 +3083,7 @@ fn iterator_proto_flat_map(
 ) -> Result<Value, crate::NativeError> {
     let source = iterator_receiver(ctx, "Iterator.prototype.flatMap")?;
     let mapper = require_callable_arg(ctx, args, "Iterator.prototype.flatMap", 0)?;
-    let source_value = Value::Iterator(source);
+    let source_value = Value::iterator(source);
     let state = crate::IteratorState::FlatMap {
         source,
         mapper,
@@ -3169,7 +3169,7 @@ fn iterator_proto_to_array(
         }
         collected.push(v);
     }
-    let iter_value = Value::Iterator(handle);
+    let iter_value = Value::iterator(handle);
     let arr = ctx
         .array_from_elements_with_roots(
             collected.iter().cloned(),
@@ -3366,7 +3366,7 @@ fn iterator_proto_next(
                 name: "Iterator.prototype.next",
                 reason: "missing execution context".to_string(),
             })?;
-    let iter_value = Value::Iterator(handle);
+    let iter_value = Value::iterator(handle);
     let (value, done) = ctx
         .cx
         .interp
@@ -3431,7 +3431,7 @@ fn regexp_string_iterator_proto_next(
                 name,
                 reason: "missing execution context".to_string(),
             })?;
-    let iter_value = Value::Iterator(handle);
+    let iter_value = Value::iterator(handle);
     let (value, done) = ctx
         .cx
         .interp
@@ -3472,7 +3472,7 @@ fn iterator_proto_return(
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.return")?;
     let arg = args.first().cloned().unwrap_or(Value::undefined());
-    let iter_value = Value::Iterator(handle);
+    let iter_value = Value::iterator(handle);
     ctx.cx
         .interp
         .gc_heap_for_cx_mut()
@@ -3580,7 +3580,7 @@ fn iterator_from_native(
     match &input {
         Value::Iterator(_) => Ok(input),
         Value::Array(arr) => {
-            let arr_value = Value::Array(*arr);
+            let arr_value = Value::array(*arr);
             let state = crate::IteratorState::Array {
                 array: *arr,
                 index: 0,

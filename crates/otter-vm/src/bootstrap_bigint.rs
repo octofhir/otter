@@ -41,7 +41,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 
 /// §21.2 BigInt — installer body, called through [`Intrinsic`].
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -67,7 +67,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     // BigInt is callable-only — use `new_static`, not
     // `new_constructor_static`, so `new BigInt(x)` triggers the
     // §10.1.10 [[Construct]]-missing path (TypeError).
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor = crate::bootstrap::native_static_with_value_roots(
         heap,
         "BigInt",
@@ -212,7 +212,7 @@ fn coerce_bigint_call_args(
                     })
                 };
                 let joined = parts.join(",");
-                *slot = Value::String(
+                *slot = Value::string(
                     crate::string::JsString::from_str(&joined, ctx.heap_mut()).map_err(|_| {
                         NativeError::TypeError {
                             name,
@@ -324,7 +324,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 
 fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     match ctx.this_value() {
-        Value::BigInt(b) => Ok(Value::BigInt(*b)),
+        Value::BigInt(b) => Ok(Value::big_int(*b)),
         Value::Object(obj) => crate::object::bigint_data(*obj, ctx.heap())
             .map(Value::BigInt)
             .ok_or_else(|| NativeError::TypeError {
@@ -350,7 +350,7 @@ fn define_static(
     call: crate::native_function::NativeFastFn,
     value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
-    let ctor_root = Value::NativeFunction(ctor);
+    let ctor_root = Value::native_function(ctor);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&ctor_root);
     roots.extend(value_roots.iter());

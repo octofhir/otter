@@ -68,7 +68,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
         heap: &mut otter_gc::GcHeap,
         global: crate::object::JsObject,
     ) -> Result<(), crate::js_surface::JsSurfaceError> {
-        let global_root = Value::Object(global);
+        let global_root = Value::object(global);
         let namespace = crate::js_surface::NamespaceBuilder::from_spec_with_value_roots(
             heap,
             &ATOMICS_SPEC,
@@ -294,7 +294,7 @@ fn coerce_element_value(
             )
         };
         match primitive {
-            Value::BigInt(b) => Ok(Value::BigInt(b)),
+            Value::BigInt(b) => Ok(Value::big_int(b)),
             Value::Boolean(b) => {
                 let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
                     .map_err(oom_to_err)?;
@@ -755,11 +755,11 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     let label_str = JsString::from_str(label, string_heap)
         .map_err(|e| type_err(method_name, format!("string allocation failed: {e}")))?;
     if is_async {
-        let label_value = Value::String(label_str);
+        let label_value = Value::string(label_str);
         let promise = ctx
             .fulfilled_promise_with_roots(label_value, &[], &[args])
             .map_err(|e| type_err(method_name, format!("promise allocation failed: {e}")))?;
-        let promise_value = Value::Promise(promise);
+        let promise_value = Value::promise(promise);
         let result = ctx
             .alloc_object_with_roots(&[&label_value, &promise_value], &[args])
             .map_err(|e| type_err(method_name, format!("object allocation failed: {e}")))?;

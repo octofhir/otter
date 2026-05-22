@@ -1643,7 +1643,7 @@ impl Interpreter {
             return Ok(existing);
         }
 
-        let bag_root = Value::Object(bag);
+        let bag_root = Value::object(bag);
         let proto =
             self.alloc_stack_rooted_object_with_extra_roots(stack, &[&function_root, &bag_root])?;
         if let Some(Value::Object(object_ctor)) =
@@ -1657,14 +1657,14 @@ impl Interpreter {
             .function(function_id)
             .is_some_and(|function| function.is_generator)
         {
-            let proto_value = Value::Object(proto);
+            let proto_value = Value::object(proto);
             let parent = self.alloc_stack_rooted_object_with_extra_roots(
                 stack,
                 &[&function_root, &bag_root, &proto_value],
             )?;
             self.finish_generator_function_prototype(context, function_id, proto, parent)?;
         }
-        let proto_value = Value::Object(proto);
+        let proto_value = Value::object(proto);
         let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
         let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
         let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);
@@ -1698,7 +1698,7 @@ impl Interpreter {
             return Ok(existing);
         }
 
-        let bag_root = Value::Object(bag);
+        let bag_root = Value::object(bag);
         let mut proto_roots = Vec::with_capacity(value_roots.len() + 2);
         proto_roots.push(&function_root);
         proto_roots.push(&bag_root);
@@ -1715,7 +1715,7 @@ impl Interpreter {
             .function(function_id)
             .is_some_and(|function| function.is_generator)
         {
-            let proto_value = Value::Object(proto);
+            let proto_value = Value::object(proto);
             let mut parent_roots = Vec::with_capacity(value_roots.len() + 3);
             parent_roots.push(&function_root);
             parent_roots.push(&bag_root);
@@ -1724,7 +1724,7 @@ impl Interpreter {
             let parent = self.alloc_runtime_rooted_object_with_roots(&parent_roots, slice_roots)?;
             self.finish_generator_function_prototype(context, function_id, proto, parent)?;
         }
-        let proto_value = Value::Object(proto);
+        let proto_value = Value::object(proto);
         let constructor = object::PropertyDescriptor::data(function_root, true, false, true);
         let _ = object::define_own_property(proto, &mut self.gc_heap, "constructor", constructor);
         let prototype_desc = object::PropertyDescriptor::data(proto_value, true, false, false);

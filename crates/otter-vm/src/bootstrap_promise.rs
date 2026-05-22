@@ -54,7 +54,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 /// §27.2 Promise — installer body, called through [`Intrinsic`].
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     // Prototype object linked to %Object.prototype%.
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -87,7 +87,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     }
 
     // §27.2.3 The Promise Constructor.
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
         heap,
         "Promise",
@@ -184,8 +184,8 @@ pub fn install_promise_well_knowns_post_bootstrap(
     let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "Promise") else {
         return Ok(());
     };
-    let global_root = Value::Object(global);
-    let ctor_root = Value::NativeFunction(ctor);
+    let global_root = Value::object(global);
+    let ctor_root = Value::native_function(ctor);
     let species_getter = crate::bootstrap::native_static_with_value_roots(
         heap,
         "get [Symbol.species]",
@@ -286,7 +286,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     if let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "Promise")? {
         handle.set_prototype_override(ctx.heap_mut(), Some(proto));
     }
-    let promise_value = Value::Promise(handle);
+    let promise_value = Value::promise(handle);
     let invoke_args: SmallVec<[Value; 8]> = smallvec::smallvec![resolve, reject];
     let invoke_result =
         ctx.interp_mut()
@@ -424,7 +424,7 @@ fn define_ctor_method(
     call: crate::native_function::NativeFastFn,
     value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
-    let ctor_root = Value::NativeFunction(ctor);
+    let ctor_root = Value::native_function(ctor);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&ctor_root);
     roots.extend(value_roots.iter());

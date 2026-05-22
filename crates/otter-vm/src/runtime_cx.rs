@@ -573,7 +573,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let map_root = Value::Map(*map);
+        let map_root = Value::map(*map);
         let key_root = key;
         let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -598,7 +598,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let set_root = Value::Set(*set);
+        let set_root = Value::set(*set);
         let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
@@ -623,7 +623,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let map_root = Value::WeakMap(*map);
+        let map_root = Value::weak_map(*map);
         let key_root = key;
         let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -648,7 +648,7 @@ impl<'rt> NativeCtx<'rt> {
         let roots = self.collect_native_roots();
         let this_value = self.call_info.this_value;
         let new_target = self.call_info.new_target;
-        let set_root = Value::WeakSet(*set);
+        let set_root = Value::weak_set(*set);
         let value_root = value;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             visit_native_roots(
@@ -920,8 +920,8 @@ mod tests {
             let mut set = ctx.alloc_set().expect("native set allocation");
             ctx.set_add(&mut set, Value::Number(NumberValue::from_i32(3)))
                 .expect("native set insert");
-            let weak_key = Value::Object(ctx.alloc_object().expect("native weak key"));
-            let weak_value = Value::Object(ctx.alloc_object().expect("native weak value"));
+            let weak_key = Value::object(ctx.alloc_object().expect("native weak key"));
+            let weak_value = Value::object(ctx.alloc_object().expect("native weak value"));
             let mut weak_map = ctx.alloc_weak_map().expect("native weak map allocation");
             ctx.weak_map_set(&mut weak_map, weak_key, weak_value)
                 .expect("native weak map insert");
@@ -951,7 +951,7 @@ mod tests {
                 &mut interp,
                 NativeCallInfo::construct(Value::Undefined, Some(Value::Undefined)),
             );
-            let target = Value::Object(ctx.alloc_object().expect("target"));
+            let target = Value::object(ctx.alloc_object().expect("target"));
             let _weak_ref = ctx
                 .alloc_weak_ref(&target, &[], &[])
                 .expect("native weak ref allocation");

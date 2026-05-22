@@ -187,7 +187,7 @@ pub(crate) fn build_match_result(
             None => out.push(Value::Undefined),
         }
     }
-    let input_value = Value::String(*input);
+    let input_value = Value::string(*input);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&input_value);
     roots.extend_from_slice(value_roots);
@@ -207,7 +207,7 @@ pub(crate) fn build_match_result(
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
     if let Some((name, range)) = first_named {
-        let arr_value = Value::Array(arr);
+        let arr_value = Value::array(arr);
         let mut roots = Vec::with_capacity(value_roots.len() + 2);
         roots.push(&input_value);
         roots.push(&arr_value);
@@ -215,13 +215,13 @@ pub(crate) fn build_match_result(
         let groups_obj = args.alloc_object_rooted(&roots, &slices)?;
         crate::object::set_prototype(groups_obj, args.gc_heap, None);
         let value = match range {
-            Some(r) => Value::String(JsString::from_utf16_units(&units[r], args.gc_heap)?),
+            Some(r) => Value::string(JsString::from_utf16_units(&units[r], args.gc_heap)?),
             None => Value::undefined(),
         };
         crate::object::set(groups_obj, args.gc_heap, name, value);
         for (name, range) in named_iter {
             let value = match range {
-                Some(r) => Value::String(JsString::from_utf16_units(&units[r], args.gc_heap)?),
+                Some(r) => Value::string(JsString::from_utf16_units(&units[r], args.gc_heap)?),
                 None => Value::undefined(),
             };
             crate::object::set(groups_obj, args.gc_heap, name, value);
@@ -232,7 +232,7 @@ pub(crate) fn build_match_result(
     }
 
     if has_indices {
-        let arr_value = Value::Array(arr);
+        let arr_value = Value::array(arr);
         let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
         indices_elems.push(pair_array(
             m.range.start,
@@ -266,7 +266,7 @@ pub(crate) fn build_match_result(
         let mut named_iter = m.named_groups();
         let first_named = named_iter.next();
         if let Some((name, range)) = first_named {
-            let indices_value = Value::Array(indices_arr);
+            let indices_value = Value::array(indices_arr);
             let mut roots = Vec::with_capacity(value_roots.len() + 3);
             roots.push(&input_value);
             roots.push(&arr_value);
@@ -338,7 +338,7 @@ pub(crate) fn build_match_result_native(
             None => out.push(Value::Undefined),
         }
     }
-    let input_value = Value::String(*input);
+    let input_value = Value::string(*input);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&input_value);
     roots.extend_from_slice(value_roots);
@@ -358,7 +358,7 @@ pub(crate) fn build_match_result_native(
     let mut named_iter = m.named_groups();
     let first_named = named_iter.next();
     if let Some((name, range)) = first_named {
-        let arr_value = Value::Array(arr);
+        let arr_value = Value::array(arr);
         let mut roots = Vec::with_capacity(value_roots.len() + 2);
         roots.push(&input_value);
         roots.push(&arr_value);
@@ -366,14 +366,14 @@ pub(crate) fn build_match_result_native(
         let groups_obj = ctx.alloc_object_with_roots(&roots, &slices)?;
         crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
         let value = match range {
-            Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
+            Some(r) => Value::string(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
             None => Value::undefined(),
         };
         ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
             .map_err(vm_shape_error_to_intrinsic)?;
         for (name, range) in named_iter {
             let value = match range {
-                Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
+                Some(r) => Value::string(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
                 None => Value::undefined(),
             };
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
@@ -385,7 +385,7 @@ pub(crate) fn build_match_result_native(
     }
 
     if has_indices {
-        let arr_value = Value::Array(arr);
+        let arr_value = Value::array(arr);
         let mut indices_elems: Vec<Value> = Vec::with_capacity(1 + m.captures.len());
         indices_elems.push(pair_array_native(
             m.range.start,
@@ -422,7 +422,7 @@ pub(crate) fn build_match_result_native(
         let mut named_iter = m.named_groups();
         let first_named = named_iter.next();
         if let Some((name, range)) = first_named {
-            let indices_value = Value::Array(indices_arr);
+            let indices_value = Value::array(indices_arr);
             let mut roots = Vec::with_capacity(value_roots.len() + 3);
             roots.push(&input_value);
             roots.push(&arr_value);
@@ -635,8 +635,8 @@ pub fn native_regexp_symbol_match(
     if matches_out.is_empty() {
         return Ok(Value::null());
     }
-    let receiver_value = Value::RegExp(re);
-    let text_value = Value::String(text);
+    let receiver_value = Value::regexp(re);
+    let text_value = Value::string(text);
     let arr = ctx
         .array_from_elements_with_roots(
             matches_out.iter().cloned(),
@@ -675,8 +675,8 @@ pub fn native_regexp_symbol_search(
     let result = re.find_from_utf16(ctx.heap(), &units, 0).into_iter().next();
     re.set_last_index_value(ctx.heap_mut(), previous);
     Ok(match result {
-        Some(m) => Value::Number(NumberValue::from_i32(m.range.start as i32)),
-        None => Value::Number(NumberValue::from_i32(-1)),
+        Some(m) => Value::number(NumberValue::from_i32(m.range.start as i32)),
+        None => Value::number(NumberValue::from_i32(-1)),
     })
 }
 
@@ -1150,7 +1150,7 @@ pub fn native_regexp_symbol_replace(
             replacer_args.push(Value::String(matched_str));
             for cap in &captures {
                 replacer_args.push(match cap {
-                    Some(s) => Value::String(*s),
+                    Some(s) => Value::string(*s),
                     None => Value::undefined(),
                 });
             }
@@ -1376,7 +1376,7 @@ pub fn native_regexp_symbol_match_all(
         name,
     )?;
 
-    let input_root = Value::String(s);
+    let input_root = Value::string(s);
     let iter_state = crate::IteratorState::RegExpString {
         matcher,
         input: s,
@@ -1801,22 +1801,22 @@ pub fn load_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str) 
             let raw = re.source(gc_heap);
             let escaped = escape_regexp_pattern(&raw);
             match JsString::from_str(&escaped, gc_heap) {
-                Ok(s) => Value::String(s),
+                Ok(s) => Value::string(s),
                 Err(_) => Value::undefined(),
             }
         }
         "flags" => match JsString::from_str(&re.flags(gc_heap).to_js_string(), gc_heap) {
-            Ok(s) => Value::String(s),
+            Ok(s) => Value::string(s),
             Err(_) => Value::undefined(),
         },
-        "hasIndices" => Value::Boolean(re.flags(gc_heap).has_indices),
-        "global" => Value::Boolean(re.flags(gc_heap).global),
-        "ignoreCase" => Value::Boolean(re.flags(gc_heap).ignore_case),
-        "multiline" => Value::Boolean(re.flags(gc_heap).multiline),
-        "dotAll" => Value::Boolean(re.flags(gc_heap).dot_all),
-        "unicode" => Value::Boolean(re.flags(gc_heap).unicode),
-        "sticky" => Value::Boolean(re.flags(gc_heap).sticky),
-        "unicodeSets" => Value::Boolean(re.flags(gc_heap).unicode_sets),
+        "hasIndices" => Value::boolean(re.flags(gc_heap).has_indices),
+        "global" => Value::boolean(re.flags(gc_heap).global),
+        "ignoreCase" => Value::boolean(re.flags(gc_heap).ignore_case),
+        "multiline" => Value::boolean(re.flags(gc_heap).multiline),
+        "dotAll" => Value::boolean(re.flags(gc_heap).dot_all),
+        "unicode" => Value::boolean(re.flags(gc_heap).unicode),
+        "sticky" => Value::boolean(re.flags(gc_heap).sticky),
+        "unicodeSets" => Value::boolean(re.flags(gc_heap).unicode_sets),
         "lastIndex" => re.last_index_value(gc_heap),
         _ => Value::undefined(),
     }
@@ -1902,12 +1902,12 @@ mod tests {
     fn test_returns_boolean() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("ab+c", "", &mut gc_heap);
-        let text = Value::String(JsString::from_str("abbbc", &mut gc_heap).unwrap());
+        let text = Value::string(JsString::from_str("abbbc", &mut gc_heap).unwrap());
         assert_eq!(
             call("test", &re, &[text], &mut gc_heap),
             Value::Boolean(true)
         );
-        let no = Value::String(JsString::from_str("xy", &mut gc_heap).unwrap());
+        let no = Value::string(JsString::from_str("xy", &mut gc_heap).unwrap());
         assert_eq!(
             call("test", &re, &[no], &mut gc_heap),
             Value::Boolean(false)
@@ -1918,7 +1918,7 @@ mod tests {
     fn exec_returns_array_or_null() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("(a)(b)", "", &mut gc_heap);
-        let text = Value::String(JsString::from_str("ab", &mut gc_heap).unwrap());
+        let text = Value::string(JsString::from_str("ab", &mut gc_heap).unwrap());
         let r = call("exec", &re, &[text], &mut gc_heap);
         match r {
             Value::Array(arr) => {
@@ -1953,7 +1953,7 @@ mod tests {
     fn exec_result_arrays_use_intrinsic_rooted_allocation() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("(?<first>a)(b)", "d", &mut gc_heap);
-        let text = Value::String(JsString::from_str("ab", &mut gc_heap).unwrap());
+        let text = Value::string(JsString::from_str("ab", &mut gc_heap).unwrap());
         let before = gc_heap.stats().new_allocated_bytes;
         let result = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         let after = gc_heap.stats().new_allocated_bytes;
@@ -1979,7 +1979,7 @@ mod tests {
     fn exec_global_walks_through_text() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let re = make("a", "g", &mut gc_heap);
-        let text = Value::String(JsString::from_str("abab", &mut gc_heap).unwrap());
+        let text = Value::string(JsString::from_str("abab", &mut gc_heap).unwrap());
         // First call → match at 0, lastIndex moves to 1.
         let r1 = call("exec", &re, std::slice::from_ref(&text), &mut gc_heap);
         match (&r1, &re) {
@@ -2067,7 +2067,7 @@ mod tests {
         );
         assert_eq!(re.last_index(&gc_heap), 9);
         // Non-lastIndex names are silently ignored.
-        let nope = Value::String(JsString::from_str("nope", &mut gc_heap).unwrap());
+        let nope = Value::string(JsString::from_str("nope", &mut gc_heap).unwrap());
         store_property(&re, &mut gc_heap, "source", nope);
     }
 }

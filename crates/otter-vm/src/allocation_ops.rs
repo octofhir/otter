@@ -114,7 +114,7 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        let proto_value = Value::Object(proto);
+        let proto_value = Value::object(proto);
         let roots = self.collect_runtime_roots();
         let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -399,7 +399,7 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        let proto_value = Value::Object(proto);
+        let proto_value = Value::object(proto);
         let roots = self.collect_allocation_roots(stack);
         let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {

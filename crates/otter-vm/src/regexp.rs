@@ -314,7 +314,7 @@ impl JsRegExp {
             body.pattern_utf16 = pattern_units;
             body.source = source;
             body.flags = flags;
-            *body.last_index.borrow_mut() = Value::Number(NumberValue::from_i32(0));
+            *body.last_index.borrow_mut() = Value::number(NumberValue::from_i32(0));
             body.prototype_override = None;
         });
         Ok(())
@@ -369,7 +369,7 @@ impl JsRegExp {
 
     /// Install / replace the lazy expando bag.
     pub fn set_expando(&self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
-        let barrier = Value::Object(expando);
+        let barrier = Value::object(expando);
         heap.with_payload(self.inner, |body| {
             body.expando = Some(expando);
         });
@@ -460,7 +460,7 @@ impl JsRegExp {
     /// through successive `g` / `y` matches.
     pub fn set_last_index(&self, heap: &otter_gc::GcHeap, value: u32) {
         heap.read_payload(self.inner, |body| {
-            *body.last_index.borrow_mut() = Value::Number(NumberValue::from_f64(value as f64));
+            *body.last_index.borrow_mut() = Value::number(NumberValue::from_f64(value as f64));
         });
     }
 

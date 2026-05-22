@@ -56,7 +56,7 @@ pub fn call(
             Ok(Value::Number(number::parse_int(&s, radix)))
         }
         // §19.2.4 / §21.1.2.12 — same callable for both names.
-        M::ParseFloat => Ok(Value::Number(number::parse_float(&coerce_to_string(
+        M::ParseFloat => Ok(Value::number(number::parse_float(&coerce_to_string(
             args.first(),
             gc_heap,
         )))),
@@ -88,10 +88,10 @@ pub fn call(
                 Value::Number(ref n) if number::is_finite(n.as_f64())
             )))
         }
-        M::NumberIsInteger => Ok(Value::Boolean(number::is_integer(
+        M::NumberIsInteger => Ok(Value::boolean(number::is_integer(
             &args.first().cloned().unwrap_or(Value::undefined()),
         ))),
-        M::NumberIsSafeInteger => Ok(Value::Boolean(number::is_safe_integer(
+        M::NumberIsSafeInteger => Ok(Value::boolean(number::is_safe_integer(
             &args.first().cloned().unwrap_or(Value::undefined()),
         ))),
         M::EncodeURI => js_string(

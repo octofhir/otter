@@ -144,7 +144,7 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &mut otter_gc::GcHeap, name
             // normally surface but the property-load path can't
             // propagate that here without a wider API change.
             match crate::bigint::BigIntValue::from_i128(gc_heap, inst.as_i128()) {
-                Ok(handle) => Value::BigInt(handle),
+                Ok(handle) => Value::big_int(handle),
                 Err(_) => Value::undefined(),
             }
         }

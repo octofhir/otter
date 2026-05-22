@@ -53,7 +53,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 
 /// §22.2 RegExp — installer body, called through [`Intrinsic`].
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -64,7 +64,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     install_prototype_methods(heap, prototype, vec![global_root])?;
     install_prototype_accessors(heap, prototype, vec![global_root])?;
 
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
         heap,
         "RegExp",
@@ -113,7 +113,7 @@ fn install_regexp_legacy_accessors(
     ctor: crate::native_function::NativeFunction,
 ) -> Result<(), JsSurfaceError> {
     use crate::native_function::NativeFunction;
-    let ctor_value = Value::NativeFunction(ctor);
+    let ctor_value = Value::native_function(ctor);
 
     fn install_get_only(
         heap: &mut otter_gc::GcHeap,
@@ -121,7 +121,7 @@ fn install_regexp_legacy_accessors(
         name: &'static str,
         getter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
-        let ctor_value = Value::NativeFunction(ctor);
+        let ctor_value = Value::native_function(ctor);
         let captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
         let getter = NativeFunction::with_length_and_captures(
             heap,
@@ -146,7 +146,7 @@ fn install_regexp_legacy_accessors(
         getter_name: &'static str,
         setter_name: &'static str,
     ) -> Result<(), JsSurfaceError> {
-        let ctor_value = Value::NativeFunction(ctor);
+        let ctor_value = Value::native_function(ctor);
         let g_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
         let s_captures: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![ctor_value];
         let getter = NativeFunction::with_length_and_captures(
@@ -293,7 +293,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     // spec-mandated algorithm. `@@matchAll` and `@@split` remain
     // foundation-driven through their `String.prototype.*`
     // counterparts and will land in follow-up commits.
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let match_sym = well_known.get(WellKnown::Match);
     let search_sym = well_known.get(WellKnown::Search);
     let replace_sym = well_known.get(WellKnown::Replace);
@@ -693,7 +693,7 @@ fn install_accessor(
     call: crate::native_function::NativeFastFn,
     value_roots: &[Value],
 ) -> Result<(), JsSurfaceError> {
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&prototype_root);
     roots.extend(value_roots.iter());

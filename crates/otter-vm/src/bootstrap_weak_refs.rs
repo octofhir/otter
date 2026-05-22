@@ -44,7 +44,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for WeakRefIntrinsic {
 
 /// §26.1 WeakRef — installer body, called through [`WeakRefIntrinsic`].
 fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     link_object_prototype(heap, prototype, global);
     {
@@ -57,7 +57,7 @@ fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
             Attr::builtin_function(),
         )?;
     }
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
         heap,
         "WeakRef",
@@ -102,7 +102,7 @@ fn install_finalization_registry(
     heap: &mut otter_gc::GcHeap,
     global: JsObject,
 ) -> Result<(), JsSurfaceError> {
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     link_object_prototype(heap, prototype, global);
     {
@@ -121,7 +121,7 @@ fn install_finalization_registry(
             Attr::builtin_function(),
         )?;
     }
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
         heap,
         "FinalizationRegistry",

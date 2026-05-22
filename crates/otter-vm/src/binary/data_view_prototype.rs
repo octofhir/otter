@@ -409,12 +409,12 @@ pub fn load_property(view: &JsDataView, heap: &otter_gc::GcHeap, name: &str) -> 
     let buffer = view.buffer(heap);
     if buffer.is_detached(heap) {
         return match name {
-            "buffer" => Value::ArrayBuffer(buffer),
+            "buffer" => Value::array_buffer(buffer),
             _ => smi(0),
         };
     }
     match name {
-        "buffer" => Value::ArrayBuffer(buffer),
+        "buffer" => Value::array_buffer(buffer),
         "byteLength" => smi(view.byte_length(heap) as i32),
         "byteOffset" => smi(view.byte_offset(heap) as i32),
         _ => Value::undefined(),

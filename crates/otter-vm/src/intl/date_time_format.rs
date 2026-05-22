@@ -145,7 +145,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     } else {
         None
     };
-    let calendar = Value::String(crate::string::JsString::from_str("iso8601", args.gc_heap)?);
+    let calendar = Value::string(crate::string::JsString::from_str("iso8601", args.gc_heap)?);
     let mut value_roots = vec![&locale_value, &calendar];
     if let Some(v) = &yr {
         value_roots.push(v);

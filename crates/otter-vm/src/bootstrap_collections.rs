@@ -244,7 +244,7 @@ fn install_collection(
 ) -> Result<(), JsSurfaceError> {
     // §24.*.2 Properties of the *Map* / *Set* / *WeakMap* / *WeakSet*
     // Prototype Object — ordinary object linked to %Object.prototype%.
-    let global_root = Value::Object(global);
+    let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
     if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
         && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
@@ -262,7 +262,7 @@ fn install_collection(
         CollectionKind::WeakMap => weak_map_ctor_call,
         CollectionKind::WeakSet => weak_set_ctor_call,
     };
-    let prototype_root = Value::Object(prototype);
+    let prototype_root = Value::object(prototype);
     let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
         heap,
         ctor_name,
@@ -291,7 +291,7 @@ fn install_collection(
     // §24.2.2.1 `Set.groupBy` was rejected by TC39; only Map has
     // it. Object.groupBy already handled elsewhere.
     if matches!(kind, CollectionKind::Map) {
-        let ctor_root = Value::NativeFunction(ctor);
+        let ctor_root = Value::native_function(ctor);
         let group_by_fn = crate::bootstrap::native_static_with_value_roots(
             heap,
             "groupBy",
@@ -344,7 +344,7 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         name: "Map.groupBy",
         reason: "out of memory".to_string(),
     })?;
-    let result_value = Value::Map(result);
+    let result_value = Value::map(result);
     for (idx, item) in items_snapshot.iter().enumerate() {
         let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
         cb_args.push(*item);
@@ -378,7 +378,7 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
                 arr
             }
         };
-        let arr_value = Value::Array(group_arr);
+        let arr_value = Value::array(group_arr);
         let len = crate::array::len(group_arr, ctx.heap());
         let roots = ctx.collect_native_roots();
         let item_clone = *item;
@@ -627,7 +627,7 @@ fn install_prototype_methods(
                 CollectionKind::Set => set_size_get,
                 _ => unreachable!(),
             };
-            let prototype_root = Value::Object(prototype);
+            let prototype_root = Value::object(prototype);
             let mut roots = Vec::with_capacity(extra_roots.len() + 1);
             roots.push(&prototype_root);
             roots.extend(extra_roots.iter());
@@ -1044,7 +1044,7 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             name: "Map.prototype.forEach",
             reason: "no active execution context".to_string(),
         })?;
-    let map_value = Value::Map(m);
+    let map_value = Value::map(m);
     let mut index = 0;
     while index < collections::map_raw_len(m, ctx.heap()) {
         let Some((k, v)) = collections::map_entry_at(m, ctx.heap(), index) else {
@@ -1112,7 +1112,7 @@ fn set_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.values")?;
-    let set_value = Value::Set(s);
+    let set_value = Value::set(s);
     let iter = ctx
         .alloc_iterator_state(
             crate::IteratorState::SetCollection {
@@ -1129,7 +1129,7 @@ fn set_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.entries")?;
-    let set_value = Value::Set(s);
+    let set_value = Value::set(s);
     let iter = ctx
         .alloc_iterator_state(
             crate::IteratorState::SetCollection {
@@ -1162,7 +1162,7 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             name: "Set.prototype.forEach",
             reason: "no active execution context".to_string(),
         })?;
-    let set_value = Value::Set(s);
+    let set_value = Value::set(s);
     let mut index = 0;
     while index < collections::set_raw_len(s, ctx.heap()) {
         let Some(v) = collections::set_value_at(s, ctx.heap(), index) else {
@@ -1519,8 +1519,8 @@ fn weak_map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let m = receiver_weak_map(ctx, "WeakMap.prototype.has")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_has(m, ctx.heap(), &key) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -1528,8 +1528,8 @@ fn weak_map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     let m = receiver_weak_map(ctx, "WeakMap.prototype.delete")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_delete(m, ctx.heap_mut(), &key) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -1549,8 +1549,8 @@ fn weak_set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let s = receiver_weak_set(ctx, "WeakSet.prototype.has")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_set_has(s, ctx.heap(), &v) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -1558,8 +1558,8 @@ fn weak_set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     let s = receiver_weak_set(ctx, "WeakSet.prototype.delete")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_set_delete(s, ctx.heap_mut(), &v) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -1675,7 +1675,7 @@ fn make_map_iterator(
     m: crate::JsMap,
     kind: MapIterKind,
 ) -> Result<Value, NativeError> {
-    let map_value = Value::Map(m);
+    let map_value = Value::map(m);
     let iter = ctx
         .alloc_iterator_state(
             crate::IteratorState::MapCollection {

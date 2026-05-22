@@ -500,10 +500,10 @@ fn coerce_for_kind(
     if kind.is_bigint() {
         match value {
             Value::BigInt(_) => Ok(*value),
-            Value::Boolean(true) => Ok(Value::BigInt(
+            Value::Boolean(true) => Ok(Value::big_int(
                 crate::bigint::BigIntValue::from_i32(gc_heap, 1).map_err(oom_to_vm)?,
             )),
-            Value::Boolean(false) => Ok(Value::BigInt(
+            Value::Boolean(false) => Ok(Value::big_int(
                 crate::bigint::BigIntValue::from_i32(gc_heap, 0).map_err(oom_to_vm)?,
             )),
             // Spec rejects Number → BigInt array store with TypeError.
@@ -511,7 +511,7 @@ fn coerce_for_kind(
             Value::String(s) => {
                 let text = s.to_lossy_string(gc_heap);
                 match crate::bigint::BigIntValue::from_decimal(gc_heap, text.trim()) {
-                    Some(Ok(b)) => Ok(Value::BigInt(b)),
+                    Some(Ok(b)) => Ok(Value::big_int(b)),
                     Some(Err(e)) => Err(oom_to_vm(e)),
                     None => Err(VmError::TypeMismatch),
                 }

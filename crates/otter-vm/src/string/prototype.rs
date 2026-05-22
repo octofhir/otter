@@ -420,7 +420,7 @@ fn impl_char_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let s = JsString::from_utf16_units(&[u], args.gc_heap)?;
             Ok(Value::String(s))
         }
-        None => Ok(Value::String(JsString::empty(args.gc_heap)?)),
+        None => Ok(Value::string(JsString::empty(args.gc_heap)?)),
     }
 }
 
@@ -1378,7 +1378,7 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     // pre-computed Array wrapped in an `IteratorState::Array` so
     // each `next()` step yields one match in iteration order.
     let arr = args.array_from_elements_rooted(out.iter().cloned(), &[], &[out.as_slice()])?;
-    let arr_value = Value::Array(arr);
+    let arr_value = Value::array(arr);
     let state = crate::IteratorState::Array {
         array: arr,
         index: 0,
@@ -1830,7 +1830,7 @@ fn native_string_replace_callable(
     let needle_units = needle.to_utf16_vec(ctx.heap());
     let needle_len = needle_units.len();
     let recv_str = recv;
-    let recv_value = Value::String(recv_str);
+    let recv_value = Value::string(recv_str);
     let context = ctx.execution_context().cloned();
     let context = match context {
         Some(c) => c,
@@ -2030,12 +2030,12 @@ mod tests {
     /// to keep the existing test cases readable.
     fn call(method: &str, recv: &str, args: &[&str]) -> String {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv_v = Value::String(JsString::from_str(recv, &mut gc_heap).unwrap());
+        let recv_v = Value::string(JsString::from_str(recv, &mut gc_heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|s| match s.parse::<i32>() {
-                Ok(n) => Value::Number(NumberValue::from_i32(n)),
-                Err(_) => Value::String(JsString::from_str(s, &mut gc_heap).unwrap()),
+                Ok(n) => Value::number(NumberValue::from_i32(n)),
+                Err(_) => Value::string(JsString::from_str(s, &mut gc_heap).unwrap()),
             })
             .collect();
         let entry = lookup(method).unwrap();
@@ -2126,12 +2126,12 @@ mod tests {
         args: &[A],
         gc_heap: &mut otter_gc::GcHeap,
     ) -> Value {
-        let recv_v = Value::String(JsString::from_str(recv, gc_heap).unwrap());
+        let recv_v = Value::string(JsString::from_str(recv, gc_heap).unwrap());
         let arg_vs: Vec<Value> = args
             .iter()
             .map(|a| match a {
-                A::N(n) => Value::Number(NumberValue::from_i32(*n)),
-                A::S(s) => Value::String(JsString::from_str(s, gc_heap).unwrap()),
+                A::N(n) => Value::number(NumberValue::from_i32(*n)),
+                A::S(s) => Value::string(JsString::from_str(s, gc_heap).unwrap()),
             })
             .collect();
         let entry = lookup(method).unwrap();
@@ -2178,7 +2178,7 @@ mod tests {
         // ToString(next)`. Numbers, Booleans, etc. coerce instead
         // of rejecting.
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::String(JsString::from_str("a", &mut gc_heap).unwrap());
+        let recv = Value::string(JsString::from_str("a", &mut gc_heap).unwrap());
         let entry = lookup("concat").unwrap();
         let result = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
@@ -2203,7 +2203,7 @@ mod tests {
     #[test]
     fn repeat_rejects_negative() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::String(JsString::from_str("abc", &mut gc_heap).unwrap());
+        let recv = Value::string(JsString::from_str("abc", &mut gc_heap).unwrap());
         let entry = lookup("repeat").unwrap();
         let err = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
@@ -2268,7 +2268,7 @@ mod tests {
         // U+10000 = '𐀀' = 0xD800 0xDC00
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let units: [u16; 3] = [0xD800, 0xDC00, b'a' as u16];
-        let recv = Value::String(JsString::from_utf16_units(&units, &mut gc_heap).unwrap());
+        let recv = Value::string(JsString::from_utf16_units(&units, &mut gc_heap).unwrap());
         let entry = lookup("codePointAt").unwrap();
         let r = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
@@ -2298,7 +2298,7 @@ mod tests {
         // Non-ASCII passes through unchanged.
         let units: [u16; 3] = [0x00C9, b'a' as u16, b'b' as u16]; // 'É' + "ab"
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::String(JsString::from_utf16_units(&units, &mut gc_heap).unwrap());
+        let recv = Value::string(JsString::from_utf16_units(&units, &mut gc_heap).unwrap());
         let entry = lookup("toLowerCase").unwrap();
         let r = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,
@@ -2481,7 +2481,7 @@ mod tests {
     fn split_undefined_separator_returns_singleton() {
         // "abc".split() === ["abc"]
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::String(JsString::from_str("abc", &mut gc_heap).unwrap());
+        let recv = Value::string(JsString::from_str("abc", &mut gc_heap).unwrap());
         let entry = lookup("split").unwrap();
         let r = (entry.impl_fn)(&mut IntrinsicArgs {
             receiver: &recv,

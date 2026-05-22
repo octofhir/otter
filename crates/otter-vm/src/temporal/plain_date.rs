@@ -95,15 +95,15 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &s
         _ => return Value::Undefined,
     };
     match name {
-        "year" => Value::Number(NumberValue::from_i32(pd.year())),
-        "month" => Value::Number(NumberValue::from_i32(pd.month() as i32)),
-        "day" => Value::Number(NumberValue::from_i32(pd.day() as i32)),
-        "dayOfWeek" => Value::Number(NumberValue::from_i32(pd.day_of_week() as i32)),
-        "dayOfYear" => Value::Number(NumberValue::from_i32(pd.day_of_year() as i32)),
-        "daysInMonth" => Value::Number(NumberValue::from_i32(pd.days_in_month() as i32)),
-        "daysInYear" => Value::Number(NumberValue::from_i32(pd.days_in_year() as i32)),
-        "monthsInYear" => Value::Number(NumberValue::from_i32(pd.months_in_year() as i32)),
-        "inLeapYear" => Value::Boolean(pd.in_leap_year()),
+        "year" => Value::number(NumberValue::from_i32(pd.year())),
+        "month" => Value::number(NumberValue::from_i32(pd.month() as i32)),
+        "day" => Value::number(NumberValue::from_i32(pd.day() as i32)),
+        "dayOfWeek" => Value::number(NumberValue::from_i32(pd.day_of_week() as i32)),
+        "dayOfYear" => Value::number(NumberValue::from_i32(pd.day_of_year() as i32)),
+        "daysInMonth" => Value::number(NumberValue::from_i32(pd.days_in_month() as i32)),
+        "daysInYear" => Value::number(NumberValue::from_i32(pd.days_in_year() as i32)),
+        "monthsInYear" => Value::number(NumberValue::from_i32(pd.months_in_year() as i32)),
+        "inLeapYear" => Value::boolean(pd.in_leap_year()),
         _ => Value::undefined(),
     }
 }

@@ -127,8 +127,8 @@ pub(crate) fn bound_own_property_descriptor(
         Slot::Overridden(desc) => Ok(Some(desc)),
         Slot::Builtin { name, length } => {
             let value = match key {
-                "name" => Value::String(JsString::from_str(&name, gc_heap)?),
-                "length" => Value::Number(length),
+                "name" => Value::string(JsString::from_str(&name, gc_heap)?),
+                "length" => Value::number(length),
                 _ => Value::undefined(),
             };
             Ok(Some(PropertyDescriptor::data(value, false, false, true)))

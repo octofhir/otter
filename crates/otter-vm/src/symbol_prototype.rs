@@ -66,7 +66,7 @@ fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 pub fn load_property(sym: &JsSymbol, name: &str) -> Value {
     if name == "description" {
         match sym.description() {
-            Some(s) => Value::String(*s),
+            Some(s) => Value::string(*s),
             None => Value::undefined(),
         }
     } else {

@@ -168,7 +168,7 @@ fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let time = receiver_time(args)?;
     match to_iso_string(time) {
-        Some(s) => Ok(Value::String(JsString::from_str(&s, args.gc_heap)?)),
+        Some(s) => Ok(Value::string(JsString::from_str(&s, args.gc_heap)?)),
         None => Ok(Value::null()),
     }
 }

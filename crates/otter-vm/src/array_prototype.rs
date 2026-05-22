@@ -2007,10 +2007,10 @@ fn array_callback_native_dispatch(
     match name {
         "forEach" => Ok(Value::undefined()),
         "find" | "findLast" => Ok(found_val),
-        "findIndex" | "findLastIndex" => Ok(Value::Number(NumberValue::from_f64(
+        "findIndex" | "findLastIndex" => Ok(Value::number(NumberValue::from_f64(
             found_idx.map_or(-1.0, |i| i as f64),
         ))),
-        "every" | "some" => Ok(Value::Boolean(bool_acc)),
+        "every" | "some" => Ok(Value::boolean(bool_acc)),
         "reduce" | "reduceRight" => {
             if !reduce_has_init {
                 return Err(NativeError::TypeError {

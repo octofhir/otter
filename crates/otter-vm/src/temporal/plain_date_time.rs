@@ -92,15 +92,15 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &s
         _ => return Value::Undefined,
     };
     match name {
-        "year" => Value::Number(NumberValue::from_i32(pdt.year())),
-        "month" => Value::Number(NumberValue::from_i32(pdt.month() as i32)),
-        "day" => Value::Number(NumberValue::from_i32(pdt.day() as i32)),
-        "hour" => Value::Number(NumberValue::from_i32(pdt.hour() as i32)),
-        "minute" => Value::Number(NumberValue::from_i32(pdt.minute() as i32)),
-        "second" => Value::Number(NumberValue::from_i32(pdt.second() as i32)),
-        "millisecond" => Value::Number(NumberValue::from_i32(pdt.millisecond() as i32)),
-        "microsecond" => Value::Number(NumberValue::from_i32(pdt.microsecond() as i32)),
-        "nanosecond" => Value::Number(NumberValue::from_i32(pdt.nanosecond() as i32)),
+        "year" => Value::number(NumberValue::from_i32(pdt.year())),
+        "month" => Value::number(NumberValue::from_i32(pdt.month() as i32)),
+        "day" => Value::number(NumberValue::from_i32(pdt.day() as i32)),
+        "hour" => Value::number(NumberValue::from_i32(pdt.hour() as i32)),
+        "minute" => Value::number(NumberValue::from_i32(pdt.minute() as i32)),
+        "second" => Value::number(NumberValue::from_i32(pdt.second() as i32)),
+        "millisecond" => Value::number(NumberValue::from_i32(pdt.millisecond() as i32)),
+        "microsecond" => Value::number(NumberValue::from_i32(pdt.microsecond() as i32)),
+        "nanosecond" => Value::number(NumberValue::from_i32(pdt.nanosecond() as i32)),
         _ => Value::undefined(),
     }
 }

@@ -55,10 +55,10 @@ impl StringifyOptions {
         let space = match (space, gc_heap) {
             (Value::Object(obj), Some(heap)) => {
                 if let Some(n) = crate::object::number_data(*obj, heap) {
-                    unwrapped = Value::Number(n);
+                    unwrapped = Value::number(n);
                     &unwrapped
                 } else if let Some(s) = crate::object::string_data(*obj, heap) {
-                    unwrapped = Value::String(s);
+                    unwrapped = Value::string(s);
                     &unwrapped
                 } else {
                     space

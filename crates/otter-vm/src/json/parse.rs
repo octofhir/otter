@@ -212,7 +212,7 @@ fn read_step(
             }
             read_step(cursor, stack, gc_heap, external_visit)
         }
-        b'"' => Ok(Value::String(read_string(cursor, gc_heap)?)),
+        b'"' => Ok(Value::string(read_string(cursor, gc_heap)?)),
         b't' => {
             consume_keyword(cursor, b"true")?;
             Ok(Value::Boolean(true))
@@ -225,7 +225,7 @@ fn read_step(
             consume_keyword(cursor, b"null")?;
             Ok(Value::null())
         }
-        b'-' | b'0'..=b'9' => Ok(Value::Number(read_number(cursor)?)),
+        b'-' | b'0'..=b'9' => Ok(Value::number(read_number(cursor)?)),
         other => Err(ParseError::at(
             cursor.pos,
             format!("unexpected byte 0x{other:02x}"),

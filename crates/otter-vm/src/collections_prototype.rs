@@ -451,9 +451,9 @@ fn impl_weak_map_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
     match collections::weak_map_has(m, heap, &key) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(CollectionError::NonObjectKey) => Ok(Value::boolean(false)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -471,9 +471,9 @@ fn impl_weak_map_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsic
     let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
     match collections::weak_map_delete(m, heap, &key) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(CollectionError::NonObjectKey) => Ok(Value::boolean(false)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -503,9 +503,9 @@ fn impl_weak_set_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
     match collections::weak_set_has(s, heap, &v) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(CollectionError::NonObjectKey) => Ok(Value::boolean(false)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -514,9 +514,9 @@ fn impl_weak_set_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsic
     let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
     match collections::weak_set_delete(s, heap, &v) {
-        Ok(b) => Ok(Value::Boolean(b)),
-        Err(CollectionError::NonObjectKey) => Ok(Value::Boolean(false)),
-        Err(_) => Ok(Value::Boolean(false)),
+        Ok(b) => Ok(Value::boolean(b)),
+        Err(CollectionError::NonObjectKey) => Ok(Value::boolean(false)),
+        Err(_) => Ok(Value::boolean(false)),
     }
 }
 
@@ -763,7 +763,7 @@ mod tests {
     fn map_set_uses_intrinsic_rooted_reservation() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let map = collections::alloc_map(&mut gc_heap).expect("map");
-        let receiver = Value::Map(map);
+        let receiver = Value::map(map);
         let args = [
             Value::Number(NumberValue::from_i32(1)),
             Value::Number(NumberValue::from_i32(2)),
@@ -790,7 +790,7 @@ mod tests {
     fn set_add_uses_intrinsic_rooted_reservation() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let set = collections::alloc_set(&mut gc_heap).expect("set");
-        let receiver = Value::Set(set);
+        let receiver = Value::set(set);
         let args = [Value::Number(NumberValue::from_i32(3))];
         let before = gc_heap.stats().reserved_bytes;
 

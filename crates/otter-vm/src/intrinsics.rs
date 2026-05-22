@@ -651,8 +651,8 @@ mod tests {
     #[test]
     fn intrinsic_runs_with_string_receiver() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let recv = Value::String(JsString::from_str("ab", &mut gc_heap).unwrap());
-        let arg = Value::String(JsString::from_str("cd", &mut gc_heap).unwrap());
+        let recv = Value::string(JsString::from_str("ab", &mut gc_heap).unwrap());
+        let arg = Value::string(JsString::from_str("cd", &mut gc_heap).unwrap());
         let entry = STRING_TABLE
             .lookup(IntrinsicReceiver::String, "concatWith")
             .unwrap();

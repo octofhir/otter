@@ -176,7 +176,7 @@ impl BoundFunction {
             };
             object::alloc_object_with_roots(heap, &mut visit)?
         };
-        let own_properties_root = Value::Object(own_properties);
+        let own_properties_root = Value::object(own_properties);
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
             own_properties_root.trace_value_slots(visitor);

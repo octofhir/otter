@@ -165,7 +165,7 @@ fn generator_and_parked_frame_roots_register_values() {
     let function = empty_function();
     let mut frame = Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("frame");
     let object = crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
-    frame.registers[0] = Value::Object(object);
+    frame.registers[0] = Value::object(object);
     let generator =
         crate::generator::JsGenerator::new(interp.gc_heap_mut(), frame).expect("generator");
     let global = *interp.global_this();
@@ -193,7 +193,7 @@ fn generator_and_parked_frame_roots_register_values() {
         Frame::for_function_with_heap(&function, interp.gc_heap_mut()).expect("parked frame");
     let parked_object =
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
-    parked_frame.registers[0] = Value::Object(parked_object);
+    parked_frame.registers[0] = Value::object(parked_object);
     let parked =
         crate::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame).expect("park");
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");

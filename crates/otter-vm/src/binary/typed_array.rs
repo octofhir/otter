@@ -167,7 +167,7 @@ impl TypedArrayKind {
                     let handle = BigIntValue::from_inner(heap, BigInt::from(0))?;
                     Ok(Value::BigInt(handle))
                 }
-                _ => Ok(Value::Number(NumberValue::from_i32(0))),
+                _ => Ok(Value::number(NumberValue::from_i32(0))),
             };
         }
         let slice = &bytes[offset..offset + bpe];

@@ -133,7 +133,7 @@ impl PromiseSlots {
                 slice_roots,
             )
             .map_err(|_| oom_native("Promise keyed combinator"))?;
-        let values_root = Value::Array(values);
+        let values_root = Value::array(values);
         let mut key_roots = Vec::with_capacity(value_roots.len() + 1);
         key_roots.extend_from_slice(value_roots);
         key_roots.push(&values_root);
@@ -202,7 +202,7 @@ impl PromiseSlots {
         };
         let key_root = key;
         let values_root = self.array_value();
-        let keys_root = Value::Array(keys);
+        let keys_root = Value::array(keys);
         let mut roots = Vec::with_capacity(value_roots.len() + 3);
         roots.extend_from_slice(value_roots);
         roots.push(&key_root);
@@ -416,7 +416,7 @@ impl PromiseBuilder {
         slice_roots: &[&[Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_runtime_rooted(interp, value_roots, slice_roots)?;
-        let promise_value = Value::Promise(promise);
+        let promise_value = Value::promise(promise);
         let mut resolve_roots = Vec::with_capacity(value_roots.len() + 1);
         resolve_roots.extend_from_slice(value_roots);
         resolve_roots.push(&promise_value);
@@ -444,7 +444,7 @@ impl PromiseBuilder {
         slice_roots: &[&[Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_stack_rooted(interp, stack, value_roots, slice_roots)?;
-        let promise_value = Value::Promise(promise);
+        let promise_value = Value::promise(promise);
         let mut resolve_roots = Vec::with_capacity(value_roots.len() + 1);
         resolve_roots.extend_from_slice(value_roots);
         resolve_roots.push(&promise_value);
@@ -472,7 +472,7 @@ impl PromiseBuilder {
         slice_roots: &[&[Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_native_rooted(ctx, value_roots, slice_roots)?;
-        let promise_value = Value::Promise(promise);
+        let promise_value = Value::promise(promise);
         let mut resolve_roots = Vec::with_capacity(value_roots.len() + 1);
         resolve_roots.extend_from_slice(value_roots);
         resolve_roots.push(&promise_value);
@@ -758,7 +758,7 @@ pub fn statics_call(
     }
     match method {
         M::Resolve => static_resolve(interp, context, constructor, args),
-        M::Reject => Ok(Value::Promise(static_reject(interp, args)?)),
+        M::Reject => Ok(Value::promise(static_reject(interp, args)?)),
         M::All => static_all_generic(interp, context, constructor, args),
         M::Race => static_race_generic(interp, context, constructor, args),
         M::AllSettled => static_all_settled_generic(interp, context, constructor, args),
@@ -1197,7 +1197,7 @@ fn call_capability_reject(
 
 fn native_error_rejection_value(err: NativeError, heap: &mut otter_gc::GcHeap) -> Value {
     if let NativeError::Thrown { message, .. } = err {
-        return Value::String(
+        return Value::string(
             crate::JsString::from_str(&message, heap).unwrap_or_else(|_| {
                 crate::JsString::from_str("", heap).expect("empty string allocates")
             }),
@@ -2382,7 +2382,7 @@ fn make_aggregate_error_runtime_rooted(
             name: "Promise",
             reason: err.to_string(),
         })?;
-    let obj_value = Value::Object(obj);
+    let obj_value = Value::object(obj);
     let arr = interp
         .alloc_runtime_rooted_array_from_values(
             errors.iter().cloned(),
@@ -2421,7 +2421,7 @@ fn make_aggregate_error_native_rooted(
             name: "Promise",
             reason: err.to_string(),
         })?;
-    let obj_value = Value::Object(obj);
+    let obj_value = Value::object(obj);
     let arr = ctx
         .array_from_elements_with_roots(errors.iter().cloned(), &[&obj_value], &[errors.as_slice()])
         .map_err(|_| oom_native("Promise.any"))?;
@@ -2743,7 +2743,7 @@ fn method_then(
         name: NAME,
         reason: "missing execution context".to_string(),
     })?;
-    let promise_root = Value::Promise(*promise);
+    let promise_root = Value::promise(*promise);
     let default_ctor = builtin_promise_constructor(interp)?;
     let c = species_constructor_runtime(interp, &exec, &promise_root, &default_ctor, NAME)?;
 
@@ -2806,7 +2806,7 @@ fn perform_then_with_handlers(
     on_fulfilled: Option<Value>,
     on_rejected: Option<Value>,
 ) -> Value {
-    let promise_root = Value::Promise(*promise);
+    let promise_root = Value::promise(*promise);
     let mut value_roots = vec![&promise_root];
     if let Some(value) = &on_fulfilled {
         value_roots.push(value);
@@ -2843,7 +2843,7 @@ fn attach_then(
     // Reusable "result-of-then" path that the combinators don't
     // expose to user code. We still need a capability so the
     // reaction has somewhere to settle, even if we never read it.
-    let promise_root = Value::Promise(*promise);
+    let promise_root = Value::promise(*promise);
     let mut value_roots = vec![&promise_root];
     if let Some(value) = &on_fulfilled {
         value_roots.push(value);
@@ -2948,7 +2948,7 @@ fn resolve_native_body(
 
     let value = args.first().cloned().unwrap_or(Value::undefined());
     if let Value::Promise(inner) = value {
-        let value_root = Value::Promise(inner);
+        let value_root = Value::promise(inner);
         let (on_fulfill, on_reject) =
             make_resolve_adoption_handlers_native_rooted(ctx, promise, &[&value_root], &[args])?;
         let interp = ctx.interp_mut();
@@ -2968,7 +2968,7 @@ fn make_resolve_adoption_handlers_native_rooted(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<(Value, Value), otter_gc::OutOfMemory> {
-    let resolver_value = Value::Promise(resolver);
+    let resolver_value = Value::promise(resolver);
     let mut fulfill_roots = Vec::with_capacity(value_roots.len() + 1);
     fulfill_roots.extend_from_slice(value_roots);
     fulfill_roots.push(&resolver_value);
@@ -2988,7 +2988,7 @@ fn make_resolve_adoption_handlers_native_rooted(
     )?;
 
     let resolver_for_reject = resolver;
-    let resolver_reject_value = Value::Promise(resolver_for_reject);
+    let resolver_reject_value = Value::promise(resolver_for_reject);
     let mut reject_roots = Vec::with_capacity(value_roots.len() + 2);
     reject_roots.extend_from_slice(value_roots);
     reject_roots.push(&resolver_reject_value);
@@ -3198,7 +3198,7 @@ mod tests {
     fn promise_constructor_builder_uses_native_rooted_young_allocation() {
         let mut interp = Interpreter::new();
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        let executor = Value::Number(NumberValue::from_i32(17));
+        let executor = Value::number(NumberValue::from_i32(17));
         let args = vec![executor];
 
         let (handle, resolve, reject) = {

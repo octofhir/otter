@@ -93,7 +93,7 @@ pub fn call_static(
     use otter_bytecode::method_id::DateMethod as M;
     match method {
         // §21.4.3.1 Date.now() — current epoch ms as a Number.
-        M::Now => Ok(Value::Number(NumberValue::from_f64(now_ms()))),
+        M::Now => Ok(Value::number(NumberValue::from_f64(now_ms()))),
         // §21.4.3.2 Date.parse(str).
         M::Parse => {
             let s = match args.first() {

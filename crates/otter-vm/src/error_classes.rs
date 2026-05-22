@@ -418,7 +418,7 @@ impl ErrorClassRegistry {
     /// - <https://tc39.es/ecma262/#sec-native-error-types-used-in-this-standard>
     pub fn new(gc_heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         let error_proto = alloc_registry_object(gc_heap, &[])?;
-        let error_proto_root = Value::Object(error_proto);
+        let error_proto_root = Value::object(error_proto);
         // §20.5.3.{4,5} — `Error.prototype.name = "Error"` and
         // `Error.prototype.message = ""` are data properties with
         // attributes `{ writable: true, enumerable: false,
@@ -493,7 +493,7 @@ impl ErrorClassRegistry {
             error_prototype_to_string,
             &[&error_proto_root],
         )?;
-        let to_string_root = Value::NativeFunction(to_string_native);
+        let to_string_root = Value::native_function(to_string_native);
         let _ = object::define_own_property(
             error_proto,
             gc_heap,
@@ -742,7 +742,7 @@ impl ErrorClassRegistry {
         // `[[Configurable]]: true`, `[[Writable]]: true`,
         // `[[Enumerable]]: false`.
         let error_ctor = alloc_registry_object(gc_heap, &[&error_proto_root, &to_string_root])?;
-        let error_ctor_root = Value::Object(error_ctor);
+        let error_ctor_root = Value::object(error_ctor);
         // §20.5.2 — `Error.prototype` lives on the constructor as
         // `{ writable: false, enumerable: false, configurable: false }`.
         // §20.5.3 — `Error.prototype.constructor` is
@@ -792,7 +792,7 @@ impl ErrorClassRegistry {
             roots.push(Value::Object(error_proto));
             let root_refs: Vec<&Value> = roots.iter().collect();
             let proto = alloc_registry_object(gc_heap, root_refs.as_slice())?;
-            let proto_root = Value::Object(proto);
+            let proto_root = Value::object(proto);
             object::set_prototype(proto, gc_heap, Some(error_proto));
             // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
             // share the same descriptor shape as `Error.prototype`'s.
@@ -815,7 +815,7 @@ impl ErrorClassRegistry {
             roots.push(proto_root);
             let root_refs: Vec<&Value> = roots.iter().collect();
             let ctor = alloc_registry_object(gc_heap, root_refs.as_slice())?;
-            let ctor_root = Value::Object(ctor);
+            let ctor_root = Value::object(ctor);
             // §20.5.6.{2,3} — same prototype/constructor shape.
             let _ = object::define_own_property(
                 ctor,
@@ -1005,7 +1005,7 @@ impl ErrorClassRegistry {
         slice_roots: &[&[Value]],
     ) -> Result<JsObject, otter_gc::OutOfMemory> {
         let proto = self.prototype(kind);
-        let proto_value = Value::Object(proto);
+        let proto_value = Value::object(proto);
         let mut roots = Vec::with_capacity(value_roots.len() + 1);
         roots.push(&proto_value);
         roots.extend_from_slice(value_roots);
@@ -1061,7 +1061,7 @@ impl ErrorClassRegistry {
             value_roots,
             object_slice_roots.as_slice(),
         )?;
-        let obj_value = Value::Object(obj);
+        let obj_value = Value::object(obj);
         let mut array_roots = Vec::with_capacity(value_roots.len() + 1);
         array_roots.push(&obj_value);
         array_roots.extend_from_slice(value_roots);

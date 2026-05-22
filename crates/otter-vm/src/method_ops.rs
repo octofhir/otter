@@ -400,7 +400,7 @@ impl Interpreter {
                     _ => return Err(VmError::TypeMismatch),
                 };
                 if let Some(slot) = coerced_args.first_mut() {
-                    *slot = Value::String(JsString::from_str(&coerced, self.gc_heap_mut())?);
+                    *slot = Value::string(JsString::from_str(&coerced, self.gc_heap_mut())?);
                 }
             }
             stack[top_idx].pc = stack[top_idx]
@@ -653,7 +653,7 @@ impl Interpreter {
                         continue;
                     }
                     let coerced = self.coerce_to_number(context, slot)?;
-                    *slot = Value::Number(coerced);
+                    *slot = Value::number(coerced);
                 }
                 for &idx in string_str_coerce {
                     let Some(slot) = small_args.get_mut(idx) else {
@@ -686,7 +686,7 @@ impl Interpreter {
             {
                 for slot in small_args.iter_mut() {
                     let coerced = self.coerce_to_number(context, slot)?;
-                    *slot = Value::Number(coerced);
+                    *slot = Value::number(coerced);
                 }
                 // §21.4.4.{20..36} step 8 — `setMonth` / `setDate` /
                 // `setHours` / `setMinutes` / `setSeconds` /
@@ -935,7 +935,7 @@ impl Interpreter {
                 // descriptors on static members (`static get foo()`
                 // / `static set foo(v)`) invoke their getter rather
                 // than yielding `undefined`.
-                let statics = Value::Object(c.statics(&self.gc_heap));
+                let statics = Value::object(c.statics(&self.gc_heap));
                 let key = VmPropertyKey::String(name);
                 match self.ordinary_get_value(context, statics, statics, &key, 0)? {
                     VmGetOutcome::Value(v) => v,
@@ -1045,7 +1045,7 @@ impl Interpreter {
         let recv_units = recv.to_utf16_vec(&self.gc_heap);
         let needle_units = needle.to_utf16_vec(&self.gc_heap);
         let needle_len = needle_units.len();
-        let recv_value = Value::String(recv);
+        let recv_value = Value::string(recv);
         let mut out: Vec<u16> = Vec::with_capacity(recv_units.len());
         if needle_len == 0 {
             let positions: Vec<usize> = if replace_all {
@@ -1249,7 +1249,7 @@ impl Interpreter {
             return Ok(false);
         }
 
-        let arr_value = Value::Array(*arr);
+        let arr_value = Value::array(*arr);
         // Snapshot the elements so callback-driven mutation of the
         // receiver does not corrupt iteration. Foundation matches
         // ECMA-262's "single-pass over indices 0..len" by capturing
@@ -1562,7 +1562,7 @@ impl Interpreter {
         args: &SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<bool, VmError> {
-        let ta_value = Value::TypedArray(*t);
+        let ta_value = Value::typed_array(*t);
         let kind = t.kind();
         let len = t.length(&self.gc_heap);
         let elements: Vec<Value> = {

@@ -260,7 +260,7 @@ fn native_group_by_rooted(
             }
         };
         let value_root = *item;
-        let arr_value = Value::Array(group);
+        let arr_value = Value::array(group);
         let roots = [&value_root, &arr_value, &Value::Object(result)];
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for v in &roots {
@@ -405,7 +405,7 @@ fn native_values_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     let values: Vec<Value> = crate::object::with_properties(target, ctx.heap(), |p| {
         p.enumerable_data_iter().map(|(_, value)| value).collect()
     });
-    let target_root = Value::Object(target);
+    let target_root = Value::object(target);
     Ok(Value::Array(ctx.array_from_elements_with_roots(
         values,
         &[&target_root],
@@ -421,7 +421,7 @@ fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
             .collect()
     });
 
-    let target_root = Value::Object(target);
+    let target_root = Value::object(target);
     let mut pairs = Vec::with_capacity(raw.len());
     for (key, value) in raw {
         let key_value = string_value(&key, ctx.heap_mut())?;
@@ -662,7 +662,7 @@ fn native_get_own_property_descriptor_rooted(
                 .interp
                 .get_own_property_descriptor_for_value(context, target, args.get(1))?;
         return match desc {
-            Some(desc) => Ok(Value::Object(native_descriptor_to_object_rooted(
+            Some(desc) => Ok(Value::object(native_descriptor_to_object_rooted(
                 ctx,
                 &desc,
                 &[&target],
@@ -754,7 +754,7 @@ fn native_get_own_property_descriptor_rooted(
         }
     };
     match desc {
-        Some(desc) => Ok(Value::Object(native_descriptor_to_object_rooted(
+        Some(desc) => Ok(Value::object(native_descriptor_to_object_rooted(
             ctx,
             &desc,
             &[],
@@ -787,13 +787,13 @@ fn native_get_own_property_descriptors_rooted(
     let Some(context) = context else {
         return Err(VmError::InvalidOperand);
     };
-    let result_root = Value::Object(result);
+    let result_root = Value::object(result);
 
     let keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
     for key in keys {
         let key_for_descriptor = match &key {
-            Value::String(s) => Value::String(*s),
-            Value::Symbol(sym) => Value::Symbol(*sym),
+            Value::String(s) => Value::string(*s),
+            Value::Symbol(sym) => Value::symbol(*sym),
             _ => continue,
         };
         let Some(desc) = ctx.cx.interp.get_own_property_descriptor_for_value(
@@ -940,7 +940,7 @@ fn native_get_own_property_symbols_rooted(
     let syms: Vec<Value> = crate::object::with_properties(target, ctx.heap(), |p| {
         p.symbol_keys().map(Value::Symbol).collect()
     });
-    let target_root = Value::Object(target);
+    let target_root = Value::object(target);
     Ok(Value::Array(ctx.array_from_elements_with_roots(
         syms,
         &[&target_root],
@@ -2341,7 +2341,7 @@ pub fn call(
                             )?));
                         }
                         match crate::object::get_own_descriptor(*target, gc_heap, string_key) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
                                 &[],
@@ -2352,7 +2352,7 @@ pub fn call(
                     }
                     PropertyKey::Symbol(sym) => {
                         match crate::object::get_own_symbol_descriptor(*target, gc_heap, sym) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
                                 &[],
@@ -2369,7 +2369,7 @@ pub fn call(
                             gc_heap,
                             key,
                         ) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
                                 &[],
@@ -2384,7 +2384,7 @@ pub fn call(
                             gc_heap,
                             sym,
                         ) {
-                            Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                            Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
                                 &[],
@@ -2399,7 +2399,7 @@ pub fn call(
                         return Ok(Value::undefined());
                     };
                     match native.own_property_descriptor(gc_heap, key)? {
-                        Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                        Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                             &desc,
                             gc_heap,
                             &[],
@@ -2416,7 +2416,7 @@ pub fn call(
                         PropertyKey::Symbol(_) => None,
                     };
                     match desc {
-                        Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
+                        Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                             &desc,
                             gc_heap,
                             &[],
@@ -2450,9 +2450,9 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptors>
         M::GetOwnPropertyDescriptors => {
             let target = expect_object(args.first())?;
-            let target_root = Value::Object(target);
+            let target_root = Value::object(target);
             let result = rooted_object(gc_heap, &[&target_root], &[args])?;
-            let result_root = Value::Object(result);
+            let result_root = Value::object(result);
             let (keys, symbols): (Vec<String>, Vec<JsSymbol>) =
                 crate::object::with_properties(target, gc_heap, |p| {
                     (
@@ -2462,7 +2462,7 @@ pub fn call(
                 });
             for key in keys {
                 if let Some(desc) = crate::object::get_own_descriptor(target, gc_heap, &key) {
-                    let value = Value::Object(descriptor_to_object_with_roots(
+                    let value = Value::object(descriptor_to_object_with_roots(
                         &desc,
                         gc_heap,
                         &[&target_root, &result_root],
@@ -2474,7 +2474,7 @@ pub fn call(
             for sym in symbols {
                 if let Some(desc) = crate::object::get_own_symbol_descriptor(target, gc_heap, &sym)
                 {
-                    let value = Value::Object(descriptor_to_object_with_roots(
+                    let value = Value::object(descriptor_to_object_with_roots(
                         &desc,
                         gc_heap,
                         &[&target_root, &result_root],
@@ -2666,7 +2666,7 @@ pub fn call(
             let values: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.enumerable_data_iter().map(|(_, v)| v).collect()
             });
-            let target_root = Value::Object(target);
+            let target_root = Value::object(target);
             Ok(Value::Array(rooted_array_from_elements(
                 gc_heap,
                 values,
@@ -2688,7 +2688,7 @@ pub fn call(
             for (k, v) in raw {
                 let key = string_value(&k, gc_heap)?;
                 let pair: smallvec::SmallVec<[Value; 4]> = smallvec::smallvec![key, v];
-                let target_root = Value::Object(target);
+                let target_root = Value::object(target);
                 pairs.push(Value::Array(rooted_array_from_elements(
                     gc_heap,
                     pair,
@@ -2696,7 +2696,7 @@ pub fn call(
                     &[args, pairs.as_slice()],
                 )?));
             }
-            let target_root = Value::Object(target);
+            let target_root = Value::object(target);
             Ok(Value::Array(rooted_array_from_elements(
                 gc_heap,
                 pairs,
@@ -2842,7 +2842,7 @@ pub fn call(
             let syms: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.symbol_keys().map(Value::Symbol).collect()
             });
-            let target_root = Value::Object(target);
+            let target_root = Value::object(target);
             Ok(Value::Array(rooted_array_from_elements(
                 gc_heap,
                 syms,

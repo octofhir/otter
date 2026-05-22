@@ -1506,11 +1506,11 @@ mod tests {
     fn weakmap_object_key_roundtrips() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let wm = alloc_weak_map(&mut heap).unwrap();
-        let obj = Value::Object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
+        let obj = Value::object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
         weak_map_set(wm, &mut heap, obj, n(42)).unwrap();
         assert!(weak_map_has(wm, &heap, &obj).unwrap());
         assert_eq!(weak_map_get(wm, &heap, &obj).unwrap(), Some(n(42)));
-        let other = Value::Object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
+        let other = Value::object(crate::object::alloc_object_old_for_fixture(&mut heap).unwrap());
         assert!(!weak_map_has(wm, &heap, &other).unwrap());
     }
 
@@ -1582,7 +1582,7 @@ mod tests {
     fn map_string_keys() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let m = alloc_map(&mut gc_heap).unwrap();
-        let key = Value::String(JsString::from_str("k", &mut gc_heap).unwrap());
+        let key = Value::string(JsString::from_str("k", &mut gc_heap).unwrap());
         map_set(m, &mut gc_heap, key, n(1)).unwrap();
         assert_eq!(map_get(m, &gc_heap, &key), Some(n(1)),);
     }

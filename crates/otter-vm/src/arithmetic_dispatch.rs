@@ -155,7 +155,7 @@ impl Interpreter {
         let v = *read_register(frame, src)?;
         let value =
             match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
-                abstract_ops::NumericKind::Num(n) => Value::Number(number::neg(n)),
+                abstract_ops::NumericKind::Num(n) => Value::number(number::neg(n)),
                 abstract_ops::NumericKind::Big(b) => {
                     let neg = bigint::ops::neg(&b);
                     let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, neg)
@@ -177,7 +177,7 @@ impl Interpreter {
         let v = *read_register(frame, src)?;
         let value =
             match abstract_ops::to_numeric_kind(&v, &self.gc_heap).ok_or(VmError::TypeMismatch)? {
-                abstract_ops::NumericKind::Num(n) => Value::Number(number::bitwise_not(n)),
+                abstract_ops::NumericKind::Num(n) => Value::number(number::bitwise_not(n)),
                 abstract_ops::NumericKind::Big(b) => {
                     let notted = bigint::ops::bitwise_not(&b);
                     let handle = bigint::BigIntValue::from_inner(&mut self.gc_heap, notted)

@@ -1206,7 +1206,7 @@ impl Interpreter {
             let produced = *read_register(&stack[top_idx], dst)?;
             // §7.4.3 step 2 — `[@@iterator]()` must return an
             // Object. Anything else is a TypeError.
-            if !matches!(produced, Value::Object(_)) {
+            if !produced.is_object() {
                 stack[top_idx].pending_get_iterator = None;
                 return Err(VmError::TypeMismatch);
             }
@@ -1222,11 +1222,11 @@ impl Interpreter {
         // 2 + 3. Fresh entry — only intercept user objects. The
         // built-in fast path is the existing in-frame match arm.
         let value = *read_register(&stack[top_idx], src)?;
-        let Value::Object(obj) = &value else {
+        let Some(obj) = value.as_object() else {
             return Ok(false);
         };
         let iter_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
-        let Some(callee) = crate::object::get_symbol(*obj, &self.gc_heap, &iter_sym) else {
+        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, &iter_sym) else {
             // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
             return Err(VmError::TypeMismatch);
         };
@@ -1282,18 +1282,18 @@ impl Interpreter {
             .cloned();
         if let Some(state) = resume {
             let result = *read_register(&stack[top_idx], state.result_reg)?;
-            let Value::Object(obj) = &result else {
+            let Some(obj) = result.as_object() else {
                 stack[top_idx].pending_iterator_next = None;
                 return Err(VmError::TypeMismatch);
             };
             let value =
-                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::undefined());
+                crate::object::get(obj, &self.gc_heap, "value").unwrap_or(Value::undefined());
             let done_value =
-                crate::object::get(*obj, &self.gc_heap, "done").unwrap_or(Value::undefined());
+                crate::object::get(obj, &self.gc_heap, "done").unwrap_or(Value::undefined());
             let done = done_value.to_boolean(&self.gc_heap);
-            if done && let Value::Iterator(rc) = &state.iterator {
+            if done && let Some(rc) = state.iterator.as_iterator() {
                 self.gc_heap
-                    .with_payload(*rc, |state| *state = IteratorState::Exhausted);
+                    .with_payload(rc, |state| *state = IteratorState::Exhausted);
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
@@ -1304,9 +1304,10 @@ impl Interpreter {
 
         // 2 + 3. Fresh entry. Inspect the iterator's inner state.
         let iter_value = *read_register(&stack[top_idx], iter_reg)?;
-        let Value::Iterator(iter_rc) = &iter_value else {
+        let Some(iter_rc_handle) = iter_value.as_iterator() else {
             return Err(VmError::TypeMismatch);
         };
+        let iter_rc = &iter_rc_handle;
         // §27.5 generator-state path — drive the suspended body
         // synchronously and write the unpacked `value` / `done`
         // pair into the caller's destination registers.
@@ -1320,12 +1321,12 @@ impl Interpreter {
                 &handle,
                 GeneratorResumeKind::Next(Value::undefined()),
             )?;
-            let Value::Object(obj) = &result else {
+            let Some(obj) = result.as_object() else {
                 return Err(VmError::TypeMismatch);
             };
             let value =
-                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::undefined());
-            let done = crate::object::get(*obj, &self.gc_heap, "done")
+                crate::object::get(obj, &self.gc_heap, "value").unwrap_or(Value::undefined());
+            let done = crate::object::get(obj, &self.gc_heap, "done")
                 .unwrap_or(Value::undefined())
                 .to_boolean(&self.gc_heap);
             if done {
@@ -1370,11 +1371,11 @@ impl Interpreter {
         };
         // Already-exhausted user iterators short-circuit per
         // §7.4.2 step 6.
-        let Value::Object(iter_obj) = &user_iter_value else {
+        let Some(iter_obj) = user_iter_value.as_object() else {
             return Err(VmError::TypeMismatch);
         };
         let next_fn =
-            crate::object::get(*iter_obj, &self.gc_heap, "next").ok_or(VmError::TypeMismatch)?;
+            crate::object::get(iter_obj, &self.gc_heap, "next").ok_or(VmError::TypeMismatch)?;
         if !is_callable(&next_fn) {
             return Err(VmError::TypeMismatch);
         }

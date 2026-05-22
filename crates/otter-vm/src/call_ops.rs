@@ -1107,13 +1107,13 @@ impl Interpreter {
     }
 
     fn native_promise_constructor(&self, callee: &Value) -> Option<NativeFunction> {
-        let native = match callee {
-            Value::NativeFunction(native) => *native,
-            Value::Object(obj) => match crate::object::constructor_native(*obj, &self.gc_heap) {
-                Some(Value::NativeFunction(native)) => native,
-                _ => return None,
-            },
-            _ => return None,
+        let native = if let Some(native) = callee.as_native_function() {
+            native
+        } else if let Some(obj) = callee.as_object() {
+            crate::object::constructor_native(obj, &self.gc_heap)
+                .and_then(|v| v.as_native_function())?
+        } else {
+            return None;
         };
         (native.name(&self.gc_heap) == "Promise").then_some(native)
     }
@@ -1135,10 +1135,9 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
         let this_value = *read_register(&stack[top_idx], this_reg)?;
-        let args_array = match read_register(&stack[top_idx], args_reg)? {
-            Value::Array(a) => *a,
-            _ => return Err(VmError::TypeMismatch),
-        };
+        let args_array = read_register(&stack[top_idx], args_reg)?
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
         let args: SmallVec<[Value; 8]> =
             crate::array::with_elements(args_array, &self.gc_heap, |elements| {
                 elements.iter().cloned().collect()
@@ -1235,65 +1234,60 @@ impl Interpreter {
                     limit: self.max_stack_depth,
                 });
             }
-            match current {
-                Value::BoundFunction(bound) => {
-                    hops += 1;
-                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                    let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                    combined.extend(bound_args);
-                    combined.extend(effective_args);
-                    effective_this = bound_this;
-                    effective_args = combined;
-                    current = target;
-                }
-                Value::ClassConstructor(cc) => {
-                    hops += 1;
-                    current = cc.ctor(&self.gc_heap);
-                }
+            if let Some(bound) = current.as_bound_function() {
+                hops += 1;
+                let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
+                let mut combined: SmallVec<[Value; 8]> =
+                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
+                combined.extend(bound_args);
+                combined.extend(effective_args);
+                effective_this = bound_this;
+                effective_args = combined;
+                current = target;
+            } else if let Some(cc) = current.as_class_constructor() {
+                hops += 1;
+                current = cc.ctor(&self.gc_heap);
+            } else if let Some(proxy) = current.as_proxy() {
                 // §10.5.12 Proxy [[Call]] — dispatch `apply` trap or
                 // fall through to target.[[Call]] when the trap is
-                // absent. Target may itself be a Proxy, hence the
-                // surrounding loop. §10.5.1 revocation check.
-                // <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-call-thisargument-argumentslist>
-                Value::Proxy(ref proxy) => {
-                    if proxy.is_revoked(&self.gc_heap) {
-                        return Err(VmError::TypeError {
-                            message: "Cannot perform 'apply' on a proxy that has been revoked"
-                                .to_string(),
-                        });
-                    }
-                    hops += 1;
-                    let handler = proxy.handler(&self.gc_heap);
-                    let trap_key = VmPropertyKey::String("apply");
-                    let trap_value =
-                        match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
-                            VmGetOutcome::Value(value) => value,
-                            VmGetOutcome::InvokeGetter { getter } => {
-                                self.run_callable_sync(context, &getter, handler, SmallVec::new())?
-                            }
-                        };
-                    if self.is_callable_runtime(&trap_value) {
-                        let argv_array = self.alloc_runtime_rooted_array_from_values(
-                            effective_args.iter().cloned(),
-                            &[&current, &effective_this, &handler, &trap_value],
-                            &[effective_args.as_slice()],
-                        )?;
-                        let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                            proxy.target(&self.gc_heap),
-                            effective_this,
-                            Value::array(argv_array),
-                        ];
-                        return self.run_callable_sync(context, &trap_value, handler, trap_args);
-                    } else if trap_value.is_undefined() || trap_value.is_null() {
-                        current = proxy.target(&self.gc_heap);
-                    } else {
-                        return Err(VmError::TypeError {
-                            message: "Proxy apply trap is not callable".to_string(),
-                        });
-                    }
+                // absent.
+                if proxy.is_revoked(&self.gc_heap) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot perform 'apply' on a proxy that has been revoked"
+                            .to_string(),
+                    });
                 }
-                _ => break,
+                hops += 1;
+                let handler = proxy.handler(&self.gc_heap);
+                let trap_key = VmPropertyKey::String("apply");
+                let trap_value =
+                    match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
+                        VmGetOutcome::Value(value) => value,
+                        VmGetOutcome::InvokeGetter { getter } => {
+                            self.run_callable_sync(context, &getter, handler, SmallVec::new())?
+                        }
+                    };
+                if self.is_callable_runtime(&trap_value) {
+                    let argv_array = self.alloc_runtime_rooted_array_from_values(
+                        effective_args.iter().cloned(),
+                        &[&current, &effective_this, &handler, &trap_value],
+                        &[effective_args.as_slice()],
+                    )?;
+                    let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                        proxy.target(&self.gc_heap),
+                        effective_this,
+                        Value::array(argv_array),
+                    ];
+                    return self.run_callable_sync(context, &trap_value, handler, trap_args);
+                } else if trap_value.is_undefined() || trap_value.is_null() {
+                    current = proxy.target(&self.gc_heap);
+                } else {
+                    return Err(VmError::TypeError {
+                        message: "Proxy apply trap is not callable".to_string(),
+                    });
+                }
+            } else {
+                break;
             }
         }
         if let Some(obj) = current.as_object()
@@ -1309,7 +1303,8 @@ impl Interpreter {
                 .invoke(&mut ctx, effective_args.as_slice())
                 .map_err(native_to_vm_error);
         }
-        if let Value::NativeFunction(native) = &current {
+        if let Some(native) = current.as_native_function() {
+            let native = &native;
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 return self.run_vm_intrinsic_sync(
@@ -1402,76 +1397,71 @@ impl Interpreter {
                     limit: self.max_stack_depth,
                 });
             }
-            match &current {
-                Value::BoundFunction(bound) => {
-                    hops += 1;
-                    let (next_target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
-                    let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                    combined.extend(bound_args);
-                    combined.extend(effective_args);
-                    if abstract_ops::same_value(&current, &effective_new_target, &self.gc_heap) {
-                        effective_new_target = next_target;
-                    }
-                    current = next_target;
-                    effective_args = combined;
+            if let Some(bound) = current.as_bound_function() {
+                hops += 1;
+                let (next_target, _bound_this, bound_args) = bound.parts(&self.gc_heap);
+                let mut combined: SmallVec<[Value; 8]> =
+                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
+                combined.extend(bound_args);
+                combined.extend(effective_args);
+                if abstract_ops::same_value(&current, &effective_new_target, &self.gc_heap) {
+                    effective_new_target = next_target;
                 }
-                // §10.5.13 Proxy [[Construct]] — dispatch `construct`
-                // trap or fall through to target.[[Construct]]. Target
-                // may be another Proxy, hence the loop.
-                // <https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-construct-argumentslist-newtarget>
-                Value::Proxy(proxy) => {
-                    if proxy.is_revoked(&self.gc_heap) {
-                        return Err(VmError::TypeError {
-                            message: "Cannot perform 'construct' on a proxy that has been revoked"
-                                .to_string(),
-                        });
-                    }
-                    hops += 1;
-                    let handler = proxy.handler(&self.gc_heap);
-                    let trap_key = VmPropertyKey::String("construct");
-                    let trap_value =
-                        match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
-                            VmGetOutcome::Value(value) => value,
-                            VmGetOutcome::InvokeGetter { getter } => {
-                                self.run_callable_sync(context, &getter, handler, SmallVec::new())?
-                            }
-                        };
-                    if self.is_callable_runtime(&trap_value) {
-                        let target_value = proxy.target(&self.gc_heap);
-                        let argv_array = self.alloc_runtime_rooted_array_from_values(
-                            effective_args.iter().cloned(),
-                            &[
-                                &current,
-                                &target_value,
-                                &effective_new_target,
-                                &handler,
-                                &trap_value,
-                            ],
-                            &[effective_args.as_slice()],
-                        )?;
-                        let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                            target_value,
-                            Value::array(argv_array),
-                            effective_new_target,
-                        ];
-                        let result =
-                            self.run_callable_sync(context, &trap_value, handler, trap_args)?;
-                        if !constructor_return_is_object(&result) {
-                            return Err(VmError::TypeError {
-                                message: "Proxy construct trap returned non-object".to_string(),
-                            });
+                current = next_target;
+                effective_args = combined;
+            } else if let Some(proxy) = current.as_proxy() {
+                // §10.5.13 Proxy [[Construct]].
+                if proxy.is_revoked(&self.gc_heap) {
+                    return Err(VmError::TypeError {
+                        message: "Cannot perform 'construct' on a proxy that has been revoked"
+                            .to_string(),
+                    });
+                }
+                hops += 1;
+                let handler = proxy.handler(&self.gc_heap);
+                let trap_key = VmPropertyKey::String("construct");
+                let trap_value =
+                    match self.ordinary_get_value(context, handler, handler, &trap_key, 0)? {
+                        VmGetOutcome::Value(value) => value,
+                        VmGetOutcome::InvokeGetter { getter } => {
+                            self.run_callable_sync(context, &getter, handler, SmallVec::new())?
                         }
-                        return Ok(result);
-                    } else if trap_value.is_undefined() || trap_value.is_null() {
-                        current = proxy.target(&self.gc_heap);
-                    } else {
+                    };
+                if self.is_callable_runtime(&trap_value) {
+                    let target_value = proxy.target(&self.gc_heap);
+                    let argv_array = self.alloc_runtime_rooted_array_from_values(
+                        effective_args.iter().cloned(),
+                        &[
+                            &current,
+                            &target_value,
+                            &effective_new_target,
+                            &handler,
+                            &trap_value,
+                        ],
+                        &[effective_args.as_slice()],
+                    )?;
+                    let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                        target_value,
+                        Value::array(argv_array),
+                        effective_new_target,
+                    ];
+                    let result =
+                        self.run_callable_sync(context, &trap_value, handler, trap_args)?;
+                    if !constructor_return_is_object(&result) {
                         return Err(VmError::TypeError {
-                            message: "Proxy construct trap is not callable".to_string(),
+                            message: "Proxy construct trap returned non-object".to_string(),
                         });
                     }
+                    return Ok(result);
+                } else if trap_value.is_undefined() || trap_value.is_null() {
+                    current = proxy.target(&self.gc_heap);
+                } else {
+                    return Err(VmError::TypeError {
+                        message: "Proxy construct trap is not callable".to_string(),
+                    });
                 }
-                _ => break,
+            } else {
+                break;
             }
         }
 
@@ -1507,9 +1497,9 @@ impl Interpreter {
         }
         let this_value = Value::object(receiver);
 
-        if let Value::Object(obj) = &current
-            && let Some(Value::NativeFunction(native)) =
-                crate::object::constructor_native(*obj, &self.gc_heap)
+        if let Some(obj) = current.as_object()
+            && let Some(native) = crate::object::constructor_native(obj, &self.gc_heap)
+                .and_then(|v| v.as_native_function())
         {
             return self.invoke_native_construct(
                 context,
@@ -1519,27 +1509,27 @@ impl Interpreter {
                 effective_args.as_slice(),
             );
         }
-        if let Value::NativeFunction(native) = &current {
+        if let Some(native) = current.as_native_function() {
             return self.invoke_native_construct(
                 context,
-                *native,
+                native,
                 &this_value,
                 &effective_new_target,
                 effective_args.as_slice(),
             );
         }
-        if let Value::ClassConstructor(class) = &current
-            && let Value::NativeFunction(native) = &class.ctor(&self.gc_heap)
+        if let Some(class) = current.as_class_constructor()
+            && let Some(native) = class.ctor(&self.gc_heap).as_native_function()
         {
             return self.invoke_native_construct(
                 context,
-                *native,
+                native,
                 &this_value,
                 &effective_new_target,
                 effective_args.as_slice(),
             );
         }
-        if let Value::ClassConstructor(class) = &current {
+        if let Some(class) = current.as_class_constructor() {
             current = class.ctor(&self.gc_heap);
         }
 

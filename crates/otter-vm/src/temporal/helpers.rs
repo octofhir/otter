@@ -26,66 +26,73 @@ use crate::temporal::payload::{JsTemporal, TemporalPayload};
 /// value is not a string. Foundation does not yet thread ToString
 /// through every primitive — strings flow through directly.
 pub fn require_string_arg(args: &IntrinsicArgs<'_>, index: u16) -> Result<String, IntrinsicError> {
-    match args.args.get(index as usize) {
-        Some(Value::String(s)) => Ok(s.to_lossy_string(args.gc_heap)),
-        _ => Err(IntrinsicError::BadArgument {
+    let v = args
+        .args
+        .get(index as usize)
+        .ok_or(IntrinsicError::BadArgument {
             index,
             reason: "must be a string",
-        }),
-    }
+        })?;
+    v.as_string()
+        .map(|s| s.to_lossy_string(args.gc_heap))
+        .ok_or(IntrinsicError::BadArgument {
+            index,
+            reason: "must be a string",
+        })
 }
 
 /// Coerce arg `index` to a [`JsObject`] handle. Used for
 /// option / partial-record arguments.
-pub fn require_object_arg<'a>(
-    args: &'a IntrinsicArgs<'_>,
+pub fn require_object_arg(
+    args: &IntrinsicArgs<'_>,
     index: u16,
-) -> Result<&'a JsObject, IntrinsicError> {
-    match args.args.get(index as usize) {
-        Some(Value::Object(o)) => Ok(o),
-        _ => Err(IntrinsicError::BadArgument {
+) -> Result<JsObject, IntrinsicError> {
+    args.args
+        .get(index as usize)
+        .and_then(|v| v.as_object())
+        .ok_or(IntrinsicError::BadArgument {
             index,
             reason: "must be an object",
-        }),
-    }
+        })
 }
 
 /// Optional object arg — returns [`None`] when missing/`undefined`.
-pub fn optional_object_arg<'a>(args: &'a IntrinsicArgs<'_>, index: u16) -> Option<&'a JsObject> {
-    match args.args.get(index as usize) {
-        Some(Value::Object(o)) => Some(o),
-        _ => None,
-    }
+pub fn optional_object_arg(args: &IntrinsicArgs<'_>, index: u16) -> Option<JsObject> {
+    args.args.get(index as usize).and_then(|v| v.as_object())
 }
 
 /// Read a numeric field from a partial-record object. Returns the
 /// default when the property is missing or `undefined`. Coerces
 /// `Value::Number` only; non-numeric values fail.
 pub fn read_i64_field(
-    obj: &JsObject,
+    obj: JsObject,
     name: &str,
     default: i64,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<i64, IntrinsicError> {
-    match crate::object::get(*obj, gc_heap, name) {
-        None | Some(Value::Undefined) => Ok(default),
-        Some(Value::Number(n)) => match n.as_smi() {
+    let Some(v) = crate::object::get(obj, gc_heap, name) else {
+        return Ok(default);
+    };
+    if v.is_undefined() {
+        return Ok(default);
+    }
+    if let Some(n) = v.as_number() {
+        match n.as_smi() {
             Some(v) => Ok(v as i64),
             None => Ok(n.as_f64() as i64),
-        },
-        Some(_) => Err(IntrinsicError::BadArgument {
+        }
+    } else {
+        Err(IntrinsicError::BadArgument {
             index: 0,
             reason: "partial-record fields must be numbers",
-        }),
+        })
     }
 }
 
 /// Read an optional string field (`{ unit: "minutes" }`).
-pub fn read_string_field(obj: &JsObject, name: &str, gc_heap: &otter_gc::GcHeap) -> Option<String> {
-    match crate::object::get(*obj, gc_heap, name) {
-        Some(Value::String(s)) => Some(s.to_lossy_string(gc_heap)),
-        _ => None,
-    }
+pub fn read_string_field(obj: JsObject, name: &str, gc_heap: &otter_gc::GcHeap) -> Option<String> {
+    let v = crate::object::get(obj, gc_heap, name)?;
+    v.as_string().map(|s| s.to_lossy_string(gc_heap))
 }
 
 /// Build a `Value::Temporal` from a payload, allocating the backing
@@ -127,31 +134,33 @@ pub fn alloc_temporal_value(
 /// Extract a [`temporal_rs::Instant`] from the receiver, or raise
 /// [`IntrinsicError::BadReceiver`] for the wrong kind.
 pub fn require_instant(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Instant, IntrinsicError> {
-    match args.receiver {
-        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
+    if let Some(t) = args.receiver.as_temporal() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::Instant(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.Instant",
             }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
+        }
+    } else {
+        Err(IntrinsicError::BadReceiver {
             expected: "Temporal.Instant",
-        }),
+        })
     }
 }
 
 /// Extract a [`temporal_rs::Duration`] from the receiver.
 pub fn require_duration(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Duration, IntrinsicError> {
-    match args.receiver {
-        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
+    if let Some(t) = args.receiver.as_temporal() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.Duration",
             }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
+        }
+    } else {
+        Err(IntrinsicError::BadReceiver {
             expected: "Temporal.Duration",
-        }),
+        })
     }
 }
 
@@ -159,16 +168,17 @@ pub fn require_duration(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Duratio
 pub fn require_plain_date(
     args: &IntrinsicArgs<'_>,
 ) -> Result<temporal_rs::PlainDate, IntrinsicError> {
-    match args.receiver {
-        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
+    if let Some(t) = args.receiver.as_temporal() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDate(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.PlainDate",
             }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
+        }
+    } else {
+        Err(IntrinsicError::BadReceiver {
             expected: "Temporal.PlainDate",
-        }),
+        })
     }
 }
 
@@ -176,16 +186,17 @@ pub fn require_plain_date(
 pub fn require_plain_time(
     args: &IntrinsicArgs<'_>,
 ) -> Result<temporal_rs::PlainTime, IntrinsicError> {
-    match args.receiver {
-        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
+    if let Some(t) = args.receiver.as_temporal() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainTime(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.PlainTime",
             }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
+        }
+    } else {
+        Err(IntrinsicError::BadReceiver {
             expected: "Temporal.PlainTime",
-        }),
+        })
     }
 }
 
@@ -193,16 +204,17 @@ pub fn require_plain_time(
 pub fn require_plain_date_time(
     args: &IntrinsicArgs<'_>,
 ) -> Result<temporal_rs::PlainDateTime, IntrinsicError> {
-    match args.receiver {
-        Value::Temporal(t) => match t.payload_clone(args.gc_heap) {
+    if let Some(t) = args.receiver.as_temporal() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDateTime(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
                 expected: "Temporal.PlainDateTime",
             }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
+        }
+    } else {
+        Err(IntrinsicError::BadReceiver {
             expected: "Temporal.PlainDateTime",
-        }),
+        })
     }
 }
 

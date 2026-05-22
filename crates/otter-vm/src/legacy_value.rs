@@ -124,6 +124,471 @@ pub enum Value {
 }
 
 impl Value {
+    // -----------------------------------------------------------------
+    // Phase-C cut-over compat layer.
+    //
+    // Snake-case constructors mirror the tagged `value::Value` surface
+    // so call sites can migrate `Value::Variant(x)` → `Value::variant(x)`
+    // mechanically before the legacy enum itself is retired. Each
+    // helper is a trivial wrapper around the matching enum variant —
+    // no behavioural change.
+    // -----------------------------------------------------------------
+
+    /// `Value::Undefined` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn undefined() -> Self {
+        Self::Undefined
+    }
+
+    /// `Value::Null` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn null() -> Self {
+        Self::Null
+    }
+
+    /// `Value::Hole` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn hole() -> Self {
+        Self::Hole
+    }
+
+    /// `Value::Boolean(b)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn boolean(b: bool) -> Self {
+        Self::Boolean(b)
+    }
+
+    /// `Value::Number(n)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn number(n: NumberValue) -> Self {
+        Self::Number(n)
+    }
+
+    /// Convenience: `Value::Number(NumberValue::from_i32(n))`.
+    #[inline]
+    #[must_use]
+    pub const fn number_i32(n: i32) -> Self {
+        Self::Number(NumberValue::from_i32(n))
+    }
+
+    /// Convenience: `Value::Number(NumberValue::from_f64(d))`.
+    #[inline]
+    #[must_use]
+    pub fn number_f64(d: f64) -> Self {
+        Self::Number(NumberValue::from_f64(d))
+    }
+
+    /// `Value::BigInt(b)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn big_int(b: bigint::BigIntValue) -> Self {
+        Self::BigInt(b)
+    }
+
+    /// `Value::String(s)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn string(s: JsString) -> Self {
+        Self::String(s)
+    }
+
+    /// `Value::Symbol(s)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn symbol(s: JsSymbol) -> Self {
+        Self::Symbol(s)
+    }
+
+    /// `Value::Function { function_id }` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn function(function_id: u32) -> Self {
+        Self::Function { function_id }
+    }
+
+    /// `Value::Object(o)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn object(o: JsObject) -> Self {
+        Self::Object(o)
+    }
+
+    /// `Value::Array(a)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn array(a: JsArray) -> Self {
+        Self::Array(a)
+    }
+
+    /// `Value::Closure(c)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn closure(c: crate::closure::JsClosure) -> Self {
+        Self::Closure(c)
+    }
+
+    /// `Value::BoundFunction(b)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn bound_function(b: BoundFunction) -> Self {
+        Self::BoundFunction(b)
+    }
+
+    /// `Value::NativeFunction(n)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn native_function(n: NativeFunction) -> Self {
+        Self::NativeFunction(n)
+    }
+
+    /// `Value::Iterator(i)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn iterator(i: IteratorHandle) -> Self {
+        Self::Iterator(i)
+    }
+
+    /// `Value::RegExp(r)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn regexp(r: JsRegExp) -> Self {
+        Self::RegExp(r)
+    }
+
+    /// `Value::Promise(p)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn promise(p: JsPromiseHandle) -> Self {
+        Self::Promise(p)
+    }
+
+    /// `Value::Map(m)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn map(m: JsMap) -> Self {
+        Self::Map(m)
+    }
+
+    /// `Value::Set(s)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn set(s: JsSet) -> Self {
+        Self::Set(s)
+    }
+
+    /// `Value::WeakMap(m)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn weak_map(m: JsWeakMap) -> Self {
+        Self::WeakMap(m)
+    }
+
+    /// `Value::WeakSet(s)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn weak_set(s: JsWeakSet) -> Self {
+        Self::WeakSet(s)
+    }
+
+    /// `Value::WeakRef(w)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn weak_ref(w: JsWeakRef) -> Self {
+        Self::WeakRef(w)
+    }
+
+    /// `Value::FinalizationRegistry(r)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn finalization_registry(r: JsFinalizationRegistry) -> Self {
+        Self::FinalizationRegistry(r)
+    }
+
+    /// `Value::Temporal(t)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn temporal(t: JsTemporal) -> Self {
+        Self::Temporal(t)
+    }
+
+    /// `Value::Intl(i)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn intl(i: JsIntl) -> Self {
+        Self::Intl(i)
+    }
+
+    /// `Value::ArrayBuffer(b)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn array_buffer(b: crate::binary::JsArrayBuffer) -> Self {
+        Self::ArrayBuffer(b)
+    }
+
+    /// `Value::DataView(v)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn data_view(v: crate::binary::JsDataView) -> Self {
+        Self::DataView(v)
+    }
+
+    /// `Value::TypedArray(t)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn typed_array(t: crate::binary::JsTypedArray) -> Self {
+        Self::TypedArray(t)
+    }
+
+    /// `Value::Generator(g)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn generator(g: crate::generator::JsGenerator) -> Self {
+        Self::Generator(g)
+    }
+
+    /// `Value::Proxy(p)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn proxy(p: crate::proxy::JsProxy) -> Self {
+        Self::Proxy(p)
+    }
+
+    /// `Value::ClassConstructor(c)` constructor.
+    #[inline]
+    #[must_use]
+    pub const fn class_constructor(c: ClassConstructor) -> Self {
+        Self::ClassConstructor(c)
+    }
+
+    // -----------------------------------------------------------------
+    // Phase-C cut-over compat layer — predicates.
+    //
+    // Mirror the tagged `value::Value::is_*` surface so call sites can
+    // migrate boolean tests independently of pattern matches.
+    // -----------------------------------------------------------------
+
+    /// `true` if `self == Value::Undefined`.
+    #[inline]
+    #[must_use]
+    pub const fn is_undefined(&self) -> bool {
+        matches!(self, Value::Undefined)
+    }
+
+    /// `true` if `self == Value::Null`.
+    #[inline]
+    #[must_use]
+    pub const fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    /// `true` if `self == Value::Hole`.
+    #[inline]
+    #[must_use]
+    pub const fn is_hole(&self) -> bool {
+        matches!(self, Value::Hole)
+    }
+
+    /// `true` if `self` is a boolean.
+    #[inline]
+    #[must_use]
+    pub const fn is_boolean(&self) -> bool {
+        matches!(self, Value::Boolean(_))
+    }
+
+    /// `true` if `self` is numeric.
+    #[inline]
+    #[must_use]
+    pub const fn is_number(&self) -> bool {
+        matches!(self, Value::Number(_))
+    }
+
+    /// `true` if `self` is a BigInt.
+    #[inline]
+    #[must_use]
+    pub const fn is_big_int(&self) -> bool {
+        matches!(self, Value::BigInt(_))
+    }
+
+    /// `true` if `self` is a string.
+    #[inline]
+    #[must_use]
+    pub const fn is_string(&self) -> bool {
+        matches!(self, Value::String(_))
+    }
+
+    /// `true` if `self` is a symbol.
+    #[inline]
+    #[must_use]
+    pub const fn is_symbol(&self) -> bool {
+        matches!(self, Value::Symbol(_))
+    }
+
+    /// `true` if `self` is a bytecode function reference.
+    #[inline]
+    #[must_use]
+    pub const fn is_function(&self) -> bool {
+        matches!(self, Value::Function { .. })
+    }
+
+    /// `true` if `self` is an ordinary object.
+    #[inline]
+    #[must_use]
+    pub const fn is_object(&self) -> bool {
+        matches!(self, Value::Object(_))
+    }
+
+    /// `true` if `self` is an array.
+    #[inline]
+    #[must_use]
+    pub const fn is_array(&self) -> bool {
+        matches!(self, Value::Array(_))
+    }
+
+    /// `true` if `self` is a closure.
+    #[inline]
+    #[must_use]
+    pub const fn is_closure(&self) -> bool {
+        matches!(self, Value::Closure(_))
+    }
+
+    /// `true` if `self` is a bound function.
+    #[inline]
+    #[must_use]
+    pub const fn is_bound_function(&self) -> bool {
+        matches!(self, Value::BoundFunction(_))
+    }
+
+    /// `true` if `self` is a native function.
+    #[inline]
+    #[must_use]
+    pub const fn is_native_function(&self) -> bool {
+        matches!(self, Value::NativeFunction(_))
+    }
+
+    /// `true` if `self` is an iterator handle.
+    #[inline]
+    #[must_use]
+    pub const fn is_iterator(&self) -> bool {
+        matches!(self, Value::Iterator(_))
+    }
+
+    /// `true` if `self` is a regexp.
+    #[inline]
+    #[must_use]
+    pub const fn is_regexp(&self) -> bool {
+        matches!(self, Value::RegExp(_))
+    }
+
+    /// `true` if `self` is a promise.
+    #[inline]
+    #[must_use]
+    pub const fn is_promise(&self) -> bool {
+        matches!(self, Value::Promise(_))
+    }
+
+    /// `true` if `self` is a `Map`.
+    #[inline]
+    #[must_use]
+    pub const fn is_map(&self) -> bool {
+        matches!(self, Value::Map(_))
+    }
+
+    /// `true` if `self` is a `Set`.
+    #[inline]
+    #[must_use]
+    pub const fn is_set(&self) -> bool {
+        matches!(self, Value::Set(_))
+    }
+
+    /// `true` if `self` is a `WeakMap`.
+    #[inline]
+    #[must_use]
+    pub const fn is_weak_map(&self) -> bool {
+        matches!(self, Value::WeakMap(_))
+    }
+
+    /// `true` if `self` is a `WeakSet`.
+    #[inline]
+    #[must_use]
+    pub const fn is_weak_set(&self) -> bool {
+        matches!(self, Value::WeakSet(_))
+    }
+
+    /// `true` if `self` is a `WeakRef`.
+    #[inline]
+    #[must_use]
+    pub const fn is_weak_ref(&self) -> bool {
+        matches!(self, Value::WeakRef(_))
+    }
+
+    /// `true` if `self` is a `FinalizationRegistry`.
+    #[inline]
+    #[must_use]
+    pub const fn is_finalization_registry(&self) -> bool {
+        matches!(self, Value::FinalizationRegistry(_))
+    }
+
+    /// `true` if `self` is a `Temporal.*` value.
+    #[inline]
+    #[must_use]
+    pub const fn is_temporal(&self) -> bool {
+        matches!(self, Value::Temporal(_))
+    }
+
+    /// `true` if `self` is an `Intl.*` value.
+    #[inline]
+    #[must_use]
+    pub const fn is_intl(&self) -> bool {
+        matches!(self, Value::Intl(_))
+    }
+
+    /// `true` if `self` is an `ArrayBuffer`.
+    #[inline]
+    #[must_use]
+    pub const fn is_array_buffer(&self) -> bool {
+        matches!(self, Value::ArrayBuffer(_))
+    }
+
+    /// `true` if `self` is a `DataView`.
+    #[inline]
+    #[must_use]
+    pub const fn is_data_view(&self) -> bool {
+        matches!(self, Value::DataView(_))
+    }
+
+    /// `true` if `self` is a `TypedArray`.
+    #[inline]
+    #[must_use]
+    pub const fn is_typed_array(&self) -> bool {
+        matches!(self, Value::TypedArray(_))
+    }
+
+    /// `true` if `self` is a `Generator`.
+    #[inline]
+    #[must_use]
+    pub const fn is_generator(&self) -> bool {
+        matches!(self, Value::Generator(_))
+    }
+
+    /// `true` if `self` is a `Proxy`.
+    #[inline]
+    #[must_use]
+    pub const fn is_proxy(&self) -> bool {
+        matches!(self, Value::Proxy(_))
+    }
+
+    /// `true` if `self` is a class constructor.
+    #[inline]
+    #[must_use]
+    pub const fn is_class_constructor(&self) -> bool {
+        matches!(self, Value::ClassConstructor(_))
+    }
+
     /// If `self` directly carries a `Gc<…>` handle, return its
     /// compressed offset for write-barrier dispatch.
     #[must_use]

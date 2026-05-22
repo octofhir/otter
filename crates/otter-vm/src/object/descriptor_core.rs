@@ -111,7 +111,7 @@ pub(super) fn ordinary_set_data_property_with_shape(
 pub(super) fn ordinary_set_symbol_data_property(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
-    key: &JsSymbol,
+    key: JsSymbol,
     value: Value,
 ) -> bool {
     let barrier_value = value;
@@ -132,7 +132,7 @@ pub(super) fn ordinary_set_symbol_data_property(
             return false;
         }
         body.symbol_props
-            .push((*key, PropertySlot::data_default(value)));
+            .push((key, PropertySlot::data_default(value)));
         true
     });
     if success {

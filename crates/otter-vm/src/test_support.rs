@@ -81,7 +81,7 @@ pub fn promise_has_object_fulfill_capability(
     promise
         .debug_fulfill_reactions(heap)
         .iter()
-        .any(|reaction| matches!(reaction.capability.promise, Value::Object(_)))
+        .any(|reaction| reaction.capability.promise.is_object())
 }
 
 pub fn promise_fulfill_reaction_count(promise: JsPromiseHandle, heap: &otter_gc::GcHeap) -> usize {

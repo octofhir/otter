@@ -186,7 +186,7 @@ pub(crate) fn array_like_present_entries(
     {
         return Some(Vec::new());
     }
-    if let Some(s) = receiver.as_string() {
+    if let Some(s) = receiver.as_string(heap) {
         let units = s.to_utf16_vec(heap);
         return Some(
             units
@@ -214,7 +214,7 @@ pub(crate) fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> us
     if let Some(obj) = receiver.as_object() {
         return read_array_like_length(obj, heap);
     }
-    if let Some(s) = receiver.as_string() {
+    if let Some(s) = receiver.as_string(heap) {
         return s.len() as usize;
     }
     if let Some(r) = receiver.as_regexp() {
@@ -283,7 +283,7 @@ fn arg_signed_index(
     if arg.is_null() {
         return Ok(0);
     }
-    if let Some(s) = arg.as_string() {
+    if let Some(s) = arg.as_string(args.gc_heap) {
         let text = s.to_lossy_string(args.gc_heap);
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -605,7 +605,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         None => ",".to_string(),
         Some(v) if v.is_undefined() => ",".to_string(),
         Some(v) => {
-            if let Some(s) = v.as_string() {
+            if let Some(s) = v.as_string(args.gc_heap) {
                 s.to_lossy_string(&*args.gc_heap)
             } else {
                 v.display_string(&*args.gc_heap)
@@ -1354,7 +1354,7 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         .as_array()
         .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
     let key_value = args.args.first().cloned().unwrap_or(Value::undefined());
-    let key_string: Option<String> = if let Some(s) = key_value.as_string() {
+    let key_string: Option<String> = if let Some(s) = key_value.as_string(args.gc_heap) {
         Some(s.to_lossy_string(&*args.gc_heap))
     } else if let Some(n) = key_value.as_number() {
         Some(n.to_display_string())
@@ -1367,11 +1367,12 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     } else {
         None
     };
-    let heap = &mut *args.gc_heap;
     // §22.1 — symbol-keyed own properties live in the per-array
     // symbol table. Surface them before the string-keyed paths so
     // `arr.hasOwnProperty(Symbol.toStringTag)` round-trips.
-    if let Some(sym) = key_value.as_symbol() {
+    let sym_opt = key_value.as_symbol(args.gc_heap);
+    let heap = &mut *args.gc_heap;
+    if let Some(sym) = sym_opt {
         return Ok(Value::boolean(
             array::get_symbol_property(arr, heap, sym).is_some(),
         ));
@@ -1408,7 +1409,7 @@ fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, In
         .as_array()
         .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
     let key_value = args.args.first().cloned().unwrap_or(Value::undefined());
-    let key_string: String = if let Some(s) = key_value.as_string() {
+    let key_string: String = if let Some(s) = key_value.as_string(args.gc_heap) {
         s.to_lossy_string(&*args.gc_heap)
     } else if let Some(n) = key_value.as_number() {
         n.to_display_string()

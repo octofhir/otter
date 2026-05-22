@@ -79,7 +79,7 @@ impl Interpreter {
     /// - [`VmError::SyntaxError`] when no eval hook is installed or
     ///   parsing / compilation fail.
     pub(crate) fn run_eval(&mut self, value: &Value, force_strict: bool) -> Result<Value, VmError> {
-        let Some(s) = value.as_string() else {
+        let Some(s) = value.as_string(&self.gc_heap) else {
             // Per §19.4.1.1 step 4, eval'd non-strings are returned
             // unchanged — `eval(42) === 42`.
             return Ok(*value);
@@ -209,7 +209,7 @@ impl Interpreter {
             function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "length")?;
         let function_id_opt = value
             .as_function()
-            .or_else(|| value.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         let prototype_value = if let Some(function_id) = function_id_opt {
             let mut roots = Vec::with_capacity(value_roots.len() + 1);
             roots.push(&value);
@@ -330,7 +330,7 @@ impl Interpreter {
         } else {
             *value
         };
-        if let Some(s) = primitive.as_string() {
+        if let Some(s) = primitive.as_string(&self.gc_heap) {
             return Ok(s.to_lossy_string(&self.gc_heap));
         }
         if primitive.is_symbol() {

@@ -171,7 +171,7 @@ pub fn install_weak_well_knowns_post_bootstrap(
         object::define_own_symbol_property_partial(
             prototype,
             heap,
-            &tag_sym,
+            tag_sym,
             PartialPropertyDescriptor {
                 value: Some(Value::string(tag)),
                 writable: Some(false),

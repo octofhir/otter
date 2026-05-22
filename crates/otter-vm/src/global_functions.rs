@@ -143,7 +143,7 @@ fn coerce_to_utf16(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> Vec<u16> {
     if value.is_undefined() {
         return "undefined".encode_utf16().collect();
     }
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(heap) {
         return s.to_utf16_vec(heap);
     }
     value.display_string(heap).encode_utf16().collect()

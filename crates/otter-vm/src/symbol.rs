@@ -214,7 +214,7 @@ impl JsSymbol {
     /// Identity comparison — strict `===` for symbols. Follows
     /// compressed-offset equality on the GC handle.
     #[must_use]
-    pub fn ptr_eq(&self, other: &Self) -> bool {
+    pub fn ptr_eq(self, other: Self) -> bool {
         self.inner == other.inner
     }
 
@@ -505,7 +505,7 @@ impl SymbolRegistry {
     /// for the given symbol, or `None` if `sym` is not registered.
     /// Identity comparison via [`JsSymbol::ptr_eq`].
     #[must_use]
-    pub fn key_for(&self, sym: &JsSymbol) -> Option<String> {
+    pub fn key_for(&self, sym: JsSymbol) -> Option<String> {
         self.entries
             .borrow()
             .iter()
@@ -554,9 +554,9 @@ mod tests {
         let mut gc = fresh_gc_heap();
         let a = JsSymbol::new(&mut gc, None).unwrap();
         let b = JsSymbol::new(&mut gc, None).unwrap();
-        assert!(!a.ptr_eq(&b));
+        assert!(!a.ptr_eq(b));
         let c = a;
-        assert!(a.ptr_eq(&c));
+        assert!(a.ptr_eq(c));
     }
 
     #[test]
@@ -565,8 +565,8 @@ mod tests {
         let reg = SymbolRegistry::new();
         let a = reg.for_key(&mut gc, "k").unwrap();
         let b = reg.for_key(&mut gc, "k").unwrap();
-        assert!(a.ptr_eq(&b));
-        assert_eq!(reg.key_for(&a).as_deref(), Some("k"));
+        assert!(a.ptr_eq(b));
+        assert_eq!(reg.key_for(a).as_deref(), Some("k"));
     }
 
     #[test]
@@ -575,10 +575,10 @@ mod tests {
         let table = WellKnownSymbols::new(&mut gc).unwrap();
         let a = table.get(WellKnown::Iterator);
         let b = table.get(WellKnown::Iterator);
-        assert!(a.ptr_eq(&b));
+        assert!(a.ptr_eq(b));
         assert_eq!(a.well_known_tag(), Some(WellKnown::Iterator));
         let other = table.get(WellKnown::ToPrimitive);
-        assert!(!a.ptr_eq(&other));
+        assert!(!a.ptr_eq(other));
     }
 
     #[test]
@@ -597,6 +597,6 @@ mod tests {
         let reg = SymbolRegistry::new();
         let table = WellKnownSymbols::new(&mut gc).unwrap();
         let iter = table.get(WellKnown::Iterator);
-        assert!(reg.key_for(&iter).is_none());
+        assert!(reg.key_for(iter).is_none());
     }
 }

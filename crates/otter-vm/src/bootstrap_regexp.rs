@@ -342,7 +342,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &match_sym,
+        match_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::native_function(match_fn)),
             writable: Some(true),
@@ -354,7 +354,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &search_sym,
+        search_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::native_function(search_fn)),
             writable: Some(true),
@@ -366,7 +366,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &replace_sym,
+        replace_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::native_function(replace_fn)),
             writable: Some(true),
@@ -378,7 +378,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &split_sym,
+        split_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::native_function(split_fn)),
             writable: Some(true),
@@ -390,7 +390,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &match_all_sym,
+        match_all_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::native_function(match_all_fn)),
             writable: Some(true),
@@ -467,7 +467,7 @@ fn is_regexp_runtime(
     value: &Value,
     name: &'static str,
 ) -> Result<bool, NativeError> {
-    if !crate::value_kind::is_object_like_value(value) {
+    if !value.is_object_type() {
         return Ok(false);
     }
     let match_sym = ctx
@@ -476,7 +476,7 @@ fn is_regexp_runtime(
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Match);
     let matcher =
-        crate::regexp_prototype::get_symbol_property_runtime(ctx, value, &match_sym, name)?;
+        crate::regexp_prototype::get_symbol_property_runtime(ctx, value, match_sym, name)?;
     if !matcher.is_undefined() {
         return Ok(matcher.to_boolean(ctx.heap()));
     }
@@ -536,7 +536,7 @@ fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     let text = args.first().cloned().unwrap_or(Value::undefined());
     let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.exec")?;
 
-    crate::regexp_prototype::exec_once_native(&re, &text_str, ctx, &[args])
+    crate::regexp_prototype::exec_once_native(&re, text_str, ctx, &[args])
         .map_err(|e| intrinsic_to_native(e, "RegExp.prototype.exec"))
 }
 
@@ -873,8 +873,8 @@ fn coerce_to_string(
     v: &Value,
     name: &'static str,
 ) -> Result<JsString, NativeError> {
-    if let Some(s) = v.as_string() {
-        return Ok(*s);
+    if let Some(s) = v.as_string(ctx.heap()) {
+        return Ok(s);
     }
     let s = v.display_string(ctx.heap());
 

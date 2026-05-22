@@ -657,7 +657,7 @@ impl NativeFunction {
     pub(crate) fn own_symbol_property_descriptor(
         &self,
         heap: &otter_gc::GcHeap,
-        key: &crate::symbol::JsSymbol,
+        key: crate::symbol::JsSymbol,
     ) -> Option<PropertyDescriptor> {
         heap.read_payload(self.inner, |body| {
             crate::object::get_own_symbol_descriptor(body.own_properties, heap, key)
@@ -773,7 +773,7 @@ impl NativeFunction {
     pub(crate) fn define_own_symbol_property(
         &self,
         heap: &mut otter_gc::GcHeap,
-        key: &crate::symbol::JsSymbol,
+        key: crate::symbol::JsSymbol,
         descriptor: crate::object::PartialPropertyDescriptor,
     ) -> bool {
         let obj = heap.read_payload(self.inner, |body| body.own_properties);
@@ -814,7 +814,7 @@ impl NativeFunction {
     pub(crate) fn delete_own_symbol_property(
         &self,
         heap: &mut otter_gc::GcHeap,
-        key: &crate::symbol::JsSymbol,
+        key: crate::symbol::JsSymbol,
     ) -> bool {
         let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
         crate::object::delete_symbol(own_properties, heap, key)

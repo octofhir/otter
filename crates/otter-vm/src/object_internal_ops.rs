@@ -27,9 +27,9 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, JsObject, JsString, Value, VmError, VmGetOutcome,
-    VmPropertyKey, abstract_ops, array, constructor_return_is_object, descriptor_value,
-    function_metadata, make_array_iterator_factory_runtime_rooted, object, object_statics, proxy,
-    regexp_prototype, string, symbol, to_length, value_kind::is_object_like_value,
+    VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata,
+    make_array_iterator_factory_runtime_rooted, object, object_statics, proxy, regexp_prototype,
+    string, symbol, to_length,
 };
 
 #[derive(Clone, Copy)]
@@ -71,10 +71,10 @@ fn primitive_to_property_key(
     value: Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    if let Some(sym) = value.as_symbol() {
-        return Ok(VmPropertyKey::Symbol(*sym));
+    if let Some(sym) = value.as_symbol(heap) {
+        return Ok(VmPropertyKey::Symbol(sym));
     }
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(heap) {
         return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
     if let Some(n) = value.as_number() {
@@ -99,11 +99,11 @@ fn property_key_value_to_vm_key(
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(heap) {
         return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
-    if let Some(sym) = value.as_symbol() {
-        return Ok(VmPropertyKey::Symbol(*sym));
+    if let Some(sym) = value.as_symbol(heap) {
+        return Ok(VmPropertyKey::Symbol(sym));
     }
     Err(VmError::TypeError {
         message: "property key must be a string or symbol".to_string(),
@@ -263,7 +263,7 @@ impl Interpreter {
     ) -> object::PropertyLookup {
         match key {
             VmPropertyKey::Atom(key) => object::lookup_own_atom(obj, &self.gc_heap, *key).lookup,
-            VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(obj, &self.gc_heap, sym),
+            VmPropertyKey::Symbol(sym) => object::lookup_own_symbol(obj, &self.gc_heap, *sym),
             _ => object::lookup_own(
                 obj,
                 &self.gc_heap,
@@ -307,7 +307,7 @@ impl Interpreter {
         let Some(value) = object::string_data(obj, &self.gc_heap) else {
             return Ok(None);
         };
-        string::exotic::descriptor_for_key(&value, key, &mut self.gc_heap)
+        string::exotic::descriptor_for_key(value, key, &mut self.gc_heap)
     }
 
     fn target_is_non_extensible_object(&self, target: &Value) -> bool {
@@ -381,7 +381,7 @@ impl Interpreter {
         if let Some(key) = key.string_name() {
             object::get_own_descriptor(obj, &self.gc_heap, key)
         } else if let VmPropertyKey::Symbol(sym) = key {
-            object::get_own_symbol_descriptor(obj, &self.gc_heap, sym)
+            object::get_own_symbol_descriptor(obj, &self.gc_heap, *sym)
         } else {
             None
         }
@@ -556,12 +556,12 @@ impl Interpreter {
             return Ok(if let Some(key) = key.string_name() {
                 object::get_own_descriptor(obj, &self.gc_heap, key)
             } else if let VmPropertyKey::Symbol(sym) = key {
-                object::get_own_symbol_descriptor(obj, &self.gc_heap, sym)
+                object::get_own_symbol_descriptor(obj, &self.gc_heap, *sym)
             } else {
                 None
             });
         }
-        if let Some(value) = target.as_string() {
+        if let Some(value) = target.as_string(&self.gc_heap) {
             return string::exotic::descriptor_for_key(value, key, &mut self.gc_heap);
         }
         if let Some(arr) = target.as_array() {
@@ -571,7 +571,7 @@ impl Interpreter {
             // `Object.getOwnPropertyDescriptor(arr, sym)` and
             // `hasOwnProperty(sym)` observe the spec shape.
             if let VmPropertyKey::Symbol(sym) = key {
-                if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, sym) {
+                if let Some(value) = array::get_symbol_property(arr, &self.gc_heap, *sym) {
                     return Ok(Some(object::PropertyDescriptor::data(
                         value, true, true, true,
                     )));
@@ -650,7 +650,7 @@ impl Interpreter {
                         return Ok(Some(desc));
                     }
                 } else if let VmPropertyKey::Symbol(sym) = key
-                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
+                    && let Some(desc) = object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
                 {
                     return Ok(Some(desc));
                 }
@@ -659,13 +659,13 @@ impl Interpreter {
         }
         let function_id = target
             .as_function()
-            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = function_id {
             if let VmPropertyKey::Symbol(sym) = key {
                 let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                     return Ok(None);
                 };
-                return Ok(object::get_own_symbol_descriptor(bag, &self.gc_heap, sym));
+                return Ok(object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym));
             }
             let key = key
                 .string_name()
@@ -709,7 +709,7 @@ impl Interpreter {
         }
         if let Some(native) = target.as_native_function() {
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                native.own_symbol_property_descriptor(&self.gc_heap, sym)
+                native.own_symbol_property_descriptor(&self.gc_heap, *sym)
             } else {
                 let key = key
                     .string_name()
@@ -825,7 +825,7 @@ impl Interpreter {
         }
         let fid = value
             .as_function()
-            .or_else(|| value.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             return Ok(self.ordinary_function_is_extensible(function_id));
         }
@@ -962,7 +962,7 @@ impl Interpreter {
         }
         if let Some(obj) = target.as_object() {
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(obj, &mut self.gc_heap, sym, descriptor)
+                object::define_own_symbol_property_partial(obj, &mut self.gc_heap, *sym, descriptor)
             } else {
                 if let Some(current) = self.string_object_exotic_descriptor(obj, key)? {
                     return Ok(is_compatible_partial_descriptor(
@@ -979,7 +979,7 @@ impl Interpreter {
         }
         if let Some(native) = target.as_native_function() {
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                native.define_own_symbol_property(&mut self.gc_heap, sym, descriptor)
+                native.define_own_symbol_property(&mut self.gc_heap, *sym, descriptor)
             } else {
                 let k = key
                     .string_name()
@@ -997,7 +997,7 @@ impl Interpreter {
                 object::define_own_symbol_property_partial(
                     statics,
                     &mut self.gc_heap,
-                    sym,
+                    *sym,
                     descriptor,
                 )
             } else {
@@ -1009,14 +1009,14 @@ impl Interpreter {
         }
         let fid = target
             .as_function()
-            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             if let VmPropertyKey::Symbol(sym) = key {
                 let bag = self.function_user_bag_runtime_rooted(function_id, &[], &[])?;
                 return Ok(object::define_own_symbol_property_partial(
                     bag,
                     &mut self.gc_heap,
-                    sym,
+                    *sym,
                     descriptor,
                 ));
             }
@@ -1063,7 +1063,7 @@ impl Interpreter {
             let bag =
                 crate::property_dispatch::regexp_ensure_expando_pub(&mut self.gc_heap, &regexp)?;
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, sym, descriptor)
+                object::define_own_symbol_property_partial(bag, &mut self.gc_heap, *sym, descriptor)
             } else {
                 let k = key
                     .string_name()
@@ -1074,7 +1074,7 @@ impl Interpreter {
         if let Some(arr) = target.as_array() {
             if let VmPropertyKey::Symbol(sym) = key {
                 let value = descriptor.value.unwrap_or(Value::undefined());
-                array::set_symbol_property(arr, &mut self.gc_heap, sym, value);
+                array::set_symbol_property(arr, &mut self.gc_heap, *sym, value);
                 return Ok(true);
             }
             let Some(k) = key.string_name() else {
@@ -1816,8 +1816,8 @@ impl Interpreter {
     ) -> Result<VmPropertyKey<'static>, VmError> {
         let primitive =
             self.evaluate_to_primitive(context, input, abstract_ops::ToPrimitiveHint::String)?;
-        if let Some(sym) = primitive.as_symbol() {
-            return Ok(VmPropertyKey::Symbol(*sym));
+        if let Some(sym) = primitive.as_symbol(&self.gc_heap) {
+            return Ok(VmPropertyKey::Symbol(sym));
         }
         Ok(VmPropertyKey::OwnedString(
             primitive.display_string(&self.gc_heap),
@@ -1972,7 +1972,7 @@ impl Interpreter {
         }
         let fid = target
             .as_function()
-            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let names = self.ordinary_function_own_property_keys(context, function_id);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
@@ -2295,7 +2295,7 @@ impl Interpreter {
             }
             let proto_opt = if proto.is_null() {
                 None
-            } else if constructor_return_is_object(proto) || proto.is_proxy() {
+            } else if proto.is_object_type() || proto.is_proxy() {
                 Some(*proto)
             } else {
                 return Ok(false);
@@ -2345,7 +2345,7 @@ impl Interpreter {
         }
         let fid = value
             .as_function()
-            .or_else(|| value.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             self.ordinary_function_prevent_extensions(function_id);
             return Ok(true);
@@ -2387,7 +2387,7 @@ impl Interpreter {
         }
         let fid = rhs
             .as_function()
-            .or_else(|| rhs.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let value = self.function_property_get(context, function_id, "prototype")?;
             return if value.is_object() || value.is_proxy() {
@@ -2464,7 +2464,7 @@ impl Interpreter {
         }
         let fid = rhs
             .as_function()
-            .or_else(|| rhs.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let value =
                 self.function_property_get_stack_rooted(context, stack, function_id, "prototype")?;
@@ -2581,7 +2581,7 @@ impl Interpreter {
         if let Some(arr) = base.as_array() {
             let value = match key {
                 VmPropertyKey::Symbol(sym) => {
-                    if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
+                    if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, *sym) {
                         v
                     } else if sym
                         .well_known_tag()
@@ -2640,7 +2640,7 @@ impl Interpreter {
         }
         let fid = base
             .as_function()
-            .or_else(|| base.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| base.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let lookup = match key {
                 VmPropertyKey::Symbol(sym) => {
@@ -2648,13 +2648,13 @@ impl Interpreter {
                         .function_user_props
                         .get(&function_id)
                         .copied()
-                        .and_then(|bag| object::get_own_symbol_descriptor(bag, &self.gc_heap, sym))
+                        .and_then(|bag| object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym))
                     {
                         Some(desc) => descriptor_to_lookup(desc),
                         None => self
                             .function_kind_prototype_for(context, function_id)
                             .and_then(|proto| {
-                                match object::lookup_symbol(proto, &self.gc_heap, sym) {
+                                match object::lookup_symbol(proto, &self.gc_heap, *sym) {
                                     object::PropertyLookup::Absent => None,
                                     lookup => Some(lookup),
                                 }
@@ -2662,7 +2662,7 @@ impl Interpreter {
                             .or_else(|| {
                                 self.function_prototype_object()
                                     .ok()
-                                    .map(|proto| object::lookup_symbol(proto, &self.gc_heap, sym))
+                                    .map(|proto| object::lookup_symbol(proto, &self.gc_heap, *sym))
                             })
                             .unwrap_or(object::PropertyLookup::Absent),
                     }
@@ -2715,7 +2715,7 @@ impl Interpreter {
         if let Some(native) = base.as_native_function() {
             let value = match key {
                 VmPropertyKey::Symbol(sym) => {
-                    match native.own_symbol_property_descriptor(&self.gc_heap, sym) {
+                    match native.own_symbol_property_descriptor(&self.gc_heap, *sym) {
                         Some(object::PropertyDescriptor {
                             kind: object::DescriptorKind::Data { value },
                             ..
@@ -2734,7 +2734,7 @@ impl Interpreter {
                         None => self
                             .function_prototype_object()
                             .ok()
-                            .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                            .and_then(|p| object::get_symbol(p, &self.gc_heap, *sym))
                             .unwrap_or(Value::undefined()),
                     }
                 }
@@ -2775,7 +2775,7 @@ impl Interpreter {
                 VmPropertyKey::Symbol(sym) => self
                     .function_prototype_object()
                     .ok()
-                    .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                    .and_then(|p| object::get_symbol(p, &self.gc_heap, *sym))
                     .unwrap_or(Value::undefined()),
                 _ => {
                     let key = key
@@ -2831,7 +2831,7 @@ impl Interpreter {
             if let Some(bag) = re.expando(&self.gc_heap) {
                 let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
-                        object::lookup_own_symbol(bag, &self.gc_heap, sym)
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
                     }
                     _ => {
                         let key = key
@@ -2894,7 +2894,7 @@ impl Interpreter {
             if let Some(bag) = promise.expando(&self.gc_heap) {
                 let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
-                        object::lookup_own_symbol(bag, &self.gc_heap, sym)
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
                     }
                     _ => {
                         let name = key
@@ -2948,7 +2948,7 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
-        if let Some(s) = base.as_string() {
+        if let Some(s) = base.as_string(&self.gc_heap) {
             if let Some(name) = key.string_name() {
                 if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
                     && n.is_finite()
@@ -2996,7 +2996,7 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
-        if let Some(t) = base.as_typed_array() {
+        if let Some(t) = base.as_typed_array(&self.gc_heap) {
             if let Some(name) = key.string_name() {
                 if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name) {
                     if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
@@ -3020,7 +3020,7 @@ impl Interpreter {
             }
             if let VmPropertyKey::Symbol(sym) = key
                 && let Some(bag) = t.expando(&self.gc_heap)
-                && let Some(v) = crate::object::get_symbol(bag, &self.gc_heap, sym)
+                && let Some(v) = crate::object::get_symbol(bag, &self.gc_heap, *sym)
             {
                 return Ok(VmGetOutcome::Value(v));
             }
@@ -3111,7 +3111,7 @@ impl Interpreter {
                     Ok(true)
                 }
                 VmPropertyKey::Symbol(sym) => {
-                    if array::get_symbol_property(arr, &self.gc_heap, sym).is_some() {
+                    if array::get_symbol_property(arr, &self.gc_heap, *sym).is_some() {
                         return Ok(true);
                     }
                     let proto = self.constructor_prototype_value("Array")?;
@@ -3179,7 +3179,7 @@ impl Interpreter {
         // DefineProperty needs observable ToPropertyDescriptor for
         // every Object target, not only Proxy targets. The rest of the
         // proxy preflight is Proxy-specific.
-        if matches!(method, M::DefineProperty) && is_object_like_value(target) {
+        if matches!(method, M::DefineProperty) && target.is_object_type() {
             let key =
                 self.evaluate_to_property_key(context, args.get(1).unwrap_or(&Value::undefined()))?;
             let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
@@ -3362,7 +3362,7 @@ impl Interpreter {
         let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
         let to_prim = value
             .as_object()
-            .and_then(|o| crate::object::get_symbol(o, &self.gc_heap, &to_prim_sym));
+            .and_then(|o| crate::object::get_symbol(o, &self.gc_heap, to_prim_sym));
         if let Some(callee) = to_prim
             && self.is_callable_runtime(&callee)
         {
@@ -3432,7 +3432,7 @@ impl Interpreter {
             };
             let mut enumerable = Vec::new();
             for key in &keys {
-                let Some(name) = key.as_string() else {
+                let Some(name) = key.as_string(&self.gc_heap) else {
                     continue;
                 };
                 let name = name.to_lossy_string(&self.gc_heap);
@@ -3470,7 +3470,7 @@ impl Interpreter {
             let own_keys = self.own_property_keys_value(context, &target)?;
             let mut out = Vec::new();
             for key_value in own_keys {
-                let Some(name) = key_value.as_string() else {
+                let Some(name) = key_value.as_string(&self.gc_heap) else {
                     continue;
                 };
                 let key = name.to_lossy_string(&self.gc_heap);
@@ -3490,7 +3490,7 @@ impl Interpreter {
         }
         let fid = target
             .as_function()
-            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             let keys = self.ordinary_function_own_property_keys(context, function_id);
             let mut out = Vec::with_capacity(keys.len());
@@ -3543,7 +3543,7 @@ impl Interpreter {
 
             let keys = self.own_property_keys_value(context, &current)?;
             for key in &keys {
-                let Some(name) = key.as_string() else {
+                let Some(name) = key.as_string(&self.gc_heap) else {
                     continue;
                 };
                 let name = name.to_lossy_string(&self.gc_heap);
@@ -3637,14 +3637,14 @@ impl Interpreter {
             return Ok(if let Some(key) = key.string_name() {
                 object::delete(obj, &mut self.gc_heap, key)
             } else if let VmPropertyKey::Symbol(sym) = key {
-                object::delete_symbol(obj, &mut self.gc_heap, sym)
+                object::delete_symbol(obj, &mut self.gc_heap, *sym)
             } else {
                 true
             });
         }
         if let Some(arr) = target.as_array() {
             return Ok(if let VmPropertyKey::Symbol(sym) = key {
-                array::delete_symbol_property(arr, &mut self.gc_heap, sym)
+                array::delete_symbol_property(arr, &mut self.gc_heap, *sym)
             } else if let Some(k) = key.string_name() {
                 array::delete_named_property(arr, &mut self.gc_heap, k)
             } else {
@@ -3653,7 +3653,7 @@ impl Interpreter {
         }
         let fid = target
             .as_function()
-            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             return Ok(if let Some(key) = key.string_name() {
                 self.ordinary_function_delete_own_property(function_id, key)
@@ -3661,7 +3661,7 @@ impl Interpreter {
                 self.function_user_props
                     .get(&function_id)
                     .copied()
-                    .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, sym))
+                    .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, *sym))
                     .unwrap_or(true)
             } else {
                 true
@@ -3671,7 +3671,7 @@ impl Interpreter {
             return Ok(match key.string_name() {
                 Some(key) => native.delete_own_property(&mut self.gc_heap, key),
                 None if let VmPropertyKey::Symbol(sym) = key => {
-                    native.delete_own_symbol_property(&mut self.gc_heap, sym)
+                    native.delete_own_symbol_property(&mut self.gc_heap, *sym)
                 }
                 None => true,
             });
@@ -3802,13 +3802,13 @@ impl Interpreter {
         }
         let fid = target
             .as_function()
-            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fid {
             return match key {
                 VmPropertyKey::Symbol(sym) => {
                     if !self.ordinary_function_has_own_symbol_property_for_extensibility(
                         function_id,
-                        sym,
+                        *sym,
                     ) && !self.ordinary_function_is_extensible(function_id)
                     {
                         return Ok(false);
@@ -3928,10 +3928,10 @@ fn optional_value_eq_pair(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc:
 /// SameValue restricted to PropertyKey-typed values (Strings and
 /// Symbols). Used by §10.5.11 Proxy `ownKeys` invariant validation.
 fn same_property_key(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
-    if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
+    if let (Some(x), Some(y)) = (a.as_string(heap), b.as_string(heap)) {
         return x.to_lossy_string(heap) == y.to_lossy_string(heap);
     }
-    if let (Some(x), Some(y)) = (a.as_symbol(), b.as_symbol()) {
+    if let (Some(x), Some(y)) = (a.as_symbol(heap), b.as_symbol(heap)) {
         return x.ptr_eq(y);
     }
     false
@@ -3945,11 +3945,11 @@ fn property_key_from_value(
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(heap) {
         return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
-    if let Some(sym) = value.as_symbol() {
-        return Ok(VmPropertyKey::Symbol(*sym));
+    if let Some(sym) = value.as_symbol(heap) {
+        return Ok(VmPropertyKey::Symbol(sym));
     }
     Err(VmError::TypeMismatch)
 }

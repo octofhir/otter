@@ -23,15 +23,12 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, IteratorState, Value, VmError, VmPropertyKey,
-    abstract_ops, array, bigint, binary, collections, constructor_return_is_object, date,
-    global_functions, json, json_to_vm_error, math, math_to_vm_error, native_function, object,
-    object_statics,
+    abstract_ops, array, bigint, binary, collections, date, global_functions, json,
+    json_to_vm_error, math, math_to_vm_error, native_function, object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
-    symbol_dispatch, symbol_to_vm_error, temporal, temporal_to_vm_error,
-    value_kind::is_object_like_value,
-    write_register,
+    symbol_dispatch, symbol_to_vm_error, temporal, temporal_to_vm_error, write_register,
 };
 
 /// Object-shaped values that need §7.1.1 `ToPrimitive` coercion before
@@ -124,8 +121,8 @@ impl Interpreter {
                             crate::abstract_ops::ToPrimitiveHint::String,
                         )?
                     };
-                    let s = if let Some(s) = primitive.as_string() {
-                        *s
+                    let s = if let Some(s) = primitive.as_string(&self.gc_heap) {
+                        s
                     } else if primitive.is_symbol() {
                         return Err(VmError::TypeError {
                             message: "JSON.parse: cannot convert a Symbol to a string".to_string(),
@@ -318,8 +315,8 @@ impl Interpreter {
                         message: "JSON.parse argument 0 must be a string".to_string(),
                     });
                 };
-                let s = if let Some(s) = primitive.as_string() {
-                    *s
+                let s = if let Some(s) = primitive.as_string(&self.gc_heap) {
+                    s
                 } else if primitive.is_symbol() {
                     return Err(VmError::TypeError {
                         message: "JSON.parse: cannot convert a Symbol to a string".to_string(),
@@ -742,7 +739,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let target_value = args.first().cloned().unwrap_or(Value::undefined());
         // §20.1.2.3 step 1 — `Type(O)` must be Object.
-        if !is_object_like_value(&target_value) {
+        if !target_value.is_object_type() {
             return Err(VmError::TypeError {
                 message: "Object.defineProperties target must be an object".to_string(),
             });
@@ -838,7 +835,7 @@ impl Interpreter {
             if src.is_nullish() {
                 continue;
             }
-            if let Some(s) = src.as_string() {
+            if let Some(s) = src.as_string(&self.gc_heap) {
                 // §22.1.4 — String exotic exposes its code units
                 // as own indexed properties plus a `length`. The
                 // latter is read-only on the wrapper, so we copy
@@ -928,7 +925,7 @@ impl Interpreter {
                         Vec::new()
                     }
                     Some(target) if target.is_string() => {
-                        let s = target.as_string().expect("guarded");
+                        let s = target.as_string(&self.gc_heap).expect("guarded");
                         let len = s.len() as usize;
                         (0..len).map(|i| i.to_string()).collect()
                     }
@@ -970,7 +967,7 @@ impl Interpreter {
                         Vec::new()
                     }
                     Some(target) if target.is_string() => {
-                        let s = target.as_string().expect("guarded");
+                        let s = target.as_string(&self.gc_heap).expect("guarded");
                         let units = s.to_utf16_vec(&self.gc_heap);
                         units
                             .into_iter()
@@ -1018,7 +1015,7 @@ impl Interpreter {
                         Vec::new()
                     }
                     Some(target) if target.is_string() => {
-                        let s = target.as_string().expect("guarded");
+                        let s = target.as_string(&self.gc_heap).expect("guarded");
                         let units = s.to_utf16_vec(&self.gc_heap);
                         units
                             .into_iter()
@@ -1085,7 +1082,7 @@ impl Interpreter {
                         break;
                     };
 
-                    if !is_object_like_value(&entry) {
+                    if !entry.is_object_type() {
                         let _ = self.iterator_close_sync(context, &iterator);
                         return Err(VmError::TypeError {
                             message: "Object.fromEntries: iterator value is not an entry object"
@@ -1159,7 +1156,7 @@ impl Interpreter {
                         VmPropertyKey::Symbol(sym) => object::get_own_symbol_descriptor(
                             class.statics(self.gc_heap()),
                             self.gc_heap(),
-                            sym,
+                            *sym,
                         ),
                         _ => object::get_own_descriptor(
                             class.statics(self.gc_heap()),
@@ -1171,7 +1168,7 @@ impl Interpreter {
                 } else if let Some(native) = target.as_native_function() {
                     match &key {
                         VmPropertyKey::Symbol(sym) => {
-                            native.own_symbol_property_descriptor(self.gc_heap(), sym)
+                            native.own_symbol_property_descriptor(self.gc_heap(), *sym)
                         }
                         _ => {
                             let key = key
@@ -1180,14 +1177,14 @@ impl Interpreter {
                             native.own_property_descriptor(self.gc_heap_mut(), key)?
                         }
                     }
-                } else if let Some(t) = target.as_typed_array() {
+                } else if let Some(t) = target.as_typed_array(&self.gc_heap) {
                     // §10.4.5.1 IntegerIndexedExoticObject
                     // [[GetOwnProperty]] — canonical-numeric-index
                     // strings produce a data descriptor for in-range
                     // elements; everything else returns no descriptor.
                     match &key {
                         VmPropertyKey::Symbol(sym) => t.expando(&self.gc_heap).and_then(|bag| {
-                            crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), sym)
+                            crate::object::get_own_symbol_descriptor(bag, self.gc_heap(), *sym)
                         }),
                         _ => {
                             let k = key
@@ -1274,7 +1271,7 @@ impl Interpreter {
                 {
                     // Empty result; primitive wrapper carries no
                     // own keys reachable through the foundation surface.
-                } else if let Some(s) = target.as_string() {
+                } else if let Some(s) = target.as_string(&self.gc_heap) {
                     let units = s.to_utf16_vec(&self.gc_heap);
                     let result_root = Value::object(result);
                     for (i, u) in units.iter().enumerate() {
@@ -1318,10 +1315,10 @@ impl Interpreter {
                     let result_root = Value::object(result);
                     let keys = self.own_property_keys_value(context, &target_value)?;
                     for key in keys {
-                        let vm_key = if let Some(s) = key.as_string() {
+                        let vm_key = if let Some(s) = key.as_string(&self.gc_heap) {
                             crate::VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-                        } else if let Some(sym) = key.as_symbol() {
-                            crate::VmPropertyKey::Symbol(*sym)
+                        } else if let Some(sym) = key.as_symbol(&self.gc_heap) {
+                            crate::VmPropertyKey::Symbol(sym)
                         } else {
                             continue;
                         };
@@ -1341,17 +1338,17 @@ impl Interpreter {
                             &[&target_value, &result_root],
                             args,
                         )?;
-                        if let Some(s) = key.as_string() {
+                        if let Some(s) = key.as_string(&self.gc_heap) {
                             self.set_property(
                                 result,
                                 &s.to_lossy_string(&self.gc_heap),
                                 Value::object(desc_obj),
                             )?;
-                        } else if let Some(sym) = key.as_symbol()
+                        } else if let Some(sym) = key.as_symbol(&self.gc_heap)
                             && !object::set_symbol(
                                 result,
                                 &mut self.gc_heap,
-                                *sym,
+                                sym,
                                 Value::object(desc_obj),
                             )
                         {
@@ -1382,14 +1379,14 @@ impl Interpreter {
                     || target.is_big_int()
                 {
                     Vec::new()
-                } else if let Some(s) = target.as_string() {
+                } else if let Some(s) = target.as_string(&self.gc_heap) {
                     let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
                     keys.push("length".to_string());
                     keys
                 } else if own_property_names_uses_internal_methods(target) {
                     self.own_property_keys_value(context, target)?
                         .into_iter()
-                        .filter_map(|key| key.as_string().map(|s| s.to_lossy_string(&self.gc_heap)))
+                        .filter_map(|key| key.as_string(&self.gc_heap).map(|s| s.to_lossy_string(&self.gc_heap)))
                         .collect()
                 } else {
                     return Err(VmError::TypeMismatch);
@@ -1486,7 +1483,7 @@ impl Interpreter {
             let key_pk = self.to_property_key_sync(context, key)?;
             let key_str = match key_pk {
                 crate::VmPropertyKey::Symbol(sym) => {
-                    let existing = crate::object::get_symbol(result, &self.gc_heap, &sym);
+                    let existing = crate::object::get_symbol(result, &self.gc_heap, sym);
                     let group = match existing {
                         Some(v) if v.is_array() => v.as_array().expect("guarded"),
                         _ => {
@@ -1708,9 +1705,9 @@ impl Interpreter {
                         index: 0,
                         origin: crate::BuiltinIteratorOrigin::Array,
                     }
-                } else if let Some(s) = value.as_string() {
+                } else if let Some(s) = value.as_string(&self.gc_heap) {
                     IteratorState::String {
-                        string: *s,
+                        string: s,
                         index: 0,
                     }
                 } else if let Some(s) = value.as_set() {
@@ -1826,7 +1823,7 @@ fn own_enumerable_keys_for_define(
         }
         return Ok(out.into_iter().map(VmPropertyKey::OwnedString).collect());
     }
-    if let Some(s) = props.as_string() {
+    if let Some(s) = props.as_string(interp.gc_heap()) {
         let units = s.to_utf16_vec(interp.gc_heap());
         return Ok((0..units.len())
             .map(|i| VmPropertyKey::OwnedString(i.to_string()))
@@ -1839,11 +1836,11 @@ fn value_to_static_property_key(
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(heap) {
         return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
-    if let Some(sym) = value.as_symbol() {
-        return Ok(VmPropertyKey::Symbol(*sym));
+    if let Some(sym) = value.as_symbol(heap) {
+        return Ok(VmPropertyKey::Symbol(sym));
     }
     Err(VmError::TypeError {
         message: "property key must be a string or symbol".to_string(),
@@ -1862,7 +1859,7 @@ fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> Strin
 
 fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
     match arg {
-        Some(v) if constructor_return_is_object(v) || abstract_ops::is_callable(v) => Ok(*v),
+        Some(v) if v.is_object_type() || abstract_ops::is_callable(v) => Ok(*v),
         _ => Err(VmError::TypeMismatch),
     }
 }
@@ -1946,7 +1943,7 @@ fn enumerable_own_string_entries(
     let keys = interp.own_property_keys_value(context, target)?;
     let mut entries = Vec::new();
     for key_value in &keys {
-        let Some(name) = key_value.as_string() else {
+        let Some(name) = key_value.as_string(interp.gc_heap()) else {
             continue;
         };
         let key_name = name.to_lossy_string(interp.gc_heap());
@@ -1990,10 +1987,10 @@ fn assign_copy_source_keys(
 ) -> Result<(), VmError> {
     let keys = interp.own_property_keys_value(context, source)?;
     for key_value in &keys {
-        let key = if let Some(s) = key_value.as_string() {
+        let key = if let Some(s) = key_value.as_string(interp.gc_heap()) {
             VmPropertyKey::OwnedString(s.to_lossy_string(interp.gc_heap()))
-        } else if let Some(sym) = key_value.as_symbol() {
-            VmPropertyKey::Symbol(*sym)
+        } else if let Some(sym) = key_value.as_symbol(interp.gc_heap()) {
+            VmPropertyKey::Symbol(sym)
         } else {
             return Err(VmError::TypeError {
                 message: "Object.assign source ownKeys returned non-property key".to_string(),
@@ -2021,7 +2018,7 @@ fn assign_copy_source_keys(
         };
         match &key {
             VmPropertyKey::Symbol(sym) => {
-                assign_set_symbol(interp, context, target_value, target_object, sym, value)?;
+                assign_set_symbol(interp, context, target_value, target_object, *sym, value)?;
             }
             _ => {
                 assign_set_string(
@@ -2107,7 +2104,7 @@ fn assign_set_symbol(
     context: &ExecutionContext,
     target_value: &Value,
     target_object: Option<crate::object::JsObject>,
-    sym: &crate::symbol::JsSymbol,
+    sym: crate::symbol::JsSymbol,
     value: Value,
 ) -> Result<(), VmError> {
     if let Some(obj) = target_object {

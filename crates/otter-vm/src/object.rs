@@ -171,9 +171,6 @@ impl ObjectPrototype {
     }
 }
 
-fn is_prototype_object_value(value: &Value) -> bool {
-    value.is_object_like()
-}
 
 // ---------- internal slot type --------------------------------------------
 
@@ -1117,14 +1114,14 @@ pub fn has_in_proto_chain(obj: JsObject, heap: &otter_gc::GcHeap, target: JsObje
 /// Look up by a [`JsString`] key. Convenience for dispatcher
 /// sites that already hold the WTF-16 form.
 #[must_use]
-pub fn get_jsstring(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsString) -> Option<Value> {
+pub fn get_jsstring(obj: JsObject, heap: &otter_gc::GcHeap, key: JsString) -> Option<Value> {
     let utf8 = key.to_lossy_string(heap);
     get(obj, heap, &utf8)
 }
 
 /// Look up an **own** symbol-keyed property.
 #[must_use]
-pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Option<Value> {
+pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> Option<Value> {
     heap.read_payload(obj, |body| {
         body.symbol_props
             .iter()
@@ -1138,7 +1135,7 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) ->
 
 /// Probe for an **own** symbol-keyed property descriptor body.
 #[must_use]
-pub fn lookup_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> PropertyLookup {
+pub fn lookup_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> PropertyLookup {
     heap.read_payload(obj, |body| {
         body.symbol_props
             .iter()
@@ -1153,13 +1150,13 @@ pub fn lookup_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol)
 /// `PropertyLookup::Absent` probe and intentionally does not walk
 /// the prototype chain.
 #[must_use]
-pub fn has_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> bool {
+pub fn has_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> bool {
     !matches!(lookup_own_symbol(obj, heap, key), PropertyLookup::Absent)
 }
 
 /// Look up a symbol-keyed property with prototype-chain walk.
 #[must_use]
-pub fn get_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Option<Value> {
+pub fn get_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> Option<Value> {
     if let Some(v) = get_own_symbol(obj, heap, key) {
         return Some(v);
     }
@@ -1180,7 +1177,7 @@ pub fn get_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> Opt
 
 /// Symbol-keyed property lookup with prototype-chain walk.
 #[must_use]
-pub fn lookup_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> PropertyLookup {
+pub fn lookup_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> PropertyLookup {
     match lookup_own_symbol(obj, heap, key) {
         PropertyLookup::Absent => {}
         hit => return hit,
@@ -1206,7 +1203,7 @@ pub fn lookup_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> 
 pub fn get_own_symbol_descriptor(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
-    key: &JsSymbol,
+    key: JsSymbol,
 ) -> Option<PropertyDescriptor> {
     heap.read_payload(obj, |body| {
         body.symbol_props
@@ -1582,7 +1579,7 @@ pub fn set_prototype_value(
             ObjectPrototype::Object(o)
         } else if let Some(p) = value.as_proxy() {
             ObjectPrototype::Proxy(p)
-        } else if is_prototype_object_value(&value) {
+        } else if value.is_object_type() {
             ObjectPrototype::Value(value)
         } else {
             return false;
@@ -1710,11 +1707,11 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
 /// Fires the GC write barrier when `value` carries a `Gc<…>`
 /// handle.
 pub fn set_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol, value: Value) -> bool {
-    descriptor_core::ordinary_set_symbol_data_property(obj, heap, &key, value)
+    descriptor_core::ordinary_set_symbol_data_property(obj, heap, key, value)
 }
 
 /// Remove a symbol-keyed own property.
-pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &JsSymbol) -> bool {
+pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) -> bool {
     heap.with_payload(obj, |body| {
         if let Some(pos) = body.symbol_props.iter().position(|(k, _)| k.ptr_eq(key)) {
             if !body.symbol_props[pos].1.flags.configurable() {
@@ -1883,7 +1880,7 @@ pub(crate) fn define_own_property_partial_with_shape(
 pub fn define_own_symbol_property_partial(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
-    key: &JsSymbol,
+    key: JsSymbol,
     descriptor: PartialPropertyDescriptor,
 ) -> bool {
     let completed = descriptor.complete_for_new_property();
@@ -1912,7 +1909,7 @@ pub fn define_own_symbol_property_partial(
                 return false;
             }
             body.symbol_props
-                .push((*key, PropertySlot::from_descriptor(completed.clone())));
+                .push((key, PropertySlot::from_descriptor(completed.clone())));
             true
         }
     });
@@ -1987,7 +1984,7 @@ pub fn define_own_property(
 pub fn define_own_symbol_property(
     obj: JsObject,
     heap: &mut otter_gc::GcHeap,
-    key: &JsSymbol,
+    key: JsSymbol,
     descriptor: PropertyDescriptor,
 ) -> bool {
     let barrier_descriptor = descriptor.clone();
@@ -2015,7 +2012,7 @@ pub fn define_own_symbol_property(
                 return false;
             }
             body.symbol_props
-                .push((*key, PropertySlot::from_descriptor(descriptor)));
+                .push((key, PropertySlot::from_descriptor(descriptor)));
             true
         }
     });
@@ -2129,7 +2126,7 @@ pub fn resolve_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> SetOutc
 }
 
 /// Symbol-keyed counterpart to [`resolve_set`].
-pub fn resolve_symbol_set(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) -> SetOutcome {
+pub fn resolve_symbol_set(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> SetOutcome {
     match lookup_own_symbol(obj, heap, key) {
         PropertyLookup::Data { flags, .. } => {
             if flags.writable() {
@@ -3289,6 +3286,6 @@ mod tests {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let sym = JsSymbol::new(&mut heap, None).unwrap();
-        assert!(delete_symbol(o, &mut heap, &sym));
+        assert!(delete_symbol(o, &mut heap, sym));
     }
 }

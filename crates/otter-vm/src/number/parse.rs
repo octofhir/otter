@@ -121,7 +121,7 @@ pub fn to_number_value(value: &Value, heap: &otter_gc::GcHeap) -> f64 {
         0.0
     } else if value.is_undefined() {
         f64::NAN
-    } else if let Some(s) = value.as_string() {
+    } else if let Some(s) = value.as_string(heap) {
         match to_number_from_string(&s.to_lossy_string(heap)) {
             NumberValue::Smi(v) => v as f64,
             NumberValue::Double(d) => d,

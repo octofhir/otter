@@ -784,7 +784,7 @@ pub fn is_extensible(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
 pub fn set_symbol_property(
     arr: JsArray,
     heap: &mut otter_gc::GcHeap,
-    key: &crate::symbol::JsSymbol,
+    key: crate::symbol::JsSymbol,
     value: Value,
 ) {
     let barrier_value = value;
@@ -793,7 +793,7 @@ pub fn set_symbol_property(
         if let Some(slot) = table.iter_mut().find(|(k, _)| k.ptr_eq(key)) {
             slot.1 = value;
         } else {
-            table.push((*key, value));
+            table.push((key, value));
         }
         body.dirty = true;
     });
@@ -806,7 +806,7 @@ pub fn set_symbol_property(
 pub fn get_symbol_property(
     arr: JsArray,
     heap: &otter_gc::GcHeap,
-    key: &crate::symbol::JsSymbol,
+    key: crate::symbol::JsSymbol,
 ) -> Option<Value> {
     heap.read_payload(arr, |body| {
         body.symbol_properties
@@ -822,7 +822,7 @@ pub fn get_symbol_property(
 pub fn delete_symbol_property(
     arr: JsArray,
     heap: &mut otter_gc::GcHeap,
-    key: &crate::symbol::JsSymbol,
+    key: crate::symbol::JsSymbol,
 ) -> bool {
     heap.with_payload(arr, |body| {
         if let Some(table) = body.symbol_properties.as_mut()

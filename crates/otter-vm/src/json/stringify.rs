@@ -83,11 +83,8 @@ impl StringifyOptions {
                 indent: vec![b' '; count],
             });
         }
-        if let Some(s) = space.as_string() {
-            let bytes = match gc_heap {
-                Some(heap) => s.to_lossy_string(heap).into_bytes(),
-                None => Vec::new(),
-            };
+        if let Some(s) = gc_heap.and_then(|h| space.as_string(h).map(|s| (s, h))) {
+            let bytes = s.0.to_lossy_string(s.1).into_bytes();
             let take = bytes.len().min(10);
             return Ok(Self {
                 indent: bytes[..take].to_vec(),
@@ -291,7 +288,7 @@ fn emit_value(
         write_number(out, n);
     } else if value.is_big_int() {
         return Err(JsonError::BigInt);
-    } else if let Some(s) = value.as_string() {
+    } else if let Some(s) = value.as_string(gc_heap) {
         write_string_literal(out, &s.to_lossy_string(gc_heap));
     } else if let Some(arr) = value.as_array() {
         // Lazy stringify memcpy fast-path: capture text from JSON.parse.
@@ -342,7 +339,7 @@ fn emit_value(
             had_member: false,
             _root: obj,
         });
-    } else if let Some(ta) = value.as_typed_array() {
+    } else if let Some(ta) = value.as_typed_array(gc_heap) {
         // §25.5.2 — TypedArrays serialise like array-likes.
         if stack.len() >= MAX_NESTING_DEPTH {
             return Err(JsonError::TooDeep {

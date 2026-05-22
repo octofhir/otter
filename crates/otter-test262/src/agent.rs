@@ -145,21 +145,25 @@ fn type_err(reason: impl Into<String>) -> NativeError {
 }
 
 fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
-    match value {
-        Value::String(s) => Ok(s.to_lossy_string(ctx.heap())),
-        Value::Undefined => Ok("undefined".to_string()),
-        Value::Null => Ok("null".to_string()),
-        Value::Boolean(b) => Ok(if *b { "true" } else { "false" }.to_string()),
-        Value::Number(n) => Ok(format!("{}", n.as_f64())),
-        Value::BigInt(b) => Ok(b.to_decimal_string(ctx.heap())),
-        _ => {
-            // Fall through to `ToString` via the receiver's
-            // `toString()` method. For the test262 surface this is
-            // rare; broadcast / report typically take strings.
-            let _ = ctx;
-            Err(type_err("expected a string argument"))
-        }
+    if let Some(s) = value.as_string(ctx.heap()) {
+        return Ok(s.to_lossy_string(ctx.heap()));
     }
+    if value.is_undefined() {
+        return Ok("undefined".to_string());
+    }
+    if value.is_null() {
+        return Ok("null".to_string());
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok(if b { "true" } else { "false" }.to_string());
+    }
+    if let Some(n) = value.as_number() {
+        return Ok(format!("{}", n.as_f64()));
+    }
+    if let Some(b) = value.as_big_int() {
+        return Ok(b.to_decimal_string(ctx.heap()));
+    }
+    Err(type_err("expected a string argument"))
 }
 
 // =====================================================================
@@ -218,16 +222,19 @@ fn run_agent_source(source: String) {
 
 fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let sab_value = args.first().copied().unwrap_or(Value::undefined());
-    let Value::ArrayBuffer(buf) = &sab_value else {
+    let Some(buf) = sab_value.as_array_buffer() else {
         return Err(type_err("first argument must be a SharedArrayBuffer"));
     };
     let Some(shared) = buf.as_shared_arc(ctx.heap()) else {
         return Err(type_err("first argument must be a SharedArrayBuffer"));
     };
     let num = match args.get(1) {
-        None | Some(Value::Undefined) => None,
-        Some(Value::Number(n)) => Some(n.as_f64()),
-        _ => return Err(type_err("second argument must be a Number or omitted")),
+        None => None,
+        Some(v) if v.is_undefined() => None,
+        Some(v) => match v.as_number() {
+            Some(n) => Some(n.as_f64()),
+            None => return Err(type_err("second argument must be a Number or omitted")),
+        },
     };
     let msg = BroadcastMessage { sab: shared, num };
     // Capture sender list under lock then drop the lock before
@@ -248,13 +255,7 @@ fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 
 fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let handler = args.first().copied().unwrap_or(Value::undefined());
-    if !matches!(
-        handler,
-        Value::NativeFunction(_)
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-    ) {
+    if !handler.is_callable() {
         return Err(type_err("receiveBroadcast handler must be a function"));
     }
 
@@ -313,9 +314,12 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 
 fn agent_sleep(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let ms = match args.first() {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Undefined) | None => 0.0,
-        _ => return Err(type_err("sleep argument must be a Number")),
+        None => 0.0,
+        Some(v) if v.is_undefined() => 0.0,
+        Some(v) => match v.as_number() {
+            Some(n) => n.as_f64(),
+            None => return Err(type_err("sleep argument must be a Number")),
+        },
     };
     if ms.is_finite() && ms > 0.0 {
         thread::sleep(Duration::from_millis(ms as u64));

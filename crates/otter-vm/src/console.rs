@@ -229,10 +229,10 @@ fn write(ctx: &mut NativeCtx<'_>, level: ConsoleLevel, args: &[Value]) {
 fn format_args(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Vec<String> {
     let heap = ctx.heap();
     args.iter()
-        .map(|value| match value {
-            Value::Object(obj)
-                if object::get(*obj, heap, "name").is_some()
-                    || object::get(*obj, heap, "message").is_some() =>
+        .map(|value| {
+            if let Some(obj) = value.as_object()
+                && (object::get(obj, heap, "name").is_some()
+                    || object::get(obj, heap, "message").is_some())
             {
                 let rendered = error_classes::render_error_to_string(value, heap);
                 if rendered.is_empty() {
@@ -240,8 +240,9 @@ fn format_args(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Vec<String> {
                 } else {
                     rendered
                 }
+            } else {
+                value.display_string(ctx.heap())
             }
-            _ => value.display_string(ctx.heap()),
         })
         .collect()
 }

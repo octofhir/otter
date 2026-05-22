@@ -252,7 +252,7 @@ pub fn call(
                     let heap = interp.gc_heap();
                     match &key {
                         VmPropertyKey::Symbol(sym) => {
-                            crate::object::resolve_symbol_set(obj, heap, sym)
+                            crate::object::resolve_symbol_set(obj, heap, *sym)
                         }
                         _ => crate::object::resolve_set(
                             obj,
@@ -327,7 +327,7 @@ fn set_data_on_receiver(
     let existing = {
         let heap = interp.gc_heap();
         match key {
-            VmPropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(recv_obj, heap, sym),
+            VmPropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(recv_obj, heap, *sym),
             _ => crate::object::lookup_own(
                 recv_obj,
                 heap,
@@ -400,7 +400,7 @@ fn coerce_property_key(
     let Some(v) = arg else {
         return Ok(VmPropertyKey::String("undefined"));
     };
-    if let Some(s) = v.as_string() {
+    if let Some(s) = v.as_string(interp.gc_heap()) {
         return Ok(VmPropertyKey::OwnedString(
             s.to_lossy_string(interp.gc_heap()),
         ));
@@ -417,8 +417,8 @@ fn coerce_property_key(
     if v.is_undefined() {
         return Ok(VmPropertyKey::String("undefined"));
     }
-    if let Some(sym) = v.as_symbol() {
-        return Ok(VmPropertyKey::Symbol(*sym));
+    if let Some(sym) = v.as_symbol(interp.gc_heap()) {
+        return Ok(VmPropertyKey::Symbol(sym));
     }
     // Fall through to general coercion path.
     interp.evaluate_to_property_key(context, v)

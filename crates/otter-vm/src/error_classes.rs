@@ -310,7 +310,7 @@ pub(crate) fn render_error_to_string_spec(
                 message: format!("Cannot convert a Symbol value to a string ('{key}')"),
             });
         }
-        if let Some(s) = value.as_string() {
+        if let Some(s) = value.as_string(interp.gc_heap()) {
             return Ok(s.to_lossy_string(interp.gc_heap()));
         }
         if value.is_null() || value.is_boolean() || value.is_number() || value.is_big_int() {
@@ -326,7 +326,7 @@ pub(crate) fn render_error_to_string_spec(
                 message: format!("Cannot convert a Symbol value to a string ('{key}')"),
             });
         }
-        if let Some(s) = primitive.as_string() {
+        if let Some(s) = primitive.as_string(interp.gc_heap()) {
             Ok(s.to_lossy_string(interp.gc_heap()))
         } else {
             Ok(primitive.display_string(interp.gc_heap()))
@@ -356,7 +356,7 @@ pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> Stri
         None => "Error".to_string(),
         Some(v) if v.is_undefined() => "Error".to_string(),
         Some(v) => v
-            .as_string()
+            .as_string(gc_heap)
             .map(|s| s.to_lossy_string(gc_heap))
             .unwrap_or_else(|| v.display_string(gc_heap)),
     };
@@ -364,7 +364,7 @@ pub fn render_error_to_string(value: &Value, gc_heap: &otter_gc::GcHeap) -> Stri
         None => String::new(),
         Some(v) if v.is_undefined() => String::new(),
         Some(v) => v
-            .as_string()
+            .as_string(gc_heap)
             .map(|s| s.to_lossy_string(gc_heap))
             .unwrap_or_else(|| v.display_string(gc_heap)),
     };
@@ -573,7 +573,7 @@ impl ErrorClassRegistry {
             let message = if let Some(v) = args.first() {
                 if v.is_undefined() {
                     None
-                } else if let Some(s) = v.as_string() {
+                } else if let Some(s) = v.as_string(ctx.heap()) {
                     Some(s.to_lossy_string(ctx.heap()))
                 } else if v.is_symbol() {
                     return Err(NativeError::TypeError {
@@ -668,7 +668,7 @@ impl ErrorClassRegistry {
             let message = if let Some(v) = a.get(1) {
                 if v.is_undefined() {
                     None
-                } else if let Some(s) = v.as_string() {
+                } else if let Some(s) = v.as_string(c.heap()) {
                     Some(s.to_lossy_string(c.heap()))
                 } else if v.is_symbol() {
                     return Err(NativeError::TypeError {

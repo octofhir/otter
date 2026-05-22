@@ -31,7 +31,7 @@ fn require_payload(args: &IntrinsicArgs<'_>) -> Result<ListFormatPayload, Intrin
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.ListFormat",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::ListFormat(p) => Ok(p),
         _ => Err(bad()),
@@ -79,7 +79,7 @@ fn collect_items(
     let values = crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
     let mut out: Vec<String> = Vec::with_capacity(values.len());
     for v in values {
-        if let Some(s) = v.as_string() {
+        if let Some(s) = v.as_string(gc_heap) {
             out.push(s.to_lossy_string(gc_heap));
         } else if let Some(n) = v.as_number() {
             out.push(n.to_display_string());

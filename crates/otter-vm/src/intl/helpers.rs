@@ -35,7 +35,7 @@ pub fn coerce_locale(arg: Option<&Value>, gc_heap: &otter_gc::GcHeap) -> String 
     let Some(v) = arg else {
         return DEFAULT_LOCALE.to_string();
     };
-    if let Some(s) = v.as_string() {
+    if let Some(s) = v.as_string(gc_heap) {
         return s.to_lossy_string(gc_heap);
     }
     DEFAULT_LOCALE.to_string()
@@ -57,7 +57,7 @@ pub fn read_string_option(
 ) -> String {
     options
         .and_then(|o| crate::object::get(*o, gc_heap, name))
-        .and_then(|v| v.as_string().map(|s| s.to_lossy_string(gc_heap)))
+        .and_then(|v| v.as_string(gc_heap).map(|s| s.to_lossy_string(gc_heap)))
         .unwrap_or_else(|| default.to_string())
 }
 

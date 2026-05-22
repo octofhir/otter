@@ -226,11 +226,4 @@ impl JsTemporal {
         self.inner == other.inner
     }
 
-    /// Visit the embedded GC handle so the scavenger can rewrite the
-    /// compressed offset in place if the body moves. Called from
-    /// [`crate::Value::trace_value_slots`].
-    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        let p = &self.inner as *const TemporalHandle as *mut otter_gc::raw::RawGc;
-        visitor(p);
-    }
 }

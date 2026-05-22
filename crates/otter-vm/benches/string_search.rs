@@ -119,7 +119,7 @@ fn bench_string_search(c: &mut Criterion) {
     let p_str = JsString::from_latin1(b"NEEDLabcd", &mut heap).unwrap();
     let mut g = c.benchmark_group("string_search/starts_with_short");
     g.bench_function("starts_with_latin1_path", |b| {
-        b.iter(|| black_box(&h_str).starts_with(black_box(&p_str), 0, &heap))
+        b.iter(|| black_box(h_str).starts_with(black_box(p_str), 0, &heap))
     });
     g.finish();
 }

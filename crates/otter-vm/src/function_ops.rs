@@ -675,7 +675,7 @@ impl Interpreter {
                 None => Ok(BindMetadataGet::Value(Value::undefined())),
             };
         }
-        if let Some(closure) = target.as_closure() {
+        if let Some(closure) = target.as_closure(&self.gc_heap) {
             return match self.ordinary_function_own_property_descriptor(
                 Some(context),
                 closure.cached_function_id,
@@ -726,7 +726,7 @@ impl Interpreter {
         let Some(value) = arg else {
             return Ok(VmPropertyKey::String("undefined"));
         };
-        if let Some(s) = value.as_string() {
+        if let Some(s) = value.as_string(heap) {
             return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
         }
         if let Some(n) = value.as_number() {
@@ -741,8 +741,8 @@ impl Interpreter {
         if value.is_undefined() {
             return Ok(VmPropertyKey::String("undefined"));
         }
-        if let Some(sym) = value.as_symbol() {
-            return Ok(VmPropertyKey::Symbol(*sym));
+        if let Some(sym) = value.as_symbol(heap) {
+            return Ok(VmPropertyKey::Symbol(sym));
         }
         Err(VmError::TypeMismatch)
     }
@@ -819,7 +819,7 @@ impl Interpreter {
     pub(crate) fn ordinary_function_has_own_symbol_property_for_extensibility(
         &self,
         function_id: u32,
-        key: &crate::symbol::JsSymbol,
+        key: crate::symbol::JsSymbol,
     ) -> bool {
         self.function_user_props
             .get(&function_id)
@@ -894,7 +894,7 @@ impl Interpreter {
         let ctor = class.ctor(&self.gc_heap);
         let function_id = ctor
             .as_function()
-            .or_else(|| ctor.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         let mut keys = if let Some(function_id) = function_id {
             let Some(context) = context else {
                 return Err(VmError::InvalidOperand);
@@ -1196,10 +1196,10 @@ impl Interpreter {
                         if !key.is_string() {
                             continue;
                         }
-                        let vm_key = if let Some(s) = key.as_string() {
+                        let vm_key = if let Some(s) = key.as_string(&self.gc_heap) {
                             VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-                        } else if let Some(sym) = key.as_symbol() {
-                            VmPropertyKey::Symbol(*sym)
+                        } else if let Some(sym) = key.as_symbol(&self.gc_heap) {
+                            VmPropertyKey::Symbol(sym)
                         } else {
                             return Err(VmError::TypeMismatch);
                         };
@@ -1262,7 +1262,7 @@ impl Interpreter {
         }
         let function_id = if let Some(id) = target.as_function() {
             Some(id)
-        } else if let Some(closure) = target.as_closure() {
+        } else if let Some(closure) = target.as_closure(&self.gc_heap) {
             Some(closure.cached_function_id)
         } else if target.is_bound_function() {
             None
@@ -1282,7 +1282,7 @@ impl Interpreter {
                     (Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         if !self.ordinary_function_has_own_symbol_property_for_extensibility(
                             function_id,
-                            sym,
+                            *sym,
                         ) && !self.ordinary_function_is_extensible(function_id)
                         {
                             return Err(VmError::TypeMismatch);
@@ -1300,7 +1300,7 @@ impl Interpreter {
                         crate::object::define_own_symbol_property_partial(
                             bag,
                             &mut self.gc_heap,
-                            sym,
+                            *sym,
                             descriptor,
                         )
                     }
@@ -1341,7 +1341,7 @@ impl Interpreter {
                         let Some(bag) = self.function_user_props.get(&function_id).copied() else {
                             return Ok(Some(Value::undefined()));
                         };
-                        crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
+                        crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym)
                     }
                     (Some(function_id), _) => self.ordinary_function_own_property_descriptor(
                         context,
@@ -1381,7 +1381,7 @@ impl Interpreter {
                         .function_user_props
                         .get(&function_id)
                         .copied()
-                        .map(|bag| crate::object::has_own_symbol(bag, &self.gc_heap, sym))
+                        .map(|bag| crate::object::has_own_symbol(bag, &self.gc_heap, *sym))
                         .unwrap_or(false),
                     (Some(function_id), _) => {
                         let key = key
@@ -1430,7 +1430,7 @@ impl Interpreter {
             M::IsExtensible => {
                 let function_id = target
                     .as_function()
-                    .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+                    .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
                 match function_id {
                     Some(function_id) => Ok(Some(Value::boolean(
                         self.ordinary_function_is_extensible(function_id),
@@ -1441,7 +1441,7 @@ impl Interpreter {
             M::PreventExtensions => {
                 let function_id = target
                     .as_function()
-                    .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+                    .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
                 match function_id {
                     Some(function_id) => {
                         self.ordinary_function_prevent_extensions(function_id);
@@ -1732,7 +1732,7 @@ impl Interpreter {
         object::define_own_symbol_property_partial(
             parent,
             &mut self.gc_heap,
-            &tag_sym,
+            tag_sym,
             object::PartialPropertyDescriptor {
                 value: Some(Value::string(tag)),
                 writable: Some(false),

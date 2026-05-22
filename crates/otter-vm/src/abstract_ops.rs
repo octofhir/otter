@@ -186,7 +186,7 @@ pub fn same_value_non_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> 
     // §7.2.11 SameValueNonNumber for String: code-unit equality
     // through the heap. Derived `PartialEq` on `JsString` is
     // handle identity after Phase B, which is too strict here.
-    if let (Some(a), Some(b)) = (x.as_string(), y.as_string()) {
+    if let (Some(a), Some(b)) = (x.as_string(heap), y.as_string(heap)) {
         return a.equals(b, heap);
     }
     // For every other variant `Value::PartialEq` matches the
@@ -291,7 +291,7 @@ pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc
     if let Some(fid) = value.as_function() {
         return !context.function_is_arrow(fid);
     }
-    if let Some(closure) = value.as_closure() {
+    if let Some(closure) = value.as_closure(heap) {
         return !context.function_is_arrow(closure.cached_function_id);
     }
     if let Some(b) = value.as_bound_function() {
@@ -372,11 +372,11 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     }
 
     // Steps 4, 5: Number x String — ToNumber the string.
-    if let (Some(n), Some(s)) = (x.as_number(), y.as_string()) {
+    if let (Some(n), Some(s)) = (x.as_number(), y.as_string(heap)) {
         let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
         return number::strict_equals(n, parsed);
     }
-    if let (Some(s), Some(n)) = (x.as_string(), y.as_number()) {
+    if let (Some(s), Some(n)) = (x.as_string(heap), y.as_number()) {
         let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
         return number::strict_equals(n, parsed);
     }
@@ -396,13 +396,13 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     // StringIntegerLiterals representing `0n`. Strings that fail
     // the grammar surface as `undefined`, which §7.2.13 step 8
     // collapses to `false`.
-    if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string()) {
+    if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string(heap)) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => big.with_inner(heap, |b| b == &parsed),
             None => false,
         };
     }
-    if let (Some(s), Some(big)) = (x.as_string(), y.as_big_int()) {
+    if let (Some(s), Some(big)) = (x.as_string(heap), y.as_big_int()) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => big.with_inner(heap, |b| b == &parsed),
             None => false,
@@ -433,6 +433,13 @@ fn same_value_non_numeric_or_strict_numeric(x: &Value, y: &Value, heap: &otter_g
     }
     if let (Some(a), Some(b)) = (x.as_big_int(), y.as_big_int()) {
         return a.numeric_eq(b, heap);
+    }
+    // §7.2.13 step 1 / 2 string arm — code-unit content equality
+    // through the heap; tagged-Value `PartialEq` is handle identity
+    // and would return false for distinct allocations of the same
+    // content.
+    if let (Some(a), Some(b)) = (x.as_string(heap), y.as_string(heap)) {
+        return a.equals(b, heap);
     }
     x == y
 }
@@ -522,14 +529,14 @@ pub fn abstract_relational_comparison(
     heap: &otter_gc::GcHeap,
 ) -> RelationalOutcome {
     // Step 1: both String → lexicographic.
-    if let (Some(a), Some(b)) = (x.as_string(), y.as_string()) {
+    if let (Some(a), Some(b)) = (x.as_string(heap), y.as_string(heap)) {
         return match a.compare_lex(b, heap) {
             std::cmp::Ordering::Less => RelationalOutcome::LessThan,
             _ => RelationalOutcome::NotLessThan,
         };
     }
     // Step 2 / 3: BigInt x String.
-    if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string()) {
+    if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string(heap)) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(b, &parsed)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
@@ -538,7 +545,7 @@ pub fn abstract_relational_comparison(
             None => RelationalOutcome::Undefined,
         };
     }
-    if let (Some(s), Some(big)) = (x.as_string(), y.as_big_int()) {
+    if let (Some(s), Some(big)) = (x.as_string(heap), y.as_big_int()) {
         return match string_to_big_int(&s.to_lossy_string(heap)) {
             Some(parsed) => match big.with_inner(heap, |b| bigint_ops::compare(&parsed, b)) {
                 std::cmp::Ordering::Less => RelationalOutcome::LessThan,
@@ -611,7 +618,7 @@ pub fn to_numeric_kind(value: &Value, heap: &otter_gc::GcHeap) -> Option<Numeric
         Some(NumericKind::Num(n))
     } else if let Some(b) = value.as_big_int() {
         Some(NumericKind::Big(b.clone_inner(heap)))
-    } else if let Some(s) = value.as_string() {
+    } else if let Some(s) = value.as_string(heap) {
         Some(NumericKind::Num(number::to_number_from_string(
             &s.to_lossy_string(heap),
         )))

@@ -877,7 +877,7 @@ fn method_finally_value(
     on_finally: Value,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.prototype.finally";
-    if !is_object_like(&receiver) {
+    if !receiver.is_object_type() {
         return Err(NativeError::TypeError {
             name: NAME,
             reason: "`this` is not an Object".to_string(),
@@ -1255,10 +1255,10 @@ fn get_symbol_property_runtime(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     receiver: Value,
-    sym: &crate::symbol::JsSymbol,
+    sym: crate::symbol::JsSymbol,
     name: &'static str,
 ) -> Result<Value, NativeError> {
-    let property_key = crate::VmPropertyKey::Symbol(*sym);
+    let property_key = crate::VmPropertyKey::Symbol(sym);
     match interp
         .ordinary_get_value(context, receiver, receiver, &property_key, 0)
         .map_err(|err| promise_vm_error(name, err))?
@@ -1290,7 +1290,7 @@ fn species_constructor_runtime(
     if c.is_undefined() {
         return Ok(*default_ctor);
     }
-    if !is_object_like(&c) {
+    if !c.is_object_type() {
         return Err(NativeError::TypeError {
             name,
             reason: "constructor is not an Object".to_string(),
@@ -1299,7 +1299,7 @@ fn species_constructor_runtime(
     let species_sym = interp
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Species);
-    let s = get_symbol_property_runtime(interp, context, c, &species_sym, name)?;
+    let s = get_symbol_property_runtime(interp, context, c, species_sym, name)?;
     if s.is_undefined() || s.is_null() {
         return Ok(c);
     }
@@ -1310,10 +1310,6 @@ fn species_constructor_runtime(
         name,
         reason: "Symbol.species is not a constructor".to_string(),
     })
-}
-
-fn is_object_like(value: &Value) -> bool {
-    value.is_object_like()
 }
 
 fn get_callable_property(
@@ -1453,7 +1449,7 @@ fn static_try_generic(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.try";
-    if !is_object_like(&constructor) {
+    if !constructor.is_object_type() {
         return Err(NativeError::TypeError {
             name: NAME,
             reason: "Promise.try `this` is not an Object".to_string(),
@@ -1529,7 +1525,7 @@ fn static_all_keyed_generic(
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
     let promises = args.first().cloned().unwrap_or(Value::undefined());
-    if !is_object_like(&promises) {
+    if !promises.is_object_type() {
         return reject_capability_error(
             interp,
             &cap,
@@ -1697,11 +1693,11 @@ fn vm_property_key_from_value(
     key: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Option<crate::VmPropertyKey<'static>> {
-    if let Some(s) = key.as_string() {
+    if let Some(s) = key.as_string(heap) {
         return Some(crate::VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
-    if let Some(sym) = key.as_symbol() {
-        return Some(crate::VmPropertyKey::Symbol(*sym));
+    if let Some(sym) = key.as_symbol(heap) {
+        return Some(crate::VmPropertyKey::Symbol(sym));
     }
     None
 }
@@ -1837,10 +1833,10 @@ fn define_keyed_result_properties(
 ) -> Result<(), NativeError> {
     for (key, value) in keys.iter().zip(values.iter()) {
         let desc = crate::object::PropertyDescriptor::data(*value, true, true, true);
-        let ok = if let Some(s) = key.as_string() {
+        let ok = if let Some(s) = key.as_string(heap) {
             let key = s.to_lossy_string(heap);
             crate::object::define_own_property(obj, heap, &key, desc)
-        } else if let Some(sym) = key.as_symbol() {
+        } else if let Some(sym) = key.as_symbol(heap) {
             crate::object::define_own_symbol_property(obj, heap, sym, desc)
         } else {
             true

@@ -198,7 +198,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     if !ctor.define_own_symbol_property(
         heap,
-        &well_known.get(WellKnown::Species),
+        well_known.get(WellKnown::Species),
         PartialPropertyDescriptor {
             get: Some(Value::native_function(species_getter)),
             enumerable: Some(false),
@@ -226,7 +226,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &well_known.get(WellKnown::ToStringTag),
+        well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
             value: Some(Value::string(tag)),
             writable: Some(false),

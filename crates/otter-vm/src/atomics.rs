@@ -135,11 +135,12 @@ fn accepts_atomic_kind(kind: TypedArrayKind) -> bool {
 /// `waitable=true` restricts the kind to Int32Array / BigInt64Array.
 fn validate_integer_typed_array(
     value: &Value,
+    heap: &otter_gc::GcHeap,
     waitable: bool,
     method_name: &'static str,
 ) -> Result<JsTypedArray, NativeError> {
     let ta = value
-        .as_typed_array()
+        .as_typed_array(heap)
         .ok_or_else(|| type_err(method_name, "argument is not a TypedArray".to_string()))?;
     let kind = ta.kind();
     if !accepts_atomic_kind(kind) {
@@ -274,7 +275,6 @@ fn coerce_element_value(
 ) -> Result<Value, NativeError> {
     let primitive = to_primitive_number(ctx, value, method_name)?;
     if kind.is_bigint() {
-        let heap = ctx.interp_mut().gc_heap_mut();
         let oom_to_err = |err: otter_gc::OutOfMemory| {
             type_err(
                 method_name,
@@ -285,13 +285,15 @@ fn coerce_element_value(
                 ),
             )
         };
+        let s_opt = primitive.as_string(ctx.heap());
+        let heap = ctx.interp_mut().gc_heap_mut();
         if let Some(b) = primitive.as_big_int() {
             Ok(Value::big_int(b))
         } else if let Some(b) = primitive.as_boolean() {
             let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
                 .map_err(oom_to_err)?;
             Ok(Value::big_int(handle))
-        } else if let Some(s) = primitive.as_string() {
+        } else if let Some(s) = s_opt {
             let txt = s.to_lossy_string(heap);
             let trimmed = txt.trim();
             let parsed = trimmed.parse::<num_bigint::BigInt>().map_err(|_| {
@@ -357,9 +359,7 @@ const fn spec_name(method: &'static str) -> &'static str {
 // =====================================================================
 
 fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        false,
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
         "Atomics.load",
     )?;
     let idx = validate_atomic_access(
@@ -382,9 +382,7 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 }
 
 fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        false,
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
         "Atomics.store",
     )?;
     let idx = validate_atomic_access(
@@ -410,9 +408,7 @@ fn modify_op(
     op: fn(i64, i64) -> i64,
     op_big: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
 ) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        false,
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
         method_name,
     )?;
     let idx = validate_atomic_access(
@@ -497,9 +493,7 @@ fn native_xor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 }
 
 fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        false,
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
         "Atomics.exchange",
     )?;
     let idx = validate_atomic_access(
@@ -530,9 +524,7 @@ fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 }
 
 fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        false,
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
         "Atomics.compareExchange",
     )?;
     let idx = validate_atomic_access(
@@ -652,7 +644,7 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
         "Atomics.wait"
     };
     let ta =
-        validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), true, method_name)?;
+        validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), true, method_name)?;
     // §25.4.3.13 Atomics.wait — buffer must be a SharedArrayBuffer.
     if !ta.buffer(ctx.heap()).is_shared() {
         return Err(type_err(
@@ -759,9 +751,7 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     // Allows Int32Array / BigInt64Array; no SharedArrayBuffer
     // requirement — the spec returns 0 for a non-shared buffer
     // because no thread can be waiting on a non-shared backing.
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        true,
+    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), true,
         "Atomics.notify",
     )?;
     let idx = validate_atomic_access(

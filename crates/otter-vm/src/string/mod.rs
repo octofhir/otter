@@ -212,15 +212,15 @@ impl JsString {
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn concat(
-        left: &JsString,
-        right: &JsString,
+        left: JsString,
+        right: JsString,
         heap: &mut GcHeap,
     ) -> Result<Self, OutOfMemory> {
         if right.is_empty() {
-            return Ok(*left);
+            return Ok(left);
         }
         if left.is_empty() {
-            return Ok(*right);
+            return Ok(right);
         }
         let mut roots = no_extra_roots;
         let handle = gc_body::concat_string_bodies(heap, left.handle, right.handle, &mut roots)?;
@@ -353,16 +353,18 @@ impl JsString {
     /// cached-length mismatch before delegating to
     /// [`gc_body::equals_string_bodies`].
     #[must_use]
-    pub fn equals(self, other: &JsString, heap: &GcHeap) -> bool {
+    pub fn equals(self, other: JsString, heap: &GcHeap) -> bool {
         if self.handle == other.handle {
             return true;
         }
         if self.cached_len != other.cached_len {
             return false;
         }
-        if self.cached_hash != other.cached_hash {
-            return false;
-        }
+        // Cannot short-circuit on `cached_hash` mismatch: cons-rope
+        // hashes use a non-FNV composition that does not match the
+        // FNV-1a of the flattened content, so two semantically equal
+        // strings can carry distinct cached hashes. Fall through to
+        // the body walk which compares code units directly.
         gc_body::equals_string_bodies(heap, self.handle, other.handle)
     }
 
@@ -376,7 +378,7 @@ impl JsString {
     /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.indexof>
     pub fn index_of(
         self,
-        needle: &JsString,
+        needle: JsString,
         from: u32,
         interrupt: Option<&crate::InterruptFlag>,
         heap: &GcHeap,
@@ -393,7 +395,7 @@ impl JsString {
         if from > last_start {
             return Ok(None);
         }
-        if let Some(result) = try_with_two_latin1(self, *needle, heap, |h_bytes, n_bytes| {
+        if let Some(result) = try_with_two_latin1(self, needle, heap, |h_bytes, n_bytes| {
             latin1_index_of(
                 h_bytes,
                 n_bytes,
@@ -421,7 +423,7 @@ impl JsString {
     /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.lastindexof>
     pub fn last_index_of(
         self,
-        needle: &JsString,
+        needle: JsString,
         position: u32,
         interrupt: Option<&crate::InterruptFlag>,
         heap: &GcHeap,
@@ -436,7 +438,7 @@ impl JsString {
         }
         let max_start = h_len - n_len;
         let last_start = position.min(max_start);
-        if let Some(result) = try_with_two_latin1(self, *needle, heap, |h_bytes, n_bytes| {
+        if let Some(result) = try_with_two_latin1(self, needle, heap, |h_bytes, n_bytes| {
             latin1_last_index_of(h_bytes, n_bytes, last_start as usize, interrupt)
         }) {
             return result;
@@ -450,7 +452,7 @@ impl JsString {
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-string.prototype.startswith>
     #[must_use]
-    pub fn starts_with(self, prefix: &JsString, from: u32, heap: &GcHeap) -> bool {
+    pub fn starts_with(self, prefix: JsString, from: u32, heap: &GcHeap) -> bool {
         let p_len = prefix.cached_len;
         if p_len == 0 {
             return true;
@@ -458,7 +460,7 @@ impl JsString {
         if from + p_len > self.cached_len {
             return false;
         }
-        if let Some(result) = try_with_two_latin1(self, *prefix, heap, |h, p| {
+        if let Some(result) = try_with_two_latin1(self, prefix, heap, |h, p| {
             let from = from as usize;
             let p_len = p_len as usize;
             h[from..from + p_len] == *p
@@ -476,7 +478,7 @@ impl JsString {
     /// caps the haystack to the first `end_position` code units —
     /// matches `String.prototype.endsWith` semantics.
     #[must_use]
-    pub fn ends_with(self, suffix: &JsString, end_position: u32, heap: &GcHeap) -> bool {
+    pub fn ends_with(self, suffix: JsString, end_position: u32, heap: &GcHeap) -> bool {
         let total = self.cached_len.min(end_position);
         let s_len = suffix.cached_len;
         if s_len > total {
@@ -488,7 +490,7 @@ impl JsString {
     /// Lexicographic code-unit comparison used by `<`, `<=`, `>`,
     /// `>=` for two strings.
     #[must_use]
-    pub fn compare_lex(self, other: &JsString, heap: &GcHeap) -> std::cmp::Ordering {
+    pub fn compare_lex(self, other: JsString, heap: &GcHeap) -> std::cmp::Ordering {
         let a = gc_body::to_utf16_vec(heap, self.handle);
         let b = gc_body::to_utf16_vec(heap, other.handle);
         a.cmp(&b)
@@ -728,8 +730,8 @@ mod tests {
         let mut heap = h();
         let thin = JsString::from_latin1(b"hello", &mut heap).unwrap();
         let flat = JsString::from_str("hello", &mut heap).unwrap();
-        assert!(thin.equals(&flat, &heap));
-        assert!(flat.equals(&thin, &heap));
+        assert!(thin.equals(flat, &heap));
+        assert!(flat.equals(thin, &heap));
     }
 
     #[test]
@@ -747,8 +749,8 @@ mod tests {
         let a = JsString::from_str("abc", &mut heap).unwrap();
         let b = JsString::from_str("abc", &mut heap).unwrap();
         let c = JsString::from_str("abd", &mut heap).unwrap();
-        assert!(a.equals(&b, &heap));
-        assert!(!a.equals(&c, &heap));
+        assert!(a.equals(b, &heap));
+        assert!(!a.equals(c, &heap));
     }
 
     #[test]
@@ -756,7 +758,7 @@ mod tests {
         let mut heap = h();
         let a = JsString::from_str("a", &mut heap).unwrap();
         let b = JsString::from_str("b", &mut heap).unwrap();
-        let ab = JsString::concat(&a, &b, &mut heap).unwrap();
+        let ab = JsString::concat(a, b, &mut heap).unwrap();
         assert_eq!(ab.len(), 2);
         assert_eq!(ab.to_lossy_string(&heap), "ab");
         heap.read_payload(ab.handle(), |body| {
@@ -771,7 +773,7 @@ mod tests {
         let mut s = JsString::empty(&mut heap).unwrap();
         let piece = JsString::from_str("abcd", &mut heap).unwrap();
         for _ in 0..1_000 {
-            s = JsString::concat(&s, &piece, &mut heap).unwrap();
+            s = JsString::concat(s, piece, &mut heap).unwrap();
         }
         assert_eq!(s.len(), 4_000);
         assert_eq!(s.to_lossy_string(&heap).len(), 4_000);
@@ -794,7 +796,7 @@ mod tests {
         let mut heap = h();
         let a = JsString::from_str("ab", &mut heap).unwrap();
         let b = JsString::from_str("cd", &mut heap).unwrap();
-        let cons = JsString::concat(&a, &b, &mut heap).unwrap();
+        let cons = JsString::concat(a, b, &mut heap).unwrap();
         let sliced = cons.slice(1, 2, &mut heap).unwrap();
         assert_eq!(sliced.to_lossy_string(&heap), "bc");
     }
@@ -804,7 +806,7 @@ mod tests {
         let mut heap = h();
         let a = JsString::from_str("ab", &mut heap).unwrap();
         let b = JsString::from_str("cd", &mut heap).unwrap();
-        let cons = JsString::concat(&a, &b, &mut heap).unwrap();
+        let cons = JsString::concat(a, b, &mut heap).unwrap();
         assert_eq!(cons.char_code_at(0, &heap), Some(b'a' as u16));
         assert_eq!(cons.char_code_at(2, &heap), Some(b'c' as u16));
         assert_eq!(cons.char_code_at(4, &heap), None);
@@ -827,7 +829,7 @@ mod tests {
         let leaf = JsString::from_str("ab", &mut heap).unwrap();
         let mut acc = leaf;
         for _ in 0..(MAX_ROPE_DEPTH * 2) {
-            acc = JsString::concat(&acc, &leaf, &mut heap).unwrap();
+            acc = JsString::concat(acc, leaf, &mut heap).unwrap();
         }
         let len = acc.len();
         let flat = acc.flatten(&mut heap).unwrap();
@@ -839,8 +841,8 @@ mod tests {
         let mut heap = h();
         let a = JsString::from_str("abc", &mut heap).unwrap();
         let empty = JsString::empty(&mut heap).unwrap();
-        let r1 = JsString::concat(&a, &empty, &mut heap).unwrap();
-        let r2 = JsString::concat(&empty, &a, &mut heap).unwrap();
+        let r1 = JsString::concat(a, empty, &mut heap).unwrap();
+        let r2 = JsString::concat(empty, a, &mut heap).unwrap();
         assert_eq!(r1.to_lossy_string(&heap), "abc");
         assert_eq!(r2.to_lossy_string(&heap), "abc");
     }

@@ -607,7 +607,7 @@ mod tests {
     fn impl_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let recv = args
             .receiver
-            .as_string()
+            .as_string(args.gc_heap)
             .ok_or(IntrinsicError::BadReceiver { expected: "string" })?;
         let n = recv.len();
         Ok(Value::string(JsString::from_str(
@@ -619,12 +619,12 @@ mod tests {
     fn impl_concat_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let recv = args
             .receiver
-            .as_string()
+            .as_string(args.gc_heap)
             .ok_or(IntrinsicError::BadReceiver { expected: "string" })?;
         let arg0 =
             args.args
                 .first()
-                .and_then(|v| v.as_string())
+                .and_then(|v| v.as_string(args.gc_heap))
                 .ok_or(IntrinsicError::BadArgument {
                     index: 0,
                     reason: "must be a string",

@@ -32,8 +32,8 @@ use crate::number::NumberValue;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
     NativeCtx, NativeError, Value, VmGetOutcome, VmPropertyKey, array, array_prototype,
-    array_statics, atomics, console, constructor_return_is_object, descriptor_value,
-    function_prototype, json, math, object_statics, reflect,
+    array_statics, atomics, console, descriptor_value, function_prototype, json, math,
+    object_statics, reflect,
 };
 use smallvec::SmallVec;
 
@@ -110,7 +110,7 @@ pub(crate) fn native_new_target_prototype(
             None
         }
     };
-    Ok(proto.filter(|value| constructor_return_is_object(value) || value.is_proxy()))
+    Ok(proto.filter(|value| value.is_object_type() || value.is_proxy()))
 }
 
 fn native_new_target_error(name: &'static str, err: crate::VmError) -> NativeError {
@@ -750,7 +750,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
 
     fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let Some(sym) = args.first().and_then(|v| v.as_symbol()) else {
+        let Some(sym) = args.first().and_then(|v| v.as_symbol(ctx.heap())) else {
             return Err(NativeError::TypeError {
                 name: "Symbol.keyFor",
                 reason: "argument must be a symbol".to_string(),
@@ -777,8 +777,8 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _args: &[Value],
     ) -> Result<Value, NativeError> {
         let this = *ctx.this_value();
-        let sym = if let Some(sym) = this.as_symbol() {
-            *sym
+        let sym = if let Some(sym) = this.as_symbol(ctx.heap()) {
+            sym
         } else if let Some(obj) = this.as_object() {
             let heap = ctx.interp_mut().gc_heap();
             crate::object::symbol_data(obj, heap).ok_or_else(|| NativeError::TypeError {
@@ -806,8 +806,8 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _args: &[Value],
     ) -> Result<Value, NativeError> {
         let this = *ctx.this_value();
-        if let Some(sym) = this.as_symbol() {
-            return Ok(Value::symbol(*sym));
+        if let Some(sym) = this.as_symbol(ctx.heap()) {
+            return Ok(Value::symbol(sym));
         }
         if let Some(obj) = this.as_object() {
             let heap = ctx.interp_mut().gc_heap();
@@ -829,8 +829,8 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _args: &[Value],
     ) -> Result<Value, NativeError> {
         let this = *ctx.this_value();
-        if let Some(sym) = this.as_symbol() {
-            return Ok(Value::symbol(*sym));
+        if let Some(sym) = this.as_symbol(ctx.heap()) {
+            return Ok(Value::symbol(sym));
         }
         if let Some(obj) = this.as_object() {
             let heap = ctx.interp_mut().gc_heap();
@@ -877,7 +877,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _args: &[Value],
     ) -> Result<Value, NativeError> {
         let this = *ctx.this_value();
-        if let Some(sym) = this.as_symbol() {
+        if let Some(sym) = this.as_symbol(ctx.heap()) {
             return match sym.description() {
                 Some(s) => Ok(Value::string(*s)),
                 None => Ok(Value::undefined()),
@@ -1016,8 +1016,8 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         _args: &[Value],
     ) -> Result<Value, crate::NativeError> {
         let this = *ctx.this_value();
-        if let Some(sym) = this.as_symbol() {
-            return Ok(Value::symbol(*sym));
+        if let Some(sym) = this.as_symbol(ctx.heap()) {
+            return Ok(Value::symbol(sym));
         }
         if let Some(obj) = this.as_object() {
             let heap = ctx.interp_mut().gc_heap();
@@ -1088,7 +1088,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
     let to_prim_desc =
         PropertyDescriptor::data(Value::native_function(to_prim_fn), false, false, true);
-    if !object::define_own_symbol_property(prototype, heap, &to_primitive_sym, to_prim_desc) {
+    if !object::define_own_symbol_property(prototype, heap, to_primitive_sym, to_prim_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(
             "Symbol.prototype[@@toPrimitive]",
         ));
@@ -1127,7 +1127,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
             object::define_own_symbol_property_partial(
                 ns,
                 heap,
-                &to_string_tag_sym,
+                to_string_tag_sym,
                 crate::object::PartialPropertyDescriptor {
                     value: Some(Value::string(tag)),
                     writable: Some(false),
@@ -1144,7 +1144,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &to_string_tag_sym,
+        to_string_tag_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::string(symbol_tag)),
             writable: Some(false),
@@ -1254,7 +1254,7 @@ fn install_constructor_species_accessor(
     let installed = if let Some(f) = ctor_value.as_native_function() {
         f.define_own_symbol_property(
             heap,
-            &species_sym,
+            species_sym,
             crate::object::PartialPropertyDescriptor {
                 get: Some(Value::native_function(species_getter)),
                 enumerable: Some(false),
@@ -1266,7 +1266,7 @@ fn install_constructor_species_accessor(
         crate::object::define_own_symbol_property_partial(
             obj,
             heap,
-            &species_sym,
+            species_sym,
             crate::object::PartialPropertyDescriptor {
                 get: Some(Value::native_function(species_getter)),
                 enumerable: Some(false),
@@ -1394,7 +1394,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
             Some(Value::object(class.prototype(ctx.heap())))
         } else if let Some(obj) = new_target.as_object() {
             object::get(obj, ctx.heap(), "prototype")
-                .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+                .filter(|value| value.is_object_type() || value.is_proxy())
         } else if let Some(native) = new_target.as_native_function() {
             native
                 .own_property_descriptor(ctx.heap_mut(), "prototype")
@@ -1403,7 +1403,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                     reason: err.to_string(),
                 })?
                 .map(|descriptor| descriptor_value(&descriptor))
-                .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+                .filter(|value| value.is_object_type() || value.is_proxy())
         } else {
             None
         };
@@ -1651,7 +1651,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let s = if let Some(arg) = args.first() {
-            if let Some(s) = arg.as_string() {
+            if let Some(s) = arg.as_string(ctx.heap()) {
                 s.to_lossy_string(ctx.heap())
             } else {
                 arg.display_string(ctx.heap())
@@ -1672,7 +1672,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         args: &[Value],
     ) -> Result<Value, NativeError> {
         let s = if let Some(arg) = args.first() {
-            if let Some(s) = arg.as_string() {
+            if let Some(s) = arg.as_string(ctx.heap()) {
                 s.to_lossy_string(ctx.heap())
             } else {
                 arg.display_string(ctx.heap())
@@ -2094,8 +2094,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::object::set_number_data(obj, &mut interp.gc_heap, n);
             return Ok(Value::object(obj));
         }
-        if let Some(s) = v.as_string() {
-            let s = *s;
+        if let Some(s) = v.as_string(ctx.heap()) {
             let interp = ctx.interp_mut();
             let proto = interp
                 .primitive_wrapper_prototype("String")
@@ -2112,8 +2111,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             crate::object::set_string_data(obj, &mut interp.gc_heap, s);
             return Ok(Value::object(obj));
         }
-        if let Some(sym) = v.as_symbol() {
-            let sym = *sym;
+        if let Some(sym) = v.as_symbol(ctx.heap()) {
             let interp = ctx.interp_mut();
             let proto = interp
                 .primitive_wrapper_prototype("Symbol")
@@ -2725,7 +2723,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &iter_sym,
+        iter_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::native_function(symbol_iter_fn)),
             writable: Some(true),
@@ -2740,7 +2738,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &tag_sym,
+        tag_sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::string(tag)),
             writable: Some(false),
@@ -2798,7 +2796,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
         object::define_own_symbol_property_partial(
             proto,
             heap,
-            &tag_sym,
+            tag_sym,
             object::PartialPropertyDescriptor {
                 value: Some(Value::string(tag_string)),
                 writable: Some(false),
@@ -3564,9 +3562,9 @@ fn iterator_from_native(
             })?;
         return Ok(Value::iterator(handle));
     }
-    if let Some(s) = input.as_string() {
+    if let Some(s) = input.as_string(ctx.heap()) {
         let state = crate::IteratorState::String {
-            string: *s,
+            string: s,
             index: 0,
         };
         let handle = ctx

@@ -41,7 +41,7 @@ fn require_collator(args: &IntrinsicArgs<'_>) -> Result<CollatorPayload, Intrins
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.Collator",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::Collator(c) => Ok(c),
         _ => Err(bad()),
@@ -50,7 +50,7 @@ fn require_collator(args: &IntrinsicArgs<'_>) -> Result<CollatorPayload, Intrins
 
 fn coerce_compare_arg(value: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<String> {
     let v = value?;
-    if let Some(s) = v.as_string() {
+    if let Some(s) = v.as_string(heap) {
         return Some(s.to_lossy_string(heap));
     }
     if let Some(n) = v.as_number() {

@@ -149,11 +149,4 @@ impl ClassConstructor {
         Self { inner }
     }
 
-    /// Visit the embedded GC handle so the scavenger can rewrite the
-    /// compressed offset in place if the body moves. Called from
-    /// [`crate::Value::trace_value_slots`].
-    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        let p = &self.inner as *const otter_gc::Gc<ClassConstructorBody> as *mut RawGc;
-        visitor(p);
-    }
 }

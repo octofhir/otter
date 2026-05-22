@@ -203,7 +203,7 @@ fn error_class_registry_prototypes_survive_force_gc() {
     let name = crate::object::get(proto, interp.gc_heap(), "name")
         .expect("TypeError.prototype.name survives force_gc");
 
-    if let Some(s) = name.as_string() {
+    if let Some(s) = name.as_string(interp.gc_heap()) {
         assert_eq!(s.to_lossy_string(interp.gc_heap()), "TypeError");
     } else {
         panic!("expected TypeError.prototype.name string, got {name:?}");

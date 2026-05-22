@@ -59,7 +59,7 @@ pub fn install_date_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &to_primitive_sym,
+        to_primitive_sym,
         PartialPropertyDescriptor {
             value: Some(Value::native_function(to_prim_fn)),
             writable: Some(false),
@@ -90,7 +90,7 @@ fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         });
     }
     let hint_value = args.first().cloned().unwrap_or(Value::undefined());
-    let Some(js) = hint_value.as_string() else {
+    let Some(js) = hint_value.as_string(ctx.heap()) else {
         return Err(NativeError::TypeError {
             name: NAME,
             reason: "hint must be a string".to_string(),

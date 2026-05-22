@@ -55,7 +55,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let spec_value = *read_register(frame, spec_reg)?;
         let specifier = spec_value
-            .as_string()
+            .as_string(&self.gc_heap)
             .ok_or(VmError::TypeMismatch)?
             .to_lossy_string(&self.gc_heap);
         let resolved = resolve_relative_url(Some(&frame.module_url), &specifier);
@@ -79,7 +79,7 @@ impl Interpreter {
         let referrer = stack[top_idx].module_url.clone();
         let import_context = context.clone();
         let promise =
-            if let Some(s) = spec_value.as_string() {
+            if let Some(s) = spec_value.as_string(&self.gc_heap) {
                 let specifier = s.to_lossy_string(&self.gc_heap);
                 if let Some(ns) =
                     self.resolve_module_namespace(context, referrer.as_ref(), &specifier)

@@ -92,7 +92,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
     let constructor_root = Value::object(constructor);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
         && let Some(object_proto) =
             object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
@@ -274,14 +274,14 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         reason: err.to_string(),
     })?;
     if ctx.is_construct_call() {
-        let Some(string) = value.as_string().copied() else {
+        let Some(string) = value.as_string(ctx.heap()) else {
             return Err(NativeError::TypeError {
                 name: "String",
                 reason: "constructor did not return a string primitive".to_string(),
             });
         };
         let this = *ctx.this_value();
-        if let Value::Object(obj) = this {
+        if let Some(obj) = this.as_object() {
             crate::object::set_string_data(obj, ctx.heap_mut(), string);
             Ok(Value::object(obj))
         } else {

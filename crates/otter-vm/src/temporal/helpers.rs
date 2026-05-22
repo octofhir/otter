@@ -33,7 +33,7 @@ pub fn require_string_arg(args: &IntrinsicArgs<'_>, index: u16) -> Result<String
             index,
             reason: "must be a string",
         })?;
-    v.as_string()
+    v.as_string(args.gc_heap)
         .map(|s| s.to_lossy_string(args.gc_heap))
         .ok_or(IntrinsicError::BadArgument {
             index,
@@ -92,7 +92,7 @@ pub fn read_i64_field(
 /// Read an optional string field (`{ unit: "minutes" }`).
 pub fn read_string_field(obj: JsObject, name: &str, gc_heap: &otter_gc::GcHeap) -> Option<String> {
     let v = crate::object::get(obj, gc_heap, name)?;
-    v.as_string().map(|s| s.to_lossy_string(gc_heap))
+    v.as_string(gc_heap).map(|s| s.to_lossy_string(gc_heap))
 }
 
 /// Build a `Value::Temporal` from a payload, allocating the backing
@@ -134,7 +134,7 @@ pub fn alloc_temporal_value(
 /// Extract a [`temporal_rs::Instant`] from the receiver, or raise
 /// [`IntrinsicError::BadReceiver`] for the wrong kind.
 pub fn require_instant(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Instant, IntrinsicError> {
-    if let Some(t) = args.receiver.as_temporal() {
+    if let Some(t) = args.receiver.as_temporal(args.gc_heap) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Instant(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
@@ -150,7 +150,7 @@ pub fn require_instant(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Instant,
 
 /// Extract a [`temporal_rs::Duration`] from the receiver.
 pub fn require_duration(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Duration, IntrinsicError> {
-    if let Some(t) = args.receiver.as_temporal() {
+    if let Some(t) = args.receiver.as_temporal(args.gc_heap) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
@@ -168,7 +168,7 @@ pub fn require_duration(args: &IntrinsicArgs<'_>) -> Result<temporal_rs::Duratio
 pub fn require_plain_date(
     args: &IntrinsicArgs<'_>,
 ) -> Result<temporal_rs::PlainDate, IntrinsicError> {
-    if let Some(t) = args.receiver.as_temporal() {
+    if let Some(t) = args.receiver.as_temporal(args.gc_heap) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDate(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
@@ -186,7 +186,7 @@ pub fn require_plain_date(
 pub fn require_plain_time(
     args: &IntrinsicArgs<'_>,
 ) -> Result<temporal_rs::PlainTime, IntrinsicError> {
-    if let Some(t) = args.receiver.as_temporal() {
+    if let Some(t) = args.receiver.as_temporal(args.gc_heap) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainTime(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {
@@ -204,7 +204,7 @@ pub fn require_plain_time(
 pub fn require_plain_date_time(
     args: &IntrinsicArgs<'_>,
 ) -> Result<temporal_rs::PlainDateTime, IntrinsicError> {
-    if let Some(t) = args.receiver.as_temporal() {
+    if let Some(t) = args.receiver.as_temporal(args.gc_heap) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDateTime(v) => Ok(v),
             _ => Err(IntrinsicError::BadReceiver {

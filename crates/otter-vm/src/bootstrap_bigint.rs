@@ -133,7 +133,7 @@ pub fn install_bigint_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &well_known.get(WellKnown::ToStringTag),
+        well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
             value: Some(Value::string(tag)),
             writable: Some(false),
@@ -291,7 +291,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
                 if b { 1.0 } else { 0.0 }
             } else if v.is_null() {
                 0.0
-            } else if let Some(s) = v.as_string() {
+            } else if let Some(s) = v.as_string(ctx.heap()) {
                 crate::number::parse::to_number_from_string(&s.to_lossy_string(ctx.heap())).as_f64()
             } else {
                 f64::NAN

@@ -369,22 +369,40 @@ fn clone_value(
         });
     }
 
-    match value {
-        Value::Undefined => Ok(StructuredCloneValue::Undefined),
-        Value::Null => Ok(StructuredCloneValue::Null),
-        Value::Boolean(value) => Ok(StructuredCloneValue::Boolean(*value)),
-        Value::Number(value) => Ok(StructuredCloneValue::Number((*value).into())),
-        Value::BigInt(value) => Ok(StructuredCloneValue::BigInt(value.to_decimal_string(heap))),
-        Value::String(value) => Ok(StructuredCloneValue::String(value.to_lossy_string(heap))),
-        Value::Array(array) => clone_array(*array, heap, options, depth, path, active),
-        Value::Object(object) => clone_object(*object, heap, options, depth, path, active),
-        Value::Map(map) => clone_map(*map, heap, options, depth, path, active),
-        Value::Set(set) => clone_set(*set, heap, options, depth, path, active),
-        other => Err(StructuredCloneError::UnsupportedValue {
-            path,
-            type_name: value_type_name(other),
-        }),
+    if value.is_undefined() {
+        return Ok(StructuredCloneValue::Undefined);
     }
+    if value.is_null() {
+        return Ok(StructuredCloneValue::Null);
+    }
+    if let Some(b) = value.as_boolean() {
+        return Ok(StructuredCloneValue::Boolean(b));
+    }
+    if let Some(n) = value.as_number() {
+        return Ok(StructuredCloneValue::Number(n.into()));
+    }
+    if let Some(b) = value.as_big_int() {
+        return Ok(StructuredCloneValue::BigInt(b.to_decimal_string(heap)));
+    }
+    if let Some(s) = value.as_string(heap) {
+        return Ok(StructuredCloneValue::String(s.to_lossy_string(heap)));
+    }
+    if let Some(arr) = value.as_array() {
+        return clone_array(arr, heap, options, depth, path, active);
+    }
+    if let Some(map) = value.as_map() {
+        return clone_map(map, heap, options, depth, path, active);
+    }
+    if let Some(set) = value.as_set() {
+        return clone_set(set, heap, options, depth, path, active);
+    }
+    if let Some(obj) = value.as_object() {
+        return clone_object(obj, heap, options, depth, path, active);
+    }
+    Err(StructuredCloneError::UnsupportedValue {
+        path,
+        type_name: value_type_name(value),
+    })
 }
 
 fn clone_array(
@@ -448,20 +466,36 @@ fn clone_error_object(
     heap: &GcHeap,
 ) -> Option<StructuredCloneValue> {
     let name = match object::get(object, heap, "name") {
-        Some(Value::String(value)) => value.to_lossy_string(heap),
-        Some(value) => value.display_string(heap),
+        Some(v) => match v.as_string(heap) {
+            Some(s) => s.to_lossy_string(heap),
+            None => v.display_string(heap),
+        },
         None => return None,
     };
     ErrorKind::from_class_name(&name)?;
     let message = match object::get(object, heap, "message") {
-        Some(Value::String(value)) => value.to_lossy_string(heap),
-        Some(Value::Undefined) | None => String::new(),
-        Some(value) => value.display_string(heap),
+        Some(v) => {
+            if let Some(s) = v.as_string(heap) {
+                s.to_lossy_string(heap)
+            } else if v.is_undefined() {
+                String::new()
+            } else {
+                v.display_string(heap)
+            }
+        }
+        None => String::new(),
     };
     let stack = match object::get(object, heap, "stack") {
-        Some(Value::String(value)) => Some(value.to_lossy_string(heap)),
-        Some(Value::Undefined) | None => None,
-        Some(value) => Some(value.display_string(heap)),
+        Some(v) => {
+            if let Some(s) = v.as_string(heap) {
+                Some(s.to_lossy_string(heap))
+            } else if v.is_undefined() {
+                None
+            } else {
+                Some(v.display_string(heap))
+            }
+        }
+        None => None,
     };
     Some(StructuredCloneValue::Error {
         name,
@@ -561,38 +595,48 @@ fn is_identifier_path_segment(value: &str) -> bool {
 }
 
 fn value_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Symbol(_) => "symbol",
-        Value::Function { .. } => "function",
-        Value::Closure(_) => "closure",
-        Value::BoundFunction(_) => "bound_function",
-        Value::NativeFunction(_) => "native_function",
-        Value::Iterator(_) => "iterator",
-        Value::RegExp(_) => "regexp",
-        Value::Promise(_) => "promise",
-        Value::WeakMap(_) => "weak_map",
-        Value::WeakSet(_) => "weak_set",
-        Value::WeakRef(_) => "weak_ref",
-        Value::FinalizationRegistry(_) => "finalization_registry",
-        Value::Temporal(_) => "temporal",
-        Value::Intl(_) => "intl",
-        Value::ArrayBuffer(_) => "array_buffer",
-        Value::DataView(_) => "data_view",
-        Value::TypedArray(_) => "typed_array",
-        Value::Generator(_) => "generator",
-        Value::Proxy(_) => "proxy",
-        Value::ClassConstructor(_) => "class_constructor",
-        Value::Undefined
-        | Value::Hole
-        | Value::Null
-        | Value::Boolean(_)
-        | Value::Number(_)
-        | Value::BigInt(_)
-        | Value::String(_)
-        | Value::Object(_)
-        | Value::Array(_)
-        | Value::Map(_)
-        | Value::Set(_) => "supported",
+    if value.is_symbol() {
+        "symbol"
+    } else if value.is_function() {
+        "function"
+    } else if value.is_closure() {
+        "closure"
+    } else if value.is_bound_function() {
+        "bound_function"
+    } else if value.is_native_function() {
+        "native_function"
+    } else if value.is_iterator() {
+        "iterator"
+    } else if value.is_regexp() {
+        "regexp"
+    } else if value.is_promise() {
+        "promise"
+    } else if value.is_weak_map() {
+        "weak_map"
+    } else if value.is_weak_set() {
+        "weak_set"
+    } else if value.is_weak_ref() {
+        "weak_ref"
+    } else if value.is_finalization_registry() {
+        "finalization_registry"
+    } else if value.is_temporal() {
+        "temporal"
+    } else if value.is_intl() {
+        "intl"
+    } else if value.is_array_buffer() {
+        "array_buffer"
+    } else if value.is_data_view() {
+        "data_view"
+    } else if value.is_typed_array() {
+        "typed_array"
+    } else if value.is_generator() {
+        "generator"
+    } else if value.is_proxy() {
+        "proxy"
+    } else if value.is_class_constructor() {
+        "class_constructor"
+    } else {
+        "supported"
     }
 }
 

@@ -69,9 +69,9 @@ fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeErr
 
 fn json_to_value(ctx: &mut NativeCtx<'_>, value: JsonValue) -> Result<Value, NativeError> {
     match value {
-        JsonValue::Null => Ok(Value::Null),
-        JsonValue::Bool(value) => Ok(Value::Boolean(value)),
-        JsonValue::Number(value) => Ok(Value::Number(NumberValue::from_f64(
+        JsonValue::Null => Ok(Value::null()),
+        JsonValue::Bool(value) => Ok(Value::boolean(value)),
+        JsonValue::Number(value) => Ok(Value::number(NumberValue::from_f64(
             value.as_f64().unwrap_or(f64::NAN),
         ))),
         JsonValue::String(value) => string_value(ctx, &value),
@@ -83,16 +83,22 @@ fn value_to_json(
     value: &Value,
     heap: &otter_runtime::otter_gc::GcHeap,
 ) -> Result<JsonValue, NativeError> {
-    match value {
-        Value::Undefined | Value::Null => Ok(JsonValue::Null),
-        Value::Boolean(value) => Ok(JsonValue::Bool(*value)),
-        Value::Number(value) => JsonNumber::from_f64(value.as_f64())
-            .map(JsonValue::Number)
-            .ok_or_else(|| type_error("json", "number is not finite JSON")),
-        Value::String(value) => Ok(JsonValue::String(value.to_lossy_string(heap))),
-        other => Err(type_error(
-            "json",
-            format!("cannot convert {} to JSON", other.display_string(heap)),
-        )),
+    if value.is_undefined() || value.is_null() {
+        return Ok(JsonValue::Null);
     }
+    if let Some(b) = value.as_boolean() {
+        return Ok(JsonValue::Bool(b));
+    }
+    if let Some(n) = value.as_number() {
+        return JsonNumber::from_f64(n.as_f64())
+            .map(JsonValue::Number)
+            .ok_or_else(|| type_error("json", "number is not finite JSON"));
+    }
+    if let Some(s) = value.as_string(heap) {
+        return Ok(JsonValue::String(s.to_lossy_string(heap)));
+    }
+    Err(type_error(
+        "json",
+        format!("cannot convert {} to JSON", value.display_string(heap)),
+    ))
 }

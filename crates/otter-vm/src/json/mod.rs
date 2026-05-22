@@ -218,8 +218,8 @@ fn coerce_json_parse_args(
     let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
     if let Some(slot) = out.first_mut() {
         let current = *slot;
-        let s = if let Some(s) = current.as_string() {
-            *s
+        let s = if let Some(s) = current.as_string(ctx.heap()) {
+            s
         } else if current.is_symbol() {
             return Err(NativeError::TypeError {
                 name: "parse",
@@ -247,8 +247,8 @@ fn coerce_json_parse_args(
                     name: "parse",
                     reason: e.to_string(),
                 })?;
-            if let Some(s) = primitive.as_string() {
-                *s
+            if let Some(s) = primitive.as_string(ctx.heap()) {
+                s
             } else if primitive.is_symbol() {
                 return Err(NativeError::TypeError {
                     name: "parse",
@@ -308,7 +308,7 @@ fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Valu
 }
 
 fn json_parse(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
-    let Some(s) = args.first().and_then(|v| v.as_string()) else {
+    let Some(s) = args.first().and_then(|v| v.as_string(gc_heap)) else {
         return Err(JsonError::BadArgument {
             name: "parse",
             index: 0,
@@ -325,7 +325,7 @@ fn json_parse_with_roots(
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<Value, JsonError> {
-    let Some(s) = args.first().and_then(|v| v.as_string()) else {
+    let Some(s) = args.first().and_then(|v| v.as_string(gc_heap)) else {
         return Err(JsonError::BadArgument {
             name: "parse",
             index: 0,

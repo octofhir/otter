@@ -34,7 +34,7 @@ fn require_payload(args: &IntrinsicArgs<'_>) -> Result<RelativeTimeFormatPayload
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.RelativeTimeFormat",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::RelativeTimeFormat(p) => Ok(p),
         _ => Err(bad()),
@@ -109,7 +109,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     } else {
         f64::NAN
     };
-    let Some(unit_str) = args.args.get(1).and_then(|v| v.as_string()) else {
+    let Some(unit_str) = args.args.get(1).and_then(|v| v.as_string(args.gc_heap)) else {
         return Err(IntrinsicError::BadArgument {
             index: 1,
             reason: "must be a string unit",

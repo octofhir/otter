@@ -161,10 +161,11 @@ pub(crate) fn blob_object(ctx: &mut NativeCtx<'_>, state: Blob) -> Result<Value,
 }
 
 fn arg_usize(args: &[Value], index: usize) -> Option<usize> {
-    match args.get(index) {
-        Some(Value::Number(value)) if value.as_f64().is_finite() && value.as_f64() >= 0.0 => {
-            Some(value.as_f64() as usize)
-        }
-        _ => None,
+    let n = args.get(index)?.as_number()?;
+    let f = n.as_f64();
+    if f.is_finite() && f >= 0.0 {
+        Some(f as usize)
+    } else {
+        None
     }
 }

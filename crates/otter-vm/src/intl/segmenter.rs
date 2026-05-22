@@ -31,7 +31,7 @@ fn require_payload(args: &IntrinsicArgs<'_>) -> Result<SegmenterPayload, Intrins
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.Segmenter",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::Segmenter(p) => Ok(p),
         _ => Err(bad()),
@@ -94,7 +94,7 @@ fn segment(text: &str, granularity: &str) -> Vec<(usize, String)> {
 fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
     let first = args.args.first();
-    let text = if let Some(s) = first.and_then(|v| v.as_string()) {
+    let text = if let Some(s) = first.and_then(|v| v.as_string(args.gc_heap)) {
         s.to_lossy_string(args.gc_heap)
     } else if let Some(n) = first.and_then(|v| v.as_number()) {
         n.to_display_string()

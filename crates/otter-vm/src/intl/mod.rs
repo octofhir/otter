@@ -61,11 +61,12 @@ use crate::intrinsics::IntrinsicEntry;
 /// Resolve `<receiver-kind>.prototype.<name>` to the matching
 /// intrinsic entry.
 #[must_use]
-pub fn lookup_prototype(receiver: &Value, name: &str) -> Option<&'static IntrinsicEntry> {
-    let intl = match receiver {
-        Value::Intl(i) => i,
-        _ => return None,
-    };
+pub fn lookup_prototype(
+    receiver: &Value,
+    gc_heap: &otter_gc::GcHeap,
+    name: &str,
+) -> Option<&'static IntrinsicEntry> {
+    let intl = receiver.as_intl(gc_heap)?;
     match intl.kind() {
         IntlKind::Collator => collator::lookup(name),
         IntlKind::NumberFormat => number_format::lookup(name),

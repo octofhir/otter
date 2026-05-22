@@ -83,7 +83,7 @@ impl Interpreter {
         let result = if lhs.is_string() || rhs.is_string() {
             let l_str = conversion::to_js_string_primitive(&lhs, self.gc_heap_mut())?;
             let r_str = conversion::to_js_string_primitive(&rhs, self.gc_heap_mut())?;
-            Value::string(JsString::concat(&l_str, &r_str, self.gc_heap_mut())?)
+            Value::string(JsString::concat(l_str, r_str, self.gc_heap_mut())?)
         } else {
             let lk =
                 abstract_ops::to_numeric_kind(&lhs, &self.gc_heap).ok_or(VmError::TypeMismatch)?;

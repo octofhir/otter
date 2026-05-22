@@ -700,7 +700,7 @@ mod tests {
         assert_eq!(v.display_string(&gc_heap), "A");
         // Surrogate pair → U+10000 '𐀀'.
         let v = parse_str_with_heap("\"\\uD800\\uDC00\"", &mut gc_heap).unwrap();
-        let s = v.as_string().expect("string");
+        let s = v.as_string(&gc_heap).expect("string");
         assert_eq!(s.to_utf16_vec(&gc_heap), vec![0xD800, 0xDC00]);
     }
 

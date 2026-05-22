@@ -39,12 +39,12 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
         reason: "must be a Temporal.PlainTime or ISO string",
     };
     let first = args.first();
-    let pt = if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+    let pt = if let Some(t) = first.and_then(|v| v.as_temporal(gc_heap)) {
         match t.payload_clone(gc_heap) {
             TemporalPayload::PlainTime(v) => v,
             _ => return Err(bad()),
         }
-    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+    } else if let Some(s) = first.and_then(|v| v.as_string(gc_heap)) {
         temporal_rs::PlainTime::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
             TemporalError::Engine {
                 class: "PlainTime",
@@ -60,7 +60,7 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
 
 /// Property reads on a `Temporal.PlainTime` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     let pt = match temporal.payload_clone(gc_heap) {
         TemporalPayload::PlainTime(v) => v,
         _ => return Value::undefined(),
@@ -109,7 +109,7 @@ fn duration_arg(
         reason: "must be a Temporal.Duration",
     };
     let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(bad()),

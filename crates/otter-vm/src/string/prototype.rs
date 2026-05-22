@@ -62,8 +62,8 @@ use crate::{NativeCtx, NativeError};
 ///   `RequireObjectCoercible`.
 fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicError> {
     let recv = args.receiver;
-    if let Some(s) = recv.as_string() {
-        return Ok(*s);
+    if let Some(s) = recv.as_string(args.gc_heap) {
+        return Ok(s);
     }
     if let Some(obj) = recv.as_object() {
         let gc = &*args.gc_heap;
@@ -100,7 +100,7 @@ fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicEr
                 .map(|v| {
                     if v.is_null() || v.is_undefined() || v.is_hole() {
                         String::new()
-                    } else if let Some(s) = v.as_string() {
+                    } else if let Some(s) = v.as_string(args.gc_heap) {
                         s.to_lossy_string(args.gc_heap)
                     } else if let Some(n) = v.as_number() {
                         n.to_display_string()
@@ -150,8 +150,8 @@ fn arg_to_string(args: &mut IntrinsicArgs<'_>, index: u16) -> Result<JsString, I
     if arg.is_null() {
         return Ok(JsString::null_str(args.gc_heap)?);
     }
-    if let Some(s) = arg.as_string() {
-        return Ok(*s);
+    if let Some(s) = arg.as_string(args.gc_heap) {
+        return Ok(s);
     }
     if let Some(b) = arg.as_boolean() {
         let text = if b { "true" } else { "false" };
@@ -206,7 +206,7 @@ fn arg_u32_or(args: &IntrinsicArgs<'_>, index: u16, default: u32) -> Result<u32,
     if arg.is_null() {
         return Ok(0);
     }
-    if let Some(s) = arg.as_string() {
+    if let Some(s) = arg.as_string(args.gc_heap) {
         return Ok(parse_index(s, args.gc_heap).unwrap_or(0));
     }
     Err(IntrinsicError::BadArgument {
@@ -232,7 +232,7 @@ fn number_to_u32(n: NumberValue) -> u32 {
     }
 }
 
-fn parse_index(s: &JsString, heap: &otter_gc::GcHeap) -> Option<u32> {
+fn parse_index(s: JsString, heap: &otter_gc::GcHeap) -> Option<u32> {
     let text = s.to_lossy_string(heap);
     text.trim().parse::<u32>().ok()
 }
@@ -261,7 +261,7 @@ fn arg_int_or(args: &IntrinsicArgs<'_>, index: u16, default: i64) -> Result<i64,
     if arg.is_null() {
         return Ok(0);
     }
-    if let Some(s) = arg.as_string() {
+    if let Some(s) = arg.as_string(args.gc_heap) {
         let text = s.to_lossy_string(args.gc_heap);
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -473,7 +473,7 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
     let pos = recv
-        .index_of(&needle, from, None, args.gc_heap)
+        .index_of(needle, from, None, args.gc_heap)
         .map_err(|Interrupted| IntrinsicError::BadArgument {
             index: 0,
             reason: "interrupted",
@@ -490,7 +490,7 @@ fn impl_starts_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
     Ok(Value::boolean(recv.starts_with(
-        &needle,
+        needle,
         from,
         args.gc_heap,
     )))
@@ -501,7 +501,7 @@ fn impl_ends_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     let needle = arg_to_string(args, 0)?;
     let end_pos = arg_u32_or(args, 1, recv.len())?;
     Ok(Value::boolean(recv.ends_with(
-        &needle,
+        needle,
         end_pos,
         args.gc_heap,
     )))
@@ -512,7 +512,7 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
     let pos = recv
-        .index_of(&needle, from, None, args.gc_heap)
+        .index_of(needle, from, None, args.gc_heap)
         .map_err(|Interrupted| IntrinsicError::BadArgument {
             index: 0,
             reason: "interrupted",
@@ -530,7 +530,7 @@ fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let mut result = recv;
     for i in 0..args.args.len() {
         let piece = arg_to_string(args, i as u16)?;
-        result = JsString::concat(&result, &piece, args.gc_heap)?;
+        result = JsString::concat(result, piece, args.gc_heap)?;
     }
     Ok(Value::string(result))
 }
@@ -682,7 +682,7 @@ fn create_html(
         let raw = if let Some(arg) = args.args.first() {
             if arg.is_undefined() {
                 "undefined".to_string()
-            } else if let Some(s) = arg.as_string() {
+            } else if let Some(s) = arg.as_string(args.gc_heap) {
                 s.to_lossy_string(args.gc_heap)
             } else {
                 arg.display_string(&*args.gc_heap)
@@ -937,7 +937,7 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
         let replacement = arg_to_string(args, 1)?;
         return regex_replace(
-            &recv,
+            recv,
             &re,
             args.gc_heap,
             &replacement.to_utf16_vec(args.gc_heap),
@@ -986,7 +986,7 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         }
         let replacement = arg_to_string(args, 1)?;
         return regex_replace(
-            &recv,
+            recv,
             &re,
             args.gc_heap,
             &replacement.to_utf16_vec(args.gc_heap),
@@ -1040,7 +1040,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     // Regex separator → defer to the dedicated walker.
     if let Some(re) = args.args.first().and_then(|v| v.as_regexp()) {
         let limit = parse_split_limit(args)?;
-        return regex_split(&recv, &re, limit, args);
+        return regex_split(recv, &re, limit, args);
     }
 
     // Resolve separator: missing or `undefined` → caller-as-only-element.
@@ -1065,11 +1065,11 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             )?));
         }
         Some(v) => {
-            if let Some(s) = v.as_string() {
+            if let Some(s) = v.as_string(args.gc_heap) {
                 s
             } else {
                 separator_owned = arg_to_string(args, 0)?;
-                &separator_owned
+                separator_owned
             }
         }
     };
@@ -1155,7 +1155,7 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
     if arg.is_null() {
         return Ok(0);
     }
-    if let Some(s) = arg.as_string() {
+    if let Some(s) = arg.as_string(args.gc_heap) {
         let text = s.to_lossy_string(args.gc_heap);
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -1178,7 +1178,7 @@ fn parse_split_limit(args: &IntrinsicArgs<'_>) -> Result<u32, IntrinsicError> {
 }
 
 fn regex_replace(
-    recv: &JsString,
+    recv: JsString,
     re: &JsRegExp,
     gc_heap: &mut otter_gc::GcHeap,
     replacement_template: &[u16],
@@ -1186,7 +1186,7 @@ fn regex_replace(
     let recv_units = recv.to_utf16_vec(gc_heap);
     let matches = collect_regex_matches(re, gc_heap, &recv_units);
     if matches.is_empty() {
-        return Ok(Value::string(*recv));
+        return Ok(Value::string(recv));
     }
     let mut buf = Vec::with_capacity(recv_units.len());
     let mut cursor = 0;
@@ -1201,7 +1201,7 @@ fn regex_replace(
 }
 
 fn regex_split(
-    recv: &JsString,
+    recv: JsString,
     re: &JsRegExp,
     limit: u32,
     args: &mut IntrinsicArgs<'_>,
@@ -1267,7 +1267,7 @@ fn coerce_pattern_to_regexp(
     // Coerce every spec-relevant operand before compiling.
     let pattern_units: Vec<u16> = if value.is_undefined() {
         Vec::new()
-    } else if let Some(s) = value.as_string() {
+    } else if let Some(s) = value.as_string(gc_heap) {
         s.to_utf16_vec(gc_heap)
     } else if value.is_null() {
         "null".encode_utf16().collect()
@@ -1343,7 +1343,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let arr = crate::regexp_prototype::build_match_result(
         &m,
         &recv_units,
-        &recv_clone,
+        recv_clone,
         has_indices,
         args,
         &[],
@@ -1383,7 +1383,7 @@ fn impl_match_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         let arr = crate::regexp_prototype::build_match_result(
             m,
             &recv_units,
-            &recv_clone,
+            recv_clone,
             has_indices,
             args,
             &[],
@@ -1527,7 +1527,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     // takes the simpler accessor and clamps to `recv.len()`.
     let position = arg_u32_or(args, 1, recv.len())?.min(recv.len());
     let pos = recv
-        .last_index_of(&needle, position, None, args.gc_heap)
+        .last_index_of(needle, position, None, args.gc_heap)
         .map_err(|Interrupted| IntrinsicError::BadArgument {
             index: 0,
             reason: "interrupted",
@@ -1546,7 +1546,7 @@ fn impl_locale_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     let recv = receiver_string(args)?.to_lossy_string(args.gc_heap);
     let other = match args.args.first() {
         Some(v) => {
-            if let Some(s) = v.as_string() {
+            if let Some(s) = v.as_string(args.gc_heap) {
                 s.to_lossy_string(args.gc_heap)
             } else {
                 v.display_string(&*args.gc_heap)
@@ -1575,7 +1575,7 @@ fn impl_normalize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         None => "NFC".to_string(),
         Some(v) if v.is_undefined() => "NFC".to_string(),
         Some(v) => {
-            if let Some(s) = v.as_string() {
+            if let Some(s) = v.as_string(args.gc_heap) {
                 s.to_lossy_string(args.gc_heap)
             } else {
                 return Err(IntrinsicError::BadArgument {
@@ -1841,8 +1841,7 @@ fn native_string_replace_callable(
     })?;
     let needle = args
         .first()
-        .and_then(|v| v.as_string())
-        .copied()
+        .and_then(|v| v.as_string(ctx.heap()))
         .expect("guarded by caller — args[0] is a string");
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     let recv_units = recv.to_utf16_vec(ctx.heap());
@@ -1884,8 +1883,8 @@ fn native_string_replace_callable(
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string = if let Some(s) = raw.as_string() {
-                *s
+            let raw_string = if let Some(s) = raw.as_string(interp.gc_heap()) {
+                s
             } else {
                 let text = raw.display_string(interp.gc_heap());
                 JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
@@ -1923,8 +1922,8 @@ fn native_string_replace_callable(
                     name: if replace_all { "replaceAll" } else { "replace" },
                     reason: err.to_string(),
                 })?;
-            let raw_string = if let Some(s) = raw.as_string() {
-                *s
+            let raw_string = if let Some(s) = raw.as_string(interp.gc_heap()) {
+                s
             } else {
                 let text = raw.display_string(interp.gc_heap());
                 JsString::from_str(&text, interp.gc_heap_mut()).map_err(|err| {
@@ -2204,7 +2203,7 @@ mod tests {
             allocation_roots: &[],
         })
         .unwrap();
-        let Some(s) = result.as_string() else {
+        let Some(s) = result.as_string(&gc_heap) else {
             panic!("expected string result, got {result:?}");
         };
         assert_eq!(s.to_lossy_string(&gc_heap), "a3");
@@ -2325,7 +2324,7 @@ mod tests {
         })
         .unwrap();
         // 'É' should stay (ASCII-only fold), 'a','b' lowercase.
-        let Some(s) = r.as_string() else {
+        let Some(s) = r.as_string(&gc_heap) else {
             panic!("expected string");
         };
         let v = s.to_utf16_vec(&gc_heap);

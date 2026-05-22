@@ -60,7 +60,7 @@ impl FunctionKindPrototypes {
             object::define_own_symbol_property_partial(
                 proto,
                 heap,
-                &tag_sym,
+                tag_sym,
                 object::PartialPropertyDescriptor {
                     value: Some(Value::string(tag_string)),
                     writable: Some(false),

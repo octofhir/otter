@@ -111,7 +111,6 @@ pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
 pub mod timers;
-mod value_kind;
 // New 8-byte tagged `Value` foundation (Phase 1.1).
 // Lives alongside the legacy enum during cut-over; once every call site
 // migrates to the accessor surface in [`value::Value`], the enum below
@@ -120,7 +119,6 @@ mod value_kind;
 pub mod bound_function;
 pub mod class_constructor;
 pub mod iterator_state;
-pub mod legacy_value;
 pub mod upvalue;
 pub mod value;
 pub mod weak_refs;
@@ -188,10 +186,8 @@ pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 pub use timers::{TimerCallbacks, TimerEntry, TimerScheduler, TimerSchedulerHandle};
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
-// Phase 1.1 — eight-byte tagged value. Lives next to the legacy enum
-// during cut-over; re-exported under a distinct name so call sites
-// can opt in incrementally without breaking the workspace.
-pub use value::{Value as TaggedValue, ValueKind as TaggedValueKind};
+// Eight-byte tagged value. Canonical `Value` export.
+pub use value::{Value, ValueKind};
 
 pub(crate) use bound_function::BoundFunctionMetadataProperty;
 pub use bound_function::{BOUND_FUNCTION_BODY_TYPE_TAG, BoundFunction, BoundFunctionBody};
@@ -202,7 +198,6 @@ pub use iterator_state::{
     ArrayIterKind, BuiltinIteratorOrigin, ITERATOR_STATE_TYPE_TAG, IteratorHandle, IteratorState,
     MapIteratorKind, SetIteratorKind,
 };
-pub use legacy_value::Value;
 pub use upvalue::{
     UPVALUE_CELL_TYPE_TAG, UpvalueCell, UpvalueCellBody, alloc_upvalue, read_upvalue, store_upvalue,
 };
@@ -961,7 +956,10 @@ impl Interpreter {
         }
     }
 
-    fn non_gc_exotic_prototype_override_key(value: &Value) -> Option<usize> {
+    fn non_gc_exotic_prototype_override_key(
+        value: &Value,
+        heap: &otter_gc::GcHeap,
+    ) -> Option<usize> {
         if let Some(buffer) = value.as_array_buffer() {
             return Some(buffer.identity_addr() as usize);
         }
@@ -969,7 +967,7 @@ impl Interpreter {
             return Some(view.identity_addr() as usize);
         }
         value
-            .as_typed_array()
+            .as_typed_array(heap)
             .map(|array| array.identity_addr() as usize)
     }
 
@@ -984,7 +982,7 @@ impl Interpreter {
         value: &Value,
         proto: Option<Value>,
     ) {
-        let Some(key) = Self::non_gc_exotic_prototype_override_key(value) else {
+        let Some(key) = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap) else {
             return;
         };
         match proto {
@@ -998,7 +996,7 @@ impl Interpreter {
     }
 
     pub(crate) fn non_gc_exotic_prototype_override(&self, value: &Value) -> Option<Value> {
-        let key = Self::non_gc_exotic_prototype_override_key(value)?;
+        let key = Self::non_gc_exotic_prototype_override_key(value, &self.gc_heap)?;
         self.non_gc_exotic_prototype_overrides.get(&key).cloned()
     }
 
@@ -1386,17 +1384,17 @@ impl Interpreter {
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
             object::set_number_data(obj, &mut self.gc_heap, value);
             obj
-        } else if let Some(value) = this_value.as_string() {
+        } else if let Some(value) = this_value.as_string(&self.gc_heap) {
             let proto = self.primitive_wrapper_prototype("String")?;
             let obj =
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
-            object::set_string_data(obj, &mut self.gc_heap, *value);
+            object::set_string_data(obj, &mut self.gc_heap, value);
             obj
-        } else if let Some(sym) = this_value.as_symbol() {
+        } else if let Some(sym) = this_value.as_symbol(&self.gc_heap) {
             let proto = self.primitive_wrapper_prototype("Symbol")?;
             let obj =
                 self.alloc_runtime_rooted_object_with_proto(proto, &[&this_value], slice_roots)?;
-            object::set_symbol_data(obj, &mut self.gc_heap, *sym);
+            object::set_symbol_data(obj, &mut self.gc_heap, sym);
             obj
         } else if let Some(value) = this_value.as_big_int() {
             let proto = self.primitive_wrapper_prototype("BigInt")?;
@@ -1436,7 +1434,7 @@ impl Interpreter {
             )?;
             object::set_number_data(obj, &mut self.gc_heap, value);
             obj
-        } else if let Some(value) = this_value.as_string() {
+        } else if let Some(value) = this_value.as_string(&self.gc_heap) {
             let proto = self.primitive_wrapper_prototype("String")?;
             let obj = self.alloc_stack_rooted_object_with_proto(
                 stack,
@@ -1444,9 +1442,9 @@ impl Interpreter {
                 &[&this_value],
                 slice_roots,
             )?;
-            object::set_string_data(obj, &mut self.gc_heap, *value);
+            object::set_string_data(obj, &mut self.gc_heap, value);
             obj
-        } else if let Some(sym) = this_value.as_symbol() {
+        } else if let Some(sym) = this_value.as_symbol(&self.gc_heap) {
             let proto = self.primitive_wrapper_prototype("Symbol")?;
             let obj = self.alloc_stack_rooted_object_with_proto(
                 stack,
@@ -1454,7 +1452,7 @@ impl Interpreter {
                 &[&this_value],
                 slice_roots,
             )?;
-            object::set_symbol_data(obj, &mut self.gc_heap, *sym);
+            object::set_symbol_data(obj, &mut self.gc_heap, sym);
             obj
         } else if let Some(value) = this_value.as_big_int() {
             let proto = self.primitive_wrapper_prototype("BigInt")?;
@@ -1487,10 +1485,10 @@ impl Interpreter {
             let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
             object::set_number_data(obj, &mut self.gc_heap, v);
             obj
-        } else if let Some(v) = value.as_string() {
+        } else if let Some(v) = value.as_string(&self.gc_heap) {
             let proto = self.primitive_wrapper_prototype("String")?;
             let obj = self.alloc_stack_rooted_object_with_proto(stack, proto, &[value], &[])?;
-            object::set_string_data(obj, &mut self.gc_heap, *v);
+            object::set_string_data(obj, &mut self.gc_heap, v);
             obj
         } else if value.is_symbol() {
             let proto = self.primitive_wrapper_prototype("Symbol")?;
@@ -3002,7 +3000,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let s = read_register(frame, src)?
-                        .as_string()
+                        .as_string(&self.gc_heap)
                         .ok_or(VmError::TypeMismatch)?;
                     let len = NumberValue::from_i32(s.len() as i32);
                     write_register(frame, dst, Value::number(len))?;
@@ -4104,7 +4102,7 @@ impl Interpreter {
     ) -> Result<Option<Value>, VmError> {
         let popped = stack.pop().ok_or(VmError::InvalidOperand)?;
         let resolved = match popped.construct_target {
-            Some(_) if constructor_return_is_object(&value) => value,
+            Some(_) if value.is_object_type() => value,
             Some(target) => Value::object(target),
             None => value,
         };
@@ -4433,7 +4431,7 @@ fn property_key_from_arg(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> Result
     let Some(v) = arg else {
         return Ok("undefined".to_string());
     };
-    if let Some(s) = v.as_string() {
+    if let Some(s) = v.as_string(heap) {
         Ok(s.to_lossy_string(heap))
     } else if let Some(n) = v.as_number() {
         Ok(n.to_display_string())
@@ -4522,8 +4520,8 @@ fn write_register(frame: &mut Frame, idx: u16, value: Value) -> Result<(), VmErr
 /// §22.1.3.34.
 fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let this = ctx.this_value();
-    let string = if let Some(s) = this.as_string() {
-        *s
+    let string = if let Some(s) = this.as_string(ctx.heap()) {
+        s
     } else if let Some(obj) = this.as_object()
         && let Some(s) = crate::object::string_data(obj, ctx.heap())
     {
@@ -4571,7 +4569,7 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     crate::object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &sym,
+        sym,
         crate::object::PartialPropertyDescriptor {
             value: Some(Value::native_function(getter)),
             writable: Some(true),
@@ -4895,11 +4893,6 @@ fn step_iterator(
     }
 }
 
-/// Whether a constructor return value is an ECMAScript object and
-/// therefore replaces the freshly-created receiver.
-fn constructor_return_is_object(value: &Value) -> bool {
-    value.is_object_like()
-}
 
 /// `true` when `value` is a `JsObject` whose internal native
 /// call slot carries a native function, i.e. it is
@@ -6188,7 +6181,7 @@ mod tests {
         let heap_ref = interp.gc_heap();
         let message = message_value
             .as_ref()
-            .and_then(|v| v.as_string())
+            .and_then(|v| v.as_string(heap_ref))
             .expect("message string");
         assert!(message.to_lossy_string(heap_ref).contains("type mismatch"));
     }
@@ -6730,7 +6723,7 @@ mod tests {
         let heap_ref = interp.gc_heap();
         let message = msg
             .as_ref()
-            .and_then(|v| v.as_string())
+            .and_then(|v| v.as_string(heap_ref))
             .expect("message string");
         assert!(
             message
@@ -7575,7 +7568,7 @@ mod tests {
         };
         let first = array::get(pair, interp.gc_heap(), 0);
         let heap_ref = interp.gc_heap();
-        let name = first.as_string().expect("string");
+        let name = first.as_string(heap_ref).expect("string");
         assert_eq!(name.to_lossy_string(heap_ref), "answer");
         assert_eq!(
             array::get(pair, interp.gc_heap(), 1),
@@ -7879,7 +7872,7 @@ mod tests {
         };
         let first = array::get(names, interp.gc_heap(), 0);
         let heap_ref = interp.gc_heap();
-        let name = first.as_string().expect("string");
+        let name = first.as_string(heap_ref).expect("string");
         assert_eq!(name.to_lossy_string(heap_ref), "answer");
     }
 

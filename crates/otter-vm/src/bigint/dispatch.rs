@@ -81,7 +81,7 @@ fn to_bigint(heap: &GcHeap, value: &Value) -> Result<BigInt, VmError> {
         }
         return Ok(BigInt::from(f as i128));
     }
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(heap) {
         return string_to_bigint(&s.to_lossy_string(heap));
     }
     // §7.1.13 step 7 — Symbol → TypeError.
@@ -162,7 +162,7 @@ fn expect_bits(arg: Option<&Value>, heap: &GcHeap) -> Result<u32, VmError> {
         0.0
     } else if let Some(b) = v.as_boolean() {
         if b { 1.0 } else { 0.0 }
-    } else if let Some(s) = v.as_string() {
+    } else if let Some(s) = v.as_string(heap) {
         crate::number::parse::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
     } else if v.is_symbol() {
         return Err(VmError::TypeError {

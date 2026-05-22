@@ -17,7 +17,7 @@ mod macro_ns {
     pub fn add_one(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let value = args
             .first()
-            .and_then(Value::as_number)
+            .and_then(|v| v.as_number())
             .map(NumberValue::as_f64)
             .unwrap_or(0.0);
         Ok(Value::number_f64(value + 1.0))
@@ -37,17 +37,15 @@ fn js_namespace_generates_static_spec_for_builder_backend() {
         .build()
         .expect("namespace");
 
-    let Value::NativeFunction(one) = object::get(ns, interp.gc_heap(), "one").expect("one") else {
-        panic!("one should be installed as a native function");
-    };
+    let one = object::get(ns, interp.gc_heap(), "one")
+        .and_then(|v| v.as_native_function())
+        .expect("one should be installed as a native function");
     assert!(one.is_static_call(interp.gc_heap()));
     assert_eq!(one.length(interp.gc_heap()), 0);
 
-    let Value::NativeFunction(add_one) =
-        object::get(ns, interp.gc_heap(), "addOne").expect("addOne")
-    else {
-        panic!("addOne should be installed as a native function");
-    };
+    let add_one = object::get(ns, interp.gc_heap(), "addOne")
+        .and_then(|v| v.as_native_function())
+        .expect("addOne should be installed as a native function");
     assert!(add_one.is_static_call(interp.gc_heap()));
     assert_eq!(add_one.length(interp.gc_heap()), 1);
 

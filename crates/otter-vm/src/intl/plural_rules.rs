@@ -55,7 +55,7 @@ fn require_payload(args: &IntrinsicArgs<'_>) -> Result<PluralRulesPayload, Intri
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.PluralRules",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::PluralRules(p) => Ok(p),
         _ => Err(bad()),

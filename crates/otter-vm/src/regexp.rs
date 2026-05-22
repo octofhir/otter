@@ -499,7 +499,7 @@ impl JsRegExp {
 fn last_index_to_u32(value: &Value, heap: &otter_gc::GcHeap) -> u32 {
     let raw = if let Some(n) = value.as_number() {
         n.as_f64()
-    } else if let Some(s) = value.as_string() {
+    } else if let Some(s) = value.as_string(heap) {
         s.to_lossy_string(heap)
             .trim()
             .parse::<f64>()

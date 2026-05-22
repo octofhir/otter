@@ -35,7 +35,6 @@ use crate::object::{
 };
 use crate::string::JsString;
 use crate::symbol::JsSymbol;
-use crate::value_kind::is_object_like_value;
 use crate::{NativeCtx, NativeError, Value, VmError};
 
 enum PropertyKey {
@@ -330,10 +329,10 @@ fn native_keys_rooted(
                 if !key.is_string() {
                     continue;
                 }
-                let vm_key = if let Some(s) = key.as_string() {
+                let vm_key = if let Some(s) = key.as_string(ctx.heap()) {
                     crate::VmPropertyKey::OwnedString(s.to_lossy_string(ctx.heap()))
-                } else if let Some(sym) = key.as_symbol() {
-                    crate::VmPropertyKey::Symbol(*sym)
+                } else if let Some(sym) = key.as_symbol(ctx.heap()) {
+                    crate::VmPropertyKey::Symbol(sym)
                 } else {
                     return Err(VmError::TypeMismatch);
                 };
@@ -483,7 +482,7 @@ fn native_from_entries_rooted(
 
         // §20.1.2.7 step 5.b.i — nextItem must be an Object; on
         // failure close the iterator and propagate a TypeError.
-        if !is_object_like_value(&entry) {
+        if !entry.is_object_type() {
             let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
             return Err(VmError::TypeError {
                 message: "Object.fromEntries: iterator value is not an entry object".to_string(),
@@ -569,8 +568,8 @@ fn set_from_entries_key_heap(
     value: Value,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<(), VmError> {
-    if let Some(sym) = key.as_symbol() {
-        crate::object::set_symbol(target, heap, *sym, value);
+    if let Some(sym) = key.as_symbol(heap) {
+        crate::object::set_symbol(target, heap, sym, value);
         return Ok(());
     }
     let key_str = property_key_from_value(key, heap)?;
@@ -612,7 +611,7 @@ fn read_entry_pair_heap(
         let value = crate::object::get(obj, heap, "1").unwrap_or(Value::undefined());
         return Ok((key, value));
     }
-    if let Some(s) = entry.as_string() {
+    if let Some(s) = entry.as_string(heap) {
         let units = s.to_utf16_vec(heap);
         let zero = units.first().copied().map_or(Value::undefined(), |u| {
             crate::string::JsString::from_utf16_units(&[u], heap)
@@ -682,7 +681,7 @@ fn native_get_own_property_descriptor_rooted(
         match &key {
             PropertyKey::String(key) => crate::object::get_own_descriptor(target, ctx.heap(), key),
             PropertyKey::Symbol(sym) => {
-                crate::object::get_own_symbol_descriptor(target, ctx.heap(), sym)
+                crate::object::get_own_symbol_descriptor(target, ctx.heap(), *sym)
             }
         }
     } else if let Some(class) = first.as_class_constructor() {
@@ -691,15 +690,15 @@ fn native_get_own_property_descriptor_rooted(
                 crate::object::get_own_descriptor(class.statics(ctx.heap()), ctx.heap(), key)
             }
             PropertyKey::Symbol(sym) => {
-                crate::object::get_own_symbol_descriptor(class.statics(ctx.heap()), ctx.heap(), sym)
+                crate::object::get_own_symbol_descriptor(class.statics(ctx.heap()), ctx.heap(), *sym)
             }
         }
     } else if let Some(native) = first.as_native_function() {
         match &key {
             PropertyKey::String(key) => native.own_property_descriptor(ctx.heap_mut(), key)?,
-            PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
+            PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), *sym),
         }
-    } else if let Some(target) = first.as_typed_array() {
+    } else if let Some(target) = first.as_typed_array(ctx.heap()) {
         // §10.4.5.1 IntegerIndexedExoticObject [[GetOwnProperty]].
         match &key {
             PropertyKey::String(k) => {
@@ -729,7 +728,7 @@ fn native_get_own_property_descriptor_rooted(
             }
             PropertyKey::Symbol(sym) => target
                 .expando(ctx.heap())
-                .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, ctx.heap(), sym)),
+                .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, ctx.heap(), *sym)),
         }
     } else if first.is_boolean()
         || first.is_number()
@@ -772,7 +771,7 @@ fn native_get_own_property_descriptors_rooted(
     if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
         crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
     }
-    if !is_object_like_value(&target) {
+    if !target.is_object_type() {
         return Ok(Value::object(result));
     }
     let Some(context) = context else {
@@ -782,10 +781,10 @@ fn native_get_own_property_descriptors_rooted(
 
     let keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
     for key in keys {
-        let key_for_descriptor = if let Some(s) = key.as_string() {
-            Value::string(*s)
-        } else if let Some(sym) = key.as_symbol() {
-            Value::symbol(*sym)
+        let key_for_descriptor = if let Some(s) = key.as_string(ctx.heap()) {
+            Value::string(s)
+        } else if let Some(sym) = key.as_symbol(ctx.heap()) {
+            Value::symbol(sym)
         } else {
             continue;
         };
@@ -799,14 +798,14 @@ fn native_get_own_property_descriptors_rooted(
         };
         let desc_obj =
             native_descriptor_to_object_rooted(ctx, &desc, &[&target, &result_root], args)?;
-        if let Some(s) = key.as_string() {
+        if let Some(s) = key.as_string(ctx.heap()) {
             ctx.set_property(
                 result,
                 &s.to_lossy_string(ctx.heap()),
                 Value::object(desc_obj),
             )?;
-        } else if let Some(sym) = key.as_symbol()
-            && !crate::object::set_symbol(result, ctx.heap_mut(), *sym, Value::object(desc_obj))
+        } else if let Some(sym) = key.as_symbol(ctx.heap())
+            && !crate::object::set_symbol(result, ctx.heap_mut(), sym, Value::object(desc_obj))
         {
             return Err(VmError::TypeMismatch);
         }
@@ -850,7 +849,7 @@ fn native_get_own_property_names_rooted(
             .collect::<Result<Vec<_>, _>>()?
     } else if first.is_boolean() || first.is_number() || first.is_symbol() {
         Vec::new()
-    } else if let Some(s) = first.as_string() {
+    } else if let Some(s) = first.as_string(ctx.heap()) {
         let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
         keys.push("length".to_string());
         keys.into_iter()
@@ -1046,10 +1045,9 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             name: "Object.getPrototypeOf",
             reason: "missing execution context".to_string(),
         })?;
+    let closure_id = target.as_closure(ctx.heap()).map(|c| c.cached_function_id);
     let interp = ctx.interp_mut();
-    let function_id = target
-        .as_function()
-        .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+    let function_id = target.as_function().or(closure_id);
     if let Some(function_id) = function_id
         && let Some(proto) = interp.function_kind_prototype_for(&exec_ctx, function_id)
     {
@@ -1072,13 +1070,13 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             reason: "Object.setPrototypeOf called on null or undefined".to_string(),
         });
     }
-    if !proto.is_null() && !is_object_like_value(&proto) {
+    if !proto.is_null() && !proto.is_object_type() {
         return Err(NativeError::TypeError {
             name: "Object.setPrototypeOf",
             reason: "Object.setPrototypeOf prototype must be an Object or null".to_string(),
         });
     }
-    if !is_object_like_value(&target) {
+    if !target.is_object_type() {
         return Ok(target);
     }
     let exec_ctx = ctx
@@ -1184,10 +1182,10 @@ fn set_primitive_wrapper_data(wrapper: JsObject, heap: &mut otter_gc::GcHeap, va
         crate::object::set_boolean_data(wrapper, heap, b);
     } else if let Some(n) = value.as_number() {
         crate::object::set_number_data(wrapper, heap, n);
-    } else if let Some(s) = value.as_string() {
-        crate::object::set_string_data(wrapper, heap, *s);
-    } else if let Some(sym) = value.as_symbol() {
-        crate::object::set_symbol_data(wrapper, heap, *sym);
+    } else if let Some(s) = value.as_string(heap) {
+        crate::object::set_string_data(wrapper, heap, s);
+    } else if let Some(sym) = value.as_symbol(heap) {
+        crate::object::set_symbol_data(wrapper, heap, sym);
     } else if let Some(bi) = value.as_big_int() {
         crate::object::set_bigint_data(wrapper, heap, bi);
     }
@@ -1280,7 +1278,7 @@ fn native_prototype_has_own_property(
     } else if let Some(class) = this_kind.as_class_constructor() {
         let key = args.first();
         let is_prototype_key = key
-            .and_then(|v| v.as_string())
+            .and_then(|v| v.as_string(ctx.heap()))
             .is_some_and(|s| s.to_lossy_string(ctx.heap()) == "prototype");
         if is_prototype_key {
             true
@@ -1327,7 +1325,7 @@ fn native_prototype_property_is_enumerable(
                 PropertyLookup::Absent => false,
             },
             PropertyKey::Symbol(sym) => {
-                match crate::object::lookup_own_symbol(obj, ctx.heap(), &sym) {
+                match crate::object::lookup_own_symbol(obj, ctx.heap(), sym) {
                     PropertyLookup::Data { flags, .. } | PropertyLookup::Accessor { flags, .. } => {
                         flags.enumerable()
                     }
@@ -1342,7 +1340,7 @@ fn native_prototype_property_is_enumerable(
             PropertyKey::String(key) => native
                 .own_property_descriptor(ctx.heap_mut(), &key)
                 .map_err(|err| object_native_error("propertyIsEnumerable", err.into()))?,
-            PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), &sym),
+            PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), sym),
         };
         desc.as_ref().is_some_and(PropertyDescriptor::enumerable)
     } else if let Some(bound) = this_clone.as_bound_function() {
@@ -1366,7 +1364,7 @@ fn native_prototype_is_prototype_of(
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let target = args.first().cloned().unwrap_or(Value::undefined());
-    if !is_object_like_value(&target) {
+    if !target.is_object_type() {
         return Ok(Value::boolean(false));
     }
     if this_value.is_nullish() {
@@ -1375,7 +1373,7 @@ fn native_prototype_is_prototype_of(
             reason: "cannot convert null or undefined to object".to_string(),
         });
     }
-    if !is_object_like_value(&this_value) {
+    if !this_value.is_object_type() {
         return Ok(Value::boolean(false));
     }
     let exec_ctx = ctx
@@ -1603,7 +1601,7 @@ fn define_accessor_helper(
         }
     };
     if let Some(exec_ctx) = ctx.execution_context().cloned()
-        && is_object_like_value(&this_value)
+        && this_value.is_object_type()
     {
         let key = property_key_to_vm_key(&key);
         let ok = ctx
@@ -1631,7 +1629,7 @@ fn define_accessor_helper(
             crate::object::define_own_property_partial(target, ctx.heap_mut(), &name, desc)
         }
         PropertyKey::Symbol(sym) => {
-            crate::object::define_own_symbol_property_partial(target, ctx.heap_mut(), &sym, desc)
+            crate::object::define_own_symbol_property_partial(target, ctx.heap_mut(), sym, desc)
         }
     };
     if !ok {
@@ -1696,7 +1694,7 @@ fn lookup_accessor_helper(
     if let Some(exec_ctx) = ctx.execution_context().cloned() {
         let key = property_key_to_vm_key(&key);
         let mut current = match this_value {
-            value if is_object_like_value(&value) => Some(value),
+            value if value.is_object_type() => Some(value),
             _ => return Ok(Value::undefined()),
         };
         while let Some(value) = current {
@@ -1741,7 +1739,7 @@ fn lookup_accessor_helper(
     while let Some(obj) = current {
         let lookup = match &key {
             PropertyKey::String(name) => crate::object::lookup_own(obj, ctx.heap(), name),
-            PropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(obj, ctx.heap(), sym),
+            PropertyKey::Symbol(sym) => crate::object::lookup_own_symbol(obj, ctx.heap(), *sym),
         };
         match lookup {
             PropertyLookup::Accessor { getter, setter, .. } => {
@@ -1978,7 +1976,7 @@ fn explicit_to_string_tag_with_context(
             smallvec::SmallVec::new(),
         )?,
     };
-    Ok(value.as_string().map(|s| s.to_lossy_string(ctx.heap())))
+    Ok(value.as_string(ctx.heap()).map(|s| s.to_lossy_string(ctx.heap())))
 }
 
 fn native_function_has_own(
@@ -1993,7 +1991,7 @@ fn native_function_has_own(
             .flatten()
             .is_some(),
         Ok(PropertyKey::Symbol(sym)) => native
-            .own_symbol_property_descriptor(gc_heap, &sym)
+            .own_symbol_property_descriptor(gc_heap, sym)
             .is_some(),
         Err(_) => false,
     }
@@ -2078,7 +2076,7 @@ pub fn call(
                         crate::object::define_own_property_partial(target, gc_heap, key, descriptor)
                     }
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
-                        target, gc_heap, sym, descriptor,
+                        target, gc_heap, *sym, descriptor,
                     ),
                 };
                 if !ok {
@@ -2098,7 +2096,7 @@ pub fn call(
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
                         class.statics(gc_heap),
                         gc_heap,
-                        sym,
+                        *sym,
                         descriptor,
                     ),
                 };
@@ -2116,7 +2114,7 @@ pub fn call(
                         descriptor.complete_for_new_property(),
                     ),
                     PropertyKey::Symbol(sym) => {
-                        native.define_own_symbol_property(gc_heap, sym, descriptor)
+                        native.define_own_symbol_property(gc_heap, *sym, descriptor)
                     }
                 };
                 if !ok {
@@ -2137,7 +2135,7 @@ pub fn call(
                             crate::object::get_own_descriptor(bag, gc_heap, k).is_some()
                         }),
                         PropertyKey::Symbol(sym) => r.expando(gc_heap).is_some_and(|bag| {
-                            crate::object::get_own_symbol_descriptor(bag, gc_heap, sym).is_some()
+                            crate::object::get_own_symbol_descriptor(bag, gc_heap, *sym).is_some()
                         }),
                     };
                     if !existing && !r.is_extensible(gc_heap) {
@@ -2152,7 +2150,7 @@ pub fn call(
                         }
                         PropertyKey::Symbol(sym) => {
                             crate::object::define_own_symbol_property_partial(
-                                bag, gc_heap, sym, descriptor,
+                                bag, gc_heap, *sym, descriptor,
                             )
                         }
                     };
@@ -2171,7 +2169,7 @@ pub fn call(
                         crate::object::define_own_property_partial(bag, gc_heap, k, descriptor)
                     }
                     PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
-                        bag, gc_heap, sym, descriptor,
+                        bag, gc_heap, *sym, descriptor,
                     ),
                 };
                 if !ok {
@@ -2180,7 +2178,7 @@ pub fn call(
                     });
                 }
                 Ok(Value::promise(p))
-            } else if let Some(t) = first.and_then(|v| v.as_typed_array()) {
+            } else if let Some(t) = first.and_then(|v| v.as_typed_array(gc_heap)) {
                 // §10.4.5.3 IntegerIndexedExoticObject [[DefineOwnProperty]].
                 match &key {
                     PropertyKey::String(k) => {
@@ -2231,7 +2229,7 @@ pub fn call(
                         let bag =
                             crate::property_dispatch::typed_array_ensure_expando_pub(gc_heap, &t)?;
                         if !crate::object::define_own_symbol_property_partial(
-                            bag, gc_heap, sym, descriptor,
+                            bag, gc_heap, *sym, descriptor,
                         ) {
                             return Err(VmError::TypeError {
                                 message: format!("Cannot define property '{}'", key.label(gc_heap)),
@@ -2278,7 +2276,7 @@ pub fn call(
                     PropertyKey::String(string_key) => {
                         if let Some(value) = crate::object::string_data(target, gc_heap)
                             && let Some(desc) = crate::string::exotic::descriptor_for_name(
-                                &value, string_key, gc_heap,
+                                value, string_key, gc_heap,
                             )?
                         {
                             return Ok(Value::object(descriptor_to_object_with_roots(
@@ -2299,7 +2297,7 @@ pub fn call(
                         }
                     }
                     PropertyKey::Symbol(sym) => {
-                        match crate::object::get_own_symbol_descriptor(target, gc_heap, sym) {
+                        match crate::object::get_own_symbol_descriptor(target, gc_heap, *sym) {
                             Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
@@ -2331,7 +2329,7 @@ pub fn call(
                         match crate::object::get_own_symbol_descriptor(
                             class.statics(gc_heap),
                             gc_heap,
-                            sym,
+                            *sym,
                         ) {
                             Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
@@ -2356,7 +2354,7 @@ pub fn call(
                     )?)),
                     None => Ok(Value::undefined()),
                 }
-            } else if let Some(value) = first.and_then(|v| v.as_string()) {
+            } else if let Some(value) = first.and_then(|v| v.as_string(gc_heap)) {
                 let desc = match &key {
                     PropertyKey::String(key) => {
                         crate::string::exotic::descriptor_for_name(value, key, gc_heap)?
@@ -2416,7 +2414,7 @@ pub fn call(
                 }
             }
             for sym in symbols {
-                if let Some(desc) = crate::object::get_own_symbol_descriptor(target, gc_heap, &sym)
+                if let Some(desc) = crate::object::get_own_symbol_descriptor(target, gc_heap, sym)
                 {
                     let value = Value::object(descriptor_to_object_with_roots(
                         &desc,
@@ -2674,7 +2672,7 @@ pub fn call(
                 class_constructor_own_property_keys_without_context(&class, gc_heap)?
             } else if first.is_some_and(|v| v.is_boolean() || v.is_number() || v.is_symbol()) {
                 Vec::new()
-            } else if let Some(s) = first.and_then(|v| v.as_string()) {
+            } else if let Some(s) = first.and_then(|v| v.as_string(gc_heap)) {
                 let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
                 keys.push("length".to_string());
                 keys
@@ -2923,7 +2921,7 @@ fn expect_property_key(
     let Some(v) = arg else {
         return Ok(PropertyKey::String("undefined".to_string()));
     };
-    if let Some(s) = v.as_string() {
+    if let Some(s) = v.as_string(heap) {
         Ok(PropertyKey::String(s.to_lossy_string(heap)))
     } else if let Some(n) = v.as_number() {
         Ok(PropertyKey::String(n.to_display_string()))
@@ -2935,8 +2933,8 @@ fn expect_property_key(
         Ok(PropertyKey::String("null".to_string()))
     } else if v.is_undefined() {
         Ok(PropertyKey::String("undefined".to_string()))
-    } else if let Some(sym) = v.as_symbol() {
-        Ok(PropertyKey::Symbol(*sym))
+    } else if let Some(sym) = v.as_symbol(heap) {
+        Ok(PropertyKey::Symbol(sym))
     } else {
         Err(VmError::TypeMismatch)
     }
@@ -2971,7 +2969,7 @@ fn has_own_property(
     key: Option<&Value>,
 ) -> Result<bool, VmError> {
     match expect_property_key(key, gc_heap)? {
-        PropertyKey::Symbol(sym) => Ok(crate::object::has_own_symbol(target, gc_heap, &sym)),
+        PropertyKey::Symbol(sym) => Ok(crate::object::has_own_symbol(target, gc_heap, sym)),
         PropertyKey::String(key) => Ok(!matches!(
             crate::object::lookup_own(target, gc_heap, &key),
             PropertyLookup::Absent
@@ -2986,7 +2984,7 @@ fn has_own_property(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-topropertykey>
 fn property_key_from_value(value: &Value, heap: &otter_gc::GcHeap) -> Result<String, VmError> {
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(heap) {
         Ok(s.to_lossy_string(heap))
     } else if let Some(n) = value.as_number() {
         Ok(n.to_display_string())

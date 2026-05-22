@@ -27,9 +27,9 @@ use smallvec::SmallVec;
 use crate::{
     AsyncFrameState, ExecutableFunction, ExecutionContext, Frame, Interpreter, JsObject,
     NativeCallInfo, NativeCtx, NativeFunction, UpvalueCell, Value, VmError, VmGetOutcome,
-    VmPropertyKey, abstract_ops, argument_window::BytecodeArgumentWindow,
-    constructor_return_is_object, is_constructor_runtime, native_to_vm_error,
-    operand_decode::register_operand, promise_dispatch, read_register, write_register,
+    VmPropertyKey, abstract_ops, argument_window::BytecodeArgumentWindow, is_constructor_runtime,
+    native_to_vm_error, operand_decode::register_operand, promise_dispatch, read_register,
+    write_register,
 };
 
 struct PreparedBytecodeFrame {
@@ -70,7 +70,7 @@ impl Interpreter {
         if let Some(function_id) = current.as_function() {
             return Ok((function_id, Frame::empty_upvalues(), effective_this));
         }
-        if let Some(c) = current.as_closure() {
+        if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
             let (upvalues, bound_this) = heap.read_payload(c.handle, |body| {
                 let ups: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(&body.upvalues[..]);
@@ -89,7 +89,7 @@ impl Interpreter {
         if let Some(function_id) = current.as_function() {
             return Ok((function_id, Frame::empty_upvalues()));
         }
-        if let Some(c) = current.as_closure() {
+        if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
             let upvalues = heap.read_payload(c.handle, |body| {
                 std::rc::Rc::<[UpvalueCell]>::from(&body.upvalues[..])
@@ -169,7 +169,7 @@ impl Interpreter {
         let mut ctx =
             NativeCtx::new_with_call_info_and_context(self, call_info, Some(context.clone()));
         let result = call.invoke(&mut ctx, args).map_err(native_to_vm_error)?;
-        Ok(if constructor_return_is_object(&result) {
+        Ok(if result.is_object_type() {
             result
         } else {
             *this_value
@@ -881,7 +881,7 @@ impl Interpreter {
                 Some(v) => {
                     // §10.5.13 step 9 — trap result must be an Object;
                     // primitive returns surface as TypeError.
-                    if !constructor_return_is_object(&v) {
+                    if !v.is_object_type() {
                         return Err(VmError::TypeError {
                             message: "Proxy construct trap returned non-object".to_string(),
                         });
@@ -1021,7 +1021,7 @@ impl Interpreter {
     ) -> Result<Option<Value>, VmError> {
         let function_id = callee
             .as_function()
-            .or_else(|| callee.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| callee.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = function_id {
             return match self.function_property_get_stack_rooted(
                 context,
@@ -1029,7 +1029,7 @@ impl Interpreter {
                 function_id,
                 "prototype",
             )? {
-                proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
+                proto if proto.is_object_type() => Ok(Some(proto)),
                 _ => Ok(None),
             };
         }
@@ -1038,7 +1038,7 @@ impl Interpreter {
         }
         if let Some(obj) = callee.as_object() {
             return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
-                Some(proto) if constructor_return_is_object(&proto) => Some(proto),
+                Some(proto) if proto.is_object_type() => Some(proto),
                 _ => None,
             });
         }
@@ -1060,7 +1060,7 @@ impl Interpreter {
     ) -> Result<Option<Value>, VmError> {
         let function_id = callee
             .as_function()
-            .or_else(|| callee.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| callee.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = function_id {
             return match self.function_property_get_runtime_rooted(
                 context,
@@ -1069,7 +1069,7 @@ impl Interpreter {
                 value_roots,
                 slice_roots,
             )? {
-                proto if constructor_return_is_object(&proto) => Ok(Some(proto)),
+                proto if proto.is_object_type() => Ok(Some(proto)),
                 _ => Ok(None),
             };
         }
@@ -1078,7 +1078,7 @@ impl Interpreter {
         }
         if let Some(obj) = callee.as_object() {
             return Ok(match crate::object::get(obj, &self.gc_heap, "prototype") {
-                Some(proto) if constructor_return_is_object(&proto) => Some(proto),
+                Some(proto) if proto.is_object_type() => Some(proto),
                 _ => None,
             });
         }
@@ -1103,7 +1103,7 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, *callee, SmallVec::new())?
             }
         };
-        Ok(constructor_return_is_object(&proto).then_some(proto))
+        Ok(proto.is_object_type().then_some(proto))
     }
 
     fn native_promise_constructor(&self, callee: &Value) -> Option<NativeFunction> {
@@ -1447,7 +1447,7 @@ impl Interpreter {
                     ];
                     let result =
                         self.run_callable_sync(context, &trap_value, handler, trap_args)?;
-                    if !constructor_return_is_object(&result) {
+                    if !result.is_object_type() {
                         return Err(VmError::TypeError {
                             message: "Proxy construct trap returned non-object".to_string(),
                         });

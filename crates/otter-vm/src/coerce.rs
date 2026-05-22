@@ -120,7 +120,7 @@ pub(crate) fn to_string_or_throw(
             message: "Cannot convert a Symbol value to a string".to_string(),
         });
     }
-    if let Some(s) = primitive.as_string() {
+    if let Some(s) = primitive.as_string(&interp.gc_heap) {
         return Ok(s.to_lossy_string(&interp.gc_heap));
     }
     if primitive.is_undefined() {
@@ -239,7 +239,7 @@ pub(crate) fn to_big_int_or_throw(
         return BigIntValue::from_i32(&mut interp.gc_heap, if b { 1 } else { 0 })
             .map_err(crate::oom_to_vm);
     }
-    if let Some(s) = primitive.as_string() {
+    if let Some(s) = primitive.as_string(&interp.gc_heap) {
         let text = s.to_lossy_string(&interp.gc_heap);
         let parsed = abstract_ops::string_to_big_int(&text).ok_or(VmError::SyntaxError {
             message: format!("Cannot convert {text:?} to a BigInt"),

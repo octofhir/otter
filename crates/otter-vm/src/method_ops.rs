@@ -320,7 +320,7 @@ impl Interpreter {
         // but routed through a TypedArray-specific dispatcher so
         // map / filter / etc. allocate a new TypedArray of the
         // receiver's kind instead of a plain Array.
-        if let Some(t) = recv_value.as_typed_array()
+        if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
             && matches!(
                 name,
                 "forEach"
@@ -399,7 +399,7 @@ impl Interpreter {
                         &original,
                         crate::abstract_ops::ToPrimitiveHint::String,
                     )?;
-                    if let Some(s) = primitive.as_string() {
+                    if let Some(s) = primitive.as_string(&self.gc_heap) {
                         s.to_lossy_string(&self.gc_heap)
                     } else if let Some(n) = primitive.as_number() {
                         n.to_display_string()
@@ -478,9 +478,9 @@ impl Interpreter {
         } else if recv_value.is_finalization_registry() {
             weak_refs::lookup_finalization_registry(name)
         } else if recv_value.is_temporal() {
-            temporal::lookup_prototype(&recv_value, name)
+            temporal::lookup_prototype(&recv_value, &self.gc_heap, name)
         } else if recv_value.is_intl() {
-            intl::lookup_prototype(&recv_value, name)
+            intl::lookup_prototype(&recv_value, &self.gc_heap, name)
         } else if recv_value.is_array_buffer() {
             binary::array_buffer_prototype::lookup(name)
         } else if recv_value.is_data_view() {
@@ -763,7 +763,7 @@ impl Interpreter {
         // properties bag attached to the compiled function.
         let fn_id_for_proto = recv_value
             .as_function()
-            .or_else(|| recv_value.as_closure().map(|c| c.cached_function_id));
+            .or_else(|| recv_value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
         if let Some(function_id) = fn_id_for_proto
             && matches!(
                 name,
@@ -845,7 +845,7 @@ impl Interpreter {
             let result = match name {
                 "hasOwnProperty" | "propertyIsEnumerable" => {
                     let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
-                    if let Some(s) = recv_value.as_string() {
+                    if let Some(s) = recv_value.as_string(&self.gc_heap) {
                         if key == "length" {
                             // propertyIsEnumerable is false for
                             // String wrapper's `length`; hasOwn
@@ -944,7 +944,7 @@ impl Interpreter {
             })
         } else if let Some(fid) = recv_value
             .as_function()
-            .or_else(|| recv_value.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| recv_value.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties resolve via the function-properties side table.
@@ -1020,11 +1020,10 @@ impl Interpreter {
         replace_all: bool,
     ) -> Result<Value, VmError> {
         use crate::string::JsString;
-        let recv = receiver.as_string().copied().ok_or(VmError::TypeMismatch)?;
+        let recv = receiver.as_string(&self.gc_heap).ok_or(VmError::TypeMismatch)?;
         let needle = args
             .first()
-            .and_then(|v| v.as_string())
-            .copied()
+            .and_then(|v| v.as_string(&self.gc_heap))
             .ok_or(VmError::TypeMismatch)?;
         let callback = args.get(1).cloned().unwrap_or(Value::undefined());
         let recv_units = recv.to_utf16_vec(&self.gc_heap);
@@ -1046,8 +1045,8 @@ impl Interpreter {
                 ];
                 let raw =
                     self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
-                let raw_string = if let Some(s) = raw.as_string() {
-                    *s
+                let raw_string = if let Some(s) = raw.as_string(&self.gc_heap) {
+                    s
                 } else {
                     JsString::from_str(&raw.display_string(&self.gc_heap), &mut self.gc_heap)
                         .map_err(|_| VmError::TypeMismatch)?
@@ -1077,8 +1076,8 @@ impl Interpreter {
                 ];
                 let raw =
                     self.run_callable_sync(context, &callback, Value::undefined(), cb_args)?;
-                let raw_string = if let Some(s) = raw.as_string() {
-                    *s
+                let raw_string = if let Some(s) = raw.as_string(&self.gc_heap) {
+                    s
                 } else {
                     JsString::from_str(&raw.display_string(&self.gc_heap), &mut self.gc_heap)
                         .map_err(|_| VmError::TypeMismatch)?

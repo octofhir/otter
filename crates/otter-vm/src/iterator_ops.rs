@@ -32,7 +32,7 @@ use crate::{
 };
 
 fn string_iterator_values(
-    s: &JsString,
+    s: JsString,
     heap: &mut otter_gc::GcHeap,
 ) -> Result<Vec<Value>, VmError> {
     let mut out = Vec::new();
@@ -105,11 +105,8 @@ impl Interpreter {
                 index: 0,
                 origin: crate::BuiltinIteratorOrigin::Array,
             }
-        } else if let Some(string) = value.as_string() {
-            IteratorState::String {
-                string: *string,
-                index: 0,
-            }
+        } else if let Some(string) = value.as_string(&self.gc_heap) {
+            IteratorState::String { string, index: 0 }
         } else if let Some(m) = value.as_map() {
             // `for…of` over a `Map` yields `[key, value]` pairs (Spec
             // §24.1.3.12 — `@@iterator` aliases `entries`); over a `Set`
@@ -329,7 +326,7 @@ impl Interpreter {
                     self,
                     context,
                     &matcher,
-                    &input,
+                    input,
                     global,
                     full_unicode,
                 )?;
@@ -474,9 +471,9 @@ impl Interpreter {
                     continue;
                 } else if let Some(g) = mapped.as_generator() {
                     IteratorState::Generator { handle: g }
-                } else if let Some(s) = mapped.as_string() {
+                } else if let Some(s) = mapped.as_string(&self.gc_heap) {
                     IteratorState::String {
-                        string: *s,
+                        string: s,
                         index: 0,
                     }
                 } else if mapped.is_set() || mapped.is_map() || mapped.is_object() {
@@ -920,7 +917,7 @@ impl Interpreter {
             let elements = array::with_elements(arr, &self.gc_heap, |elements| elements.to_vec());
             return Ok(elements);
         }
-        if let Some(s) = iterable.as_string() {
+        if let Some(s) = iterable.as_string(&self.gc_heap) {
             return string_iterator_values(s, &mut self.gc_heap);
         }
         if let Some(s) = iterable.as_set() {
@@ -1226,7 +1223,7 @@ impl Interpreter {
             return Ok(false);
         };
         let iter_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
-        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, &iter_sym) else {
+        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, iter_sym) else {
             // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
             return Err(VmError::TypeMismatch);
         };

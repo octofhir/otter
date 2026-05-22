@@ -96,9 +96,16 @@ pub fn runtime_arg_to_string(
     heap: &otter_gc::GcHeap,
 ) -> String {
     match args.get(index) {
-        Some(RuntimeValue::String(value)) => value.to_lossy_string(heap),
-        Some(RuntimeValue::Undefined) | None => String::new(),
-        Some(value) => value.display_string(heap),
+        Some(value) => {
+            if let Some(s) = value.as_string(heap) {
+                s.to_lossy_string(heap)
+            } else if value.is_undefined() {
+                String::new()
+            } else {
+                value.display_string(heap)
+            }
+        }
+        None => String::new(),
     }
 }
 
@@ -110,9 +117,16 @@ pub fn runtime_optional_arg_to_string(
     heap: &otter_gc::GcHeap,
 ) -> Option<String> {
     match args.get(index) {
-        Some(RuntimeValue::String(value)) => Some(value.to_lossy_string(heap)),
-        Some(RuntimeValue::Undefined) | None => None,
-        Some(value) => Some(value.display_string(heap)),
+        Some(value) => {
+            if let Some(s) = value.as_string(heap) {
+                Some(s.to_lossy_string(heap))
+            } else if value.is_undefined() {
+                None
+            } else {
+                Some(value.display_string(heap))
+            }
+        }
+        None => None,
     }
 }
 
@@ -121,7 +135,7 @@ pub fn runtime_string_value(
     ctx: &mut RuntimeNativeCtx<'_>,
     value: &str,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
-    Ok(RuntimeValue::String(
+    Ok(RuntimeValue::string(
         RuntimeJsString::from_str(value, ctx.heap_mut())
             .map_err(|err| runtime_type_error("string", err.to_string()))?,
     ))
@@ -133,12 +147,13 @@ pub fn runtime_this_object(
     name: &'static str,
     expected: &'static str,
 ) -> Result<RuntimeJsObject, RuntimeNativeError> {
-    match *ctx.this_value() {
-        RuntimeValue::Object(object) => Ok(object),
-        _ => Err(runtime_type_error(
+    if let Some(object) = ctx.this_value().as_object() {
+        Ok(object)
+    } else {
+        Err(runtime_type_error(
             name,
             format!("invalid {expected} receiver"),
-        )),
+        ))
     }
 }
 

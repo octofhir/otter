@@ -24,7 +24,7 @@ use super::{number_value, smi};
 
 fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsTypedArray, IntrinsicError> {
     args.receiver
-        .as_typed_array()
+        .as_typed_array(args.gc_heap)
         .ok_or(IntrinsicError::BadReceiver {
             expected: "typedarray",
         })
@@ -375,7 +375,7 @@ fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let separator = if let Some(v) = args.args.first() {
         if v.is_undefined() {
             ",".to_string()
-        } else if let Some(s) = v.as_string() {
+        } else if let Some(s) = v.as_string(args.gc_heap) {
             s.to_lossy_string(args.gc_heap)
         } else {
             v.display_string(args.gc_heap)
@@ -442,7 +442,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
         })
     }
-    if let Some(src) = source.as_typed_array() {
+    if let Some(src) = source.as_typed_array(args.gc_heap) {
         let src_len = src.length(args.gc_heap);
         if off + src_len > t.length(args.gc_heap) {
             return Err(IntrinsicError::BadArgument {
@@ -497,7 +497,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let coerced = coerce(kind, &v, args.gc_heap)?;
             t.set(args.gc_heap, off + i, &coerced);
         }
-    } else if let Some(s) = source.as_string() {
+    } else if let Some(s) = source.as_string(args.gc_heap) {
         // §22.2.3.23.1 step 14 — String indexed-char wrapper.
         let units = s.to_utf16_vec(args.gc_heap);
         let src_len = units.len();

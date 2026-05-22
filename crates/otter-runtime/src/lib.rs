@@ -1481,7 +1481,7 @@ impl Runtime {
             .interp
             .error_classes_for_trace()
             .prototype(otter_vm::ErrorKind::TypeError);
-        let proto_root = otter_vm::Value::Object(proto);
+        let proto_root = otter_vm::Value::object(proto);
         let obj = self
             .interp
             .alloc_host_object_with_roots(&[&proto_root], &[])?;
@@ -1495,9 +1495,9 @@ impl Runtime {
             obj,
             self.interp.gc_heap_mut(),
             "message",
-            otter_vm::Value::String(message_str),
+            otter_vm::Value::string(message_str),
         );
-        Ok(otter_vm::Value::Object(obj))
+        Ok(otter_vm::Value::object(obj))
     }
 
     fn load_dynamic_module(
@@ -1528,7 +1528,7 @@ impl Runtime {
             ))
         })?;
         if let Some(env) = self.interp.module_env(&target_url) {
-            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::Object(env)));
+            return Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(env)));
         }
         // HTTPS / HTTP targets take a separate fetch path because
         // `module_graph::load_program` only walks file:// URLs.
@@ -1583,14 +1583,14 @@ impl Runtime {
             }
             otter_vm_init_marker_install(&mut self.interp, env);
             let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, &url)?;
-            let callee = otter_vm::Value::Function { function_id };
+            let callee = otter_vm::Value::function_id(function_id);
             let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
-                otter_vm::Value::Object(env),
-                otter_vm::Value::Object(import_meta),
+                otter_vm::Value::object(env),
+                otter_vm::Value::object(import_meta),
             ];
             if let Err(err) =
                 self.interp
-                    .run_callable_sync(&context, &callee, otter_vm::Value::Undefined, args)
+                    .run_callable_sync(&context, &callee, otter_vm::Value::undefined(), args)
             {
                 // §16.2.1.7 step 7.b.i — an evaluation throw maps
                 // to a promise rejection. Prefer the original
@@ -1615,7 +1615,7 @@ impl Runtime {
                 "dynamic import: namespace missing after load: \"{target_url}\""
             ))
         })?;
-        Ok(DynamicModuleLoad::Loaded(otter_vm::Value::Object(
+        Ok(DynamicModuleLoad::Loaded(otter_vm::Value::object(
             namespace,
         )))
     }
@@ -1681,14 +1681,14 @@ impl Runtime {
             .register_module_env(std::rc::Rc::from(target_url), env);
         otter_vm_init_marker_install(&mut self.interp, env);
         let import_meta = alloc_dynamic_import_meta(&mut self.interp, env, target_url)?;
-        let callee = otter_vm::Value::Function { function_id: 0 };
+        let callee = otter_vm::Value::function_id(0);
         let args: smallvec::SmallVec<[otter_vm::Value; 8]> = smallvec::smallvec![
-            otter_vm::Value::Object(env),
-            otter_vm::Value::Object(import_meta),
+            otter_vm::Value::object(env),
+            otter_vm::Value::object(import_meta),
         ];
         if let Err(err) =
             self.interp
-                .run_callable_sync(&context, &callee, otter_vm::Value::Undefined, args)
+                .run_callable_sync(&context, &callee, otter_vm::Value::undefined(), args)
         {
             if matches!(err, otter_vm::VmError::Uncaught { .. })
                 && let Some(thrown) = self.interp.take_pending_uncaught_throw()
@@ -1699,7 +1699,7 @@ impl Runtime {
                 "dynamic import: HTTPS evaluation failed for \"{target_url}\": {err}"
             )));
         }
-        Ok(otter_vm::Value::Object(env))
+        Ok(otter_vm::Value::object(env))
     }
 
     /// Install `value` as a `globalThis.<name>` data property.
@@ -1717,7 +1717,7 @@ impl Runtime {
     /// Install a host-defined native function as a global binding.
     ///
     /// The function is allocated on the runtime's GC heap as a
-    /// `Value::NativeFunction` with the given `name` and arity, then
+    /// `Value::native_function` with the given `name` and arity, then
     /// stored on `globalThis` via [`Self::set_global`]. Standard
     /// descriptor attributes (`{ writable: true, enumerable: false,
     /// configurable: true }`) are applied.
@@ -1778,7 +1778,7 @@ impl Runtime {
                 heap_limit_bytes: oom.heap_limit_bytes(),
             })?;
         let id = self.promise_registry.register(handle);
-        Ok((id, otter_vm::Value::Promise(handle)))
+        Ok((id, otter_vm::Value::promise(handle)))
     }
 
     /// Settle the promise registered under `id` with `outcome` and
@@ -1809,7 +1809,7 @@ impl Runtime {
                 otter_vm::JsPromise::fulfill(
                     &handle,
                     self.interp.gc_heap_mut(),
-                    otter_vm::Value::Undefined,
+                    otter_vm::Value::undefined(),
                 ),
                 true,
             ),
@@ -1817,7 +1817,7 @@ impl Runtime {
                 otter_vm::JsPromise::fulfill(
                     &handle,
                     self.interp.gc_heap_mut(),
-                    otter_vm::Value::Null,
+                    otter_vm::Value::null(),
                 ),
                 true,
             ),
@@ -1825,7 +1825,7 @@ impl Runtime {
                 otter_vm::JsPromise::fulfill(
                     &handle,
                     self.interp.gc_heap_mut(),
-                    otter_vm::Value::Boolean(b),
+                    otter_vm::Value::boolean(b),
                 ),
                 true,
             ),
@@ -1833,7 +1833,7 @@ impl Runtime {
                 otter_vm::JsPromise::fulfill(
                     &handle,
                     self.interp.gc_heap_mut(),
-                    otter_vm::Value::Number(otter_vm::NumberValue::from_f64(n)),
+                    otter_vm::Value::number(otter_vm::NumberValue::from_f64(n)),
                 ),
                 true,
             ),
@@ -1843,7 +1843,7 @@ impl Runtime {
                     otter_vm::JsPromise::fulfill(
                         &handle,
                         self.interp.gc_heap_mut(),
-                        otter_vm::Value::String(str_val),
+                        otter_vm::Value::string(str_val),
                     ),
                     true,
                 )
@@ -1854,7 +1854,7 @@ impl Runtime {
                     otter_vm::JsPromise::reject(
                         &handle,
                         self.interp.gc_heap_mut(),
-                        otter_vm::Value::String(str_val),
+                        otter_vm::Value::string(str_val),
                     ),
                     false,
                 )
@@ -1909,7 +1909,7 @@ impl Runtime {
             smallvec::SmallVec::with_capacity(entry.extra_args.len());
         args.extend(entry.extra_args);
         self.interp
-            .run_callable_sync(&context, &entry.callback, otter_vm::Value::Undefined, args)
+            .run_callable_sync(&context, &entry.callback, otter_vm::Value::undefined(), args)
             .map_err(|error| {
                 map_vm_error(otter_vm::RunError {
                     error,
@@ -2939,7 +2939,7 @@ const DYNAMIC_INIT_MARKER: &str = "__otter_module_inited__";
 
 fn otter_vm_init_marker_set(interp: &otter_vm::Interpreter, env: otter_vm::JsObject) -> bool {
     otter_vm::object::get(env, interp.gc_heap(), DYNAMIC_INIT_MARKER)
-        .is_some_and(|v| matches!(v, otter_vm::Value::Boolean(true)))
+        .is_some_and(|v| v.as_boolean() == Some(true))
 }
 
 fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, env: otter_vm::JsObject) {
@@ -2947,7 +2947,7 @@ fn otter_vm_init_marker_install(interp: &mut otter_vm::Interpreter, env: otter_v
         env,
         interp.gc_heap_mut(),
         DYNAMIC_INIT_MARKER,
-        otter_vm::Value::Boolean(true),
+        otter_vm::Value::boolean(true),
     );
 }
 
@@ -2956,7 +2956,7 @@ fn alloc_dynamic_import_meta(
     env: otter_vm::JsObject,
     url: &str,
 ) -> Result<otter_vm::JsObject, DynLoadError> {
-    let env_root = otter_vm::Value::Object(env);
+    let env_root = otter_vm::Value::object(env);
     let import_meta = interp
         .alloc_host_object_with_roots(&[&env_root], &[])
         .map_err(|e| {
@@ -2971,7 +2971,7 @@ fn alloc_dynamic_import_meta(
         import_meta,
         interp.gc_heap_mut(),
         "url",
-        otter_vm::Value::String(url_string),
+        otter_vm::Value::string(url_string),
     );
     Ok(import_meta)
 }
@@ -3017,15 +3017,12 @@ fn diagnostic_from_thrown_value(
         );
     }
     let heap = interp.gc_heap();
-    let obj = match value {
-        otter_vm::Value::Object(obj) => *obj,
-        primitive => {
-            return Diagnostic::new(
-                DiagnosticKind::Type,
-                DiagnosticCode::Uncaught,
-                primitive.display_string(heap),
-            );
-        }
+    let Some(obj) = value.as_object() else {
+        return Diagnostic::new(
+            DiagnosticKind::Type,
+            DiagnosticCode::Uncaught,
+            value.display_string(heap),
+        );
     };
 
     let name = otter_vm::object::get(obj, heap, "name")
@@ -3050,7 +3047,9 @@ fn diagnostic_from_thrown_value(
     // `errors`: AggregateError. Each entry becomes an aggregated
     // diagnostic; recurse one level so nested causes inside each
     // error survive.
-    if let Some(otter_vm::Value::Array(errors)) = otter_vm::object::get(obj, heap, "errors") {
+    if let Some(errors) =
+        otter_vm::object::get(obj, heap, "errors").and_then(|v| v.as_array())
+    {
         let entries: Vec<Diagnostic> = otter_vm::array::with_elements(errors, heap, |slice| {
             slice
                 .iter()

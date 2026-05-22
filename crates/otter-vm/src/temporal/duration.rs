@@ -54,7 +54,7 @@ pub fn dispatch_static(
 /// Spec §7.2.1 `Temporal.Duration.from`.
 fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
     let first = args.first();
-    let dur = if let Some(s) = first.and_then(|v| v.as_string()) {
+    let dur = if let Some(s) = first.and_then(|v| v.as_string(gc_heap)) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
             TemporalError::Engine {
                 class: "Duration",
@@ -68,7 +68,7 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
             method: "from",
             message: e.to_string(),
         })?
-    } else if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+    } else if let Some(t) = first.and_then(|v| v.as_temporal(gc_heap)) {
         match t.payload_clone(gc_heap) {
             TemporalPayload::Duration(d) => d,
             _ => {
@@ -116,7 +116,7 @@ fn expect_duration(
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Duration, TemporalError> {
     let arg = args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(gc_heap)) {
         match t.payload_clone(gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(TemporalError::BadArgument {
@@ -126,7 +126,7 @@ fn expect_duration(
                 reason: "must be a Temporal.Duration",
             }),
         }
-    } else if let Some(s) = arg.and_then(|v| v.as_string()) {
+    } else if let Some(s) = arg.and_then(|v| v.as_string(gc_heap)) {
         temporal_rs::Duration::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
             TemporalError::Engine {
                 class: "Duration",
@@ -215,7 +215,7 @@ fn optional_field(
 
 /// Property reads on a `Temporal.Duration` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     let d = match temporal.payload_clone(gc_heap) {
         TemporalPayload::Duration(v) => v,
         _ => return Value::undefined(),
@@ -309,7 +309,7 @@ fn duration_arg(
         reason: "must be a Temporal.Duration",
     };
     let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(bad()),

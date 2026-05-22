@@ -46,39 +46,35 @@ fn js_class_generates_spec_shaped_class_constructor() {
     let class = ClassBuilder::from_spec(interp.gc_heap_mut(), &MACRO_CLASS_SPEC)
         .build()
         .expect("class");
-    let Value::ClassConstructor(class) = class else {
-        panic!("macro class should build a class constructor value");
-    };
+    let class = class
+        .as_class_constructor()
+        .expect("macro class should build a class constructor value");
 
     let class_ctor = class.ctor(interp.gc_heap());
-    let Value::NativeFunction(ctor) = &class_ctor else {
-        panic!("constructor should be native");
-    };
+    let ctor = class_ctor
+        .as_native_function()
+        .expect("constructor should be native");
     assert!(ctor.is_static_call(interp.gc_heap()));
     assert_eq!(ctor.length(interp.gc_heap()), 1);
 
     let class_statics = class.statics(interp.gc_heap());
-    let Value::NativeFunction(from) =
-        object::get(class_statics, interp.gc_heap(), "from").expect("from")
-    else {
-        panic!("static method should be native");
-    };
+    let from = object::get(class_statics, interp.gc_heap(), "from")
+        .and_then(|v| v.as_native_function())
+        .expect("static method should be native");
     assert!(from.is_static_call(interp.gc_heap()));
     assert_eq!(from.length(interp.gc_heap()), 1);
 
     let class_prototype = class.prototype(interp.gc_heap());
-    let Value::NativeFunction(value_of) =
-        object::get(class_prototype, interp.gc_heap(), "valueOf").expect("valueOf")
-    else {
-        panic!("prototype method should be native");
-    };
+    let value_of = object::get(class_prototype, interp.gc_heap(), "valueOf")
+        .and_then(|v| v.as_native_function())
+        .expect("prototype method should be native");
     assert!(value_of.is_static_call(interp.gc_heap()));
     assert_eq!(value_of.length(interp.gc_heap()), 0);
 
-    assert!(matches!(
-        object::get(class_prototype, interp.gc_heap(), "constructor"),
-        Some(Value::ClassConstructor(_))
-    ));
+    assert!(
+        object::get(class_prototype, interp.gc_heap(), "constructor")
+            .is_some_and(|v| v.is_class_constructor())
+    );
 
     let answer = object::get_own_descriptor(class_prototype, interp.gc_heap(), "answer")
         .expect("answer accessor");

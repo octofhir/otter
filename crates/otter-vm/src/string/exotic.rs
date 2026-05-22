@@ -26,7 +26,7 @@ use crate::string::JsString;
 use crate::{Value, VmError, VmPropertyKey};
 
 pub(crate) fn descriptor_for_key(
-    value: &JsString,
+    value: JsString,
     key: &VmPropertyKey,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Option<PropertyDescriptor>, VmError> {
@@ -37,7 +37,7 @@ pub(crate) fn descriptor_for_key(
 }
 
 pub(crate) fn descriptor_for_name(
-    value: &JsString,
+    value: JsString,
     key: &str,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Option<PropertyDescriptor>, VmError> {

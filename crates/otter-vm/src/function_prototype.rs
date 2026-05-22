@@ -70,7 +70,7 @@ pub(crate) fn install_symbol_has_instance(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let descriptor = PropertyDescriptor::data(Value::native_function(value), false, false, false);
-    if !object::define_own_symbol_property(prototype, heap, &well_known_has_instance, descriptor) {
+    if !object::define_own_symbol_property(prototype, heap, well_known_has_instance, descriptor) {
         return Err(JsSurfaceError::DefinePropertyFailed("[Symbol.hasInstance]"));
     }
     Ok(())

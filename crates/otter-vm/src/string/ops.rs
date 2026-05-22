@@ -40,15 +40,17 @@ impl Interpreter {
         recv: u16,
         idx: u16,
     ) -> Result<(), VmError> {
-        let recv_s = *read_register(frame, recv)?
-            .as_string()
+        let recv_s = read_register(frame, recv)?
+            .as_string(&self.gc_heap)
             .ok_or(VmError::TypeMismatch)?;
-        let idx = match read_register(frame, idx)? {
-            Value::Number(n) => match n.as_smi() {
+        let idx_v = read_register(frame, idx)?;
+        let idx = if let Some(n) = idx_v.as_number() {
+            match n.as_smi() {
                 Some(v) if v >= 0 => v as u32,
                 _ => recv_s.len(),
-            },
-            _ => return Err(VmError::TypeMismatch),
+            }
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         let result = match recv_s.char_code_at(idx, &self.gc_heap) {
             Some(unit) => JsString::from_utf16_units(&[unit], &mut self.gc_heap)?,

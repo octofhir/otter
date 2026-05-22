@@ -318,7 +318,7 @@ pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &well_known.get(WellKnown::ToStringTag),
+        well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
             value: Some(Value::string(tag)),
             writable: Some(false),
@@ -357,7 +357,7 @@ pub fn install_array_buffer_well_knowns_post_bootstrap(
     object::define_own_symbol_property_partial(
         prototype,
         heap,
-        &well_known.get(WellKnown::ToStringTag),
+        well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
             value: Some(Value::string(tag)),
             writable: Some(false),

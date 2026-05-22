@@ -2,7 +2,7 @@
 //! must not capture it.
 
 fn main() {
-    let value = otter_vm::Value::Undefined;
+    let value = otter_vm::Value::undefined();
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         std::hint::black_box(value);

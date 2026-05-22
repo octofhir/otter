@@ -156,7 +156,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         receiver: &Value,
-        string: &JsString,
+        string: JsString,
         name: &str,
     ) -> Result<Value, VmError> {
         match string_index_property_name(name) {
@@ -223,7 +223,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let lhs = *read_register(frame, lhs)?;
         let rhs = *read_register(frame, rhs)?;
-        let key_name = if let Some(s) = lhs.as_string() {
+        let key_name = if let Some(s) = lhs.as_string(&self.gc_heap) {
             Some(s.to_lossy_string(&self.gc_heap))
         } else if let Some(n) = lhs.as_number() {
             Some(n.to_display_string())
@@ -246,7 +246,7 @@ impl Interpreter {
             has_class_static_property(self, &c, &lhs)
         } else if let Some(function_id) = rhs
             .as_function()
-            .or_else(|| rhs.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| rhs.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             if let Some(name) = key_name.as_deref() {
                 let bag_has = self
@@ -283,7 +283,7 @@ impl Interpreter {
                     .flatten()
                     .is_some()
                     || matches!(name, "call" | "apply" | "bind" | "toString")
-            } else if let Some(sym) = lhs.as_symbol() {
+            } else if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
                 native
                     .own_symbol_property_descriptor(&self.gc_heap, sym)
                     .is_some()
@@ -324,14 +324,14 @@ impl Interpreter {
             crate::array::delete_named_property(arr, &mut self.gc_heap, name)
         } else if let Some(function_id) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             self.ordinary_function_delete_own_property(function_id, name)
         } else if let Some(native) = receiver.as_native_function() {
             native.delete_own_property(&mut self.gc_heap, name)
         } else if let Some(bound) = receiver.as_bound_function() {
             function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)
-        } else if let Some(t) = receiver.as_typed_array() {
+        } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(n) = canonical_numeric_index_string(name) {
                 if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
                     true
@@ -383,9 +383,9 @@ impl Interpreter {
         let receiver = *read_register(frame, obj_reg)?;
         let idx = *read_register(frame, idx_reg)?;
         let removed = if let Some(obj) = receiver.as_object() {
-            if let Some(sym) = idx.as_symbol() {
+            if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::object::delete_symbol(obj, &mut self.gc_heap, sym)
-            } else if let Some(s) = idx.as_string() {
+            } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 crate::object::delete(obj, &mut self.gc_heap, &name)
             } else if let Some(n) = idx.as_number() {
@@ -410,15 +410,15 @@ impl Interpreter {
                         &n.to_display_string(),
                     ),
                 }
-            } else if let Some(s) = idx.as_string() {
+            } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 crate::array::delete_named_property(arr, &mut self.gc_heap, &name)
-            } else if let Some(sym) = idx.as_symbol() {
+            } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::array::delete_symbol_property(arr, &mut self.gc_heap, sym)
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(s) = receiver.as_string() {
+        } else if let Some(s) = receiver.as_string(&self.gc_heap) {
             if let Some(n) = idx.as_number() {
                 !matches!(n.as_smi(), Some(v) if v >= 0 && (v as u32) < s.len())
             } else {
@@ -426,32 +426,32 @@ impl Interpreter {
             }
         } else if let Some(function_id) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
-            if let Some(s) = idx.as_string() {
+            if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 self.ordinary_function_delete_own_property(function_id, &name)
             } else {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(native) = receiver.as_native_function() {
-            if let Some(sym) = idx.as_symbol() {
+            if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 native.delete_own_symbol_property(&mut self.gc_heap, sym)
-            } else if let Some(s) = idx.as_string() {
+            } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 native.delete_own_property(&mut self.gc_heap, &name)
             } else {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(bound) = receiver.as_bound_function() {
-            if let Some(s) = idx.as_string() {
+            if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, &name)
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(t) = receiver.as_typed_array() {
-            if let Some(s) = idx.as_string() {
+        } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
+            if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 match canonical_numeric_index_string(&name) {
                     Some(n) => {
@@ -475,7 +475,7 @@ impl Interpreter {
             } else if let Some(n) = idx.as_number() {
                 t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                     || !matches!(n.as_smi(), Some(v) if v >= 0 && (v as usize) < t.length(&self.gc_heap))
-            } else if let Some(sym) = idx.as_symbol() {
+            } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 if let Some(bag) = t.expando(&self.gc_heap) {
                     crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
                 } else {
@@ -654,7 +654,7 @@ impl Interpreter {
                     }
                 }
             }
-        } else if let Some(s) = receiver.as_string() {
+        } else if let Some(s) = receiver.as_string(&self.gc_heap) {
             self.load_string_primitive_property(context, &receiver, s, name)?
         } else if receiver.is_array() {
             let v = &receiver;
@@ -678,7 +678,7 @@ impl Interpreter {
             }
         } else if let Some(fid) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             self.function_property_get_stack_rooted(context, stack, fid, name)?
         } else if let Some(native) = receiver.as_native_function() {
@@ -734,7 +734,7 @@ impl Interpreter {
                     direct
                 }
             }
-        } else if let Some(s) = receiver.as_symbol() {
+        } else if let Some(s) = receiver.as_symbol(&self.gc_heap) {
             symbol_prototype::load_property(s, name)
         } else if receiver.is_iterator() {
             // §27.1.5 — read string-keyed properties through
@@ -803,7 +803,7 @@ impl Interpreter {
             } else {
                 direct
             }
-        } else if let Some(t) = receiver.as_temporal() {
+        } else if let Some(t) = receiver.as_temporal(&self.gc_heap) {
             temporal::load_property(t, &mut self.gc_heap, name)
         } else if let Some(b) = receiver.as_array_buffer() {
             let direct = binary::array_buffer_prototype::load_property(b, &self.gc_heap, name);
@@ -824,7 +824,7 @@ impl Interpreter {
             } else {
                 direct
             }
-        } else if let Some(t) = receiver.as_typed_array() {
+        } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             // §10.4.5.4 [[Get]] — check the expando bag before
             // per-kind built-ins so user-installed properties win.
             if let Some(bag) = t.expando(&self.gc_heap)
@@ -934,7 +934,7 @@ impl Interpreter {
                 crate::array::set_named_property(a, &mut self.gc_heap, name, value)?;
             }
             None
-        } else if let Some(t) = receiver.as_typed_array() {
+        } else if let Some(t) = receiver.as_typed_array(&self.gc_heap) {
             if let Some(n) = canonical_numeric_index_string(name) {
                 if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
                     && n.is_finite()
@@ -955,7 +955,7 @@ impl Interpreter {
             None
         } else if let Some(fid) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             let has_own = self
                 .ordinary_function_has_own_string_property_for_extensibility(context, fid, name)?;
@@ -1115,9 +1115,9 @@ impl Interpreter {
         let idx_value_raw = *read_register(frame, idx_reg)?;
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         let value = if let Some(obj) = recv.as_object() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 crate::object::get_symbol(obj, &self.gc_heap, sym).unwrap_or(Value::undefined())
-            } else if let Some(key) = idx_value.as_string() {
+            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 crate::object::get(obj, &self.gc_heap, &key.to_lossy_string(&self.gc_heap))
                     .unwrap_or(Value::undefined())
             } else if let Some(n) = idx_value.as_number() {
@@ -1127,7 +1127,7 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(arr) = recv.as_array() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 if sym
                     .well_known_tag()
                     .is_some_and(|t| t == symbol::WellKnown::Iterator)
@@ -1156,7 +1156,7 @@ impl Interpreter {
                         }
                     }
                 }
-            } else if let Some(key) = idx_value.as_string() {
+            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 // Computed string-key access on Array exotic.
                 let name = key.to_lossy_string(&self.gc_heap);
                 if name == "length" {
@@ -1217,9 +1217,9 @@ impl Interpreter {
             }
         } else if let Some(fid) = recv
             .as_function()
-            .or_else(|| recv.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| recv.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 match self.ordinary_function_own_property_descriptor(
                     Some(context),
                     fid,
@@ -1228,8 +1228,8 @@ impl Interpreter {
                     Some(desc) => descriptor_value(&desc),
                     None => Value::undefined(),
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
-                let key = VmPropertyKey::Symbol(*sym);
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                let key = VmPropertyKey::Symbol(sym);
                 match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1241,14 +1241,14 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(native) = recv.as_native_function() {
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 match native.own_property_descriptor(&mut self.gc_heap, &key)? {
                     Some(desc) => descriptor_value(&desc),
                     None => Value::undefined(),
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
-                let key = VmPropertyKey::Symbol(*sym);
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                let key = VmPropertyKey::Symbol(sym);
                 match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1261,7 +1261,7 @@ impl Interpreter {
             }
         } else if let Some(bound) = recv.as_bound_function() {
             let bound = &bound;
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 match function_metadata::bound_own_property_descriptor(
                     bound,
@@ -1271,8 +1271,8 @@ impl Interpreter {
                     Some(desc) => descriptor_value(&desc),
                     None => Value::undefined(),
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
-                let key = VmPropertyKey::Symbol(*sym);
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                let key = VmPropertyKey::Symbol(sym);
                 match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1283,8 +1283,8 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(t) = recv.as_typed_array() {
-            if let Some(key) = idx_value.as_string() {
+        } else if let Some(t) = recv.as_typed_array(&self.gc_heap) {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(n) = canonical_numeric_index_string(&name) {
                     if n.is_finite()
@@ -1323,8 +1323,8 @@ impl Interpreter {
                     Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
                     None => Value::undefined(),
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
-                let key = VmPropertyKey::Symbol(*sym);
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                let key = VmPropertyKey::Symbol(sym);
                 match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1335,10 +1335,10 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(s) = recv.as_string() {
+        } else if let Some(s) = recv.as_string(&self.gc_heap) {
             // §10.4.3 String exotic [[GetOwnProperty]] — UTF-16 code
             // unit indexed access then String.prototype fallback.
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
                 self.load_string_primitive_property(context, &recv, s, &name)?
             } else if let Some(n) = idx_value.as_number() {
@@ -1354,8 +1354,8 @@ impl Interpreter {
                     let name = n.to_display_string();
                     self.load_string_primitive_property(context, &recv, s, &name)?
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
-                let key = VmPropertyKey::Symbol(*sym);
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                let key = VmPropertyKey::Symbol(sym);
                 let proto = self.constructor_prototype_value("String")?;
                 if proto.is_nullish() {
                     Value::undefined()
@@ -1372,7 +1372,7 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(r) = recv.as_regexp() {
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 // Computed string-key on RegExp.
                 let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(bag) = r.expando(&self.gc_heap)
@@ -1387,8 +1387,8 @@ impl Interpreter {
                         direct
                     }
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
-                let key = VmPropertyKey::Symbol(*sym);
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                let key = VmPropertyKey::Symbol(sym);
                 match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1400,14 +1400,14 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(m) = recv.as_map() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 if sym
                     .well_known_tag()
                     .is_some_and(|t| t == symbol::WellKnown::Iterator)
                 {
                     collections_prototype::make_map_iterator_factory(m, &mut self.gc_heap)?
                 } else {
-                    let key = VmPropertyKey::Symbol(*sym);
+                    let key = VmPropertyKey::Symbol(sym);
                     match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1420,14 +1420,14 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(set) = recv.as_set() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 if sym
                     .well_known_tag()
                     .is_some_and(|t| t == symbol::WellKnown::Iterator)
                 {
                     collections_prototype::make_set_iterator_factory(set, &mut self.gc_heap)?
                 } else {
-                    let key = VmPropertyKey::Symbol(*sym);
+                    let key = VmPropertyKey::Symbol(sym);
                     match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
                         crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1450,8 +1450,8 @@ impl Interpreter {
         {
             // §10.2 — symbol-keyed access on callable / class /
             // collection exotics walks via ordinary [[Get]].
-            if let Some(sym) = idx_value.as_symbol() {
-                let key = VmPropertyKey::Symbol(*sym);
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                let key = VmPropertyKey::Symbol(sym);
                 match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1474,9 +1474,9 @@ impl Interpreter {
             } else {
                 "BigInt"
             };
-            let key = if let Some(sym) = idx_value.as_symbol() {
-                VmPropertyKey::Symbol(*sym)
-            } else if let Some(s) = idx_value.as_string() {
+            let key = if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                VmPropertyKey::Symbol(sym)
+            } else if let Some(s) = idx_value.as_string(&self.gc_heap) {
                 VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
             } else if let Some(n) = idx_value.as_number() {
                 VmPropertyKey::OwnedString(n.to_display_string())
@@ -1519,11 +1519,11 @@ impl Interpreter {
         let strict = context.function_is_strict(frame.function_id);
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         if let Some(obj) = recv.as_object() {
-            if let Some(sym) = idx_value.as_symbol() {
-                if !crate::object::set_symbol(obj, &mut self.gc_heap, *sym, value) {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
+                if !crate::object::set_symbol(obj, &mut self.gc_heap, sym, value) {
                     Self::failed_set_result(strict, "Cannot assign to symbol property")?;
                 }
-            } else if let Some(key) = idx_value.as_string() {
+            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 self.store_computed_ordinary_property(obj, &key, value, strict)?;
             } else if let Some(n) = idx_value.as_number() {
@@ -1534,9 +1534,9 @@ impl Interpreter {
             }
         } else if let Some(fid) = recv
             .as_function()
-            .or_else(|| recv.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| recv.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
                     context, fid, &key,
@@ -1569,7 +1569,7 @@ impl Interpreter {
                         }
                     }
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 if !self.ordinary_function_has_own_symbol_property_for_extensibility(fid, sym)
                     && !self.ordinary_function_is_extensible(fid)
                 {
@@ -1582,7 +1582,7 @@ impl Interpreter {
                 }
                 let bag =
                     self.function_user_bag_stack_rooted(stack, fid, &[&recv, &idx_value, &value])?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on function".to_string(),
                     });
@@ -1591,7 +1591,7 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(native) = recv.as_native_function() {
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 match native.own_property_descriptor(&mut self.gc_heap, &key)? {
                     Some(desc) if !desc.writable() => {
@@ -1617,7 +1617,7 @@ impl Interpreter {
                         }
                     }
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let desc = object::PartialPropertyDescriptor {
                     value: Some(value),
                     writable: Some(true),
@@ -1631,7 +1631,7 @@ impl Interpreter {
             }
         } else if let Some(bound) = recv.as_bound_function() {
             let bound = &bound;
-            if let Some(key) = idx_value.as_string() {
+            if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 match function_metadata::bound_own_property_descriptor(
                     bound,
@@ -1666,11 +1666,11 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(arr) = recv.as_array() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 // §22.1 Array exotic — symbol-keyed writes land in
                 // per-array symbol-property table.
                 crate::array::set_symbol_property(arr, &mut self.gc_heap, sym, value);
-            } else if let Some(key) = idx_value.as_string() {
+            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
                 if self.store_array_accessor_property(context, arr, &name, &value, strict)? {
                     // Accessor setter handled assignment.
@@ -1747,7 +1747,7 @@ impl Interpreter {
             } else {
                 return Err(VmError::TypeMismatch);
             }
-        } else if let Some(t) = recv.as_typed_array() {
+        } else if let Some(t) = recv.as_typed_array(&self.gc_heap) {
             if let Some(n) = idx_value.as_number() {
                 // §10.4.5.14 IntegerIndexedElementSet.
                 match n.as_smi() {
@@ -1761,7 +1761,7 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::TypeMismatch),
                 }
-            } else if let Some(key) = idx_value.as_string() {
+            } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(nf) = canonical_numeric_index_string(&name) {
                     if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
@@ -1782,9 +1782,9 @@ impl Interpreter {
                 } else {
                     typed_array_set_expando(self, &t, &name, value)?;
                 }
-            } else if let Some(sym) = idx_value.as_symbol() {
+            } else if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let bag = typed_array_ensure_expando(self, &t)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on TypedArray".to_string(),
                     });
@@ -1793,7 +1793,7 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(r) = recv.as_regexp() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 // §22.2.6 — symbol-keyed writes land in expando bag.
                 let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
                     object::get_own_symbol_descriptor(bag, &self.gc_heap, sym).is_none()
@@ -1807,7 +1807,7 @@ impl Interpreter {
                     return Ok(());
                 }
                 let bag = regexp_ensure_expando(self, &r, &recv)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on RegExp".to_string(),
                     });
@@ -1816,9 +1816,9 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(p) = recv.as_promise() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let bag = promise_ensure_expando_pub(&mut self.gc_heap, &p)?;
-                if !crate::object::set_symbol(bag, &mut self.gc_heap, *sym, value) {
+                if !crate::object::set_symbol(bag, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on Promise".to_string(),
                     });
@@ -1827,9 +1827,9 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             }
         } else if let Some(c) = recv.as_class_constructor() {
-            if let Some(sym) = idx_value.as_symbol() {
+            if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 let statics = c.statics(&self.gc_heap);
-                if !crate::object::set_symbol(statics, &mut self.gc_heap, *sym, value) {
+                if !crate::object::set_symbol(statics, &mut self.gc_heap, sym, value) {
                     return Err(VmError::TypeError {
                         message: "Cannot store symbol property on class constructor".to_string(),
                     });
@@ -1935,13 +1935,13 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         obj: JsObject,
-        sym: &crate::symbol::JsSymbol,
+        sym: crate::symbol::JsSymbol,
         value: Value,
         strict: bool,
     ) -> Result<(), VmError> {
         match crate::object::resolve_symbol_set(obj, &self.gc_heap, sym) {
             object::SetOutcome::AssignData => {
-                if !crate::object::set_symbol(obj, &mut self.gc_heap, *sym, value) {
+                if !crate::object::set_symbol(obj, &mut self.gc_heap, sym, value) {
                     Self::failed_set_result(strict, "Cannot assign to symbol property")?;
                 }
                 Ok(())
@@ -2195,7 +2195,7 @@ impl Interpreter {
         {
             let own_present = if let Some(fid) = receiver
                 .as_function()
-                .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+                .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
             {
                 self.function_user_props
                     .get(&fid)
@@ -2242,7 +2242,7 @@ impl Interpreter {
             c.statics(&self.gc_heap)
         } else if let Some(fid) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             match self.function_user_props.get(&fid).copied() {
                 Some(bag) => bag,
@@ -2315,12 +2315,12 @@ impl Interpreter {
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
-        let key = if let Some(s) = key_value.as_string() {
+        let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
         } else if let Some(n) = key_value.as_number() {
             VmPropertyKey::OwnedString(n.to_display_string())
-        } else if let Some(sym) = key_value.as_symbol() {
-            VmPropertyKey::Symbol(*sym)
+        } else if let Some(sym) = key_value.as_symbol(&self.gc_heap) {
+            VmPropertyKey::Symbol(sym)
         } else {
             return Ok(false);
         };
@@ -2423,7 +2423,7 @@ impl Interpreter {
             class.statics(&self.gc_heap)
         } else if let Some(fid) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             let Some(bag) = self.function_user_props.get(&fid).copied() else {
                 return Ok(false);
@@ -2433,7 +2433,7 @@ impl Interpreter {
             return Ok(false);
         };
         let lookup = match &key {
-            VmPropertyKey::Symbol(sym) => crate::object::lookup_symbol(obj, &self.gc_heap, sym),
+            VmPropertyKey::Symbol(sym) => crate::object::lookup_symbol(obj, &self.gc_heap, *sym),
             _ => crate::object::lookup(
                 obj,
                 &self.gc_heap,
@@ -2545,7 +2545,7 @@ impl Interpreter {
                 {
                     let lookup = match &key {
                         VmPropertyKey::Symbol(sym) => {
-                            object::lookup_own_symbol(obj, &self.gc_heap, sym)
+                            object::lookup_own_symbol(obj, &self.gc_heap, *sym)
                         }
                         _ => object::lookup_own(
                             obj,
@@ -2619,7 +2619,7 @@ impl Interpreter {
                             };
                             match &key {
                                 VmPropertyKey::Symbol(sym) => {
-                                    match object::resolve_symbol_set(target, &self.gc_heap, sym) {
+                                    match object::resolve_symbol_set(target, &self.gc_heap, *sym) {
                                         object::SetOutcome::AssignData => {}
                                         object::SetOutcome::InvokeSetter { setter } => {
                                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2711,12 +2711,12 @@ impl Interpreter {
             String(String),
             Symbol(crate::symbol::JsSymbol),
         }
-        let key = if let Some(s) = key_value.as_string() {
+        let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
             ComputedPropertyKey::String(s.to_lossy_string(&self.gc_heap))
         } else if let Some(n) = key_value.as_number() {
             ComputedPropertyKey::String(n.to_display_string())
-        } else if let Some(sym) = key_value.as_symbol() {
-            ComputedPropertyKey::Symbol(*sym)
+        } else if let Some(sym) = key_value.as_symbol(&self.gc_heap) {
+            ComputedPropertyKey::Symbol(sym)
         } else {
             return Ok(false);
         };
@@ -2763,7 +2763,7 @@ impl Interpreter {
                             object::resolve_set(target, &self.gc_heap, key)
                         }
                         ComputedPropertyKey::Symbol(sym) => {
-                            object::resolve_symbol_set(target, &self.gc_heap, sym)
+                            object::resolve_symbol_set(target, &self.gc_heap, *sym)
                         }
                     };
                     match outcome {
@@ -2864,7 +2864,7 @@ impl Interpreter {
             (receiver.as_native_function(), &key)
         {
             let obj = native.own_properties_object(&self.gc_heap);
-            match object::resolve_symbol_set(obj, &self.gc_heap, sym) {
+            match object::resolve_symbol_set(obj, &self.gc_heap, *sym) {
                 object::SetOutcome::AssignData => {
                     if !object::set_symbol(obj, &mut self.gc_heap, *sym, value) {
                         return Self::finish_failed_set(
@@ -2944,7 +2944,7 @@ impl Interpreter {
                 }
                 ComputedPropertyKey::Symbol(sym) => {
                     let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
-                        object::get_own_symbol_descriptor(bag, &self.gc_heap, sym).is_none()
+                        object::get_own_symbol_descriptor(bag, &self.gc_heap, *sym).is_none()
                     });
                     if absent && !r.is_extensible(&self.gc_heap) {
                         return Self::finish_failed_set(
@@ -2973,7 +2973,7 @@ impl Interpreter {
             class.statics(&self.gc_heap)
         } else if let Some(fid) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             match &key {
                 ComputedPropertyKey::String(key) => {
@@ -3001,7 +3001,7 @@ impl Interpreter {
                     }
                 }
                 ComputedPropertyKey::Symbol(sym) => {
-                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(fid, sym)
+                    if !self.ordinary_function_has_own_symbol_property_for_extensibility(fid, *sym)
                         && !self.ordinary_function_is_extensible(fid)
                     {
                         return Self::finish_failed_set(
@@ -3019,7 +3019,7 @@ impl Interpreter {
         let outcome = match &key {
             ComputedPropertyKey::String(key) => crate::object::resolve_set(obj, &self.gc_heap, key),
             ComputedPropertyKey::Symbol(sym) => {
-                crate::object::resolve_symbol_set(obj, &self.gc_heap, sym)
+                crate::object::resolve_symbol_set(obj, &self.gc_heap, *sym)
             }
         };
         match outcome {
@@ -3323,7 +3323,7 @@ impl Interpreter {
             c.statics(&self.gc_heap)
         } else if let Some(fid) = receiver
             .as_function()
-            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
         {
             if function_metadata::ordinary_function_metadata_key(name).is_some()
                 && let Some(desc) =
@@ -3442,7 +3442,7 @@ impl Interpreter {
         if !(rhs.is_object() || rhs.is_proxy()) {
             return Ok(false);
         };
-        if let (Some(obj), Some(key_string)) = (rhs.as_object(), lhs.as_string()) {
+        if let (Some(obj), Some(key_string)) = (rhs.as_object(), lhs.as_string(&self.gc_heap)) {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
@@ -3484,9 +3484,9 @@ impl Interpreter {
             self.has_property_ics[site]
                 .disable_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
         }
-        let key = if let Some(sym) = lhs.as_symbol() {
-            VmPropertyKey::Symbol(*sym)
-        } else if let Some(s) = lhs.as_string() {
+        let key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
+            VmPropertyKey::Symbol(sym)
+        } else if let Some(s) = lhs.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
         } else {
             VmPropertyKey::OwnedString(lhs.display_string(&self.gc_heap))
@@ -3637,9 +3637,9 @@ fn string_index_property_name(key: &str) -> Option<u32> {
 }
 
 fn has_object_property(interpreter: &Interpreter, obj: JsObject, key: &Value) -> bool {
-    if let Some(s) = key.as_symbol() {
+    if let Some(s) = key.as_symbol(&interpreter.gc_heap) {
         crate::object::get_symbol(obj, &interpreter.gc_heap, s).is_some()
-    } else if let Some(s) = key.as_string() {
+    } else if let Some(s) = key.as_string(&interpreter.gc_heap) {
         let k = s.to_lossy_string(&interpreter.gc_heap);
         !matches!(
             crate::object::lookup(obj, &interpreter.gc_heap, &k),
@@ -3671,7 +3671,7 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
                     .is_some()
             }
         }
-    } else if let Some(s) = key.as_string() {
+    } else if let Some(s) = key.as_string(&interpreter.gc_heap) {
         let k = s.to_lossy_string(&interpreter.gc_heap);
         if k == "length" {
             return true;
@@ -3683,7 +3683,7 @@ fn has_array_property(interpreter: &Interpreter, arr: JsArray, key: &Value) -> b
         }
         // §22.1.4 — surface named-property side table for `in`.
         crate::array::get_named_property(arr, &interpreter.gc_heap, &k).is_some()
-    } else if let Some(sym) = key.as_symbol() {
+    } else if let Some(sym) = key.as_symbol(&interpreter.gc_heap) {
         // §22.1 Array exotic — symbol-keyed own table.
         crate::array::get_symbol_property(arr, &interpreter.gc_heap, sym).is_some()
     } else {
@@ -3696,7 +3696,7 @@ fn has_class_static_property(
     class: &ClassConstructor,
     key: &Value,
 ) -> bool {
-    if let Some(s) = key.as_string() {
+    if let Some(s) = key.as_string(&interpreter.gc_heap) {
         let k = s.to_lossy_string(&interpreter.gc_heap);
         if k == "prototype" {
             return true;

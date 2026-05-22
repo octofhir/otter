@@ -277,7 +277,7 @@ pub fn finalization_registry_register(
     unregister_token: Option<&Value>,
 ) -> Result<(), crate::VmError> {
     let target_raw = weak_target_raw(target)?;
-    if held_value.as_gc_raw() == Some(target_raw) {
+    if held_value.as_raw_gc() == Some(target_raw) {
         return Err(crate::VmError::TypeMismatch);
     }
     let barrier_held_value = held_value;
@@ -393,7 +393,7 @@ pub fn process_weak_refs_and_finalizers(heap: &mut otter_gc::GcHeap) -> Vec<Fina
 }
 
 fn weak_target_raw(value: &Value) -> Result<RawGc, crate::VmError> {
-    value.as_gc_raw().ok_or(crate::VmError::TypeMismatch)
+    value.as_raw_gc().ok_or(crate::VmError::TypeMismatch)
 }
 
 fn raw_to_value(heap: &otter_gc::GcHeap, raw: RawGc) -> Option<Value> {

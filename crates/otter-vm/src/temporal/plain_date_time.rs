@@ -57,7 +57,7 @@ fn parse_arg(
     method: &'static str,
 ) -> Result<temporal_rs::PlainDateTime, TemporalError> {
     let arg = args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(gc_heap)) {
         match t.payload_clone(gc_heap) {
             TemporalPayload::PlainDateTime(v) => Ok(v),
             _ => Err(TemporalError::BadArgument {
@@ -67,7 +67,7 @@ fn parse_arg(
                 reason: "must be a Temporal.PlainDateTime",
             }),
         }
-    } else if let Some(s) = arg.and_then(|v| v.as_string()) {
+    } else if let Some(s) = arg.and_then(|v| v.as_string(gc_heap)) {
         temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
             TemporalError::Engine {
                 class: "PlainDateTime",
@@ -87,7 +87,7 @@ fn parse_arg(
 
 /// Property reads on a `Temporal.PlainDateTime` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     let pdt = match temporal.payload_clone(gc_heap) {
         TemporalPayload::PlainDateTime(v) => v,
         _ => return Value::undefined(),
@@ -142,7 +142,7 @@ fn duration_arg(
         reason: "must be a Temporal.Duration",
     };
     let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(bad()),

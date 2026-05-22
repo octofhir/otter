@@ -97,7 +97,7 @@ impl MapKey {
     /// 2. Object-shaped values map to [`MapKey::ObjectValue`] so the key is a
     ///    traced slot. This keeps identity stable across young-generation
     ///    relocation.
-    pub fn from_value(value: &Value) -> Self {
+    pub fn from_value(value: &Value, heap: &otter_gc::GcHeap) -> Self {
         if value.is_undefined() {
             MapKey::Undefined
         } else if value.is_null() {
@@ -111,10 +111,10 @@ impl MapKey {
             MapKey::Number(normalised)
         } else if let Some(b) = value.as_big_int() {
             MapKey::BigInt(b)
-        } else if let Some(s) = value.as_string() {
-            MapKey::String(*s)
-        } else if let Some(s) = value.as_symbol() {
-            MapKey::Symbol(*s)
+        } else if let Some(s) = value.as_string(heap) {
+            MapKey::String(s)
+        } else if let Some(s) = value.as_symbol(heap) {
+            MapKey::Symbol(s)
         } else {
             // Object-shaped values map to ObjectValue (identity).
             MapKey::ObjectValue(*value)
@@ -146,9 +146,9 @@ impl MapKey {
                 if a.cached_hash() != b.cached_hash() || a.len() != b.len() {
                     return false;
                 }
-                a.equals(b, heap)
+                a.equals(*b, heap)
             }
-            (MapKey::Symbol(a), MapKey::Symbol(b)) => a.ptr_eq(b),
+            (MapKey::Symbol(a), MapKey::Symbol(b)) => a.ptr_eq(*b),
             (MapKey::ObjectValue(a), MapKey::ObjectValue(b)) => a == b,
             _ => false,
         }
@@ -309,7 +309,7 @@ pub fn map_is_empty(map: JsMap, heap: &otter_gc::GcHeap) -> bool {
 /// `Map.prototype.get` — Spec §24.1.3.6.
 #[must_use]
 pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value> {
-    let k = MapKey::from_value(key);
+    let k = MapKey::from_value(key, heap);
     heap.read_payload(map, |body| {
         body.entries
             .iter()
@@ -321,7 +321,7 @@ pub fn map_get(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> Option<Value
 /// `Map.prototype.has` — Spec §24.1.3.7.
 #[must_use]
 pub fn map_has(map: JsMap, heap: &otter_gc::GcHeap, key: &Value) -> bool {
-    let k = MapKey::from_value(key);
+    let k = MapKey::from_value(key, heap);
     heap.read_payload(map, |body| {
         body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     })
@@ -337,7 +337,7 @@ pub fn map_set(
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_key = key;
     let barrier_value = value;
-    let k = MapKey::from_value(&key);
+    let k = MapKey::from_value(&key, heap);
     let existing_idx = heap.read_payload(map, |body| {
         body.entries
             .iter()
@@ -373,7 +373,7 @@ pub(crate) fn map_set_with_roots(
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_key = key;
     let barrier_value = value;
-    let k = MapKey::from_value(&key);
+    let k = MapKey::from_value(&key, heap);
     let existing_idx = heap.read_payload(*map, |body| {
         body.entries
             .iter()
@@ -403,7 +403,7 @@ pub(crate) fn map_set_with_roots(
 /// `Map.prototype.delete` — Spec §24.1.3.3. Returns `true` when
 /// the entry existed.
 pub fn map_delete(map: JsMap, heap: &mut otter_gc::GcHeap, key: &Value) -> bool {
-    let k = MapKey::from_value(key);
+    let k = MapKey::from_value(key, heap);
     let idx = heap.read_payload(map, |body| {
         body.entries
             .iter()
@@ -586,7 +586,7 @@ pub fn set_is_empty(set: JsSet, heap: &otter_gc::GcHeap) -> bool {
 /// `Set.prototype.has` — Spec §24.2.3.7.
 #[must_use]
 pub fn set_has(set: JsSet, heap: &otter_gc::GcHeap, value: &Value) -> bool {
-    let k = MapKey::from_value(value);
+    let k = MapKey::from_value(value, heap);
     heap.read_payload(set, |body| {
         body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     })
@@ -599,7 +599,7 @@ pub fn set_add(
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_value = value;
-    let k = MapKey::from_value(&value);
+    let k = MapKey::from_value(&value, heap);
     let exists = heap.read_payload(set, |body| {
         body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     });
@@ -625,7 +625,7 @@ pub(crate) fn set_add_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
     let barrier_value = value;
-    let k = MapKey::from_value(&value);
+    let k = MapKey::from_value(&value, heap);
     let exists = heap.read_payload(*set, |body| {
         body.entries.iter().any(|entry| entry.key_matches(&k, heap))
     });
@@ -646,7 +646,7 @@ pub(crate) fn set_add_with_roots(
 
 /// `Set.prototype.delete` — Spec §24.2.3.4.
 pub fn set_delete(set: JsSet, heap: &mut otter_gc::GcHeap, value: &Value) -> bool {
-    let k = MapKey::from_value(value);
+    let k = MapKey::from_value(value, heap);
     let idx = heap.read_payload(set, |body| {
         body.entries
             .iter()
@@ -714,7 +714,7 @@ impl WeakCollectionKey {
     fn matches(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Object(a), Self::Object(b)) => a == b,
-            (Self::Symbol(a), Self::Symbol(b)) => a.ptr_eq(b),
+            (Self::Symbol(a), Self::Symbol(b)) => a.ptr_eq(*b),
             _ => false,
         }
     }
@@ -801,7 +801,7 @@ pub fn weak_map_get(
     heap: &otter_gc::GcHeap,
     key: &Value,
 ) -> Result<Option<Value>, CollectionError> {
-    let key = weak_collection_key(key)?;
+    let key = weak_collection_key(key, heap)?;
     Ok(heap.read_payload(map, |body| {
         body.entries
             .iter()
@@ -815,7 +815,7 @@ pub fn weak_map_has(
     heap: &otter_gc::GcHeap,
     key: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = weak_collection_key(key)?;
+    let key = weak_collection_key(key, heap)?;
     Ok(heap.read_payload(map, |body| {
         body.entries
             .iter()
@@ -844,7 +844,7 @@ pub fn weak_map_set(
     let barrier_value = value;
     let key_root = key;
     let value_root = value;
-    let key_for_exists = weak_collection_key(&key)?;
+    let key_for_exists = weak_collection_key(&key, heap)?;
     let exists = heap.read_payload(map, |body| {
         body.entries
             .iter()
@@ -858,7 +858,7 @@ pub fn weak_map_set(
         };
         reserve_weak_map_for_target_len_with_roots(&mut map, heap, target_len, &mut reserve_roots)?;
     }
-    let key = weak_collection_key(&key)?;
+    let key = weak_collection_key(&key, heap)?;
     heap.with_payload(map, |body| {
         if let Some((_, existing)) = body
             .entries
@@ -885,7 +885,7 @@ pub(crate) fn weak_map_set_with_roots(
     let barrier_value = value;
     let key_root = key;
     let value_root = value;
-    let key = weak_collection_key(&key)?;
+    let key = weak_collection_key(&key, heap)?;
     let exists = heap.read_payload(*map, |body| {
         body.entries
             .iter()
@@ -925,7 +925,7 @@ pub fn weak_map_delete(
     heap: &mut otter_gc::GcHeap,
     key: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = weak_collection_key(key)?;
+    let key = weak_collection_key(key, heap)?;
     Ok(heap.with_payload(map, |body| {
         if let Some(index) = body
             .entries
@@ -1015,7 +1015,7 @@ pub fn weak_set_has(
     heap: &otter_gc::GcHeap,
     value: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = weak_collection_key(value)?;
+    let key = weak_collection_key(value, heap)?;
     Ok(heap.read_payload(set, |body| {
         body.entries.iter().any(|entry_key| entry_key.matches(&key))
     }))
@@ -1039,7 +1039,7 @@ pub fn weak_set_add(
     value: Value,
 ) -> Result<(), CollectionError> {
     let value_root = value;
-    let key_for_exists = weak_collection_key(&value)?;
+    let key_for_exists = weak_collection_key(&value, heap)?;
     let exists = heap.read_payload(set, |body| {
         body.entries
             .iter()
@@ -1052,7 +1052,7 @@ pub fn weak_set_add(
         };
         reserve_weak_set_for_target_len_with_roots(&mut set, heap, target_len, &mut reserve_roots)?;
     }
-    let key = weak_collection_key(&value)?;
+    let key = weak_collection_key(&value, heap)?;
     heap.with_payload(set, |body| {
         if !body.entries.iter().any(|entry_key| entry_key.matches(&key)) {
             body.entries.push(key);
@@ -1069,7 +1069,7 @@ pub(crate) fn weak_set_add_with_roots(
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), CollectionError> {
     let value_root = value;
-    let key = weak_collection_key(&value)?;
+    let key = weak_collection_key(&value, heap)?;
     let exists = heap.read_payload(*set, |body| {
         body.entries.iter().any(|entry_key| entry_key.matches(&key))
     });
@@ -1099,7 +1099,7 @@ pub fn weak_set_delete(
     heap: &mut otter_gc::GcHeap,
     value: &Value,
 ) -> Result<bool, CollectionError> {
-    let key = weak_collection_key(value)?;
+    let key = weak_collection_key(value, heap)?;
     Ok(heap.with_payload(set, |body| {
         if let Some(index) = body
             .entries
@@ -1131,12 +1131,12 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
                         for (key, value) in &body.entries {
                             match key {
                                 WeakCollectionKey::Object(raw) if heap.is_marked(*raw) => {
-                                    if let Some(value_raw) = value.as_gc_raw() {
+                                    if let Some(value_raw) = value.as_raw_gc() {
                                         additions.push(value_raw);
                                     }
                                 }
                                 WeakCollectionKey::Symbol(_) => {
-                                    if let Some(value_raw) = value.as_gc_raw() {
+                                    if let Some(value_raw) = value.as_raw_gc() {
                                         additions.push(value_raw);
                                     }
                                 }
@@ -1204,14 +1204,17 @@ pub fn run_ephemeron_fixpoint(heap: &mut otter_gc::GcHeap) {
 }
 
 /// Project a value accepted by `CanBeHeldWeakly` to a weak collection key.
-fn weak_collection_key(value: &Value) -> Result<WeakCollectionKey, CollectionError> {
-    if let Some(raw) = value.as_gc_raw() {
+fn weak_collection_key(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<WeakCollectionKey, CollectionError> {
+    if let Some(raw) = value.as_raw_gc() {
         return Ok(WeakCollectionKey::Object(raw));
     }
-    if let Some(symbol) = value.as_symbol()
+    if let Some(symbol) = value.as_symbol(heap)
         && !symbol.is_registered()
     {
-        return Ok(WeakCollectionKey::Symbol(*symbol));
+        return Ok(WeakCollectionKey::Symbol(symbol));
     }
     Err(CollectionError::NonObjectKey)
 }
@@ -1452,7 +1455,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut m = alloc_map(&mut heap).unwrap();
         let key = young_object_value(&mut heap);
-        let before = key.as_gc_raw().unwrap();
+        let before = key.as_raw_gc().unwrap();
 
         map_set(m, &mut heap, key, n(42)).unwrap();
 
@@ -1462,7 +1465,7 @@ mod tests {
         };
         heap.collect_minor_with_roots(&mut roots);
 
-        let after = key.as_gc_raw().unwrap();
+        let after = key.as_raw_gc().unwrap();
         assert_ne!(after, before);
         assert!(map_has(m, &heap, &key));
         assert_eq!(map_get(m, &heap, &key), Some(n(42)));
@@ -1474,7 +1477,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut s = alloc_set(&mut heap).unwrap();
         let key = young_object_value(&mut heap);
-        let before = key.as_gc_raw().unwrap();
+        let before = key.as_raw_gc().unwrap();
 
         set_add(s, &mut heap, key).unwrap();
 
@@ -1484,7 +1487,7 @@ mod tests {
         };
         heap.collect_minor_with_roots(&mut roots);
 
-        let after = key.as_gc_raw().unwrap();
+        let after = key.as_raw_gc().unwrap();
         assert_ne!(after, before);
         assert!(set_has(s, &heap, &key));
         assert_eq!(set_values(s, &heap), vec![key]);
@@ -1516,8 +1519,8 @@ mod tests {
         let mut wm = alloc_weak_map(&mut heap).unwrap();
         let key = young_object_value(&mut heap);
         let value = young_object_value(&mut heap);
-        let key_before = key.as_gc_raw().unwrap();
-        let value_before = value.as_gc_raw().unwrap();
+        let key_before = key.as_raw_gc().unwrap();
+        let value_before = value.as_raw_gc().unwrap();
 
         weak_map_set(wm, &mut heap, key, value).unwrap();
 
@@ -1527,10 +1530,10 @@ mod tests {
         };
         heap.collect_minor_with_roots(&mut roots);
 
-        let key_after = key.as_gc_raw().unwrap();
+        let key_after = key.as_raw_gc().unwrap();
         let value_after = weak_map_get(wm, &heap, &key)
             .unwrap()
-            .and_then(|value| value.as_gc_raw())
+            .and_then(|value| value.as_raw_gc())
             .unwrap();
         assert_ne!(key_after, key_before);
         assert_ne!(value_after, value_before);
@@ -1559,7 +1562,7 @@ mod tests {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let mut ws = alloc_weak_set(&mut heap).unwrap();
         let key = young_object_value(&mut heap);
-        let before = key.as_gc_raw().unwrap();
+        let before = key.as_raw_gc().unwrap();
 
         weak_set_add(ws, &mut heap, key).unwrap();
 
@@ -1569,7 +1572,7 @@ mod tests {
         };
         heap.collect_minor_with_roots(&mut roots);
 
-        let after = key.as_gc_raw().unwrap();
+        let after = key.as_raw_gc().unwrap();
         assert_ne!(after, before);
         assert!(weak_set_has(ws, &heap, &key).unwrap());
     }

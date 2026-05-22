@@ -55,7 +55,7 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
 ];
 
 fn native_is_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::boolean(args.first().is_some_and(Value::is_array)))
+    Ok(Value::boolean(args.first().is_some_and(|v| v.is_array())))
 }
 
 /// §23.1.2.3 `Array.of(...items)` JS-visible NativeFunction.

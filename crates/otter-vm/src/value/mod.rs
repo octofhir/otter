@@ -79,9 +79,17 @@ use tag::*;
 ///
 /// `#[repr(transparent)] u64`. See module docs for the encoding
 /// contract.
+///
+/// `Value` is explicitly `!Send + !Sync`: even though the bit pattern
+/// is a plain `u64`, every pointer-tagged payload aliases a GC handle
+/// owned by exactly one isolate. The `PhantomData<*const ()>` second
+/// field (ZST) removes the auto-Send / auto-Sync impls without
+/// changing the runtime layout.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Value(u64);
+pub struct Value(u64, std::marker::PhantomData<*const ()>);
+
+const _NOT_SEND: std::marker::PhantomData<*const ()> = std::marker::PhantomData;
 
 // ---------------------------------------------------------------------------
 // Layout guards (Phase 1.1 — load-bearing).
@@ -204,15 +212,15 @@ impl Value {
     // -----------------------------------------------------------------------
 
     /// `undefined`.
-    pub const UNDEFINED: Value = Value(pack(TAG_SPECIAL, SPECIAL_UNDEFINED));
+    pub const UNDEFINED: Value = Value(pack(TAG_SPECIAL, SPECIAL_UNDEFINED), _NOT_SEND);
     /// `null`.
-    pub const NULL: Value = Value(pack(TAG_SPECIAL, SPECIAL_NULL));
+    pub const NULL: Value = Value(pack(TAG_SPECIAL, SPECIAL_NULL), _NOT_SEND);
     /// Internal "array hole" sentinel — never observed by user code.
-    pub const HOLE: Value = Value(pack(TAG_SPECIAL, SPECIAL_HOLE));
+    pub const HOLE: Value = Value(pack(TAG_SPECIAL, SPECIAL_HOLE), _NOT_SEND);
     /// `false`.
-    pub const FALSE: Value = Value(pack(TAG_SPECIAL, SPECIAL_FALSE));
+    pub const FALSE: Value = Value(pack(TAG_SPECIAL, SPECIAL_FALSE), _NOT_SEND);
     /// `true`.
-    pub const TRUE: Value = Value(pack(TAG_SPECIAL, SPECIAL_TRUE));
+    pub const TRUE: Value = Value(pack(TAG_SPECIAL, SPECIAL_TRUE), _NOT_SEND);
 
     // -----------------------------------------------------------------------
     // Bit-level access (audited helpers; not part of the public stable
@@ -224,7 +232,7 @@ impl Value {
     #[doc(hidden)]
     #[inline(always)]
     pub const fn from_bits(bits: u64) -> Self {
-        Self(bits)
+        Self(bits, _NOT_SEND)
     }
 
     /// Raw bit pattern. Diagnostic only.
@@ -270,7 +278,7 @@ impl Value {
     #[inline]
     #[must_use]
     pub const fn number_i32(n: i32) -> Self {
-        Self(pack(TAG_INT32, n as u32 as u64))
+        Self(pack(TAG_INT32, n as u32 as u64), _NOT_SEND)
     }
 
     /// Number from an `f64`. NaNs are canonicalised; integer-valued
@@ -280,9 +288,9 @@ impl Value {
     #[must_use]
     pub fn number_f64(d: f64) -> Self {
         if d.is_nan() {
-            return Self(CANONICAL_NAN);
+            return Self(CANONICAL_NAN, _NOT_SEND);
         }
-        Self(d.to_bits())
+        Self(d.to_bits(), _NOT_SEND)
     }
 
     /// Number from the runtime [`NumberValue`] view, preferring the
@@ -300,7 +308,7 @@ impl Value {
     #[inline]
     #[must_use]
     pub const fn function_id(id: u32) -> Self {
-        Self(pack(TAG_FUNCTION_ID, id as u64))
+        Self(pack(TAG_FUNCTION_ID, id as u64), _NOT_SEND)
     }
 
     // -----------------------------------------------------------------------
@@ -318,21 +326,21 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn from_object_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_OBJECT, raw.0 as u64))
+        Self(pack(TAG_PTR_OBJECT, raw.0 as u64), _NOT_SEND)
     }
 
     /// Build a string-family value (`TAG_PTR_STRING`).
     #[inline]
     #[must_use]
     pub fn from_string_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_STRING, raw.0 as u64))
+        Self(pack(TAG_PTR_STRING, raw.0 as u64), _NOT_SEND)
     }
 
     /// Build a callable-family value (`TAG_PTR_FUNCTION`).
     #[inline]
     #[must_use]
     pub fn from_function_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_FUNCTION, raw.0 as u64))
+        Self(pack(TAG_PTR_FUNCTION, raw.0 as u64), _NOT_SEND)
     }
 
     /// Build a "other primitive" value (`TAG_PTR_OTHER`) — symbols,
@@ -340,7 +348,7 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn from_other_gc(raw: otter_gc::raw::RawGc) -> Self {
-        Self(pack(TAG_PTR_OTHER, raw.0 as u64))
+        Self(pack(TAG_PTR_OTHER, raw.0 as u64), _NOT_SEND)
     }
 
     /// Build a closure value. Packs the [`JsClosure`] handle under
@@ -466,21 +474,21 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn string_gc(s: JsStringHandle) -> Self {
-        Self(pack(TAG_PTR_STRING, s.offset() as u64))
+        Self(pack(TAG_PTR_STRING, s.offset() as u64), _NOT_SEND)
     }
 
     /// BigInt value. Packs the [`BigIntHandle`] under `TAG_PTR_OTHER`.
     #[inline]
     #[must_use]
     pub fn big_int_gc(b: BigIntHandle) -> Self {
-        Self(pack(TAG_PTR_OTHER, b.offset() as u64))
+        Self(pack(TAG_PTR_OTHER, b.offset() as u64), _NOT_SEND)
     }
 
     /// Symbol value. Packs the [`SymbolHandle`] under `TAG_PTR_OTHER`.
     #[inline]
     #[must_use]
     pub fn symbol_gc(s: SymbolHandle) -> Self {
-        Self(pack(TAG_PTR_OTHER, s.offset() as u64))
+        Self(pack(TAG_PTR_OTHER, s.offset() as u64), _NOT_SEND)
     }
 
     /// `Temporal.*` value. Object-shaped per Temporal proposal §8.
@@ -783,6 +791,19 @@ impl Value {
     #[must_use]
     pub fn is_object_like(self) -> bool {
         top_tag(self.0) == TAG_PTR_OBJECT
+    }
+
+    /// ECMA-262 `Type(value) is Object` — any heap-backed reference
+    /// type (plain object, callable, exotic). Wider than
+    /// [`Self::is_object_like`], which is narrowed to TAG_PTR_OBJECT
+    /// only. Use this when implementing spec predicates that say
+    /// "If V is an Object" (e.g. `isPrototypeOf`, `instanceof`,
+    /// `OrdinaryCreateFromConstructor`, `IsConstructor` validation,
+    /// the `Object` ToPrimitive path).
+    #[inline]
+    #[must_use]
+    pub fn is_object_type(self) -> bool {
+        self.is_object_like() || self.is_callable()
     }
 
     /// `TAG_PTR_OTHER` family — symbol / bigint.
@@ -2032,7 +2053,7 @@ mod tests {
         use otter_gc::GcHeap;
 
         let mut heap = GcHeap::new().expect("heap");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
         let upvalues = vec![cell];
         let closure = alloc_closure(&mut heap, 99, upvalues, None).expect("alloc");
         let v = Value::closure(closure);
@@ -2075,7 +2096,7 @@ mod tests {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("obj");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
         let closure = alloc_closure(&mut heap, 1, vec![cell], None).expect("closure");
 
         let vobj = Value::object(obj);
@@ -2239,7 +2260,7 @@ mod tests {
         let mut heap = GcHeap::new().expect("heap");
         let mut roots = |_v: &mut dyn FnMut(*mut RawGc)| {};
         let obj = alloc_object_with_roots(&mut heap, &mut roots).expect("alloc");
-        let cell = alloc_upvalue(&mut heap, LegacyValue::Undefined).expect("cell");
+        let cell = alloc_upvalue(&mut heap, LegacyValue::undefined()).expect("cell");
         let closure = alloc_closure(&mut heap, 1, vec![cell], None).expect("closure");
 
         let vo = Value::object(obj);

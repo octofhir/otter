@@ -95,7 +95,7 @@ pub fn call_static(
         M::Now => Ok(Value::number_f64(now_ms())),
         // §21.4.3.2 Date.parse(str).
         M::Parse => {
-            let Some(s) = args.first().and_then(|v| v.as_string()) else {
+            let Some(s) = args.first().and_then(|v| v.as_string(heap)) else {
                 return Ok(Value::number_f64(f64::NAN));
             };
             Ok(Value::number_f64(parse_date(&s.to_lossy_string(heap))))
@@ -133,7 +133,7 @@ pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
         0 => now_ms(),
         1 => {
             let v = &args[0];
-            if let Some(s) = v.as_string() {
+            if let Some(s) = v.as_string(heap) {
                 parse_date(&s.to_lossy_string(heap))
             } else if let Some(n) = v.as_number() {
                 n.as_f64()

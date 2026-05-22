@@ -47,7 +47,7 @@ pub(crate) fn to_number_primitive(
     if value.is_big_int() || value.is_symbol() {
         return Err(VmError::TypeMismatch);
     }
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(gc_heap) {
         return Ok(number::to_number_from_string(&s.to_lossy_string(gc_heap)));
     }
     Ok(NumberValue::Double(f64::NAN))
@@ -57,7 +57,7 @@ pub(crate) fn to_string_primitive(
     value: &Value,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<String, VmError> {
-    if let Some(s) = value.as_string() {
+    if let Some(s) = value.as_string(gc_heap) {
         return Ok(s.to_lossy_string(gc_heap));
     }
     if let Some(n) = value.as_number() {
@@ -82,16 +82,27 @@ pub(crate) fn to_js_string_primitive(
     value: &Value,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<JsString, VmError> {
-    if let Some(s) = value.as_string() {
-        return Ok(*s);
+    if let Some(s) = value.as_string(gc_heap) {
+        return Ok(s);
     }
     if let Some(n) = value.as_number() {
         return number::ecma::number_to_string(n.as_f64(), gc_heap)
             .map_err(|_| VmError::TypeMismatch);
     }
-    // BigInt arm cannot fire here without a GcHeap; the caller is
-    // expected to coerce BigInt through
-    // `to_string_primitive(..., heap)` upstream of this helper.
+    if let Some(b) = value.as_boolean() {
+        let text = if b { "true" } else { "false" };
+        return JsString::from_str(text, gc_heap).map_err(|_| VmError::TypeMismatch);
+    }
+    if value.is_null() {
+        return JsString::from_str("null", gc_heap).map_err(|_| VmError::TypeMismatch);
+    }
+    if value.is_undefined() || value.is_hole() {
+        return JsString::from_str("undefined", gc_heap).map_err(|_| VmError::TypeMismatch);
+    }
+    if let Some(b) = value.as_big_int() {
+        let text = b.to_decimal_string(gc_heap);
+        return JsString::from_str(&text, gc_heap).map_err(|_| VmError::TypeMismatch);
+    }
     Err(VmError::TypeMismatch)
 }
 
@@ -102,7 +113,7 @@ pub(crate) fn string_constructor_js_string(
     let Some(value) = value else {
         return JsString::empty(gc_heap).map_err(|_| VmError::TypeMismatch);
     };
-    if let Some(s) = value.as_symbol() {
+    if let Some(s) = value.as_symbol(gc_heap) {
         return JsString::from_str(&s.descriptive_string(gc_heap), gc_heap)
             .map_err(|_| VmError::TypeMismatch);
     }
@@ -163,7 +174,7 @@ impl Interpreter {
             return Ok(None);
         };
         let to_primitive_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, &to_primitive_sym) else {
+        let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, to_primitive_sym) else {
             return Ok(None);
         };
         if !self.is_callable_runtime(&callee) {
@@ -299,7 +310,7 @@ impl Interpreter {
             return Ok(None);
         };
         let lookup = match key {
-            VmPropertyKey::Symbol(sym) => object::lookup_symbol(proto, &self.gc_heap, sym),
+            VmPropertyKey::Symbol(sym) => object::lookup_symbol(proto, &self.gc_heap, *sym),
             _ => object::lookup(
                 proto,
                 &self.gc_heap,
@@ -437,7 +448,7 @@ impl Interpreter {
                 return Some(proto);
             }
             "DataView"
-        } else if let Some(t) = value.as_typed_array() {
+        } else if let Some(t) = value.as_typed_array(&self.gc_heap) {
             if let Some(proto) = self
                 .non_gc_exotic_prototype_override(value)
                 .and_then(|v| v.as_object())

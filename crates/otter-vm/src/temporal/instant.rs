@@ -96,7 +96,7 @@ fn parse_instant_arg(
     method: &'static str,
 ) -> Result<temporal_rs::Instant, TemporalError> {
     let arg = args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(gc_heap)) {
         match t.payload_clone(gc_heap) {
             TemporalPayload::Instant(v) => Ok(v),
             _ => Err(TemporalError::BadArgument {
@@ -106,7 +106,7 @@ fn parse_instant_arg(
                 reason: "must be a Temporal.Instant",
             }),
         }
-    } else if let Some(s) = arg.and_then(|v| v.as_string()) {
+    } else if let Some(s) = arg.and_then(|v| v.as_string(gc_heap)) {
         temporal_rs::Instant::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
             TemporalError::Engine {
                 class: "Instant",
@@ -128,7 +128,7 @@ fn parse_instant_arg(
 /// `epochNanoseconds` accessor allocates a BigInt body and so takes
 /// `&mut GcHeap`; the `epochMilliseconds` arm is heap-free but
 /// shares the signature for uniform dispatch.
-pub fn load_property(temporal: &JsTemporal, gc_heap: &mut otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, gc_heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     let inst = match temporal.payload_clone(gc_heap) {
         TemporalPayload::Instant(v) => v,
         _ => return Value::undefined(),
@@ -181,7 +181,7 @@ fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
     let first = args.args.first();
-    let other = if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+    let other = if let Some(t) = first.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Instant(v) => v,
             _ => {
@@ -191,7 +191,7 @@ fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
         }
-    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+    } else if let Some(s) = first.and_then(|v| v.as_string(args.gc_heap)) {
         temporal_rs::Instant::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
             .map_err(temporal_err)?
     } else {
@@ -213,7 +213,7 @@ fn arg_as_duration(
         reason: "must be a Temporal.Duration",
     };
     let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(bad()),

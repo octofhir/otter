@@ -61,7 +61,7 @@ fn require_date_time(args: &IntrinsicArgs<'_>) -> Result<DateTimeFormatPayload, 
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.DateTimeFormat",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::DateTimeFormat(d) => Ok(d),
         _ => Err(bad()),
@@ -73,7 +73,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let first = args.args.first();
     let formatted = if let Some(n) = first.and_then(|v| v.as_number()) {
         format_epoch_ms(n.as_f64() as i64, &payload)
-    } else if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+    } else if let Some(t) = first.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDateTime(pdt) => format_pdt(&pdt, &payload),
             TemporalPayload::PlainDate(pd) => format_pd(&pd, &payload),

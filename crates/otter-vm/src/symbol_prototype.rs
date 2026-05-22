@@ -24,9 +24,9 @@ use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, Intrin
 use crate::string::JsString;
 use crate::{JsSymbol, Value};
 
-fn receiver_symbol<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsSymbol, IntrinsicError> {
+fn receiver_symbol(args: &IntrinsicArgs<'_>) -> Result<JsSymbol, IntrinsicError> {
     args.receiver
-        .as_symbol()
+        .as_symbol(args.gc_heap)
         .ok_or(IntrinsicError::BadReceiver { expected: "symbol" })
 }
 
@@ -42,14 +42,14 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// receiver symbol primitive.
 fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
-    Ok(Value::symbol(*sym))
+    Ok(Value::symbol(sym))
 }
 
 /// `Symbol.prototype[@@toPrimitive]` — Spec §20.4.3.5. The hint is
 /// ignored; the symbol primitive is returned for every hint.
 fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let sym = receiver_symbol(args)?;
-    Ok(Value::symbol(*sym))
+    Ok(Value::symbol(sym))
 }
 
 /// Read a non-method property off `Symbol.prototype`-bearing
@@ -62,7 +62,7 @@ fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-symbol.prototype.description>
 #[must_use]
-pub fn load_property(sym: &JsSymbol, name: &str) -> Value {
+pub fn load_property(sym: JsSymbol, name: &str) -> Value {
     if name == "description" {
         match sym.description() {
             Some(s) => Value::string(*s),
@@ -119,9 +119,9 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let s = JsString::from_str("ok", &mut gc_heap).unwrap();
         let sym = JsSymbol::new(&mut gc_heap, Some(s)).unwrap();
-        let value = load_property(&sym, "description");
+        let value = load_property(sym, "description");
         assert_eq!(value.display_string(&gc_heap), "ok");
         let no_desc = JsSymbol::new(&mut gc_heap, None).unwrap();
-        assert!(load_property(&no_desc, "description").is_undefined());
+        assert!(load_property(no_desc, "description").is_undefined());
     }
 }

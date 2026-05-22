@@ -353,7 +353,7 @@ fn coerce_all(
             NumberValue::Smi(0)
         } else if v.is_undefined() {
             NumberValue::Double(f64::NAN)
-        } else if let Some(s) = v.as_string() {
+        } else if let Some(s) = v.as_string(heap) {
             // §7.1.4 ToNumber on String.
             crate::number::parse::to_number_from_string(&s.to_lossy_string(heap))
         } else if v.is_big_int() {
@@ -655,7 +655,7 @@ mod tests {
     use super::*;
 
     fn n(v: i32) -> Value {
-        Value::Number(NumberValue::Smi(v))
+        Value::number(NumberValue::Smi(v))
     }
 
     #[test]
@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(r.as_number().unwrap().as_smi(), Some(3));
         let nan_r = call(
             MathMethod::Max,
-            &[n(1), Value::Number(NumberValue::Double(f64::NAN))],
+            &[n(1), Value::number(NumberValue::Double(f64::NAN))],
             &heap,
         )
         .unwrap();

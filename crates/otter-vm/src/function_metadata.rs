@@ -318,7 +318,7 @@ pub(crate) fn bound_create_metadata_from_values(
     heap: &otter_gc::GcHeap,
 ) -> BoundFunctionCreateMetadata {
     let target_name = target_name
-        .as_string()
+        .as_string(heap)
         .map(|s| s.to_lossy_string(heap))
         .unwrap_or_default();
     let target_len = target_length
@@ -353,11 +353,11 @@ fn callable_metadata_value(
 fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Result<String, VmError> {
     if let Some(fid) = callee
         .as_function()
-        .or_else(|| callee.as_closure().map(|c| c.cached_function_id))
+        .or_else(|| callee.as_closure(ctx.heap()).map(|c| c.cached_function_id))
     {
         if let Some(value) = ordinary_function_user_property(ctx, fid, "name") {
             return Ok(value
-                .as_string()
+                .as_string(ctx.heap())
                 .map(|s| s.to_lossy_string(ctx.heap()))
                 .unwrap_or_default());
         }
@@ -370,7 +370,7 @@ fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Resul
     if let Some(native) = callee.as_native_function() {
         return match native.own_property_descriptor(ctx.gc_heap, "name")? {
             Some(desc) => Ok(descriptor_value(&desc)
-                .as_string()
+                .as_string(ctx.heap())
                 .map(|s| s.to_lossy_string(ctx.heap()))
                 .unwrap_or_default()),
             None => Ok(String::new()),
@@ -379,7 +379,7 @@ fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Resul
     if let Some(bound) = callee.as_bound_function() {
         return match bound_own_property_descriptor(&bound, ctx.gc_heap, "name")? {
             Some(desc) => Ok(descriptor_value(&desc)
-                .as_string()
+                .as_string(ctx.heap())
                 .map(|s| s.to_lossy_string(ctx.heap()))
                 .unwrap_or_default()),
             None => Ok(String::new()),
@@ -402,7 +402,7 @@ fn callable_name(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Resul
 fn callable_length(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Result<f64, VmError> {
     if let Some(fid) = callee
         .as_function()
-        .or_else(|| callee.as_closure().map(|c| c.cached_function_id))
+        .or_else(|| callee.as_closure(ctx.heap()).map(|c| c.cached_function_id))
     {
         if let Some(value) = ordinary_function_user_property(ctx, fid, "length") {
             return Ok(value

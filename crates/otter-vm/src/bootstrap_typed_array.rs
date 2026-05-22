@@ -338,7 +338,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         object::define_own_symbol_property_partial(
             abstract_proto,
             heap,
-            &tag_sym,
+            tag_sym,
             PartialPropertyDescriptor {
                 get: Some(Value::native_function(getter)),
                 enumerable: Some(false),
@@ -356,7 +356,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         object::define_own_symbol_property_partial(
             abstract_proto,
             heap,
-            &iterator_sym,
+            iterator_sym,
             PartialPropertyDescriptor {
                 value: Some(values_value),
                 writable: Some(true),
@@ -467,7 +467,7 @@ fn ta_callback_receiver(
     method: &'static str,
 ) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
     ctx.this_value()
-        .as_typed_array()
+        .as_typed_array(ctx.heap())
         .ok_or_else(|| NativeError::TypeError {
             name: method,
             reason: "this is not a TypedArray".to_string(),
@@ -831,7 +831,7 @@ fn ta_build_result(
 fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
-        .as_typed_array()
+        .as_typed_array(ctx.heap())
         .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.buffer",
             reason: "this is not a TypedArray".to_string(),
@@ -843,7 +843,7 @@ fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
-        .as_typed_array()
+        .as_typed_array(ctx.heap())
         .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.byteLength",
             reason: "this is not a TypedArray".to_string(),
@@ -858,7 +858,7 @@ fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
-        .as_typed_array()
+        .as_typed_array(ctx.heap())
         .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.byteOffset",
             reason: "this is not a TypedArray".to_string(),
@@ -873,7 +873,7 @@ fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
-        .as_typed_array()
+        .as_typed_array(ctx.heap())
         .ok_or_else(|| NativeError::TypeError {
             name: "TypedArray.prototype.length",
             reason: "this is not a TypedArray".to_string(),
@@ -891,7 +891,7 @@ fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype-%symbol.tostringtag%>
 fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let Some(t) = this_value.as_typed_array() else {
+    let Some(t) = this_value.as_typed_array(ctx.heap()) else {
         return Ok(Value::undefined());
     };
     let kind_name = t.kind().name();
@@ -1165,7 +1165,7 @@ fn ta_ctor_dispatch(
             .interp
             .well_known_symbols()
             .get(crate::symbol::WellKnown::Iterator);
-        let has_iter = crate::object::get_symbol(src_obj, ctx.heap(), &iter_sym).is_some();
+        let has_iter = crate::object::get_symbol(src_obj, ctx.heap(), iter_sym).is_some();
         if has_iter {
             let src_value = Value::object(src_obj);
             let drained = drain_iterable_into_values(ctx, exec, &src_value)?;

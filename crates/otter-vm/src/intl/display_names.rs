@@ -33,7 +33,7 @@ fn require_payload(args: &IntrinsicArgs<'_>) -> Result<DisplayNamesPayload, Intr
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.DisplayNames",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::DisplayNames(p) => Ok(p),
         _ => Err(bad()),
@@ -133,7 +133,7 @@ fn lookup_name(kind: &str, code: &str) -> Option<&'static str> {
 /// §12.5.5 `of(code)`.
 fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let code = if let Some(s) = args.args.first().and_then(|v| v.as_string()) {
+    let code = if let Some(s) = args.args.first().and_then(|v| v.as_string(args.gc_heap)) {
         s.to_lossy_string(args.gc_heap)
     } else if let Some(n) = args.args.first().and_then(|v| v.as_number()) {
         n.to_display_string()

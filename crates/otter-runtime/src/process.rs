@@ -48,12 +48,12 @@ pub(crate) fn install_global(
     let process = interp
         .alloc_host_object_with_roots(&[], &[])
         .map_err(gc_oom_to_error)?;
-    let process_root = Value::Object(process);
+    let process_root = Value::object(process);
     let argv_values = process_argv
         .iter()
         .map(|arg| {
             JsString::from_str(arg, interp.gc_heap_mut())
-                .map(otter_vm::Value::String)
+                .map(otter_vm::Value::string)
                 .map_err(string_oom_to_error)
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -68,7 +68,7 @@ pub(crate) fn install_global(
         process,
         interp.gc_heap_mut(),
         "argv",
-        otter_vm::Value::Array(argv),
+        otter_vm::Value::array(argv),
     );
 
     let exec_argv = interp
@@ -78,7 +78,7 @@ pub(crate) fn install_global(
         process,
         interp.gc_heap_mut(),
         "execArgv",
-        otter_vm::Value::Array(exec_argv),
+        otter_vm::Value::array(exec_argv),
     );
 
     let argv0 = process_argv.first().map(String::as_str).unwrap_or("otter");
@@ -108,7 +108,7 @@ pub(crate) fn install_global(
         process,
         interp.gc_heap_mut(),
         "versions",
-        otter_vm::Value::Object(versions),
+        otter_vm::Value::object(versions),
     );
 
     let release = interp
@@ -120,20 +120,20 @@ pub(crate) fn install_global(
         process,
         interp.gc_heap_mut(),
         "release",
-        otter_vm::Value::Object(release),
+        otter_vm::Value::object(release),
     );
 
     otter_vm::object::set(
         process,
         interp.gc_heap_mut(),
         "pid",
-        Value::Number(NumberValue::from_i32(pid_to_i32(snapshot.pid))),
+        Value::number(NumberValue::from_i32(pid_to_i32(snapshot.pid))),
     );
     otter_vm::object::set(
         process,
         interp.gc_heap_mut(),
         "ppid",
-        Value::Number(NumberValue::from_i32(pid_to_i32(
+        Value::number(NumberValue::from_i32(pid_to_i32(
             snapshot.ppid.unwrap_or(0),
         ))),
     );
@@ -142,7 +142,7 @@ pub(crate) fn install_global(
         process,
         interp.gc_heap_mut(),
         "exitCode",
-        otter_vm::Value::Undefined,
+        otter_vm::Value::undefined(),
     );
 
     let env = interp
@@ -157,7 +157,7 @@ pub(crate) fn install_global(
             continue;
         }
         let value = JsString::from_str(&value, interp.gc_heap_mut())
-            .map(otter_vm::Value::String)
+            .map(otter_vm::Value::string)
             .map_err(string_oom_to_error)?;
         otter_vm::object::set(env, interp.gc_heap_mut(), &name, value);
     }
@@ -165,7 +165,7 @@ pub(crate) fn install_global(
         process,
         interp.gc_heap_mut(),
         "env",
-        otter_vm::Value::Object(env),
+        otter_vm::Value::object(env),
     );
 
     define_process_method(
@@ -210,7 +210,7 @@ pub(crate) fn install_global(
     )?;
     let hrtime = hrtime_value(interp, start).map_err(gc_oom_to_error)?;
     otter_vm::object::set(process, interp.gc_heap_mut(), "hrtime", hrtime);
-    interp.set_global("process", otter_vm::Value::Object(process));
+    interp.set_global("process", otter_vm::Value::object(process));
     Ok(())
 }
 
@@ -240,8 +240,9 @@ fn define_process_method(
 }
 
 pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
-    let Some(Value::Object(process)) =
+    let Some(process) =
         otter_vm::object::get(*interp.global_this(), interp.gc_heap(), "process")
+            .and_then(|v| v.as_object())
     else {
         return 0;
     };
@@ -252,14 +253,14 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
 }
 
 fn string_value(interp: &mut Interpreter, value: &str) -> Result<otter_vm::Value, OtterError> {
-    Ok(otter_vm::Value::String(
+    Ok(otter_vm::Value::string(
         JsString::from_str(value, interp.gc_heap_mut()).map_err(string_oom_to_error)?,
     ))
 }
 
 fn cwd_call(cwd: String) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
-        Ok(otter_vm::Value::String(
+        Ok(otter_vm::Value::string(
             JsString::from_str(&cwd, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
                 name: "process.cwd",
                 reason: err.to_string(),
@@ -273,7 +274,7 @@ fn process_exit(
     _ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    let code = normalize_exit_code(args.first().unwrap_or(&Value::Undefined)).ok_or_else(|| {
+    let code = normalize_exit_code(args.first().unwrap_or(&Value::undefined())).ok_or_else(|| {
         NativeError::TypeError {
             name: "process.exit",
             reason: "exit code must be a finite number between 0 and 255".to_string(),
@@ -300,13 +301,13 @@ fn process_next_tick(
             },
             other => other,
         })?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn uptime_call(start: Instant, base_secs: Option<u64>) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
         let seconds = base_secs.map_or(0.0, |secs| secs as f64) + start.elapsed().as_secs_f64();
-        Ok(Value::Number(NumberValue::from_f64(seconds)))
+        Ok(Value::number(NumberValue::from_f64(seconds)))
     });
     NativeCall::Dynamic(call)
 }
@@ -326,7 +327,7 @@ fn process_memory_usage(
     set_number_property(interp, object, "heapUsed", heap_used);
     set_number_property(interp, object, "external", 0.0);
     set_number_property(interp, object, "arrayBuffers", 0.0);
-    Ok(Value::Object(object))
+    Ok(Value::object(object))
 }
 
 fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter_gc::OutOfMemory> {
@@ -342,7 +343,7 @@ fn hrtime_value(interp: &mut Interpreter, start: Instant) -> Result<Value, otter
     let object = interp.alloc_host_object_with_roots(&[&function, &bigint], &[])?;
     otter_vm::object::set_call_native(object, interp.gc_heap_mut(), function);
     otter_vm::object::set(object, interp.gc_heap_mut(), "bigint", bigint);
-    Ok(Value::Object(object))
+    Ok(Value::object(object))
 }
 
 fn hrtime_call(start: Instant) -> NativeCall {
@@ -350,10 +351,10 @@ fn hrtime_call(start: Instant) -> NativeCall {
         let elapsed = start.elapsed();
         let mut seconds = elapsed.as_secs() as i64;
         let mut nanos = elapsed.subsec_nanos() as i64;
-        if let Some(Value::Array(previous)) = args.first() {
+        if let Some(previous) = args.first().and_then(|v| v.as_array()) {
             let heap = ctx.heap_mut();
-            let prev_seconds = number_to_i64(&otter_vm::array::get(*previous, heap, 0));
-            let prev_nanos = number_to_i64(&otter_vm::array::get(*previous, heap, 1));
+            let prev_seconds = number_to_i64(&otter_vm::array::get(previous, heap, 0));
+            let prev_nanos = number_to_i64(&otter_vm::array::get(previous, heap, 1));
             if let (Some(prev_seconds), Some(prev_nanos)) = (prev_seconds, prev_nanos) {
                 seconds -= prev_seconds;
                 nanos -= prev_nanos;
@@ -364,11 +365,11 @@ fn hrtime_call(start: Instant) -> NativeCall {
             }
         }
         let values = [
-            Value::Number(NumberValue::from_f64(seconds.max(0) as f64)),
-            Value::Number(NumberValue::from_f64(nanos.max(0) as f64)),
+            Value::number(NumberValue::from_f64(seconds.max(0) as f64)),
+            Value::number(NumberValue::from_f64(nanos.max(0) as f64)),
         ];
         let array = ctx.array_from_elements_with_roots(values, &[], &[args])?;
-        Ok(Value::Array(array))
+        Ok(Value::array(array))
     });
     NativeCall::Dynamic(call)
 }
@@ -386,18 +387,18 @@ fn hrtime_bigint_call(start: Instant) -> NativeCall {
                         e.heap_limit_bytes(),
                     ),
                 })?;
-        Ok(Value::BigInt(handle))
+        Ok(Value::big_int(handle))
     });
     NativeCall::Dynamic(call)
 }
 
 fn normalize_exit_code(value: &Value) -> Option<u8> {
-    match value {
-        Value::Undefined => Some(0),
-        Value::Number(NumberValue::Smi(n)) => Some((*n).clamp(0, 255) as u8),
-        Value::Number(NumberValue::Double(n)) if n.is_finite() => {
-            Some((*n as i32).clamp(0, 255) as u8)
-        }
+    if value.is_undefined() {
+        return Some(0);
+    }
+    match value.as_number()? {
+        NumberValue::Smi(n) => Some(n.clamp(0, 255) as u8),
+        NumberValue::Double(n) if n.is_finite() => Some((n as i32).clamp(0, 255) as u8),
         _ => None,
     }
 }
@@ -412,14 +413,14 @@ fn set_number_property(
         object,
         interp.gc_heap_mut(),
         name,
-        Value::Number(NumberValue::from_f64(value)),
+        Value::number(NumberValue::from_f64(value)),
     );
 }
 
 fn number_to_i64(value: &Value) -> Option<i64> {
-    match value {
-        Value::Number(NumberValue::Smi(n)) => Some(i64::from(*n)),
-        Value::Number(NumberValue::Double(n)) if n.is_finite() => Some(*n as i64),
+    match value.as_number()? {
+        NumberValue::Smi(n) => Some(i64::from(n)),
+        NumberValue::Double(n) if n.is_finite() => Some(n as i64),
         _ => None,
     }
 }

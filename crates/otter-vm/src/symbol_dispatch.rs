@@ -144,8 +144,8 @@ fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, S
     let description = if let Some(first) = args.first() {
         if first.is_undefined() {
             None
-        } else if let Some(s) = first.as_string() {
-            Some(*s)
+        } else if let Some(s) = first.as_string(&interp.gc_heap) {
+            Some(s)
         } else if first.is_symbol() {
             return Err(SymbolError::BadArgument {
                 name: "Symbol",
@@ -179,7 +179,7 @@ fn symbol_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolE
 fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
     let sym = args
         .first()
-        .and_then(|v| v.as_symbol())
+        .and_then(|v| v.as_symbol(&interp.gc_heap))
         .ok_or(SymbolError::BadArgument {
             name: "keyFor",
             index: 0,
@@ -208,7 +208,7 @@ fn key_argument(
     if first.is_undefined() {
         return Ok("undefined".to_string());
     }
-    if let Some(s) = first.as_string() {
+    if let Some(s) = first.as_string(heap) {
         return Ok(s.to_lossy_string(heap));
     }
     if first.is_symbol() {

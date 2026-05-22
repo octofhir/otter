@@ -208,10 +208,7 @@ fn response_constructor_native(
 ) -> Result<Value, NativeError> {
     let body = runtime_optional_arg_to_string(args, 0, ctx.heap())
         .map(|value| Blob::new(value.into_bytes(), ""));
-    let status = match args.get(1) {
-        Some(Value::Number(value)) => value.as_f64() as u16,
-        _ => 200,
-    };
+    let status = args.get(1).and_then(|v| v.as_number()).map_or(200, |n| n.as_f64() as u16);
     let status_text = crate::arg_string(args, 2, ctx.heap());
     let response = Response::new(status, status_text, body)
         .map_err(|err| crate::type_error("Response", err.to_string()))?;

@@ -95,7 +95,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
                 if b { 1.0 } else { 0.0 }
             } else if v.is_null() {
                 0.0
-            } else if let Some(s) = v.as_string() {
+            } else if let Some(s) = v.as_string(args.gc_heap) {
                 crate::number::parse::to_number_from_string(&s.to_lossy_string(args.gc_heap))
                     .as_f64()
             } else {

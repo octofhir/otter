@@ -64,7 +64,7 @@ fn vm_shape_error_to_intrinsic(err: VmError) -> IntrinsicError {
 /// [`MakeMatchIndicesIndexPairArray`](https://tc39.es/ecma262/#sec-makematchindicesindexpairarray)).
 pub(crate) fn exec_once(
     re: &JsRegExp,
-    text: &JsString,
+    text: JsString,
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     let units = text.to_utf16_vec(args.gc_heap);
@@ -112,7 +112,7 @@ pub(crate) fn exec_once(
 
 pub(crate) fn exec_once_native(
     re: &JsRegExp,
-    text: &JsString,
+    text: JsString,
     ctx: &mut NativeCtx<'_>,
     slice_roots: &[&[Value]],
 ) -> Result<Value, IntrinsicError> {
@@ -167,7 +167,7 @@ pub(crate) fn exec_once_native(
 pub(crate) fn build_match_result(
     m: &regress::Match,
     units: &[u16],
-    input: &JsString,
+    input: JsString,
     has_indices: bool,
     args: &mut IntrinsicArgs<'_>,
     value_roots: &[&Value],
@@ -185,7 +185,7 @@ pub(crate) fn build_match_result(
             None => out.push(Value::undefined()),
         }
     }
-    let input_value = Value::string(*input);
+    let input_value = Value::string(input);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&input_value);
     roots.extend_from_slice(value_roots);
@@ -318,7 +318,7 @@ pub(crate) fn build_match_result(
 pub(crate) fn build_match_result_native(
     m: &regress::Match,
     units: &[u16],
-    input: &JsString,
+    input: JsString,
     has_indices: bool,
     ctx: &mut NativeCtx<'_>,
     value_roots: &[&Value],
@@ -336,7 +336,7 @@ pub(crate) fn build_match_result_native(
             None => out.push(Value::undefined()),
         }
     }
-    let input_value = Value::string(*input);
+    let input_value = Value::string(input);
     let mut roots = Vec::with_capacity(value_roots.len() + 1);
     roots.push(&input_value);
     roots.extend_from_slice(value_roots);
@@ -517,13 +517,13 @@ fn pair_array_native(
 fn impl_exec(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re_clone = receiver_regexp(args)?;
     let text = arg_to_string_primitive(args, 0)?;
-    exec_once(&re_clone, &text, args)
+    exec_once(&re_clone, text, args)
 }
 
 fn impl_test(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let re_clone = receiver_regexp(args)?;
     let text = arg_to_string_primitive(args, 0)?;
-    let result = exec_once(&re_clone, &text, args)?;
+    let result = exec_once(&re_clone, text, args)?;
     Ok(Value::boolean(!result.is_null()))
 }
 
@@ -539,8 +539,8 @@ fn arg_to_string_primitive(
     index: usize,
 ) -> Result<JsString, IntrinsicError> {
     let raw = args.args.get(index).cloned().unwrap_or(Value::undefined());
-    if let Some(s) = raw.as_string() {
-        return Ok(*s);
+    if let Some(s) = raw.as_string(args.gc_heap) {
+        return Ok(s);
     }
     if raw.is_symbol() {
         return Err(IntrinsicError::BadArgument {
@@ -607,7 +607,7 @@ pub fn native_regexp_symbol_match(
     let flags = re.flags(ctx.heap());
     let units = text.to_utf16_vec(ctx.heap());
     if !flags.global {
-        return exec_once_native(&re, &text, ctx, &[])
+        return exec_once_native(&re, text, ctx, &[])
             .map_err(intrinsic_to_native_error("RegExp.prototype[@@match]"));
     }
     let full_unicode = flags.unicode || flags.unicode_sets;
@@ -708,8 +708,8 @@ fn string_arg_to_jsstring(
     method_name: &'static str,
 ) -> Result<JsString, crate::NativeError> {
     let raw = args.get(index).cloned().unwrap_or(Value::undefined());
-    if let Some(s) = raw.as_string() {
-        return Ok(*s);
+    if let Some(s) = raw.as_string(ctx.heap()) {
+        return Ok(s);
     }
     if raw.is_symbol() {
         return Err(crate::NativeError::TypeError {
@@ -847,8 +847,8 @@ pub(crate) fn coerce_to_jsstring_runtime(
             reason: "cannot convert a Symbol to a string".to_string(),
         });
     }
-    if let Some(s) = value.as_string() {
-        return Ok(*s);
+    if let Some(s) = value.as_string(ctx.heap()) {
+        return Ok(s);
     }
     let primitive = if crate::abstract_ops::is_primitive(value) {
         *value
@@ -942,7 +942,7 @@ fn to_integer_or_infinity_runtime(
 fn regexp_exec_runtime(
     ctx: &mut NativeCtx<'_>,
     rx: &Value,
-    s: &JsString,
+    s: JsString,
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
     let exec_fn = get_property_runtime(ctx, rx, "exec", name)?;
@@ -954,11 +954,11 @@ fn regexp_exec_runtime(
             reason: "missing execution context".to_string(),
         })?;
         let mut args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        args.push(Value::string(*s));
+        args.push(Value::string(s));
         let result = interp
             .run_callable_sync(&exec_ctx, &exec_fn, *rx, args)
             .map_err(vm_err_to_native(name))?;
-        if !result.is_null() && !crate::value_kind::is_object_like_value(&result) {
+        if !result.is_null() && !result.is_object_type() {
             return Err(crate::NativeError::TypeError {
                 name,
                 reason: "exec did not return an Object or null".to_string(),
@@ -988,7 +988,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     interp: &mut crate::Interpreter,
     context: &crate::ExecutionContext,
     matcher: &Value,
-    input: &JsString,
+    input: JsString,
     global: bool,
     full_unicode: bool,
 ) -> Result<Option<Value>, crate::VmError> {
@@ -1048,7 +1048,7 @@ pub fn native_regexp_symbol_replace(
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@replace]";
     let receiver = *ctx.this_value();
-    if !crate::value_kind::is_object_like_value(&receiver) {
+    if !receiver.is_object_type() {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "called on a non-object receiver".to_string(),
@@ -1087,7 +1087,7 @@ pub fn native_regexp_symbol_replace(
     // Step 10-12 — collect results.
     let mut results: Vec<Value> = Vec::new();
     loop {
-        let result = regexp_exec_runtime(ctx, &receiver, &s, name)?;
+        let result = regexp_exec_runtime(ctx, &receiver, s, name)?;
         if result.is_null() {
             break;
         }
@@ -1228,7 +1228,7 @@ pub fn native_regexp_symbol_replace(
 pub(crate) fn get_symbol_property_runtime(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    sym: &crate::symbol::JsSymbol,
+    sym: crate::symbol::JsSymbol,
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
     let (interp, exec) = ctx.interp_mut_and_context();
@@ -1241,7 +1241,7 @@ pub(crate) fn get_symbol_property_runtime(
             &exec,
             *receiver,
             *receiver,
-            &crate::VmPropertyKey::Symbol(*sym),
+            &crate::VmPropertyKey::Symbol(sym),
             0,
         )
         .map_err(vm_err_to_native(name))?;
@@ -1272,7 +1272,7 @@ fn species_constructor_runtime(
     if c.is_undefined() {
         return Ok(*default_ctor);
     }
-    if !crate::value_kind::is_object_like_value(&c) {
+    if !c.is_object_type() {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "constructor is not an Object".to_string(),
@@ -1283,7 +1283,7 @@ fn species_constructor_runtime(
         .interp
         .well_known_symbols()
         .get(crate::symbol::WellKnown::Species);
-    let s = get_symbol_property_runtime(ctx, &c, &species_sym, name)?;
+    let s = get_symbol_property_runtime(ctx, &c, species_sym, name)?;
     if s.is_nullish() {
         return Ok(c);
     }
@@ -1322,7 +1322,7 @@ pub fn native_regexp_symbol_match_all(
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@matchAll]";
     let receiver = *ctx.this_value();
-    if !crate::value_kind::is_object_like_value(&receiver) {
+    if !receiver.is_object_type() {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "called on a non-object receiver".to_string(),
@@ -1415,7 +1415,7 @@ pub fn native_regexp_symbol_split(
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@split]";
     let receiver = *ctx.this_value();
-    if !crate::value_kind::is_object_like_value(&receiver) {
+    if !receiver.is_object_type() {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "called on a non-object receiver".to_string(),
@@ -1526,7 +1526,7 @@ pub fn native_regexp_symbol_split(
     // Step 16 — empty S: one probe; if exec yields a match, return
     // empty array, otherwise return `[S]`.
     if size == 0 {
-        let z = regexp_exec_runtime(ctx, &splitter, &s, name)?;
+        let z = regexp_exec_runtime(ctx, &splitter, s, name)?;
         if !z.is_null() {
             let arr = ctx
                 .array_from_elements_with_roots(out_elements, &[&splitter], &[])
@@ -1561,7 +1561,7 @@ pub fn native_regexp_symbol_split(
             Value::number_f64(q as f64),
             name,
         )?;
-        let z = regexp_exec_runtime(ctx, &splitter, &s, name)?;
+        let z = regexp_exec_runtime(ctx, &splitter, s, name)?;
         if z.is_null() {
             q = advance_string_index(&s_units, q, unicode_matching);
             continue;

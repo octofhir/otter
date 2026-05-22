@@ -67,7 +67,7 @@ pub fn to_index(value: &Value, heap: &otter_gc::GcHeap) -> Option<u64> {
         if b { 1.0 } else { 0.0 }
     } else if value.is_null() {
         0.0
-    } else if let Some(s) = value.as_string() {
+    } else if let Some(s) = value.as_string(heap) {
         crate::number::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
     } else {
         return None;
@@ -122,14 +122,14 @@ pub fn smi(n: i32) -> Value {
 /// - <https://tc39.es/ecma262/#sec-get-%25typedarray%25.prototype-%40%40tostringtag>
 /// - <https://tc39.es/ecma262/#sec-get-dataview.prototype-%40%40tostringtag>
 #[must_use]
-pub fn to_string_tag_for(value: &Value) -> Option<&'static str> {
+pub fn to_string_tag_for(value: &Value, heap: &otter_gc::GcHeap) -> Option<&'static str> {
     if value.is_array_buffer() {
         return Some("ArrayBuffer");
     }
     if value.is_data_view() {
         return Some("DataView");
     }
-    if let Some(t) = value.as_typed_array() {
+    if let Some(t) = value.as_typed_array(heap) {
         return Some(t.kind().name());
     }
     None

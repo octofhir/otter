@@ -34,7 +34,6 @@
 //!   equality across the two kinds checks numeric value.
 
 use num_bigint::{BigInt, Sign};
-use otter_gc::raw::SlotVisitor;
 use serde::{Deserialize, Serialize};
 
 pub mod dispatch;
@@ -141,13 +140,6 @@ impl BigIntValue {
         Self { inner: handle }
     }
 
-    /// Visit the embedded GC handle so the scavenger can rewrite the
-    /// compressed offset in place if the body moves. Called from
-    /// [`crate::Value::trace_value_slots`].
-    pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
-        let p = &self.inner as *const BigIntHandle as *mut otter_gc::raw::RawGc;
-        visitor(p);
-    }
 
     /// Spec rendering: decimal digits **without** a trailing `n`.
     /// Computed on demand from the body's `BigInt` payload — V8 /

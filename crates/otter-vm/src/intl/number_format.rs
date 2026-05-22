@@ -44,7 +44,7 @@ pub fn resolve(
             match opts_ref
                 .and_then(|o| crate::object::get(*o, gc_heap, "currency"))
                 .and_then(|v| {
-                    v.as_string()
+                    v.as_string(gc_heap)
                         .map(|s| s.to_lossy_string(gc_heap).to_uppercase())
                 }) {
                 Some(c) => Some(c),
@@ -96,7 +96,7 @@ fn require_number_format(args: &IntrinsicArgs<'_>) -> Result<NumberFormatPayload
     let bad = || IntrinsicError::BadReceiver {
         expected: "Intl.NumberFormat",
     };
-    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
     match intl.payload_clone(args.gc_heap) {
         IntlPayload::NumberFormat(n) => Ok(n),
         _ => Err(bad()),
@@ -108,7 +108,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let first = args.args.first();
     let n = if let Some(num) = first.and_then(|v| v.as_number()) {
         num.as_f64()
-    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+    } else if let Some(s) = first.and_then(|v| v.as_string(args.gc_heap)) {
         s.to_lossy_string(args.gc_heap)
             .parse::<f64>()
             .unwrap_or(f64::NAN)

@@ -38,8 +38,7 @@ use crate::collections::{self, CollectionError};
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{
-    NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey,
-    constructor_return_is_object, descriptor_value,
+    NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey, descriptor_value,
 };
 
 // ---------------------------------------------------------------
@@ -127,7 +126,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
         object::define_own_symbol_property_partial(
             prototype,
             heap,
-            &to_string_tag,
+            to_string_tag,
             PartialPropertyDescriptor {
                 value: Some(Value::string(tag)),
                 writable: Some(false),
@@ -146,7 +145,7 @@ pub fn install_collection_well_knowns_post_bootstrap(
             object::define_own_symbol_property_partial(
                 prototype,
                 heap,
-                &iterator_sym,
+                iterator_sym,
                 PartialPropertyDescriptor {
                     value: Some(method_value),
                     writable: Some(true),
@@ -720,7 +719,7 @@ fn apply_collection_new_target_prototype(
         Some(Value::object(class.prototype(ctx.heap())))
     } else if let Some(obj) = new_target.as_object() {
         object::get(obj, ctx.heap(), "prototype")
-            .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+            .filter(|value| value.is_object_type() || value.is_proxy())
     } else if let Some(native) = new_target.as_native_function() {
         native
             .own_property_descriptor(ctx.heap_mut(), "prototype")
@@ -729,7 +728,7 @@ fn apply_collection_new_target_prototype(
                 reason: err.to_string(),
             })?
             .map(|descriptor| descriptor_value(&descriptor))
-            .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+            .filter(|value| value.is_object_type() || value.is_proxy())
     } else {
         None
     };

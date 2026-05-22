@@ -374,7 +374,7 @@ fn construct_typed_array_with_roots(
         let view = JsTypedArray::new(gc_heap, buf, kind, byte_offset, length).map_err(oom_to_vm)?;
         return Ok(Value::typed_array(view));
     }
-    if let Some(src) = first.as_typed_array() {
+    if let Some(src) = first.as_typed_array(gc_heap) {
         if src.buffer(gc_heap).is_detached(gc_heap) {
             return Err(VmError::TypeMismatch);
         }
@@ -419,7 +419,7 @@ fn from_static_with_roots(
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     let source = args.first().cloned().unwrap_or(Value::undefined());
-    if let Some(src) = source.as_typed_array() {
+    if let Some(src) = source.as_typed_array(gc_heap) {
         if src.buffer(gc_heap).is_detached(gc_heap) {
             return Err(VmError::TypeMismatch);
         }
@@ -440,7 +440,7 @@ fn from_static_with_roots(
         }
         return typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit);
     }
-    if let Some(s) = source.as_string() {
+    if let Some(s) = source.as_string(gc_heap) {
         let text = s.to_lossy_string(gc_heap);
         let mut chars: Vec<Value> = Vec::with_capacity(text.chars().count());
         for c in text.chars() {
@@ -499,7 +499,7 @@ fn coerce_for_kind(
             ))
         } else if value.is_number() {
             Err(VmError::TypeMismatch)
-        } else if let Some(s) = value.as_string() {
+        } else if let Some(s) = value.as_string(gc_heap) {
             let text = s.to_lossy_string(gc_heap);
             match crate::bigint::BigIntValue::from_decimal(gc_heap, text.trim()) {
                 Some(Ok(b)) => Ok(Value::big_int(b)),

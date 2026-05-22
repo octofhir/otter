@@ -60,7 +60,7 @@ fn parse_arg(
     method: &'static str,
 ) -> Result<temporal_rs::PlainDate, TemporalError> {
     let arg = args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(gc_heap)) {
         match t.payload_clone(gc_heap) {
             TemporalPayload::PlainDate(v) => Ok(v),
             _ => Err(TemporalError::BadArgument {
@@ -70,7 +70,7 @@ fn parse_arg(
                 reason: "must be a Temporal.PlainDate",
             }),
         }
-    } else if let Some(s) = arg.and_then(|v| v.as_string()) {
+    } else if let Some(s) = arg.and_then(|v| v.as_string(gc_heap)) {
         temporal_rs::PlainDate::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
             TemporalError::Engine {
                 class: "PlainDate",
@@ -90,7 +90,7 @@ fn parse_arg(
 
 /// Property reads on a `Temporal.PlainDate` receiver.
 #[must_use]
-pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     let pd = match temporal.payload_clone(gc_heap) {
         TemporalPayload::PlainDate(v) => v,
         _ => return Value::undefined(),
@@ -134,7 +134,7 @@ fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let pd = require_plain_date(args)?;
     let first = args.args.first();
-    let other = if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+    let other = if let Some(t) = first.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::PlainDate(v) => v,
             _ => {
@@ -144,7 +144,7 @@ fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 });
             }
         }
-    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+    } else if let Some(s) = first.and_then(|v| v.as_string(args.gc_heap)) {
         temporal_rs::PlainDate::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
             .map_err(temporal_err)?
     } else {
@@ -167,7 +167,7 @@ fn duration_arg(
         reason: "must be a Temporal.Duration",
     };
     let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
         match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(bad()),

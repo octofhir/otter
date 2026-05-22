@@ -257,7 +257,7 @@ mod tests {
             assert_eq!(body.upvalues.len(), 2);
             assert_eq!(body.upvalues[0], cell_a);
             assert_eq!(body.upvalues[1], cell_b);
-            assert!(matches!(body.bound_this, Some(Value::Null)));
+            assert!(matches!(body.bound_this, Some(v) if v.is_null()));
         });
     }
 

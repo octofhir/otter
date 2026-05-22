@@ -38,15 +38,15 @@ fn raft_generates_grouped_static_namespace_spec() {
         .build()
         .expect("namespace");
 
-    let Value::NativeFunction(one) = object::get(ns, interp.gc_heap(), "one").expect("one") else {
-        panic!("one should be native");
-    };
+    let one = object::get(ns, interp.gc_heap(), "one")
+        .and_then(|v| v.as_native_function())
+        .expect("one should be native");
     assert!(one.is_static_call(interp.gc_heap()));
     assert_eq!(one.length(interp.gc_heap()), 0);
 
-    let Value::NativeFunction(two) = object::get(ns, interp.gc_heap(), "two").expect("two") else {
-        panic!("two should be native");
-    };
+    let two = object::get(ns, interp.gc_heap(), "two")
+        .and_then(|v| v.as_native_function())
+        .expect("two should be native");
     assert!(two.is_static_call(interp.gc_heap()));
     assert_eq!(two.length(interp.gc_heap()), 1);
 }

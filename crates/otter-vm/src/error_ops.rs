@@ -82,7 +82,7 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<Option<String>, VmError> {
-        if matches!(value, Value::Undefined) {
+        if value.is_undefined() {
             return Ok(None);
         }
         Ok(Some(self.coerce_to_string(context, value)?))
@@ -245,7 +245,7 @@ impl Interpreter {
                 stack,
                 kind,
                 Some(message.to_string()),
-                &Value::Undefined,
+                &Value::undefined(),
             )
             .ok()?
         };
@@ -255,7 +255,7 @@ impl Interpreter {
                 &self.gc_heap,
                 "prototype",
             ) {
-                Some(Value::Object(proto)) => proto,
+                Some(v) if let Some(proto) = v.as_object() => proto,
                 _ => self.error_classes.prototype(kind),
             };
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
@@ -265,10 +265,10 @@ impl Interpreter {
                 obj,
                 &mut self.gc_heap,
                 "message",
-                Value::String(message_str),
+                Value::string(message_str),
             );
         }
-        Some(Value::Object(obj))
+        Some(Value::object(obj))
     }
 }
 
@@ -404,7 +404,7 @@ pub(crate) fn native_to_vm_error(err: NativeError) -> VmError {
 /// fine; once the full Error hierarchy is in we'll synthesize a
 /// real `TypeError` / `RangeError` instance.
 pub(crate) fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Value {
-    Value::String(
+    Value::string(
         crate::JsString::from_str(&err.to_string(), heap).unwrap_or_else(|_| {
             // Allocator failure here is exceptional; substitute
             // an empty string rather than panicking.
@@ -482,12 +482,12 @@ pub(crate) fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {
 /// so the unwind printout matches what `e.toString()` returns at
 /// the JS surface (§20.5.3.4).
 pub(crate) fn render_thrown_value(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
-    if let Value::Object(obj) = value {
+    if let Some(obj) = value.as_object() {
         // Treat anything with both `name` and `message` data slots
         // as an Error instance. Plain objects fall through to
         // `[object Object]` via `display_string`.
-        let has_name = crate::object::get(*obj, gc_heap, "name").is_some();
-        let has_message = crate::object::get(*obj, gc_heap, "message").is_some();
+        let has_name = crate::object::get(obj, gc_heap, "name").is_some();
+        let has_message = crate::object::get(obj, gc_heap, "message").is_some();
         if has_name || has_message {
             let rendered = error_classes::render_error_to_string(value, gc_heap);
             if !rendered.is_empty() {

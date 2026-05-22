@@ -46,11 +46,11 @@ pub fn call(
         M::ParseInt => {
             let s = coerce_to_string(args.first(), gc_heap);
             let radix = match args.get(1) {
-                None | Some(Value::Undefined) => 0i32,
-                Some(Value::Number(n)) => match n.as_smi() {
-                    Some(v) => v,
-                    None => n.as_f64() as i32,
-                },
+                Some(v) if let Some(n) = v.as_number() => {
+                    n.as_smi().unwrap_or_else(|| n.as_f64() as i32)
+                }
+                Some(v) if v.is_undefined() => 0,
+                None => 0,
                 _ => 0,
             };
             Ok(Value::number(number::parse_int(&s, radix)))
@@ -76,17 +76,19 @@ pub fn call(
         // §21.1.2.3 / §21.1.2.2 — strict, no coercion.
         M::NumberIsNaN => {
             let value = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::boolean(matches!(
-                value,
-                Value::Number(ref n) if number::is_nan(n.as_f64())
-            )))
+            Ok(Value::boolean(
+                value
+                    .as_number()
+                    .is_some_and(|n| number::is_nan(n.as_f64())),
+            ))
         }
         M::NumberIsFinite => {
             let value = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::boolean(matches!(
-                value,
-                Value::Number(ref n) if number::is_finite(n.as_f64())
-            )))
+            Ok(Value::boolean(
+                value
+                    .as_number()
+                    .is_some_and(|n| number::is_finite(n.as_f64())),
+            ))
         }
         M::NumberIsInteger => Ok(Value::boolean(number::is_integer(
             &args.first().cloned().unwrap_or(Value::undefined()),
@@ -135,11 +137,16 @@ pub fn call(
 /// but preserves the spec's "string of code units" view that
 /// `escape` / `unescape` walk.
 fn coerce_to_utf16(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> Vec<u16> {
-    match arg {
-        None | Some(Value::Undefined) => "undefined".encode_utf16().collect(),
-        Some(Value::String(s)) => s.to_utf16_vec(heap),
-        Some(other) => other.display_string(heap).encode_utf16().collect(),
+    let Some(value) = arg else {
+        return "undefined".encode_utf16().collect();
+    };
+    if value.is_undefined() {
+        return "undefined".encode_utf16().collect();
     }
+    if let Some(s) = value.as_string() {
+        return s.to_utf16_vec(heap);
+    }
+    value.display_string(heap).encode_utf16().collect()
 }
 
 /// §B.2.1.1 `escape(string)` — emit ASCII alphanumerics plus the
@@ -221,7 +228,8 @@ fn legacy_unescape(units: &[u16]) -> Vec<u16> {
 
 fn coerce_to_string(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> String {
     match arg {
-        None | Some(Value::Undefined) => "undefined".to_string(),
+        None => "undefined".to_string(),
+        Some(v) if v.is_undefined() => "undefined".to_string(),
         Some(other) => other.display_string(heap),
     }
 }

@@ -1950,7 +1950,7 @@ fn explicit_to_string_tag_with_context(
         .interp
         .well_known_symbols()
         .get(crate::symbol::WellKnown::ToStringTag);
-    // `Value::String` primitive doesn't have its own arm in
+    // string primitive doesn't have its own arm in
     // `ordinary_get_value`; route the lookup through
     // `String.prototype` explicitly so user-installed
     // `String.prototype[@@toStringTag]` overrides surface.
@@ -1978,10 +1978,7 @@ fn explicit_to_string_tag_with_context(
             smallvec::SmallVec::new(),
         )?,
     };
-    match value {
-        Value::String(s) => Ok(Some(s.to_lossy_string(ctx.heap()))),
-        _ => Ok(None),
-    }
+    Ok(value.as_string().map(|s| s.to_lossy_string(ctx.heap())))
 }
 
 fn native_function_has_own(
@@ -2037,10 +2034,12 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.create>
         M::Create => {
             let proto = args.first().cloned().unwrap_or(Value::undefined());
-            let proto_value = match proto {
-                Value::Object(_) | Value::Iterator(_) => Some(proto),
-                Value::Null => None,
-                _ => return Err(VmError::TypeMismatch),
+            let proto_value = if proto.is_object() || proto.is_iterator() {
+                Some(proto)
+            } else if proto.is_null() {
+                None
+            } else {
+                return Err(VmError::TypeMismatch);
             };
             let obj = rooted_object(gc_heap, &[&proto], &[args])?;
             if !crate::object::set_prototype_value(obj, gc_heap, proto_value) {
@@ -2049,10 +2048,7 @@ pub fn call(
             if let Some(props_arg) = args.get(1)
                 && !props_arg.is_undefined()
             {
-                let props = match props_arg {
-                    Value::Object(o) => *o,
-                    _ => return Err(VmError::TypeMismatch),
-                };
+                let props = props_arg.as_object().ok_or(VmError::TypeMismatch)?;
                 let entries: Vec<(String, Value)> =
                     crate::object::with_properties(props, gc_heap, |p| {
                         p.enumerable_data_iter()
@@ -2060,10 +2056,7 @@ pub fn call(
                             .collect()
                     });
                 for (key, desc_value) in entries {
-                    let desc_obj = match desc_value {
-                        Value::Object(o) => o,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
+                    let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
                     let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
                     if !crate::object::define_own_property_partial(obj, gc_heap, &key, descriptor) {
                         return Err(VmError::TypeMismatch);
@@ -2078,75 +2071,67 @@ pub fn call(
             let key = expect_property_key(args.get(1), gc_heap)?;
             let desc_obj = expect_object(args.get(2))?;
             let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
-            match args.first() {
-                Some(Value::Object(target)) => {
-                    let ok = match &key {
-                        PropertyKey::String(key) => crate::object::define_own_property_partial(
-                            *target, gc_heap, key, descriptor,
-                        ),
-                        PropertyKey::Symbol(sym) => {
-                            crate::object::define_own_symbol_property_partial(
-                                *target, gc_heap, sym, descriptor,
-                            )
-                        }
-                    };
-                    if !ok {
-                        return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
-                        });
+            let first = args.first();
+            if let Some(target) = first.and_then(|v| v.as_object()) {
+                let ok = match &key {
+                    PropertyKey::String(key) => {
+                        crate::object::define_own_property_partial(target, gc_heap, key, descriptor)
                     }
-                    Ok(Value::object(*target))
+                    PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
+                        target, gc_heap, sym, descriptor,
+                    ),
+                };
+                if !ok {
+                    return Err(VmError::TypeError {
+                        message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                    });
                 }
-                Some(Value::ClassConstructor(class)) => {
-                    let ok = match &key {
-                        PropertyKey::String(key) => crate::object::define_own_property_partial(
-                            class.statics(gc_heap),
-                            gc_heap,
-                            key,
-                            descriptor,
-                        ),
-                        PropertyKey::Symbol(sym) => {
-                            crate::object::define_own_symbol_property_partial(
-                                class.statics(gc_heap),
-                                gc_heap,
-                                sym,
-                                descriptor,
-                            )
-                        }
-                    };
-                    if !ok {
-                        return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
-                        });
+                Ok(Value::object(target))
+            } else if let Some(class) = first.and_then(|v| v.as_class_constructor()) {
+                let ok = match &key {
+                    PropertyKey::String(key) => crate::object::define_own_property_partial(
+                        class.statics(gc_heap),
+                        gc_heap,
+                        key,
+                        descriptor,
+                    ),
+                    PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
+                        class.statics(gc_heap),
+                        gc_heap,
+                        sym,
+                        descriptor,
+                    ),
+                };
+                if !ok {
+                    return Err(VmError::TypeError {
+                        message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                    });
+                }
+                Ok(Value::class_constructor(class))
+            } else if let Some(native) = first.and_then(|v| v.as_native_function()) {
+                let ok = match &key {
+                    PropertyKey::String(key) => native.define_own_property(
+                        gc_heap,
+                        key,
+                        descriptor.complete_for_new_property(),
+                    ),
+                    PropertyKey::Symbol(sym) => {
+                        native.define_own_symbol_property(gc_heap, sym, descriptor)
                     }
-                    Ok(Value::class_constructor(*class))
-                }
-                Some(Value::NativeFunction(native)) => {
-                    let ok = match &key {
-                        PropertyKey::String(key) => native.define_own_property(
-                            gc_heap,
-                            key,
-                            descriptor.complete_for_new_property(),
+                };
+                if !ok {
+                    return Err(VmError::TypeError {
+                        message: format!(
+                            "Cannot define property '{}' on function {}",
+                            key.label(gc_heap),
+                            native.name(gc_heap)
                         ),
-                        PropertyKey::Symbol(sym) => {
-                            native.define_own_symbol_property(gc_heap, sym, descriptor)
-                        }
-                    };
-                    if !ok {
-                        return Err(VmError::TypeError {
-                            message: format!(
-                                "Cannot define property '{}' on function {}",
-                                key.label(gc_heap),
-                                native.name(gc_heap)
-                            ),
-                        });
-                    }
-                    Ok(Value::native_function(*native))
+                    });
                 }
-                // RegExp instances expose `lastIndex` and the
-                // expando bag for ordinary defineProperty.
-                Some(Value::RegExp(r)) => {
-                    let r = *r;
+                Ok(Value::native_function(native))
+            } else if let Some(r) = first.and_then(|v| v.as_regexp()) {
+                // RegExp instances expose `lastIndex` + expando.
+                {
                     let existing = match &key {
                         PropertyKey::String(k) => r.expando(gc_heap).is_some_and(|bag| {
                             crate::object::get_own_descriptor(bag, gc_heap, k).is_some()
@@ -2178,89 +2163,60 @@ pub fn call(
                     }
                     Ok(Value::regexp(r))
                 }
-                // Promise instances also expose the lazy expando
-                // bag through Object.defineProperty.
-                Some(Value::Promise(p)) => {
-                    let p = *p;
-                    let bag = crate::property_dispatch::promise_ensure_expando_pub(gc_heap, &p)?;
-                    let ok = match &key {
-                        PropertyKey::String(k) => {
-                            crate::object::define_own_property_partial(bag, gc_heap, k, descriptor)
-                        }
-                        PropertyKey::Symbol(sym) => {
-                            crate::object::define_own_symbol_property_partial(
-                                bag, gc_heap, sym, descriptor,
-                            )
-                        }
-                    };
-                    if !ok {
-                        return Err(VmError::TypeError {
-                            message: format!("Cannot define property '{}'", key.label(gc_heap)),
-                        });
+            } else if let Some(p) = first.and_then(|v| v.as_promise()) {
+                // Promise instances also expose lazy expando.
+                let bag = crate::property_dispatch::promise_ensure_expando_pub(gc_heap, &p)?;
+                let ok = match &key {
+                    PropertyKey::String(k) => {
+                        crate::object::define_own_property_partial(bag, gc_heap, k, descriptor)
                     }
-                    Ok(Value::promise(p))
+                    PropertyKey::Symbol(sym) => crate::object::define_own_symbol_property_partial(
+                        bag, gc_heap, sym, descriptor,
+                    ),
+                };
+                if !ok {
+                    return Err(VmError::TypeError {
+                        message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                    });
                 }
-                // §10.4.5.3 IntegerIndexedExoticObject
-                // [[DefineOwnProperty]] — canonical-numeric-index
-                // keys verify the index against the live element
-                // (writable / enumerable / configurable / value);
-                // everything else falls through to OrdinaryDefine
-                // against the lazy expando bag.
-                Some(Value::TypedArray(t)) => {
-                    let t = *t;
-                    match &key {
-                        PropertyKey::String(k) => {
-                            if let Some(n) =
-                                crate::property_dispatch::canonical_numeric_index_string(k)
+                Ok(Value::promise(p))
+            } else if let Some(t) = first.and_then(|v| v.as_typed_array()) {
+                // §10.4.5.3 IntegerIndexedExoticObject [[DefineOwnProperty]].
+                match &key {
+                    PropertyKey::String(k) => {
+                        if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(k)
+                        {
+                            if t.buffer(gc_heap).is_detached(gc_heap)
+                                || !n.is_finite()
+                                || n.fract() != 0.0
+                                || n < 0.0
+                                || (n as usize) >= t.length(gc_heap)
+                                || descriptor.configurable == Some(false)
+                                || descriptor.enumerable == Some(false)
+                                || descriptor.writable == Some(false)
+                                || descriptor.is_accessor()
                             {
-                                if t.buffer(gc_heap).is_detached(gc_heap)
-                                    || !n.is_finite()
-                                    || n.fract() != 0.0
-                                    || n < 0.0
-                                    || (n as usize) >= t.length(gc_heap)
-                                    || descriptor.configurable == Some(false)
-                                    || descriptor.enumerable == Some(false)
-                                    || descriptor.writable == Some(false)
-                                    || descriptor.is_accessor()
-                                {
-                                    return Err(VmError::TypeError {
-                                        message: format!(
-                                            "Cannot define property '{}'",
-                                            key.label(gc_heap)
-                                        ),
-                                    });
-                                }
-                                if let Some(value) = descriptor.value {
-                                    let coerced =
-                                        crate::binary::dispatch::coerce_element_for_store(
-                                            gc_heap,
-                                            t.kind(),
-                                            &value,
-                                        )?;
-                                    t.set(gc_heap, n as usize, &coerced);
-                                }
-                            } else {
-                                let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
-                                    gc_heap, &t,
-                                )?;
-                                if !crate::object::define_own_property_partial(
-                                    bag, gc_heap, k, descriptor,
-                                ) {
-                                    return Err(VmError::TypeError {
-                                        message: format!(
-                                            "Cannot define property '{}'",
-                                            key.label(gc_heap)
-                                        ),
-                                    });
-                                }
+                                return Err(VmError::TypeError {
+                                    message: format!(
+                                        "Cannot define property '{}'",
+                                        key.label(gc_heap)
+                                    ),
+                                });
                             }
-                        }
-                        PropertyKey::Symbol(sym) => {
+                            if let Some(value) = descriptor.value {
+                                let coerced = crate::binary::dispatch::coerce_element_for_store(
+                                    gc_heap,
+                                    t.kind(),
+                                    &value,
+                                )?;
+                                t.set(gc_heap, n as usize, &coerced);
+                            }
+                        } else {
                             let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
                                 gc_heap, &t,
                             )?;
-                            if !crate::object::define_own_symbol_property_partial(
-                                bag, gc_heap, sym, descriptor,
+                            if !crate::object::define_own_property_partial(
+                                bag, gc_heap, k, descriptor,
                             ) {
                                 return Err(VmError::TypeError {
                                     message: format!(
@@ -2271,11 +2227,23 @@ pub fn call(
                             }
                         }
                     }
-                    Ok(Value::typed_array(t))
+                    PropertyKey::Symbol(sym) => {
+                        let bag =
+                            crate::property_dispatch::typed_array_ensure_expando_pub(gc_heap, &t)?;
+                        if !crate::object::define_own_symbol_property_partial(
+                            bag, gc_heap, sym, descriptor,
+                        ) {
+                            return Err(VmError::TypeError {
+                                message: format!("Cannot define property '{}'", key.label(gc_heap)),
+                            });
+                        }
+                    }
                 }
-                _ => Err(VmError::TypeError {
+                Ok(Value::typed_array(t))
+            } else {
+                Err(VmError::TypeError {
                     message: "Object.defineProperty target must be an object".to_string(),
-                }),
+                })
             }
         }
         // §20.1.2.5 Object.defineProperties(O, Properties)
@@ -2292,10 +2260,7 @@ pub fn call(
                         .collect()
                 });
             for (key, desc_value) in entries {
-                let desc_obj = match desc_value {
-                    Value::Object(o) => o,
-                    _ => return Err(VmError::TypeMismatch),
-                };
+                let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
                 let descriptor = coerce_to_descriptor(&desc_obj, gc_heap)?;
                 if !crate::object::define_own_property_partial(target, gc_heap, &key, descriptor) {
                     return Err(VmError::TypeMismatch);
@@ -2307,10 +2272,11 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.getownpropertydescriptor>
         M::GetOwnPropertyDescriptor => {
             let key = expect_property_key(args.get(1), gc_heap)?;
-            match args.first() {
-                Some(Value::Object(target)) => match &key {
+            let first = args.first();
+            if let Some(target) = first.and_then(|v| v.as_object()) {
+                match &key {
                     PropertyKey::String(string_key) => {
-                        if let Some(value) = crate::object::string_data(*target, gc_heap)
+                        if let Some(value) = crate::object::string_data(target, gc_heap)
                             && let Some(desc) = crate::string::exotic::descriptor_for_name(
                                 &value, string_key, gc_heap,
                             )?
@@ -2322,7 +2288,7 @@ pub fn call(
                                 &[args],
                             )?));
                         }
-                        match crate::object::get_own_descriptor(*target, gc_heap, string_key) {
+                        match crate::object::get_own_descriptor(target, gc_heap, string_key) {
                             Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
@@ -2333,7 +2299,7 @@ pub fn call(
                         }
                     }
                     PropertyKey::Symbol(sym) => {
-                        match crate::object::get_own_symbol_descriptor(*target, gc_heap, sym) {
+                        match crate::object::get_own_symbol_descriptor(target, gc_heap, sym) {
                             Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
@@ -2343,8 +2309,9 @@ pub fn call(
                             None => Ok(Value::undefined()),
                         }
                     }
-                },
-                Some(Value::ClassConstructor(class)) => match &key {
+                }
+            } else if let Some(class) = first.and_then(|v| v.as_class_constructor()) {
+                match &key {
                     PropertyKey::String(key) => {
                         match crate::object::get_own_descriptor(
                             class.statics(gc_heap),
@@ -2375,57 +2342,52 @@ pub fn call(
                             None => Ok(Value::undefined()),
                         }
                     }
-                },
-                Some(Value::NativeFunction(native)) => {
-                    let PropertyKey::String(key) = &key else {
-                        return Ok(Value::undefined());
-                    };
-                    match native.own_property_descriptor(gc_heap, key)? {
-                        Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                            &desc,
-                            gc_heap,
-                            &[],
-                            &[args],
-                        )?)),
-                        None => Ok(Value::undefined()),
-                    }
                 }
-                Some(Value::String(value)) => {
-                    let desc = match &key {
-                        PropertyKey::String(key) => {
-                            crate::string::exotic::descriptor_for_name(value, key, gc_heap)?
-                        }
-                        PropertyKey::Symbol(_) => None,
-                    };
-                    match desc {
-                        Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
-                            &desc,
-                            gc_heap,
-                            &[],
-                            &[args],
-                        )?)),
-                        None => Ok(Value::undefined()),
-                    }
+            } else if let Some(native) = first.and_then(|v| v.as_native_function()) {
+                let PropertyKey::String(key) = &key else {
+                    return Ok(Value::undefined());
+                };
+                match native.own_property_descriptor(gc_heap, key)? {
+                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
+                        &desc,
+                        gc_heap,
+                        &[],
+                        &[args],
+                    )?)),
+                    None => Ok(Value::undefined()),
                 }
-                // §20.1.2.7 Object.getOwnPropertyDescriptor performs
-                // `obj = ? ToObject(O)` first. Primitive Boolean /
-                // Number / String / Symbol / BigInt coerce to their
-                // wrapper, which carries no own data properties
-                // matching arbitrary keys (other than indexed chars
-                // and `length` on String). Returning `Undefined` for
-                // the common "no such own property" case matches
-                // spec without materialising a transient wrapper.
-                Some(
-                    Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_),
-                ) => Ok(Value::undefined()),
-                Some(Value::Null) | Some(Value::Undefined) | None => Err(VmError::TypeError {
+            } else if let Some(value) = first.and_then(|v| v.as_string()) {
+                let desc = match &key {
+                    PropertyKey::String(key) => {
+                        crate::string::exotic::descriptor_for_name(value, key, gc_heap)?
+                    }
+                    PropertyKey::Symbol(_) => None,
+                };
+                match desc {
+                    Some(desc) => Ok(Value::object(descriptor_to_object_with_roots(
+                        &desc,
+                        gc_heap,
+                        &[],
+                        &[args],
+                    )?)),
+                    None => Ok(Value::undefined()),
+                }
+            } else if first
+                .is_some_and(|v| v.is_boolean() || v.is_number() || v.is_symbol() || v.is_big_int())
+            {
+                // §20.1.2.7 Object.getOwnPropertyDescriptor — primitive
+                // wrappers carry no own data props for arbitrary keys.
+                Ok(Value::undefined())
+            } else if first.is_none_or(|v| v.is_null() || v.is_undefined()) {
+                Err(VmError::TypeError {
                     message:
                         "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
                             .to_string(),
-                }),
-                _ => Err(VmError::TypeError {
+                })
+            } else {
+                Err(VmError::TypeError {
                     message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
-                }),
+                })
             }
         }
         // §20.1.2.11 Object.getOwnPropertyDescriptors(O)
@@ -2555,22 +2517,17 @@ pub fn call(
         // §20.1.2.17 Object.keys(O) — enumerable own string keys.
         // <https://tc39.es/ecma262/#sec-object.keys>
         M::Keys => {
-            let owned: Vec<String> = match args.first() {
-                Some(Value::Object(target)) => {
-                    crate::object::with_properties(*target, gc_heap, |p| {
-                        p.enumerable_keys().map(|k| k.to_string()).collect()
-                    })
-                }
-                Some(Value::NativeFunction(native)) => native
-                    .enumerable_own_property_keys(gc_heap)
-                    .into_iter()
-                    .collect(),
-                Some(Value::BoundFunction(bound)) => {
-                    crate::function_metadata::bound_enumerable_own_property_keys(bound, gc_heap)
-                        .into_iter()
-                        .collect()
-                }
-                _ => return Err(VmError::TypeMismatch),
+            let first = args.first();
+            let owned: Vec<String> = if let Some(target) = first.and_then(|v| v.as_object()) {
+                crate::object::with_properties(target, gc_heap, |p| {
+                    p.enumerable_keys().map(|k| k.to_string()).collect()
+                })
+            } else if let Some(native) = first.and_then(|v| v.as_native_function()) {
+                native.enumerable_own_property_keys(gc_heap)
+            } else if let Some(bound) = first.and_then(|v| v.as_bound_function()) {
+                crate::function_metadata::bound_enumerable_own_property_keys(&bound, gc_heap)
+            } else {
+                return Err(VmError::TypeMismatch);
             };
             let mut names = Vec::with_capacity(owned.len());
             for k in owned {
@@ -2640,52 +2597,45 @@ pub fn call(
         M::Assign => {
             let target = expect_object(args.first())?;
             for src in args.iter().skip(1) {
-                match src {
-                    // Per spec, `null` / `undefined` sources are
-                    // skipped silently.
-                    Value::Undefined | Value::Null => continue,
-                    Value::Object(o) => {
-                        let entries: Vec<(String, Value)> =
-                            crate::object::with_properties(*o, gc_heap, |p| {
-                                p.enumerable_data_iter()
-                                    .map(|(k, v)| (k.to_string(), v))
-                                    .collect()
-                            });
-                        for (k, v) in entries {
-                            crate::object::set(target, gc_heap, &k, v);
-                        }
-                    }
-                    _ => return Err(VmError::TypeMismatch),
+                if src.is_undefined() || src.is_null() {
+                    // Per spec, null/undefined sources are skipped.
+                    continue;
+                }
+                let o = src.as_object().ok_or(VmError::TypeMismatch)?;
+                let entries: Vec<(String, Value)> =
+                    crate::object::with_properties(o, gc_heap, |p| {
+                        p.enumerable_data_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect()
+                    });
+                for (k, v) in entries {
+                    crate::object::set(target, gc_heap, &k, v);
                 }
             }
             Ok(Value::object(target))
         }
         // §20.1.2.7 Object.fromEntries(iterable). Foundation accepts
         // an array of `[k, v]` pairs (the most common shape) and a
-        // `Value::Map`; arbitrary iterables route through the user
+        // Map; arbitrary iterables route through the user
         // iterator protocol once it lands here too — filed.
         // <https://tc39.es/ecma262/#sec-object.fromentries>
         M::FromEntries => {
             let iter = args.first().cloned().unwrap_or(Value::undefined());
             let iter_root = iter;
             let result = rooted_object(gc_heap, &[&iter_root], &[args])?;
-            match iter {
-                Value::Array(arr) => {
-                    // Snapshot to avoid holding the array's RefCell
-                    // borrow while we recurse into per-pair work.
-                    let snapshot: Vec<Value> =
-                        crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
-                    for entry in snapshot {
-                        let (key, value) = read_entry_pair_heap(&entry, gc_heap)?;
-                        set_from_entries_key_heap(result, &key, value, gc_heap)?;
-                    }
+            if let Some(arr) = iter.as_array() {
+                let snapshot: Vec<Value> =
+                    crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
+                for entry in snapshot {
+                    let (key, value) = read_entry_pair_heap(&entry, gc_heap)?;
+                    set_from_entries_key_heap(result, &key, value, gc_heap)?;
                 }
-                Value::Map(m) => {
-                    for (key, value) in crate::collections::map_entries(m, gc_heap) {
-                        set_from_entries_key_heap(result, &key, value, gc_heap)?;
-                    }
+            } else if let Some(m) = iter.as_map() {
+                for (key, value) in crate::collections::map_entries(m, gc_heap) {
+                    set_from_entries_key_heap(result, &key, value, gc_heap)?;
                 }
-                _ => return Err(VmError::TypeMismatch),
+            } else {
+                return Err(VmError::TypeMismatch);
             }
             Ok(Value::object(result))
         }
@@ -2693,10 +2643,13 @@ pub fn call(
         // alternative to `Object.prototype.hasOwnProperty.call`.
         // <https://tc39.es/ecma262/#sec-object.hasown>
         M::HasOwn => {
-            let target = match args.first() {
-                Some(Value::Object(target)) => *target,
-                Some(Value::ClassConstructor(class)) => class.statics(gc_heap),
-                _ => return Err(VmError::TypeMismatch),
+            let first = args.first();
+            let target = if let Some(target) = first.and_then(|v| v.as_object()) {
+                target
+            } else if let Some(class) = first.and_then(|v| v.as_class_constructor()) {
+                class.statics(gc_heap)
+            } else {
+                return Err(VmError::TypeMismatch);
             };
             let present = has_own_property(target, gc_heap, args.get(1))?;
             Ok(Value::boolean(present))
@@ -2705,45 +2658,28 @@ pub fn call(
         // string-keyed property, regardless of enumerability.
         // <https://tc39.es/ecma262/#sec-object.getownpropertynames>
         M::GetOwnPropertyNames => {
-            let owned: Vec<String> = match args.first() {
-                Some(Value::Object(target)) => {
-                    crate::object::with_properties(*target, gc_heap, |p| {
-                        p.keys().map(|k| k.to_string()).collect()
-                    })
-                }
-                Some(Value::NativeFunction(native)) => {
-                    native.own_property_keys(gc_heap).into_iter().collect()
-                }
-                Some(Value::BoundFunction(bound)) => {
-                    crate::function_metadata::bound_own_property_keys(bound, gc_heap)
-                        .into_iter()
-                        .collect()
-                }
-                // Ordinary functions / closures — without an
-                // `ExecutionContext` we cannot honor the arrow-vs-
-                // constructor branch in
-                // [`Interpreter::ordinary_function_own_property_keys`].
-                // The context-aware paths
-                // ([`super::run_object_static_call_operands`] +
-                // [`native_get_own_property_names_rooted`]) reach
-                // this branch only after exhausting their own
-                // handlers, so signal "no context" here and let the
-                // caller fall through to the array shape it expects
-                // (the realistic fast paths already produced a
-                // result before landing here).
-                Some(Value::Function { .. }) | Some(Value::Closure(_)) => {
-                    return Err(VmError::InvalidOperand);
-                }
-                Some(Value::ClassConstructor(class)) => {
-                    class_constructor_own_property_keys_without_context(class, gc_heap)?
-                }
-                Some(Value::Boolean(_) | Value::Number(_) | Value::Symbol(_)) => Vec::new(),
-                Some(Value::String(s)) => {
-                    let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
-                    keys.push("length".to_string());
-                    keys
-                }
-                _ => return Err(VmError::TypeMismatch),
+            let first = args.first();
+            let owned: Vec<String> = if let Some(target) = first.and_then(|v| v.as_object()) {
+                crate::object::with_properties(target, gc_heap, |p| {
+                    p.keys().map(|k| k.to_string()).collect()
+                })
+            } else if let Some(native) = first.and_then(|v| v.as_native_function()) {
+                native.own_property_keys(gc_heap)
+            } else if let Some(bound) = first.and_then(|v| v.as_bound_function()) {
+                crate::function_metadata::bound_own_property_keys(&bound, gc_heap)
+            } else if first.is_some_and(|v| v.is_function() || v.is_closure()) {
+                // Ordinary function / closure — no context here.
+                return Err(VmError::InvalidOperand);
+            } else if let Some(class) = first.and_then(|v| v.as_class_constructor()) {
+                class_constructor_own_property_keys_without_context(&class, gc_heap)?
+            } else if first.is_some_and(|v| v.is_boolean() || v.is_number() || v.is_symbol()) {
+                Vec::new()
+            } else if let Some(s) = first.and_then(|v| v.as_string()) {
+                let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
+                keys.push("length".to_string());
+                keys
+            } else {
+                return Err(VmError::TypeMismatch);
             };
             let mut names: Vec<Value> = Vec::with_capacity(owned.len());
             for k in owned {
@@ -2965,35 +2901,44 @@ fn lookup_to_optional_bool(lookup: &PropertyLookup, heap: &otter_gc::GcHeap) -> 
 fn lookup_to_optional_value(lookup: &PropertyLookup) -> Result<Option<Value>, VmError> {
     match lookup {
         PropertyLookup::Absent => Ok(None),
-        PropertyLookup::Data { value, .. } => match value {
-            Value::Undefined => Ok(None),
-            v => Ok(Some(*v)),
-        },
+        PropertyLookup::Data { value, .. } => {
+            if value.is_undefined() {
+                Ok(None)
+            } else {
+                Ok(Some(*value))
+            }
+        }
         PropertyLookup::Accessor { .. } => Ok(None),
     }
 }
 
 fn expect_object(arg: Option<&Value>) -> Result<JsObject, VmError> {
-    match arg {
-        Some(Value::Object(o)) => Ok(*o),
-        _ => Err(VmError::TypeMismatch),
-    }
+    arg.and_then(|v| v.as_object()).ok_or(VmError::TypeMismatch)
 }
 
 fn expect_property_key(
     arg: Option<&Value>,
     heap: &otter_gc::GcHeap,
 ) -> Result<PropertyKey, VmError> {
-    match arg {
-        Some(Value::String(s)) => Ok(PropertyKey::String(s.to_lossy_string(heap))),
-        Some(Value::Number(n)) => Ok(PropertyKey::String(n.to_display_string())),
-        Some(Value::Boolean(b)) => Ok(PropertyKey::String(
-            (if *b { "true" } else { "false" }).to_string(),
-        )),
-        Some(Value::Null) => Ok(PropertyKey::String("null".to_string())),
-        Some(Value::Undefined) | None => Ok(PropertyKey::String("undefined".to_string())),
-        Some(Value::Symbol(sym)) => Ok(PropertyKey::Symbol(*sym)),
-        _ => Err(VmError::TypeMismatch),
+    let Some(v) = arg else {
+        return Ok(PropertyKey::String("undefined".to_string()));
+    };
+    if let Some(s) = v.as_string() {
+        Ok(PropertyKey::String(s.to_lossy_string(heap)))
+    } else if let Some(n) = v.as_number() {
+        Ok(PropertyKey::String(n.to_display_string()))
+    } else if let Some(b) = v.as_boolean() {
+        Ok(PropertyKey::String(
+            (if b { "true" } else { "false" }).to_string(),
+        ))
+    } else if v.is_null() {
+        Ok(PropertyKey::String("null".to_string()))
+    } else if v.is_undefined() {
+        Ok(PropertyKey::String("undefined".to_string()))
+    } else if let Some(sym) = v.as_symbol() {
+        Ok(PropertyKey::Symbol(*sym))
+    } else {
+        Err(VmError::TypeMismatch)
     }
 }
 
@@ -3041,12 +2986,17 @@ fn has_own_property(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-topropertykey>
 fn property_key_from_value(value: &Value, heap: &otter_gc::GcHeap) -> Result<String, VmError> {
-    match value {
-        Value::String(s) => Ok(s.to_lossy_string(heap)),
-        Value::Number(n) => Ok(n.to_display_string()),
-        Value::Boolean(b) => Ok((if *b { "true" } else { "false" }).to_string()),
-        Value::Null => Ok("null".to_string()),
-        Value::Undefined => Ok("undefined".to_string()),
-        _ => Err(VmError::TypeMismatch),
+    if let Some(s) = value.as_string() {
+        Ok(s.to_lossy_string(heap))
+    } else if let Some(n) = value.as_number() {
+        Ok(n.to_display_string())
+    } else if let Some(b) = value.as_boolean() {
+        Ok((if b { "true" } else { "false" }).to_string())
+    } else if value.is_null() {
+        Ok("null".to_string())
+    } else if value.is_undefined() {
+        Ok("undefined".to_string())
+    } else {
+        Err(VmError::TypeMismatch)
     }
 }

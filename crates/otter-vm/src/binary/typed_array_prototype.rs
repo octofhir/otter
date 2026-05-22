@@ -23,12 +23,11 @@ use super::typed_array::{JsTypedArray, TypedArrayKind};
 use super::{number_value, smi};
 
 fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsTypedArray, IntrinsicError> {
-    match args.receiver {
-        Value::TypedArray(t) => Ok(*t),
-        _ => Err(IntrinsicError::BadReceiver {
+    args.receiver
+        .as_typed_array()
+        .ok_or(IntrinsicError::BadReceiver {
             expected: "typedarray",
-        }),
-    }
+        })
 }
 
 fn check_not_detached(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), IntrinsicError> {
@@ -44,12 +43,20 @@ fn check_not_detached(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(), I
 /// `[0, len]` per §7.1.5 ToIntegerOrInfinity then offset-from-end
 /// for negative values.
 fn relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
-    let n = match arg {
-        None | Some(Value::Undefined) => return default,
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        _ => return default,
+    let Some(v) = arg else {
+        return default;
+    };
+    if v.is_undefined() {
+        return default;
+    }
+    let n = if let Some(num) = v.as_number() {
+        num.as_f64()
+    } else if let Some(b) = v.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if v.is_null() {
+        0.0
+    } else {
+        return default;
     };
     if n.is_nan() {
         return 0;
@@ -66,12 +73,20 @@ fn relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
 }
 
 fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
-    let n = match arg {
-        None | Some(Value::Undefined) => return default,
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        _ => return default,
+    let Some(v) = arg else {
+        return default;
+    };
+    if v.is_undefined() {
+        return default;
+    }
+    let n = if let Some(num) = v.as_number() {
+        num.as_f64()
+    } else if let Some(b) = v.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if v.is_null() {
+        0.0
+    } else {
+        return default;
     };
     if n.is_nan() {
         return 0;
@@ -152,15 +167,14 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t, &*args.gc_heap)?;
     let len = t.length(args.gc_heap) as i64;
-    let idx = match args.args.first() {
-        Some(Value::Number(n)) => {
-            let f = n.as_f64();
-            if !f.is_finite() {
-                return Ok(Value::undefined());
-            }
-            f.trunc() as i64
+    let idx = if let Some(n) = args.args.first().and_then(|v| v.as_number()) {
+        let f = n.as_f64();
+        if !f.is_finite() {
+            return Ok(Value::undefined());
         }
-        _ => 0,
+        f.trunc() as i64
+    } else {
+        0
     };
     let resolved = if idx < 0 { len + idx } else { idx };
     if resolved < 0 || resolved >= len {
@@ -219,13 +233,13 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     check_not_detached(&t, &*args.gc_heap)?;
     let len = t.length(args.gc_heap) as i64;
     let value = args.args.first().cloned().unwrap_or(Value::undefined());
-    if t.kind().is_bigint() && !matches!(&value, Value::BigInt(_)) {
+    if t.kind().is_bigint() && !value.is_big_int() {
         return Err(IntrinsicError::BadArgument {
             index: 0,
             reason: "must be a BigInt",
         });
     }
-    if !t.kind().is_bigint() && matches!(&value, Value::BigInt(_)) {
+    if !t.kind().is_bigint() && value.is_big_int() {
         return Err(IntrinsicError::BadArgument {
             index: 0,
             reason: "must be a Number",
@@ -358,10 +372,16 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t, &*args.gc_heap)?;
-    let separator = match args.args.first() {
-        None | Some(Value::Undefined) => ",".to_string(),
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        Some(other) => other.display_string(args.gc_heap),
+    let separator = if let Some(v) = args.args.first() {
+        if v.is_undefined() {
+            ",".to_string()
+        } else if let Some(s) = v.as_string() {
+            s.to_lossy_string(args.gc_heap)
+        } else {
+            v.display_string(args.gc_heap)
+        }
+    } else {
+        ",".to_string()
     };
     join_into_string(&t, &separator, args.gc_heap)
 }
@@ -378,9 +398,8 @@ fn join_into_string(
             out.push_str(separator);
         }
         let v = t.get(gc_heap, i).map_err(intrinsic_oom)?;
-        match &v {
-            Value::Undefined | Value::Null => {}
-            other => out.push_str(&other.display_string(gc_heap)),
+        if !(v.is_undefined() || v.is_null()) {
+            out.push_str(&v.display_string(gc_heap));
         }
     }
     Ok(Value::string(JsString::from_str(&out, gc_heap)?))
@@ -423,107 +442,91 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
         })
     }
-    match source {
-        Value::TypedArray(src) => {
-            let src_len = src.length(args.gc_heap);
-            if off + src_len > t.length(args.gc_heap) {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "source overruns destination",
-                });
-            }
-            // Snapshot first to handle aliasing of the same buffer.
-            let snapshot: Vec<Value> = {
-                let mut tmp = Vec::with_capacity(src_len);
-                for i in 0..src_len {
-                    tmp.push(src.get(args.gc_heap, i).map_err(intrinsic_oom)?);
-                }
-                tmp
-            };
-            for (i, v) in snapshot.iter().enumerate() {
-                let coerced = coerce(kind, v, args.gc_heap)?;
-                t.set(args.gc_heap, off + i, &coerced);
-            }
-        }
-        Value::Array(arr) => {
-            let src_len = crate::array::len(arr, args.gc_heap);
-            if off + src_len > t.length(args.gc_heap) {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "source overruns destination",
-                });
-            }
-            for i in 0..src_len {
-                let v = crate::array::get(arr, args.gc_heap, i);
-                let coerced = coerce(kind, &v, args.gc_heap)?;
-                t.set(args.gc_heap, off + i, &coerced);
-            }
-        }
-        Value::Object(obj) => {
-            // §22.2.3.23.1 step 14 — array-like Object source: read
-            // `length` then `[0..len)` indexed values, coerced to
-            // the destination kind.
-            let len_value =
-                crate::object::get(obj, args.gc_heap, "length").unwrap_or(Value::undefined());
-            let len_n = crate::number::to_number_value(&len_value, args.gc_heap);
-            let src_len = if len_n.is_nan() || len_n <= 0.0 {
-                0
-            } else {
-                len_n.min(9_007_199_254_740_991.0) as usize
-            };
-            if off + src_len > t.length(args.gc_heap) {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "source overruns destination",
-                });
-            }
-            for i in 0..src_len {
-                let key = i.to_string();
-                let v = crate::object::get(obj, args.gc_heap, &key).unwrap_or(Value::undefined());
-                let coerced = coerce(kind, &v, args.gc_heap)?;
-                t.set(args.gc_heap, off + i, &coerced);
-            }
-        }
-        // §22.2.3.23.1 step 14 — `ToObject(array)` for primitive
-        // sources. String → indexed-character wrapper (length =
-        // code-unit count); Number / Boolean → wrapper with no
-        // indexed slots (length = 0, no-op write). Symbol /
-        // BigInt fall through to TypeError per ToObject.
-        Value::String(s) => {
-            let units = s.to_utf16_vec(args.gc_heap);
-            let src_len = units.len();
-            if off + src_len > t.length(args.gc_heap) {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "source overruns destination",
-                });
-            }
-            for (i, unit) in units.iter().enumerate() {
-                let ch = char::from_u32(*unit as u32).unwrap_or('\u{FFFD}');
-                let s_one = ch.to_string();
-                let v = Value::string(JsString::from_str(&s_one, args.gc_heap)?);
-                let coerced = coerce(kind, &v, args.gc_heap)?;
-                t.set(args.gc_heap, off + i, &coerced);
-            }
-        }
-        Value::Number(_)
-        | Value::Boolean(_)
-        | Value::Symbol(_)
-        | Value::BigInt(_)
-        | Value::Null
-        | Value::Undefined => {
-            // ToObject wraps primitives. Number / Boolean / Symbol /
-            // BigInt wrappers have no own indexed properties → length
-            // is undefined → no-op. Per spec ToObject(undefined/null)
-            // throws but tests expect silent acceptance through the
-            // wrapper-length=0 fallback for the §22.2.3.23.1 path.
-        }
-        _ => {
+    if let Some(src) = source.as_typed_array() {
+        let src_len = src.length(args.gc_heap);
+        if off + src_len > t.length(args.gc_heap) {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
-                reason: "must be a TypedArray or array-like",
+                reason: "source overruns destination",
             });
         }
+        // Snapshot first to handle aliasing of the same buffer.
+        let snapshot: Vec<Value> = {
+            let mut tmp = Vec::with_capacity(src_len);
+            for i in 0..src_len {
+                tmp.push(src.get(args.gc_heap, i).map_err(intrinsic_oom)?);
+            }
+            tmp
+        };
+        for (i, v) in snapshot.iter().enumerate() {
+            let coerced = coerce(kind, v, args.gc_heap)?;
+            t.set(args.gc_heap, off + i, &coerced);
+        }
+    } else if let Some(arr) = source.as_array() {
+        let src_len = crate::array::len(arr, args.gc_heap);
+        if off + src_len > t.length(args.gc_heap) {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "source overruns destination",
+            });
+        }
+        for i in 0..src_len {
+            let v = crate::array::get(arr, args.gc_heap, i);
+            let coerced = coerce(kind, &v, args.gc_heap)?;
+            t.set(args.gc_heap, off + i, &coerced);
+        }
+    } else if let Some(obj) = source.as_object() {
+        // §22.2.3.23.1 step 14 — array-like Object source.
+        let len_value =
+            crate::object::get(obj, args.gc_heap, "length").unwrap_or(Value::undefined());
+        let len_n = crate::number::to_number_value(&len_value, args.gc_heap);
+        let src_len = if len_n.is_nan() || len_n <= 0.0 {
+            0
+        } else {
+            len_n.min(9_007_199_254_740_991.0) as usize
+        };
+        if off + src_len > t.length(args.gc_heap) {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "source overruns destination",
+            });
+        }
+        for i in 0..src_len {
+            let key = i.to_string();
+            let v = crate::object::get(obj, args.gc_heap, &key).unwrap_or(Value::undefined());
+            let coerced = coerce(kind, &v, args.gc_heap)?;
+            t.set(args.gc_heap, off + i, &coerced);
+        }
+    } else if let Some(s) = source.as_string() {
+        // §22.2.3.23.1 step 14 — String indexed-char wrapper.
+        let units = s.to_utf16_vec(args.gc_heap);
+        let src_len = units.len();
+        if off + src_len > t.length(args.gc_heap) {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "source overruns destination",
+            });
+        }
+        for (i, unit) in units.iter().enumerate() {
+            let ch = char::from_u32(*unit as u32).unwrap_or('\u{FFFD}');
+            let s_one = ch.to_string();
+            let v = Value::string(JsString::from_str(&s_one, args.gc_heap)?);
+            let coerced = coerce(kind, &v, args.gc_heap)?;
+            t.set(args.gc_heap, off + i, &coerced);
+        }
+    } else if source.is_number()
+        || source.is_boolean()
+        || source.is_symbol()
+        || source.is_big_int()
+        || source.is_null()
+        || source.is_undefined()
+    {
+        // Primitive wrappers have no own indexed properties — no-op.
+    } else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a TypedArray or array-like",
+        });
     }
     Ok(Value::undefined())
 }
@@ -573,7 +576,7 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     build_new_typed_array_rooted(args, t.kind(), &snapshot)
 }
 
-/// Wrap a snapshot of values in a `Value::Iterator`. Mirrors the
+/// Wrap a snapshot of values in an iterator value. Mirrors the
 /// pattern Map / Set iterators use so callers see a real `next()`
 /// surface instead of a plain Array.
 ///
@@ -628,24 +631,26 @@ fn impl_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 // ---- comparison helpers -------------------------------------------------
 
 fn values_equal_strict(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => crate::number::equals(*x, *y),
-        (Value::BigInt(x), Value::BigInt(y)) => x == y,
-        _ => false,
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        crate::number::equals(x, y)
+    } else if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
+        x == y
+    } else {
+        false
     }
 }
 
 /// SameValueZero — like strict equality but `NaN === NaN`.
 fn values_equal_zero(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            if x.is_nan() && y.is_nan() {
-                return true;
-            }
-            crate::number::equals(*x, *y)
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        if x.is_nan() && y.is_nan() {
+            return true;
         }
-        (Value::BigInt(x), Value::BigInt(y)) => x == y,
-        _ => false,
+        crate::number::equals(x, y)
+    } else if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
+        x == y
+    } else {
+        false
     }
 }
 
@@ -653,22 +658,17 @@ fn values_equal_zero(a: &Value, b: &Value) -> bool {
 /// ascending for BigInt kinds. Per §23.2.3.30 step 4.
 fn sort_default(values: &mut [Value], bigint_kind: bool, heap: &otter_gc::GcHeap) {
     if bigint_kind {
-        values.sort_by(|a, b| match (a, b) {
-            (Value::BigInt(x), Value::BigInt(y)) => {
+        values.sort_by(|a, b| {
+            if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
                 x.with_inner(heap, |xb| y.with_inner(heap, |yb| xb.cmp(yb)))
+            } else {
+                std::cmp::Ordering::Equal
             }
-            _ => std::cmp::Ordering::Equal,
         });
     } else {
         values.sort_by(|a, b| {
-            let x = match a {
-                Value::Number(n) => n.as_f64(),
-                _ => 0.0,
-            };
-            let y = match b {
-                Value::Number(n) => n.as_f64(),
-                _ => 0.0,
-            };
+            let x = a.as_number().map(|n| n.as_f64()).unwrap_or(0.0);
+            let y = b.as_number().map(|n| n.as_f64()).unwrap_or(0.0);
             // NaN sorts to the end per spec; also handles ±0 equal.
             match (x.is_nan(), y.is_nan()) {
                 (true, true) => std::cmp::Ordering::Equal,
@@ -730,7 +730,7 @@ pub fn load_property(t: &JsTypedArray, heap: &otter_gc::GcHeap, name: &str) -> V
         "BYTES_PER_ELEMENT" => smi(t.kind().bytes_per_element() as i32),
         _ => {
             let _ = number_value;
-            Value::Undefined
+            Value::undefined()
         }
     }
 }
@@ -762,7 +762,7 @@ mod tests {
             after > before,
             "TypedArray.prototype.entries should allocate pair arrays, snapshot array, and iterator state in young space"
         );
-        assert!(matches!(result, Value::Iterator(_)));
+        assert!(result.is_iterator());
     }
 
     #[test]
@@ -784,7 +784,7 @@ mod tests {
         })
         .expect("slice");
 
-        assert!(matches!(result, Value::TypedArray(_)));
+        assert!(result.is_typed_array());
         // `tracked_bytes` includes the new GC body plus the 4-byte
         // external backing store reservation.
         assert!(gc_heap.tracked_bytes() - before >= 4);

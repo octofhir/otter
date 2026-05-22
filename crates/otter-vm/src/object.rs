@@ -2964,7 +2964,7 @@ mod tests {
             None
         );
         assert_eq!(get_own(second, &heap, "x"), None);
-        assert_eq!(get_own(proto, &heap, "x"), Some(Value::Boolean(true)));
+        assert_eq!(get_own(proto, &heap, "x"), Some(Value::boolean(true)));
     }
 
     #[test]

@@ -958,7 +958,7 @@ pub(crate) fn set_property_flags(
 #[must_use]
 pub fn get_named_property(arr: JsArray, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
     if key == "length" {
-        return Some(Value::Number(crate::number::NumberValue::from_f64(
+        return Some(Value::number(crate::number::NumberValue::from_f64(
             len(arr, heap) as f64,
         )));
     }

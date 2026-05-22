@@ -1371,7 +1371,7 @@ mod tests {
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].as_number().unwrap().as_smi(), Some(1));
         assert_eq!(keys[1].as_number().unwrap().as_smi(), Some(2));
-        assert_eq!(map_get(m, &heap, &n(1)), Some(Value::Boolean(false)));
+        assert_eq!(map_get(m, &heap, &n(1)), Some(Value::boolean(false)));
     }
 
     #[test]

@@ -170,7 +170,7 @@ pub(crate) fn install_typed_array_entry(
     // %TypedArray%. The override is consulted by
     // `Object.getPrototypeOf` / `__proto__` walks.
     let abstract_ctor = ensure_abstract_typed_array_constructor(heap, global)?;
-    ctor.set_prototype_override(heap, Some(Value::NativeFunction(abstract_ctor)));
+    ctor.set_prototype_override(heap, Some(Value::native_function(abstract_ctor)));
     // Also expose BYTES_PER_ELEMENT on the constructor (§23.2.6.1).
     let bpe_desc = PropertyDescriptor::data(
         Value::Number(NumberValue::from_i32(bpe)),

@@ -44,7 +44,6 @@ pub use typed_array::{
 };
 
 use crate::Value;
-use crate::number::NumberValue;
 
 /// §7.1.22 `ToIndex(value)` — coerce to a non-negative integer in
 /// `[0, 2^53 - 1]`. Returns `None` for non-integer inputs after
@@ -59,13 +58,19 @@ use crate::number::NumberValue;
 /// <https://tc39.es/ecma262/#sec-toindex>
 #[must_use]
 pub fn to_index(value: &Value, heap: &otter_gc::GcHeap) -> Option<u64> {
-    let n = match value {
-        Value::Undefined => return Some(0),
-        Value::Number(n) => n.as_f64(),
-        Value::Boolean(true) => 1.0,
-        Value::Boolean(false) | Value::Null => 0.0,
-        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string(heap)).as_f64(),
-        _ => return None,
+    if value.is_undefined() {
+        return Some(0);
+    }
+    let n = if let Some(n) = value.as_number() {
+        n.as_f64()
+    } else if let Some(b) = value.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if value.is_null() {
+        0.0
+    } else if let Some(s) = value.as_string() {
+        crate::number::to_number_from_string(&s.to_lossy_string(heap)).as_f64()
+    } else {
+        return None;
     };
     if n.is_nan() {
         return Some(0);
@@ -90,7 +95,8 @@ pub fn to_index(value: &Value, heap: &otter_gc::GcHeap) -> Option<u64> {
 #[must_use]
 pub fn to_little_endian_flag(value: Option<&Value>, heap: &otter_gc::GcHeap) -> bool {
     match value {
-        None | Some(Value::Undefined) => false,
+        None => false,
+        Some(v) if v.is_undefined() => false,
         Some(v) => v.to_boolean(heap),
     }
 }
@@ -98,13 +104,13 @@ pub fn to_little_endian_flag(value: Option<&Value>, heap: &otter_gc::GcHeap) -> 
 /// Construct a `Value::Number` from an `f64`.
 #[must_use]
 pub fn number_value(n: f64) -> Value {
-    Value::Number(NumberValue::from_f64(n))
+    Value::number_f64(n)
 }
 
 /// Construct a `Value::Number` from a small integer.
 #[must_use]
 pub fn smi(n: i32) -> Value {
-    Value::Number(NumberValue::from_i32(n))
+    Value::number_i32(n)
 }
 
 /// Spec-canonical `[Symbol.toStringTag]` rendering for binary
@@ -117,10 +123,14 @@ pub fn smi(n: i32) -> Value {
 /// - <https://tc39.es/ecma262/#sec-get-dataview.prototype-%40%40tostringtag>
 #[must_use]
 pub fn to_string_tag_for(value: &Value) -> Option<&'static str> {
-    Some(match value {
-        Value::ArrayBuffer(_) => "ArrayBuffer",
-        Value::DataView(_) => "DataView",
-        Value::TypedArray(t) => t.kind().name(),
-        _ => return None,
-    })
+    if value.is_array_buffer() {
+        return Some("ArrayBuffer");
+    }
+    if value.is_data_view() {
+        return Some("DataView");
+    }
+    if let Some(t) = value.as_typed_array() {
+        return Some(t.kind().name());
+    }
+    None
 }

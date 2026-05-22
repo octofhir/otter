@@ -142,13 +142,13 @@ fn receiver_string(args: &mut IntrinsicArgs<'_>) -> Result<JsString, IntrinsicEr
 /// (`ToString(undefined) = "undefined"`).
 fn arg_to_string(args: &mut IntrinsicArgs<'_>, index: u16) -> Result<JsString, IntrinsicError> {
     let Some(arg) = args.args.get(index as usize) else {
-        return Ok(JsString::from_str("undefined", args.gc_heap)?);
+        return Ok(JsString::undefined_str(args.gc_heap)?);
     };
     if arg.is_undefined() {
-        return Ok(JsString::from_str("undefined", args.gc_heap)?);
+        return Ok(JsString::undefined_str(args.gc_heap)?);
     }
     if arg.is_null() {
-        return Ok(JsString::from_str("null", args.gc_heap)?);
+        return Ok(JsString::null_str(args.gc_heap)?);
     }
     if let Some(s) = arg.as_string() {
         return Ok(*s);

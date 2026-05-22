@@ -167,6 +167,23 @@ impl JsString {
         Self::from_utf16_units(&[], heap)
     }
 
+    /// `"undefined"` convenience constructor. Used by every
+    /// `ToString(undefined)` / missing-arg coercion site.
+    ///
+    /// # Errors
+    /// See [`Self::from_latin1`].
+    pub fn undefined_str(heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        Self::from_latin1(b"undefined", heap)
+    }
+
+    /// `"null"` convenience constructor. Used by `ToString(null)`.
+    ///
+    /// # Errors
+    /// See [`Self::from_latin1`].
+    pub fn null_str(heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        Self::from_latin1(b"null", heap)
+    }
+
     /// Length in WTF-16 code units (O(1), heap-free).
     #[must_use]
     pub fn len(self) -> u32 {

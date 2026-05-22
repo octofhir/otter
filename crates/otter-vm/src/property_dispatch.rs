@@ -129,11 +129,11 @@ impl Interpreter {
                 return Ok(Value::string(js));
             }
             Value::Null => {
-                let js = JsString::from_str("null", self.gc_heap_mut())?;
+                let js = JsString::null_str(self.gc_heap_mut())?;
                 return Ok(Value::string(js));
             }
             Value::Undefined | Value::Hole => {
-                let js = JsString::from_str("undefined", self.gc_heap_mut())?;
+                let js = JsString::undefined_str(self.gc_heap_mut())?;
                 return Ok(Value::string(js));
             }
             Value::BigInt(b) => {

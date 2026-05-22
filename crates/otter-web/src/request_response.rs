@@ -3,9 +3,9 @@
 use otter_runtime::{
     RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeHostObjectError,
     RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNumberValue as NumberValue, RuntimeObjectBuilder as ObjectBuilder,
-    RuntimeValue as Value, runtime_class, runtime_constructor, runtime_method,
-    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
+    runtime_constructor, runtime_method, runtime_optional_arg_to_string, runtime_this_object,
+    runtime_with_host_data,
 };
 
 use crate::blob::Blob;
@@ -239,7 +239,7 @@ fn request_object(ctx: &mut NativeCtx<'_>, state: Request) -> Result<Value, Nati
     let headers = crate::headers::headers_object(ctx, state.headers().clone())?;
     let body = match state.body() {
         Some(body) => crate::blob::blob_object(ctx, body.clone())?,
-        None => Value::Null,
+        None => Value::null(),
     };
     let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
     builder
@@ -249,16 +249,16 @@ fn request_object(ctx: &mut NativeCtx<'_>, state: Request) -> Result<Value, Nati
         .and_then(|builder| builder.readonly_property("body", body))
         .and_then(|builder| builder.builtin_method("clone", 0, request_clone_native))
         .map_err(|err| crate::type_error("Request", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::object(builder.build()))
 }
 
 fn response_object(ctx: &mut NativeCtx<'_>, state: Response) -> Result<Value, NativeError> {
-    let status = Value::Number(NumberValue::from_f64(state.status() as f64));
+    let status = Value::number_f64(state.status() as f64);
     let status_text = crate::string_value(ctx, state.status_text())?;
     let headers = crate::headers::headers_object(ctx, state.headers().clone())?;
     let body = match state.body() {
         Some(body) => crate::blob::blob_object(ctx, body.clone())?,
-        None => Value::Null,
+        None => Value::null(),
     };
     let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
     builder
@@ -268,5 +268,5 @@ fn response_object(ctx: &mut NativeCtx<'_>, state: Response) -> Result<Value, Na
         .and_then(|builder| builder.readonly_property("body", body))
         .and_then(|builder| builder.builtin_method("clone", 0, response_clone_native))
         .map_err(|err| crate::type_error("Response", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::object(builder.build()))
 }

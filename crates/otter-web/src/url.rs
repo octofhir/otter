@@ -184,5 +184,5 @@ pub(crate) fn url_object(ctx: &mut NativeCtx<'_>, state: WebUrl) -> Result<Value
         .and_then(|builder| builder.data_property("search", search))
         .and_then(|builder| builder.data_property("hash", hash))
         .map_err(|err| crate::type_error("URL", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::object(builder.build()))
 }

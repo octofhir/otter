@@ -115,7 +115,7 @@ fn write_file_sync(
             message: err.to_string(),
         })
     })?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn exists_sync(
@@ -125,9 +125,9 @@ fn exists_sync(
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.existsSync")?;
     if !capabilities.read.matches_path(&path) {
-        return Ok(Value::Boolean(false));
+        return Ok(Value::boolean(false));
     }
-    Ok(Value::Boolean(path.exists()))
+    Ok(Value::boolean(path.exists()))
 }
 
 fn mkdir_sync(
@@ -143,7 +143,7 @@ fn mkdir_sync(
             message: err.to_string(),
         })
     })?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn path_arg(

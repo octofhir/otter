@@ -3,9 +3,9 @@
 use otter_runtime::{
     RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeJsObject as JsObject,
     RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeNumberValue as NumberValue, RuntimeObjectBuilder as ObjectBuilder,
-    RuntimeValue as Value, runtime_class, runtime_constructor, runtime_getter, runtime_method,
-    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
+    runtime_constructor, runtime_getter, runtime_method, runtime_optional_arg_to_string,
+    runtime_this_object, runtime_with_host_data,
 };
 
 /// Owned Blob data.
@@ -136,7 +136,7 @@ fn blob_text_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 fn blob_size_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let size = blob_snapshot(ctx, "Blob.prototype.size")?.size();
-    Ok(Value::Number(NumberValue::from_f64(size as f64)))
+    Ok(Value::number_f64(size as f64))
 }
 
 fn blob_type_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -148,7 +148,7 @@ fn blob_type_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 pub(crate) fn blob_object(ctx: &mut NativeCtx<'_>, state: Blob) -> Result<Value, NativeError> {
     let content_type = crate::string_value(ctx, state.content_type())?;
-    let size = Value::Number(NumberValue::from_f64(state.size() as f64));
+    let size = Value::number_f64(state.size() as f64);
     let mut builder = ObjectBuilder::from_host_data(ctx, state)?;
     builder
         .readonly_property("size", size)
@@ -157,7 +157,7 @@ pub(crate) fn blob_object(ctx: &mut NativeCtx<'_>, state: Blob) -> Result<Value,
         .and_then(|builder| builder.builtin_method("arrayBuffer", 0, blob_array_buffer_native))
         .and_then(|builder| builder.builtin_method("slice", 2, blob_slice_native))
         .map_err(|err| crate::type_error("Blob", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::object(builder.build()))
 }
 
 fn arg_usize(args: &[Value], index: usize) -> Option<usize> {

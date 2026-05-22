@@ -146,7 +146,7 @@ fn headers_append_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     })
     .map_err(|err| host_error("Headers.prototype.append", err))?;
     result.map_err(|err| crate::type_error("Headers.prototype.append", err.to_string()))?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn headers_delete_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -156,7 +156,7 @@ fn headers_delete_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| headers.delete(&name))
             .map_err(|err| host_error("Headers.prototype.delete", err))?;
     result.map_err(|err| crate::type_error("Headers.prototype.delete", err.to_string()))?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn headers_get_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -166,7 +166,7 @@ fn headers_get_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         .map_err(|err| host_error("Headers.prototype.get", err))?;
     match result.map_err(|err| crate::type_error("Headers.prototype.get", err.to_string()))? {
         Some(value) => crate::string_value(ctx, &value),
-        None => Ok(Value::Null),
+        None => Ok(Value::null()),
     }
 }
 
@@ -175,7 +175,7 @@ fn headers_has_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     let name = crate::arg_string(args, 0, ctx.heap());
     let result = runtime_with_host_data::<Headers, _>(ctx, object, |headers| headers.has(&name))
         .map_err(|err| host_error("Headers.prototype.has", err))?;
-    Ok(Value::Boolean(result.map_err(|err| {
+    Ok(Value::boolean(result.map_err(|err| {
         crate::type_error("Headers.prototype.has", err.to_string())
     })?))
 }
@@ -188,7 +188,7 @@ fn headers_set_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
         runtime_with_host_data_mut::<Headers, _>(ctx, object, |headers| headers.set(&name, &value))
             .map_err(|err| host_error("Headers.prototype.set", err))?;
     result.map_err(|err| crate::type_error("Headers.prototype.set", err.to_string()))?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn headers_entries_native(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -216,5 +216,5 @@ pub(crate) fn headers_object(
         .and_then(|builder| builder.builtin_method("set", 2, headers_set_native))
         .and_then(|builder| builder.builtin_method("entries", 0, headers_entries_native))
         .map_err(|err| crate::type_error("Headers", err.to_string()))?;
-    Ok(Value::Object(builder.build()))
+    Ok(Value::object(builder.build()))
 }

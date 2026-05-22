@@ -299,7 +299,7 @@ impl otter_gc::SafeTraceable for PurePromiseBody {
             reaction.trace_value_slots(visitor);
         }
         if let Some(expando) = &self.expando {
-            Value::Object(*expando).trace_value_slots(visitor);
+            Value::object(*expando).trace_value_slots(visitor);
         }
         if let Some(proto) = &self.prototype_override {
             proto.trace_value_slots(visitor);
@@ -941,7 +941,7 @@ fn reaction_to_microtask(
             };
             Some(Microtask {
                 callee,
-                this_value: Value::Undefined,
+                this_value: Value::undefined(),
                 args: smallvec![value],
                 context: reaction.context,
                 result_capability,
@@ -955,8 +955,8 @@ fn reaction_to_microtask(
         } => {
             let frame = crate::generator::take_parked_frame(parked, heap)?;
             Some(Microtask {
-                callee: Value::Undefined,
-                this_value: Value::Undefined,
+                callee: Value::undefined(),
+                this_value: Value::undefined(),
                 args: smallvec![value],
                 context: reaction.context,
                 result_capability: None,
@@ -975,8 +975,8 @@ fn reaction_to_microtask(
         } => {
             let frame = crate::generator::take_parked_frame(parked, heap)?;
             Some(Microtask {
-                callee: Value::Undefined,
-                this_value: Value::Undefined,
+                callee: Value::undefined(),
+                this_value: Value::undefined(),
                 args: smallvec![value],
                 context: reaction.context,
                 result_capability: None,
@@ -1002,19 +1002,18 @@ fn record_reaction_barriers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::number::NumberValue;
     use otter_bytecode::{BytecodeModule, SourceKind};
 
     fn n(v: i32) -> Value {
-        Value::Number(NumberValue::from_i32(v))
+        Value::number_i32(v)
     }
 
     fn cap_for(heap: &mut otter_gc::GcHeap) -> PromiseCapability {
         let p = JsPromiseHandle::pending(heap).expect("cap promise");
         PromiseCapability {
-            promise: Value::Promise(p),
-            resolve: Value::Undefined,
-            reject: Value::Undefined,
+            promise: Value::promise(p),
+            resolve: Value::undefined(),
+            reject: Value::undefined(),
             context: None,
         }
     }

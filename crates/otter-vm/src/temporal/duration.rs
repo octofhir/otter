@@ -25,7 +25,6 @@ use std::sync::LazyLock;
 
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
 use crate::object::JsObject;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{
@@ -54,23 +53,23 @@ pub fn dispatch_static(
 
 /// Spec §7.2.1 `Temporal.Duration.from`.
 fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
-    let dur = match args.first() {
-        Some(Value::String(s)) => temporal_rs::Duration::from_utf8(
-            s.to_lossy_string(gc_heap).as_bytes(),
-        )
-        .map_err(|e| TemporalError::Engine {
-            class: "Duration",
-            method: "from",
-            message: e.to_string(),
-        })?,
-        Some(Value::Object(obj)) => {
-            partial_from_object(obj, gc_heap).map_err(|e| TemporalError::Engine {
+    let first = args.first();
+    let dur = if let Some(s) = first.and_then(|v| v.as_string()) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
+            TemporalError::Engine {
                 class: "Duration",
                 method: "from",
                 message: e.to_string(),
-            })?
-        }
-        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+            }
+        })?
+    } else if let Some(obj) = first.and_then(|v| v.as_object()) {
+        partial_from_object(&obj, gc_heap).map_err(|e| TemporalError::Engine {
+            class: "Duration",
+            method: "from",
+            message: e.to_string(),
+        })?
+    } else if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(gc_heap) {
             TemporalPayload::Duration(d) => d,
             _ => {
                 return Err(TemporalError::BadArgument {
@@ -80,15 +79,14 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
                     reason: "must be a Temporal.Duration, partial-record, or ISO string",
                 });
             }
-        },
-        _ => {
-            return Err(TemporalError::BadArgument {
-                class: "Duration",
-                method: "from",
-                index: 0,
-                reason: "must be a Temporal.Duration, partial-record, or ISO string",
-            });
         }
+    } else {
+        return Err(TemporalError::BadArgument {
+            class: "Duration",
+            method: "from",
+            index: 0,
+            reason: "must be a Temporal.Duration, partial-record, or ISO string",
+        });
     };
     alloc_temporal_value(gc_heap, TemporalPayload::Duration(dur))
 }
@@ -109,7 +107,7 @@ fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, Temporal
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    Ok(Value::number(NumberValue::from_i32(n)))
+    Ok(Value::number_i32(n))
 }
 
 fn expect_duration(
@@ -117,8 +115,9 @@ fn expect_duration(
     index: u16,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::Duration, TemporalError> {
-    match args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+    let arg = args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
             _ => Err(TemporalError::BadArgument {
                 class: "Duration",
@@ -126,29 +125,28 @@ fn expect_duration(
                 index,
                 reason: "must be a Temporal.Duration",
             }),
-        },
-        Some(Value::String(s)) => {
-            temporal_rs::Duration::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
-                TemporalError::Engine {
-                    class: "Duration",
-                    method: "compare",
-                    message: e.to_string(),
-                }
-            })
         }
-        Some(Value::Object(obj)) => {
-            partial_from_object(obj, gc_heap).map_err(|e| TemporalError::Engine {
+    } else if let Some(s) = arg.and_then(|v| v.as_string()) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
+            TemporalError::Engine {
                 class: "Duration",
                 method: "compare",
                 message: e.to_string(),
-            })
-        }
-        _ => Err(TemporalError::BadArgument {
+            }
+        })
+    } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
+        partial_from_object(&obj, gc_heap).map_err(|e| TemporalError::Engine {
+            class: "Duration",
+            method: "compare",
+            message: e.to_string(),
+        })
+    } else {
+        Err(TemporalError::BadArgument {
             class: "Duration",
             method: "compare",
             index,
             reason: "must be a Temporal.Duration or partial-record",
-        }),
+        })
     }
 }
 
@@ -199,15 +197,20 @@ fn optional_field(
     name: &str,
     gc_heap: &otter_gc::GcHeap,
 ) -> Result<Option<i64>, temporal_rs::TemporalError> {
-    match crate::object::get(*obj, gc_heap, name) {
-        None | Some(Value::Undefined) => Ok(None),
-        Some(Value::Number(n)) => Ok(Some(match n.as_smi() {
+    let v = crate::object::get(*obj, gc_heap, name);
+    let Some(v) = v else {
+        return Ok(None);
+    };
+    if v.is_undefined() {
+        return Ok(None);
+    }
+    if let Some(n) = v.as_number() {
+        return Ok(Some(match n.as_smi() {
             Some(v) => v as i64,
             None => n.as_f64() as i64,
-        })),
-        Some(_) => Err(temporal_rs::TemporalError::range()
-            .with_message("Duration partial fields must be numbers")),
+        }));
     }
+    Err(temporal_rs::TemporalError::range().with_message("Duration partial fields must be numbers"))
 }
 
 /// Property reads on a `Temporal.Duration` receiver.
@@ -215,20 +218,20 @@ fn optional_field(
 pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
     let d = match temporal.payload_clone(gc_heap) {
         TemporalPayload::Duration(v) => v,
-        _ => return Value::Undefined,
+        _ => return Value::undefined(),
     };
     match name {
-        "years" => Value::number(NumberValue::from_i32(d.years() as i32)),
-        "months" => Value::number(NumberValue::from_i32(d.months() as i32)),
-        "weeks" => Value::number(NumberValue::from_i32(d.weeks() as i32)),
-        "days" => Value::number(NumberValue::from_i32(d.days() as i32)),
-        "hours" => Value::number(NumberValue::from_i32(d.hours() as i32)),
-        "minutes" => Value::number(NumberValue::from_i32(d.minutes() as i32)),
-        "seconds" => Value::number(NumberValue::from_i32(d.seconds() as i32)),
-        "milliseconds" => Value::number(NumberValue::from_i32(d.milliseconds() as i32)),
-        "microseconds" => Value::number(NumberValue::from_f64(d.microseconds() as f64)),
-        "nanoseconds" => Value::number(NumberValue::from_f64(d.nanoseconds() as f64)),
-        "sign" => Value::number(NumberValue::from_i32(d.sign() as i32)),
+        "years" => Value::number_i32(d.years() as i32),
+        "months" => Value::number_i32(d.months() as i32),
+        "weeks" => Value::number_i32(d.weeks() as i32),
+        "days" => Value::number_i32(d.days() as i32),
+        "hours" => Value::number_i32(d.hours() as i32),
+        "minutes" => Value::number_i32(d.minutes() as i32),
+        "seconds" => Value::number_i32(d.seconds() as i32),
+        "milliseconds" => Value::number_i32(d.milliseconds() as i32),
+        "microseconds" => Value::number_f64(d.microseconds() as f64),
+        "nanoseconds" => Value::number_f64(d.nanoseconds() as f64),
+        "sign" => Value::number_i32(d.sign() as i32),
         "blank" => Value::boolean(d.is_zero()),
         _ => Value::undefined(),
     }
@@ -292,7 +295,7 @@ fn impl_total(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     })?;
     let total = dur.total(unit, None).map_err(temporal_err)?;
-    Ok(Value::number(NumberValue::from_f64(total.as_inner())))
+    Ok(Value::number_f64(total.as_inner()))
 }
 
 /// Coerce arg `index` to a `temporal_rs::Duration`. Accepts a real
@@ -301,25 +304,24 @@ fn duration_arg(
     args: &IntrinsicArgs<'_>,
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
-    match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+    let bad = || IntrinsicError::BadArgument {
+        index,
+        reason: "must be a Temporal.Duration",
+    };
+    let arg = args.args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
-            _ => Err(IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration",
-            }),
-        },
-        Some(Value::Object(obj)) => {
-            let heap = &*args.gc_heap;
-            partial_from_object(obj, heap).map_err(|_| IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration partial",
-            })
+            _ => Err(bad()),
         }
-        _ => Err(IntrinsicError::BadArgument {
+    } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
+        let heap = &*args.gc_heap;
+        partial_from_object(&obj, heap).map_err(|_| IntrinsicError::BadArgument {
             index,
-            reason: "must be a Temporal.Duration",
-        }),
+            reason: "must be a Temporal.Duration partial",
+        })
+    } else {
+        Err(bad())
     }
 }
 

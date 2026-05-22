@@ -62,7 +62,7 @@ impl Interpreter {
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let value =
-            crate::object::get(self.global_this, &self.gc_heap, name).unwrap_or(Value::Undefined);
+            crate::object::get(self.global_this, &self.gc_heap, name).unwrap_or(Value::undefined());
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())

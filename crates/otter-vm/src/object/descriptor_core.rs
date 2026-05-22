@@ -235,7 +235,7 @@ pub(super) fn validate_and_apply_partial(
         // Data descriptor.
         let mut value = match &existing.body {
             SlotBody::Data { value } => *value,
-            SlotBody::Accessor { .. } => Value::Undefined,
+            SlotBody::Accessor { .. } => Value::undefined(),
         };
         if let Some(v) = &incoming.value {
             value = *v;

@@ -304,12 +304,12 @@ fn native_json_call(
 }
 
 fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
-    let space = args.get(2).cloned().unwrap_or(Value::Undefined);
+    let value = args.first().cloned().unwrap_or(Value::undefined());
+    let space = args.get(2).cloned().unwrap_or(Value::undefined());
     let opts = StringifyOptions::from_space_with_heap(&space, Some(gc_heap))?;
     match stringify_with_options(&value, &opts, gc_heap)? {
         Some(text) => Ok(Value::String(JsString::from_str(&text, gc_heap)?)),
-        None => Ok(Value::Undefined),
+        None => Ok(Value::undefined()),
     }
 }
 

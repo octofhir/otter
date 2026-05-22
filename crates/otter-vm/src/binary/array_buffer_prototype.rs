@@ -71,7 +71,7 @@ fn impl_resize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             reason: "exceeds maxByteLength",
         });
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 /// §25.1.5.8 `transfer(newLength?)` — copy + detach. The new buffer
@@ -182,7 +182,7 @@ fn impl_grow(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             reason: "cannot grow",
         });
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 /// `ArrayBuffer.prototype` / `SharedArrayBuffer.prototype` table.

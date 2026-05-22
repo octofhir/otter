@@ -835,7 +835,7 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
         }
         body_offset_of(heap, body, key).map(|offset| match &body.slots[offset as usize].body {
             SlotBody::Data { value } => *value,
-            SlotBody::Accessor { .. } => Value::Undefined,
+            SlotBody::Accessor { .. } => Value::undefined(),
         })
     })
 }
@@ -1156,7 +1156,7 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: &JsSymbol) ->
             .find(|(k, _)| k.ptr_eq(key))
             .map(|(_, slot)| match &slot.body {
                 SlotBody::Data { value } => *value,
-                SlotBody::Accessor { .. } => Value::Undefined,
+                SlotBody::Accessor { .. } => Value::undefined(),
             })
     })
 }
@@ -2281,7 +2281,7 @@ impl<'a> Properties<'a> {
             let slot = &self.body.slots[*idx];
             let value = match &slot.body {
                 SlotBody::Data { value } => *value,
-                SlotBody::Accessor { .. } => Value::Undefined,
+                SlotBody::Accessor { .. } => Value::undefined(),
             };
             (key.as_str(), value)
         })

@@ -1042,7 +1042,7 @@ impl Interpreter {
                         _ => {}
                     }
                 }
-                Ok(stored.unwrap_or(Value::Null))
+                Ok(stored.unwrap_or(Value::null()))
             }
             Value::NativeFunction(nf) => {
                 if let Some(over) = nf.prototype_override(&self.gc_heap) {
@@ -1056,7 +1056,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::Map(map) => {
@@ -1066,7 +1066,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::Set(set) => {
@@ -1076,7 +1076,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::WeakMap(map) => {
@@ -1087,7 +1087,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::WeakSet(set) => {
@@ -1098,7 +1098,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::Promise(promise) => {
@@ -1107,7 +1107,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::RegExp(regexp) => {
@@ -1116,7 +1116,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::WeakRef(weak_ref) => {
@@ -1127,7 +1127,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::FinalizationRegistry(registry) => {
@@ -1139,7 +1139,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::Function { .. }
@@ -1163,7 +1163,7 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::Generator(generator) => {
@@ -1172,12 +1172,12 @@ impl Interpreter {
                 }
                 match self.intrinsic_prototype_object_for(value) {
                     Some(o) => Ok(Value::Object(o)),
-                    None => Ok(Value::Null),
+                    None => Ok(Value::null()),
                 }
             }
             Value::Iterator(_) => match self.intrinsic_prototype_object_for(value) {
                 Some(o) => Ok(Value::Object(o)),
-                None => Ok(Value::Null),
+                None => Ok(Value::null()),
             },
             // §20.1.2.10 Object.getPrototypeOf: when applied to a
             // primitive value, the spec performs `ToObject(value)`
@@ -1192,7 +1192,7 @@ impl Interpreter {
             | Value::Boolean(_)
             | Value::BigInt(_) => match self.intrinsic_prototype_object_for(value) {
                 Some(o) => Ok(Value::Object(o)),
-                None => Ok(Value::Null),
+                None => Ok(Value::null()),
             },
             other => Err(VmError::TypeMismatchAt {
                 op: "Object.getPrototypeOf",
@@ -2197,7 +2197,7 @@ impl Interpreter {
             fulfilled,
         } = task.kind
         {
-            let value = task.args.into_iter().next().unwrap_or(Value::Undefined);
+            let value = task.args.into_iter().next().unwrap_or(Value::undefined());
             return self.run_async_resume(context, frame, await_dst, fulfilled, value);
         }
         if let MicrotaskKind::AsyncGenResume {
@@ -2207,7 +2207,7 @@ impl Interpreter {
             owner,
         } = task.kind
         {
-            let value = task.args.into_iter().next().unwrap_or(Value::Undefined);
+            let value = task.args.into_iter().next().unwrap_or(Value::undefined());
             return self.run_async_gen_resume(context, frame, await_dst, fulfilled, value, owner);
         }
         // Resolve callee → function_id + upvalues. Mirrors the
@@ -2494,7 +2494,7 @@ impl Interpreter {
                                 Vec::new(),
                             ));
                         }
-                        crate::promise::PromiseState::Pending => return Ok(Value::Undefined),
+                        crate::promise::PromiseState::Pending => return Ok(Value::undefined()),
                     }
                 }
                 Ok(value)
@@ -2544,7 +2544,7 @@ impl Interpreter {
                         }
                         unwind?;
                         if stack.is_empty() {
-                            break Ok(Value::Undefined);
+                            break Ok(Value::undefined());
                         }
                         continue;
                     }
@@ -2564,7 +2564,7 @@ impl Interpreter {
                         }
                         unwind?;
                         if stack.is_empty() {
-                            break Ok(Value::Undefined);
+                            break Ok(Value::undefined());
                         }
                         continue;
                     }
@@ -2596,7 +2596,7 @@ impl Interpreter {
                 // `VmError::Uncaught`; this guard catches the
                 // residual "fell off the bottom" path and treats
                 // it as completion.
-                return Ok(Value::Undefined);
+                return Ok(Value::undefined());
             }
             let top_idx = stack.len() - 1;
             let function_id = stack[top_idx].function_id;
@@ -2711,7 +2711,7 @@ impl Interpreter {
                     let awaited = *read_register(&stack[top_idx], src)?;
                     self.do_await(stack, context, dst, awaited)?;
                     if stack.is_empty() {
-                        return Ok(Value::Undefined);
+                        return Ok(Value::undefined());
                     }
                     continue;
                 }
@@ -4450,7 +4450,7 @@ fn bound_function_object_prototype_intercept(
 fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {
     match &desc.kind {
         crate::object::DescriptorKind::Data { value } => *value,
-        crate::object::DescriptorKind::Accessor { .. } => Value::Undefined,
+        crate::object::DescriptorKind::Accessor { .. } => Value::undefined(),
     }
 }
 
@@ -5861,7 +5861,7 @@ mod tests {
     #[test]
     fn iterator_helper_map_uses_young_allocation_with_frame_roots() {
         fn identity_mapper(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+            Ok(args.first().cloned().unwrap_or(Value::undefined()))
         }
 
         let module = module_with(Vec::new(), 4);
@@ -5920,7 +5920,7 @@ mod tests {
             interp.gc_heap_mut(),
             "returnCapturedArray",
             smallvec::smallvec![Value::Array(mapped)],
-            |_ctx, _args, captures| Ok(captures.first().cloned().unwrap_or(Value::Undefined)),
+            |_ctx, _args, captures| Ok(captures.first().cloned().unwrap_or(Value::undefined())),
         )
         .unwrap();
 
@@ -5963,7 +5963,7 @@ mod tests {
     #[test]
     fn array_callback_map_uses_stack_rooted_result_allocation() {
         fn identity_mapper(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+            Ok(args.first().cloned().unwrap_or(Value::undefined()))
         }
 
         let module = BytecodeModule {
@@ -6765,7 +6765,7 @@ mod tests {
     #[test]
     fn promise_new_uses_stack_rooted_capability_allocation() {
         fn executor(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         }
 
         let module = module_with(Vec::new(), 3);
@@ -7991,11 +7991,11 @@ mod tests {
     #[test]
     fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
         fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.get(2).cloned().unwrap_or(Value::Undefined))
+            Ok(args.get(2).cloned().unwrap_or(Value::undefined()))
         }
 
         fn target_noop(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         }
 
         let module = module_with(vec![], 4);
@@ -8049,7 +8049,7 @@ mod tests {
     #[test]
     fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
         fn return_proxy_arg(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.get(2).cloned().unwrap_or(Value::Undefined))
+            Ok(args.get(2).cloned().unwrap_or(Value::undefined()))
         }
 
         let ctor = test_function(
@@ -8119,11 +8119,11 @@ mod tests {
     #[test]
     fn run_callable_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
         fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.get(2).cloned().unwrap_or(Value::Undefined))
+            Ok(args.get(2).cloned().unwrap_or(Value::undefined()))
         }
 
         fn target_noop(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         }
 
         let module = module_with(Vec::new(), 1);
@@ -8214,7 +8214,7 @@ mod tests {
     #[test]
     fn run_construct_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
         fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.get(1).cloned().unwrap_or(Value::Undefined))
+            Ok(args.get(1).cloned().unwrap_or(Value::undefined()))
         }
 
         let ctor = test_function(

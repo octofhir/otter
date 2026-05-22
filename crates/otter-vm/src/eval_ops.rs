@@ -125,7 +125,7 @@ impl Interpreter {
                         value: render_thrown_value(&reason, &self.gc_heap),
                     });
                 }
-                crate::promise::PromiseState::Pending => Value::Undefined,
+                crate::promise::PromiseState::Pending => Value::undefined(),
             });
         }
         Ok(value)
@@ -232,7 +232,7 @@ impl Interpreter {
                     )?,
                 }
             }
-            _ => Value::Undefined,
+            _ => Value::undefined(),
         };
         let target_capture = value;
         let callback_context = function_context.clone();

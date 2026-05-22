@@ -501,7 +501,7 @@ fn ta_oom_to_native(method: &'static str) -> impl Fn(otter_gc::OutOfMemory) -> N
 }
 
 fn ta_require_callable(args: &[Value], method: &'static str) -> Result<Value, NativeError> {
-    let cb = args.first().cloned().unwrap_or(Value::Undefined);
+    let cb = args.first().cloned().unwrap_or(Value::undefined());
     if !crate::abstract_ops::is_callable(&cb) {
         return Err(NativeError::TypeError {
             name: method,
@@ -544,20 +544,20 @@ fn ta_invoke_callback(
 fn ta_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.forEach")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.forEach")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
     for (i, v) in elements.into_iter().enumerate() {
         ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.map")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.map")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -579,7 +579,7 @@ fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.filter")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.filter")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -596,7 +596,7 @@ fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.find")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.find")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -606,13 +606,13 @@ fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             return Ok(v);
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findIndex")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findIndex")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -630,7 +630,7 @@ fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLast")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findLast")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -641,13 +641,13 @@ fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             return Ok(v);
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.findLastIndex")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.findLastIndex")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -666,7 +666,7 @@ fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.every")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.every")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -682,7 +682,7 @@ fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let t = ta_callback_receiver(ctx, "TypedArray.prototype.some")?;
     let callee = ta_require_callable(args, "TypedArray.prototype.some")?;
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::TypedArray(t);
     let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
         .map_err(ta_oom_to_native("TypedArray callback"))?;
@@ -904,7 +904,7 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
     let this_value = *ctx.this_value();
     let kind_name = match this_value {
         Value::TypedArray(t) => t.kind().name(),
-        _ => return Ok(Value::Undefined),
+        _ => return Ok(Value::undefined()),
     };
 
     Ok(Value::String(

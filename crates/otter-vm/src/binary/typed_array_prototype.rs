@@ -156,7 +156,7 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(Value::Number(n)) => {
             let f = n.as_f64();
             if !f.is_finite() {
-                return Ok(Value::Undefined);
+                return Ok(Value::undefined());
             }
             f.trunc() as i64
         }
@@ -164,7 +164,7 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     };
     let resolved = if idx < 0 { len + idx } else { idx };
     if resolved < 0 || resolved >= len {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
     t.get(args.gc_heap, resolved as usize)
         .map_err(intrinsic_oom)
@@ -218,7 +218,7 @@ fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let t = receiver(args)?;
     check_not_detached(&t, &*args.gc_heap)?;
     let len = t.length(args.gc_heap) as i64;
-    let value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let value = args.args.first().cloned().unwrap_or(Value::undefined());
     if t.kind().is_bigint() && !matches!(&value, Value::BigInt(_)) {
         return Err(IntrinsicError::BadArgument {
             index: 0,
@@ -294,7 +294,7 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     if len == 0 {
         return Ok(smi(-1));
     }
-    let target = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let target = args.args.first().cloned().unwrap_or(Value::undefined());
     let start = integer_arg(args.args.get(1), 0);
     let from = if start < 0 {
         (len + start).max(0)
@@ -316,7 +316,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     if len == 0 {
         return Ok(smi(-1));
     }
-    let target = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let target = args.args.first().cloned().unwrap_or(Value::undefined());
     let start = integer_arg(args.args.get(1), len - 1);
     let from = if start < 0 {
         (len + start).max(-1)
@@ -340,7 +340,7 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     let t = receiver(args)?;
     check_not_detached(&t, &*args.gc_heap)?;
     let len = t.length(args.gc_heap) as i64;
-    let target = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let target = args.args.first().cloned().unwrap_or(Value::undefined());
     let start = integer_arg(args.args.get(1), 0);
     let from = if start < 0 {
         (len + start).max(0)
@@ -409,7 +409,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         });
     }
     let off = offset as usize;
-    let source = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let source = args.args.first().cloned().unwrap_or(Value::undefined());
     let kind = t.kind();
     fn coerce(
         kind: TypedArrayKind,
@@ -464,7 +464,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             // `length` then `[0..len)` indexed values, coerced to
             // the destination kind.
             let len_value =
-                crate::object::get(obj, args.gc_heap, "length").unwrap_or(Value::Undefined);
+                crate::object::get(obj, args.gc_heap, "length").unwrap_or(Value::undefined());
             let len_n = crate::number::to_number_value(&len_value, args.gc_heap);
             let src_len = if len_n.is_nan() || len_n <= 0.0 {
                 0
@@ -479,7 +479,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
             for i in 0..src_len {
                 let key = i.to_string();
-                let v = crate::object::get(obj, args.gc_heap, &key).unwrap_or(Value::Undefined);
+                let v = crate::object::get(obj, args.gc_heap, &key).unwrap_or(Value::undefined());
                 let coerced = coerce(kind, &v, args.gc_heap)?;
                 t.set(args.gc_heap, off + i, &coerced);
             }
@@ -525,7 +525,7 @@ fn impl_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             });
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -567,7 +567,7 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             reason: "index out of range",
         });
     }
-    let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let value = args.args.get(1).cloned().unwrap_or(Value::undefined());
     let mut snapshot = copy_view(&t, args.gc_heap).map_err(intrinsic_oom)?;
     snapshot[resolved as usize] = value;
     build_new_typed_array_rooted(args, t.kind(), &snapshot)

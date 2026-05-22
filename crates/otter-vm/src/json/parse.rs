@@ -223,7 +223,7 @@ fn read_step(
         }
         b'n' => {
             consume_keyword(cursor, b"null")?;
-            Ok(Value::Null)
+            Ok(Value::null())
         }
         b'-' | b'0'..=b'9' => Ok(Value::Number(read_number(cursor)?)),
         other => Err(ParseError::at(

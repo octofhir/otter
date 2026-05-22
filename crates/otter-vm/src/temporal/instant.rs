@@ -145,10 +145,10 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &mut otter_gc::GcHeap, name
             // propagate that here without a wider API change.
             match crate::bigint::BigIntValue::from_i128(gc_heap, inst.as_i128()) {
                 Ok(handle) => Value::BigInt(handle),
-                Err(_) => Value::Undefined,
+                Err(_) => Value::undefined(),
             }
         }
-        _ => Value::Undefined,
+        _ => Value::undefined(),
     }
 }
 

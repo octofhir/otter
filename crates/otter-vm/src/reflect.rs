@@ -63,18 +63,18 @@ pub fn call(
         // §28.1.2 Reflect.apply(target, thisArgument, argumentsList)
         // <https://tc39.es/ecma262/#sec-reflect.apply>
         M::Apply => {
-            let target = args.first().cloned().unwrap_or(Value::Undefined);
+            let target = args.first().cloned().unwrap_or(Value::undefined());
             if !is_callable(&target, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
-            let this_value = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let this_value = args.get(1).cloned().unwrap_or(Value::undefined());
             let argv = create_list_from_array_like(interp, context, args.get(2))?;
             interp.run_callable_sync(context, &target, this_value, argv)
         }
         // §28.1.3 Reflect.construct(target, argumentsList[, newTarget])
         // <https://tc39.es/ecma262/#sec-reflect.construct>
         M::Construct => {
-            let target = args.first().cloned().unwrap_or(Value::Undefined);
+            let target = args.first().cloned().unwrap_or(Value::undefined());
             if !is_constructor(&target, context, interp.gc_heap()) {
                 return Err(VmError::NotCallable);
             }
@@ -90,7 +90,7 @@ pub fn call(
         M::DefineProperty => {
             let target = expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
-            let attributes = args.get(2).cloned().unwrap_or(Value::Undefined);
+            let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
             let descriptor = interp.evaluate_to_property_descriptor(context, &attributes)?;
             let ok = interp.define_own_property_value(context, &target, &key, descriptor)?;
             Ok(Value::Boolean(ok))
@@ -130,14 +130,14 @@ pub fn call(
                 &[&target],
                 &[args],
             )? {
-                None => Ok(Value::Undefined),
+                None => Ok(Value::undefined()),
                 Some(desc) => {
                     let flags = desc.flags;
                     let descriptor_roots: Vec<Value> = match &desc.kind {
                         crate::object::DescriptorKind::Data { value } => vec![*value],
                         crate::object::DescriptorKind::Accessor { getter, setter } => vec![
-                            (*getter).unwrap_or(Value::Undefined),
-                            (*setter).unwrap_or(Value::Undefined),
+                            (*getter).unwrap_or(Value::undefined()),
+                            (*setter).unwrap_or(Value::undefined()),
                         ],
                     };
                     let obj =
@@ -241,7 +241,7 @@ pub fn call(
         M::Set => {
             let target = expect_object_value(args.first())?;
             let key = coerce_property_key(interp, context, args.get(1))?;
-            let value = args.get(2).cloned().unwrap_or(Value::Undefined);
+            let value = args.get(2).cloned().unwrap_or(Value::undefined());
             let receiver = args.get(3).cloned().unwrap_or(target);
             // §10.1.9 OrdinarySet with receiver semantics for ordinary
             // object targets. Proxy / non-ordinary targets route
@@ -293,9 +293,9 @@ pub fn call(
             let target = expect_object_value(args.first())?;
             let proto = match args.get(1) {
                 Some(Value::Object(_)) | Some(Value::Proxy(_)) | Some(Value::Null) => {
-                    args.get(1).cloned().unwrap_or(Value::Null)
+                    args.get(1).cloned().unwrap_or(Value::null())
                 }
-                None => Value::Null,
+                None => Value::null(),
                 _ => return Err(VmError::TypeMismatch),
             };
             let ok = interp.set_prototype_value_proxy_aware(context, &target, &proto)?;
@@ -441,7 +441,7 @@ fn create_list_from_array_like(
                 elements
                     .iter()
                     .map(|v| match v {
-                        Value::Hole => Value::Undefined,
+                        Value::Hole => Value::undefined(),
                         other => *other,
                     })
                     .collect()

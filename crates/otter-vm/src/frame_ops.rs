@@ -39,7 +39,7 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
     ) -> Result<(), VmError> {
-        let value = frame.new_target.unwrap_or(Value::Undefined);
+        let value = frame.new_target.unwrap_or(Value::undefined());
         write_register(frame, dst, value)?;
         frame.pc += 1;
         Ok(())

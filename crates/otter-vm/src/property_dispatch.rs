@@ -174,7 +174,7 @@ impl Interpreter {
                     &[unit],
                     &mut self.gc_heap,
                 )?)),
-                None => Ok(Value::Undefined),
+                None => Ok(Value::undefined()),
             },
             None if name == "length" => {
                 Ok(Value::Number(NumberValue::from_i32(string.len() as i32)))
@@ -610,7 +610,7 @@ impl Interpreter {
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let value = match &receiver {
             Value::Object(o) => {
-                crate::object::get(*o, &self.gc_heap, name).unwrap_or(Value::Undefined)
+                crate::object::get(*o, &self.gc_heap, name).unwrap_or(Value::undefined())
             }
             Value::ClassConstructor(c) => {
                 if name == "prototype" {
@@ -679,10 +679,10 @@ impl Interpreter {
                                             &mut ctx, &ctor, name,
                                         )?
                                     }
-                                    _ => Value::Undefined,
+                                    _ => Value::undefined(),
                                 }
                             }
-                            _ => Value::Undefined,
+                            _ => Value::undefined(),
                         }
                     }
                 }
@@ -736,13 +736,13 @@ impl Interpreter {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
                                 self.run_callable_sync(context, g, receiver, args)?
                             }
-                            None => Value::Undefined,
+                            None => Value::undefined(),
                         },
                     },
                     None => self
                         .load_function_prototype_method(name)
                         .or_else(|| self.load_object_prototype_method(name))
-                        .unwrap_or(Value::Undefined),
+                        .unwrap_or(Value::undefined()),
                 }
             }
             Value::BoundFunction(bound) => {
@@ -757,13 +757,13 @@ impl Interpreter {
                             Some(g) if abstract_ops::is_callable(g) => {
                                 self.run_callable_sync(context, g, receiver, SmallVec::new())?
                             }
-                            _ => Value::Undefined,
+                            _ => Value::undefined(),
                         },
                     },
                     None => self
                         .load_function_prototype_method(name)
                         .or_else(|| self.load_object_prototype_method(name))
-                        .unwrap_or(Value::Undefined),
+                        .unwrap_or(Value::undefined()),
                 }
             }
             v @ Value::RegExp(_) => {
@@ -1240,15 +1240,15 @@ impl Interpreter {
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         let value = match (&recv, &idx_value) {
             (Value::Object(obj), Value::Symbol(sym)) => {
-                crate::object::get_symbol(*obj, &self.gc_heap, sym).unwrap_or(Value::Undefined)
+                crate::object::get_symbol(*obj, &self.gc_heap, sym).unwrap_or(Value::undefined())
             }
             (Value::Object(obj), Value::String(key)) => {
                 crate::object::get(*obj, &self.gc_heap, &key.to_lossy_string(&self.gc_heap))
-                    .unwrap_or(Value::Undefined)
+                    .unwrap_or(Value::undefined())
             }
             (Value::Object(obj), Value::Number(n)) => {
                 let key = n.to_display_string();
-                crate::object::get(*obj, &self.gc_heap, &key).unwrap_or(Value::Undefined)
+                crate::object::get(*obj, &self.gc_heap, &key).unwrap_or(Value::undefined())
             }
             (
                 Value::Function { function_id }
@@ -1264,14 +1264,14 @@ impl Interpreter {
                     &key.to_lossy_string(&self.gc_heap),
                 )? {
                     Some(desc) => descriptor_value(&desc),
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 }
             }
             (Value::NativeFunction(native), Value::String(key)) => {
                 let key = key.to_lossy_string(&self.gc_heap);
                 match native.own_property_descriptor(&mut self.gc_heap, &key)? {
                     Some(desc) => descriptor_value(&desc),
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 }
             }
             (Value::BoundFunction(bound), Value::String(key)) => {
@@ -1282,7 +1282,7 @@ impl Interpreter {
                     &key,
                 )? {
                     Some(desc) => descriptor_value(&desc),
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 }
             }
             (Value::Array(arr), Value::Symbol(sym))
@@ -1312,7 +1312,7 @@ impl Interpreter {
                         let proto = self.constructor_prototype_value("Array")?;
                         if let Value::Object(p) = proto {
                             crate::object::get_symbol(p, &self.gc_heap, sym)
-                                .unwrap_or(Value::Undefined)
+                                .unwrap_or(Value::undefined())
                         } else {
                             Value::Undefined
                         }
@@ -1345,7 +1345,7 @@ impl Interpreter {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.run_callable_sync(context, &getter, recv, args)?
                         }
-                        _ => Value::Undefined,
+                        _ => Value::undefined(),
                     }
                 } else if let Some(idx) = crate::object::array_index_property_name(&name) {
                     crate::array::get(*arr, &self.gc_heap, idx as usize)
@@ -1380,7 +1380,7 @@ impl Interpreter {
                     // §10.4.5.4 step 3 — non-canonical-numeric keys
                     // fall through to OrdinaryGet. Honour the lazy
                     // expando bag first, then the prototype chain.
-                    let mut value = Value::Undefined;
+                    let mut value = Value::undefined();
                     let mut found = false;
                     if let Some(bag) = t.expando(&self.gc_heap)
                         && let Some(v) = crate::object::get(bag, &self.gc_heap, &name)
@@ -1565,7 +1565,7 @@ impl Interpreter {
                                             args,
                                         )?
                                     }
-                                    _ => Value::Undefined,
+                                    _ => Value::undefined(),
                                 }
                             } else {
                                 crate::array::get(a, &self.gc_heap, idx)
@@ -1576,7 +1576,7 @@ impl Interpreter {
                             &self.gc_heap,
                             fallback_key.as_deref().expect("fallback key"),
                         )
-                        .unwrap_or(Value::Undefined),
+                        .unwrap_or(Value::undefined()),
                     },
                     Value::String(s) => match idx {
                         Some(idx) => match s.char_code_at(idx as u32, &self.gc_heap) {
@@ -1586,11 +1586,11 @@ impl Interpreter {
                             )?),
                             None => Value::String(crate::JsString::empty(self.gc_heap_mut())?),
                         },
-                        None => Value::Undefined,
+                        None => Value::undefined(),
                     },
                     Value::TypedArray(t) => match idx {
                         Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
-                        None => Value::Undefined,
+                        None => Value::undefined(),
                     },
                     _ => return Err(VmError::TypeMismatch),
                 }
@@ -2097,7 +2097,7 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         let proto = self.constructor_prototype_value(proto_name)?;
         let Value::Object(proto_obj) = proto else {
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         };
         let key = VmPropertyKey::String(name);
         match self.ordinary_get_value(context, Value::Object(proto_obj), *receiver, &key, 0)? {

@@ -196,7 +196,7 @@ fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Sym
             let s = JsString::from_str(&key, interp.gc_heap_mut())?;
             Ok(Value::String(s))
         }
-        None => Ok(Value::Undefined),
+        None => Ok(Value::undefined()),
     }
 }
 

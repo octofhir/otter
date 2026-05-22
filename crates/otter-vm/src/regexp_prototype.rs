@@ -75,7 +75,7 @@ pub(crate) fn exec_once(
     let mut start = re.last_index(args.gc_heap) as usize;
     if (flags.global || flags.sticky) && start > len {
         re.set_last_index(args.gc_heap, 0);
-        return Ok(Value::Null);
+        return Ok(Value::null());
     }
     if !flags.global && !flags.sticky {
         start = 0;
@@ -90,12 +90,12 @@ pub(crate) fn exec_once(
             if flags.global || flags.sticky {
                 re.set_last_index(args.gc_heap, 0);
             }
-            return Ok(Value::Null);
+            return Ok(Value::null());
         }
     };
     if flags.sticky && m.range.start != start {
         re.set_last_index(args.gc_heap, 0);
-        return Ok(Value::Null);
+        return Ok(Value::null());
     }
     if flags.global || flags.sticky {
         re.set_last_index(args.gc_heap, m.range.end as u32);
@@ -124,7 +124,7 @@ pub(crate) fn exec_once_native(
     let mut start = re.last_index(ctx.heap()) as usize;
     if (flags.global || flags.sticky) && start > len {
         re.set_last_index(ctx.heap_mut(), 0);
-        return Ok(Value::Null);
+        return Ok(Value::null());
     }
     if !flags.global && !flags.sticky {
         start = 0;
@@ -139,12 +139,12 @@ pub(crate) fn exec_once_native(
             if flags.global || flags.sticky {
                 re.set_last_index(ctx.heap_mut(), 0);
             }
-            return Ok(Value::Null);
+            return Ok(Value::null());
         }
     };
     if flags.sticky && m.range.start != start {
         re.set_last_index(ctx.heap_mut(), 0);
-        return Ok(Value::Null);
+        return Ok(Value::null());
     }
     if flags.global || flags.sticky {
         re.set_last_index(ctx.heap_mut(), m.range.end as u32);
@@ -216,13 +216,13 @@ pub(crate) fn build_match_result(
         crate::object::set_prototype(groups_obj, args.gc_heap, None);
         let value = match range {
             Some(r) => Value::String(JsString::from_utf16_units(&units[r], args.gc_heap)?),
-            None => Value::Undefined,
+            None => Value::undefined(),
         };
         crate::object::set(groups_obj, args.gc_heap, name, value);
         for (name, range) in named_iter {
             let value = match range {
                 Some(r) => Value::String(JsString::from_utf16_units(&units[r], args.gc_heap)?),
-                None => Value::Undefined,
+                None => Value::undefined(),
             };
             crate::object::set(groups_obj, args.gc_heap, name, value);
         }
@@ -282,7 +282,7 @@ pub(crate) fn build_match_result(
                     &roots,
                     &[out.as_slice(), indices_elems.as_slice()],
                 )?,
-                None => Value::Undefined,
+                None => Value::undefined(),
             };
             crate::object::set(g_obj, args.gc_heap, name, v);
             for (name, range) in named_iter {
@@ -294,7 +294,7 @@ pub(crate) fn build_match_result(
                         &roots,
                         &[out.as_slice(), indices_elems.as_slice()],
                     )?,
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 };
                 crate::object::set(g_obj, args.gc_heap, name, v);
             }
@@ -367,14 +367,14 @@ pub(crate) fn build_match_result_native(
         crate::object::set_prototype(groups_obj, ctx.heap_mut(), None);
         let value = match range {
             Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
-            None => Value::Undefined,
+            None => Value::undefined(),
         };
         ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
             .map_err(vm_shape_error_to_intrinsic)?;
         for (name, range) in named_iter {
             let value = match range {
                 Some(r) => Value::String(JsString::from_utf16_units(&units[r], ctx.heap_mut())?),
-                None => Value::Undefined,
+                None => Value::undefined(),
             };
             ctx.set_property_with_roots(groups_obj, name, value, &roots, &slices)
                 .map_err(vm_shape_error_to_intrinsic)?;
@@ -438,7 +438,7 @@ pub(crate) fn build_match_result_native(
                     &roots,
                     &[out.as_slice(), indices_elems.as_slice()],
                 )?,
-                None => Value::Undefined,
+                None => Value::undefined(),
             };
             ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
                 .map_err(vm_shape_error_to_intrinsic)?;
@@ -451,7 +451,7 @@ pub(crate) fn build_match_result_native(
                         &roots,
                         &[out.as_slice(), indices_elems.as_slice()],
                     )?,
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 };
                 ctx.set_property_with_roots(g_obj, name, v, &roots, &index_slices)
                     .map_err(vm_shape_error_to_intrinsic)?;
@@ -540,7 +540,7 @@ fn arg_to_string_primitive(
     args: &mut IntrinsicArgs<'_>,
     index: usize,
 ) -> Result<JsString, IntrinsicError> {
-    let raw = args.args.get(index).cloned().unwrap_or(Value::Undefined);
+    let raw = args.args.get(index).cloned().unwrap_or(Value::undefined());
     let text: String = match &raw {
         Value::String(s) => return Ok(*s),
         Value::Undefined => "undefined".to_string(),
@@ -633,7 +633,7 @@ pub fn native_regexp_symbol_match(
     }
     re.set_last_index(ctx.heap_mut(), 0);
     if matches_out.is_empty() {
-        return Ok(Value::Null);
+        return Ok(Value::null());
     }
     let receiver_value = Value::RegExp(re);
     let text_value = Value::String(text);
@@ -703,7 +703,7 @@ fn string_arg_to_jsstring(
     index: usize,
     method_name: &'static str,
 ) -> Result<JsString, crate::NativeError> {
-    let raw = args.get(index).cloned().unwrap_or(Value::Undefined);
+    let raw = args.get(index).cloned().unwrap_or(Value::undefined());
     let text: String = match &raw {
         Value::String(s) => return Ok(*s),
         Value::Undefined => "undefined".to_string(),
@@ -1045,8 +1045,8 @@ pub fn native_regexp_symbol_replace(
         });
     }
 
-    let string_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let replace_value_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let string_arg = args.first().cloned().unwrap_or(Value::undefined());
+    let replace_value_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
     // Step 3 — S = ? ToString(string).
     let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
@@ -1151,7 +1151,7 @@ pub fn native_regexp_symbol_replace(
             for cap in &captures {
                 replacer_args.push(match cap {
                     Some(s) => Value::String(*s),
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 });
             }
             replacer_args.push(Value::Number(NumberValue::from_f64(position as f64)));
@@ -1324,7 +1324,7 @@ pub fn native_regexp_symbol_match_all(
             reason: "called on a non-object receiver".to_string(),
         });
     }
-    let string_arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let string_arg = args.first().cloned().unwrap_or(Value::undefined());
     let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
 
     let default_ctor = {
@@ -1417,8 +1417,8 @@ pub fn native_regexp_symbol_split(
             reason: "called on a non-object receiver".to_string(),
         });
     }
-    let string_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let limit_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let string_arg = args.first().cloned().unwrap_or(Value::undefined());
+    let limit_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
     // Step 4 — S = ? ToString(string).
     let s = coerce_to_jsstring_runtime(ctx, &string_arg, name)?;
@@ -1802,12 +1802,12 @@ pub fn load_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str) 
             let escaped = escape_regexp_pattern(&raw);
             match JsString::from_str(&escaped, gc_heap) {
                 Ok(s) => Value::String(s),
-                Err(_) => Value::Undefined,
+                Err(_) => Value::undefined(),
             }
         }
         "flags" => match JsString::from_str(&re.flags(gc_heap).to_js_string(), gc_heap) {
             Ok(s) => Value::String(s),
-            Err(_) => Value::Undefined,
+            Err(_) => Value::undefined(),
         },
         "hasIndices" => Value::Boolean(re.flags(gc_heap).has_indices),
         "global" => Value::Boolean(re.flags(gc_heap).global),
@@ -1818,7 +1818,7 @@ pub fn load_property(re: &JsRegExp, gc_heap: &mut otter_gc::GcHeap, name: &str) 
         "sticky" => Value::Boolean(re.flags(gc_heap).sticky),
         "unicodeSets" => Value::Boolean(re.flags(gc_heap).unicode_sets),
         "lastIndex" => re.last_index_value(gc_heap),
-        _ => Value::Undefined,
+        _ => Value::undefined(),
     }
 }
 

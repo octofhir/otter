@@ -142,7 +142,7 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         message: &str,
     ) -> Result<Value, VmError> {
-        let message_root = Value::Undefined;
+        let message_root = Value::undefined();
         let obj = self.make_error_instance_with_stack_roots(
             stack,
             ErrorKind::TypeError,

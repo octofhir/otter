@@ -153,7 +153,7 @@ fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         )?));
     }
     if payload.fallback == "none" {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
     Ok(Value::String(crate::string::JsString::from_str(
         &code,

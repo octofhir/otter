@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn native_ctx_weak_ref_allocation_uses_young_space() {
         fn cleanup(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         }
 
         let mut interp = Interpreter::new();

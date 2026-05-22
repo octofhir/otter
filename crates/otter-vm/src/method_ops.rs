@@ -152,13 +152,13 @@ impl Interpreter {
         if let Value::Generator(g) = &recv_value {
             let kind = match name {
                 "next" => Some(GeneratorResumeKind::Next(
-                    arg_values.first().cloned().unwrap_or(Value::Undefined),
+                    arg_values.first().cloned().unwrap_or(Value::undefined()),
                 )),
                 "return" => Some(GeneratorResumeKind::Return(
-                    arg_values.first().cloned().unwrap_or(Value::Undefined),
+                    arg_values.first().cloned().unwrap_or(Value::undefined()),
                 )),
                 "throw" => Some(GeneratorResumeKind::Throw(
-                    arg_values.first().cloned().unwrap_or(Value::Undefined),
+                    arg_values.first().cloned().unwrap_or(Value::undefined()),
                 )),
                 _ => None,
             };
@@ -354,7 +354,7 @@ impl Interpreter {
             let mut coerced_args = arg_values.clone();
             let needs_coerce = !matches!(coerced_args.first(), Some(Value::String(_)));
             if needs_coerce {
-                let original = coerced_args.first().cloned().unwrap_or(Value::Undefined);
+                let original = coerced_args.first().cloned().unwrap_or(Value::undefined());
                 let coerced = match &original {
                     Value::Undefined => "undefined".to_string(),
                     Value::Null => "null".to_string(),
@@ -1041,7 +1041,7 @@ impl Interpreter {
             Some(Value::String(s)) => *s,
             _ => return Err(VmError::TypeMismatch),
         };
-        let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let callback = args.get(1).cloned().unwrap_or(Value::undefined());
         let recv_units = recv.to_utf16_vec(&self.gc_heap);
         let needle_units = needle.to_utf16_vec(&self.gc_heap);
         let needle_len = needle_units.len();
@@ -1154,7 +1154,7 @@ impl Interpreter {
         // §24.1.3.5 / §24.2.3.6 step 4 — when `thisArg` is supplied,
         // bind it as the callback's `this`; otherwise let
         // `OrdinaryCallBindThis` default to undefined / globalObject.
-        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
         if !matches!(recv, Value::Map(_) | Value::Set(_)) {
             return Err(VmError::TypeMismatch);
         }
@@ -1272,7 +1272,7 @@ impl Interpreter {
         // second positional pass it through `OrdinaryCallBindThis`.
         // `reduce` / `reduceRight` / `sort` do NOT take a `thisArg`
         // and keep the default undefined receiver.
-        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
         let result = match name {
             "forEach" => {
                 let callee = require_callable(args.first())?;
@@ -1386,7 +1386,7 @@ impl Interpreter {
                 // §23.1.3.10: holes are visited but produce
                 // `undefined` for the callback's element argument.
                 let callee = require_callable(args.first())?;
-                let mut found = Value::Undefined;
+                let mut found = Value::undefined();
                 for (i, value) in elements.into_iter().enumerate() {
                     let elem = if matches!(value, Value::Hole) {
                         Value::Undefined
@@ -1579,7 +1579,7 @@ impl Interpreter {
             .checked_add(1)
             .ok_or(VmError::InvalidOperand)?;
 
-        let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
         let result = match name {
             "forEach" => {
@@ -1619,7 +1619,7 @@ impl Interpreter {
             }
             "find" => {
                 let callee = require_callable(args.first())?;
-                let mut found = Value::Undefined;
+                let mut found = Value::undefined();
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let hit = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
@@ -1645,7 +1645,7 @@ impl Interpreter {
             }
             "findLast" => {
                 let callee = require_callable(args.first())?;
-                let mut found = Value::Undefined;
+                let mut found = Value::undefined();
                 for i in (0..len).rev() {
                     let value = elements[i];
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
@@ -1796,7 +1796,7 @@ impl Interpreter {
         match name {
             "call" => {
                 let mut iter = args.into_iter();
-                let this_value = iter.next().unwrap_or(Value::Undefined);
+                let this_value = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = iter.collect();
                 stack[top_idx].pc = stack[top_idx]
                     .pc
@@ -1806,7 +1806,7 @@ impl Interpreter {
             }
             "apply" => {
                 let mut iter = args.into_iter();
-                let this_value = iter.next().unwrap_or(Value::Undefined);
+                let this_value = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
                     None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
                     Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
@@ -1819,7 +1819,7 @@ impl Interpreter {
             }
             "bind" => {
                 let mut iter = args.into_iter();
-                let this_value = iter.next().unwrap_or(Value::Undefined);
+                let this_value = iter.next().unwrap_or(Value::undefined());
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
                 let mut ctx = function_metadata::FunctionMetadataContext::new(
                     context,

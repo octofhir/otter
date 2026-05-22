@@ -314,8 +314,8 @@ fn install_collection(
 /// into groups keyed by callback return value, store result in
 /// a new Map.
 fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let items = args.first().cloned().unwrap_or(Value::Undefined);
-    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let items = args.first().cloned().unwrap_or(Value::undefined());
+    let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     if matches!(items, Value::Undefined | Value::Null) {
         return Err(NativeError::TypeError {
             name: "Map.groupBy",
@@ -688,7 +688,7 @@ fn construct_collection(
     }
     let target = alloc_collection(ctx, kind)?;
     apply_collection_new_target_prototype(ctx, &target, kind)?;
-    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let iterable = args.first().cloned().unwrap_or(Value::undefined());
     if matches!(iterable, Value::Undefined | Value::Null) {
         return Ok(target);
     }
@@ -976,14 +976,14 @@ fn read_indexed_property(
 
 fn map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.get")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
-    Ok(collections::map_get(m, ctx.heap(), &key).unwrap_or(Value::Undefined))
+    let key = args.first().cloned().unwrap_or(Value::undefined());
+    Ok(collections::map_get(m, ctx.heap(), &key).unwrap_or(Value::undefined()))
 }
 
 fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let mut m = receiver_map(ctx, "Map.prototype.set")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
-    let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let key = args.first().cloned().unwrap_or(Value::undefined());
+    let value = args.get(1).cloned().unwrap_or(Value::undefined());
     ctx.map_set(&mut m, key, value)
         .map_err(|_| oom("Map.prototype.set"))?;
     Ok(Value::Map(m))
@@ -991,13 +991,13 @@ fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.has")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.first().cloned().unwrap_or(Value::undefined());
     Ok(Value::Boolean(collections::map_has(m, ctx.heap(), &key)))
 }
 
 fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.delete")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.first().cloned().unwrap_or(Value::undefined());
     Ok(Value::Boolean(collections::map_delete(
         m,
         ctx.heap_mut(),
@@ -1008,7 +1008,7 @@ fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 fn map_proto_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.clear")?;
     collections::map_clear(m, ctx.heap_mut());
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn map_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1029,14 +1029,14 @@ fn map_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
 /// §24.1.3.5 Map.prototype.forEach.
 fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.forEach")?;
-    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    let callback = args.first().cloned().unwrap_or(Value::undefined());
     if !ctx.interp_mut().is_callable_runtime(&callback) {
         return Err(NativeError::TypeError {
             name: "Map.prototype.forEach",
             reason: "callback is not callable".to_string(),
         });
     }
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let context = ctx
         .execution_context()
         .cloned()
@@ -1062,7 +1062,7 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             )
             .map_err(|e| vm_to_native(e, "Map.prototype.forEach"))?;
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1078,7 +1078,7 @@ fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 
 fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let mut s = receiver_set(ctx, "Set.prototype.add")?;
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.first().cloned().unwrap_or(Value::undefined());
     ctx.set_add(&mut s, v)
         .map_err(|_| oom("Set.prototype.add"))?;
     Ok(Value::Set(s))
@@ -1086,13 +1086,13 @@ fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 
 fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.has")?;
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.first().cloned().unwrap_or(Value::undefined());
     Ok(Value::Boolean(collections::set_has(s, ctx.heap(), &v)))
 }
 
 fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.delete")?;
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.first().cloned().unwrap_or(Value::undefined());
     Ok(Value::Boolean(collections::set_delete(
         s,
         ctx.heap_mut(),
@@ -1103,7 +1103,7 @@ fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 fn set_proto_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.clear")?;
     collections::set_clear(s, ctx.heap_mut());
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn set_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -1147,14 +1147,14 @@ fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
 /// §24.2.3.6 Set.prototype.forEach.
 fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.forEach")?;
-    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    let callback = args.first().cloned().unwrap_or(Value::undefined());
     if !ctx.interp_mut().is_callable_runtime(&callback) {
         return Err(NativeError::TypeError {
             name: "Set.prototype.forEach",
             reason: "callback is not callable".to_string(),
         });
     }
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let context = ctx
         .execution_context()
         .cloned()
@@ -1180,7 +1180,7 @@ fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             )
             .map_err(|e| vm_to_native(e, "Set.prototype.forEach"))?;
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 /// Whether `name` belongs to the ES set-methods surface that needs
@@ -1236,7 +1236,7 @@ pub(crate) fn set_method_call(
 /// - <https://tc39.es/ecma262/#sec-set.prototype.union>
 fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this = receiver_set(ctx, "Set.prototype.union")?;
-    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.union")?;
     let mut result = ctx.alloc_set().map_err(|_| oom("Set.prototype.union"))?;
     for value in collections::set_values(this, ctx.heap()) {
@@ -1258,7 +1258,7 @@ fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 /// - <https://tc39.es/ecma262/#sec-set.prototype.intersection>
 fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this = receiver_set(ctx, "Set.prototype.intersection")?;
-    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.intersection")?;
     let mut result = ctx
         .alloc_set()
@@ -1305,7 +1305,7 @@ fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 /// - <https://tc39.es/ecma262/#sec-set.prototype.difference>
 fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this = receiver_set(ctx, "Set.prototype.difference")?;
-    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.difference")?;
     let mut result = ctx
         .alloc_set()
@@ -1348,7 +1348,7 @@ fn set_proto_symmetric_difference(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this = receiver_set(ctx, "Set.prototype.symmetricDifference")?;
-    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.symmetricDifference")?;
     let mut result = ctx
         .alloc_set()
@@ -1390,7 +1390,7 @@ fn set_proto_symmetric_difference(
 /// - <https://tc39.es/ecma262/#sec-set.prototype.issubsetof>
 fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this = receiver_set(ctx, "Set.prototype.isSubsetOf")?;
-    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.isSubsetOf")?;
     if (collections::set_len(this, ctx.heap()) as f64) > other_rec.size() {
         return Ok(Value::Boolean(false));
@@ -1422,7 +1422,7 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 /// - <https://tc39.es/ecma262/#sec-set.prototype.issupersetof>
 fn set_proto_is_superset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this = receiver_set(ctx, "Set.prototype.isSupersetOf")?;
-    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.isSupersetOf")?;
     if (collections::set_len(this, ctx.heap()) as f64) < other_rec.size() {
         return Ok(Value::Boolean(false));
@@ -1450,7 +1450,7 @@ fn set_proto_is_disjoint_from(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this = receiver_set(ctx, "Set.prototype.isDisjointFrom")?;
-    let other = args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.first().cloned().unwrap_or(Value::undefined());
     let other_rec = get_set_record(ctx, other, "Set.prototype.isDisjointFrom")?;
     let context = execution_context(ctx, "Set.prototype.isDisjointFrom")?;
     if (collections::set_len(this, ctx.heap()) as f64) <= other_rec.size() {
@@ -1499,17 +1499,17 @@ fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 
 fn weak_map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.get")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_get(m, ctx.heap(), &key) {
         Ok(Some(v)) => Ok(v),
-        _ => Ok(Value::Undefined),
+        _ => Ok(Value::undefined()),
     }
 }
 
 fn weak_map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let mut m = receiver_weak_map(ctx, "WeakMap.prototype.set")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
-    let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let key = args.first().cloned().unwrap_or(Value::undefined());
+    let value = args.get(1).cloned().unwrap_or(Value::undefined());
     ctx.weak_map_set(&mut m, key, value)
         .map_err(|e| collection_to_native(e, "WeakMap.prototype.set"))?;
     Ok(Value::WeakMap(m))
@@ -1517,7 +1517,7 @@ fn weak_map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn weak_map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.has")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_has(m, ctx.heap(), &key) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(_) => Ok(Value::Boolean(false)),
@@ -1526,7 +1526,7 @@ fn weak_map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn weak_map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.delete")?;
-    let key = args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_delete(m, ctx.heap_mut(), &key) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(_) => Ok(Value::Boolean(false)),
@@ -1539,7 +1539,7 @@ fn weak_map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 
 fn weak_set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let mut s = receiver_weak_set(ctx, "WeakSet.prototype.add")?;
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.first().cloned().unwrap_or(Value::undefined());
     ctx.weak_set_add(&mut s, v)
         .map_err(|e| collection_to_native(e, "WeakSet.prototype.add"))?;
     Ok(Value::WeakSet(s))
@@ -1547,7 +1547,7 @@ fn weak_set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn weak_set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_weak_set(ctx, "WeakSet.prototype.has")?;
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_set_has(s, ctx.heap(), &v) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(_) => Ok(Value::Boolean(false)),
@@ -1556,7 +1556,7 @@ fn weak_set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn weak_set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_weak_set(ctx, "WeakSet.prototype.delete")?;
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_set_delete(s, ctx.heap_mut(), &v) {
         Ok(b) => Ok(Value::Boolean(b)),
         Err(_) => Ok(Value::Boolean(false)),
@@ -1859,13 +1859,13 @@ fn set_record_next_key(
                 });
             };
             let done = crate::object::get(record, ctx.heap(), "done")
-                .unwrap_or(Value::Undefined)
+                .unwrap_or(Value::undefined())
                 .to_boolean(ctx.heap());
             if done {
                 return Ok(None);
             }
             Ok(Some(
-                crate::object::get(record, ctx.heap(), "value").unwrap_or(Value::Undefined),
+                crate::object::get(record, ctx.heap(), "value").unwrap_or(Value::undefined()),
             ))
         }
         SetRecordKeys::Dynamic {

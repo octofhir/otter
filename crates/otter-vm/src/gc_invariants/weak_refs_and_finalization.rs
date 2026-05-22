@@ -103,7 +103,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
         let calls = Arc::clone(&calls);
         move |_, _, _| {
             calls.fetch_add(1, Ordering::Relaxed);
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         }
     })
     .expect("native cleanup");
@@ -160,8 +160,8 @@ fn finalization_registry_registers_without_strong_target_retention() {
 fn dropped_finalization_registry_self_cycle_is_reaped() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
     let target = alloc_old_object(&mut heap).expect("target");
-    let callback =
-        native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::Undefined)).expect("native cleanup");
+    let callback = native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::undefined()))
+        .expect("native cleanup");
     let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
     finalization_registry_register(
         registry,
@@ -199,7 +199,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
                 matches!(args.first(), Some(Value::Boolean(true))),
                 Ordering::Relaxed,
             );
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         })
         .expect("native cleanup")
     };
@@ -254,13 +254,13 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
         native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args, _| {
             let interp = ctx.interp_mut();
             let Some(Value::WeakRef(weak_ref)) = args.first() else {
-                return Ok(Value::Undefined);
+                return Ok(Value::undefined());
             };
             observed_undefined.store(
                 weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined,
                 Ordering::Relaxed,
             );
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         })
         .expect("native cleanup")
     };
@@ -298,7 +298,7 @@ fn finalization_cleanup_job_carries_registry_context() {
         let called = Arc::clone(&called);
         move |_, _, _| {
             called.store(true, Ordering::Relaxed);
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         }
     })
     .expect("native cleanup");
@@ -341,13 +341,13 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
         native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args, _| {
             let interp = ctx.interp_mut();
             let Some(Value::WeakRef(weak_ref)) = args.first() else {
-                return Ok(Value::Undefined);
+                return Ok(Value::undefined());
             };
             observed_undefined.store(
                 weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined,
                 Ordering::Relaxed,
             );
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         })
         .expect("native cleanup")
     };
@@ -388,7 +388,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
         move |ctx, _, _| {
             let _allocated = ctx.alloc_object()?;
             allocated_after_gc.store(true, Ordering::Relaxed);
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         }
     })
     .expect("native cleanup");
@@ -424,8 +424,8 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
 #[test]
 fn finalization_registry_unregister_token_removes_cells() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
-    let callback =
-        native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::Undefined)).expect("native cleanup");
+    let callback = native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::undefined()))
+        .expect("native cleanup");
     let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
     let target = alloc_old_object(&mut heap).expect("target");
     let token = alloc_old_object(&mut heap).expect("token");
@@ -461,8 +461,8 @@ fn weak_finalization_registry_prunes_dead_handles_and_keeps_lazy_flag() {
     assert_eq!(heap.weak_ref_count(), 0);
     assert!(!heap.has_finalization_registries());
 
-    let callback =
-        native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::Undefined)).expect("native cleanup");
+    let callback = native_value(&mut heap, "cleanup", |_, _, _| Ok(Value::undefined()))
+        .expect("native cleanup");
     let registry = alloc_finalization_registry(&mut heap, callback).expect("registry");
     assert_eq!(heap.finalization_registry_count(), 1);
     assert!(heap.has_finalization_registries());

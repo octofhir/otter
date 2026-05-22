@@ -89,15 +89,15 @@ impl CapabilityExecutorState {
                 reason: "promise capability executor already has a reject function".to_string(),
             });
         }
-        let resolve = args.first().cloned().unwrap_or(Value::Undefined);
-        let reject = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let resolve = args.first().cloned().unwrap_or(Value::undefined());
+        let reject = args.get(1).cloned().unwrap_or(Value::undefined());
         if !matches!(resolve, Value::Undefined) {
             *self.resolve.borrow_mut() = Some(resolve);
         }
         if !matches!(reject, Value::Undefined) {
             *self.reject.borrow_mut() = Some(reject);
         }
-        Ok(Value::Undefined)
+        Ok(Value::undefined())
     }
 }
 
@@ -791,7 +791,7 @@ pub fn prototype_call(
             interp,
             context,
             Value::Promise(*promise),
-            args.first().cloned().unwrap_or(Value::Undefined),
+            args.first().cloned().unwrap_or(Value::undefined()),
         ),
         other => Err(NativeError::TypeError {
             name: "Promise.prototype",
@@ -923,7 +923,7 @@ fn make_then_finally(
         move |ctx, args, captures| {
             let c = captures[0];
             let on_finally = captures[1];
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let value = args.first().cloned().unwrap_or(Value::undefined());
             let result = {
                 let (interp, _) = ctx.interp_mut_and_context();
                 interp
@@ -973,7 +973,7 @@ fn make_catch_finally(
         move |ctx, args, captures| {
             let c = captures[0];
             let on_finally = captures[1];
-            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            let reason = args.first().cloned().unwrap_or(Value::undefined());
             let result = {
                 let (interp, _) = ctx.interp_mut_and_context();
                 interp
@@ -1141,8 +1141,8 @@ fn new_generic_promise_capability(
     let promise = interp
         .run_construct_sync(&exec, &constructor, constructor, smallvec![executor])
         .map_err(|err| promise_vm_error("Promise", err))?;
-    let resolve = (*state.resolve.borrow()).unwrap_or(Value::Undefined);
-    let reject = (*state.reject.borrow()).unwrap_or(Value::Undefined);
+    let resolve = (*state.resolve.borrow()).unwrap_or(Value::undefined());
+    let reject = (*state.reject.borrow()).unwrap_or(Value::undefined());
     if !crate::is_callable_value(&resolve) {
         return Err(NativeError::TypeError {
             name: "Promise",
@@ -1410,7 +1410,7 @@ fn static_resolve(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let value = args.first().cloned().unwrap_or(Value::undefined());
     if let Value::Promise(p) = &value {
         if let Some(exec) = context.as_ref() {
             let value_constructor =
@@ -1428,7 +1428,7 @@ fn static_resolve(
 }
 
 fn static_reject(interp: &mut Interpreter, args: &[Value]) -> Result<JsPromiseHandle, NativeError> {
-    let reason = args.first().cloned().unwrap_or(Value::Undefined);
+    let reason = args.first().cloned().unwrap_or(Value::undefined());
     Ok(PromiseBuilder::new().rejected_runtime_rooted(interp, reason, &[], &[args])?)
 }
 
@@ -1438,7 +1438,7 @@ fn static_resolve_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let value = args.first().cloned().unwrap_or(Value::undefined());
     let cap = new_generic_promise_capability(interp, context, constructor, &[&value], &[args])?;
     call_capability_resolve(interp, &cap, value)?;
     Ok(cap.promise)
@@ -1450,7 +1450,7 @@ fn static_reject_generic(
     constructor: Value,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let reason = args.first().cloned().unwrap_or(Value::Undefined);
+    let reason = args.first().cloned().unwrap_or(Value::undefined());
     let cap = new_generic_promise_capability(interp, context, constructor, &[&reason], &[args])?;
     call_capability_reject(interp, &cap, reason)?;
     Ok(cap.promise)
@@ -1486,7 +1486,7 @@ fn static_try_generic(
         name: NAME,
         reason: "missing execution context".to_string(),
     })?;
-    let callbackfn = args.first().cloned().unwrap_or(Value::Undefined);
+    let callbackfn = args.first().cloned().unwrap_or(Value::undefined());
     let forwarded: SmallVec<[Value; 8]> = if args.len() > 1 {
         args[1..].iter().cloned().collect()
     } else {
@@ -1551,7 +1551,7 @@ fn static_all_keyed_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    let promises = args.first().cloned().unwrap_or(Value::Undefined);
+    let promises = args.first().cloned().unwrap_or(Value::undefined());
     if !is_object_like(&promises) {
         return reject_capability_error(
             interp,
@@ -1581,7 +1581,7 @@ fn static_all_keyed_generic(
             &[args, all_keys.as_slice()],
         )?;
         let slots_root = slots.array_value();
-        let keys_root = slots.keys_value().unwrap_or(Value::Undefined);
+        let keys_root = slots.keys_value().unwrap_or(Value::undefined());
         interp.push_iteration_anchor(slots_root);
         interp.push_iteration_anchor(keys_root);
         for key in all_keys {
@@ -1775,7 +1775,7 @@ fn keyed_element_function(
         value_roots,
         slice_roots,
         move |ctx, args, _captures| {
-            let payload = args.first().cloned().unwrap_or(Value::Undefined);
+            let payload = args.first().cloned().unwrap_or(Value::undefined());
             let value = match variant {
                 KeyedVariant::All => payload,
                 KeyedVariant::AllSettled => build_settled_record(fulfilled, payload, ctx)?,
@@ -1783,7 +1783,7 @@ fn keyed_element_function(
             if slots.fill(ctx.heap_mut(), index, value) {
                 resolve_keyed_slots_native(ctx, &cap, &slots, name)?;
             }
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         },
     )
     .map_err(|_| oom_native(name))
@@ -1891,7 +1891,7 @@ fn static_all_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let iterable = args.first().cloned().unwrap_or(Value::undefined());
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
@@ -1984,7 +1984,7 @@ fn static_all_generic(
                 ],
                 &[args],
                 move |ctx, args, _captures| {
-                    let v = args.first().cloned().unwrap_or(Value::Undefined);
+                    let v = args.first().cloned().unwrap_or(Value::undefined());
                     if slots_for_fulfill.fill(ctx.heap_mut(), i, v) {
                         let collected = slots_for_fulfill.collect_values(ctx.heap());
                         let arr = ctx.array_from_elements_with_roots(
@@ -1999,7 +1999,7 @@ fn static_all_generic(
                         let interp = ctx.interp_mut();
                         call_capability_resolve(interp, &cap_for_fulfill, Value::Array(arr))?;
                     }
-                    Ok(Value::Undefined)
+                    Ok(Value::undefined())
                 },
             )?;
             let attach_result =
@@ -2054,7 +2054,7 @@ fn static_race_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let iterable = args.first().cloned().unwrap_or(Value::undefined());
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
@@ -2117,7 +2117,7 @@ fn static_all_settled_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let iterable = args.first().cloned().unwrap_or(Value::undefined());
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
@@ -2221,7 +2221,7 @@ fn static_all_settled_generic(
                     ],
                     &[args],
                     move |ctx, args, _captures| {
-                        let v = args.first().cloned().unwrap_or(Value::Undefined);
+                        let v = args.first().cloned().unwrap_or(Value::undefined());
                         let record = build_settled_record(true, v, ctx)?;
                         if slots.fill(ctx.heap_mut(), i, record) {
                             let collected = slots.collect_values(ctx.heap());
@@ -2233,7 +2233,7 @@ fn static_all_settled_generic(
                             let interp = ctx.interp_mut();
                             call_capability_resolve(interp, &cap, Value::Array(arr))?;
                         }
-                        Ok(Value::Undefined)
+                        Ok(Value::undefined())
                     },
                 )?
             };
@@ -2271,7 +2271,7 @@ fn static_all_settled_generic(
                     ],
                     &[args],
                     move |ctx, args, _captures| {
-                        let r = args.first().cloned().unwrap_or(Value::Undefined);
+                        let r = args.first().cloned().unwrap_or(Value::undefined());
                         let record = build_settled_record(false, r, ctx)?;
                         if slots.fill(ctx.heap_mut(), i, record) {
                             let collected = slots.collect_values(ctx.heap());
@@ -2283,7 +2283,7 @@ fn static_all_settled_generic(
                             let interp = ctx.interp_mut();
                             call_capability_resolve(interp, &cap, Value::Array(arr))?;
                         }
-                        Ok(Value::Undefined)
+                        Ok(Value::undefined())
                     },
                 )?
             };
@@ -2482,7 +2482,7 @@ fn static_any_generic(
         Ok(value) => value,
         Err(err) => return reject_capability_error(interp, &cap, err),
     };
-    let iterable = args.first().cloned().unwrap_or(Value::Undefined);
+    let iterable = args.first().cloned().unwrap_or(Value::undefined());
     let (iterator, next_method) = match interp.get_iterator_sync(&exec, &iterable) {
         Ok(record) => record,
         Err(err) => {
@@ -2584,7 +2584,7 @@ fn static_any_generic(
                     ],
                     &[args],
                     move |ctx, args, _captures| {
-                        let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                        let reason = args.first().cloned().unwrap_or(Value::undefined());
                         if errors.fill(ctx.heap_mut(), i, reason) {
                             let collected = errors.collect_values(ctx.heap());
                             let agg =
@@ -2592,7 +2592,7 @@ fn static_any_generic(
                             let interp = ctx.interp_mut();
                             call_capability_reject(interp, &cap, agg)?;
                         }
-                        Ok(Value::Undefined)
+                        Ok(Value::undefined())
                     },
                 )?
             };
@@ -2943,23 +2943,23 @@ fn resolve_native_body(
         matches!(promise.state(interp.gc_heap()), PromiseState::Pending)
     };
     if !pending {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
 
-    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    let value = args.first().cloned().unwrap_or(Value::undefined());
     if let Value::Promise(inner) = value {
         let value_root = Value::Promise(inner);
         let (on_fulfill, on_reject) =
             make_resolve_adoption_handlers_native_rooted(ctx, promise, &[&value_root], &[args])?;
         let interp = ctx.interp_mut();
         attach_then(interp, context, &inner, Some(on_fulfill), Some(on_reject));
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
 
     let interp = ctx.interp_mut();
     let jobs = promise.fulfill(interp.gc_heap_mut(), value);
     drain_jobs(interp, jobs);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn make_resolve_adoption_handlers_native_rooted(
@@ -2980,10 +2980,10 @@ fn make_resolve_adoption_handlers_native_rooted(
         slice_roots,
         move |ctx, args, _captures| {
             let interp = ctx.interp_mut();
-            let v = args.first().cloned().unwrap_or(Value::Undefined);
+            let v = args.first().cloned().unwrap_or(Value::undefined());
             let jobs = resolver.fulfill(interp.gc_heap_mut(), v);
             drain_jobs(interp, jobs);
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         },
     )?;
 
@@ -3001,10 +3001,10 @@ fn make_resolve_adoption_handlers_native_rooted(
         slice_roots,
         move |ctx, args, _captures| {
             let interp = ctx.interp_mut();
-            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            let reason = args.first().cloned().unwrap_or(Value::undefined());
             let jobs = resolver_for_reject.reject(interp.gc_heap_mut(), reason);
             drain_jobs(interp, jobs);
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         },
     )?;
 
@@ -3027,11 +3027,11 @@ fn make_reject_native_runtime_rooted(
         move |ctx, args, _captures| {
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                let reason = args.first().cloned().unwrap_or(Value::undefined());
                 let jobs = promise.reject(interp.gc_heap_mut(), reason);
                 drain_jobs(interp, jobs);
             }
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         },
     )
 }
@@ -3054,11 +3054,11 @@ fn make_reject_native_stack_rooted(
         move |ctx, args, _captures| {
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                let reason = args.first().cloned().unwrap_or(Value::undefined());
                 let jobs = promise.reject(interp.gc_heap_mut(), reason);
                 drain_jobs(interp, jobs);
             }
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         },
     )
 }
@@ -3079,11 +3079,11 @@ fn make_reject_native_native_rooted(
         move |ctx, args, _captures| {
             let interp = ctx.interp_mut();
             if matches!(promise.state(interp.gc_heap()), PromiseState::Pending) {
-                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                let reason = args.first().cloned().unwrap_or(Value::undefined());
                 let jobs = promise.reject(interp.gc_heap_mut(), reason);
                 drain_jobs(interp, jobs);
             }
-            Ok(Value::Undefined)
+            Ok(Value::undefined())
         },
     )
 }
@@ -3157,7 +3157,7 @@ mod tests {
         let args = [Value::Number(NumberValue::from_i32(7))];
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
-        let constructor = Value::Undefined;
+        let constructor = Value::undefined();
         let promise_value =
             static_resolve(&mut interp, None, constructor, &args).expect("Promise.resolve");
 

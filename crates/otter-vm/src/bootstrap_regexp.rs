@@ -213,7 +213,7 @@ fn legacy_accessor_getter(
     captures: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let ctor = captures.first().cloned().unwrap_or(Value::Undefined);
+    let ctor = captures.first().cloned().unwrap_or(Value::undefined());
     if !values_strict_equal(&this_value, &ctor) {
         return Err(NativeError::TypeError {
             name: "RegExp legacy accessor",
@@ -239,14 +239,14 @@ fn legacy_accessor_setter(
     captures: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let ctor = captures.first().cloned().unwrap_or(Value::Undefined);
+    let ctor = captures.first().cloned().unwrap_or(Value::undefined());
     if !values_strict_equal(&this_value, &ctor) {
         return Err(NativeError::TypeError {
             name: "RegExp legacy accessor",
             reason: "Method called on incompatible receiver".to_string(),
         });
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn values_strict_equal(a: &Value, b: &Value) -> bool {
@@ -408,8 +408,8 @@ pub fn install_regexp_well_knowns_post_bootstrap(
 
 /// §22.2.3.1 RegExp(pattern, flags).
 fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let pattern_arg = args.first().cloned().unwrap_or(Value::Undefined);
-    let flags_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let pattern_arg = args.first().cloned().unwrap_or(Value::undefined());
+    let flags_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let pattern_is_regexp = is_regexp_runtime(ctx, &pattern_arg, "RegExp")?;
 
     // §22.2.3.1 steps 3-4 — bare `RegExp(pattern)` returns a
@@ -489,8 +489,8 @@ fn regexp_constructor_matches(
 ) -> Result<bool, NativeError> {
     let pattern_ctor =
         crate::regexp_prototype::get_property_runtime(ctx, pattern, "constructor", "RegExp")?;
-    let regexp_ctor =
-        object::get(*ctx.cx.interp.global_this(), ctx.heap(), "RegExp").unwrap_or(Value::Undefined);
+    let regexp_ctor = object::get(*ctx.cx.interp.global_this(), ctx.heap(), "RegExp")
+        .unwrap_or(Value::undefined());
     Ok(values_strict_equal(&pattern_ctor, &regexp_ctor))
 }
 
@@ -533,7 +533,7 @@ fn install_prototype_methods(
 
 fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let re = receiver_regexp(ctx, "RegExp.prototype.exec")?;
-    let text = args.first().cloned().unwrap_or(Value::Undefined);
+    let text = args.first().cloned().unwrap_or(Value::undefined());
     let text_str = coerce_to_string(ctx, &text, "RegExp.prototype.exec")?;
 
     crate::regexp_prototype::exec_once_native(&re, &text_str, ctx, &[args])
@@ -556,8 +556,8 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             reason: "cannot compile a RegExp subclass instance".to_string(),
         });
     }
-    let pattern_raw = args.first().cloned().unwrap_or(Value::Undefined);
-    let flags_raw = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let pattern_raw = args.first().cloned().unwrap_or(Value::undefined());
+    let flags_raw = args.get(1).cloned().unwrap_or(Value::undefined());
     let (pattern_units, flags_str) = match pattern_raw {
         Value::RegExp(other) => {
             if !matches!(flags_raw, Value::Undefined) {

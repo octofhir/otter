@@ -190,9 +190,9 @@ pub(crate) fn set_weak_ref_prototype_override(
 pub fn weak_ref_deref(weak_ref: JsWeakRef, heap: &otter_gc::GcHeap) -> Value {
     let target = heap.read_payload(weak_ref, |body| body.target);
     if target.is_null() {
-        return Value::Undefined;
+        return Value::undefined();
     }
-    raw_to_value(heap, target).unwrap_or(Value::Undefined)
+    raw_to_value(heap, target).unwrap_or(Value::undefined())
 }
 
 /// Allocate a fresh `FinalizationRegistry` while exposing caller-owned roots.
@@ -447,20 +447,20 @@ fn impl_finalization_registry_register(
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     let registry = receiver_finalization_registry(args)?;
-    let target = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let held_value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let target = args.args.first().cloned().unwrap_or(Value::undefined());
+    let held_value = args.args.get(1).cloned().unwrap_or(Value::undefined());
     let unregister_token = args.args.get(2);
     let heap = &mut *args.gc_heap;
     finalization_registry_register(registry, heap, &target, held_value, unregister_token)
         .map_err(vm_to_intrinsic)?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn impl_finalization_registry_unregister(
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     let registry = receiver_finalization_registry(args)?;
-    let token = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let token = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
     let removed =
         finalization_registry_unregister(registry, heap, &token).map_err(vm_to_intrinsic)?;

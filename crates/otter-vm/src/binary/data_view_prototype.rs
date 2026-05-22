@@ -108,7 +108,7 @@ where
     check_not_detached(&view, &*args.gc_heap)?;
     let offset = read_byte_offset(args)?;
     ensure_within(&view, &*args.gc_heap, offset, byte_count)?;
-    let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let value = args.args.get(1).cloned().unwrap_or(Value::undefined());
     let little_endian = to_little_endian_flag(args.args.get(2), &*args.gc_heap);
     // Encode the value into a small scratch buffer first so the
     // BigInt read path (which only needs `&heap`) doesn't fight the
@@ -120,7 +120,7 @@ where
     buffer.with_bytes_mut(args.gc_heap, |buf| {
         buf[abs_offset..abs_offset + byte_count].copy_from_slice(&staging);
     });
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 // ---- getX implementations -----------------------------------------------
@@ -417,6 +417,6 @@ pub fn load_property(view: &JsDataView, heap: &otter_gc::GcHeap, name: &str) -> 
         "buffer" => Value::ArrayBuffer(buffer),
         "byteLength" => smi(view.byte_length(heap) as i32),
         "byteOffset" => smi(view.byte_offset(heap) as i32),
-        _ => Value::Undefined,
+        _ => Value::undefined(),
     }
 }

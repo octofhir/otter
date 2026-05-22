@@ -79,7 +79,7 @@ pub(crate) fn callable_intrinsic_property(
 ) -> Result<Value, VmError> {
     match callable_metadata_value(ctx, callee, key)? {
         Some(value) => Ok(value),
-        None => Ok(Value::Undefined),
+        None => Ok(Value::undefined()),
     }
 }
 
@@ -129,7 +129,7 @@ pub(crate) fn bound_own_property_descriptor(
             let value = match key {
                 "name" => Value::String(JsString::from_str(&name, gc_heap)?),
                 "length" => Value::Number(length),
-                _ => Value::Undefined,
+                _ => Value::undefined(),
             };
             Ok(Some(PropertyDescriptor::data(value, false, false, true)))
         }
@@ -486,7 +486,7 @@ pub(crate) fn ordinary_function_metadata_key(key: &str) -> Option<&'static str> 
 fn descriptor_value(desc: &PropertyDescriptor) -> Value {
     match &desc.kind {
         DescriptorKind::Data { value } => *value,
-        DescriptorKind::Accessor { .. } => Value::Undefined,
+        DescriptorKind::Accessor { .. } => Value::undefined(),
     }
 }
 

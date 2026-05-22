@@ -266,7 +266,7 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
             reason: "Promise constructor requires 'new'".to_string(),
         });
     }
-    let executor = args.first().cloned().unwrap_or(Value::Undefined);
+    let executor = args.first().cloned().unwrap_or(Value::undefined());
     if !ctx.interp_mut().is_callable_runtime(&executor) {
         return Err(NativeError::TypeError {
             name: "Promise",
@@ -402,13 +402,13 @@ fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 /// - <https://tc39.es/ecma262/#sec-promise.prototype.catch>
 fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let on_rejected = args.first().cloned().unwrap_or(Value::Undefined);
+    let on_rejected = args.first().cloned().unwrap_or(Value::undefined());
     promise_dispatch::invoke_then(ctx, this_value, Value::Undefined, on_rejected)
 }
 
 fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let on_finally = args.first().cloned().unwrap_or(Value::Undefined);
+    let on_finally = args.first().cloned().unwrap_or(Value::undefined());
     promise_dispatch::method_finally_invoke(ctx, this_value, on_finally)
 }
 

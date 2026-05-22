@@ -671,7 +671,7 @@ impl ErrorClassRegistry {
                 }
                 Some(v) => Some(v.display_string(c.heap())),
             };
-            let errors_arg = a.first().cloned().unwrap_or(Value::Undefined);
+            let errors_arg = a.first().cloned().unwrap_or(Value::undefined());
             let cause = read_options_cause(a.get(2), c.heap());
 
             // §20.5.7.1 step 4 — IterableToList(errors). Spec

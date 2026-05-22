@@ -67,7 +67,7 @@ pub fn load_property(sym: &JsSymbol, name: &str) -> Value {
     if name == "description" {
         match sym.description() {
             Some(s) => Value::String(*s),
-            None => Value::Undefined,
+            None => Value::undefined(),
         }
     } else {
         Value::Undefined

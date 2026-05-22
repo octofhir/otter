@@ -110,8 +110,8 @@ pub enum ConstValue {
 impl ConstValue {
     fn to_value(self) -> Value {
         match self {
-            Self::Undefined => Value::Undefined,
-            Self::Null => Value::Null,
+            Self::Undefined => Value::undefined(),
+            Self::Null => Value::null(),
             Self::Boolean(v) => Value::Boolean(v),
             Self::Number(v) => Value::Number(NumberValue::from_f64(v)),
         }
@@ -456,7 +456,7 @@ impl<'rt> ObjectBuilder<'rt> {
             )?)),
             None => None,
         };
-        let getter_root = getter.unwrap_or(Value::Undefined);
+        let getter_root = getter.unwrap_or(Value::undefined());
         let mut setter_roots = Vec::with_capacity(self.value_roots.len() + 2);
         setter_roots.push(&object_root);
         setter_roots.push(&getter_root);
@@ -877,7 +877,7 @@ mod tests {
     }
 
     fn construct(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
-        Ok(Value::Undefined)
+        Ok(Value::undefined())
     }
 
     static METHODS: &[MethodSpec] = &[MethodSpec {

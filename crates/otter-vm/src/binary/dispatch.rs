@@ -58,7 +58,7 @@ pub fn array_buffer_call(
         // §25.1.3.1 ArrayBuffer.isView(arg) — returns `true` when
         // arg is a TypedArray or DataView.
         M::IsView => {
-            let v = args.first().cloned().unwrap_or(Value::Undefined);
+            let v = args.first().cloned().unwrap_or(Value::undefined());
             Ok(Value::Boolean(matches!(
                 v,
                 Value::TypedArray(_) | Value::DataView(_)
@@ -123,7 +123,7 @@ pub fn array_buffer_call_with_roots(
             Ok(Value::ArrayBuffer(buf))
         }
         M::IsView => {
-            let v = args.first().cloned().unwrap_or(Value::Undefined);
+            let v = args.first().cloned().unwrap_or(Value::undefined());
             Ok(Value::Boolean(matches!(
                 v,
                 Value::TypedArray(_) | Value::DataView(_)
@@ -402,12 +402,12 @@ fn construct_typed_array_with_roots(
         }
         Some(Value::Object(obj)) => {
             let length_value =
-                crate::object::get(*obj, gc_heap, "length").unwrap_or(Value::Undefined);
+                crate::object::get(*obj, gc_heap, "length").unwrap_or(Value::undefined());
             let len = to_index(&length_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v =
-                    crate::object::get(*obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
+                    crate::object::get(*obj, gc_heap, &i.to_string()).unwrap_or(Value::undefined());
                 values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)
@@ -422,7 +422,7 @@ fn from_static_with_roots(
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
-    let source = args.first().cloned().unwrap_or(Value::Undefined);
+    let source = args.first().cloned().unwrap_or(Value::undefined());
     match source {
         Value::TypedArray(src) => {
             if src.buffer(gc_heap).is_detached(gc_heap) {
@@ -462,12 +462,13 @@ fn from_static_with_roots(
             typed_array_from_values_with_roots(kind, &chars, gc_heap, external_visit)
         }
         Value::Object(obj) => {
-            let len_value = crate::object::get(obj, gc_heap, "length").unwrap_or(Value::Undefined);
+            let len_value =
+                crate::object::get(obj, gc_heap, "length").unwrap_or(Value::undefined());
             let len = to_index(&len_value, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
             let mut values: Vec<Value> = Vec::with_capacity(len);
             for i in 0..len {
                 let v =
-                    crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::Undefined);
+                    crate::object::get(obj, gc_heap, &i.to_string()).unwrap_or(Value::undefined());
                 values.push(coerce_for_kind(gc_heap, kind, &v)?);
             }
             typed_array_from_values_with_roots(kind, &values, gc_heap, external_visit)

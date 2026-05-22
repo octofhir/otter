@@ -195,7 +195,7 @@ fn weak_ref_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let target = args.first().cloned().unwrap_or(Value::undefined());
     if !target_can_be_weak(&target) {
         return Err(NativeError::TypeError {
             name: "WeakRef",
@@ -218,7 +218,7 @@ fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
             reason: "constructor requires 'new'".to_string(),
         });
     }
-    let cleanup = args.first().cloned().unwrap_or(Value::Undefined);
+    let cleanup = args.first().cloned().unwrap_or(Value::undefined());
     if !ctx.interp_mut().is_callable_runtime(&cleanup) {
         return Err(NativeError::TypeError {
             name: "FinalizationRegistry",
@@ -251,8 +251,8 @@ fn weak_ref_proto_deref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Valu
 
 fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let registry = receiver_finalization_registry(ctx, "FinalizationRegistry.prototype.register")?;
-    let target = args.first().cloned().unwrap_or(Value::Undefined);
-    let held_value = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let target = args.first().cloned().unwrap_or(Value::undefined());
+    let held_value = args.get(1).cloned().unwrap_or(Value::undefined());
     let unregister_token = args.get(2).cloned();
     if !target_can_be_weak(&target) {
         return Err(NativeError::TypeError {
@@ -268,13 +268,13 @@ fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
         unregister_token.as_ref(),
     )
     .map_err(|e| vm_to_native(e, "FinalizationRegistry.prototype.register"))?;
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn fr_proto_unregister(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let registry =
         receiver_finalization_registry(ctx, "FinalizationRegistry.prototype.unregister")?;
-    let token = args.first().cloned().unwrap_or(Value::Undefined);
+    let token = args.first().cloned().unwrap_or(Value::undefined());
     let removed = weak_refs::finalization_registry_unregister(registry, ctx.heap_mut(), &token)
         .map_err(|e| vm_to_native(e, "FinalizationRegistry.prototype.unregister"))?;
     Ok(Value::Boolean(removed))

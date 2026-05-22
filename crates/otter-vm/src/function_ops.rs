@@ -337,7 +337,7 @@ impl Interpreter {
                     return Err(VmError::NotCallable);
                 }
                 let mut iter = args.into_iter();
-                let receiver = iter.next().unwrap_or(Value::Undefined);
+                let receiver = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = iter.collect();
                 self.run_callable_sync(context, &this_value, receiver, forwarded)
             }
@@ -346,7 +346,7 @@ impl Interpreter {
                     return Err(VmError::NotCallable);
                 }
                 let mut iter = args.into_iter();
-                let receiver = iter.next().unwrap_or(Value::Undefined);
+                let receiver = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
                     None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
                     Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
@@ -358,7 +358,7 @@ impl Interpreter {
                     return Err(VmError::NotCallable);
                 }
                 let mut iter = args.into_iter();
-                let receiver = iter.next().unwrap_or(Value::Undefined);
+                let receiver = iter.next().unwrap_or(Value::undefined());
                 let bound_args: SmallVec<[Value; 4]> = iter.collect();
                 let mut ctx = function_metadata::FunctionMetadataContext::new(
                     context,
@@ -416,7 +416,7 @@ impl Interpreter {
                 // §20.2.3.6: Return ? OrdinaryHasInstance(F, V) where
                 // F is the `this` value and V is the first argument.
                 // <https://tc39.es/ecma262/#sec-function.prototype-@@hasinstance>
-                let v = args.into_iter().next().unwrap_or(Value::Undefined);
+                let v = args.into_iter().next().unwrap_or(Value::undefined());
                 let result = self.ordinary_has_instance(context, &this_value, &v)?;
                 Ok(Value::Boolean(result))
             }
@@ -1551,8 +1551,8 @@ impl Interpreter {
                 self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
-                self.set_property(result, "get", (*getter).unwrap_or(Value::Undefined))?;
-                self.set_property(result, "set", (*setter).unwrap_or(Value::Undefined))?;
+                self.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
+                self.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
             }
         }
         self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
@@ -1618,7 +1618,7 @@ impl Interpreter {
         {
             return Ok(value);
         }
-        Ok(Value::Undefined)
+        Ok(Value::undefined())
     }
 
     pub(crate) fn function_property_get_stack_rooted(

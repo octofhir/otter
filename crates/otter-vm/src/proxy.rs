@@ -141,8 +141,8 @@ impl JsProxy {
     pub fn revoke(self, heap: &mut otter_gc::GcHeap) {
         heap.with_payload(self.handle, |body| {
             body.revoked = true;
-            body.target = Value::Null;
-            body.handler = Value::Null;
+            body.target = Value::null();
+            body.handler = Value::null();
         });
     }
 

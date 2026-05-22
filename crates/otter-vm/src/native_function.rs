@@ -1053,7 +1053,7 @@ fn native_builtin_descriptor(
     let value = match key {
         "name" => Value::String(JsString::from_str(body.name, heap)?),
         "length" => Value::Number(crate::number::NumberValue::from_i32(body.length as i32)),
-        _ => Value::Undefined,
+        _ => Value::undefined(),
     };
     let configurable = match key {
         "name" => body.metadata.name_configurable,
@@ -1145,7 +1145,7 @@ mod tests {
     fn native_value_dispatches() {
         let mut interp = crate::Interpreter::new();
         let f = native_value(interp.gc_heap_mut(), "identity", |_, args, _captures| {
-            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+            Ok(args.first().cloned().unwrap_or(Value::undefined()))
         })
         .expect("native");
         let Value::NativeFunction(native) = &f else {
@@ -1188,7 +1188,7 @@ mod tests {
     #[test]
     fn static_native_value_uses_fast_path_and_length() {
         fn id(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            Ok(args.first().cloned().unwrap_or(Value::Undefined))
+            Ok(args.first().cloned().unwrap_or(Value::undefined()))
         }
 
         let mut interp = crate::Interpreter::new();

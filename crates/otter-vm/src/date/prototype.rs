@@ -169,7 +169,7 @@ fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let time = receiver_time(args)?;
     match to_iso_string(time) {
         Some(s) => Ok(Value::String(JsString::from_str(&s, args.gc_heap)?)),
-        None => Ok(Value::Null),
+        None => Ok(Value::null()),
     }
 }
 
@@ -618,7 +618,7 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     if let Value::Number(n) = &tv
         && !n.as_f64().is_finite()
     {
-        return Ok(Value::Null);
+        return Ok(Value::null());
     }
 
     // Step 4 — Invoke(O, "toISOString").

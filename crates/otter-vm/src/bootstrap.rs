@@ -626,7 +626,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                     if let Some(Value::Proxy(proxy)) = captures.first() {
                         proxy.revoke(ctx.heap_mut());
                     }
-                    Ok(Value::Undefined)
+                    Ok(Value::undefined())
                 },
             )
             .map_err(|_| NativeError::TypeError {
@@ -793,7 +793,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
                     })?;
                 Ok(Value::String(value))
             }
-            None => Ok(Value::Undefined),
+            None => Ok(Value::undefined()),
         }
     }
 
@@ -903,14 +903,14 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         match *ctx.this_value() {
             Value::Symbol(sym) => match sym.description() {
                 Some(s) => Ok(Value::String(*s)),
-                None => Ok(Value::Undefined),
+                None => Ok(Value::undefined()),
             },
             Value::Object(obj) => {
                 let heap = ctx.interp_mut().gc_heap();
                 match crate::object::symbol_data(obj, heap) {
                     Some(sym) => match sym.description() {
                         Some(s) => Ok(Value::String(*s)),
-                        None => Ok(Value::Undefined),
+                        None => Ok(Value::undefined()),
                     },
                     None => Err(NativeError::TypeError {
                         name: "get Symbol.prototype.description",
@@ -1663,14 +1663,14 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let v = args.first().cloned().unwrap_or(Value::Undefined);
+        let v = args.first().cloned().unwrap_or(Value::undefined());
         Ok(Value::Boolean(crate::number::parse::is_integer(&v)))
     }
     fn number_is_safe_integer_native(
         _ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let v = args.first().cloned().unwrap_or(Value::Undefined);
+        let v = args.first().cloned().unwrap_or(Value::undefined());
         Ok(Value::Boolean(crate::number::parse::is_safe_integer(&v)))
     }
     fn number_parse_int_native(
@@ -1851,7 +1851,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         // entry point so reflective access works.
         // <https://tc39.es/ecma262/#sec-eval-x>
         fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
             ctx.interp_mut()
                 .run_eval(&arg, false)
                 .map_err(|err| NativeError::TypeError {
@@ -1926,7 +1926,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         _ctx: &mut NativeCtx<'_>,
         _args: &[Value],
     ) -> Result<Value, NativeError> {
-        Ok(Value::Undefined)
+        Ok(Value::undefined())
     }
 
     fn function_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -2995,7 +2995,7 @@ fn require_callable_arg(
     name: &'static str,
     index: usize,
 ) -> Result<Value, crate::NativeError> {
-    let v = args.get(index).cloned().unwrap_or(Value::Undefined);
+    let v = args.get(index).cloned().unwrap_or(Value::undefined());
     if ctx.cx.interp.is_callable_runtime(&v) {
         Ok(v)
     } else {
@@ -3103,7 +3103,7 @@ fn iterator_arg_count_native(
     args: &[Value],
     name: &'static str,
 ) -> Result<u64, crate::NativeError> {
-    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
     // §27.5.1.2 step 3 — `numLimit = ? ToNumber(limit)`. Non-
     // primitive operands route through `ToPrimitive(hint: number)`
     // so `valueOf` / `toString` / `Symbol.toPrimitive` hooks fire.
@@ -3221,7 +3221,7 @@ fn iterator_proto_for_each(
             })?;
         idx += 1.0;
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn iterator_proto_reduce(
@@ -3345,7 +3345,7 @@ fn iterator_proto_find(
         }
         idx += 1.0;
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 /// §27.1.5.1.2 `%IteratorPrototype%.next()` — drive one step on the
@@ -3471,7 +3471,7 @@ fn iterator_proto_return(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.return")?;
-    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
     let iter_value = Value::Iterator(handle);
     ctx.cx
         .interp
@@ -3510,7 +3510,7 @@ fn iterator_proto_throw(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let _handle = iterator_receiver_builtin(ctx, "Iterator.prototype.throw")?;
-    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
     Err(crate::NativeError::Thrown {
         name: "Iterator.prototype.throw",
         message: arg.display_string(ctx.heap()),
@@ -3576,7 +3576,7 @@ fn iterator_from_native(
     ctx: &mut crate::NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
-    let input = args.first().cloned().unwrap_or(Value::Undefined);
+    let input = args.first().cloned().unwrap_or(Value::undefined());
     match &input {
         Value::Iterator(_) => Ok(input),
         Value::Array(arr) => {

@@ -615,7 +615,7 @@ fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     // Spec §25.4.13 — argument is coerced via ToIntegerOrInfinity
     // (no ToIndex), so negative / non-integer / NaN map to `false`
     // by failing the `matches!(.., 1|2|4|8)` filter.
-    let arg = args.first().cloned().unwrap_or(Value::Undefined);
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
     let primitive = to_primitive_number(ctx, &arg, "Atomics.isLockFree")?;
     if matches!(primitive, Value::Symbol(_)) {
         return Err(type_err(
@@ -654,7 +654,7 @@ fn native_pause(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             ));
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn native_wait(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

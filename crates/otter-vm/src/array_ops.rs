@@ -125,9 +125,9 @@ impl Interpreter {
         context: &ExecutionContext,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let items = args.first().cloned().unwrap_or(Value::Undefined);
-        let map_fn = args.get(1).cloned().unwrap_or(Value::Undefined);
-        let this_arg = args.get(2).cloned().unwrap_or(Value::Undefined);
+        let items = args.first().cloned().unwrap_or(Value::undefined());
+        let map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
+        let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
         let has_map = !matches!(map_fn, Value::Undefined);
         if has_map && !self.is_callable_runtime(&map_fn) {
             return Err(VmError::TypeError {

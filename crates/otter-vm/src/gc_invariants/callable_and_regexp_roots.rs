@@ -63,7 +63,7 @@ fn native_function_captures_root_gc_values_when_rooted() {
         interp.gc_heap_mut(),
         "capture-root",
         smallvec![Value::Object(captured)],
-        |_, _, _| Ok(Value::Undefined),
+        |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
     let global = *interp.global_this();
@@ -145,7 +145,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         interp.gc_heap_mut(),
         "cycle-native",
         smallvec![Value::Object(native_object)],
-        |_, _, _| Ok(Value::Undefined),
+        |_, _, _| Ok(Value::undefined()),
     )
     .expect("native");
     crate::object::set(native_object, interp.gc_heap_mut(), "back", native);

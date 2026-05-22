@@ -34,7 +34,7 @@ pub fn call(
     match method {
         // §21.2.1 BigInt(value) — coerce `value` to a BigInt.
         M::Construct => {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let value = args.first().cloned().unwrap_or(Value::undefined());
             let big = to_bigint(heap, &value)?;
             let handle = BigIntValue::from_inner(heap, big).map_err(oom_to_vm)?;
             Ok(Value::BigInt(handle))
@@ -42,7 +42,7 @@ pub fn call(
         // §21.2.2.1 BigInt.asIntN(bits, value).
         M::AsIntN => {
             let bits = expect_bits(args.first(), heap)?;
-            let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let value = args.get(1).cloned().unwrap_or(Value::undefined());
             let n = to_bigint(heap, &value)?;
             let clipped = as_int_n(bits, &n);
             let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;
@@ -51,7 +51,7 @@ pub fn call(
         // §21.2.2.2 BigInt.asUintN(bits, value).
         M::AsUintN => {
             let bits = expect_bits(args.first(), heap)?;
-            let value = args.get(1).cloned().unwrap_or(Value::Undefined);
+            let value = args.get(1).cloned().unwrap_or(Value::undefined());
             let n = to_bigint(heap, &value)?;
             let clipped = as_uint_n(bits, &n);
             let handle = BigIntValue::from_inner(heap, clipped).map_err(oom_to_vm)?;

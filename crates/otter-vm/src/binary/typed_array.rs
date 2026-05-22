@@ -572,7 +572,7 @@ impl JsTypedArray {
         index: usize,
     ) -> Result<Value, otter_gc::OutOfMemory> {
         if self.buffer(heap).is_detached(heap) || index >= self.length(heap) {
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         }
         let bpe = self.cached_kind.bytes_per_element();
         let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
@@ -586,7 +586,7 @@ impl JsTypedArray {
         });
         match snapshot {
             Some(b) => self.cached_kind.read(heap, &b, 0),
-            None => Ok(Value::Undefined),
+            None => Ok(Value::undefined()),
         }
     }
 

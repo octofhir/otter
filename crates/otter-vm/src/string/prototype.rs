@@ -840,7 +840,7 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         raw
     };
     if idx < 0 || idx >= len {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
     let unit = recv
         .char_code_at(idx as u32, args.gc_heap)
@@ -856,7 +856,7 @@ fn impl_code_point_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
     let raw = arg_int_or(args, 0, 0)?;
     let len = recv.len() as i64;
     if raw < 0 || raw >= len {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
     let idx = raw as u32;
     let cu1 = recv
@@ -1293,7 +1293,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         // `g` flag → return array of full matches only (no captures).
         let matches = collect_regex_matches(re, &*args.gc_heap, &recv_units);
         if matches.is_empty() {
-            return Ok(Value::Null);
+            return Ok(Value::null());
         }
         let mut out: Vec<Value> = Vec::with_capacity(matches.len());
         for m in &matches {
@@ -1314,7 +1314,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         .next()
     {
         Some(m) => m,
-        None => return Ok(Value::Null),
+        None => return Ok(Value::null()),
     };
     let recv_clone = recv;
     let has_indices = re.flags(&*args.gc_heap).has_indices;
@@ -1825,7 +1825,7 @@ fn native_string_replace_callable(
         Some(Value::String(s)) => *s,
         _ => unreachable!("guarded by caller — args[0] is Value::String"),
     };
-    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     let recv_units = recv.to_utf16_vec(ctx.heap());
     let needle_units = needle.to_utf16_vec(ctx.heap());
     let needle_len = needle_units.len();

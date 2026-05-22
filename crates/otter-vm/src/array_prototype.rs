@@ -58,7 +58,7 @@ const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
 /// §7.3.18 LengthOfArrayLike — read `O.length`, ToLength-coerce,
 /// clamp to [`MAX_ARRAY_LIKE_PROBE_LEN`].
 fn read_array_like_length(obj: crate::object::JsObject, heap: &otter_gc::GcHeap) -> usize {
-    let len_val = crate::object::get(obj, heap, "length").unwrap_or(Value::Undefined);
+    let len_val = crate::object::get(obj, heap, "length").unwrap_or(Value::undefined());
     match len_val {
         Value::Number(n) => {
             let f = n.as_f64();
@@ -127,7 +127,7 @@ pub(crate) fn array_like_present_entries(
                     .into_iter()
                     .map(|i| {
                         let key = i.to_string();
-                        let v = crate::object::get(*obj, heap, &key).unwrap_or(Value::Undefined);
+                        let v = crate::object::get(*obj, heap, &key).unwrap_or(Value::undefined());
                         (i, v)
                     })
                     .collect(),
@@ -190,7 +190,7 @@ pub(crate) fn array_like_present_entries(
                     .map(|(i, u)| {
                         let s = crate::string::JsString::from_utf16_units(&[u], heap)
                             .map(Value::String)
-                            .unwrap_or(Value::Undefined);
+                            .unwrap_or(Value::undefined());
                         (i, s)
                     })
                     .collect(),
@@ -335,11 +335,11 @@ fn impl_pop(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 "length",
                 Value::Number(NumberValue::from_i32(0)),
             );
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         }
         let last_idx = len - 1;
         let key = last_idx.to_string();
-        let element = crate::object::get(*obj, heap, &key).unwrap_or(Value::Undefined);
+        let element = crate::object::get(*obj, heap, &key).unwrap_or(Value::undefined());
         let _ = crate::object::delete(*obj, heap, &key);
         crate::object::set(
             *obj,
@@ -364,7 +364,7 @@ fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             } else {
                 // §23.1.3.26: a leading hole shifts to `undefined`.
                 match elements.remove(0) {
-                    Value::Hole => Value::Undefined,
+                    Value::Hole => Value::undefined(),
                     other => other,
                 }
             }
@@ -381,7 +381,7 @@ fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 "length",
                 Value::Number(NumberValue::from_i32(0)),
             );
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         }
         // Walk pre-shift present own indices in ascending order. The
         // post-shift state is the same set with each index decremented
@@ -428,7 +428,7 @@ fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             "length",
             Value::Number(NumberValue::from_f64((len - 1) as f64)),
         );
-        return Ok(first.unwrap_or(Value::Undefined));
+        return Ok(first.unwrap_or(Value::undefined()));
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -675,7 +675,7 @@ fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     // `[,,].includes(undefined) === true`. The dense Array path keeps
     // the existing tight `with_elements` walk; the array-like
     // fallback uses the sparse iterator.
-    let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let needle = args.args.first().cloned().unwrap_or(Value::undefined());
     let needle_is_undefined = matches!(needle, Value::Undefined);
     if let Value::Array(arr) = args.receiver {
         let found = array::with_elements(*arr, &*args.gc_heap, |elements| {
@@ -698,7 +698,7 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     // §23.1.3.14 — generic over array-likes. The dense `Value::Array`
     // path keeps the existing tight `with_elements` walk so common
     // dense-array calls don't pay a snapshot allocation.
-    let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let needle = args.args.first().cloned().unwrap_or(Value::undefined());
     let from_raw = arg_signed_index(args, 1, 0)?;
     let heap = &mut *args.gc_heap;
     if let Value::Array(arr) = args.receiver {
@@ -741,7 +741,7 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let raw = arg_signed_index(args, 0, 0)?;
         let idx = if raw < 0 { len + raw } else { raw };
         if idx < 0 || idx >= len {
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         }
         let heap = &mut *args.gc_heap;
         return Ok(array::get(*arr, heap, idx as usize));
@@ -751,11 +751,11 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let raw = arg_signed_index(args, 0, 0)?;
         let idx = if raw < 0 { len + raw } else { raw };
         if idx < 0 || idx >= len {
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         }
         let key = (idx as usize).to_string();
         let heap = &mut *args.gc_heap;
-        return Ok(crate::object::get(*obj, heap, &key).unwrap_or(Value::Undefined));
+        return Ok(crate::object::get(*obj, heap, &key).unwrap_or(Value::undefined()));
     }
     Err(IntrinsicError::BadReceiver { expected: "array" })
 }
@@ -765,7 +765,7 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// tight reverse walk to avoid a snapshot allocation on hot paths.
 /// <https://tc39.es/ecma262/#sec-array.prototype.lastindexof>
 fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let needle = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let needle = args.args.first().cloned().unwrap_or(Value::undefined());
     if let Value::Array(arr) = args.receiver {
         let len = array::len(*arr, &*args.gc_heap);
         let from_default = (len as i64).saturating_sub(1);
@@ -861,10 +861,10 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
             let key_i = i.to_string();
             let key_m = mirror.to_string();
-            let v_i = crate::object::get(*obj, heap, &key_i).unwrap_or(Value::Undefined);
+            let v_i = crate::object::get(*obj, heap, &key_i).unwrap_or(Value::undefined());
             let mirror_present = pre_present.contains(&mirror);
             if mirror_present {
-                let v_m = crate::object::get(*obj, heap, &key_m).unwrap_or(Value::Undefined);
+                let v_m = crate::object::get(*obj, heap, &key_m).unwrap_or(Value::undefined());
                 crate::object::set(*obj, heap, &key_i, v_m);
                 crate::object::set(*obj, heap, &key_m, v_i);
             } else {
@@ -889,7 +889,7 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             // Mirror absent → i migrates down to mirror; delete i.
             let key_i = i.to_string();
             let key_m = mirror.to_string();
-            let v_i = crate::object::get(*obj, heap, &key_i).unwrap_or(Value::Undefined);
+            let v_i = crate::object::get(*obj, heap, &key_i).unwrap_or(Value::undefined());
             crate::object::set(*obj, heap, &key_m, v_i);
             let _ = crate::object::delete(*obj, heap, &key_i);
         }
@@ -902,7 +902,7 @@ fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 /// Generic over array-likes via ToObject(this) + LengthOfArrayLike.
 /// <https://tc39.es/ecma262/#sec-array.prototype.fill>
 fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let value = args.args.first().cloned().unwrap_or(Value::undefined());
     if let Value::Array(arr) = args.receiver {
         let len = array::len(*arr, &*args.gc_heap);
         let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
@@ -965,7 +965,9 @@ fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Value::Object(obj) => {
             let len = read_array_like_length(*obj, heap);
             (0..len)
-                .map(|i| crate::object::get(*obj, heap, &i.to_string()).unwrap_or(Value::Undefined))
+                .map(|i| {
+                    crate::object::get(*obj, heap, &i.to_string()).unwrap_or(Value::undefined())
+                })
                 .collect()
         }
         _ => Vec::new(),
@@ -1306,7 +1308,7 @@ fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
                 for (i, slot) in src.iter_mut().enumerate() {
                     if let Some(v) = elements.get(i) {
                         *slot = match v {
-                            Value::Hole => Value::Undefined,
+                            Value::Hole => Value::undefined(),
                             other => *other,
                         };
                     }
@@ -1355,7 +1357,7 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     let Value::Array(arr) = args.receiver else {
         return Err(IntrinsicError::BadReceiver { expected: "array" });
     };
-    let key_value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key_value = args.args.first().cloned().unwrap_or(Value::undefined());
     let key_string: Option<String> = match &key_value {
         Value::String(s) => Some(s.to_lossy_string(&*args.gc_heap)),
         Value::Number(n) => Some(n.to_display_string()),
@@ -1403,7 +1405,7 @@ fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, In
     let Value::Array(arr) = args.receiver else {
         return Err(IntrinsicError::BadReceiver { expected: "array" });
     };
-    let key_value = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key_value = args.args.first().cloned().unwrap_or(Value::undefined());
     let key_string: String = match &key_value {
         Value::String(s) => s.to_lossy_string(&*args.gc_heap),
         Value::Number(n) => n.to_display_string(),
@@ -1526,7 +1528,7 @@ fn impl_to_sorted(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
                 for (i, slot) in out.iter_mut().enumerate() {
                     if let Some(v) = elements.get(i) {
                         *slot = match v {
-                            Value::Hole => Value::Undefined,
+                            Value::Hole => Value::undefined(),
                             other => *other,
                         };
                     }
@@ -1578,7 +1580,7 @@ fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
             for (i, slot) in out.iter_mut().enumerate() {
                 if let Some(v) = elements.get(len - 1 - i) {
                     *slot = match v {
-                        Value::Hole => Value::Undefined,
+                        Value::Hole => Value::undefined(),
                         other => *other,
                     };
                 }
@@ -1618,7 +1620,7 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             reason: "index out of bounds for Array.prototype.with",
         });
     }
-    let replacement = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let replacement = args.args.get(1).cloned().unwrap_or(Value::undefined());
     let actual = actual as usize;
     let mut out: Vec<Value> = vec![Value::Undefined; len];
     if let Value::Array(arr) = args.receiver {
@@ -1628,7 +1630,7 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                     *slot = replacement;
                 } else if let Some(v) = elements.get(i) {
                     *slot = match v {
-                        Value::Hole => Value::Undefined,
+                        Value::Hole => Value::undefined(),
                         other => *other,
                     };
                 }
@@ -1887,8 +1889,8 @@ fn array_callback_native_dispatch(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
-    let callback = args.first().cloned().unwrap_or(Value::Undefined);
-    let this_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let callback = args.first().cloned().unwrap_or(Value::undefined());
+    let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let (interp, ctx_opt) = ctx.interp_mut_and_context();
     let context = ctx_opt.ok_or(NativeError::TypeError {
         name: "Array.prototype callback",
@@ -1902,10 +1904,10 @@ fn array_callback_native_dispatch(
         })?
     };
     let len = array_like_length(&receiver, interp.gc_heap());
-    let mut acc = Value::Undefined;
+    let mut acc = Value::undefined();
     let mut out: Vec<(usize, Value)> = Vec::new();
     let mut found_idx: Option<usize> = None;
-    let mut found_val = Value::Undefined;
+    let mut found_val = Value::undefined();
     let mut bool_acc: bool = match name {
         "every" => true,
         "some" => false,
@@ -2003,7 +2005,7 @@ fn array_callback_native_dispatch(
         }
     }
     match name {
-        "forEach" => Ok(Value::Undefined),
+        "forEach" => Ok(Value::undefined()),
         "find" | "findLast" => Ok(found_val),
         "findIndex" | "findLastIndex" => Ok(Value::Number(NumberValue::from_f64(
             found_idx.map_or(-1.0, |i| i as f64),

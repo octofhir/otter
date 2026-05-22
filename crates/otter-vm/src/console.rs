@@ -174,27 +174,27 @@ pub(crate) fn install(
 
 fn console_log(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Log, args);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn console_info(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Info, args);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn console_debug(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Debug, args);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn console_warn(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Warn, args);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn console_error(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Error, args);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn console_trace(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -204,12 +204,12 @@ fn console_trace(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     ctx.interp_mut()
         .console_sink()
         .write(ConsoleLevel::Trace, &values);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn console_assert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     if args.first().is_some_and(|v| v.to_boolean(ctx.heap())) {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
 
     let mut values = Vec::new();
@@ -218,7 +218,7 @@ fn console_assert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     ctx.interp_mut()
         .console_sink()
         .write(ConsoleLevel::Assert, &values);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn write(ctx: &mut NativeCtx<'_>, level: ConsoleLevel, args: &[Value]) {

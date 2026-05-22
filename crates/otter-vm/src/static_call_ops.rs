@@ -553,7 +553,7 @@ impl Interpreter {
                 // when the arg isn't already a String / Symbol /
                 // Number / Boolean / Null / Undefined primitive
                 // that the free coercion handles directly.
-                let key_arg = args.get(1).cloned().unwrap_or(Value::Undefined);
+                let key_arg = args.get(1).cloned().unwrap_or(Value::undefined());
                 let needs_coercion = !matches!(
                     &key_arg,
                     Value::String(_)
@@ -644,7 +644,7 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let proto = args.first().cloned().unwrap_or(Value::Undefined);
+        let proto = args.first().cloned().unwrap_or(Value::undefined());
         let proto_value = match proto {
             Value::Object(_) | Value::Iterator(_) => Some(proto),
             Value::Null => None,
@@ -711,7 +711,7 @@ impl Interpreter {
         _stack: &SmallVec<[Frame; 8]>,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let target_value = args.first().cloned().unwrap_or(Value::Undefined);
+        let target_value = args.first().cloned().unwrap_or(Value::undefined());
         // §20.1.2.3 step 1 — `Type(O)` must be Object.
         if !is_object_like_value(&target_value) {
             return Err(VmError::TypeError {
@@ -725,7 +725,7 @@ impl Interpreter {
         // `own_enumerable_string_keyed_property_entries` helper so
         // arrays / functions / class constructors / native functions
         // behave like ordinary objects here.
-        let props_value = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let props_value = args.get(1).cloned().unwrap_or(Value::undefined());
         // §7.1.18 ToObject — `null` / `undefined` throw a
         // TypeError. Other primitives wrap into their boxed
         // form which has no own enumerable string-keyed
@@ -785,7 +785,7 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let target_input = args.first().cloned().unwrap_or(Value::Undefined);
+        let target_input = args.first().cloned().unwrap_or(Value::undefined());
         // §20.1.2.1 step 2 — `ToObject(target)`. The spec returns the
         // resulting object as `target`, so Array / RegExp / Map / etc.
         // exotics pass straight through; only Null / Undefined throw
@@ -892,7 +892,7 @@ impl Interpreter {
         use method_id::ObjectMethod as M;
         match method {
             M::ForInKeys => {
-                let target = args.first().cloned().unwrap_or(Value::Undefined);
+                let target = args.first().cloned().unwrap_or(Value::undefined());
                 let keys = self.enumerable_for_in_string_keys_for_value(context, target)?;
                 let mut names = Vec::with_capacity(keys.len());
                 for key in keys {
@@ -955,7 +955,7 @@ impl Interpreter {
                             .map(|u| {
                                 crate::string::JsString::from_utf16_units(&[u], self.gc_heap_mut())
                                     .map(Value::String)
-                                    .unwrap_or(Value::Undefined)
+                                    .unwrap_or(Value::undefined())
                             })
                             .collect()
                     }
@@ -997,7 +997,7 @@ impl Interpreter {
                                     self.gc_heap_mut(),
                                 )
                                 .map(Value::String)
-                                .unwrap_or(Value::Undefined);
+                                .unwrap_or(Value::undefined());
                                 (i.to_string(), v)
                             })
                             .collect()
@@ -1036,7 +1036,7 @@ impl Interpreter {
                 // protocol with IteratorClose on abrupt completion per
                 // the AddEntriesFromIterable analogue used in step 4.
                 // <https://tc39.es/ecma262/#sec-object.fromentries>
-                let iter = args.first().cloned().unwrap_or(Value::Undefined);
+                let iter = args.first().cloned().unwrap_or(Value::undefined());
                 if matches!(iter, Value::Undefined | Value::Null) {
                     return Err(VmError::TypeError {
                         message: "Object.fromEntries: iterable must not be null or undefined"
@@ -1394,7 +1394,7 @@ impl Interpreter {
                     }
                     _ => return Err(VmError::TypeMismatch),
                 };
-                let target_root = args.first().cloned().unwrap_or(Value::Undefined);
+                let target_root = args.first().cloned().unwrap_or(Value::undefined());
                 let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
                     stack,
                     syms,
@@ -1419,8 +1419,8 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        let items = args.first().cloned().unwrap_or(Value::Undefined);
-        let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+        let items = args.first().cloned().unwrap_or(Value::undefined());
+        let callback = args.get(1).cloned().unwrap_or(Value::undefined());
         if matches!(items, Value::Undefined | Value::Null) {
             return Err(VmError::TypeError {
                 message: "Object.groupBy: items must be iterable".to_string(),
@@ -1549,8 +1549,8 @@ impl Interpreter {
                 self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
-                self.set_property(result, "get", (*getter).unwrap_or(Value::Undefined))?;
-                self.set_property(result, "set", (*setter).unwrap_or(Value::Undefined))?;
+                self.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
+                self.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
             }
         }
         self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
@@ -1632,7 +1632,7 @@ impl Interpreter {
                         if let Some(Value::Proxy(proxy)) = captures.first() {
                             proxy.revoke(ctx.heap_mut());
                         }
-                        Ok(Value::Undefined)
+                        Ok(Value::undefined())
                     },
                 )?;
                 let obj = self.alloc_stack_rooted_object_with_value_roots(
@@ -1657,7 +1657,7 @@ impl Interpreter {
         match method {
             M::Construct => Err(VmError::TypeMismatch),
             M::From => {
-                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                let value = args.first().cloned().unwrap_or(Value::undefined());
                 let state = match value {
                     Value::Iterator(rc) => return Ok(Value::Iterator(rc)),
                     Value::Generator(handle) => IteratorState::Generator { handle },

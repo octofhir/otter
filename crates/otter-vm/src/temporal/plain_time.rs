@@ -79,7 +79,7 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &s
         "millisecond" => Value::Number(NumberValue::from_i32(pt.millisecond() as i32)),
         "microsecond" => Value::Number(NumberValue::from_i32(pt.microsecond() as i32)),
         "nanosecond" => Value::Number(NumberValue::from_i32(pt.nanosecond() as i32)),
-        _ => Value::Undefined,
+        _ => Value::undefined(),
     }
 }
 

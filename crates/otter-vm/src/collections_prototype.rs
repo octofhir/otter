@@ -48,29 +48,29 @@ fn receiver_map(args: &IntrinsicArgs<'_>) -> Result<JsMap, IntrinsicError> {
 
 fn impl_map_get(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
-    Ok(collections::map_get(m, heap, &key).unwrap_or(Value::Undefined))
+    Ok(collections::map_get(m, heap, &key).unwrap_or(Value::undefined()))
 }
 
 fn impl_map_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let mut m = receiver_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
+    let value = args.args.get(1).cloned().unwrap_or(Value::undefined());
     args.map_set_rooted(&mut m, key, value)?;
     Ok(Value::Map(m))
 }
 
 fn impl_map_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
     Ok(Value::Boolean(collections::map_has(m, heap, &key)))
 }
 
 fn impl_map_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
     Ok(Value::Boolean(collections::map_delete(m, heap, &key)))
 }
@@ -79,7 +79,7 @@ fn impl_map_clear(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     let m = receiver_map(args)?;
     let heap = &mut *args.gc_heap;
     collections::map_clear(m, heap);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 /// `Map.prototype.keys` — returns a foundation iterator factory
@@ -157,21 +157,21 @@ fn receiver_set(args: &IntrinsicArgs<'_>) -> Result<JsSet, IntrinsicError> {
 
 fn impl_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let mut s = receiver_set(args)?;
-    let v = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.args.first().cloned().unwrap_or(Value::undefined());
     args.set_add_rooted(&mut s, v)?;
     Ok(Value::Set(s))
 }
 
 fn impl_set_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let v = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
     Ok(Value::Boolean(collections::set_has(s, heap, &v)))
 }
 
 fn impl_set_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let v = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
     Ok(Value::Boolean(collections::set_delete(s, heap, &v)))
 }
@@ -180,7 +180,7 @@ fn impl_set_clear(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     let s = receiver_set(args)?;
     let heap = &mut *args.gc_heap;
     collections::set_clear(s, heap);
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn impl_set_values(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -237,7 +237,7 @@ fn set_method_other_snapshot(
 /// already present (insertion order preserved).
 fn impl_set_union(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.args.first().cloned().unwrap_or(Value::undefined());
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     // Walk `this` first; then merge `other` entries skipping
     // already-present values via the existing
@@ -269,7 +269,7 @@ fn impl_set_union(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 /// determinism).
 fn impl_set_intersection(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.args.first().cloned().unwrap_or(Value::undefined());
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let mut new_set = {
         let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -305,7 +305,7 @@ fn impl_set_intersection(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
 /// not in `other`.
 fn impl_set_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.args.first().cloned().unwrap_or(Value::undefined());
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let mut new_set = {
         let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -332,7 +332,7 @@ fn impl_set_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
 /// `this` xor `other`.
 fn impl_set_symmetric_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.args.first().cloned().unwrap_or(Value::undefined());
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let mut new_set = {
         let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
@@ -370,7 +370,7 @@ fn impl_set_symmetric_difference(args: &mut IntrinsicArgs<'_>) -> Result<Value, 
 /// `this` is in `other`.
 fn impl_set_is_subset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.args.first().cloned().unwrap_or(Value::undefined());
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let heap = &*args.gc_heap;
     let this_values = collections::set_values(s, heap);
@@ -386,7 +386,7 @@ fn impl_set_is_subset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
 /// `other` is in `this`.
 fn impl_set_is_superset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.args.first().cloned().unwrap_or(Value::undefined());
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let heap = &*args.gc_heap;
     let all_in_this = other_values
@@ -399,7 +399,7 @@ fn impl_set_is_superset_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrin
 /// value.
 fn impl_set_is_disjoint_from(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_set(args)?;
-    let other = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let other = args.args.first().cloned().unwrap_or(Value::undefined());
     let other_values = set_method_other_snapshot(&other, &*args.gc_heap)?;
     let heap = &*args.gc_heap;
     let any_shared = other_values
@@ -437,18 +437,18 @@ fn receiver_weak_map(args: &IntrinsicArgs<'_>) -> Result<JsWeakMap, IntrinsicErr
 
 fn impl_weak_map_get(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_weak_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
     match collections::weak_map_get(m, heap, &key) {
         Ok(Some(v)) => Ok(v),
-        Ok(None) | Err(CollectionError::NonObjectKey) => Ok(Value::Undefined),
-        Err(_) => Ok(Value::Undefined),
+        Ok(None) | Err(CollectionError::NonObjectKey) => Ok(Value::undefined()),
+        Err(_) => Ok(Value::undefined()),
     }
 }
 
 fn impl_weak_map_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_weak_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
     match collections::weak_map_has(m, heap, &key) {
         Ok(b) => Ok(Value::Boolean(b)),
@@ -459,8 +459,8 @@ fn impl_weak_map_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 
 fn impl_weak_map_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let mut m = receiver_weak_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
-    let value = args.args.get(1).cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
+    let value = args.args.get(1).cloned().unwrap_or(Value::undefined());
     args.weak_map_set_rooted(&mut m, key, value)
         .map_err(weak_collection_to_intrinsic)?;
     Ok(Value::WeakMap(m))
@@ -468,7 +468,7 @@ fn impl_weak_map_set(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 
 fn impl_weak_map_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let m = receiver_weak_map(args)?;
-    let key = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let key = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
     match collections::weak_map_delete(m, heap, &key) {
         Ok(b) => Ok(Value::Boolean(b)),
@@ -492,7 +492,7 @@ fn receiver_weak_set(args: &IntrinsicArgs<'_>) -> Result<JsWeakSet, IntrinsicErr
 
 fn impl_weak_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let mut s = receiver_weak_set(args)?;
-    let v = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.args.first().cloned().unwrap_or(Value::undefined());
     args.weak_set_add_rooted(&mut s, v)
         .map_err(weak_collection_to_intrinsic)?;
     Ok(Value::WeakSet(s))
@@ -500,7 +500,7 @@ fn impl_weak_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 
 fn impl_weak_set_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_weak_set(args)?;
-    let v = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &*args.gc_heap;
     match collections::weak_set_has(s, heap, &v) {
         Ok(b) => Ok(Value::Boolean(b)),
@@ -511,7 +511,7 @@ fn impl_weak_set_has(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
 
 fn impl_weak_set_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let s = receiver_weak_set(args)?;
-    let v = args.args.first().cloned().unwrap_or(Value::Undefined);
+    let v = args.args.first().cloned().unwrap_or(Value::undefined());
     let heap = &mut *args.gc_heap;
     match collections::weak_set_delete(s, heap, &v) {
         Ok(b) => Ok(Value::Boolean(b)),
@@ -651,7 +651,7 @@ pub fn load_property_with_heap(value: &Value, name: &str, heap: &otter_gc::GcHea
             Value::Set(s) => {
                 Value::Number(NumberValue::from_i32(collections::set_len(*s, heap) as i32))
             }
-            _ => Value::Undefined,
+            _ => Value::undefined(),
         }
     } else {
         Value::Undefined

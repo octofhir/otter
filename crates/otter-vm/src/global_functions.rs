@@ -62,37 +62,37 @@ pub fn call(
         )))),
         // §19.2.3 — coerces, then defers to the strict predicate.
         M::IsNaN => {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let value = args.first().cloned().unwrap_or(Value::undefined());
             Ok(Value::Boolean(number::is_nan(number::to_number_value(
                 &value, gc_heap,
             ))))
         }
         M::IsFinite => {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let value = args.first().cloned().unwrap_or(Value::undefined());
             Ok(Value::Boolean(number::is_finite(number::to_number_value(
                 &value, gc_heap,
             ))))
         }
         // §21.1.2.3 / §21.1.2.2 — strict, no coercion.
         M::NumberIsNaN => {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let value = args.first().cloned().unwrap_or(Value::undefined());
             Ok(Value::Boolean(matches!(
                 value,
                 Value::Number(ref n) if number::is_nan(n.as_f64())
             )))
         }
         M::NumberIsFinite => {
-            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            let value = args.first().cloned().unwrap_or(Value::undefined());
             Ok(Value::Boolean(matches!(
                 value,
                 Value::Number(ref n) if number::is_finite(n.as_f64())
             )))
         }
         M::NumberIsInteger => Ok(Value::Boolean(number::is_integer(
-            &args.first().cloned().unwrap_or(Value::Undefined),
+            &args.first().cloned().unwrap_or(Value::undefined()),
         ))),
         M::NumberIsSafeInteger => Ok(Value::Boolean(number::is_safe_integer(
-            &args.first().cloned().unwrap_or(Value::Undefined),
+            &args.first().cloned().unwrap_or(Value::undefined()),
         ))),
         M::EncodeURI => js_string(
             &uri_encode(&coerce_to_string(args.first(), gc_heap), false),

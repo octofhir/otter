@@ -332,9 +332,9 @@ pub fn get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Value {
                     .as_ref()
                     .and_then(|sparse| sparse.get(&idx).cloned())
             })
-            .unwrap_or(Value::Undefined);
+            .unwrap_or(Value::undefined());
         match raw {
-            Value::Hole => Value::Undefined,
+            Value::Hole => Value::undefined(),
             other => other,
         }
     })
@@ -688,7 +688,7 @@ pub(crate) fn set_length_writable(arr: JsArray, heap: &mut otter_gc::GcHeap, wri
 
 fn delete_array_body_index(body: &mut ArrayBody, idx: usize) {
     if let Some(slot) = body.elements.get_mut(idx) {
-        *slot = Value::Hole;
+        *slot = Value::hole();
     }
     if let Some(sparse) = body.sparse_elements.as_mut() {
         sparse.remove(&idx);
@@ -746,7 +746,7 @@ fn array_index_at_or_above(key: &str, limit: usize) -> bool {
 pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     heap.with_payload(arr, |body| {
         if body.length == 0 {
-            return Value::Undefined;
+            return Value::undefined();
         }
         let idx = body.length - 1;
         let popped = if idx < body.elements.len() {
@@ -758,7 +758,7 @@ pub fn pop(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
         };
         truncate_array_body_to(body, idx);
         match popped {
-            Some(Value::Hole) | None => Value::Undefined,
+            Some(Value::Hole) | None => Value::undefined(),
             Some(other) => other,
         }
     })
@@ -1004,7 +1004,7 @@ pub fn set_accessor(
         if let Some(idx) = crate::object::array_index_property_name(key) {
             let idx = idx as usize;
             if let Some(slot) = body.elements.get_mut(idx) {
-                *slot = Value::Hole;
+                *slot = Value::hole();
             }
             if let Some(sparse) = body.sparse_elements.as_mut() {
                 sparse.remove(&idx);
@@ -1071,7 +1071,7 @@ pub fn delete_named_property(arr: JsArray, heap: &mut otter_gc::GcHeap, key: &st
                 }
             }
             if let Some(slot) = body.elements.get_mut(idx) {
-                *slot = Value::Hole;
+                *slot = Value::hole();
             }
             if let Some(sparse) = body.sparse_elements.as_mut() {
                 sparse.remove(&idx);

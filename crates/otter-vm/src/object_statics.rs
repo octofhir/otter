@@ -206,8 +206,8 @@ fn native_group_by_rooted(
     context: Option<&crate::ExecutionContext>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    let items = args.first().cloned().unwrap_or(Value::Undefined);
-    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let items = args.first().cloned().unwrap_or(Value::undefined());
+    let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     if matches!(items, Value::Undefined | Value::Null) {
         return Err(VmError::TypeError {
             message: "Object.groupBy: items must be iterable".to_string(),
@@ -273,7 +273,7 @@ fn native_group_by_rooted(
 }
 
 fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
-    let proto = args.first().cloned().unwrap_or(Value::Undefined);
+    let proto = args.first().cloned().unwrap_or(Value::undefined());
     let proto_value = match proto {
         Value::Object(_) | Value::Iterator(_) => Some(proto),
         Value::Null => None,
@@ -452,7 +452,7 @@ fn native_from_entries_rooted(
     context: Option<&crate::ExecutionContext>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    let iter = args.first().cloned().unwrap_or(Value::Undefined);
+    let iter = args.first().cloned().unwrap_or(Value::undefined());
     // §7.1.4 RequireObjectCoercible — undefined / null reject before
     // GetIterator.
     if matches!(iter, Value::Undefined | Value::Null) {
@@ -605,17 +605,17 @@ fn read_entry_pair_heap(
                 let zero = units.first().copied().map_or(Value::Undefined, |u| {
                     crate::string::JsString::from_utf16_units(&[u], heap)
                         .map(Value::String)
-                        .unwrap_or(Value::Undefined)
+                        .unwrap_or(Value::undefined())
                 });
                 let one = units.get(1).copied().map_or(Value::Undefined, |u| {
                     crate::string::JsString::from_utf16_units(&[u], heap)
                         .map(Value::String)
-                        .unwrap_or(Value::Undefined)
+                        .unwrap_or(Value::undefined())
                 });
                 return Ok((zero, one));
             }
-            let key = crate::object::get(*obj, heap, "0").unwrap_or(Value::Undefined);
-            let value = crate::object::get(*obj, heap, "1").unwrap_or(Value::Undefined);
+            let key = crate::object::get(*obj, heap, "0").unwrap_or(Value::undefined());
+            let value = crate::object::get(*obj, heap, "1").unwrap_or(Value::undefined());
             Ok((key, value))
         }
         Value::String(s) => {
@@ -623,12 +623,12 @@ fn read_entry_pair_heap(
             let zero = units.first().copied().map_or(Value::Undefined, |u| {
                 crate::string::JsString::from_utf16_units(&[u], heap)
                     .map(Value::String)
-                    .unwrap_or(Value::Undefined)
+                    .unwrap_or(Value::undefined())
             });
             let one = units.get(1).copied().map_or(Value::Undefined, |u| {
                 crate::string::JsString::from_utf16_units(&[u], heap)
                     .map(Value::String)
-                    .unwrap_or(Value::Undefined)
+                    .unwrap_or(Value::undefined())
             });
             Ok((zero, one))
         }
@@ -668,7 +668,7 @@ fn native_get_own_property_descriptor_rooted(
                 &[&target],
                 args,
             )?)),
-            None => Ok(Value::Undefined),
+            None => Ok(Value::undefined()),
         };
     }
 
@@ -760,7 +760,7 @@ fn native_get_own_property_descriptor_rooted(
             &[],
             args,
         )?)),
-        None => Ok(Value::Undefined),
+        None => Ok(Value::undefined()),
     }
 }
 
@@ -982,8 +982,8 @@ fn native_descriptor_to_object_rooted(
             ctx.set_property(result, "writable", Value::Boolean(desc.writable()))?;
         }
         DescriptorKind::Accessor { getter, setter } => {
-            ctx.set_property(result, "get", (*getter).unwrap_or(Value::Undefined))?;
-            ctx.set_property(result, "set", (*setter).unwrap_or(Value::Undefined))?;
+            ctx.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
+            ctx.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
         }
     }
     ctx.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
@@ -1047,8 +1047,8 @@ native_object_static!(native_group_by, GroupBy);
 /// `Object.getOwnPropertyDescriptor(Object, "is").value`) and then
 /// invoke it through `.call` / `Reflect.apply` see the spec result.
 fn native_is(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let a = args.first().cloned().unwrap_or(Value::Undefined);
-    let b = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let a = args.first().cloned().unwrap_or(Value::undefined());
+    let b = args.get(1).cloned().unwrap_or(Value::undefined());
     Ok(Value::Boolean(crate::abstract_ops::same_value(
         &a,
         &b,
@@ -1060,7 +1060,7 @@ fn native_is(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// after ToObject coercion. Primitive operands resolve to their
 /// respective `%X.prototype%` per §7.1.18.
 fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let target = args.first().cloned().unwrap_or(Value::undefined());
     let exec_ctx = ctx
         .execution_context()
         .cloned()
@@ -1087,8 +1087,8 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 /// `[[Prototype]]` of `O` to `proto` (which must be Object or Null)
 /// and returns `O` after ToObject coercion checks.
 fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let target = args.first().cloned().unwrap_or(Value::Undefined);
-    let proto = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let target = args.first().cloned().unwrap_or(Value::undefined());
+    let proto = args.get(1).cloned().unwrap_or(Value::undefined());
     if matches!(target, Value::Null | Value::Undefined) {
         return Err(NativeError::TypeError {
             name: "Object.setPrototypeOf",
@@ -1251,7 +1251,10 @@ fn native_prototype_has_own_property(
         let key = ctx
             .cx
             .interp
-            .to_property_key_sync(&context, args.first().cloned().unwrap_or(Value::Undefined))
+            .to_property_key_sync(
+                &context,
+                args.first().cloned().unwrap_or(Value::undefined()),
+            )
             .map_err(|err| object_native_error("hasOwnProperty", err))?;
         if matches!(this_value, Value::Null | Value::Undefined) {
             return Err(NativeError::TypeError {
@@ -1388,7 +1391,7 @@ fn native_prototype_is_prototype_of(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
-    let target = args.first().cloned().unwrap_or(Value::Undefined);
+    let target = args.first().cloned().unwrap_or(Value::undefined());
     if !is_object_like_value(&target) {
         return Ok(Value::Boolean(false));
     }
@@ -1460,7 +1463,7 @@ pub fn native_prototype_proto_get(
     // Context-less fallback (sync embedders without a JS frame).
     match this_value {
         Value::Object(o) => {
-            Ok(crate::object::prototype_value(o, ctx.heap()).unwrap_or(Value::Null))
+            Ok(crate::object::prototype_value(o, ctx.heap()).unwrap_or(Value::null()))
         }
         _ => {
             let name = match ctx.this_value() {
@@ -1469,13 +1472,13 @@ pub fn native_prototype_proto_get(
                 Value::String(_) => "String",
                 Value::Symbol(_) => "Symbol",
                 Value::BigInt(_) => "BigInt",
-                _ => return Ok(Value::Null),
+                _ => return Ok(Value::null()),
             };
             Ok(ctx
                 .cx
                 .interp
                 .constructor_prototype_value(name)
-                .unwrap_or(Value::Null))
+                .unwrap_or(Value::null()))
         }
     }
 }
@@ -1503,7 +1506,7 @@ pub fn native_prototype_proto_set(
             reason: "cannot convert null or undefined to object".to_string(),
         });
     }
-    let proto_value = args.first().cloned().unwrap_or(Value::Undefined);
+    let proto_value = args.first().cloned().unwrap_or(Value::undefined());
     // §B.2.2.1.2 step 2 — only Object / Null proto values are
     // honoured; everything else returns undefined without
     // mutating. Proxy-as-prototype is admissible via the broader
@@ -1512,11 +1515,11 @@ pub fn native_prototype_proto_set(
         &proto_value,
         Value::Object(_) | Value::Null | Value::Proxy(_)
     ) {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
     // §B.2.2.1.2 step 3 — non-object receivers silently no-op.
     if !matches!(this_value, Value::Object(_) | Value::Proxy(_)) {
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
     // §20.1.3 — `Object.prototype` is an immutable-prototype
     // exotic. Reject any change that would diverge from its
@@ -1526,7 +1529,7 @@ pub fn native_prototype_proto_set(
     if let Value::Object(obj) = this_value {
         let object_proto = ctx.cx.interp.object_prototype_object_opt();
         if object_proto == Some(obj) {
-            let current = crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::Null);
+            let current = crate::object::prototype_value(obj, ctx.heap()).unwrap_or(Value::null());
             if !crate::abstract_ops::same_value(&proto_value, &current, ctx.heap()) {
                 return Err(NativeError::TypeError {
                     name: "set __proto__",
@@ -1534,7 +1537,7 @@ pub fn native_prototype_proto_set(
                         .to_string(),
                 });
             }
-            return Ok(Value::Undefined);
+            return Ok(Value::undefined());
         }
     }
     let exec_ctx = ctx
@@ -1555,7 +1558,7 @@ pub fn native_prototype_proto_set(
             reason: "cyclic or non-extensible prototype chain".to_string(),
         });
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 /// §B.2.2.2 `Object.prototype.__defineGetter__(P, getter)`.
@@ -1603,7 +1606,7 @@ fn define_accessor_helper(
             reason: "cannot convert null or undefined to object".to_string(),
         });
     }
-    let callable = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let callable = args.get(1).cloned().unwrap_or(Value::undefined());
     if !crate::is_callable_value(&callable) {
         return Err(NativeError::TypeError {
             name: method_name,
@@ -1641,14 +1644,14 @@ fn define_accessor_helper(
                 reason: "cannot redefine property".to_string(),
             });
         }
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
 
     let Value::Object(target) = this_value else {
         // §7.1.18 ToObject — primitives wrap. The accessor lands on
         // the transient wrapper which is discarded once the call
         // returns, mirroring V8/JSC.
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     };
     let ok = match key {
         PropertyKey::String(name) => {
@@ -1664,7 +1667,7 @@ fn define_accessor_helper(
             reason: "cannot redefine property".to_string(),
         });
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 /// §B.2.2.4 `Object.prototype.__lookupGetter__(P)`.
@@ -1721,7 +1724,7 @@ fn lookup_accessor_helper(
         let key = property_key_to_vm_key(&key);
         let mut current = match this_value {
             value if is_object_like_value(&value) => Some(value),
-            _ => return Ok(Value::Undefined),
+            _ => return Ok(Value::undefined()),
         };
         while let Some(value) = current {
             let desc = ctx
@@ -1740,12 +1743,12 @@ fn lookup_accessor_helper(
                 return Ok(match desc.kind {
                     DescriptorKind::Accessor { getter, setter } => {
                         if lookup_setter {
-                            setter.unwrap_or(Value::Undefined)
+                            setter.unwrap_or(Value::undefined())
                         } else {
-                            getter.unwrap_or(Value::Undefined)
+                            getter.unwrap_or(Value::undefined())
                         }
                     }
-                    DescriptorKind::Data { .. } => Value::Undefined,
+                    DescriptorKind::Data { .. } => Value::undefined(),
                 });
             }
             let proto = ctx
@@ -1759,12 +1762,12 @@ fn lookup_accessor_helper(
                 Some(proto)
             };
         }
-        return Ok(Value::Undefined);
+        return Ok(Value::undefined());
     }
 
     let mut current = match this_value {
         Value::Object(o) => Some(o),
-        _ => return Ok(Value::Undefined),
+        _ => return Ok(Value::undefined()),
     };
     while let Some(obj) = current {
         let lookup = match &key {
@@ -1774,15 +1777,15 @@ fn lookup_accessor_helper(
         match lookup {
             PropertyLookup::Accessor { getter, setter, .. } => {
                 let value = if lookup_setter { setter } else { getter };
-                return Ok(value.unwrap_or(Value::Undefined));
+                return Ok(value.unwrap_or(Value::undefined()));
             }
-            PropertyLookup::Data { .. } => return Ok(Value::Undefined),
+            PropertyLookup::Data { .. } => return Ok(Value::undefined()),
             PropertyLookup::Absent => {
                 current = crate::object::prototype(obj, ctx.heap());
             }
         }
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn property_key_to_vm_key(key: &PropertyKey) -> crate::VmPropertyKey<'static> {
@@ -2051,7 +2054,7 @@ pub fn call(
         // §20.1.2.2 Object.create(O, Properties)
         // <https://tc39.es/ecma262/#sec-object.create>
         M::Create => {
-            let proto = args.first().cloned().unwrap_or(Value::Undefined);
+            let proto = args.first().cloned().unwrap_or(Value::undefined());
             let proto_value = match proto {
                 Value::Object(_) | Value::Iterator(_) => Some(proto),
                 Value::Null => None,
@@ -2344,7 +2347,7 @@ pub fn call(
                                 &[],
                                 &[args],
                             )?)),
-                            None => Ok(Value::Undefined),
+                            None => Ok(Value::undefined()),
                         }
                     }
                     PropertyKey::Symbol(sym) => {
@@ -2355,7 +2358,7 @@ pub fn call(
                                 &[],
                                 &[args],
                             )?)),
-                            None => Ok(Value::Undefined),
+                            None => Ok(Value::undefined()),
                         }
                     }
                 },
@@ -2372,7 +2375,7 @@ pub fn call(
                                 &[],
                                 &[args],
                             )?)),
-                            None => Ok(Value::Undefined),
+                            None => Ok(Value::undefined()),
                         }
                     }
                     PropertyKey::Symbol(sym) => {
@@ -2387,13 +2390,13 @@ pub fn call(
                                 &[],
                                 &[args],
                             )?)),
-                            None => Ok(Value::Undefined),
+                            None => Ok(Value::undefined()),
                         }
                     }
                 },
                 Some(Value::NativeFunction(native)) => {
                     let PropertyKey::String(key) = &key else {
-                        return Ok(Value::Undefined);
+                        return Ok(Value::undefined());
                     };
                     match native.own_property_descriptor(gc_heap, key)? {
                         Some(desc) => Ok(Value::Object(descriptor_to_object_with_roots(
@@ -2402,7 +2405,7 @@ pub fn call(
                             &[],
                             &[args],
                         )?)),
-                        None => Ok(Value::Undefined),
+                        None => Ok(Value::undefined()),
                     }
                 }
                 Some(Value::String(value)) => {
@@ -2419,7 +2422,7 @@ pub fn call(
                             &[],
                             &[args],
                         )?)),
-                        None => Ok(Value::Undefined),
+                        None => Ok(Value::undefined()),
                     }
                 }
                 // §20.1.2.7 Object.getOwnPropertyDescriptor performs
@@ -2432,7 +2435,7 @@ pub fn call(
                 // spec without materialising a transient wrapper.
                 Some(
                     Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) | Value::BigInt(_),
-                ) => Ok(Value::Undefined),
+                ) => Ok(Value::undefined()),
                 Some(Value::Null) | Some(Value::Undefined) | None => Err(VmError::TypeError {
                     message:
                         "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
@@ -2487,7 +2490,7 @@ pub fn call(
         // §20.1.2.6 Object.freeze(O)
         // <https://tc39.es/ecma262/#sec-object.freeze>
         M::Freeze => {
-            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
             if let Value::Object(o) = &arg {
                 crate::object::freeze(*o, gc_heap);
             }
@@ -2497,7 +2500,7 @@ pub fn call(
         }
         // §20.1.2.20 Object.seal(O)
         M::Seal => {
-            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
             if let Value::Object(o) = &arg {
                 crate::object::seal(*o, gc_heap);
             }
@@ -2505,7 +2508,7 @@ pub fn call(
         }
         // §20.1.2.18 Object.preventExtensions(O)
         M::PreventExtensions => {
-            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
             match &arg {
                 Value::Object(o) => crate::object::prevent_extensions(*o, gc_heap),
                 Value::Array(a) => crate::array::prevent_extensions(*a, gc_heap),
@@ -2516,7 +2519,7 @@ pub fn call(
         }
         // §20.1.2.15 Object.isFrozen(O)
         M::IsFrozen => {
-            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
             // Per spec, `Object.isFrozen(non_object) === true`. Heap
             // exotics default to extensible+configurable so they are
             // not frozen unless the foundation explicitly toggles
@@ -2551,7 +2554,7 @@ pub fn call(
         }
         // §20.1.2.16 Object.isSealed(O)
         M::IsSealed => {
-            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
             // §20.1.2.16 — `Object.isSealed(non_object) === true`. For
             // ordinary objects, `is_sealed` walks the property table
             // checking that nothing is configurable and that the
@@ -2591,7 +2594,7 @@ pub fn call(
         }
         // §20.1.2.14 Object.isExtensible(O)
         M::IsExtensible => {
-            let arg = args.first().cloned().unwrap_or(Value::Undefined);
+            let arg = args.first().cloned().unwrap_or(Value::undefined());
             // §20.1.2.14 — `Object.isExtensible(non_object) === false`.
             // Every heap-allocated value kind is an Object, so they
             // all default to extensible until a `preventExtensions`
@@ -2739,7 +2742,7 @@ pub fn call(
         // iterator protocol once it lands here too — filed.
         // <https://tc39.es/ecma262/#sec-object.fromentries>
         M::FromEntries => {
-            let iter = args.first().cloned().unwrap_or(Value::Undefined);
+            let iter = args.first().cloned().unwrap_or(Value::undefined());
             let iter_root = iter;
             let result = rooted_object(gc_heap, &[&iter_root], &[args])?;
             match iter {
@@ -2912,7 +2915,7 @@ pub fn coerce_to_descriptor(
     if has_value {
         descriptor.value = Some(match value {
             PropertyLookup::Data { value, .. } => value,
-            _ => Value::Undefined,
+            _ => Value::undefined(),
         });
     }
     if has_writable {
@@ -2921,10 +2924,10 @@ pub fn coerce_to_descriptor(
     descriptor.enumerable = lookup_to_optional_bool(&enumerable, gc_heap);
     descriptor.configurable = lookup_to_optional_bool(&configurable, gc_heap);
     if has_get {
-        descriptor.get = Some(lookup_to_optional_value(&getter)?.unwrap_or(Value::Undefined));
+        descriptor.get = Some(lookup_to_optional_value(&getter)?.unwrap_or(Value::undefined()));
     }
     if has_set {
-        descriptor.set = Some(lookup_to_optional_value(&setter)?.unwrap_or(Value::Undefined));
+        descriptor.set = Some(lookup_to_optional_value(&setter)?.unwrap_or(Value::undefined()));
     }
     Ok(descriptor)
 }
@@ -3000,13 +3003,13 @@ fn descriptor_to_object_with_roots(
                 result,
                 gc_heap,
                 "get",
-                (*getter).unwrap_or(Value::Undefined),
+                (*getter).unwrap_or(Value::undefined()),
             );
             crate::object::set(
                 result,
                 gc_heap,
                 "set",
-                (*setter).unwrap_or(Value::Undefined),
+                (*setter).unwrap_or(Value::undefined()),
             );
         }
     }
@@ -3075,7 +3078,7 @@ fn native_to_property_key(
     arg: Option<&Value>,
     method_name: &'static str,
 ) -> Result<PropertyKey, NativeError> {
-    let value = arg.cloned().unwrap_or(Value::Undefined);
+    let value = arg.cloned().unwrap_or(Value::undefined());
     let Some(exec_ctx) = ctx.execution_context().cloned() else {
         return expect_property_key(Some(&value), ctx.heap())
             .map_err(|err| object_native_error(method_name, err));

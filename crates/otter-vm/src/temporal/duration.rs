@@ -230,7 +230,7 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &s
         "nanoseconds" => Value::Number(NumberValue::from_f64(d.nanoseconds() as f64)),
         "sign" => Value::Number(NumberValue::from_i32(d.sign() as i32)),
         "blank" => Value::Boolean(d.is_zero()),
-        _ => Value::Undefined,
+        _ => Value::undefined(),
     }
 }
 

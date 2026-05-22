@@ -108,7 +108,7 @@ fn complete_partial_descriptor_against_current(
             partial.configurable.unwrap_or(false),
         ),
         _ => object::PropertyDescriptor::data(
-            partial.value.unwrap_or(Value::Undefined),
+            partial.value.unwrap_or(Value::undefined()),
             partial.writable.unwrap_or(false),
             partial.enumerable.unwrap_or(false),
             partial.configurable.unwrap_or(false),
@@ -391,12 +391,12 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         match object::get(self.global_this, &self.gc_heap, constructor_name) {
             Some(Value::Object(constructor)) => {
-                Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::Null))
+                Ok(object::get(constructor, &self.gc_heap, "prototype").unwrap_or(Value::null()))
             }
             Some(Value::NativeFunction(ctor)) => {
                 match ctor.own_property_descriptor(&mut self.gc_heap, "prototype") {
                     Ok(Some(descriptor)) => Ok(descriptor_value(&descriptor)),
-                    _ => Ok(Value::Null),
+                    _ => Ok(Value::null()),
                 }
             }
             Some(Value::ClassConstructor(class)) => {
@@ -722,7 +722,7 @@ impl Interpreter {
         hops: usize,
     ) -> Result<Value, VmError> {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
-            return Ok(Value::Null);
+            return Ok(Value::null());
         }
         match value {
             Value::Proxy(proxy) => {
@@ -1130,7 +1130,7 @@ impl Interpreter {
                 // data values; full descriptor attributes will land
                 // alongside the rest of the array attribute story.
                 if let VmPropertyKey::Symbol(sym) = key {
-                    let value = descriptor.value.unwrap_or(Value::Undefined);
+                    let value = descriptor.value.unwrap_or(Value::undefined());
                     array::set_symbol_property(*arr, &mut self.gc_heap, sym, value);
                     return Ok(true);
                 }
@@ -1358,7 +1358,7 @@ impl Interpreter {
             }
             let updated = if descriptor.is_data() {
                 object::PropertyDescriptor::data(
-                    descriptor.value.unwrap_or(Value::Undefined),
+                    descriptor.value.unwrap_or(Value::undefined()),
                     descriptor.writable.unwrap_or(false),
                     descriptor.enumerable.unwrap_or(current.enumerable()),
                     descriptor.configurable.unwrap_or(current.configurable()),
@@ -1522,7 +1522,7 @@ impl Interpreter {
             }
             let updated = if descriptor.is_data() {
                 object::PropertyDescriptor::data(
-                    descriptor.value.unwrap_or(Value::Undefined),
+                    descriptor.value.unwrap_or(Value::undefined()),
                     descriptor.writable.unwrap_or(false),
                     descriptor.enumerable.unwrap_or(current.enumerable()),
                     descriptor.configurable.unwrap_or(current.configurable()),
@@ -2332,7 +2332,7 @@ impl Interpreter {
                 // §10.1.2 OrdinarySetPrototypeOf full algorithm.
                 let obj = *obj;
                 let current_proto =
-                    object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::Null);
+                    object::prototype_value(obj, &self.gc_heap).unwrap_or(Value::null());
                 // §20.1.3 — %Object.prototype% is an
                 // immutable-prototype exotic object. It reports
                 // success only when the requested prototype is
@@ -2372,7 +2372,7 @@ impl Interpreter {
                             }
                             hops += 1;
                             p = object::prototype_value(*candidate, &self.gc_heap)
-                                .unwrap_or(Value::Null);
+                                .unwrap_or(Value::null());
                         }
                         // Non-ordinary prototype links short-circuit
                         // the cycle walk per §10.1.2 step 8.c.i.
@@ -2534,9 +2534,9 @@ impl Interpreter {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.run_callable_sync(context, &getter, *rhs, args)?
                         }
-                        _ => Value::Undefined,
+                        _ => Value::undefined(),
                     },
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 };
                 if matches!(value, Value::Object(_) | Value::Proxy(_)) {
                     Ok(Some(value))
@@ -2619,9 +2619,9 @@ impl Interpreter {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.run_callable_sync(context, &getter, *rhs, args)?
                         }
-                        _ => Value::Undefined,
+                        _ => Value::undefined(),
                     },
-                    None => Value::Undefined,
+                    None => Value::undefined(),
                 };
                 if matches!(value, Value::Object(_) | Value::Proxy(_)) {
                     Ok(Some(value))
@@ -2738,7 +2738,7 @@ impl Interpreter {
                                         hops + 1,
                                     );
                                 }
-                                Ok(_) | Err(_) => Value::Undefined,
+                                Ok(_) | Err(_) => Value::undefined(),
                             }
                         }
                     }
@@ -2864,7 +2864,7 @@ impl Interpreter {
                             _ => VmGetOutcome::Value(Value::Undefined),
                         });
                     }
-                    object::PropertyLookup::Absent => Value::Undefined,
+                    object::PropertyLookup::Absent => Value::undefined(),
                 };
                 if let Some(outcome) =
                     self.callable_realm_prototype_accessor_outcome(&value, key)?
@@ -2896,7 +2896,7 @@ impl Interpreter {
                                 .function_prototype_object()
                                 .ok()
                                 .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                                .unwrap_or(Value::Undefined),
+                                .unwrap_or(Value::undefined()),
                         }
                     }
                     _ => {
@@ -2922,7 +2922,7 @@ impl Interpreter {
                             None => self
                                 .load_function_prototype_method(key)
                                 .or_else(|| self.load_object_prototype_method(key))
-                                .unwrap_or(Value::Undefined),
+                                .unwrap_or(Value::undefined()),
                         }
                     }
                 };
@@ -2939,7 +2939,7 @@ impl Interpreter {
                         .function_prototype_object()
                         .ok()
                         .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                        .unwrap_or(Value::Undefined),
+                        .unwrap_or(Value::undefined()),
                     _ => {
                         let key = key
                             .string_name()
@@ -2963,7 +2963,7 @@ impl Interpreter {
                             None => self
                                 .load_function_prototype_method(key)
                                 .or_else(|| self.load_object_prototype_method(key))
-                                .unwrap_or(Value::Undefined),
+                                .unwrap_or(Value::undefined()),
                         }
                     }
                 };
@@ -3043,7 +3043,7 @@ impl Interpreter {
                     }
                 }
                 let direct = match key {
-                    VmPropertyKey::Symbol(_) => Value::Undefined,
+                    VmPropertyKey::Symbol(_) => Value::undefined(),
                     _ => {
                         let key = key
                             .string_name()
@@ -3442,7 +3442,7 @@ impl Interpreter {
         if matches!(method, M::DefineProperty) && is_object_like_value(target) {
             let key =
                 self.evaluate_to_property_key(context, args.get(1).unwrap_or(&Value::Undefined))?;
-            let attributes = args.get(2).cloned().unwrap_or(Value::Undefined);
+            let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
             let descriptor = self.evaluate_to_property_descriptor(context, &attributes)?;
             let ok = self.define_own_property_value(context, target, &key, descriptor)?;
             if !ok {
@@ -3502,7 +3502,7 @@ impl Interpreter {
             M::DefineProperty => {
                 let key = self
                     .evaluate_to_property_key(context, args.get(1).unwrap_or(&Value::Undefined))?;
-                let attributes = args.get(2).cloned().unwrap_or(Value::Undefined);
+                let attributes = args.get(2).cloned().unwrap_or(Value::undefined());
                 let descriptor = self.evaluate_to_property_descriptor(context, &attributes)?;
                 let ok = self.define_own_property_value(context, target, &key, descriptor)?;
                 if !ok {
@@ -3569,7 +3569,7 @@ impl Interpreter {
         target: Value,
         key: Option<&Value>,
     ) -> Result<Option<object::PropertyDescriptor>, VmError> {
-        let key = self.to_property_key_sync(context, key.cloned().unwrap_or(Value::Undefined))?;
+        let key = self.to_property_key_sync(context, key.cloned().unwrap_or(Value::undefined()))?;
         self.ordinary_get_own_property_descriptor_value_runtime_rooted(
             context,
             target,

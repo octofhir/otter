@@ -280,10 +280,10 @@ impl Interpreter {
                 let Value::Object(record) = &result else {
                     return Err(VmError::TypeMismatch);
                 };
-                let value =
-                    crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+                let value = crate::object::get(*record, &self.gc_heap, "value")
+                    .unwrap_or(Value::undefined());
                 let done = crate::object::get(*record, &self.gc_heap, "done")
-                    .unwrap_or(Value::Undefined)
+                    .unwrap_or(Value::undefined())
                     .to_boolean(&self.gc_heap);
                 if done {
                     self.gc_heap
@@ -305,10 +305,10 @@ impl Interpreter {
                 let Value::Object(record) = &result else {
                     return Err(VmError::TypeMismatch);
                 };
-                let value =
-                    crate::object::get(*record, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+                let value = crate::object::get(*record, &self.gc_heap, "value")
+                    .unwrap_or(Value::undefined());
                 let done = crate::object::get(*record, &self.gc_heap, "done")
-                    .unwrap_or(Value::Undefined)
+                    .unwrap_or(Value::undefined())
                     .to_boolean(&self.gc_heap);
                 if done {
                     self.gc_heap
@@ -714,7 +714,7 @@ impl Interpreter {
             // iterators are handled by the dedicated
             // `Value::Generator` dispatch above.
             "return" => {
-                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                let arg = args.first().cloned().unwrap_or(Value::undefined());
                 let obj =
                     self.alloc_stack_rooted_object_with_extra_roots(stack, &[&iter_value, &arg])?;
                 self.set_property(obj, "value", arg)?;
@@ -722,7 +722,7 @@ impl Interpreter {
                 Value::Object(obj)
             }
             "throw" => {
-                let arg = args.first().cloned().unwrap_or(Value::Undefined);
+                let arg = args.first().cloned().unwrap_or(Value::undefined());
                 return Err(VmError::Uncaught {
                     value: value_kind_name(&arg).to_string(),
                 });
@@ -959,13 +959,13 @@ impl Interpreter {
                         });
                     };
                     let done = crate::object::get(*record, &self.gc_heap, "done")
-                        .unwrap_or(Value::Undefined)
+                        .unwrap_or(Value::undefined())
                         .to_boolean(&self.gc_heap);
                     if done {
                         return Ok(out);
                     }
                     let value = crate::object::get(*record, &self.gc_heap, "value")
-                        .unwrap_or(Value::Undefined);
+                        .unwrap_or(Value::undefined());
                     out.push(value);
                 }
             }
@@ -1111,7 +1111,7 @@ impl Interpreter {
                     // already settled `pending_request` from inside
                     // `Op::Yield`.
                     if is_async {
-                        return Ok(Value::Undefined);
+                        return Ok(Value::undefined());
                     }
                     return self.make_runtime_rooted_iter_result(v, false, &[], &[]);
                 }
@@ -1134,7 +1134,7 @@ impl Interpreter {
                     // Body suspended on `Op::Await`; the resume
                     // microtask will eventually settle
                     // `pending_request`.
-                    return Ok(Value::Undefined);
+                    return Ok(Value::undefined());
                 }
                 // Body completed.
                 handle.mark_done(&mut self.gc_heap);
@@ -1153,7 +1153,7 @@ impl Interpreter {
                             smallvec::smallvec![record],
                         )?;
                     }
-                    return Ok(Value::Undefined);
+                    return Ok(Value::undefined());
                 }
                 self.make_runtime_rooted_iter_result(value, true, &[], &[])
             }
@@ -1294,9 +1294,9 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             };
             let value =
-                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::undefined());
             let done_value =
-                crate::object::get(*obj, &self.gc_heap, "done").unwrap_or(Value::Undefined);
+                crate::object::get(*obj, &self.gc_heap, "done").unwrap_or(Value::undefined());
             let done = done_value.to_boolean(&self.gc_heap);
             if done && let Value::Iterator(rc) = &state.iterator {
                 self.gc_heap
@@ -1331,9 +1331,9 @@ impl Interpreter {
                 return Err(VmError::TypeMismatch);
             };
             let value =
-                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::Undefined);
+                crate::object::get(*obj, &self.gc_heap, "value").unwrap_or(Value::undefined());
             let done = crate::object::get(*obj, &self.gc_heap, "done")
-                .unwrap_or(Value::Undefined)
+                .unwrap_or(Value::undefined())
                 .to_boolean(&self.gc_heap);
             if done {
                 self.gc_heap

@@ -296,7 +296,7 @@ impl PartialPropertyDescriptor {
             )
         } else {
             PropertyDescriptor::data(
-                self.value.unwrap_or(Value::Undefined),
+                self.value.unwrap_or(Value::undefined()),
                 self.writable.unwrap_or(false),
                 self.enumerable.unwrap_or(false),
                 self.configurable.unwrap_or(false),

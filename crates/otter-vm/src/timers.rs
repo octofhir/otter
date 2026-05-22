@@ -262,7 +262,7 @@ fn schedule_timer_common(
     repeat: bool,
     native_name: &'static str,
 ) -> Result<Value, NativeError> {
-    let callback = args.first().cloned().unwrap_or(Value::Undefined);
+    let callback = args.first().cloned().unwrap_or(Value::undefined());
     ensure_callable(&callback, native_name)?;
     let delay_ms = coerce_delay_ms(args.get(1), ctx.heap());
     let extra: SmallVec<[Value; 4]> = args.iter().skip(2).cloned().collect();
@@ -303,17 +303,17 @@ fn cancel_timer_common(
             if raw.is_finite() && raw >= 0.0 {
                 raw as u64
             } else {
-                return Ok(Value::Undefined);
+                return Ok(Value::undefined());
             }
         }
-        _ => return Ok(Value::Undefined),
+        _ => return Ok(Value::undefined()),
     };
     let interp = ctx.interp_mut();
     interp.timer_callbacks_mut().remove(token);
     if let Some(scheduler) = interp.timer_scheduler() {
         let _ = scheduler.cancel(token);
     }
-    Ok(Value::Undefined)
+    Ok(Value::undefined())
 }
 
 fn set_timeout_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {

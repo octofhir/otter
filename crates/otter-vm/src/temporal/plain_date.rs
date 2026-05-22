@@ -104,7 +104,7 @@ pub fn load_property(temporal: &JsTemporal, gc_heap: &otter_gc::GcHeap, name: &s
         "daysInYear" => Value::Number(NumberValue::from_i32(pd.days_in_year() as i32)),
         "monthsInYear" => Value::Number(NumberValue::from_i32(pd.months_in_year() as i32)),
         "inLeapYear" => Value::Boolean(pd.in_leap_year()),
-        _ => Value::Undefined,
+        _ => Value::undefined(),
     }
 }
 

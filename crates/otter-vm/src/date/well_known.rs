@@ -88,7 +88,7 @@ fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             reason: "this value must be an Object".to_string(),
         });
     }
-    let hint_value = args.first().cloned().unwrap_or(Value::Undefined);
+    let hint_value = args.first().cloned().unwrap_or(Value::undefined());
     let try_first = match &hint_value {
         Value::String(js) => {
             let token = js.to_lossy_string(ctx.heap());

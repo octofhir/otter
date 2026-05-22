@@ -23,12 +23,11 @@ use super::data_view::JsDataView;
 use super::{number_value, smi, to_index, to_little_endian_flag};
 
 fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsDataView, IntrinsicError> {
-    match args.receiver {
-        Value::DataView(v) => Ok(*v),
-        _ => Err(IntrinsicError::BadReceiver {
+    args.receiver
+        .as_data_view()
+        .ok_or(IntrinsicError::BadReceiver {
             expected: "dataview",
-        }),
-    }
+        })
 }
 
 /// §25.3.1.1 step 5 — every read / write must guard the backing
@@ -43,7 +42,10 @@ fn check_not_detached(view: &JsDataView, heap: &otter_gc::GcHeap) -> Result<(), 
 }
 
 fn read_byte_offset(args: &IntrinsicArgs<'_>) -> Result<usize, IntrinsicError> {
-    match to_index(args.args.first().unwrap_or(&Value::Undefined), args.gc_heap) {
+    match to_index(
+        args.args.first().unwrap_or(&Value::undefined()),
+        args.gc_heap,
+    ) {
         Some(n) => Ok(n as usize),
         None => Err(IntrinsicError::BadArgument {
             index: 0,
@@ -237,14 +239,22 @@ fn impl_get_biguint64(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
 // ---- setX implementations -----------------------------------------------
 
 fn coerce_number(value: &Value, heap: &otter_gc::GcHeap) -> NumberValue {
-    match value {
-        Value::Number(n) => *n,
-        Value::Boolean(true) => NumberValue::from_i32(1),
-        Value::Boolean(false) | Value::Null => NumberValue::from_i32(0),
-        Value::Undefined => NumberValue::from_f64(f64::NAN),
-        Value::String(s) => crate::number::to_number_from_string(&s.to_lossy_string(heap)),
-        _ => NumberValue::from_f64(f64::NAN),
+    if let Some(n) = value.as_number() {
+        return n;
     }
+    if let Some(b) = value.as_boolean() {
+        return NumberValue::from_i32(if b { 1 } else { 0 });
+    }
+    if value.is_null() {
+        return NumberValue::from_i32(0);
+    }
+    if value.is_undefined() {
+        return NumberValue::from_f64(f64::NAN);
+    }
+    if let Some(s) = value.as_string() {
+        return crate::number::to_number_from_string(&s.to_lossy_string(heap));
+    }
+    NumberValue::from_f64(f64::NAN)
 }
 
 fn coerce_int(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
@@ -256,10 +266,9 @@ fn coerce_int(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
 }
 
 fn coerce_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
-    let big = match value {
-        Value::BigInt(b) => b.clone_inner(heap),
-        _ => BigInt::from(0),
-    };
+    let big = value
+        .as_big_int()
+        .map_or_else(|| BigInt::from(0), |b| b.clone_inner(heap));
     use num_traits::Signed;
     let modulus: BigInt = BigInt::from(1u64) << 64;
     let mut wrapped: BigInt = &big % &modulus;
@@ -275,10 +284,9 @@ fn coerce_bigint64(value: &Value, heap: &otter_gc::GcHeap) -> i64 {
 }
 
 fn coerce_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
-    let big = match value {
-        Value::BigInt(b) => b.clone_inner(heap),
-        _ => BigInt::from(0),
-    };
+    let big = value
+        .as_big_int()
+        .map_or_else(|| BigInt::from(0), |b| b.clone_inner(heap));
     use num_traits::Signed;
     let modulus: BigInt = BigInt::from(1u64) << 64;
     let mut wrapped: BigInt = &big % &modulus;

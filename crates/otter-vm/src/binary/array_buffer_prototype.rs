@@ -15,12 +15,11 @@ use super::array_buffer::JsArrayBuffer;
 use super::{number_value, smi};
 
 fn receiver(args: &IntrinsicArgs<'_>) -> Result<JsArrayBuffer, IntrinsicError> {
-    match args.receiver {
-        Value::ArrayBuffer(b) => Ok(*b),
-        _ => Err(IntrinsicError::BadReceiver {
+    args.receiver
+        .as_array_buffer()
+        .ok_or(IntrinsicError::BadReceiver {
             expected: "arraybuffer",
-        }),
-    }
+        })
 }
 
 /// §25.1.5.4 `slice(start, end)` — half-open range, clamps to
@@ -55,16 +54,18 @@ fn impl_resize(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             expected: "resizable non-detached arraybuffer",
         });
     }
-    let new_len =
-        match super::to_index(args.args.first().unwrap_or(&Value::Undefined), args.gc_heap) {
-            Some(n) => n as usize,
-            None => {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "must be a non-negative integer",
-                });
-            }
-        };
+    let new_len = match super::to_index(
+        args.args.first().unwrap_or(&Value::undefined()),
+        args.gc_heap,
+    ) {
+        Some(n) => n as usize,
+        None => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a non-negative integer",
+            });
+        }
+    };
     if !buf.resize(args.gc_heap, new_len) {
         return Err(IntrinsicError::BadArgument {
             index: 0,
@@ -96,7 +97,8 @@ fn transfer_inner(args: &mut IntrinsicArgs<'_>, fixed: bool) -> Result<Value, In
     }
     let cur_len = buf.byte_length(args.gc_heap);
     let new_len = match args.args.first() {
-        None | Some(Value::Undefined) => cur_len,
+        None => cur_len,
+        Some(v) if v.is_undefined() => cur_len,
         Some(v) => match super::to_index(v, args.gc_heap) {
             Some(n) => n as usize,
             None => {
@@ -137,12 +139,20 @@ fn transfer_inner(args: &mut IntrinsicArgs<'_>, fixed: bool) -> Result<Value, In
 }
 
 fn clamp_relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
-    let n = match arg {
-        None | Some(Value::Undefined) => return default,
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        _ => return default,
+    let Some(v) = arg else {
+        return default;
+    };
+    if v.is_undefined() {
+        return default;
+    }
+    let n = if let Some(n) = v.as_number() {
+        n.as_f64()
+    } else if let Some(b) = v.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if v.is_null() {
+        0.0
+    } else {
+        return default;
     };
     if !n.is_finite() {
         if n.is_nan() {
@@ -166,16 +176,18 @@ fn impl_grow(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             expected: "growable shared arraybuffer",
         });
     }
-    let new_len =
-        match super::to_index(args.args.first().unwrap_or(&Value::Undefined), args.gc_heap) {
-            Some(n) => n as usize,
-            None => {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "must be a non-negative integer",
-                });
-            }
-        };
+    let new_len = match super::to_index(
+        args.args.first().unwrap_or(&Value::undefined()),
+        args.gc_heap,
+    ) {
+        Some(n) => n as usize,
+        None => {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a non-negative integer",
+            });
+        }
+    };
     if !buf.grow(args.gc_heap, new_len) {
         return Err(IntrinsicError::BadArgument {
             index: 0,
@@ -223,7 +235,7 @@ pub fn load_property(buf: JsArrayBuffer, heap: &otter_gc::GcHeap, name: &str) ->
         // `byte_length`.
         _ => {
             let _ = number_value;
-            Value::Undefined
+            Value::undefined()
         }
     }
 }

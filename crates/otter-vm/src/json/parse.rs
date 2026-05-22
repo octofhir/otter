@@ -652,18 +652,19 @@ mod tests {
     #[test]
     fn parses_primitives() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        assert!(matches!(
-            parse_str_with_heap("null", &mut gc_heap).unwrap(),
-            Value::Null
-        ));
-        assert!(matches!(
-            parse_str_with_heap("true", &mut gc_heap).unwrap(),
-            Value::Boolean(true)
-        ));
-        assert!(matches!(
-            parse_str_with_heap("false", &mut gc_heap).unwrap(),
-            Value::Boolean(false)
-        ));
+        assert!(parse_str_with_heap("null", &mut gc_heap).unwrap().is_null());
+        assert_eq!(
+            parse_str_with_heap("true", &mut gc_heap)
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
+        assert_eq!(
+            parse_str_with_heap("false", &mut gc_heap)
+                .unwrap()
+                .as_boolean(),
+            Some(false)
+        );
         assert_eq!(
             parse_str_with_heap("42", &mut gc_heap)
                 .unwrap()
@@ -699,20 +700,18 @@ mod tests {
         assert_eq!(v.display_string(&gc_heap), "A");
         // Surrogate pair → U+10000 '𐀀'.
         let v = parse_str_with_heap("\"\\uD800\\uDC00\"", &mut gc_heap).unwrap();
-        match v {
-            Value::String(s) => assert_eq!(s.to_utf16_vec(&gc_heap), vec![0xD800, 0xDC00]),
-            _ => panic!(),
-        }
+        let s = v.as_string().expect("string");
+        assert_eq!(s.to_utf16_vec(&gc_heap), vec![0xD800, 0xDC00]);
     }
 
     #[test]
     fn parses_array_and_object() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = parse_str_with_heap("{\"x\":[1,2,3]}", &mut gc_heap).unwrap();
-        let Value::Object(obj) = v else { panic!() };
-        let Some(Value::Array(arr)) = crate::object::get(obj, &gc_heap, "x") else {
-            panic!()
-        };
+        let obj = v.as_object().expect("object");
+        let arr = crate::object::get(obj, &gc_heap, "x")
+            .and_then(|v| v.as_array())
+            .expect("array");
         assert_eq!(crate::array::len(arr, &gc_heap), 3);
         assert_eq!(
             crate::array::get(arr, &gc_heap, 2).display_string(&gc_heap),
@@ -749,13 +748,13 @@ mod tests {
     fn nested_object_round_trip() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let v = parse_str_with_heap("{\"a\":{\"b\":{\"c\":42}}}", &mut gc_heap).unwrap();
-        let Value::Object(o) = v else { panic!() };
-        let Some(Value::Object(o2)) = crate::object::get(o, &gc_heap, "a") else {
-            panic!()
-        };
-        let Some(Value::Object(o3)) = crate::object::get(o2, &gc_heap, "b") else {
-            panic!()
-        };
+        let o = v.as_object().expect("object");
+        let o2 = crate::object::get(o, &gc_heap, "a")
+            .and_then(|v| v.as_object())
+            .expect("a");
+        let o3 = crate::object::get(o2, &gc_heap, "b")
+            .and_then(|v| v.as_object())
+            .expect("b");
         assert_eq!(
             crate::object::get(o3, &gc_heap, "c")
                 .unwrap()

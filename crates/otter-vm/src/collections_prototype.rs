@@ -32,7 +32,6 @@
 use crate::Value;
 use crate::collections::{self, CollectionError, JsMap, JsSet, JsWeakMap, JsWeakSet};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
 use smallvec::SmallVec;
 
 // ---------------------------------------------------------------
@@ -40,10 +39,9 @@ use smallvec::SmallVec;
 // ---------------------------------------------------------------
 
 fn receiver_map(args: &IntrinsicArgs<'_>) -> Result<JsMap, IntrinsicError> {
-    match args.receiver {
-        Value::Map(m) => Ok(*m),
-        _ => Err(IntrinsicError::BadReceiver { expected: "Map" }),
-    }
+    args.receiver
+        .as_map()
+        .ok_or(IntrinsicError::BadReceiver { expected: "Map" })
 }
 
 fn impl_map_get(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -149,10 +147,9 @@ fn make_iter_value(
 // ---------------------------------------------------------------
 
 fn receiver_set(args: &IntrinsicArgs<'_>) -> Result<JsSet, IntrinsicError> {
-    match args.receiver {
-        Value::Set(s) => Ok(*s),
-        _ => Err(IntrinsicError::BadReceiver { expected: "Set" }),
-    }
+    args.receiver
+        .as_set()
+        .ok_or(IntrinsicError::BadReceiver { expected: "Set" })
 }
 
 fn impl_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -219,17 +216,19 @@ fn set_method_other_snapshot(
     other: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<Vec<Value>, IntrinsicError> {
-    match other {
-        Value::Set(s) => Ok(collections::set_values(*s, heap)),
-        Value::Map(m) => Ok(collections::map_entries(*m, heap)
+    if let Some(s) = other.as_set() {
+        return Ok(collections::set_values(s, heap));
+    }
+    if let Some(m) = other.as_map() {
+        return Ok(collections::map_entries(m, heap)
             .into_iter()
             .map(|(k, _)| k)
-            .collect()),
-        _ => Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a Set or Map",
-        }),
+            .collect());
     }
+    Err(IntrinsicError::BadArgument {
+        index: 0,
+        reason: "must be a Set or Map",
+    })
 }
 
 /// §24.2.4.7 `Set.prototype.union(other)` — return a new Set with
@@ -427,12 +426,11 @@ fn impl_set_entries(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
 // ---------------------------------------------------------------
 
 fn receiver_weak_map(args: &IntrinsicArgs<'_>) -> Result<JsWeakMap, IntrinsicError> {
-    match args.receiver {
-        Value::WeakMap(m) => Ok(*m),
-        _ => Err(IntrinsicError::BadReceiver {
+    args.receiver
+        .as_weak_map()
+        .ok_or(IntrinsicError::BadReceiver {
             expected: "WeakMap",
-        }),
-    }
+        })
 }
 
 fn impl_weak_map_get(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -482,12 +480,11 @@ fn impl_weak_map_delete(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsic
 // ---------------------------------------------------------------
 
 fn receiver_weak_set(args: &IntrinsicArgs<'_>) -> Result<JsWeakSet, IntrinsicError> {
-    match args.receiver {
-        Value::WeakSet(s) => Ok(*s),
-        _ => Err(IntrinsicError::BadReceiver {
+    args.receiver
+        .as_weak_set()
+        .ok_or(IntrinsicError::BadReceiver {
             expected: "WeakSet",
-        }),
-    }
+        })
 }
 
 fn impl_weak_set_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
@@ -637,25 +634,22 @@ pub fn lookup_weak_set(name: &str) -> Option<&'static crate::intrinsics::Intrins
 #[must_use]
 pub fn load_property(value: &Value, name: &str) -> Value {
     let _ = (value, name);
-    Value::Undefined
+    Value::undefined()
 }
 
 /// Heap-aware version of [`load_property`].
 #[must_use]
 pub fn load_property_with_heap(value: &Value, name: &str, heap: &otter_gc::GcHeap) -> Value {
-    if name == "size" {
-        match value {
-            Value::Map(m) => {
-                Value::Number(NumberValue::from_i32(collections::map_len(*m, heap) as i32))
-            }
-            Value::Set(s) => {
-                Value::Number(NumberValue::from_i32(collections::set_len(*s, heap) as i32))
-            }
-            _ => Value::undefined(),
-        }
-    } else {
-        Value::Undefined
+    if name != "size" {
+        return Value::undefined();
     }
+    if let Some(m) = value.as_map() {
+        return Value::number_i32(collections::map_len(m, heap) as i32);
+    }
+    if let Some(s) = value.as_set() {
+        return Value::number_i32(collections::set_len(s, heap) as i32);
+    }
+    Value::undefined()
 }
 
 /// Build the native callable that `Map.prototype[Symbol.iterator]`
@@ -670,14 +664,11 @@ pub fn make_map_iterator_factory(
         "Map[Symbol.iterator]",
         smallvec::smallvec![Value::map(map)],
         |ctx, _, captures| {
-            let map = match captures.first() {
-                Some(Value::Map(map)) => *map,
-                _ => {
-                    return Err(crate::NativeError::TypeError {
-                        name: "Map[Symbol.iterator]",
-                        reason: "missing traced map capture".to_string(),
-                    });
-                }
+            let Some(map) = captures.first().and_then(|v| v.as_map()) else {
+                return Err(crate::NativeError::TypeError {
+                    name: "Map[Symbol.iterator]",
+                    reason: "missing traced map capture".to_string(),
+                });
             };
             let state = map_iter_state_native(MapIterKind::Entries, map, ctx)?;
             Ok(make_native_iter_value(ctx, state)?)
@@ -696,14 +687,11 @@ pub fn make_set_iterator_factory(
         "Set[Symbol.iterator]",
         smallvec::smallvec![Value::set(set)],
         |ctx, _, captures| {
-            let set = match captures.first() {
-                Some(Value::Set(set)) => *set,
-                _ => {
-                    return Err(crate::NativeError::TypeError {
-                        name: "Set[Symbol.iterator]",
-                        reason: "missing traced set capture".to_string(),
-                    });
-                }
+            let Some(set) = captures.first().and_then(|v| v.as_set()) else {
+                return Err(crate::NativeError::TypeError {
+                    name: "Set[Symbol.iterator]",
+                    reason: "missing traced set capture".to_string(),
+                });
             };
             Ok(make_native_iter_value(
                 ctx,
@@ -731,7 +719,7 @@ fn map_iter_state_native(
             MapIterKind::Entries => {
                 let pair =
                     ctx.array_from_elements_with_roots([k, v], &[], &[snapshot.as_slice()])?;
-                Value::Array(pair)
+                Value::array(pair)
             }
         });
     }
@@ -757,17 +745,13 @@ fn make_native_iter_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::number::NumberValue;
 
     #[test]
     fn map_set_uses_intrinsic_rooted_reservation() {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let map = collections::alloc_map(&mut gc_heap).expect("map");
         let receiver = Value::map(map);
-        let args = [
-            Value::Number(NumberValue::from_i32(1)),
-            Value::Number(NumberValue::from_i32(2)),
-        ];
+        let args = [Value::number_i32(1), Value::number_i32(2)];
         let before = gc_heap.stats().reserved_bytes;
 
         let result = impl_map_set(&mut IntrinsicArgs {
@@ -783,7 +767,7 @@ mod tests {
             after > before,
             "Map.prototype.set should reserve backing storage through intrinsic roots"
         );
-        assert!(matches!(result, Value::Map(_)));
+        assert!(result.is_map());
     }
 
     #[test]
@@ -791,7 +775,7 @@ mod tests {
         let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
         let set = collections::alloc_set(&mut gc_heap).expect("set");
         let receiver = Value::set(set);
-        let args = [Value::number(NumberValue::from_i32(3))];
+        let args = [Value::number_i32(3)];
         let before = gc_heap.stats().reserved_bytes;
 
         let result = impl_set_add(&mut IntrinsicArgs {
@@ -807,6 +791,6 @@ mod tests {
             after > before,
             "Set.prototype.add should reserve backing storage through intrinsic roots"
         );
-        assert!(matches!(result, Value::Set(_)));
+        assert!(result.is_set());
     }
 }

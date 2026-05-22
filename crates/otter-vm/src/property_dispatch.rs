@@ -875,264 +875,233 @@ impl Interpreter {
         let value = *read_register(frame, src)?;
         let strict = context.function_is_strict(frame.function_id);
         let receiver = *read_register(frame, obj_reg)?;
-        let target = match &receiver {
-            Value::Object(o) => Some(*o),
-            Value::ClassConstructor(c) => Some(c.statics(&self.gc_heap)),
-            Value::RegExp(r) => {
-                // `lastIndex` lives in the body slot; every other
-                // named write lands in the lazy expando bag so
-                // `re.global = false` / `re.exec = fn` survive
-                // observability checks.
-                if name == "lastIndex" {
-                    regexp_prototype::store_property(r, &mut self.gc_heap, name, value);
-                    None
-                } else {
-                    let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
-                        matches!(
-                            object::lookup_own(bag, &self.gc_heap, name),
-                            object::PropertyLookup::Absent
-                        )
-                    });
-                    if absent && !r.is_extensible(&self.gc_heap) {
-                        Self::failed_set_result(
-                            strict,
-                            format!("Cannot add property '{name}' to non-extensible RegExp"),
-                        )?;
-                        None
-                    } else {
-                        let bag = regexp_ensure_expando(self, r, &receiver)?;
-                        if !self.ordinary_set_data_property(bag, name, value)? {
-                            Self::failed_set_result(
-                                strict,
-                                format!("Cannot assign to property '{name}'"),
-                            )?;
-                        }
-                        None
-                    }
-                }
-            }
-            Value::Array(a) => {
-                if !self.store_array_accessor_property(context, *a, name, &value, strict)? {
-                    let has_own_named =
-                        crate::array::get_named_property(*a, &self.gc_heap, name).is_some();
-                    if !has_own_named {
-                        let proto = self.constructor_prototype_value("Array")?;
-                        if let Value::Object(proto) = proto {
-                            match crate::object::resolve_set(proto, &self.gc_heap, name) {
-                                object::SetOutcome::InvokeSetter { setter } => {
-                                    let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                    args.push(value);
-                                    self.run_callable_sync(
-                                        context,
-                                        &setter,
-                                        Value::Array(*a),
-                                        args,
-                                    )?;
-                                    stack[top_idx].pc += 1;
-                                    return Ok(());
-                                }
-                                object::SetOutcome::Reject { .. } => {
-                                    Self::failed_set_result(
-                                        strict,
-                                        format!("Cannot assign to property '{name}'"),
-                                    )?;
-                                    stack[top_idx].pc += 1;
-                                    return Ok(());
-                                }
-                                object::SetOutcome::AssignData => {}
-                            }
-                        }
-                    }
-                    crate::array::set_named_property(*a, &mut self.gc_heap, name, value)?;
-                }
+        let target = if let Some(o) = receiver.as_object() {
+            Some(o)
+        } else if let Some(c) = receiver.as_class_constructor() {
+            Some(c.statics(&self.gc_heap))
+        } else if let Some(r) = receiver.as_regexp() {
+            // `lastIndex` lives in the body slot; every other
+            // named write lands in the lazy expando bag so
+            // `re.global = false` / `re.exec = fn` survive
+            // observability checks.
+            if name == "lastIndex" {
+                regexp_prototype::store_property(&r, &mut self.gc_heap, name, value);
                 None
-            }
-            Value::TypedArray(t) => {
-                if let Some(n) = canonical_numeric_index_string(name) {
-                    if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                        && n.is_finite()
-                        && n.fract() == 0.0
-                        && n >= 0.0
-                        && (n as usize) < t.length(&self.gc_heap)
-                    {
-                        let coerced = binary::dispatch::coerce_element_for_store(
-                            &mut self.gc_heap,
-                            t.kind(),
-                            &value,
-                        )?;
-                        t.set(&mut self.gc_heap, n as usize, &coerced);
-                    }
-                } else {
-                    let t_clone = *t;
-                    typed_array_set_expando(self, &t_clone, name, value)?;
-                }
-                None
-            }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let fid = *function_id;
-                let has_own = self.ordinary_function_has_own_string_property_for_extensibility(
-                    context, fid, name,
-                )?;
-                if matches!(name, "name" | "length") {
-                    if let Some(desc) =
-                        self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
-                        && !desc.writable()
-                    {
-                        Self::failed_set_result(
-                            strict,
-                            format!("Cannot assign to read-only property '{name}' of function"),
-                        )?;
-                        None
-                    } else {
-                        let bag = self.function_user_bag_with_stack_roots(
-                            stack,
-                            fid,
-                            &[&receiver, &value],
-                        )?;
-                        if let Some(metadata_key) =
-                            function_metadata::ordinary_function_metadata_key(name)
-                        {
-                            self.function_deleted_metadata.remove(&(fid, metadata_key));
-                        }
-                        Some(bag)
-                    }
-                } else if !has_own && !self.ordinary_function_is_extensible(fid) {
+            } else {
+                let absent = r.expando(&self.gc_heap).is_none_or(|bag| {
+                    matches!(
+                        object::lookup_own(bag, &self.gc_heap, name),
+                        object::PropertyLookup::Absent
+                    )
+                });
+                if absent && !r.is_extensible(&self.gc_heap) {
                     Self::failed_set_result(
                         strict,
-                        format!("Cannot add property '{name}' to non-extensible function"),
+                        format!("Cannot add property '{name}' to non-extensible RegExp"),
+                    )?;
+                    None
+                } else {
+                    let bag = regexp_ensure_expando(self, &r, &receiver)?;
+                    if !self.ordinary_set_data_property(bag, name, value)? {
+                        Self::failed_set_result(
+                            strict,
+                            format!("Cannot assign to property '{name}'"),
+                        )?;
+                    }
+                    None
+                }
+            }
+        } else if let Some(a) = receiver.as_array() {
+            if !self.store_array_accessor_property(context, a, name, &value, strict)? {
+                let has_own_named =
+                    crate::array::get_named_property(a, &self.gc_heap, name).is_some();
+                if !has_own_named {
+                    let proto = self.constructor_prototype_value("Array")?;
+                    if let Some(proto) = proto.as_object() {
+                        match crate::object::resolve_set(proto, &self.gc_heap, name) {
+                            object::SetOutcome::InvokeSetter { setter } => {
+                                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                                args.push(value);
+                                self.run_callable_sync(context, &setter, Value::array(a), args)?;
+                                stack[top_idx].pc += 1;
+                                return Ok(());
+                            }
+                            object::SetOutcome::Reject { .. } => {
+                                Self::failed_set_result(
+                                    strict,
+                                    format!("Cannot assign to property '{name}'"),
+                                )?;
+                                stack[top_idx].pc += 1;
+                                return Ok(());
+                            }
+                            object::SetOutcome::AssignData => {}
+                        }
+                    }
+                }
+                crate::array::set_named_property(a, &mut self.gc_heap, name, value)?;
+            }
+            None
+        } else if let Some(t) = receiver.as_typed_array() {
+            if let Some(n) = canonical_numeric_index_string(name) {
+                if !t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
+                    && n.is_finite()
+                    && n.fract() == 0.0
+                    && n >= 0.0
+                    && (n as usize) < t.length(&self.gc_heap)
+                {
+                    let coerced = binary::dispatch::coerce_element_for_store(
+                        &mut self.gc_heap,
+                        t.kind(),
+                        &value,
+                    )?;
+                    t.set(&mut self.gc_heap, n as usize, &coerced);
+                }
+            } else {
+                typed_array_set_expando(self, &t, name, value)?;
+            }
+            None
+        } else if let Some(fid) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            let has_own = self
+                .ordinary_function_has_own_string_property_for_extensibility(context, fid, name)?;
+            if matches!(name, "name" | "length") {
+                if let Some(desc) =
+                    self.ordinary_function_own_property_descriptor(Some(context), fid, name)?
+                    && !desc.writable()
+                {
+                    Self::failed_set_result(
+                        strict,
+                        format!("Cannot assign to read-only property '{name}' of function"),
                     )?;
                     None
                 } else {
                     let bag =
                         self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?;
+                    if let Some(metadata_key) =
+                        function_metadata::ordinary_function_metadata_key(name)
+                    {
+                        self.function_deleted_metadata.remove(&(fid, metadata_key));
+                    }
                     Some(bag)
                 }
+            } else if !has_own && !self.ordinary_function_is_extensible(fid) {
+                Self::failed_set_result(
+                    strict,
+                    format!("Cannot add property '{name}' to non-extensible function"),
+                )?;
+                None
+            } else {
+                let bag =
+                    self.function_user_bag_with_stack_roots(stack, fid, &[&receiver, &value])?;
+                Some(bag)
             }
-            Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&mut self.gc_heap, name)? {
-                    Some(desc) if !desc.writable() => {
+        } else if let Some(native) = receiver.as_native_function() {
+            match native.own_property_descriptor(&mut self.gc_heap, name)? {
+                Some(desc) if !desc.writable() => {
+                    Self::failed_set_result(
+                        strict,
+                        format!(
+                            "Cannot assign to read-only property '{name}' of function {}",
+                            native.name(&self.gc_heap)
+                        ),
+                    )?;
+                    None
+                }
+                _ => {
+                    let enumerable =
+                        function_metadata::ordinary_function_metadata_key(name).is_none();
+                    let desc = object::PropertyDescriptor::data(value, true, enumerable, true);
+                    if !native.define_own_property(&mut self.gc_heap, name, desc) {
                         Self::failed_set_result(
                             strict,
                             format!(
-                                "Cannot assign to read-only property '{name}' of function {}",
+                                "Cannot define property '{name}' on function {}",
                                 native.name(&self.gc_heap)
                             ),
                         )?;
-                        None
                     }
-                    _ => {
-                        let enumerable =
-                            function_metadata::ordinary_function_metadata_key(name).is_none();
-                        let desc = object::PropertyDescriptor::data(value, true, enumerable, true);
-                        if !native.define_own_property(&mut self.gc_heap, name, desc) {
-                            Self::failed_set_result(
-                                strict,
-                                format!(
-                                    "Cannot define property '{name}' on function {}",
-                                    native.name(&self.gc_heap)
-                                ),
-                            )?;
-                        }
-                        None
-                    }
+                    None
                 }
             }
-            Value::BoundFunction(bound) => {
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &mut self.gc_heap,
-                    name,
-                )? {
-                    Some(desc) if !desc.writable() => {
+        } else if let Some(bound) = receiver.as_bound_function() {
+            let bound = &bound;
+            match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)?
+            {
+                Some(desc) if !desc.writable() => {
+                    Self::failed_set_result(
+                        strict,
+                        format!("Cannot assign to read-only property '{name}' of bound function"),
+                    )?;
+                    None
+                }
+                _ => {
+                    let desc = object::PropertyDescriptor::data(value, true, true, true);
+                    if !function_metadata::bound_define_own_property(
+                        bound,
+                        &mut self.gc_heap,
+                        name,
+                        desc,
+                    ) {
                         Self::failed_set_result(
                             strict,
-                            format!(
-                                "Cannot assign to read-only property '{name}' of bound function"
-                            ),
+                            format!("Cannot define property '{name}' on bound function"),
                         )?;
-                        None
                     }
-                    _ => {
-                        let desc = object::PropertyDescriptor::data(value, true, true, true);
-                        if !function_metadata::bound_define_own_property(
-                            bound,
-                            &mut self.gc_heap,
-                            name,
-                            desc,
-                        ) {
-                            Self::failed_set_result(
-                                strict,
-                                format!("Cannot define property '{name}' on bound function"),
-                            )?;
-                        }
-                        None
-                    }
+                    None
                 }
             }
-            Value::Promise(p) => {
-                let bag = if let Some(bag) = p.expando(&self.gc_heap) {
-                    bag
-                } else {
-                    let p_value = receiver;
-                    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                        p_value.trace_value_slots(visitor);
-                    };
-                    let bag = crate::object::alloc_object_with_roots(
-                        &mut self.gc_heap,
-                        &mut external_visit,
-                    )?;
-                    p.set_expando(&mut self.gc_heap, bag);
-                    bag
+        } else if let Some(p) = receiver.as_promise() {
+            let bag = if let Some(bag) = p.expando(&self.gc_heap) {
+                bag
+            } else {
+                let p_value = receiver;
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    p_value.trace_value_slots(visitor);
                 };
-                Some(bag)
-            }
-            Value::Undefined | Value::Null | Value::Hole => {
-                return Err(VmError::TypeError {
-                    message: format!(
-                        "Cannot set property '{name}' on {}",
-                        value_kind_name(&receiver)
-                    ),
-                });
-            }
-            Value::Boolean(_)
-            | Value::Number(_)
-            | Value::String(_)
-            | Value::Symbol(_)
-            | Value::BigInt(_) => {
-                Self::failed_set_result(
-                    strict,
-                    format!(
-                        "Cannot set property '{name}' on {}",
-                        value_kind_name(&receiver)
-                    ),
-                )?;
-                None
-            }
-            other => {
-                // §10.1.9.2 OrdinarySetWithOwnDescriptor — for
-                // exotic receivers without their own [[Set]] (Map,
-                // Set, WeakMap, WeakSet, WeakRef,
-                // FinalizationRegistry, ArrayBuffer,
-                // SharedArrayBuffer, DataView, Iterator, Generator,
-                // Proxy already handled higher up), the spec
-                // delegates to the prototype's [[Set]]. The
-                // prototype is the realm's `<Kind>.prototype`
-                // (ordinary object) and the write would create an
-                // own data property on the receiver — but the
-                // receiver carries no expando slot here. Mirror
-                // [[Set]]'s observable contract: silently ignore
-                // in non-strict mode and surface TypeError in
-                // strict mode.
-                Self::failed_set_result(
-                    strict,
-                    format!("Cannot set property '{name}' on {}", value_kind_name(other)),
-                )?;
-                None
-            }
+                let bag =
+                    crate::object::alloc_object_with_roots(&mut self.gc_heap, &mut external_visit)?;
+                p.set_expando(&mut self.gc_heap, bag);
+                bag
+            };
+            Some(bag)
+        } else if receiver.is_undefined() || receiver.is_null() || receiver.is_hole() {
+            return Err(VmError::TypeError {
+                message: format!(
+                    "Cannot set property '{name}' on {}",
+                    value_kind_name(&receiver)
+                ),
+            });
+        } else if receiver.is_boolean()
+            || receiver.is_number()
+            || receiver.is_string()
+            || receiver.is_symbol()
+            || receiver.is_big_int()
+        {
+            Self::failed_set_result(
+                strict,
+                format!(
+                    "Cannot set property '{name}' on {}",
+                    value_kind_name(&receiver)
+                ),
+            )?;
+            None
+        } else {
+            // §10.1.9.2 OrdinarySetWithOwnDescriptor — for
+            // exotic receivers without their own [[Set]] (Map,
+            // Set, WeakMap, WeakSet, WeakRef,
+            // FinalizationRegistry, ArrayBuffer,
+            // SharedArrayBuffer, DataView, Iterator, Generator,
+            // Proxy already handled higher up).
+            Self::failed_set_result(
+                strict,
+                format!(
+                    "Cannot set property '{name}' on {}",
+                    value_kind_name(&receiver)
+                ),
+            )?;
+            None
         };
         if let Some(target) = target {
             self.set_property(target, name, value)?;

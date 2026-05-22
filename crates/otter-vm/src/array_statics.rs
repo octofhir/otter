@@ -30,7 +30,6 @@ use smallvec::SmallVec;
 
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::number::NumberValue;
 use crate::{NativeCtx, NativeError, Value, VmError};
 
 /// Static methods installed on the `Array` constructor.
@@ -56,10 +55,7 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
 ];
 
 fn native_is_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::boolean(matches!(
-        args.first(),
-        Some(Value::Array(_))
-    )))
+    Ok(Value::boolean(args.first().is_some_and(Value::is_array)))
 }
 
 /// §23.1.2.3 `Array.of(...items)` JS-visible NativeFunction.
@@ -94,14 +90,11 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 }
 
 fn is_constructor(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-    )
+    value.is_function()
+        || value.is_closure()
+        || value.is_native_function()
+        || value.is_bound_function()
+        || value.is_class_constructor()
 }
 
 /// §23.1.2.3 step 4–7: `Construct(C, «len»)` then write each item
@@ -113,30 +106,26 @@ fn construct_and_fill(
 ) -> Result<Value, VmError> {
     let len = args.len();
     let mut ctor_args: SmallVec<[Value; 8]> = SmallVec::with_capacity(1);
-    ctor_args.push(Value::number(NumberValue::from_i32(len as i32)));
+    ctor_args.push(Value::number_i32(len as i32));
     let receiver = {
         let (interp, exec) = ctx.interp_mut_and_context();
         let exec = exec.ok_or(VmError::InvalidOperand)?;
         interp.run_construct_sync(&exec, target, *target, ctor_args)?
     };
-    let receiver_obj = match &receiver {
-        Value::Object(obj) => *obj,
-        Value::Array(_) => return Ok(receiver),
-        _ => {
-            return Err(VmError::TypeError {
-                message: "Array.of constructor returned a non-object".to_string(),
-            });
-        }
+    let receiver_obj = if let Some(obj) = receiver.as_object() {
+        obj
+    } else if receiver.is_array() {
+        return Ok(receiver);
+    } else {
+        return Err(VmError::TypeError {
+            message: "Array.of constructor returned a non-object".to_string(),
+        });
     };
     for (idx, value) in args.iter().enumerate() {
         let key = idx.to_string();
         ctx.set_property(receiver_obj, &key, *value)?;
     }
-    ctx.set_property(
-        receiver_obj,
-        "length",
-        Value::Number(NumberValue::from_i32(len as i32)),
-    )?;
+    ctx.set_property(receiver_obj, "length", Value::number_i32(len as i32))?;
     Ok(receiver)
 }
 

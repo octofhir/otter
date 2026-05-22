@@ -3167,9 +3167,9 @@ mod tests {
             after > before,
             "Promise capability creation should allocate promise and closures through runtime roots"
         );
-        assert!(matches!(cap.promise, Value::Promise(_)));
-        assert!(matches!(cap.resolve, Value::NativeFunction(_)));
-        assert!(matches!(cap.reject, Value::NativeFunction(_)));
+        assert!(cap.promise.is_promise());
+        assert!(cap.resolve.is_native_function());
+        assert!(cap.reject.is_native_function());
     }
 
     #[test]
@@ -3183,8 +3183,8 @@ mod tests {
             let mut ctx = NativeCtx::new_with_call_info(
                 &mut interp,
                 NativeCallInfo::construct(
-                    Value::Number(NumberValue::from_i32(1)),
-                    Some(Value::Number(NumberValue::from_i32(2))),
+                    Value::number(NumberValue::from_i32(1)),
+                    Some(Value::number(NumberValue::from_i32(2))),
                 ),
             );
             PromiseBuilder::new()

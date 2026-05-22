@@ -356,7 +356,7 @@ impl Frame {
             function,
             None,
             upvalues,
-            Value::Undefined,
+            Value::undefined(),
         ))
     }
 
@@ -369,7 +369,7 @@ impl Frame {
             function,
             return_register,
             Self::empty_upvalues(),
-            Value::Undefined,
+            Value::undefined(),
         )
     }
 

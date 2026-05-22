@@ -92,20 +92,16 @@ pub fn load_static(interp: &mut Interpreter, name: &str) -> Result<Value, Symbol
     // `Symbol.keyFor`, plus every well-known own-data symbol slot
     // (`Symbol.iterator`, `Symbol.toPrimitive`, …) resolves here.
     let symbol_ctor = crate::object::get(interp.global_this, &interp.gc_heap, "Symbol");
-    match &symbol_ctor {
-        Some(Value::Object(ctor)) => {
-            if let Some(value) = crate::object::get(*ctor, &interp.gc_heap, name) {
-                return Ok(value);
-            }
-        }
-        Some(Value::NativeFunction(native)) => {
-            if let Ok(Some(desc)) = native.own_property_descriptor(&mut interp.gc_heap, name)
-                && let crate::object::DescriptorKind::Data { value } = desc.kind
-            {
-                return Ok(value);
-            }
-        }
-        _ => {}
+    if let Some(ctor) = symbol_ctor.as_ref().and_then(|v| v.as_object())
+        && let Some(value) = crate::object::get(ctor, &interp.gc_heap, name)
+    {
+        return Ok(value);
+    }
+    if let Some(native) = symbol_ctor.as_ref().and_then(|v| v.as_native_function())
+        && let Ok(Some(desc)) = native.own_property_descriptor(&mut interp.gc_heap, name)
+        && let crate::object::DescriptorKind::Data { value } = desc.kind
+    {
+        return Ok(value);
     }
     // Compiler-fast-path well-known symbols even when bootstrap has
     // not yet wired the constructor (eg. during early
@@ -145,27 +141,27 @@ pub fn call(
 /// rejects the `new` form (TypeError) but the foundation has no
 /// dedicated path for that today.
 fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
-    let description = match args.first() {
-        None | Some(Value::Undefined) => None,
-        Some(Value::String(s)) => Some(*s),
-        // §7.1.17 ToString rejects Symbol with TypeError.
-        Some(Value::Symbol(_)) => {
+    let description = if let Some(first) = args.first() {
+        if first.is_undefined() {
+            None
+        } else if let Some(s) = first.as_string() {
+            Some(*s)
+        } else if first.is_symbol() {
             return Err(SymbolError::BadArgument {
                 name: "Symbol",
                 index: 0,
                 reason: "Cannot convert a Symbol value to a string",
             });
-        }
-        // Spec coerces to string with `ToString`. Foundation
-        // narrows to non-Symbol primitives plus a fallback to
-        // `display_string` for Object operands (no `@@toPrimitive` /
-        // `toString` invocation here — the `Op::SymbolCall`
-        // dispatcher has no `ExecutionContext`).
-        Some(other) => {
+        } else {
+            // Spec coerces to string with `ToString`. Foundation
+            // narrows to non-Symbol primitives plus a fallback to
+            // `display_string` for Object operands.
             let rendered =
-                JsString::from_str(&other.display_string(&interp.gc_heap), interp.gc_heap_mut())?;
+                JsString::from_str(&first.display_string(&interp.gc_heap), interp.gc_heap_mut())?;
             Some(rendered)
         }
+    } else {
+        None
     };
     let sym = JsSymbol::new(&mut interp.gc_heap, description)?;
     Ok(Value::symbol(sym))
@@ -181,16 +177,14 @@ fn symbol_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolE
 
 /// `Symbol.keyFor(sym)` — Spec §20.4.2.6.
 fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
-    let sym = match args.first() {
-        Some(Value::Symbol(s)) => s,
-        _ => {
-            return Err(SymbolError::BadArgument {
-                name: "keyFor",
-                index: 0,
-                reason: "must be a symbol",
-            });
-        }
-    };
+    let sym = args
+        .first()
+        .and_then(|v| v.as_symbol())
+        .ok_or(SymbolError::BadArgument {
+            name: "keyFor",
+            index: 0,
+            reason: "must be a symbol",
+        })?;
     match interp.symbol_registry().key_for(sym) {
         Some(key) => {
             let s = JsString::from_str(&key, interp.gc_heap_mut())?;
@@ -208,14 +202,21 @@ fn key_argument(
     heap: &otter_gc::GcHeap,
     name: &'static str,
 ) -> Result<String, SymbolError> {
-    match args.first() {
-        None | Some(Value::Undefined) => Ok("undefined".to_string()),
-        Some(Value::String(s)) => Ok(s.to_lossy_string(heap)),
-        Some(Value::Symbol(_)) => Err(SymbolError::BadArgument {
+    let Some(first) = args.first() else {
+        return Ok("undefined".to_string());
+    };
+    if first.is_undefined() {
+        return Ok("undefined".to_string());
+    }
+    if let Some(s) = first.as_string() {
+        return Ok(s.to_lossy_string(heap));
+    }
+    if first.is_symbol() {
+        return Err(SymbolError::BadArgument {
             name,
             index: 0,
             reason: "key must not be a symbol",
-        }),
-        Some(other) => Ok(other.display_string(heap)),
+        });
     }
+    Ok(first.display_string(heap))
 }

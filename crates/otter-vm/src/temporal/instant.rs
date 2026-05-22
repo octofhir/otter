@@ -19,7 +19,6 @@ use std::sync::LazyLock;
 
 use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{
     alloc_temporal_value, js_string_value, make_temporal, require_instant, temporal_err,
@@ -56,16 +55,17 @@ fn from_epoch_milliseconds(
     args: &[Value],
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, TemporalError> {
-    let ms = match args.first() {
-        Some(Value::Number(n)) => n.as_f64() as i64,
-        _ => {
-            return Err(TemporalError::BadArgument {
-                class: "Instant",
-                method: "fromEpochMilliseconds",
-                index: 0,
-                reason: "must be a number",
-            });
-        }
+    let Some(ms) = args
+        .first()
+        .and_then(|v| v.as_number())
+        .map(|n| n.as_f64() as i64)
+    else {
+        return Err(TemporalError::BadArgument {
+            class: "Instant",
+            method: "fromEpochMilliseconds",
+            index: 0,
+            reason: "must be a number",
+        });
     };
     let inst =
         temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|e| TemporalError::Engine {
@@ -86,7 +86,7 @@ fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, Temporal
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
     };
-    Ok(Value::number(NumberValue::from_i32(n)))
+    Ok(Value::number_i32(n))
 }
 
 fn parse_instant_arg(
@@ -95,8 +95,9 @@ fn parse_instant_arg(
     index: u16,
     method: &'static str,
 ) -> Result<temporal_rs::Instant, TemporalError> {
-    match args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload_clone(gc_heap) {
+    let arg = args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(gc_heap) {
             TemporalPayload::Instant(v) => Ok(v),
             _ => Err(TemporalError::BadArgument {
                 class: "Instant",
@@ -104,22 +105,22 @@ fn parse_instant_arg(
                 index,
                 reason: "must be a Temporal.Instant",
             }),
-        },
-        Some(Value::String(s)) => {
-            temporal_rs::Instant::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
-                TemporalError::Engine {
-                    class: "Instant",
-                    method,
-                    message: e.to_string(),
-                }
-            })
         }
-        _ => Err(TemporalError::BadArgument {
+    } else if let Some(s) = arg.and_then(|v| v.as_string()) {
+        temporal_rs::Instant::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
+            TemporalError::Engine {
+                class: "Instant",
+                method,
+                message: e.to_string(),
+            }
+        })
+    } else {
+        Err(TemporalError::BadArgument {
             class: "Instant",
             method,
             index,
             reason: "must be a Temporal.Instant or ISO string",
-        }),
+        })
     }
 }
 
@@ -130,12 +131,10 @@ fn parse_instant_arg(
 pub fn load_property(temporal: &JsTemporal, gc_heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     let inst = match temporal.payload_clone(gc_heap) {
         TemporalPayload::Instant(v) => v,
-        _ => return Value::Undefined,
+        _ => return Value::undefined(),
     };
     match name {
-        "epochMilliseconds" => {
-            Value::Number(NumberValue::from_f64(inst.epoch_milliseconds() as f64))
-        }
+        "epochMilliseconds" => Value::number_f64(inst.epoch_milliseconds() as f64),
         "epochNanoseconds" => {
             // Per spec returns a BigInt. On allocation failure the
             // accessor returns `undefined` — the caller has no error
@@ -181,8 +180,9 @@ fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
 
 fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let inst = require_instant(args)?;
-    let other = match args.args.first() {
-        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+    let first = args.args.first();
+    let other = if let Some(t) = first.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::Instant(v) => v,
             _ => {
                 return Err(IntrinsicError::BadArgument {
@@ -190,17 +190,15 @@ fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                     reason: "must be a Temporal.Instant",
                 });
             }
-        },
-        Some(Value::String(s)) => {
-            temporal_rs::Instant::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
-                .map_err(temporal_err)?
         }
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a Temporal.Instant or ISO string",
-            });
-        }
+    } else if let Some(s) = first.and_then(|v| v.as_string()) {
+        temporal_rs::Instant::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
+            .map_err(temporal_err)?
+    } else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a Temporal.Instant or ISO string",
+        });
     };
     Ok(Value::boolean(inst.as_i128() == other.as_i128()))
 }
@@ -210,27 +208,26 @@ fn arg_as_duration(
     args: &IntrinsicArgs<'_>,
     index: u16,
 ) -> Result<temporal_rs::Duration, IntrinsicError> {
-    match args.args.get(index as usize) {
-        Some(Value::Temporal(t)) => match t.payload_clone(args.gc_heap) {
+    let bad = || IntrinsicError::BadArgument {
+        index,
+        reason: "must be a Temporal.Duration",
+    };
+    let arg = args.args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal()).copied() {
+        match t.payload_clone(args.gc_heap) {
             TemporalPayload::Duration(d) => Ok(d),
-            _ => Err(IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration",
-            }),
-        },
-        Some(Value::Object(obj)) => {
-            let heap = &*args.gc_heap;
-            crate::temporal::duration::partial_from_object(obj, heap).map_err(|_| {
-                IntrinsicError::BadArgument {
-                    index,
-                    reason: "must be a Temporal.Duration partial",
-                }
-            })
+            _ => Err(bad()),
         }
-        _ => Err(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a Temporal.Duration",
-        }),
+    } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
+        let heap = &*args.gc_heap;
+        crate::temporal::duration::partial_from_object(&obj, heap).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index,
+                reason: "must be a Temporal.Duration partial",
+            }
+        })
+    } else {
+        Err(bad())
     }
 }
 

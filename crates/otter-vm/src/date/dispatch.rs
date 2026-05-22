@@ -22,7 +22,6 @@ use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 
 use super::{make_date, now_ms};
-use crate::number::NumberValue;
 use crate::object::{self, JsObject};
 use crate::{Value, VmError};
 
@@ -93,19 +92,18 @@ pub fn call_static(
     use otter_bytecode::method_id::DateMethod as M;
     match method {
         // §21.4.3.1 Date.now() — current epoch ms as a Number.
-        M::Now => Ok(Value::number(NumberValue::from_f64(now_ms()))),
+        M::Now => Ok(Value::number_f64(now_ms())),
         // §21.4.3.2 Date.parse(str).
         M::Parse => {
-            let s = match args.first() {
-                Some(Value::String(s)) => s.to_lossy_string(heap),
-                _ => return Ok(Value::number(NumberValue::from_f64(f64::NAN))),
+            let Some(s) = args.first().and_then(|v| v.as_string()) else {
+                return Ok(Value::number_f64(f64::NAN));
             };
-            Ok(Value::number(NumberValue::from_f64(parse_date(&s))))
+            Ok(Value::number_f64(parse_date(&s.to_lossy_string(heap))))
         }
         // §21.4.3.4 Date.UTC(year, month, day?, …).
         M::UTC => {
             if args.is_empty() {
-                return Ok(Value::number(NumberValue::from_f64(f64::NAN)));
+                return Ok(Value::number_f64(f64::NAN));
             }
             let year = year_with_two_digit_rule(number_arg(args, 0));
             let month = number_or(args, 1, 0.0);
@@ -114,9 +112,9 @@ pub fn call_static(
             let minutes = number_or(args, 4, 0.0);
             let seconds = number_or(args, 5, 0.0);
             let ms = number_or(args, 6, 0.0);
-            Ok(Value::number(NumberValue::from_f64(make_date(
+            Ok(Value::number_f64(make_date(
                 year, month, day, hours, minutes, seconds, ms,
-            ))))
+            )))
         }
         // Construct is allocating — must go through `call(...)`.
         M::Construct => Err(VmError::InvalidOperand),
@@ -133,18 +131,26 @@ pub fn call_static(
 pub fn construct_time_value(args: &[Value], heap: &GcHeap) -> f64 {
     match args.len() {
         0 => now_ms(),
-        1 => match &args[0] {
-            Value::String(s) => parse_date(&s.to_lossy_string(heap)),
-            Value::Number(n) => n.as_f64(),
-            // §21.4.2.2 step 3.b — if value has [[DateValue]], use
-            // that. Other objects fall back to ToPrimitive→Number;
-            // primitive coercion outside the fast path lands as
-            // NaN here (foundation behaviour).
-            Value::Object(o) => object::date_data(*o, heap).unwrap_or(f64::NAN),
-            Value::Boolean(true) => 1.0,
-            Value::Boolean(false) | Value::Null => 0.0,
-            _ => f64::NAN,
-        },
+        1 => {
+            let v = &args[0];
+            if let Some(s) = v.as_string() {
+                parse_date(&s.to_lossy_string(heap))
+            } else if let Some(n) = v.as_number() {
+                n.as_f64()
+            } else if let Some(o) = v.as_object() {
+                // §21.4.2.2 step 3.b — if value has [[DateValue]],
+                // use that. Other objects fall back to
+                // ToPrimitive→Number; primitive coercion outside
+                // the fast path lands as NaN here.
+                object::date_data(o, heap).unwrap_or(f64::NAN)
+            } else if let Some(b) = v.as_boolean() {
+                if b { 1.0 } else { 0.0 }
+            } else if v.is_null() {
+                0.0
+            } else {
+                f64::NAN
+            }
+        }
         _ => {
             let year = year_with_two_digit_rule(number_arg(args, 0));
             let month = number_arg(args, 1);
@@ -175,11 +181,15 @@ fn year_with_two_digit_rule(year: f64) -> f64 {
 }
 
 fn number_arg(args: &[Value], idx: usize) -> f64 {
-    match args.get(idx) {
-        Some(Value::Number(n)) => n.as_f64(),
-        Some(Value::Boolean(true)) => 1.0,
-        Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
-        _ => f64::NAN,
+    let v = args.get(idx);
+    if let Some(n) = v.and_then(|v| v.as_number()) {
+        n.as_f64()
+    } else if let Some(b) = v.and_then(|v| v.as_boolean()) {
+        if b { 1.0 } else { 0.0 }
+    } else if v.is_some_and(|v| v.is_null()) {
+        0.0
+    } else {
+        f64::NAN
     }
 }
 

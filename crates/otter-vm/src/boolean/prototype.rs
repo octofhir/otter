@@ -21,18 +21,17 @@ use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError};
 
 fn receiver_bool(args: &IntrinsicArgs<'_>) -> Result<bool, IntrinsicError> {
-    match args.receiver {
-        Value::Boolean(b) => Ok(*b),
-        Value::Object(obj) => {
-            let gc = &*args.gc_heap;
-            crate::object::boolean_data(*obj, gc).ok_or(IntrinsicError::BadReceiver {
-                expected: "boolean",
-            })
-        }
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "boolean",
-        }),
+    if let Some(b) = args.receiver.as_boolean() {
+        return Ok(b);
     }
+    if let Some(obj) = args.receiver.as_object() {
+        return crate::object::boolean_data(obj, args.gc_heap).ok_or(IntrinsicError::BadReceiver {
+            expected: "boolean",
+        });
+    }
+    Err(IntrinsicError::BadReceiver {
+        expected: "boolean",
+    })
 }
 
 /// §20.3.3.2 Boolean.prototype.toString — `"true"` / `"false"`.

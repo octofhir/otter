@@ -348,7 +348,7 @@ impl Interpreter {
         roots.extend_from_slice(value_roots);
         let obj = self.alloc_runtime_rooted_object_with_roots(&roots, slice_roots)?;
         self.set_property(obj, "value", value)?;
-        self.set_property(obj, "done", Value::Boolean(done))?;
+        self.set_property(obj, "done", Value::boolean(done))?;
         Ok(Value::object(obj))
     }
 
@@ -603,10 +603,9 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
         let value = *read_register(frame, value_reg)?;
-        let array = match read_register(frame, arr_reg)? {
-            Value::Array(a) => *a,
-            _ => return Err(VmError::TypeMismatch),
-        };
+        let array = read_register(frame, arr_reg)?
+            .as_array()
+            .ok_or(VmError::TypeMismatch)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {

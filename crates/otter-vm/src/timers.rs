@@ -46,7 +46,7 @@ use smallvec::SmallVec;
 
 use crate::execution_context::ExecutionContext;
 use crate::native_function::{NativeCall, NativeError, NativeFastFn};
-use crate::number::{self, NumberValue};
+use crate::number;
 use crate::object::JsObject;
 use crate::runtime_cx::NativeCtx;
 use crate::{Attr, JsSurfaceError, ObjectBuilder, Value};
@@ -233,8 +233,9 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 
 fn coerce_delay_ms(value: Option<&Value>, heap: &otter_gc::GcHeap) -> u64 {
     let n = match value {
-        Some(Value::Number(num)) => num.as_f64(),
-        Some(Value::Undefined) | None => 0.0,
+        Some(v) if let Some(num) = v.as_number() => num.as_f64(),
+        Some(v) if v.is_undefined() => 0.0,
+        None => 0.0,
         Some(other) => number::parse::to_number_value(other, heap),
     };
     if n.is_nan() || n <= 0.0 {
@@ -289,7 +290,7 @@ fn schedule_timer_common(
             repeat_ms: repeat.then_some(delay_ms),
         },
     );
-    Ok(Value::number(NumberValue::from_f64(token as f64)))
+    Ok(Value::number_f64(token as f64))
 }
 
 fn cancel_timer_common(
@@ -297,8 +298,8 @@ fn cancel_timer_common(
     args: &[Value],
     _native_name: &'static str,
 ) -> Result<Value, NativeError> {
-    let token = match args.first() {
-        Some(Value::Number(n)) => {
+    let token = match args.first().and_then(|v| v.as_number()) {
+        Some(n) => {
             let raw = n.as_f64();
             if raw.is_finite() && raw >= 0.0 {
                 raw as u64
@@ -306,7 +307,7 @@ fn cancel_timer_common(
                 return Ok(Value::undefined());
             }
         }
-        _ => return Ok(Value::undefined()),
+        None => return Ok(Value::undefined()),
     };
     let interp = ctx.interp_mut();
     interp.timer_callbacks_mut().remove(token);

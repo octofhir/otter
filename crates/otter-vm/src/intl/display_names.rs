@@ -30,16 +30,13 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> D
 }
 
 fn require_payload(args: &IntrinsicArgs<'_>) -> Result<DisplayNamesPayload, IntrinsicError> {
-    match args.receiver {
-        Value::Intl(intl) => match intl.payload_clone(args.gc_heap) {
-            IntlPayload::DisplayNames(p) => Ok(p),
-            _ => Err(IntrinsicError::BadReceiver {
-                expected: "Intl.DisplayNames",
-            }),
-        },
-        _ => Err(IntrinsicError::BadReceiver {
-            expected: "Intl.DisplayNames",
-        }),
+    let bad = || IntrinsicError::BadReceiver {
+        expected: "Intl.DisplayNames",
+    };
+    let intl = args.receiver.as_intl().ok_or_else(bad)?;
+    match intl.payload_clone(args.gc_heap) {
+        IntlPayload::DisplayNames(p) => Ok(p),
+        _ => Err(bad()),
     }
 }
 
@@ -136,15 +133,15 @@ fn lookup_name(kind: &str, code: &str) -> Option<&'static str> {
 /// §12.5.5 `of(code)`.
 fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let payload = require_payload(args)?;
-    let code = match args.args.first() {
-        Some(Value::String(s)) => s.to_lossy_string(args.gc_heap),
-        Some(Value::Number(n)) => n.to_display_string(),
-        _ => {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "must be a string code",
-            });
-        }
+    let code = if let Some(s) = args.args.first().and_then(|v| v.as_string()) {
+        s.to_lossy_string(args.gc_heap)
+    } else if let Some(n) = args.args.first().and_then(|v| v.as_number()) {
+        n.to_display_string()
+    } else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "must be a string code",
+        });
     };
     if let Some(name) = lookup_name(&payload.kind, &code) {
         return Ok(Value::string(crate::string::JsString::from_str(

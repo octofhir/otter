@@ -54,10 +54,10 @@ impl Interpreter {
         spec_reg: u16,
     ) -> Result<(), VmError> {
         let spec_value = *read_register(frame, spec_reg)?;
-        let specifier = match spec_value {
-            Value::String(s) => s.to_lossy_string(&self.gc_heap),
-            _ => return Err(VmError::TypeMismatch),
-        };
+        let specifier = spec_value
+            .as_string()
+            .ok_or(VmError::TypeMismatch)?
+            .to_lossy_string(&self.gc_heap);
         let resolved = resolve_relative_url(Some(&frame.module_url), &specifier);
         let resolved_str =
             JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
@@ -78,8 +78,8 @@ impl Interpreter {
         let spec_value = *read_register(&stack[top_idx], spec_reg)?;
         let referrer = stack[top_idx].module_url.clone();
         let import_context = context.clone();
-        let promise = match spec_value {
-            Value::String(s) => {
+        let promise =
+            if let Some(s) = spec_value.as_string() {
                 let specifier = s.to_lossy_string(&self.gc_heap);
                 if let Some(ns) =
                     self.resolve_module_namespace(context, referrer.as_ref(), &specifier)
@@ -105,16 +105,14 @@ impl Interpreter {
                     promise_dispatch::PromiseBuilder::with_context(import_context.clone())
                         .rejected_stack_rooted(self, stack, reason, &[], &[])?
                 }
-            }
-            _ => {
+            } else {
                 let reason = self.make_type_error_with_stack_roots(
                     stack,
                     "dynamic import: specifier must be a string",
                 )?;
                 promise_dispatch::PromiseBuilder::with_context(import_context)
                     .rejected_stack_rooted(self, stack, reason, &[], &[])?
-            }
-        };
+            };
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
         stack[top_idx].pc += 1;
         Ok(())

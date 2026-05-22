@@ -96,7 +96,7 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         units.push(to_uint16(n));
     }
     JsString::from_utf16_units(&units, ctx.heap_mut())
-        .map(Value::String)
+        .map(Value::string)
         .map_err(|_| NativeError::TypeError {
             name: "String.fromCharCode",
             reason: "string allocation failed".to_string(),
@@ -142,7 +142,7 @@ fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
         }
     }
     JsString::from_utf16_units(&units, ctx.heap_mut())
-        .map(Value::String)
+        .map(Value::string)
         .map_err(|_| NativeError::TypeError {
             name: "String.fromCodePoint",
             reason: "string allocation failed".to_string(),

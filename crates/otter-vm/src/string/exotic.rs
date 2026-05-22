@@ -23,7 +23,7 @@
 
 use crate::object::PropertyDescriptor;
 use crate::string::JsString;
-use crate::{NumberValue, Value, VmError, VmPropertyKey};
+use crate::{Value, VmError, VmPropertyKey};
 
 pub(crate) fn descriptor_for_key(
     value: &JsString,
@@ -43,7 +43,7 @@ pub(crate) fn descriptor_for_name(
 ) -> Result<Option<PropertyDescriptor>, VmError> {
     if key == "length" {
         return Ok(Some(PropertyDescriptor::data(
-            Value::Number(NumberValue::from_i32(value.len() as i32)),
+            Value::number_i32(value.len() as i32),
             false,
             false,
             false,
@@ -56,7 +56,7 @@ pub(crate) fn descriptor_for_name(
         return Ok(None);
     };
     Ok(Some(PropertyDescriptor::data(
-        Value::String(JsString::from_utf16_units(&[unit], gc_heap)?),
+        Value::string(JsString::from_utf16_units(&[unit], gc_heap)?),
         false,
         true,
         false,

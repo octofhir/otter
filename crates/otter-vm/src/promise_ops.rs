@@ -62,7 +62,7 @@ impl Interpreter {
         frame.pc += 1;
         self.microtasks.enqueue(Microtask {
             callee,
-            this_value: Value::Undefined,
+            this_value: Value::undefined(),
             args,
             context: Some(context.clone()),
             result_capability: None,
@@ -97,7 +97,7 @@ impl Interpreter {
             stack,
             context,
             &executor,
-            Value::Undefined,
+            Value::undefined(),
             args,
             scratch_dst,
         )

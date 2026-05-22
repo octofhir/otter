@@ -1121,107 +1121,57 @@ impl Interpreter {
         let recv = *read_register(frame, recv_reg)?;
         let idx_value_raw = *read_register(frame, idx_reg)?;
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
-        let value = match (&recv, &idx_value) {
-            (Value::Object(obj), Value::Symbol(sym)) => {
-                crate::object::get_symbol(*obj, &self.gc_heap, sym).unwrap_or(Value::undefined())
-            }
-            (Value::Object(obj), Value::String(key)) => {
-                crate::object::get(*obj, &self.gc_heap, &key.to_lossy_string(&self.gc_heap))
+        let value = if let Some(obj) = recv.as_object() {
+            if let Some(sym) = idx_value.as_symbol() {
+                crate::object::get_symbol(obj, &self.gc_heap, sym).unwrap_or(Value::undefined())
+            } else if let Some(key) = idx_value.as_string() {
+                crate::object::get(obj, &self.gc_heap, &key.to_lossy_string(&self.gc_heap))
                     .unwrap_or(Value::undefined())
-            }
-            (Value::Object(obj), Value::Number(n)) => {
+            } else if let Some(n) = idx_value.as_number() {
                 let key = n.to_display_string();
-                crate::object::get(*obj, &self.gc_heap, &key).unwrap_or(Value::undefined())
+                crate::object::get(obj, &self.gc_heap, &key).unwrap_or(Value::undefined())
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            (
-                Value::Function { function_id }
-                | Value::Closure(crate::closure::JsClosure {
-                    cached_function_id: function_id,
-                    ..
-                }),
-                Value::String(key),
-            ) => {
-                match self.ordinary_function_own_property_descriptor(
-                    Some(context),
-                    *function_id,
-                    &key.to_lossy_string(&self.gc_heap),
-                )? {
-                    Some(desc) => descriptor_value(&desc),
-                    None => Value::undefined(),
-                }
-            }
-            (Value::NativeFunction(native), Value::String(key)) => {
-                let key = key.to_lossy_string(&self.gc_heap);
-                match native.own_property_descriptor(&mut self.gc_heap, &key)? {
-                    Some(desc) => descriptor_value(&desc),
-                    None => Value::undefined(),
-                }
-            }
-            (Value::BoundFunction(bound), Value::String(key)) => {
-                let key = key.to_lossy_string(&self.gc_heap);
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &mut self.gc_heap,
-                    &key,
-                )? {
-                    Some(desc) => descriptor_value(&desc),
-                    None => Value::undefined(),
-                }
-            }
-            (Value::Array(arr), Value::Symbol(sym))
+        } else if let Some(arr) = recv.as_array() {
+            if let Some(sym) = idx_value.as_symbol() {
                 if sym
                     .well_known_tag()
-                    .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-            {
-                // §22.1.5.1 — own Symbol.iterator override on the
-                // array exotic body wins over the prototype slot so
-                // user-installed `arr[Symbol.iterator] = fn` is
-                // observable.
-                if let Some(v) = crate::array::get_symbol_property(*arr, &self.gc_heap, sym) {
-                    v
+                    .is_some_and(|t| t == symbol::WellKnown::Iterator)
+                {
+                    // §22.1.5.1 — own Symbol.iterator override on the
+                    // array exotic body wins over the prototype slot.
+                    if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
+                        v
+                    } else {
+                        make_array_iterator_factory(arr, &mut self.gc_heap)?
+                    }
                 } else {
-                    make_array_iterator_factory(*arr, &mut self.gc_heap)?
-                }
-            }
-            // §22.1 Array exotic — symbol-keyed access reads the
-            // array's own symbol table first (e.g.
-            // `arr[Symbol.toStringTag]`); on miss, walks
-            // `Array.prototype` so inherited symbol-keyed members
-            // (e.g. `@@toStringTag` accessor) still resolve.
-            (Value::Array(arr), Value::Symbol(sym)) => {
-                match crate::array::get_symbol_property(*arr, &self.gc_heap, sym) {
-                    Some(v) => v,
-                    None => {
-                        let proto = self.constructor_prototype_value("Array")?;
-                        if let Value::Object(p) = proto {
-                            crate::object::get_symbol(p, &self.gc_heap, sym)
-                                .unwrap_or(Value::undefined())
-                        } else {
-                            Value::Undefined
+                    // §22.1 Array exotic — symbol-keyed access reads
+                    // array's own symbol table first; on miss walks
+                    // `Array.prototype`.
+                    match crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
+                        Some(v) => v,
+                        None => {
+                            let proto = self.constructor_prototype_value("Array")?;
+                            if let Some(p) = proto.as_object() {
+                                crate::object::get_symbol(p, &self.gc_heap, sym)
+                                    .unwrap_or(Value::undefined())
+                            } else {
+                                Value::undefined()
+                            }
                         }
                     }
                 }
-            }
-            // Computed string-key access on Array exotic objects:
-            // `arr["0"]`, `arr["length"]`, `arr[i]` after `for (i in
-            // arr)` (where `i` is a string property key) must observe
-            // the spec's `Array` [[Get]] internal method — integer-
-            // index strings route to dense / sparse element storage,
-            // `length` returns the length, and anything else falls
-            // through to the named-property table plus the Array
-            // prototype chain (so `arr["push"]` resolves to
-            // `Array.prototype.push`). Without this arm the default
-            // branch demanded a numeric key and surfaced a bogus
-            // `TypeMismatch` for `for-in` body access.
-            // <https://tc39.es/ecma262/#sec-array-exotic-objects-get-p-receiver>
-            (Value::Array(arr), Value::String(key)) => {
+            } else if let Some(key) = idx_value.as_string() {
+                // Computed string-key access on Array exotic.
                 let name = key.to_lossy_string(&self.gc_heap);
                 if name == "length" {
-                    Value::Number(NumberValue::from_f64(
-                        crate::array::len(*arr, &self.gc_heap) as f64,
+                    Value::number(NumberValue::from_f64(
+                        crate::array::len(arr, &self.gc_heap) as f64
                     ))
                 } else if let Some((getter, _setter)) =
-                    crate::array::get_accessor(*arr, &self.gc_heap, &name)
+                    crate::array::get_accessor(arr, &self.gc_heap, &name)
                 {
                     match getter {
                         Some(getter) if abstract_ops::is_callable(&getter) => {
@@ -1231,22 +1181,117 @@ impl Interpreter {
                         _ => Value::undefined(),
                     }
                 } else if let Some(idx) = crate::object::array_index_property_name(&name) {
-                    crate::array::get(*arr, &self.gc_heap, idx as usize)
+                    crate::array::get(arr, &self.gc_heap, idx as usize)
                 } else {
-                    match crate::array::get_named_property(*arr, &self.gc_heap, &name) {
+                    match crate::array::get_named_property(arr, &self.gc_heap, &name) {
                         Some(v) => v,
                         None => {
                             self.load_from_constructor_prototype(context, "Array", &recv, &name)?
                         }
                     }
                 }
+            } else if let Some(n) = idx_value.as_number() {
+                match crate::array::index_from_number(n) {
+                    Some(idx) => {
+                        let key = idx.to_string();
+                        if let Some((getter, _setter)) =
+                            crate::array::get_accessor(arr, &self.gc_heap, &key)
+                        {
+                            match getter {
+                                Some(getter) if abstract_ops::is_callable(&getter) => {
+                                    let args: smallvec::SmallVec<[Value; 8]> =
+                                        smallvec::SmallVec::new();
+                                    self.run_callable_sync(
+                                        context,
+                                        &getter,
+                                        Value::array(arr),
+                                        args,
+                                    )?
+                                }
+                                _ => Value::undefined(),
+                            }
+                        } else {
+                            crate::array::get(arr, &self.gc_heap, idx)
+                        }
+                    }
+                    None => {
+                        crate::array::get_named_property(arr, &self.gc_heap, &n.to_display_string())
+                            .unwrap_or(Value::undefined())
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            // §10.4.5.4 IntegerIndexedExoticObject [[Get]]:
-            // canonical numeric index strings short-circuit to the
-            // element / undefined path; non-numeric keys walk the
-            // ordinary prototype chain.
-            // <https://tc39.es/ecma262/#sec-integer-indexed-exotic-objects-get-p-receiver>
-            (Value::TypedArray(t), Value::String(key)) => {
+        } else if let Some(fid) = recv
+            .as_function()
+            .or_else(|| recv.as_closure().map(|c| c.cached_function_id))
+        {
+            if let Some(key) = idx_value.as_string() {
+                match self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    fid,
+                    &key.to_lossy_string(&self.gc_heap),
+                )? {
+                    Some(desc) => descriptor_value(&desc),
+                    None => Value::undefined(),
+                }
+            } else if let Some(sym) = idx_value.as_symbol() {
+                let key = VmPropertyKey::Symbol(*sym);
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(native) = recv.as_native_function() {
+            if let Some(key) = idx_value.as_string() {
+                let key = key.to_lossy_string(&self.gc_heap);
+                match native.own_property_descriptor(&mut self.gc_heap, &key)? {
+                    Some(desc) => descriptor_value(&desc),
+                    None => Value::undefined(),
+                }
+            } else if let Some(sym) = idx_value.as_symbol() {
+                let key = VmPropertyKey::Symbol(*sym);
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(bound) = recv.as_bound_function() {
+            let bound = &bound;
+            if let Some(key) = idx_value.as_string() {
+                let key = key.to_lossy_string(&self.gc_heap);
+                match function_metadata::bound_own_property_descriptor(
+                    bound,
+                    &mut self.gc_heap,
+                    &key,
+                )? {
+                    Some(desc) => descriptor_value(&desc),
+                    None => Value::undefined(),
+                }
+            } else if let Some(sym) = idx_value.as_symbol() {
+                let key = VmPropertyKey::Symbol(*sym);
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(t) = recv.as_typed_array() {
+            if let Some(key) = idx_value.as_string() {
                 let name = key.to_lossy_string(&self.gc_heap);
                 if let Some(n) = canonical_numeric_index_string(&name) {
                     if n.is_finite()
@@ -1257,12 +1302,9 @@ impl Interpreter {
                         t.get(&mut self.gc_heap, n as usize)
                             .map_err(crate::oom_to_vm)?
                     } else {
-                        Value::Undefined
+                        Value::undefined()
                     }
                 } else {
-                    // §10.4.5.4 step 3 — non-canonical-numeric keys
-                    // fall through to OrdinaryGet. Honour the lazy
-                    // expando bag first, then the prototype chain.
                     let mut value = Value::undefined();
                     let mut found = false;
                     if let Some(bag) = t.expando(&self.gc_heap)
@@ -1273,102 +1315,23 @@ impl Interpreter {
                     }
                     if !found {
                         let direct =
-                            binary::typed_array_prototype::load_property(t, &self.gc_heap, &name);
-                        value = match direct {
-                            Value::Undefined => {
-                                let kind_name = t.kind().name();
-                                self.load_from_constructor_prototype(
-                                    context, kind_name, &recv, &name,
-                                )?
-                            }
-                            v => v,
+                            binary::typed_array_prototype::load_property(&t, &self.gc_heap, &name);
+                        value = if direct.is_undefined() {
+                            let kind_name = t.kind().name();
+                            self.load_from_constructor_prototype(context, kind_name, &recv, &name)?
+                        } else {
+                            direct
                         };
                     }
                     value
                 }
-            }
-            // §10.4.3 String exotic [[GetOwnProperty]] exposes each
-            // UTF-16 code unit as an own, read-only indexed property.
-            // Computed access reaches this arm after ToPropertyKey,
-            // so both `"abc"[0]` and `"abc"["0"]` must resolve here
-            // before falling back to String.prototype.
-            // <https://tc39.es/ecma262/#sec-string-exotic-objects-getownproperty-p>
-            (Value::String(s), Value::String(key)) => {
-                let name = key.to_lossy_string(&self.gc_heap);
-                self.load_string_primitive_property(context, &recv, s, &name)?
-            }
-            (Value::String(s), Value::Number(key)) => {
-                let name = key.to_display_string();
-                self.load_string_primitive_property(context, &recv, s, &name)?
-            }
-            // Computed string-key access on RegExp must observe the
-            // same own/prototype lookup as `re.lastIndex` (member
-            // access). Without this arm, `re["lastIndex"]` falls
-            // through to the numeric-index default and surfaces a
-            // bogus `TypeMismatch` (see ECMA-262 §22.2.5 — RegExp
-            // exposes `source`, `flags`, `global`, `lastIndex`, etc.
-            // as proper own/prototype properties).
-            (Value::RegExp(r), Value::String(key)) => {
-                let name = key.to_lossy_string(&self.gc_heap);
-                if let Some(bag) = r.expando(&self.gc_heap)
-                    && let Some(value) = crate::object::get(bag, &self.gc_heap, &name)
-                {
-                    value
-                } else {
-                    let direct = regexp_prototype::load_property(r, &mut self.gc_heap, &name);
-                    match direct {
-                        Value::Undefined => {
-                            self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
-                        }
-                        value => value,
-                    }
+            } else if let Some(n) = idx_value.as_number() {
+                match crate::array::index_from_number(n) {
+                    Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
+                    None => Value::undefined(),
                 }
-            }
-            (Value::Map(m), Value::Symbol(sym))
-                if sym
-                    .well_known_tag()
-                    .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-            {
-                collections_prototype::make_map_iterator_factory(*m, &mut self.gc_heap)?
-            }
-            (Value::Set(s), Value::Symbol(sym))
-                if sym
-                    .well_known_tag()
-                    .is_some_and(|t| t == symbol::WellKnown::Iterator) =>
-            {
-                collections_prototype::make_set_iterator_factory(*s, &mut self.gc_heap)?
-            }
-            // §10.2 — callable + class shapes inherit @@-keyed
-            // properties through `Function.prototype` (or the class
-            // statics for `ClassConstructor`). Without a Symbol-key
-            // arm here, `f[Symbol.hasInstance]` falls through to the
-            // numeric-index default and trips `TypeMismatch`. Route
-            // through `ordinary_get_value` so the per-shape lookup
-            // (function user-props → Function.prototype → walked
-            // accessor outcomes) fires correctly.
-            (
-                Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_),
-                Value::Symbol(_),
-            ) => {
-                let key = match &idx_value {
-                    Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-                    _ => unreachable!(),
-                };
+            } else if let Some(sym) = idx_value.as_symbol() {
+                let key = VmPropertyKey::Symbol(*sym);
                 match self.ordinary_get_value(context, recv, recv, &key, 0)? {
                     crate::VmGetOutcome::Value(v) => v,
                     crate::VmGetOutcome::InvokeGetter { getter } => {
@@ -1376,42 +1339,33 @@ impl Interpreter {
                         self.run_callable_sync(context, &getter, recv, args)?
                     }
                 }
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            // §7.1.18 ToObject — primitive receivers walk their
-            // wrapper prototype for both string- and symbol-keyed
-            // access. Mirrors V8 / JSC where `Symbol()[
-            // Symbol.toPrimitive]` resolves to
-            // `Symbol.prototype[Symbol.toPrimitive]` rather than
-            // throwing. The wrapper itself is not materialized; the
-            // primitive flows through as `this` to any subsequent
-            // call.
-            (
-                Value::Symbol(_)
-                | Value::Boolean(_)
-                | Value::Number(_)
-                | Value::BigInt(_)
-                | Value::String(_),
-                Value::Symbol(_) | Value::String(_) | Value::Number(_),
-            ) => {
-                let ctor_name = match &recv {
-                    Value::Symbol(_) => "Symbol",
-                    Value::Boolean(_) => "Boolean",
-                    Value::Number(_) => "Number",
-                    Value::BigInt(_) => "BigInt",
-                    Value::String(_) => "String",
-                    _ => unreachable!(),
-                };
-                let key = match &idx_value {
-                    Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-                    Value::String(s) => {
-                        VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+        } else if let Some(s) = recv.as_string() {
+            // §10.4.3 String exotic [[GetOwnProperty]] — UTF-16 code
+            // unit indexed access then String.prototype fallback.
+            if let Some(key) = idx_value.as_string() {
+                let name = key.to_lossy_string(&self.gc_heap);
+                self.load_string_primitive_property(context, &recv, s, &name)?
+            } else if let Some(n) = idx_value.as_number() {
+                if let Some(idx) = crate::array::index_from_number(n) {
+                    match s.char_code_at(idx as u32, &self.gc_heap) {
+                        Some(unit) => Value::string(crate::JsString::from_utf16_units(
+                            &[unit],
+                            &mut self.gc_heap,
+                        )?),
+                        None => Value::string(crate::JsString::empty(self.gc_heap_mut())?),
                     }
-                    Value::Number(n) => VmPropertyKey::OwnedString(n.to_display_string()),
-                    _ => unreachable!(),
-                };
-                let proto = self.constructor_prototype_value(ctor_name)?;
+                } else {
+                    let name = n.to_display_string();
+                    self.load_string_primitive_property(context, &recv, s, &name)?
+                }
+            } else if let Some(sym) = idx_value.as_symbol() {
+                let key = VmPropertyKey::Symbol(*sym);
+                let proto = self.constructor_prototype_value("String")?;
                 if proto.is_nullish() {
-                    Value::Undefined
+                    Value::undefined()
                 } else {
                     match self.ordinary_get_value(context, proto, recv, &key, 0)? {
                         crate::VmGetOutcome::Value(v) => v,
@@ -1421,63 +1375,135 @@ impl Interpreter {
                         }
                     }
                 }
+            } else {
+                return Err(VmError::TypeMismatch);
             }
-            _ => {
-                let (idx, fallback_key) = match &idx_value {
-                    Value::Number(n) => match crate::array::index_from_number(*n) {
-                        Some(idx) => (Some(idx), None),
-                        None => (None, Some(n.to_display_string())),
-                    },
-                    _ => return Err(VmError::TypeMismatch),
-                };
-                match recv {
-                    Value::Array(a) => match idx {
-                        Some(idx) => {
-                            let key = idx.to_string();
-                            if let Some((getter, _setter)) =
-                                crate::array::get_accessor(a, &self.gc_heap, &key)
-                            {
-                                match getter {
-                                    Some(getter) if abstract_ops::is_callable(&getter) => {
-                                        let args: smallvec::SmallVec<[Value; 8]> =
-                                            smallvec::SmallVec::new();
-                                        self.run_callable_sync(
-                                            context,
-                                            &getter,
-                                            Value::Array(a),
-                                            args,
-                                        )?
-                                    }
-                                    _ => Value::undefined(),
-                                }
-                            } else {
-                                crate::array::get(a, &self.gc_heap, idx)
-                            }
+        } else if let Some(r) = recv.as_regexp() {
+            if let Some(key) = idx_value.as_string() {
+                // Computed string-key on RegExp.
+                let name = key.to_lossy_string(&self.gc_heap);
+                if let Some(bag) = r.expando(&self.gc_heap)
+                    && let Some(value) = crate::object::get(bag, &self.gc_heap, &name)
+                {
+                    value
+                } else {
+                    let direct = regexp_prototype::load_property(&r, &mut self.gc_heap, &name);
+                    if direct.is_undefined() {
+                        self.load_from_constructor_prototype(context, "RegExp", &recv, &name)?
+                    } else {
+                        direct
+                    }
+                }
+            } else if let Some(sym) = idx_value.as_symbol() {
+                let key = VmPropertyKey::Symbol(*sym);
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(m) = recv.as_map() {
+            if let Some(sym) = idx_value.as_symbol() {
+                if sym
+                    .well_known_tag()
+                    .is_some_and(|t| t == symbol::WellKnown::Iterator)
+                {
+                    collections_prototype::make_map_iterator_factory(m, &mut self.gc_heap)?
+                } else {
+                    let key = VmPropertyKey::Symbol(*sym);
+                    match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                        crate::VmGetOutcome::Value(v) => v,
+                        crate::VmGetOutcome::InvokeGetter { getter } => {
+                            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                            self.run_callable_sync(context, &getter, recv, args)?
                         }
-                        None => crate::array::get_named_property(
-                            a,
-                            &self.gc_heap,
-                            fallback_key.as_deref().expect("fallback key"),
-                        )
-                        .unwrap_or(Value::undefined()),
-                    },
-                    Value::String(s) => match idx {
-                        Some(idx) => match s.char_code_at(idx as u32, &self.gc_heap) {
-                            Some(unit) => Value::string(crate::JsString::from_utf16_units(
-                                &[unit],
-                                &mut self.gc_heap,
-                            )?),
-                            None => Value::string(crate::JsString::empty(self.gc_heap_mut())?),
-                        },
-                        None => Value::undefined(),
-                    },
-                    Value::TypedArray(t) => match idx {
-                        Some(idx) => t.get(&mut self.gc_heap, idx).map_err(crate::oom_to_vm)?,
-                        None => Value::undefined(),
-                    },
-                    _ => return Err(VmError::TypeMismatch),
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(set) = recv.as_set() {
+            if let Some(sym) = idx_value.as_symbol() {
+                if sym
+                    .well_known_tag()
+                    .is_some_and(|t| t == symbol::WellKnown::Iterator)
+                {
+                    collections_prototype::make_set_iterator_factory(set, &mut self.gc_heap)?
+                } else {
+                    let key = VmPropertyKey::Symbol(*sym);
+                    match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                        crate::VmGetOutcome::Value(v) => v,
+                        crate::VmGetOutcome::InvokeGetter { getter } => {
+                            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                            self.run_callable_sync(context, &getter, recv, args)?
+                        }
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if recv.is_class_constructor()
+            || recv.is_weak_map()
+            || recv.is_weak_set()
+            || recv.is_weak_ref()
+            || recv.is_finalization_registry()
+            || recv.is_promise()
+            || recv.is_array_buffer()
+            || recv.is_data_view()
+        {
+            // §10.2 — symbol-keyed access on callable / class /
+            // collection exotics walks via ordinary [[Get]].
+            if let Some(sym) = idx_value.as_symbol() {
+                let key = VmPropertyKey::Symbol(*sym);
+                match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
+                }
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if recv.is_symbol() || recv.is_boolean() || recv.is_number() || recv.is_big_int() {
+            // §7.1.18 ToObject — primitive receivers walk wrapper
+            // prototype for string/symbol/number key access.
+            let ctor_name = if recv.is_symbol() {
+                "Symbol"
+            } else if recv.is_boolean() {
+                "Boolean"
+            } else if recv.is_number() {
+                "Number"
+            } else {
+                "BigInt"
+            };
+            let key = if let Some(sym) = idx_value.as_symbol() {
+                VmPropertyKey::Symbol(*sym)
+            } else if let Some(s) = idx_value.as_string() {
+                VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+            } else if let Some(n) = idx_value.as_number() {
+                VmPropertyKey::OwnedString(n.to_display_string())
+            } else {
+                return Err(VmError::TypeMismatch);
+            };
+            let proto = self.constructor_prototype_value(ctor_name)?;
+            if proto.is_nullish() {
+                Value::undefined()
+            } else {
+                match self.ordinary_get_value(context, proto, recv, &key, 0)? {
+                    crate::VmGetOutcome::Value(v) => v,
+                    crate::VmGetOutcome::InvokeGetter { getter } => {
+                        let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
                 }
             }
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         write_register(frame, dst, value)?;
         frame.pc += 1;

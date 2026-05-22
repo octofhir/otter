@@ -1123,6 +1123,65 @@ impl Value {
         true
     }
 
+    /// Spec [`typeof`](https://tc39.es/ecma262/#sec-typeof-operator) —
+    /// the JS-visible type tag. Heap-free except for the GC-header
+    /// `type_tag` probe used to discriminate Symbol vs BigInt under
+    /// `TAG_PTR_OTHER`.
+    ///
+    /// An ordinary `JsObject` with a hidden native `[[Call]]` slot
+    /// still surfaces here as `"object"`; the heap-aware variant
+    /// [`Self::typeof_string_with_heap`] upgrades that case to
+    /// `"function"`.
+    #[must_use]
+    #[allow(dead_code)] // Wired up at Phase-1 swap.
+    pub fn typeof_string(self) -> &'static str {
+        if let Some(t) = self.typeof_pure() {
+            return t;
+        }
+        match self.kind() {
+            ValueKind::PtrOther => match self.other_family_kind() {
+                Some(OtherFamilyKind::Symbol) => "symbol",
+                Some(OtherFamilyKind::BigInt) => "bigint",
+                _ => "object",
+            },
+            _ => "object",
+        }
+    }
+
+    /// `typeof` when the VM heap is available. Ordinary objects can
+    /// carry a hidden native `[[Call]]` slot, so their visible tag is
+    /// `"function"` even though the value kind is `PtrObject`.
+    #[must_use]
+    #[allow(dead_code)] // Wired up at Phase-1 swap.
+    pub fn typeof_string_with_heap(self, heap: &otter_gc::GcHeap) -> &'static str {
+        if let Some(obj) = self.as_object()
+            && crate::object::call_native(obj, heap).is_some_and(|v| v.is_native_function())
+        {
+            return "function";
+        }
+        self.typeof_string()
+    }
+
+    /// Convenience: shared empty-string constant. Allocates only on
+    /// first call per heap.
+    ///
+    /// # Errors
+    /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+    #[allow(dead_code)] // Wired up at Phase-1 swap.
+    pub fn empty_string(heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self::string(crate::string::JsString::empty(heap)?))
+    }
+
+    /// Construct a string value from in-memory text. Convenience for
+    /// tests and the compiler's literal table.
+    ///
+    /// # Errors
+    /// See [`crate::string::JsString::from_str`].
+    #[allow(dead_code)] // Wired up at Phase-1 swap.
+    pub fn from_str(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
+        Ok(Self::string(crate::string::JsString::from_str(s, heap)?))
+    }
+
     /// Render the value as a debug-style string suitable for CLI
     /// preview output. The BigInt / String / Symbol arms read the body
     /// through `heap`; every other primitive short-circuits without

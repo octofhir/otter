@@ -1109,7 +1109,7 @@ impl Interpreter {
             }
         }
         out.extend_from_slice(&recv_units[cursor..]);
-        Ok(Value::String(
+        Ok(Value::string(
             JsString::from_utf16_units(&out, &mut self.gc_heap)
                 .map_err(|_| VmError::TypeMismatch)?,
         ))

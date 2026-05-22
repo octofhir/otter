@@ -56,7 +56,7 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
 ];
 
 fn native_is_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::Boolean(matches!(
+    Ok(Value::boolean(matches!(
         args.first(),
         Some(Value::Array(_))
     )))

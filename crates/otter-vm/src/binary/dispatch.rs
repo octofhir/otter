@@ -59,7 +59,7 @@ pub fn array_buffer_call(
         // arg is a TypedArray or DataView.
         M::IsView => {
             let v = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::Boolean(matches!(
+            Ok(Value::boolean(matches!(
                 v,
                 Value::TypedArray(_) | Value::DataView(_)
             )))
@@ -124,7 +124,7 @@ pub fn array_buffer_call_with_roots(
         }
         M::IsView => {
             let v = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::Boolean(matches!(
+            Ok(Value::boolean(matches!(
                 v,
                 Value::TypedArray(_) | Value::DataView(_)
             )))

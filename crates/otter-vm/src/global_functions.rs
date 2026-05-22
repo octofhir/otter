@@ -63,27 +63,27 @@ pub fn call(
         // §19.2.3 — coerces, then defers to the strict predicate.
         M::IsNaN => {
             let value = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::Boolean(number::is_nan(number::to_number_value(
+            Ok(Value::boolean(number::is_nan(number::to_number_value(
                 &value, gc_heap,
             ))))
         }
         M::IsFinite => {
             let value = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::Boolean(number::is_finite(number::to_number_value(
+            Ok(Value::boolean(number::is_finite(number::to_number_value(
                 &value, gc_heap,
             ))))
         }
         // §21.1.2.3 / §21.1.2.2 — strict, no coercion.
         M::NumberIsNaN => {
             let value = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::Boolean(matches!(
+            Ok(Value::boolean(matches!(
                 value,
                 Value::Number(ref n) if number::is_nan(n.as_f64())
             )))
         }
         M::NumberIsFinite => {
             let value = args.first().cloned().unwrap_or(Value::undefined());
-            Ok(Value::Boolean(matches!(
+            Ok(Value::boolean(matches!(
                 value,
                 Value::Number(ref n) if number::is_finite(n.as_f64())
             )))
@@ -124,7 +124,7 @@ pub fn call(
         M::Unescape => {
             let units = coerce_to_utf16(args.first(), gc_heap);
             let decoded = legacy_unescape(&units);
-            Ok(Value::String(
+            Ok(Value::string(
                 JsString::from_utf16_units(&decoded, gc_heap).map_err(|_| VmError::TypeMismatch)?,
             ))
         }
@@ -227,7 +227,7 @@ fn coerce_to_string(arg: Option<&Value>, heap: &otter_gc::GcHeap) -> String {
 }
 
 fn js_string(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, VmError> {
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str(s, heap).map_err(|_| VmError::TypeMismatch)?,
     ))
 }

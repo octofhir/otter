@@ -4594,7 +4594,7 @@ fn string_proto_iterator(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
         }
     };
     let state = IteratorState::String { string, index: 0 };
-    Ok(Value::Iterator(ctx.alloc_iterator_state(
+    Ok(Value::iterator(ctx.alloc_iterator_state(
         state,
         &[],
         &[],
@@ -4683,7 +4683,7 @@ fn array_iterator_factory_call(
         index: 0,
         origin: BuiltinIteratorOrigin::Array,
     };
-    Ok(Value::Iterator(ctx.alloc_iterator_state(
+    Ok(Value::iterator(ctx.alloc_iterator_state(
         state,
         &[],
         &[],

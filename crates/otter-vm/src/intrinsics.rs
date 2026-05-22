@@ -610,7 +610,7 @@ mod tests {
             _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
         };
         let n = recv.len();
-        Ok(Value::String(JsString::from_str(
+        Ok(Value::string(JsString::from_str(
             &n.to_string(),
             args.gc_heap,
         )?))

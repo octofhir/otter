@@ -96,7 +96,7 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         args: &[Value],
     ) -> Result<Value, VmError> {
-        Ok(Value::Array(
+        Ok(Value::array(
             self.alloc_stack_rooted_array_from_values_with_root_slices(
                 stack,
                 args.iter().cloned(),
@@ -226,7 +226,7 @@ impl Interpreter {
                 mapped.push(value);
             }
         }
-        Ok(Value::Array(self.alloc_runtime_rooted_array_from_values(
+        Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
             mapped,
             &[&items, &map_fn, &this_arg],
             &[],

@@ -134,7 +134,7 @@ fn impl_to_fixed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     }
     let digits = f_arg as u32;
     let rendered = super::ecma_fixed::number_to_fixed(recv.as_f64(), digits);
-    Ok(Value::String(JsString::from_latin1(
+    Ok(Value::string(JsString::from_latin1(
         rendered.as_bytes(),
         args.gc_heap,
     )?))
@@ -174,7 +174,7 @@ fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         }
     };
     let rendered = super::ecma_fixed::number_to_exponential(value, digits);
-    Ok(Value::String(JsString::from_latin1(
+    Ok(Value::string(JsString::from_latin1(
         rendered.as_bytes(),
         args.gc_heap,
     )?))
@@ -216,7 +216,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     }
     let precision = p as u32;
     let rendered = super::ecma_fixed::number_to_precision(value, Some(precision));
-    Ok(Value::String(JsString::from_latin1(
+    Ok(Value::string(JsString::from_latin1(
         rendered.as_bytes(),
         args.gc_heap,
     )?))

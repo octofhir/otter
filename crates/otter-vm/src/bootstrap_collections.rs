@@ -998,7 +998,7 @@ fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.delete")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
-    Ok(Value::Boolean(collections::map_delete(
+    Ok(Value::boolean(collections::map_delete(
         m,
         ctx.heap_mut(),
         &key,
@@ -1067,7 +1067,7 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "get Map.prototype.size")?;
-    Ok(Value::Number(crate::number::NumberValue::from_i32(
+    Ok(Value::number(crate::number::NumberValue::from_i32(
         collections::map_len(m, ctx.heap()) as i32,
     )))
 }
@@ -1093,7 +1093,7 @@ fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.delete")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
-    Ok(Value::Boolean(collections::set_delete(
+    Ok(Value::boolean(collections::set_delete(
         s,
         ctx.heap_mut(),
         &v,
@@ -1488,7 +1488,7 @@ fn set_proto_is_disjoint_from(
 
 fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "get Set.prototype.size")?;
-    Ok(Value::Number(crate::number::NumberValue::from_i32(
+    Ok(Value::number(crate::number::NumberValue::from_i32(
         collections::set_len(s, ctx.heap()) as i32,
     )))
 }

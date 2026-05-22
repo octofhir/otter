@@ -153,7 +153,7 @@ fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             });
         }
     };
-    Ok(Value::Boolean(
+    Ok(Value::boolean(
         pd.compare_iso(&other) == std::cmp::Ordering::Equal,
     ))
 }

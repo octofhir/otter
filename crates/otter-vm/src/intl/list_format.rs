@@ -105,7 +105,7 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let heap = &*args.gc_heap;
     let items = collect_items(args.args.first(), heap)?;
     let rendered = join(&items, &payload);
-    Ok(Value::String(crate::string::JsString::from_str(
+    Ok(Value::string(crate::string::JsString::from_str(
         &rendered,
         args.gc_heap,
     )?))
@@ -121,7 +121,7 @@ fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsic
         crate::object::set(part, heap, "type", literal);
         crate::object::set(part, heap, "value", s);
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         [Value::Object(part)],
         &[],
         &[],

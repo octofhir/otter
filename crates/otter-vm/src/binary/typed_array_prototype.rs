@@ -591,7 +591,7 @@ fn wrap_iterator(
         index: 0,
         origin: crate::BuiltinIteratorOrigin::Array,
     };
-    Ok(Value::Iterator(args.alloc_iterator_state_rooted(
+    Ok(Value::iterator(args.alloc_iterator_state_rooted(
         state,
         &[&arr_value],
         &[],

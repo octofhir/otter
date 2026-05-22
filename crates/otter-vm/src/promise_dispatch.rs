@@ -1422,7 +1422,7 @@ fn static_resolve(
             return Ok(Value::promise(*p));
         }
     }
-    Ok(Value::Promise(
+    Ok(Value::promise(
         PromiseBuilder::new().fulfilled_runtime_rooted(interp, value, &[], &[args])?,
     ))
 }
@@ -2434,7 +2434,7 @@ fn make_aggregate_error_native_rooted(
 }
 
 fn aggregate_error_message(heap: &mut otter_gc::GcHeap) -> Result<Value, NativeError> {
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str("All promises were rejected", heap).map_err(|e| {
             NativeError::TypeError {
                 name: "Promise",

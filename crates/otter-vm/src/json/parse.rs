@@ -344,7 +344,7 @@ fn finish_builder(
                     value.trace_value_slots(visitor);
                 }
             };
-            Ok(Value::Array(
+            Ok(Value::array(
                 crate::array::from_elements_with_source_and_roots(
                     gc_heap,
                     elements.iter().cloned(),

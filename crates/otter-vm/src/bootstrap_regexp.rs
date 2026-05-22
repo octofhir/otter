@@ -220,7 +220,7 @@ fn legacy_accessor_getter(
             reason: "Method called on incompatible receiver".to_string(),
         });
     }
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str("", ctx.heap_mut()).map_err(|_| NativeError::TypeError {
             name: "RegExp legacy accessor",
             reason: "out of memory".to_string(),
@@ -746,7 +746,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
         }
     };
     let escaped = crate::regexp_prototype::escape_regexp_pattern(&raw);
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str(&escaped, ctx.heap_mut()).map_err(|_| oom("source"))?,
     ))
 }
@@ -838,7 +838,7 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
         }
     }
 
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str(&out, ctx.heap_mut()).map_err(|_| oom("flags"))?,
     ))
 }

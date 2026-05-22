@@ -321,7 +321,6 @@ pub struct DrainBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::number::NumberValue;
 
     fn task_for(n: i32) -> Microtask {
         Microtask {

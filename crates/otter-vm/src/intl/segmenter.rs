@@ -137,7 +137,7 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         elements.push(Value::object(obj));
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         elements,
         &[&input_value],
         &[&prepared_values],

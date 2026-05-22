@@ -475,7 +475,7 @@ fn impl_starts_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let recv = receiver_string(args)?;
     let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
-    Ok(Value::Boolean(recv.starts_with(
+    Ok(Value::boolean(recv.starts_with(
         &needle,
         from,
         args.gc_heap,
@@ -486,7 +486,7 @@ fn impl_ends_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     let recv = receiver_string(args)?;
     let needle = arg_to_string(args, 0)?;
     let end_pos = arg_u32_or(args, 1, recv.len())?;
-    Ok(Value::Boolean(recv.ends_with(
+    Ok(Value::boolean(recv.ends_with(
         &needle,
         end_pos,
         args.gc_heap,
@@ -545,7 +545,7 @@ fn impl_repeat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     for _ in 0..count {
         buf.extend_from_slice(&units);
     }
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &buf,
         args.gc_heap,
     )?))
@@ -592,7 +592,7 @@ fn pad_impl(args: &mut IntrinsicArgs<'_>, side: PadSide) -> Result<Value, Intrin
     if matches!(side, PadSide::Start) {
         buf.extend_from_slice(&recv_units);
     }
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &buf,
         args.gc_heap,
     )?))
@@ -636,7 +636,7 @@ fn trim_impl(args: &mut IntrinsicArgs<'_>, side: TrimSide) -> Result<Value, Intr
     } else {
         &[][..]
     };
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         slice,
         args.gc_heap,
     )?))
@@ -748,7 +748,7 @@ fn impl_to_well_formed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         }
         i += 1;
     }
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &out,
         args.gc_heap,
     )?))
@@ -775,7 +775,7 @@ fn impl_substr(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     if int_length <= 0 {
         return Ok(Value::string(JsString::empty(args.gc_heap)?));
     }
-    Ok(Value::String(recv.slice(
+    Ok(Value::string(recv.slice(
         int_start as u32,
         int_length as u32,
         args.gc_heap,
@@ -845,7 +845,7 @@ fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let unit = recv
         .char_code_at(idx as u32, args.gc_heap)
         .expect("index in range yields a code unit");
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &[unit],
         args.gc_heap,
     )?))
@@ -888,7 +888,7 @@ fn impl_to_lower_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             u
         }
     });
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &lowered,
         args.gc_heap,
     )?))
@@ -904,7 +904,7 @@ fn impl_to_upper_case(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             u
         }
     });
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &upper,
         args.gc_heap,
     )?))
@@ -945,7 +945,7 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     buf.extend_from_slice(&recv_units[..pos]);
     buf.extend_from_slice(&replacement_units);
     buf.extend_from_slice(&recv_units[pos + needle_units.len()..]);
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &buf,
         args.gc_heap,
     )?))
@@ -1006,7 +1006,7 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
         }
     }
     buf.extend_from_slice(&recv_units[i..]);
-    Ok(Value::String(JsString::from_utf16_units(
+    Ok(Value::string(JsString::from_utf16_units(
         &buf,
         args.gc_heap,
     )?))
@@ -1086,7 +1086,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let part = JsString::from_utf16_units(&recv_units[start..], args.gc_heap)?;
         out.push(Value::string(part));
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1211,7 +1211,7 @@ fn regex_split(
         let part = JsString::from_utf16_units(&recv_units[cursor..], args.gc_heap)?;
         out.push(Value::string(part));
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1928,7 +1928,7 @@ fn native_string_replace_callable(
         }
     }
     out.extend_from_slice(&recv_units[cursor..]);
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_utf16_units(&out, interp.gc_heap_mut()).map_err(|err| {
             NativeError::TypeError {
                 name: if replace_all { "replaceAll" } else { "replace" },

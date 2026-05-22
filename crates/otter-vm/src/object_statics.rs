@@ -393,7 +393,7 @@ fn native_keys_rooted(
     for key in owned {
         names.push(string_value(&key, ctx.heap_mut())?);
     }
-    Ok(Value::Array(ctx.array_from_elements_with_roots(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         names,
         &[],
         &[args],
@@ -406,7 +406,7 @@ fn native_values_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
         p.enumerable_data_iter().map(|(_, value)| value).collect()
     });
     let target_root = Value::object(target);
-    Ok(Value::Array(ctx.array_from_elements_with_roots(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         values,
         &[&target_root],
         &[args],
@@ -432,7 +432,7 @@ fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         )?;
         pairs.push(Value::array(pair));
     }
-    Ok(Value::Array(ctx.array_from_elements_with_roots(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         pairs,
         &[&target_root],
         &[args],
@@ -878,7 +878,7 @@ fn native_get_own_property_names_rooted(
         }
         _ => return Err(VmError::TypeMismatch),
     };
-    Ok(Value::Array(ctx.array_from_elements_with_roots(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         values,
         &[],
         &[args],
@@ -941,7 +941,7 @@ fn native_get_own_property_symbols_rooted(
         p.symbol_keys().map(Value::Symbol).collect()
     });
     let target_root = Value::object(target);
-    Ok(Value::Array(ctx.array_from_elements_with_roots(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         syms,
         &[&target_root],
         &[args],
@@ -1049,7 +1049,7 @@ native_object_static!(native_group_by, GroupBy);
 fn native_is(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let a = args.first().cloned().unwrap_or(Value::undefined());
     let b = args.get(1).cloned().unwrap_or(Value::undefined());
-    Ok(Value::Boolean(crate::abstract_ops::same_value(
+    Ok(Value::boolean(crate::abstract_ops::same_value(
         &a,
         &b,
         ctx.heap(),
@@ -1148,7 +1148,7 @@ fn native_prototype_to_string(
     };
     let display = format!("[object {tag}]");
 
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str(&display, ctx.heap_mut()).map_err(|_| NativeError::TypeError {
             name: "toString",
             reason: "out of memory while allocating string".to_string(),
@@ -2652,7 +2652,7 @@ pub fn call(
             for k in owned {
                 names.push(string_value(&k, gc_heap)?);
             }
-            Ok(Value::Array(rooted_array_from_elements(
+            Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 names,
                 &[],
@@ -2667,7 +2667,7 @@ pub fn call(
                 p.enumerable_data_iter().map(|(_, v)| v).collect()
             });
             let target_root = Value::object(target);
-            Ok(Value::Array(rooted_array_from_elements(
+            Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 values,
                 &[&target_root],
@@ -2697,7 +2697,7 @@ pub fn call(
                 )?));
             }
             let target_root = Value::object(target);
-            Ok(Value::Array(rooted_array_from_elements(
+            Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 pairs,
                 &[&target_root],
@@ -2825,7 +2825,7 @@ pub fn call(
             for k in owned {
                 names.push(string_value(&k, gc_heap)?);
             }
-            Ok(Value::Array(rooted_array_from_elements(
+            Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 names,
                 &[],
@@ -2843,7 +2843,7 @@ pub fn call(
                 p.symbol_keys().map(Value::Symbol).collect()
             });
             let target_root = Value::object(target);
-            Ok(Value::Array(rooted_array_from_elements(
+            Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 syms,
                 &[&target_root],
@@ -2867,7 +2867,7 @@ pub fn call(
 }
 
 fn string_value(s: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, VmError> {
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str(s, heap).map_err(|_| VmError::TypeMismatch)?,
     ))
 }

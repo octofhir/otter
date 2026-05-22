@@ -74,7 +74,7 @@ fn impl_select(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         Some(Value::Boolean(false)) | Some(Value::Null) => 0.0,
         _ => f64::NAN,
     };
-    Ok(Value::String(crate::string::JsString::from_str(
+    Ok(Value::string(crate::string::JsString::from_str(
         plural_category_en(n, &payload.kind),
         args.gc_heap,
     )?))

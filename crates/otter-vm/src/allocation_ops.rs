@@ -226,7 +226,7 @@ impl Interpreter {
                 }
             }
         };
-        Ok(Value::NativeFunction(
+        Ok(Value::native_function(
             NativeFunction::new_static_with_roots(
                 &mut self.gc_heap,
                 name,
@@ -300,13 +300,15 @@ impl Interpreter {
                 }
             }
         };
-        Ok(Value::NativeFunction(NativeFunction::from_call_with_roots(
-            &mut self.gc_heap,
-            name,
-            length,
-            call,
-            &mut external_visit,
-        )?))
+        Ok(Value::native_function(
+            NativeFunction::from_call_with_roots(
+                &mut self.gc_heap,
+                name,
+                length,
+                call,
+                &mut external_visit,
+            )?,
+        ))
     }
 
     pub(crate) fn alloc_runtime_rooted_iterator_state(

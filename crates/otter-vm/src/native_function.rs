@@ -935,7 +935,7 @@ where
         + Sync
         + 'static,
 {
-    Ok(Value::NativeFunction(NativeFunction::new(
+    Ok(Value::native_function(NativeFunction::new(
         heap, name, call,
     )?))
 }
@@ -947,7 +947,7 @@ pub fn native_value_static(
     length: u8,
     call: NativeFastFn,
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::NativeFunction(NativeFunction::new_static(
+    Ok(Value::native_function(NativeFunction::new_static(
         heap, name, length, call,
     )?))
 }
@@ -966,7 +966,7 @@ where
         + Sync
         + 'static,
 {
-    Ok(Value::NativeFunction(NativeFunction::with_captures(
+    Ok(Value::native_function(NativeFunction::with_captures(
         heap, name, call, captures,
     )?))
 }
@@ -981,7 +981,7 @@ pub(crate) fn native_constructor_value_with_captures_unchecked_with_roots<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
+    Ok(Value::native_function(NativeFunction::allocate_with_roots(
         heap,
         name,
         0,
@@ -1003,7 +1003,7 @@ pub(crate) fn native_value_with_captures_unchecked_with_roots<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
+    Ok(Value::native_function(NativeFunction::allocate_with_roots(
         heap,
         name,
         0,
@@ -1027,7 +1027,7 @@ pub(crate) fn traced_native_value_with_length<F>(
 where
     F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
 {
-    Ok(Value::NativeFunction(NativeFunction::allocate_with_roots(
+    Ok(Value::native_function(NativeFunction::allocate_with_roots(
         heap,
         name,
         length,

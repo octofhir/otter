@@ -38,7 +38,7 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let clamped_start = start.clamp(0, len) as usize;
     let clamped_end = end.clamp(clamped_start as i64, len) as usize;
     let copy: Vec<u8> = buf.with_bytes(args.gc_heap, |b| b[clamped_start..clamped_end].to_vec());
-    Ok(Value::ArrayBuffer(args.array_buffer_from_bytes_rooted(
+    Ok(Value::array_buffer(args.array_buffer_from_bytes_rooted(
         copy,
         &[],
         &[],

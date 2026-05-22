@@ -137,7 +137,7 @@ fn make_iter_value(
     args: &mut IntrinsicArgs<'_>,
     state: crate::IteratorState,
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::Iterator(args.alloc_iterator_state_rooted(
+    Ok(Value::iterator(args.alloc_iterator_state_rooted(
         state,
         &[],
         &[],
@@ -747,7 +747,7 @@ fn make_native_iter_value(
     ctx: &mut crate::NativeCtx<'_>,
     state: crate::IteratorState,
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::Iterator(ctx.alloc_iterator_state(
+    Ok(Value::iterator(ctx.alloc_iterator_state(
         state,
         &[],
         &[],

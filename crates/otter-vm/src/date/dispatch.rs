@@ -114,7 +114,7 @@ pub fn call_static(
             let minutes = number_or(args, 4, 0.0);
             let seconds = number_or(args, 5, 0.0);
             let ms = number_or(args, 6, 0.0);
-            Ok(Value::Number(NumberValue::from_f64(make_date(
+            Ok(Value::number(NumberValue::from_f64(make_date(
                 year, month, day, hours, minutes, seconds, ms,
             ))))
         }

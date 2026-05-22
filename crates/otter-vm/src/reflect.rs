@@ -225,7 +225,7 @@ pub fn call(
         M::OwnKeys => {
             let target = expect_object_value(args.first())?;
             let keys = interp.own_property_keys_value(context, &target)?;
-            Ok(Value::Array(
+            Ok(Value::array(
                 interp.alloc_runtime_rooted_array_from_values(keys, &[&target], &[])?,
             ))
         }

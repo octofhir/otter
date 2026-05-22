@@ -554,7 +554,7 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         out[i - start] = v;
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -597,7 +597,7 @@ fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             other => combined.push(*other),
         }
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         combined.iter().cloned(),
         &[],
         &[combined.as_slice()],
@@ -974,7 +974,7 @@ fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     };
     let mut out: Vec<Value> = Vec::with_capacity(elements.len());
     walk(&mut out, heap, &elements, depth);
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1341,7 +1341,7 @@ fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError
         dst += 1;
         srcidx += 1;
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1558,7 +1558,7 @@ fn impl_to_sorted(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
                 .cmp(&b.display_string(args.gc_heap)),
         }
     });
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1596,7 +1596,7 @@ fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
             out[len - 1 - i] = v;
         }
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],
@@ -1647,7 +1647,7 @@ fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         out[actual] = replacement;
     }
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         out.iter().cloned(),
         &[],
         &[out.as_slice()],

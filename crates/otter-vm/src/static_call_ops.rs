@@ -1827,7 +1827,7 @@ fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
 }
 
 fn stack_static_string_value(s: &str, interp: &mut Interpreter) -> Result<Value, VmError> {
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_str(s, interp.gc_heap_mut()).map_err(|_| VmError::TypeMismatch)?,
     ))
 }

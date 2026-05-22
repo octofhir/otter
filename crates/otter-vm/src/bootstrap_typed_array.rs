@@ -850,7 +850,7 @@ fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
         Value::TypedArray(t) => {
             let t = *t;
             let n = t.byte_length(ctx.heap());
-            Ok(Value::Number(crate::number::NumberValue::from_f64(
+            Ok(Value::number(crate::number::NumberValue::from_f64(
                 n as f64,
             )))
         }
@@ -867,7 +867,7 @@ fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
         Value::TypedArray(t) => {
             let t = *t;
             let n = t.byte_offset(ctx.heap());
-            Ok(Value::Number(crate::number::NumberValue::from_f64(
+            Ok(Value::number(crate::number::NumberValue::from_f64(
                 n as f64,
             )))
         }
@@ -884,7 +884,7 @@ fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
         Value::TypedArray(t) => {
             let t = *t;
             let n = t.length(ctx.heap());
-            Ok(Value::Number(crate::number::NumberValue::from_f64(
+            Ok(Value::number(crate::number::NumberValue::from_f64(
                 n as f64,
             )))
         }
@@ -907,7 +907,7 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
         _ => return Ok(Value::undefined()),
     };
 
-    Ok(Value::String(
+    Ok(Value::string(
         crate::string::JsString::from_str(kind_name, ctx.heap_mut()).map_err(|_| {
             NativeError::TypeError {
                 name: "TypedArray.prototype[@@toStringTag]",

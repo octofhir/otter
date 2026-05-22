@@ -494,14 +494,14 @@ fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     if b.is_detached(ctx.heap()) {
         return Ok(Value::number(NumberValue::from_i32(0)));
     }
-    Ok(Value::Number(NumberValue::from_i32(
+    Ok(Value::number(NumberValue::from_i32(
         b.byte_length(ctx.heap()) as i32,
     )))
 }
 
 fn ab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.maxByteLength")?;
-    Ok(Value::Number(NumberValue::from_i32(
+    Ok(Value::number(NumberValue::from_i32(
         b.max_byte_length(ctx.heap()) as i32,
     )))
 }

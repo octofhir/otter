@@ -45,7 +45,7 @@ pub fn call(
                 };
                 units.push(truncated);
             }
-            Ok(Value::String(
+            Ok(Value::string(
                 JsString::from_utf16_units(&units, gc_heap).map_err(|_| VmError::TypeMismatch)?,
             ))
         }
@@ -71,7 +71,7 @@ pub fn call(
                     units.push(0xDC00 | (v & 0x3FF) as u16);
                 }
             }
-            Ok(Value::String(
+            Ok(Value::string(
                 JsString::from_utf16_units(&units, gc_heap).map_err(|_| VmError::TypeMismatch)?,
             ))
         }

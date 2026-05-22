@@ -101,7 +101,7 @@ pub(crate) fn exec_once(
         re.set_last_index(args.gc_heap, m.range.end as u32);
     }
 
-    Ok(Value::Array(build_match_result(
+    Ok(Value::array(build_match_result(
         &m,
         &units,
         text,
@@ -150,7 +150,7 @@ pub(crate) fn exec_once_native(
         re.set_last_index(ctx.heap_mut(), m.range.end as u32);
     }
 
-    Ok(Value::Array(build_match_result_native(
+    Ok(Value::array(build_match_result_native(
         &m,
         &units,
         text,
@@ -489,7 +489,7 @@ fn pair_array(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::Array(args.array_from_elements_rooted(
+    Ok(Value::array(args.array_from_elements_rooted(
         [
             Value::Number(NumberValue::from_i32(start as i32)),
             Value::Number(NumberValue::from_i32(end as i32)),
@@ -506,7 +506,7 @@ fn pair_array_native(
     value_roots: &[&Value],
     slice_roots: &[&[Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
-    Ok(Value::Array(ctx.array_from_elements_with_roots(
+    Ok(Value::array(ctx.array_from_elements_with_roots(
         [
             Value::Number(NumberValue::from_i32(start as i32)),
             Value::Number(NumberValue::from_i32(end as i32)),
@@ -1207,7 +1207,7 @@ pub fn native_regexp_symbol_replace(
         accumulated.extend_from_slice(&s_units[next_source_position..]);
     }
 
-    Ok(Value::String(
+    Ok(Value::string(
         JsString::from_utf16_units(&accumulated, ctx.heap_mut()).map_err(|_| {
             crate::NativeError::TypeError {
                 name,

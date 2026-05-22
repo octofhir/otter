@@ -366,7 +366,7 @@ fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
     if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
         return Ok(Value::number(crate::number::NumberValue::from_i32(0)));
     }
-    Ok(Value::Number(crate::number::NumberValue::from_i32(
+    Ok(Value::number(crate::number::NumberValue::from_i32(
         view.byte_length(ctx.heap()) as i32,
     )))
 }
@@ -376,7 +376,7 @@ fn dv_get_byte_offset(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
     if view.buffer(ctx.heap()).is_detached(ctx.heap()) {
         return Ok(Value::number(crate::number::NumberValue::from_i32(0)));
     }
-    Ok(Value::Number(crate::number::NumberValue::from_i32(
+    Ok(Value::number(crate::number::NumberValue::from_i32(
         view.byte_offset(ctx.heap()) as i32,
     )))
 }

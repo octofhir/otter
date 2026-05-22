@@ -52,50 +52,49 @@ impl StringifyOptions {
     ) -> Result<Self, JsonError> {
         // §25.5.2.4 step 5 — unwrap Number / String wrapper objects.
         let unwrapped: Value;
-        let space = match (space, gc_heap) {
-            (Value::Object(obj), Some(heap)) => {
-                if let Some(n) = crate::object::number_data(*obj, heap) {
-                    unwrapped = Value::number(n);
-                    &unwrapped
-                } else if let Some(s) = crate::object::string_data(*obj, heap) {
-                    unwrapped = Value::string(s);
-                    &unwrapped
-                } else {
-                    space
-                }
+        let space = if let Some(obj) = space.as_object()
+            && let Some(heap) = gc_heap
+        {
+            if let Some(n) = crate::object::number_data(obj, heap) {
+                unwrapped = Value::number(n);
+                &unwrapped
+            } else if let Some(s) = crate::object::string_data(obj, heap) {
+                unwrapped = Value::string(s);
+                &unwrapped
+            } else {
+                space
             }
-            _ => space,
+        } else {
+            space
         };
-        match space {
-            Value::Undefined | Value::Null => Ok(Self::default()),
-            Value::Number(n) => {
-                let f = n.as_f64();
-                let count = if f.is_nan() || f <= 0.0 {
-                    0
-                } else if f >= 10.0 {
-                    10
-                } else {
-                    f.trunc() as usize
-                };
-                Ok(Self {
-                    indent: vec![b' '; count],
-                })
-            }
-            Value::String(s) => {
-                let bytes = match gc_heap {
-                    Some(heap) => s.to_lossy_string(heap).into_bytes(),
-                    None => Vec::new(),
-                };
-                let take = bytes.len().min(10);
-                Ok(Self {
-                    indent: bytes[..take].to_vec(),
-                })
-            }
-            // §25.5.2.4 step 8: `Else, let gap be the empty
-            // String.` Boolean / Symbol / Object / other primitives
-            // silently degrade to compact output rather than throwing.
-            _ => Ok(Self::default()),
+        if space.is_undefined() || space.is_null() {
+            return Ok(Self::default());
         }
+        if let Some(n) = space.as_number() {
+            let f = n.as_f64();
+            let count = if f.is_nan() || f <= 0.0 {
+                0
+            } else if f >= 10.0 {
+                10
+            } else {
+                f.trunc() as usize
+            };
+            return Ok(Self {
+                indent: vec![b' '; count],
+            });
+        }
+        if let Some(s) = space.as_string() {
+            let bytes = match gc_heap {
+                Some(heap) => s.to_lossy_string(heap).into_bytes(),
+                None => Vec::new(),
+            };
+            let take = bytes.len().min(10);
+            return Ok(Self {
+                indent: bytes[..take].to_vec(),
+            });
+        }
+        // §25.5.2.4 step 8 — empty gap fallback.
+        Ok(Self::default())
     }
 
     /// `true` when the output should be pretty-printed.
@@ -280,156 +279,104 @@ fn emit_value(
     options: &StringifyOptions,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<(), JsonError> {
-    match value {
-        Value::Null => out.push_str("null"),
-        // Top-level `undefined` is filtered upstream; nested
-        // `undefined` reaches us only inside arrays where the
-        // caller already substituted `null`. As a safety net, treat
-        // it as null too.
-        Value::Undefined | Value::Hole => out.push_str("null"),
-        Value::Boolean(true) => out.push_str("true"),
-        Value::Boolean(false) => out.push_str("false"),
-        Value::Number(n) => write_number(out, *n),
-        Value::BigInt(_) => return Err(JsonError::BigInt),
-        Value::String(s) => write_string_literal(out, &s.to_lossy_string(gc_heap)),
-        Value::Array(arr) => {
-            // Lazy stringify memcpy fast-path: an array that came
-            // from `JSON.parse` and has not been mutated since
-            // captures the original textual `[…]` slice on its body.
-            // When every element is a render-stable primitive
-            // (numbers / strings / booleans / null) the captured
-            // bytes are still authoritative, so we re-emit them
-            // verbatim without descending. Pretty-printing changes
-            // layout, so it disables the fast path.
-            //
-            // Spec: <https://tc39.es/ecma262/#sec-json.stringify> §25.5.2
-            if !options.pretty()
-                && let Some(source) = crate::array::clean_source_bytes(*arr, gc_heap)
-                && let Ok(text) = std::str::from_utf8(&source)
-            {
-                out.push_str(text);
-                return Ok(());
-            }
-            if stack.len() >= MAX_NESTING_DEPTH {
-                return Err(JsonError::TooDeep {
-                    limit: MAX_NESTING_DEPTH,
-                });
-            }
-            visit.enter_array(arr)?;
-            out.push('[');
-            stack.push(Frame::Array {
-                arr: *arr,
-                idx: 0,
-                had_member: false,
+    if value.is_null() {
+        out.push_str("null");
+    } else if value.is_undefined() || value.is_hole() {
+        // Top-level `undefined` filtered upstream; nested also routes
+        // to `null` upstream — belt-and-braces.
+        out.push_str("null");
+    } else if let Some(b) = value.as_boolean() {
+        out.push_str(if b { "true" } else { "false" });
+    } else if let Some(n) = value.as_number() {
+        write_number(out, n);
+    } else if value.is_big_int() {
+        return Err(JsonError::BigInt);
+    } else if let Some(s) = value.as_string() {
+        write_string_literal(out, &s.to_lossy_string(gc_heap));
+    } else if let Some(arr) = value.as_array() {
+        // Lazy stringify memcpy fast-path: capture text from JSON.parse.
+        if !options.pretty()
+            && let Some(source) = crate::array::clean_source_bytes(arr, gc_heap)
+            && let Ok(text) = std::str::from_utf8(&source)
+        {
+            out.push_str(text);
+            return Ok(());
+        }
+        if stack.len() >= MAX_NESTING_DEPTH {
+            return Err(JsonError::TooDeep {
+                limit: MAX_NESTING_DEPTH,
             });
         }
-        Value::Object(obj) => {
-            // §25.5.2 Date instances are ordinary objects with a
-            // `[[DateValue]]` internal slot — emit the ISO 8601
-            // form before falling into the generic object branch.
-            // Mirrors `Date.prototype.toJSON` (§21.4.4.41).
-            // <https://tc39.es/ecma262/#sec-date.prototype.tojson>
-            if let Some(time) = crate::object::date_data(*obj, gc_heap) {
-                match crate::date::to_iso_string(time) {
-                    Some(s) => write_string_literal(out, &s),
-                    None => out.push_str("null"),
-                }
-                return Ok(());
+        visit.enter_array(&arr)?;
+        out.push('[');
+        stack.push(Frame::Array {
+            arr,
+            idx: 0,
+            had_member: false,
+        });
+    } else if let Some(obj) = value.as_object() {
+        // §25.5.2 Date instances expose `[[DateValue]]`.
+        if let Some(time) = crate::object::date_data(obj, gc_heap) {
+            match crate::date::to_iso_string(time) {
+                Some(s) => write_string_literal(out, &s),
+                None => out.push_str("null"),
             }
-            if stack.len() >= MAX_NESTING_DEPTH {
-                return Err(JsonError::TooDeep {
-                    limit: MAX_NESTING_DEPTH,
-                });
-            }
-            visit.enter_object(obj)?;
-            out.push('{');
-            // Per ECMA-262 §25.5.2.4 SerializeJSONObject step 4 we
-            // walk only the enumerable own string keys. Accessor
-            // slots are skipped here for the slice — invoking
-            // getters during serialisation requires interpreter
-            // access and is filed as a follow-up.
-            // <https://tc39.es/ecma262/#sec-serializejsonobject>
-            let entries: Vec<(String, Value)> =
-                crate::object::with_properties(*obj, gc_heap, |p| {
-                    p.enumerable_data_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect()
-                });
-            stack.push(Frame::Object {
-                entries,
-                idx: 0,
-                had_member: false,
-                _root: *obj,
+            return Ok(());
+        }
+        if stack.len() >= MAX_NESTING_DEPTH {
+            return Err(JsonError::TooDeep {
+                limit: MAX_NESTING_DEPTH,
             });
         }
-        // Symbols are silently dropped by `JSON.stringify` per
-        // §25.5.2. Inside an array context the upstream walker has
-        // already substituted `null`; for top-level symbols and
-        // belt-and-braces guards we also emit `null` here. Map /
-        // Set / Weak collections do not have a JSON representation
-        // either — their default serialisation is `{}`. For the
-        // foundation we render them as `null` to match the
-        // existing wildcard behaviour.
-        Value::Symbol(_)
-        | Value::Function { .. }
-        | Value::Closure(_)
-        | Value::BoundFunction(_)
-        | Value::NativeFunction(_)
-        | Value::Iterator(_)
-        | Value::RegExp(_)
-        | Value::Promise(_)
-        | Value::ClassConstructor(_)
-        | Value::Map(_)
-        | Value::Set(_)
-        | Value::WeakMap(_)
-        | Value::WeakSet(_)
-        | Value::WeakRef(_)
-        | Value::FinalizationRegistry(_)
-        | Value::Temporal(_)
-        | Value::Intl(_)
-        | Value::ArrayBuffer(_)
-        | Value::DataView(_)
-        | Value::Generator(_)
-        | Value::Proxy(_) => {
-            out.push_str("null");
+        visit.enter_object(&obj)?;
+        out.push('{');
+        // §25.5.2.4 SerializeJSONObject step 4 — enumerable own string keys.
+        let entries: Vec<(String, Value)> = crate::object::with_properties(obj, gc_heap, |p| {
+            p.enumerable_data_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect()
+        });
+        stack.push(Frame::Object {
+            entries,
+            idx: 0,
+            had_member: false,
+            _root: obj,
+        });
+    } else if let Some(ta) = value.as_typed_array() {
+        // §25.5.2 — TypedArrays serialise like array-likes.
+        if stack.len() >= MAX_NESTING_DEPTH {
+            return Err(JsonError::TooDeep {
+                limit: MAX_NESTING_DEPTH,
+            });
         }
-        // §25.5.2 — TypedArrays serialise like ordinary array-likes:
-        // their indexed elements emit as a JSON array. Spec §25.5.2.4
-        // SerializeJSONArray treats them through the array branch.
-        Value::TypedArray(ta) => {
-            if stack.len() >= MAX_NESTING_DEPTH {
-                return Err(JsonError::TooDeep {
-                    limit: MAX_NESTING_DEPTH,
-                });
+        out.push('[');
+        let len = ta.length(gc_heap);
+        for i in 0..len {
+            if i > 0 {
+                out.push(',');
             }
-            out.push('[');
-            let len = ta.length(gc_heap);
-            for i in 0..len {
-                if i > 0 {
-                    out.push(',');
-                }
-                let value = ta.get(gc_heap, i)?;
-                emit_value(&value, out, stack, visit, options, gc_heap)?;
-            }
-            out.push(']');
+            let value = ta.get(gc_heap, i)?;
+            emit_value(&value, out, stack, visit, options, gc_heap)?;
         }
+        out.push(']');
+    } else {
+        // Symbols, functions, Map / Set / Weak collections, etc.
+        // — render as `null` per §25.5.2 + foundation fallback.
+        out.push_str("null");
     }
     let _ = options;
     Ok(())
 }
 
 fn is_serialisable(value: &Value) -> bool {
-    !matches!(
-        value,
-        Value::Undefined
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_)
-            | Value::Iterator(_)
-            | Value::RegExp(_)
-            | Value::ClassConstructor(_)
-    )
+    !(value.is_undefined()
+        || value.is_function()
+        || value.is_closure()
+        || value.is_bound_function()
+        || value.is_native_function()
+        || value.is_iterator()
+        || value.is_regexp()
+        || value.is_class_constructor())
 }
 
 fn write_number(out: &mut String, n: NumberValue) {
@@ -506,9 +453,9 @@ mod tests {
 
     #[test]
     fn options_space_clamped_to_ten() {
-        let opts = StringifyOptions::from_space(&Value::Number(NumberValue::from_i32(20))).unwrap();
+        let opts = StringifyOptions::from_space(&Value::number(NumberValue::from_i32(20))).unwrap();
         assert_eq!(opts.indent.len(), 10);
-        let opts = StringifyOptions::from_space(&Value::Number(NumberValue::from_i32(-5))).unwrap();
+        let opts = StringifyOptions::from_space(&Value::number(NumberValue::from_i32(-5))).unwrap();
         assert_eq!(opts.indent.len(), 0);
     }
 
@@ -516,7 +463,7 @@ mod tests {
     fn options_string_truncated_to_ten_bytes() {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let s = crate::string::JsString::from_str("xxxxxxxxxxYYYY", &mut heap).unwrap();
-        let opts = StringifyOptions::from_space_with_heap(&Value::String(s), Some(&heap)).unwrap();
+        let opts = StringifyOptions::from_space_with_heap(&Value::string(s), Some(&heap)).unwrap();
         assert_eq!(opts.indent.len(), 10);
     }
 
@@ -538,8 +485,8 @@ mod tests {
     fn cycle_detection_handles_self_reference() {
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let obj = crate::object::alloc_object_old_for_fixture(&mut heap).unwrap();
-        crate::object::set(obj, &mut heap, "self", Value::Object(obj));
-        let err = stringify(&Value::Object(obj), &mut heap).unwrap_err();
+        crate::object::set(obj, &mut heap, "self", Value::object(obj));
+        let err = stringify(&Value::object(obj), &mut heap).unwrap_err();
         assert!(matches!(err, JsonError::Cyclic));
     }
 }

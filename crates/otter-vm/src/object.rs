@@ -164,40 +164,15 @@ impl ObjectPrototype {
     fn as_value(&self) -> Option<Value> {
         match self {
             Self::Null => None,
-            Self::Object(obj) => Some(Value::Object(*obj)),
+            Self::Object(obj) => Some(Value::object(*obj)),
             Self::Value(value) => Some(*value),
-            Self::Proxy(proxy) => Some(Value::Proxy(*proxy)),
+            Self::Proxy(proxy) => Some(Value::proxy(*proxy)),
         }
     }
 }
 
 fn is_prototype_object_value(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Object(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Promise(_)
-            | Value::Iterator(_)
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Temporal(_)
-            | Value::Intl(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::Generator(_)
-            | Value::Proxy(_)
-    )
+    value.is_object_like()
 }
 
 // ---------- internal slot type --------------------------------------------
@@ -854,7 +829,7 @@ pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
     match lookup(obj, heap, key) {
         PropertyLookup::Absent => None,
         PropertyLookup::Data { value, .. } => Some(value),
-        PropertyLookup::Accessor { .. } => Some(Value::Undefined),
+        PropertyLookup::Accessor { .. } => Some(Value::undefined()),
     }
 }
 
@@ -1583,7 +1558,7 @@ pub(crate) fn ordinary_set_data_property_with_shape(
 }
 
 /// Replace the prototype with a spec-legal value. `None` or
-/// `Some(Value::Null)` detaches the chain.
+/// `Some(Value::null())` detaches the chain.
 ///
 /// Implements `OrdinarySetPrototypeOf` per ECMA-262 §10.1.2.1 — the
 /// `SameValue(V, current)` early-return, the non-extensibility
@@ -1600,12 +1575,20 @@ pub fn set_prototype_value(
     heap: &mut otter_gc::GcHeap,
     proto: Option<Value>,
 ) -> bool {
-    let new_proto = match proto {
-        Some(Value::Object(proto)) => ObjectPrototype::Object(proto),
-        Some(Value::Proxy(proxy)) => ObjectPrototype::Proxy(proxy),
-        Some(Value::Null) | None => ObjectPrototype::Null,
-        Some(value) if is_prototype_object_value(&value) => ObjectPrototype::Value(value),
-        _ => return false,
+    let new_proto = if let Some(value) = proto {
+        if value.is_null() {
+            ObjectPrototype::Null
+        } else if let Some(o) = value.as_object() {
+            ObjectPrototype::Object(o)
+        } else if let Some(p) = value.as_proxy() {
+            ObjectPrototype::Proxy(p)
+        } else if is_prototype_object_value(&value) {
+            ObjectPrototype::Value(value)
+        } else {
+            return false;
+        }
+    } else {
+        ObjectPrototype::Null
     };
     // §10.1.2.1 step 4 — `SameValue(V, current) is true → return true`.
     let current = heap.read_payload(obj, |body| body.prototype.clone());
@@ -1662,11 +1645,13 @@ fn prototype_same(a: &ObjectPrototype, b: &ObjectPrototype) -> bool {
 }
 
 fn same_prototype_value(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Object(x), Value::Object(y)) => x == y,
-        (Value::Array(x), Value::Array(y)) => crate::array::ptr_eq(*x, *y),
-        _ => false,
+    if let (Some(x), Some(y)) = (a.as_object(), b.as_object()) {
+        return x == y;
     }
+    if let (Some(x), Some(y)) = (a.as_array(), b.as_array()) {
+        return crate::array::ptr_eq(x, y);
+    }
+    false
 }
 
 /// Replace the prototype with an ordinary object or `null`.
@@ -1674,7 +1659,7 @@ fn same_prototype_value(a: &Value, b: &Value) -> bool {
 /// This compatibility helper preserves existing call sites that do
 /// not need Proxy-as-prototype support.
 pub fn set_prototype(obj: JsObject, heap: &mut otter_gc::GcHeap, proto: Option<JsObject>) {
-    let value = proto.map(Value::Object);
+    let value = proto.map(Value::object);
     set_prototype_value(obj, heap, value);
 }
 
@@ -2463,7 +2448,7 @@ mod tests {
 
         assert!(
             interp
-                .ordinary_set_data_property(o, "x", Value::Boolean(true))
+                .ordinary_set_data_property(o, "x", Value::boolean(true))
                 .expect("set")
         );
 
@@ -2485,10 +2470,10 @@ mod tests {
             .expect("object");
 
         interp
-            .set_property(o, "value", Value::Number(NumberValue::from_i32(1)))
+            .set_property(o, "value", Value::number_i32(1))
             .expect("set value");
         interp
-            .set_property(o, "done", Value::Boolean(false))
+            .set_property(o, "done", Value::boolean(false))
             .expect("set done");
 
         let shape_handle = shape(o, interp.gc_heap());
@@ -2510,7 +2495,7 @@ mod tests {
             .expect("object");
 
         interp
-            .set_property(o, "x", Value::Boolean(true))
+            .set_property(o, "x", Value::boolean(true))
             .expect("set x");
 
         let shape_handle = shape(o, interp.gc_heap());
@@ -2534,7 +2519,7 @@ mod tests {
             .expect("object");
 
         interp
-            .set_property(o, "x", Value::Boolean(true))
+            .set_property(o, "x", Value::boolean(true))
             .expect("set x");
         interp.gc_heap_mut().with_payload(o, |body| {
             body.dictionary_keys.clear();
@@ -2544,14 +2529,11 @@ mod tests {
         assert_eq!(len(o, interp.gc_heap()), 1);
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
         assert!(matches!(
             lookup_own(o, interp.gc_heap(), "x"),
-            PropertyLookup::Data {
-                value: Value::Boolean(true),
-                ..
-            }
+            PropertyLookup::Data { value, .. } if value.as_boolean() == Some(true)
         ));
         assert!(get_own_descriptor(o, interp.gc_heap(), "x").is_some());
         let keys: Vec<String> = with_properties(o, interp.gc_heap(), |p| {
@@ -2559,11 +2541,11 @@ mod tests {
         });
         assert_eq!(keys, vec!["x"]);
 
-        set(o, interp.gc_heap_mut(), "x", Value::Boolean(false));
+        set(o, interp.gc_heap_mut(), "x", Value::boolean(false));
 
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
-            Some(Value::Boolean(false))
+            Some(Value::boolean(false))
         );
         assert_eq!(interp.gc_heap().read_payload(o, |body| body.slots.len()), 1);
     }
@@ -2575,7 +2557,7 @@ mod tests {
             .alloc_runtime_rooted_object_with_roots(&[], &[])
             .expect("object");
         let descriptor = PartialPropertyDescriptor {
-            value: Some(Value::Number(NumberValue::from_i32(42))),
+            value: Some(Value::number_i32(42)),
             writable: Some(true),
             enumerable: Some(true),
             configurable: Some(true),
@@ -2606,9 +2588,9 @@ mod tests {
             .expect("object");
 
         interp
-            .set_property(o, "a", Value::Boolean(true))
+            .set_property(o, "a", Value::boolean(true))
             .expect("set a");
-        interp.set_property(o, "b", Value::Null).expect("set b");
+        interp.set_property(o, "b", Value::null()).expect("set b");
 
         let before = shape(o, interp.gc_heap());
         assert!(!before.is_null());
@@ -2618,7 +2600,7 @@ mod tests {
 
         assert!(shape(o, interp.gc_heap()).is_null());
         assert!(get(o, interp.gc_heap(), "a").is_none());
-        assert!(matches!(get(o, interp.gc_heap(), "b"), Some(Value::Null)));
+        assert!(get(o, interp.gc_heap(), "b").is_some_and(|v| v.is_null()));
     }
 
     #[test]
@@ -2643,7 +2625,7 @@ mod tests {
         assert!(shape(first, interp.gc_heap()).is_null());
         assert_eq!(
             get_own(first, interp.gc_heap(), "x"),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
 
         let second = interp
@@ -2657,13 +2639,13 @@ mod tests {
                 interp.gc_heap_mut(),
                 key,
                 &transition,
-                &Value::Null,
+                &Value::null(),
             ),
             Some(())
         );
 
         assert!(shape(second, interp.gc_heap()).is_null());
-        assert_eq!(get_own(second, interp.gc_heap(), "x"), Some(Value::Null));
+        assert_eq!(get_own(second, interp.gc_heap(), "x"), Some(Value::null()));
     }
 
     #[test]
@@ -2674,12 +2656,12 @@ mod tests {
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
 
-        set(o, interp.gc_heap_mut(), "x", Value::Boolean(true));
+        set(o, interp.gc_heap_mut(), "x", Value::boolean(true));
 
         assert!(shape(o, interp.gc_heap()).is_null());
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
     }
 
@@ -2695,13 +2677,13 @@ mod tests {
             o,
             interp.gc_heap_mut(),
             "x",
-            Value::Boolean(true)
+            Value::boolean(true)
         ));
 
         assert!(shape(o, interp.gc_heap()).is_null());
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
     }
 
@@ -2723,7 +2705,7 @@ mod tests {
         assert!(shape(o, interp.gc_heap()).is_null());
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
     }
 
@@ -2735,7 +2717,7 @@ mod tests {
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.shape_root());
         let descriptor = PartialPropertyDescriptor {
-            value: Some(Value::Boolean(true)),
+            value: Some(Value::boolean(true)),
             writable: Some(true),
             enumerable: Some(true),
             configurable: Some(true),
@@ -2752,7 +2734,7 @@ mod tests {
         assert!(shape(o, interp.gc_heap()).is_null());
         assert_eq!(
             get_own(o, interp.gc_heap(), "x"),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
     }
 
@@ -2760,15 +2742,15 @@ mod tests {
     fn set_then_get_roundtrip() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::Boolean(true));
-        assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(true))));
+        set(o, &mut heap, "x", Value::boolean(true));
+        assert!(get(o, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
     }
 
     #[test]
     fn atom_lookup_reports_shape_and_slot_metadata() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::Boolean(true));
+        set(o, &mut heap, "x", Value::boolean(true));
         let shape = shape_id(o, &heap);
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
@@ -2787,10 +2769,7 @@ mod tests {
         );
         assert!(matches!(
             hit.lookup,
-            PropertyLookup::Data {
-                value: Value::Boolean(true),
-                ..
-            }
+            PropertyLookup::Data { value, .. } if value.as_boolean() == Some(true)
         ));
     }
 
@@ -2798,7 +2777,7 @@ mod tests {
     fn atom_slot_guard_rejects_shape_change() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::Boolean(true));
+        set(o, &mut heap, "x", Value::boolean(true));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
             "x",
@@ -2806,10 +2785,10 @@ mod tests {
         let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
         assert_eq!(
             load_own_data_slot_atom(o, &heap, key, hit),
-            Some(Value::Boolean(true))
+            Some(Value::boolean(true))
         );
 
-        set(o, &mut heap, "y", Value::Null);
+        set(o, &mut heap, "y", Value::null());
 
         assert_eq!(load_own_data_slot_atom(o, &heap, key, hit), None);
     }
@@ -2818,7 +2797,7 @@ mod tests {
     fn atom_slot_store_updates_guarded_data_slot() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::Boolean(true));
+        set(o, &mut heap, "x", Value::boolean(true));
         let key = AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(AtomId::from_constant_index(7)),
             "x",
@@ -2831,10 +2810,10 @@ mod tests {
         );
         assert_eq!(
             load_own_data_slot_atom(o, &heap, key, hit),
-            Some(Value::Boolean(false))
+            Some(Value::boolean(false))
         );
 
-        set(o, &mut heap, "y", Value::Null);
+        set(o, &mut heap, "y", Value::null());
 
         assert_eq!(
             store_own_data_slot_atom(o, &mut heap, key, hit, &Value::boolean(true)),
@@ -2889,7 +2868,7 @@ mod tests {
         let transition =
             capture_store_property_transition(first, &mut heap, key, &Value::boolean(true))
                 .expect("transition install");
-        set(proto, &mut heap, "x", Value::Null);
+        set(proto, &mut heap, "x", Value::null());
 
         let second = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(second, &mut heap, Some(proto));
@@ -2941,7 +2920,7 @@ mod tests {
     fn raw_atom_add_transition_rejects_unshared_inherited_dictionary_shape() {
         let mut heap = fresh_heap();
         let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(proto, &mut heap, "x", Value::Boolean(true));
+        set(proto, &mut heap, "x", Value::boolean(true));
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
@@ -2960,7 +2939,7 @@ mod tests {
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            replay_store_property_transition(second, &mut heap, key, &transition, &Value::Null,),
+            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),),
             None
         );
         assert_eq!(get_own(second, &heap, "x"), None);
@@ -2971,7 +2950,7 @@ mod tests {
     fn atom_add_transition_rejects_inherited_data_after_writable_change() {
         let mut heap = fresh_heap();
         let proto = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(proto, &mut heap, "x", Value::Boolean(true));
+        set(proto, &mut heap, "x", Value::boolean(true));
         let first = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(first, &mut heap, Some(proto));
         let key = AtomizedPropertyKey::new(
@@ -2992,7 +2971,7 @@ mod tests {
         set_prototype(second, &mut heap, Some(proto));
 
         assert_eq!(
-            replay_store_property_transition(second, &mut heap, key, &transition, &Value::Null,),
+            replay_store_property_transition(second, &mut heap, key, &transition, &Value::null(),),
             None
         );
     }
@@ -3015,7 +2994,7 @@ mod tests {
         );
 
         assert!(
-            capture_store_property_transition(receiver, &mut heap, key, &Value::Null).is_none()
+            capture_store_property_transition(receiver, &mut heap, key, &Value::null()).is_none()
         );
         assert!(get_own(receiver, &heap, "x").is_none());
     }
@@ -3025,9 +3004,9 @@ mod tests {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let empty = shape_id(o, &heap);
-        set(o, &mut heap, "x", Value::Boolean(true));
+        set(o, &mut heap, "x", Value::boolean(true));
         let with_x = shape_id(o, &heap);
-        set(o, &mut heap, "x", Value::Boolean(false));
+        set(o, &mut heap, "x", Value::boolean(false));
 
         assert_ne!(empty, with_x);
         assert_eq!(shape_id(o, &heap), with_x);
@@ -3044,9 +3023,9 @@ mod tests {
     fn insertion_order_is_preserved() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "a", Value::Boolean(true));
-        set(o, &mut heap, "b", Value::Boolean(false));
-        set(o, &mut heap, "c", Value::Null);
+        set(o, &mut heap, "a", Value::boolean(true));
+        set(o, &mut heap, "b", Value::boolean(false));
+        set(o, &mut heap, "c", Value::null());
         let keys: Vec<String> =
             with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
         assert_eq!(keys, vec!["a", "b", "c"]);
@@ -3056,13 +3035,13 @@ mod tests {
     fn integer_index_keys_sort_before_strings() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "b", Value::Boolean(true));
-        set(o, &mut heap, "10", Value::Boolean(true));
-        set(o, &mut heap, "2", Value::Boolean(true));
-        set(o, &mut heap, "a", Value::Boolean(true));
-        set(o, &mut heap, "1", Value::Boolean(true));
-        set(o, &mut heap, "01", Value::Boolean(true));
-        set(o, &mut heap, "4294967295", Value::Boolean(true));
+        set(o, &mut heap, "b", Value::boolean(true));
+        set(o, &mut heap, "10", Value::boolean(true));
+        set(o, &mut heap, "2", Value::boolean(true));
+        set(o, &mut heap, "a", Value::boolean(true));
+        set(o, &mut heap, "1", Value::boolean(true));
+        set(o, &mut heap, "01", Value::boolean(true));
+        set(o, &mut heap, "4294967295", Value::boolean(true));
 
         let keys: Vec<String> =
             with_properties(o, &heap, |p| p.keys().map(str::to_string).collect());
@@ -3073,7 +3052,7 @@ mod tests {
     fn delete_removes_property() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::Boolean(true));
+        set(o, &mut heap, "x", Value::boolean(true));
         assert!(delete(o, &mut heap, "x"));
         assert!(get(o, &heap, "x").is_none());
         // §10.1.10 — deleting a missing property still reports
@@ -3086,9 +3065,9 @@ mod tests {
         let mut heap = fresh_heap();
         let a = alloc_object_old_for_fixture(&mut heap).unwrap();
         let b = a; // Copy
-        set(a, &mut heap, "x", Value::Boolean(true));
+        set(a, &mut heap, "x", Value::boolean(true));
         assert_eq!(a, b);
-        assert!(matches!(get(b, &heap, "x"), Some(Value::Boolean(true))));
+        assert!(get(b, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -3138,9 +3117,9 @@ mod tests {
     fn overwrite_does_not_grow_shape() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::Boolean(true));
+        set(o, &mut heap, "x", Value::boolean(true));
         let s1 = shape_id(o, &heap);
-        set(o, &mut heap, "x", Value::Null);
+        set(o, &mut heap, "x", Value::null());
         let s2 = shape_id(o, &heap);
         assert_eq!(s1, s2);
         assert_eq!(len(o, &heap), 1);
@@ -3150,8 +3129,8 @@ mod tests {
     fn delete_switches_to_dictionary_shape() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "a", Value::Boolean(true));
-        set(o, &mut heap, "b", Value::Null);
+        set(o, &mut heap, "a", Value::boolean(true));
+        set(o, &mut heap, "b", Value::null());
         let before = shape_id(o, &heap);
         assert!(supports_fast_property_ic(o, &heap));
         delete(o, &mut heap, "a");
@@ -3160,7 +3139,7 @@ mod tests {
         assert!(!supports_fast_property_ic(o, &heap));
         assert_eq!(len(o, &heap), 1);
         assert!(get(o, &heap, "a").is_none());
-        assert!(matches!(get(o, &heap, "b"), Some(Value::Null)));
+        assert!(get(o, &heap, "b").is_some_and(|v| v.is_null()));
     }
 
     #[test]
@@ -3206,11 +3185,11 @@ mod tests {
             o,
             &mut heap,
             "x",
-            Value::Boolean(true)
+            Value::boolean(true)
         ));
 
         let got = get_own_descriptor(o, &heap, "x").unwrap();
-        assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(true))));
+        assert!(get(o, &heap, "x").is_some_and(|v| v.as_boolean() == Some(true)));
         assert!(got.writable());
         assert!(!got.enumerable());
         assert!(!got.configurable());
@@ -3231,10 +3210,10 @@ mod tests {
             o,
             &mut heap,
             "x",
-            Value::Boolean(true)
+            Value::boolean(true)
         ));
 
-        assert!(matches!(get(o, &heap, "x"), Some(Value::Boolean(false))));
+        assert!(get(o, &heap, "x").is_some_and(|v| v.as_boolean() == Some(false)));
     }
 
     #[test]
@@ -3242,15 +3221,15 @@ mod tests {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
 
-        assert!(ordinary_set_data_property(o, &mut heap, "x", Value::Null));
-        assert!(matches!(get(o, &heap, "x"), Some(Value::Null)));
+        assert!(ordinary_set_data_property(o, &mut heap, "x", Value::null()));
+        assert!(get(o, &heap, "x").is_some_and(|v| v.is_null()));
 
         prevent_extensions(o, &mut heap);
         assert!(!ordinary_set_data_property(
             o,
             &mut heap,
             "y",
-            Value::Boolean(true)
+            Value::boolean(true)
         ));
         assert!(get(o, &heap, "y").is_none());
     }
@@ -3259,7 +3238,7 @@ mod tests {
     fn freeze_makes_object_non_writable() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "x", Value::Boolean(true));
+        set(o, &mut heap, "x", Value::boolean(true));
         freeze(o, &mut heap);
         assert!(is_frozen(o, &heap));
         assert!(is_sealed(o, &heap));
@@ -3279,7 +3258,7 @@ mod tests {
     fn seal_blocks_new_properties() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        set(o, &mut heap, "a", Value::Null);
+        set(o, &mut heap, "a", Value::null());
         seal(o, &mut heap);
         assert!(is_sealed(o, &heap));
         assert!(!is_frozen(o, &heap));

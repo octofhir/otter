@@ -524,11 +524,16 @@ impl Interpreter {
         obj_reg: u16,
         proto_reg: u16,
     ) -> Result<(), VmError> {
-        let proto = match read_register(frame, proto_reg)? {
-            Value::Object(_) | Value::Proxy(_) | Value::Iterator(_) | Value::Null => {
-                *read_register(frame, proto_reg)?
-            }
-            Value::ClassConstructor(c) => Value::object(c.statics(&self.gc_heap)),
+        let raw_proto = *read_register(frame, proto_reg)?;
+        let proto = if raw_proto.is_object()
+            || raw_proto.is_proxy()
+            || raw_proto.is_iterator()
+            || raw_proto.is_null()
+        {
+            raw_proto
+        } else if let Some(c) = raw_proto.as_class_constructor() {
+            Value::object(c.statics(&self.gc_heap))
+        } else if raw_proto.is_native_function() {
             // §15.7.14 ClassDefinitionEvaluation step 6.b — `class D
             // extends C` sets D.[[Prototype]] (the static side) to
             // the parent constructor C verbatim, so static methods on
@@ -537,23 +542,30 @@ impl Interpreter {
             // native callable through as an `ObjectPrototype::Value`
             // — the prototype walker in `ordinary_get_value` knows
             // how to walk into a NativeFunction receiver.
-            Value::NativeFunction(_) => *read_register(frame, proto_reg)?,
-            _ => return Err(VmError::TypeMismatch),
+            raw_proto
+        } else {
+            return Err(VmError::TypeMismatch);
         };
         let receiver = *read_register(frame, obj_reg)?;
-        match &receiver {
-            Value::Object(_) => {
-                let ok = self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
-                if !ok {
-                    return Err(VmError::TypeError {
-                        message: "Object.setPrototypeOf failed".to_string(),
-                    });
-                }
+        if receiver.is_object() {
+            let ok = self.set_prototype_value_proxy_aware(context, &receiver, &proto)?;
+            if !ok {
+                return Err(VmError::TypeError {
+                    message: "Object.setPrototypeOf failed".to_string(),
+                });
             }
-            Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_) => {}
+        } else if receiver.is_function()
+            || receiver.is_closure()
+            || receiver.is_bound_function()
+            || receiver.is_native_function()
+        {
+            // no-op
+        } else if receiver.is_boolean()
+            || receiver.is_number()
+            || receiver.is_string()
+            || receiver.is_symbol()
+            || receiver.is_big_int()
+        {
             // §20.1.2.21 step 4 — `Object.setPrototypeOf(primitive,
             // proto)` returns the primitive unchanged after the
             // RequireObjectCoercible / proto-typecheck steps (which
@@ -561,12 +573,8 @@ impl Interpreter {
             // Symbol / BigInt` because they are coercible). Mirror
             // V8 / JSC and skip the prototype write — the wrapper
             // would be unreachable.
-            Value::Boolean(_)
-            | Value::Number(_)
-            | Value::String(_)
-            | Value::Symbol(_)
-            | Value::BigInt(_) => {}
-            _ => return Err(VmError::TypeMismatch),
+        } else {
+            return Err(VmError::TypeMismatch);
         }
         frame.pc += 1;
         Ok(())
@@ -583,338 +591,269 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = key.name();
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let value = match &receiver {
-            Value::Object(o) => {
-                crate::object::get(*o, &self.gc_heap, name).unwrap_or(Value::undefined())
-            }
-            Value::ClassConstructor(c) => {
-                if name == "prototype" {
-                    Value::Object(c.prototype(&self.gc_heap))
+        let value = if let Some(o) = receiver.as_object() {
+            crate::object::get(o, &self.gc_heap, name).unwrap_or(Value::undefined())
+        } else if let Some(c) = receiver.as_class_constructor() {
+            if name == "prototype" {
+                Value::object(c.prototype(&self.gc_heap))
+            } else {
+                let statics = c.statics(&self.gc_heap);
+                let direct = crate::object::get(statics, &self.gc_heap, name);
+                if let Some(v) = direct {
+                    v
                 } else {
-                    let statics = c.statics(&self.gc_heap);
-                    let direct = crate::object::get(statics, &self.gc_heap, name);
-                    if let Some(v) = direct {
-                        v
-                    } else {
-                        // §15.7.10 step 6.b — `class D extends C` sets
-                        // D.[[Prototype]] = C. When the parent is a
-                        // non-Object callable (NativeFunction such as
-                        // `Promise`, ClassConstructor for a user
-                        // class), the proto chain walked by
-                        // `object::get` stops at the first non-Object
-                        // hop. Fall back to `ordinary_get_value` on
-                        // the statics's stored prototype so static
-                        // inheritance (`Foo.reject`,
-                        // `MySet[Symbol.species]`, ...) resolves.
-                        let parent = crate::object::prototype_value(statics, &self.gc_heap);
-                        let walked = match parent {
-                            Some(p)
-                                if !matches!(
-                                    p,
-                                    Value::Object(_) | Value::Null | Value::Undefined
-                                ) =>
+                    // §15.7.10 step 6.b — `class D extends C` sets
+                    // D.[[Prototype]] = C. When the parent is a
+                    // non-Object callable (NativeFunction such as
+                    // `Promise`, ClassConstructor for a user
+                    // class), the proto chain walked by
+                    // `object::get` stops at the first non-Object
+                    // hop. Fall back to `ordinary_get_value` on
+                    // the statics's stored prototype so static
+                    // inheritance (`Foo.reject`,
+                    // `MySet[Symbol.species]`, ...) resolves.
+                    let parent = crate::object::prototype_value(statics, &self.gc_heap);
+                    let walked = match parent {
+                        Some(p) if !(p.is_object() || p.is_null() || p.is_undefined()) => {
+                            match self.ordinary_get_value(
+                                context,
+                                p,
+                                receiver,
+                                &VmPropertyKey::String(name),
+                                0,
+                            )? {
+                                VmGetOutcome::Value(v) => Some(v),
+                                VmGetOutcome::InvokeGetter { getter } => {
+                                    Some(self.run_callable_sync(
+                                        context,
+                                        &getter,
+                                        receiver,
+                                        SmallVec::new(),
+                                    )?)
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    match walked {
+                        Some(v) if !v.is_undefined() => v,
+                        _ if name == "name" || name == "length" => {
+                            let ctor = c.ctor(&self.gc_heap);
+                            if ctor.is_function()
+                                || ctor.is_closure()
+                                || ctor.is_native_function()
+                                || ctor.is_bound_function()
                             {
-                                match self.ordinary_get_value(
+                                let mut ctx = function_metadata::FunctionMetadataContext::new(
                                     context,
-                                    p,
-                                    receiver,
-                                    &VmPropertyKey::String(name),
-                                    0,
-                                )? {
-                                    VmGetOutcome::Value(v) => Some(v),
-                                    VmGetOutcome::InvokeGetter { getter } => {
-                                        Some(self.run_callable_sync(
-                                            context,
-                                            &getter,
-                                            receiver,
-                                            SmallVec::new(),
-                                        )?)
-                                    }
-                                }
+                                    &mut self.gc_heap,
+                                    &self.function_user_props,
+                                    &self.function_deleted_metadata,
+                                );
+                                function_metadata::callable_intrinsic_property(
+                                    &mut ctx, &ctor, name,
+                                )?
+                            } else {
+                                Value::undefined()
                             }
-                            _ => None,
-                        };
-                        match walked {
-                            Some(v) if !v.is_undefined() => v,
-                            _ if name == "name" || name == "length" => {
-                                let ctor = c.ctor(&self.gc_heap);
-                                match &ctor {
-                                    Value::Function { .. }
-                                    | Value::Closure(_)
-                                    | Value::NativeFunction(_)
-                                    | Value::BoundFunction(_) => {
-                                        let mut ctx =
-                                            function_metadata::FunctionMetadataContext::new(
-                                                context,
-                                                &mut self.gc_heap,
-                                                &self.function_user_props,
-                                                &self.function_deleted_metadata,
-                                            );
-                                        function_metadata::callable_intrinsic_property(
-                                            &mut ctx, &ctor, name,
-                                        )?
-                                    }
-                                    _ => Value::undefined(),
-                                }
-                            }
-                            _ => Value::undefined(),
                         }
+                        _ => Value::undefined(),
                     }
                 }
             }
-            Value::String(s) => self.load_string_primitive_property(context, &receiver, s, name)?,
-            v if v.is_array() => {
-                let direct = if let Value::Array(a) = v {
-                    if let Some((getter, _setter)) =
-                        crate::array::get_accessor(*a, &self.gc_heap, name)
-                    {
-                        match getter {
-                            Some(getter) if abstract_ops::is_callable(&getter) => {
-                                let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                Some(self.run_callable_sync(context, &getter, *v, args)?)
-                            }
-                            _ => Some(Value::Undefined),
-                        }
-                    } else {
-                        crate::array::get_named_property(*a, &self.gc_heap, name)
+        } else if let Some(s) = receiver.as_string() {
+            self.load_string_primitive_property(context, &receiver, s, name)?
+        } else if receiver.is_array() {
+            let v = &receiver;
+            let a = v.as_array().unwrap();
+            let direct = if let Some((getter, _setter)) =
+                crate::array::get_accessor(a, &self.gc_heap, name)
+            {
+                match getter {
+                    Some(getter) if abstract_ops::is_callable(&getter) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        Some(self.run_callable_sync(context, &getter, *v, args)?)
                     }
-                } else {
-                    None
-                };
-                match direct {
-                    Some(value) => value,
-                    None => self.load_from_constructor_prototype(context, "Array", v, name)?,
+                    _ => Some(Value::undefined()),
                 }
+            } else {
+                crate::array::get_named_property(a, &self.gc_heap, name)
+            };
+            match direct {
+                Some(value) => value,
+                None => self.load_from_constructor_prototype(context, "Array", v, name)?,
             }
-            Value::Function { function_id } => {
-                let fid = *function_id;
-                self.function_property_get_stack_rooted(context, stack, fid, name)?
-            }
-            Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let fid = *function_id;
-                self.function_property_get_stack_rooted(context, stack, fid, name)?
-            }
-            Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&mut self.gc_heap, name)? {
-                    Some(desc) => match &desc.kind {
-                        object::DescriptorKind::Data { value } => *value,
-                        // §10.1.8.1 OrdinaryGet step 7 — accessor
-                        // descriptors invoke `[[Get]]` with the
-                        // receiver. RegExp's `%RegExp%.input` /
-                        // `lastMatch` / etc. legacy accessors land
-                        // here.
-                        object::DescriptorKind::Accessor { getter, .. } => match getter {
-                            Some(g) => {
-                                let args: SmallVec<[Value; 8]> = SmallVec::new();
-                                self.run_callable_sync(context, g, receiver, args)?
-                            }
-                            None => Value::undefined(),
-                        },
+        } else if let Some(fid) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            self.function_property_get_stack_rooted(context, stack, fid, name)?
+        } else if let Some(native) = receiver.as_native_function() {
+            match native.own_property_descriptor(&mut self.gc_heap, name)? {
+                Some(desc) => match &desc.kind {
+                    object::DescriptorKind::Data { value } => *value,
+                    object::DescriptorKind::Accessor { getter, .. } => match getter {
+                        Some(g) => {
+                            let args: SmallVec<[Value; 8]> = SmallVec::new();
+                            self.run_callable_sync(context, g, receiver, args)?
+                        }
+                        None => Value::undefined(),
                     },
-                    None => self
-                        .load_function_prototype_method(name)
-                        .or_else(|| self.load_object_prototype_method(name))
-                        .unwrap_or(Value::undefined()),
-                }
+                },
+                None => self
+                    .load_function_prototype_method(name)
+                    .or_else(|| self.load_object_prototype_method(name))
+                    .unwrap_or(Value::undefined()),
             }
-            Value::BoundFunction(bound) => {
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &mut self.gc_heap,
-                    name,
-                )? {
-                    Some(desc) => match &desc.kind {
-                        object::DescriptorKind::Data { value } => *value,
-                        object::DescriptorKind::Accessor { getter, .. } => match getter {
-                            Some(g) if abstract_ops::is_callable(g) => {
-                                self.run_callable_sync(context, g, receiver, SmallVec::new())?
-                            }
-                            _ => Value::undefined(),
-                        },
-                    },
-                    None => self
-                        .load_function_prototype_method(name)
-                        .or_else(|| self.load_object_prototype_method(name))
-                        .unwrap_or(Value::undefined()),
-                }
-            }
-            v if v.is_regexp() => {
-                let r = if let Value::RegExp(r) = v {
-                    *r
-                } else {
-                    unreachable!()
-                };
-                // Expando bag wins over the spec-mandated direct
-                // load so user-installed members
-                // (`re.exec = fn`, `re.global = false`) shadow the
-                // built-in accessors during test262 observability
-                // checks.
-                if let Some(bag) = r.expando(&self.gc_heap)
-                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
-                {
-                    value
-                } else {
-                    let direct = regexp_prototype::load_property(&r, &mut self.gc_heap, name);
-                    match direct {
-                        Value::Undefined => {
-                            self.load_from_constructor_prototype(context, "RegExp", v, name)?
+        } else if let Some(bound) = receiver.as_bound_function() {
+            let bound = &bound;
+            match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)?
+            {
+                Some(desc) => match &desc.kind {
+                    object::DescriptorKind::Data { value } => *value,
+                    object::DescriptorKind::Accessor { getter, .. } => match getter {
+                        Some(g) if abstract_ops::is_callable(g) => {
+                            self.run_callable_sync(context, g, receiver, SmallVec::new())?
                         }
-                        value => value,
-                    }
+                        _ => Value::undefined(),
+                    },
+                },
+                None => self
+                    .load_function_prototype_method(name)
+                    .or_else(|| self.load_object_prototype_method(name))
+                    .unwrap_or(Value::undefined()),
+            }
+        } else if let Some(r) = receiver.as_regexp() {
+            // Expando bag wins over the spec-mandated direct
+            // load so user-installed members
+            // (`re.exec = fn`, `re.global = false`) shadow the
+            // built-in accessors during test262 observability
+            // checks.
+            if let Some(bag) = r.expando(&self.gc_heap)
+                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+            {
+                value
+            } else {
+                let direct = regexp_prototype::load_property(&r, &mut self.gc_heap, name);
+                if direct.is_undefined() {
+                    self.load_from_constructor_prototype(context, "RegExp", &receiver, name)?
+                } else {
+                    direct
                 }
             }
-            Value::Symbol(s) => symbol_prototype::load_property(s, name),
+        } else if let Some(s) = receiver.as_symbol() {
+            symbol_prototype::load_property(s, name)
+        } else if receiver.is_iterator() {
             // §27.1.5 — read string-keyed properties through
             // `Iterator.prototype` so the new spec-mandated
             // `next` / `return` / `throw` natives (and the helper
             // terminals like `map` / `forEach` / `toArray`) all
             // resolve uniformly via the realm prototype.
-            // `this` rebinding through `Function.prototype.call`
-            // surfaces correctly because the native methods take
-            // their receiver from `ctx.this_value()` rather than
-            // synthesized captures.
-            v if v.is_iterator() => {
-                self.load_from_constructor_prototype(context, "Iterator", v, name)?
-            }
-            v @ (Value::WeakRef(_) | Value::FinalizationRegistry(_)) => {
-                let proto_name = match v {
-                    Value::WeakRef(_) => "WeakRef",
-                    Value::FinalizationRegistry(_) => "FinalizationRegistry",
-                    _ => unreachable!(),
+            self.load_from_constructor_prototype(context, "Iterator", &receiver, name)?
+        } else if receiver.is_weak_ref() || receiver.is_finalization_registry() {
+            let proto_name = if receiver.is_weak_ref() {
+                "WeakRef"
+            } else {
+                "FinalizationRegistry"
+            };
+            self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+        } else if let Some(p) = receiver.as_promise() {
+            // §27.2.5 — user-installed own properties
+            // (`promise.then = fn`) live in a lazy expando bag;
+            // honour them before the prototype walk.
+            if let Some(bag) = p.expando(&self.gc_heap)
+                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+            {
+                value
+            } else {
+                // §27.2.4.7.1 OrdinaryCreateFromConstructor —
+                // when `new SubPromise(executor)` set
+                // `prototype_override` to `SubPromise.prototype`,
+                // walk *that* chain.
+                let proto = match p.prototype_override(&self.gc_heap) {
+                    Some(proto) => proto,
+                    None => self.constructor_prototype_value("Promise")?,
                 };
-                self.load_from_constructor_prototype(context, proto_name, v, name)?
-            }
-            v if v.is_promise() => {
-                // §27.2.5 — user-installed own properties
-                // (`promise.then = fn`) live in a lazy expando bag;
-                // honour them before the prototype walk.
-                let p = if let Value::Promise(p) = v {
-                    *p
+                if proto.is_nullish() {
+                    Value::undefined()
                 } else {
-                    unreachable!()
-                };
-                if let Some(bag) = p.expando(&self.gc_heap)
-                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
-                {
-                    value
-                } else {
-                    // §27.2.4.7.1 OrdinaryCreateFromConstructor —
-                    // when `new SubPromise(executor)` set
-                    // `prototype_override` to `SubPromise.prototype`,
-                    // walk *that* chain, not the realm
-                    // `%Promise.prototype%`. Without this the
-                    // sub-class instance's `.constructor` resolves
-                    // to the parent Promise and SpeciesConstructor
-                    // misroutes downstream chained promises.
-                    let proto = match p.prototype_override(&self.gc_heap) {
-                        Some(proto) => proto,
-                        None => self.constructor_prototype_value("Promise")?,
-                    };
-                    if proto.is_nullish() {
-                        Value::Undefined
-                    } else {
-                        let key = VmPropertyKey::String(name);
-                        match self.ordinary_get_value(context, proto, *v, &key, 0)? {
-                            VmGetOutcome::Value(value) => value,
-                            VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
-                                context,
-                                &getter,
-                                *v,
-                                smallvec::SmallVec::new(),
-                            )?,
-                        }
+                    let key = VmPropertyKey::String(name);
+                    match self.ordinary_get_value(context, proto, receiver, &key, 0)? {
+                        VmGetOutcome::Value(value) => value,
+                        VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                            context,
+                            &getter,
+                            receiver,
+                            smallvec::SmallVec::new(),
+                        )?,
                     }
                 }
             }
-            v @ (Value::Map(_) | Value::Set(_) | Value::WeakMap(_) | Value::WeakSet(_)) => {
-                match collections_prototype::load_property_with_heap(v, name, &self.gc_heap) {
-                    Value::Undefined => {
-                        let proto_name = match v {
-                            Value::Map(_) => "Map",
-                            Value::Set(_) => "Set",
-                            Value::WeakMap(_) => "WeakMap",
-                            Value::WeakSet(_) => "WeakSet",
-                            _ => unreachable!(),
-                        };
-                        self.load_from_constructor_prototype(context, proto_name, v, name)?
-                    }
-                    value => value,
-                }
-            }
-            Value::Temporal(t) => temporal::load_property(t, &mut self.gc_heap, name),
-            v @ Value::ArrayBuffer(_) => {
-                let (direct, is_shared) = if let Value::ArrayBuffer(b) = v {
-                    (
-                        binary::array_buffer_prototype::load_property(*b, &self.gc_heap, name),
-                        b.is_shared(),
-                    )
+        } else if receiver.is_map()
+            || receiver.is_set()
+            || receiver.is_weak_map()
+            || receiver.is_weak_set()
+        {
+            let direct =
+                collections_prototype::load_property_with_heap(&receiver, name, &self.gc_heap);
+            if direct.is_undefined() {
+                let proto_name = if receiver.is_map() {
+                    "Map"
+                } else if receiver.is_set() {
+                    "Set"
+                } else if receiver.is_weak_map() {
+                    "WeakMap"
                 } else {
-                    (Value::Undefined, false)
+                    "WeakSet"
                 };
-                match direct {
-                    Value::Undefined => {
-                        let proto_name = if is_shared {
-                            "SharedArrayBuffer"
-                        } else {
-                            "ArrayBuffer"
-                        };
-                        self.load_from_constructor_prototype(context, proto_name, v, name)?
-                    }
-                    value => value,
-                }
+                self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+            } else {
+                direct
             }
-            v @ Value::DataView(_) => {
-                let direct = if let Value::DataView(dv) = v {
-                    binary::data_view_prototype::load_property(dv, &self.gc_heap, name)
+        } else if let Some(t) = receiver.as_temporal() {
+            temporal::load_property(t, &mut self.gc_heap, name)
+        } else if let Some(b) = receiver.as_array_buffer() {
+            let direct = binary::array_buffer_prototype::load_property(b, &self.gc_heap, name);
+            if direct.is_undefined() {
+                let proto_name = if b.is_shared() {
+                    "SharedArrayBuffer"
                 } else {
-                    Value::Undefined
+                    "ArrayBuffer"
                 };
-                match direct {
-                    Value::Undefined => {
-                        self.load_from_constructor_prototype(context, "DataView", v, name)?
-                    }
-                    value => value,
+                self.load_from_constructor_prototype(context, proto_name, &receiver, name)?
+            } else {
+                direct
+            }
+        } else if let Some(dv) = receiver.as_data_view() {
+            let direct = binary::data_view_prototype::load_property(&dv, &self.gc_heap, name);
+            if direct.is_undefined() {
+                self.load_from_constructor_prototype(context, "DataView", &receiver, name)?
+            } else {
+                direct
+            }
+        } else if let Some(t) = receiver.as_typed_array() {
+            // §10.4.5.4 [[Get]] — check the expando bag before
+            // per-kind built-ins so user-installed properties win.
+            if let Some(bag) = t.expando(&self.gc_heap)
+                && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
+            {
+                value
+            } else {
+                let direct = binary::typed_array_prototype::load_property(&t, &self.gc_heap, name);
+                if direct.is_undefined() {
+                    let kind_name = t.kind().name();
+                    self.load_from_constructor_prototype(context, kind_name, &receiver, name)?
+                } else {
+                    direct
                 }
             }
-            v @ Value::TypedArray(_) => {
-                let t = if let Value::TypedArray(t) = v {
-                    t
-                } else {
-                    unreachable!()
-                };
-                // §10.4.5.4 [[Get]] — check the expando bag before
-                // the per-kind built-ins so user-installed
-                // properties (`typedArr.foo = 1`,
-                // `typedArr.constructor = X`) win over inherited
-                // defaults.
-                if let Some(bag) = t.expando(&self.gc_heap)
-                    && let Some(value) = crate::object::get(bag, &self.gc_heap, name)
-                {
-                    value
-                } else {
-                    let direct =
-                        binary::typed_array_prototype::load_property(t, &self.gc_heap, name);
-                    match direct {
-                        Value::Undefined => {
-                            let kind_name = t.kind().name();
-                            self.load_from_constructor_prototype(context, kind_name, v, name)?
-                        }
-                        value => value,
-                    }
-                }
-            }
-            v @ Value::BigInt(_) => {
-                self.load_from_constructor_prototype(context, "BigInt", v, name)?
-            }
-            other => {
-                return Err(VmError::TypeMismatchAt {
-                    op: "property read",
-                    kind: value_kind_name(other),
-                });
-            }
+        } else if receiver.is_big_int() {
+            self.load_from_constructor_prototype(context, "BigInt", &receiver, name)?
+        } else {
+            return Err(VmError::TypeMismatchAt {
+                op: "property read",
+                kind: value_kind_name(&receiver),
+            });
         };
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;

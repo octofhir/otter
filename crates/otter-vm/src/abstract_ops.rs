@@ -114,16 +114,13 @@ impl ToPrimitiveHint {
 /// - <https://tc39.es/ecma262/#sec-toprimitive>
 #[must_use]
 pub fn is_primitive(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Undefined
-            | Value::Null
-            | Value::Boolean(_)
-            | Value::Number(_)
-            | Value::BigInt(_)
-            | Value::String(_)
-            | Value::Symbol(_)
-    )
+    value.is_undefined()
+        || value.is_null()
+        || value.is_boolean()
+        || value.is_number()
+        || value.is_big_int()
+        || value.is_string()
+        || value.is_symbol()
 }
 
 /// Return `true` when `x` and `y` are identical under ECMA-262
@@ -141,10 +138,10 @@ pub fn is_primitive(value: &Value) -> bool {
 /// - <https://tc39.es/ecma262/#sec-samevalue>
 #[must_use]
 pub fn same_value(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
-    match (x, y) {
-        (Value::Number(a), Value::Number(b)) => same_value_numeric(*a, *b),
-        _ => same_value_non_numeric(x, y, heap),
+    if let (Some(a), Some(b)) = (x.as_number(), y.as_number()) {
+        return same_value_numeric(a, b);
     }
+    same_value_non_numeric(x, y, heap)
 }
 
 /// Return `true` when `x` and `y` are identical under ECMA-262
@@ -157,10 +154,10 @@ pub fn same_value(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
 /// - <https://tc39.es/ecma262/#sec-samevaluezero>
 #[must_use]
 pub fn same_value_zero(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
-    match (x, y) {
-        (Value::Number(a), Value::Number(b)) => same_value_zero_numeric(*a, *b),
-        _ => same_value_non_numeric(x, y, heap),
+    if let (Some(a), Some(b)) = (x.as_number(), y.as_number()) {
+        return same_value_zero_numeric(a, b);
     }
+    same_value_non_numeric(x, y, heap)
 }
 
 /// Tail of `SameValue` and `SameValueZero` once the numeric
@@ -176,22 +173,26 @@ pub fn same_value_zero(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
 /// - <https://tc39.es/ecma262/#sec-samevaluenonnumeric>
 #[must_use]
 pub fn same_value_non_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
-    match (x, y) {
-        (Value::Number(_), _) | (_, Value::Number(_)) => false,
-        // §7.2.13 step 2.b: BigInt-BigInt equality is numeric.
-        // `Value::PartialEq`'s BigInt arm uses handle-offset
-        // equality and is not spec-correct on its own; route here
-        // to `numeric_eq` which reads the bodies through `heap`.
-        (Value::BigInt(a), Value::BigInt(b)) => a.numeric_eq(*b, heap),
-        // §7.2.11 SameValueNonNumber for String: code-unit equality
-        // through the heap. Derived `PartialEq` on `JsString` is
-        // handle identity after Phase B, which is too strict here.
-        (Value::String(a), Value::String(b)) => a.equals(b, heap),
-        // For every other variant `Value::PartialEq` matches the
-        // spec's `SameValueNonNumber` reduction (identity for
-        // heap-shared shapes).
-        _ => x == y,
+    if x.is_number() || y.is_number() {
+        return false;
     }
+    // §7.2.13 step 2.b: BigInt-BigInt equality is numeric.
+    // `Value::PartialEq`'s BigInt arm uses handle-offset
+    // equality and is not spec-correct on its own; route here
+    // to `numeric_eq` which reads the bodies through `heap`.
+    if let (Some(a), Some(b)) = (x.as_big_int(), y.as_big_int()) {
+        return a.numeric_eq(b, heap);
+    }
+    // §7.2.11 SameValueNonNumber for String: code-unit equality
+    // through the heap. Derived `PartialEq` on `JsString` is
+    // handle identity after Phase B, which is too strict here.
+    if let (Some(a), Some(b)) = (x.as_string(), y.as_string()) {
+        return a.equals(b, heap);
+    }
+    // For every other variant `Value::PartialEq` matches the
+    // spec's `SameValueNonNumber` reduction (identity for
+    // heap-shared shapes).
+    x == y
 }
 
 /// SameValue restricted to two `NumberValue` operands.
@@ -232,7 +233,7 @@ fn same_value_zero_numeric(a: NumberValue, b: NumberValue) -> bool {
 /// - <https://tc39.es/ecma262/#sec-isarray>
 #[must_use]
 pub fn is_array(value: &Value) -> bool {
-    matches!(value, Value::Array(_))
+    value.is_array()
 }
 
 /// Return `true` when `value` carries an internal `[[Call]]` slot.
@@ -247,20 +248,17 @@ pub fn is_array(value: &Value) -> bool {
 /// - <https://tc39.es/ecma262/#sec-iscallable>
 #[must_use]
 pub fn is_callable(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_)
-            | Value::ClassConstructor(_)
-            // §28.2.1.1 — a Proxy reports `[[Call]]` when its
-            // handler defines `apply` (or via target inspection in
-            // the wider machinery). Foundation: assume callable; the
-            // dispatcher delegates non-callable targets to a proper
-            // TypeError on actual call.
-            | Value::Proxy(_)
-    )
+    value.is_function()
+        || value.is_closure()
+        || value.is_bound_function()
+        || value.is_native_function()
+        || value.is_class_constructor()
+        // §28.2.1.1 — a Proxy reports `[[Call]]` when its
+        // handler defines `apply` (or via target inspection in
+        // the wider machinery). Foundation: assume callable; the
+        // dispatcher delegates non-callable targets to a proper
+        // TypeError on actual call.
+        || value.is_proxy()
 }
 
 /// Return `true` when `value` carries an internal `[[Construct]]`
@@ -284,27 +282,30 @@ pub fn is_callable(value: &Value) -> bool {
 /// - <https://tc39.es/ecma262/#sec-isconstructor>
 #[must_use]
 pub fn is_constructor(value: &Value, context: &ExecutionContext, heap: &otter_gc::GcHeap) -> bool {
-    match value {
-        Value::ClassConstructor(_) => true,
-        Value::NativeFunction(native) => native.is_constructable(heap),
-        Value::Function { function_id }
-        | Value::Closure(crate::closure::JsClosure {
-            cached_function_id: function_id,
-            ..
-        }) => !context.function_is_arrow(*function_id),
-        Value::BoundFunction(b) => {
-            let (target, _, _) = b.parts(heap);
-            is_constructor(&target, context, heap)
-        }
-        // §28.2.4.3 — a non-revoked Proxy reports `[[Construct]]`
-        // iff its target does. Revoked proxies surface as
-        // non-constructor here; the per-trap revocation guard
-        // produces the spec-required TypeError on actual call.
-        Value::Proxy(proxy) => {
-            !proxy.is_revoked(heap) && is_constructor(&proxy.target(heap), context, heap)
-        }
-        _ => false,
+    if value.is_class_constructor() {
+        return true;
     }
+    if let Some(native) = value.as_native_function() {
+        return native.is_constructable(heap);
+    }
+    if let Some(fid) = value.as_function() {
+        return !context.function_is_arrow(fid);
+    }
+    if let Some(closure) = value.as_closure() {
+        return !context.function_is_arrow(closure.cached_function_id);
+    }
+    if let Some(b) = value.as_bound_function() {
+        let (target, _, _) = b.parts(heap);
+        return is_constructor(&target, context, heap);
+    }
+    // §28.2.4.3 — a non-revoked Proxy reports `[[Construct]]`
+    // iff its target does. Revoked proxies surface as
+    // non-constructor here; the per-trap revocation guard
+    // produces the spec-required TypeError on actual call.
+    if let Some(proxy) = value.as_proxy() {
+        return !proxy.is_revoked(heap) && is_constructor(&proxy.target(heap), context, heap);
+    }
+    false
 }
 
 /// Outcome of ECMA-262 §7.2.14 `AbstractRelationalComparison`.
@@ -354,61 +355,69 @@ pub enum RelationalOutcome {
 #[must_use]
 pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
     // Step 1: same type → IsStrictlyEqual.
-    let same_kind = matches!(
-        (x, y),
-        (Value::Undefined, Value::Undefined)
-            | (Value::Null, Value::Null)
-            | (Value::Boolean(_), Value::Boolean(_))
-            | (Value::Number(_), Value::Number(_))
-            | (Value::BigInt(_), Value::BigInt(_))
-            | (Value::String(_), Value::String(_))
-            | (Value::Symbol(_), Value::Symbol(_))
-    );
+    let same_kind = (x.is_undefined() && y.is_undefined())
+        || (x.is_null() && y.is_null())
+        || (x.is_boolean() && y.is_boolean())
+        || (x.is_number() && y.is_number())
+        || (x.is_big_int() && y.is_big_int())
+        || (x.is_string() && y.is_string())
+        || (x.is_symbol() && y.is_symbol());
     if same_kind {
         return same_value_non_numeric_or_strict_numeric(x, y, heap);
     }
 
-    match (x, y) {
-        // Step 2: null == undefined.
-        (Value::Null, Value::Undefined) | (Value::Undefined, Value::Null) => true,
-
-        // Steps 4, 5: Number x String — ToNumber the string.
-        (Value::Number(n), Value::String(s)) => {
-            let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
-            number::strict_equals(*n, parsed)
-        }
-        (Value::String(s), Value::Number(n)) => {
-            let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
-            number::strict_equals(*n, parsed)
-        }
-
-        // Step 6, 8: Boolean → Number, then recurse. We model the
-        // recursion as one step rather than re-entering this
-        // function (avoids needing a fresh `Value`).
-        (Value::Boolean(b), other) | (other, Value::Boolean(b)) => {
-            let coerced = Value::number(NumberValue::from_i32(if *b { 1 } else { 0 }));
-            is_loosely_equal(&coerced, other, heap)
-        }
-
-        // Steps 12: BigInt x String. §7.1.14 StringToBigInt:
-        // whitespace-only / empty strings are valid
-        // StringIntegerLiterals representing `0n`. Strings that fail
-        // the grammar surface as `undefined`, which §7.2.13 step 8
-        // collapses to `false`.
-        (Value::BigInt(big), Value::String(s)) | (Value::String(s), Value::BigInt(big)) => {
-            match string_to_big_int(&s.to_lossy_string(heap)) {
-                Some(parsed) => big.with_inner(heap, |b| b == &parsed),
-                None => false,
-            }
-        }
-
-        // Steps 13, 14: BigInt x Number.
-        (Value::BigInt(big), Value::Number(num)) | (Value::Number(num), Value::BigInt(big)) => {
-            big.with_inner(heap, |b| bigint_eq_number(b, *num))
-        }
-
-        _ => false,
+    // Step 2: null == undefined.
+    if (x.is_null() && y.is_undefined()) || (x.is_undefined() && y.is_null()) {
+        return true;
     }
+
+    // Steps 4, 5: Number x String — ToNumber the string.
+    if let (Some(n), Some(s)) = (x.as_number(), y.as_string()) {
+        let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
+        return number::strict_equals(n, parsed);
+    }
+    if let (Some(s), Some(n)) = (x.as_string(), y.as_number()) {
+        let parsed = number::to_number_from_string(&s.to_lossy_string(heap));
+        return number::strict_equals(n, parsed);
+    }
+
+    // Step 6, 8: Boolean → Number, then recurse.
+    if let Some(b) = x.as_boolean() {
+        let coerced = Value::number_i32(if b { 1 } else { 0 });
+        return is_loosely_equal(&coerced, y, heap);
+    }
+    if let Some(b) = y.as_boolean() {
+        let coerced = Value::number_i32(if b { 1 } else { 0 });
+        return is_loosely_equal(x, &coerced, heap);
+    }
+
+    // Steps 12: BigInt x String. §7.1.14 StringToBigInt:
+    // whitespace-only / empty strings are valid
+    // StringIntegerLiterals representing `0n`. Strings that fail
+    // the grammar surface as `undefined`, which §7.2.13 step 8
+    // collapses to `false`.
+    if let (Some(big), Some(s)) = (x.as_big_int(), y.as_string()) {
+        return match string_to_big_int(&s.to_lossy_string(heap)) {
+            Some(parsed) => big.with_inner(heap, |b| b == &parsed),
+            None => false,
+        };
+    }
+    if let (Some(s), Some(big)) = (x.as_string(), y.as_big_int()) {
+        return match string_to_big_int(&s.to_lossy_string(heap)) {
+            Some(parsed) => big.with_inner(heap, |b| b == &parsed),
+            None => false,
+        };
+    }
+
+    // Steps 13, 14: BigInt x Number.
+    if let (Some(big), Some(num)) = (x.as_big_int(), y.as_number()) {
+        return big.with_inner(heap, |b| bigint_eq_number(b, num));
+    }
+    if let (Some(num), Some(big)) = (x.as_number(), y.as_big_int()) {
+        return big.with_inner(heap, |b| bigint_eq_number(b, num));
+    }
+
+    false
 }
 
 /// Spec `IsStrictlyEqual` for two operands of the same type as
@@ -419,11 +428,11 @@ pub fn is_loosely_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
 /// (handle-offset equality is not spec-correct). Every other
 /// variant defers to `Value::PartialEq`.
 fn same_value_non_numeric_or_strict_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
-    if let (Value::Number(a), Value::Number(b)) = (x, y) {
-        return number::strict_equals(*a, *b);
+    if let (Some(a), Some(b)) = (x.as_number(), y.as_number()) {
+        return number::strict_equals(a, b);
     }
-    if let (Value::BigInt(a), Value::BigInt(b)) = (x, y) {
-        return a.numeric_eq(*b, heap);
+    if let (Some(a), Some(b)) = (x.as_big_int(), y.as_big_int()) {
+        return a.numeric_eq(b, heap);
     }
     x == y
 }

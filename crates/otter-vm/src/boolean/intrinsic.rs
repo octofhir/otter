@@ -72,7 +72,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         statics,
         heap,
         "prototype",
-        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+        crate::object::PropertyDescriptor::data(Value::object(prototype), false, false, false),
     );
     // §20.3.2 — `Boolean.length` is a non-writable, non-enumerable,
     // configurable data property whose value matches the constructor

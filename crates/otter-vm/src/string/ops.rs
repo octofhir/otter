@@ -28,7 +28,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let tag = read_register(frame, src)?.typeof_string_with_heap(&self.gc_heap);
         let s = JsString::from_str(tag, &mut self.gc_heap)?;
-        write_register(frame, dst, Value::String(s))?;
+        write_register(frame, dst, Value::string(s))?;
         frame.pc += 1;
         Ok(())
     }
@@ -54,7 +54,7 @@ impl Interpreter {
             Some(unit) => JsString::from_utf16_units(&[unit], &mut self.gc_heap)?,
             None => JsString::empty(&mut self.gc_heap)?,
         };
-        write_register(frame, dst, Value::String(result))?;
+        write_register(frame, dst, Value::string(result))?;
         frame.pc += 1;
         Ok(())
     }

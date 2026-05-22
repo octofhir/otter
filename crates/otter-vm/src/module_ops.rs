@@ -42,7 +42,7 @@ impl Interpreter {
             .ok_or_else(|| VmError::UnknownIntrinsic {
                 name: format!("import \"{specifier}\""),
             })?;
-        write_register(frame, dst, Value::Object(namespace))?;
+        write_register(frame, dst, Value::object(namespace))?;
         frame.pc += 1;
         Ok(())
     }
@@ -61,7 +61,7 @@ impl Interpreter {
         let resolved = resolve_relative_url(Some(&frame.module_url), &specifier);
         let resolved_str =
             JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
-        write_register(frame, dst, Value::String(resolved_str))?;
+        write_register(frame, dst, Value::string(resolved_str))?;
         frame.pc += 1;
         Ok(())
     }
@@ -115,7 +115,7 @@ impl Interpreter {
                     .rejected_stack_rooted(self, stack, reason, &[], &[])?
             }
         };
-        write_register(&mut stack[top_idx], dst, Value::Promise(promise))?;
+        write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
         stack[top_idx].pc += 1;
         Ok(())
     }

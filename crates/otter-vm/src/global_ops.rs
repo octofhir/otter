@@ -25,7 +25,7 @@ impl Interpreter {
         frame: &mut Frame,
         dst: u16,
     ) -> Result<(), VmError> {
-        write_register(frame, dst, Value::Object(self.global_this))?;
+        write_register(frame, dst, Value::object(self.global_this))?;
         frame.pc += 1;
         Ok(())
     }

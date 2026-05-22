@@ -222,7 +222,7 @@ impl Interpreter {
             }
             _ => false,
         };
-        write_register(frame, dst, Value::Boolean(result))?;
+        write_register(frame, dst, Value::boolean(result))?;
         frame.pc += 1;
         Ok(())
     }
@@ -322,7 +322,7 @@ impl Interpreter {
             }
             _ => return Err(VmError::TypeMismatch),
         };
-        write_register(frame, dst, Value::Boolean(present))?;
+        write_register(frame, dst, Value::boolean(present))?;
         frame.pc += 1;
         Ok(())
     }
@@ -395,7 +395,7 @@ impl Interpreter {
                 message: format!("Cannot delete property '{name}'"),
             });
         }
-        write_register(frame, dst, Value::Boolean(removed))?;
+        write_register(frame, dst, Value::boolean(removed))?;
         frame.pc += 1;
         Ok(())
     }
@@ -524,7 +524,7 @@ impl Interpreter {
                 message: "Cannot delete property".to_string(),
             });
         }
-        write_register(frame, dst, Value::Boolean(removed))?;
+        write_register(frame, dst, Value::boolean(removed))?;
         frame.pc += 1;
         Ok(())
     }
@@ -2433,7 +2433,7 @@ impl Interpreter {
         let result = self.instanceof_operator_stack_rooted(context, stack, &lhs, &rhs)?;
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        write_register(&mut stack[top_idx], dst, Value::Boolean(result))?;
+        write_register(&mut stack[top_idx], dst, Value::boolean(result))?;
         Ok(true)
     }
 
@@ -3643,7 +3643,7 @@ impl Interpreter {
         let pc = stack[top_idx].pc;
         stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
         let present = self.ordinary_has_property_value(context, rhs, &key, 0)?;
-        write_register(&mut stack[top_idx], dst, Value::Boolean(present))?;
+        write_register(&mut stack[top_idx], dst, Value::boolean(present))?;
         Ok(true)
     }
 
@@ -3674,7 +3674,7 @@ impl Interpreter {
             &VmPropertyKey::atom(atomized_key),
             0,
         )?;
-        write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
+        write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
         Ok(true)
     }
 
@@ -3705,7 +3705,7 @@ impl Interpreter {
                 message: "Cannot delete property".to_string(),
             });
         }
-        write_register(&mut stack[top_idx], dst, Value::Boolean(removed))?;
+        write_register(&mut stack[top_idx], dst, Value::boolean(removed))?;
         Ok(true)
     }
 

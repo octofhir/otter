@@ -274,7 +274,7 @@ fn install_collection(
 
     // §24.1.2.1 / §24.2.2.1 — `prototype` own data property:
     // non-writable, non-enumerable, non-configurable.
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -284,7 +284,7 @@ fn install_collection(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(Value::native_function(ctor), true, false, true),
     );
 
     // §24.1.2.1 `Map.groupBy(items, callback)` static.
@@ -300,7 +300,7 @@ fn install_collection(
             &[&global_root, &ctor_root],
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc = PropertyDescriptor::data(Value::NativeFunction(group_by_fn), true, false, true);
+        let desc = PropertyDescriptor::data(Value::native_function(group_by_fn), true, false, true);
         if !ctor.define_own_property(heap, "groupBy", desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("groupBy"));
         }

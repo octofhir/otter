@@ -147,7 +147,7 @@ fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
     };
     if let Some(name) = lookup_name(&payload.kind, &code) {
-        return Ok(Value::String(crate::string::JsString::from_str(
+        return Ok(Value::string(crate::string::JsString::from_str(
             name,
             args.gc_heap,
         )?));

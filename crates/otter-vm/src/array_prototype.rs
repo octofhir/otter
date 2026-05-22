@@ -451,7 +451,7 @@ fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             elements.clear();
             elements.extend(values);
         });
-        return Ok(Value::Number(NumberValue::from_i32(
+        return Ok(Value::number(NumberValue::from_i32(
             (existing_len + arg_count) as i32,
         )));
     }
@@ -533,7 +533,7 @@ fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 elements[start..end].to_vec()
             }
         });
-        return Ok(Value::Array(args.array_from_elements_rooted(
+        return Ok(Value::array(args.array_from_elements_rooted(
             slice.iter().cloned(),
             &[],
             &[slice.as_slice()],
@@ -1020,7 +1020,7 @@ fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             }
             removed
         });
-        return Ok(Value::Array(args.array_from_elements_rooted(
+        return Ok(Value::array(args.array_from_elements_rooted(
             removed.iter().cloned(),
             &[],
             &[removed.as_slice()],
@@ -1146,7 +1146,7 @@ fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             "length",
             Value::Number(NumberValue::from_f64(new_len as f64)),
         );
-        return Ok(Value::Array(args.array_from_elements_rooted(
+        return Ok(Value::array(args.array_from_elements_rooted(
             removed.iter().cloned(),
             &[],
             &[removed.as_slice()],
@@ -1371,7 +1371,7 @@ fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     // symbol table. Surface them before the string-keyed paths so
     // `arr.hasOwnProperty(Symbol.toStringTag)` round-trips.
     if let Value::Symbol(sym) = &key_value {
-        return Ok(Value::Boolean(
+        return Ok(Value::boolean(
             array::get_symbol_property(*arr, heap, sym).is_some(),
         ));
     }

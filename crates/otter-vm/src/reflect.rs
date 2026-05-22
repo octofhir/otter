@@ -278,7 +278,7 @@ pub fn call(
                         // §10.1.9 step 4 — data path. Honour receiver:
                         // when target ≠ receiver, the data write lands
                         // on receiver, not target.
-                        return Ok(Value::Boolean(set_data_on_receiver(
+                        return Ok(Value::boolean(set_data_on_receiver(
                             interp, context, &target, &key, value, &receiver,
                         )?));
                     }

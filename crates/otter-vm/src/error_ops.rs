@@ -44,7 +44,7 @@ impl Interpreter {
             &value,
         )?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::Object(obj))?;
+        write_register(frame, dst, Value::object(obj))?;
         frame.pc += 1;
         Ok(())
     }
@@ -67,7 +67,7 @@ impl Interpreter {
         let owned_message = self.coerce_error_message(context, &value)?;
         let obj = self.make_error_instance_with_stack_roots(stack, kind, owned_message, &value)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::Object(obj))?;
+        write_register(frame, dst, Value::object(obj))?;
         frame.pc += 1;
         Ok(())
     }
@@ -111,7 +111,7 @@ impl Interpreter {
                 obj,
                 &mut self.gc_heap,
                 "message",
-                object::PropertyDescriptor::data(Value::String(s), true, false, true),
+                object::PropertyDescriptor::data(Value::string(s), true, false, true),
             );
         }
         Ok(obj)
@@ -129,7 +129,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let kind = ErrorKind::from_class_name(kind_name).ok_or(VmError::InvalidOperand)?;
         let ctor = self.error_classes.constructor(kind);
-        write_register(frame, dst, Value::Object(ctor))?;
+        write_register(frame, dst, Value::object(ctor))?;
         frame.pc += 1;
         Ok(())
     }

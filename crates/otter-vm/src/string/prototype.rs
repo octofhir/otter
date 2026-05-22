@@ -931,7 +931,7 @@ fn impl_replace(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         let mut buf = Vec::with_capacity(recv_units.len() + replacement_units.len());
         buf.extend_from_slice(&replacement_units);
         buf.extend_from_slice(&recv_units);
-        return Ok(Value::String(JsString::from_utf16_units(
+        return Ok(Value::string(JsString::from_utf16_units(
             &buf,
             args.gc_heap,
         )?));
@@ -985,7 +985,7 @@ fn impl_replace_all(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
             buf.push(u);
         }
         buf.extend_from_slice(&replacement_units);
-        return Ok(Value::String(JsString::from_utf16_units(
+        return Ok(Value::string(JsString::from_utf16_units(
             &buf,
             args.gc_heap,
         )?));
@@ -1029,7 +1029,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let separator = match args.args.first() {
         None | Some(Value::Undefined) => {
             let singleton = [Value::String(recv)];
-            return Ok(Value::Array(args.array_from_elements_rooted(
+            return Ok(Value::array(args.array_from_elements_rooted(
                 singleton.iter().cloned(),
                 &[],
                 &[singleton.as_slice()],
@@ -1044,7 +1044,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
 
     let limit = parse_split_limit(args)?;
     if limit == 0 {
-        return Ok(Value::Array(args.array_from_elements_rooted(
+        return Ok(Value::array(args.array_from_elements_rooted(
             std::iter::empty(),
             &[],
             &[],
@@ -1063,7 +1063,7 @@ fn impl_split(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
                 args.gc_heap,
             )?));
         }
-        return Ok(Value::Array(args.array_from_elements_rooted(
+        return Ok(Value::array(args.array_from_elements_rooted(
             out.iter().cloned(),
             &[],
             &[out.as_slice()],
@@ -1171,7 +1171,7 @@ fn regex_split(
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     if limit == 0 {
-        return Ok(Value::Array(args.array_from_elements_rooted(
+        return Ok(Value::array(args.array_from_elements_rooted(
             std::iter::empty(),
             &[],
             &[],
@@ -1300,7 +1300,7 @@ fn impl_match(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             let s = JsString::from_utf16_units(&recv_units[m.range.clone()], args.gc_heap)?;
             out.push(Value::string(s));
         }
-        return Ok(Value::Array(args.array_from_elements_rooted(
+        return Ok(Value::array(args.array_from_elements_rooted(
             out.iter().cloned(),
             &[],
             &[out.as_slice()],
@@ -1882,7 +1882,7 @@ fn native_string_replace_callable(
                 out.push(recv_units[pos]);
             }
         }
-        return Ok(Value::String(
+        return Ok(Value::string(
             JsString::from_utf16_units(&out, interp.gc_heap_mut()).map_err(|err| {
                 NativeError::TypeError {
                     name: if replace_all { "replaceAll" } else { "replace" },

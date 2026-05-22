@@ -90,7 +90,7 @@ impl FunctionKindPrototypes {
                 proto,
                 heap,
                 "constructor",
-                object::PropertyDescriptor::data(Value::Object(ctor), true, false, true),
+                object::PropertyDescriptor::data(Value::object(ctor), true, false, true),
             );
             Ok((ctor, proto))
         };

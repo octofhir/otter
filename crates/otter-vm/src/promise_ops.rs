@@ -42,7 +42,7 @@ impl Interpreter {
         let value = *read_register(&stack[top_idx], src)?;
         let promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .fulfilled_stack_rooted(self, stack, value, &[], &[])?;
-        write_register(&mut stack[top_idx], dst, Value::Promise(promise))?;
+        write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
         stack[top_idx].pc += 1;
         Ok(())
     }
@@ -88,7 +88,7 @@ impl Interpreter {
         let (handle, resolve, reject) =
             promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .construct_stack_rooted(self, stack, &[&executor], &[])?;
-        write_register(&mut stack[top_idx], dst, Value::Promise(handle))?;
+        write_register(&mut stack[top_idx], dst, Value::promise(handle))?;
         stack[top_idx].pc += 1;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
         args.push(resolve);

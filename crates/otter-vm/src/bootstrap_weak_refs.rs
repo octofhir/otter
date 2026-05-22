@@ -66,7 +66,7 @@ fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -74,7 +74,7 @@ fn install_weak_ref(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(Value::native_function(ctor), true, false, true),
     );
     crate::bootstrap::define_global_value(
         global,
@@ -130,7 +130,7 @@ fn install_finalization_registry(
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -138,7 +138,7 @@ fn install_finalization_registry(
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(Value::native_function(ctor), true, false, true),
     );
     crate::bootstrap::define_global_value(
         global,

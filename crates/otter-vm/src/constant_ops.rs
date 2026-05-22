@@ -31,7 +31,7 @@ impl Interpreter {
         let value = bigint::BigIntValue::from_decimal(&mut self.gc_heap, decimal)
             .ok_or(VmError::InvalidOperand)?
             .map_err(crate::oom_to_vm)?;
-        write_register(frame, dst, Value::BigInt(value))?;
+        write_register(frame, dst, Value::big_int(value))?;
         frame.pc += 1;
         Ok(())
     }

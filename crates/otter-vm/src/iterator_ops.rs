@@ -163,7 +163,7 @@ impl Interpreter {
             // Already-an-iterator should pass through unchanged.
             Value::Iterator(rc) => {
                 let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::Iterator(*rc))?;
+                write_register(frame, dst, Value::iterator(*rc))?;
                 frame.pc += 1;
                 return Ok(());
             }
@@ -171,7 +171,7 @@ impl Interpreter {
         };
         let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[&value], &[])?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::Iterator(iter))?;
+        write_register(frame, dst, Value::iterator(iter))?;
         frame.pc += 1;
         Ok(())
     }
@@ -189,7 +189,7 @@ impl Interpreter {
         };
         let (value, done) = step_iterator(iter, &mut self.gc_heap)?;
         write_register(frame, value_dst, value)?;
-        write_register(frame, done_dst, Value::Boolean(done))?;
+        write_register(frame, done_dst, Value::boolean(done))?;
         frame.pc += 1;
         Ok(())
     }
@@ -1220,7 +1220,7 @@ impl Interpreter {
             let iter_state = IteratorState::User { iterator: produced };
             let iter =
                 self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
-            write_register(&mut stack[top_idx], dst, Value::Iterator(iter))?;
+            write_register(&mut stack[top_idx], dst, Value::iterator(iter))?;
             stack[top_idx].pending_get_iterator = None;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
@@ -1303,7 +1303,7 @@ impl Interpreter {
                     .with_payload(*rc, |state| *state = IteratorState::Exhausted);
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
-            write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
+            write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
             stack[top_idx].pending_iterator_next = None;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
@@ -1340,7 +1340,7 @@ impl Interpreter {
                     .with_payload(*iter_rc, |state| *state = IteratorState::Exhausted);
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
-            write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
+            write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
         }
@@ -1359,7 +1359,7 @@ impl Interpreter {
         if needs_full_step {
             let (value, done) = self.iterator_next_full(context, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
-            write_register(&mut stack[top_idx], done_dst, Value::Boolean(done))?;
+            write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
         }

@@ -2717,7 +2717,7 @@ mod tests {
             o,
             interp.gc_heap_mut(),
             "x",
-            PropertyDescriptor::data(Value::Boolean(true), true, true, true),
+            PropertyDescriptor::data(Value::boolean(true), true, true, true),
         ));
 
         assert!(shape(o, interp.gc_heap()).is_null());
@@ -2985,7 +2985,7 @@ mod tests {
             proto,
             &mut heap,
             "x",
-            PropertyDescriptor::data(Value::Boolean(true), false, true, true),
+            PropertyDescriptor::data(Value::boolean(true), false, true, true),
         ));
 
         let second = alloc_object_old_for_fixture(&mut heap).unwrap();
@@ -3005,7 +3005,7 @@ mod tests {
             proto,
             &mut heap,
             "x",
-            PropertyDescriptor::data(Value::Boolean(true), false, true, true),
+            PropertyDescriptor::data(Value::boolean(true), false, true, true),
         ));
         let receiver = alloc_object_old_for_fixture(&mut heap).unwrap();
         set_prototype(receiver, &mut heap, Some(proto));
@@ -3167,7 +3167,7 @@ mod tests {
     fn define_property_with_default_attrs() {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        let desc = PropertyDescriptor::data(Value::Boolean(true), false, false, false);
+        let desc = PropertyDescriptor::data(Value::boolean(true), false, false, false);
         assert!(define_own_property(o, &mut heap, "x", desc));
         let got = get_own_descriptor(o, &heap, "x").unwrap();
         assert!(got.is_data());
@@ -3184,7 +3184,7 @@ mod tests {
             o,
             &mut heap,
             "x",
-            PropertyDescriptor::data(Value::Boolean(true), true, true, false),
+            PropertyDescriptor::data(Value::boolean(true), true, true, false),
         );
         // Try to switch the data slot to an accessor — must fail.
         let accessor = PropertyDescriptor::accessor(None, None, true, false);
@@ -3199,7 +3199,7 @@ mod tests {
             o,
             &mut heap,
             "x",
-            PropertyDescriptor::data(Value::Boolean(false), true, false, false),
+            PropertyDescriptor::data(Value::boolean(false), true, false, false),
         ));
 
         assert!(ordinary_set_data_property(
@@ -3224,7 +3224,7 @@ mod tests {
             o,
             &mut heap,
             "x",
-            PropertyDescriptor::data(Value::Boolean(false), false, true, true),
+            PropertyDescriptor::data(Value::boolean(false), false, true, true),
         ));
 
         assert!(!ordinary_set_data_property(
@@ -3299,7 +3299,7 @@ mod tests {
             o,
             &mut heap,
             "x",
-            PropertyDescriptor::data(Value::Boolean(true), true, true, false),
+            PropertyDescriptor::data(Value::boolean(true), true, true, false),
         );
         assert!(!delete(o, &mut heap, "x"));
         assert!(get(o, &heap, "x").is_some());

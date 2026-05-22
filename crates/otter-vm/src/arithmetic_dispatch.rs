@@ -205,7 +205,7 @@ impl Interpreter {
         // `abstract_ops::same_value` for the spec-correct numeric
         // BigInt comparison.
         let eq = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
-        write_register(frame, dst, Value::Boolean(eq ^ negate))?;
+        write_register(frame, dst, Value::boolean(eq ^ negate))?;
         frame.pc += 1;
         Ok(())
     }
@@ -221,7 +221,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
-        write_register(frame, dst, Value::Boolean(eq ^ negate))?;
+        write_register(frame, dst, Value::boolean(eq ^ negate))?;
         frame.pc += 1;
         Ok(())
     }
@@ -273,7 +273,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         let result = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
-        write_register(frame, dst, Value::Boolean(result))?;
+        write_register(frame, dst, Value::boolean(result))?;
         frame.pc += 1;
         Ok(())
     }
@@ -350,7 +350,7 @@ fn run_compare_values(
         ),
         _ => unreachable!("run_compare_values called with non-relational op"),
     };
-    write_register(frame, dst, Value::Boolean(truthy))?;
+    write_register(frame, dst, Value::boolean(truthy))?;
     frame.pc += 1;
     Ok(())
 }

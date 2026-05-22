@@ -95,7 +95,7 @@ impl Interpreter {
         let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
         let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::Array(array))?;
+        write_register(frame, dst, Value::array(array))?;
         frame.pc += 1;
         Ok(())
     }

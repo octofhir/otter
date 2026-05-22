@@ -930,7 +930,7 @@ fn native_get_own_property_symbols_rooted(
             .into_iter()
             .filter(|v| matches!(v, Value::Symbol(_)))
             .collect();
-        return Ok(Value::Array(ctx.array_from_elements_with_roots(
+        return Ok(Value::array(ctx.array_from_elements_with_roots(
             values,
             &[&target],
             &[args],
@@ -1329,7 +1329,7 @@ fn native_prototype_property_is_enumerable(
             .interp
             .get_own_property_descriptor_for_value(&context, this_value, args.first())
             .map_err(|err| object_native_error("propertyIsEnumerable", err))?;
-        return Ok(Value::Boolean(
+        return Ok(Value::boolean(
             desc.as_ref().is_some_and(PropertyDescriptor::enumerable),
         ));
     }
@@ -2333,7 +2333,7 @@ pub fn call(
                                 &value, string_key, gc_heap,
                             )?
                         {
-                            return Ok(Value::Object(descriptor_to_object_with_roots(
+                            return Ok(Value::object(descriptor_to_object_with_roots(
                                 &desc,
                                 gc_heap,
                                 &[],

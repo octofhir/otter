@@ -162,7 +162,7 @@ pub(crate) fn install_typed_array_entry(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let ctor_root = Value::native_function(ctor);
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -200,7 +200,7 @@ pub(crate) fn install_typed_array_entry(
         let _ = ctor.define_own_property(
             heap,
             "from",
-            PropertyDescriptor::data(Value::NativeFunction(from_native), true, false, true),
+            PropertyDescriptor::data(Value::native_function(from_native), true, false, true),
         );
         let of_native = crate::bootstrap::native_static_with_value_roots(
             heap,
@@ -213,7 +213,7 @@ pub(crate) fn install_typed_array_entry(
         let _ = ctor.define_own_property(
             heap,
             "of",
-            PropertyDescriptor::data(Value::NativeFunction(of_native), true, false, true),
+            PropertyDescriptor::data(Value::native_function(of_native), true, false, true),
         );
     }
 
@@ -268,7 +268,7 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
                 abstract_proto,
                 heap,
                 name,
-                PropertyDescriptor::data(Value::NativeFunction(f), true, false, true),
+                PropertyDescriptor::data(Value::native_function(f), true, false, true),
             );
             Ok(())
         };
@@ -619,7 +619,7 @@ fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     for (i, v) in elements.into_iter().enumerate() {
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::Number(crate::number::NumberValue::from_i32(
+            return Ok(Value::number(crate::number::NumberValue::from_i32(
                 i as i32,
             )));
         }
@@ -655,7 +655,7 @@ fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
         let v = elements[i];
         let hit = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
         if hit.to_boolean(ctx.interp_mut().gc_heap()) {
-            return Ok(Value::Number(crate::number::NumberValue::from_i32(
+            return Ok(Value::number(crate::number::NumberValue::from_i32(
                 i as i32,
             )));
         }
@@ -964,7 +964,7 @@ fn ensure_abstract_typed_array_constructor(
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     // §23.2.2.3 %TypedArray%.prototype is non-writable,
     // non-enumerable, non-configurable.
-    let proto_desc = PropertyDescriptor::data(Value::Object(abstract_proto), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(abstract_proto), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -974,14 +974,14 @@ fn ensure_abstract_typed_array_constructor(
         abstract_proto,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(Value::native_function(ctor), true, false, true),
     );
     // Hide the abstract ctor under a non-enumerable global slot.
     object::define_own_property(
         global,
         heap,
         ABSTRACT_CTOR_SLOT,
-        PropertyDescriptor::data(Value::NativeFunction(ctor), false, false, false),
+        PropertyDescriptor::data(Value::native_function(ctor), false, false, false),
     );
     Ok(ctor)
 }
@@ -1018,7 +1018,7 @@ fn ensure_abstract_typed_array_prototype(
         global,
         heap,
         ABSTRACT_PROTO_SLOT,
-        PropertyDescriptor::data(Value::Object(proto), false, false, false),
+        PropertyDescriptor::data(Value::object(proto), false, false, false),
     );
     Ok(proto)
 }

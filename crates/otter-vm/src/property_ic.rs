@@ -763,7 +763,7 @@ mod tests {
             obj,
             &mut heap,
             "x",
-            PropertyDescriptor::data(Value::Boolean(true), false, true, true),
+            PropertyDescriptor::data(Value::boolean(true), false, true, true),
         ));
 
         assert!(

@@ -110,7 +110,7 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
         }
     };
     if radix == 10 {
-        return Ok(Value::String(super::ecma::number_to_string(
+        return Ok(Value::string(super::ecma::number_to_string(
             recv.as_f64(),
             args.gc_heap,
         )?));
@@ -152,7 +152,7 @@ fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     // range check so `(Infinity).toExponential(101)` returns
     // `"Infinity"` (matching V8 / Test262 `infinity.js`).
     if !value.is_finite() {
-        return Ok(Value::String(super::ecma::number_to_string(
+        return Ok(Value::string(super::ecma::number_to_string(
             value,
             args.gc_heap,
         )?));
@@ -189,7 +189,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let value = recv.as_f64();
     // §21.1.3.5 step 2: undefined precision is plain ToString.
     if matches!(args.args.first(), None | Some(Value::Undefined)) {
-        return Ok(Value::String(super::ecma::number_to_string(
+        return Ok(Value::string(super::ecma::number_to_string(
             value,
             args.gc_heap,
         )?));
@@ -202,7 +202,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let p = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
     // §21.1.3.5 step 4: NaN/Infinity short-circuit AFTER coercion.
     if !value.is_finite() {
-        return Ok(Value::String(super::ecma::number_to_string(
+        return Ok(Value::string(super::ecma::number_to_string(
             value,
             args.gc_heap,
         )?));

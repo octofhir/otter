@@ -261,7 +261,7 @@ impl Interpreter {
             // can find its owner once execution starts.
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
+            write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
             return Ok(());
         }
         stack.push(new_frame);
@@ -334,7 +334,7 @@ impl Interpreter {
             gen_handle.set_async(&mut self.gc_heap, is_async_generator);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
             let top_idx = stack.len() - 1;
-            write_register(&mut stack[top_idx], dst, Value::Generator(gen_handle))?;
+            write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
             return Ok(());
         }
         stack.push(frame);

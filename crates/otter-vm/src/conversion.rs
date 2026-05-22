@@ -131,7 +131,7 @@ impl Interpreter {
         src: u16,
     ) -> Result<(), VmError> {
         let value = to_number_primitive(read_register(frame, src)?, &self.gc_heap)?;
-        write_register(frame, dst, Value::Number(value))?;
+        write_register(frame, dst, Value::number(value))?;
         frame.pc += 1;
         Ok(())
     }

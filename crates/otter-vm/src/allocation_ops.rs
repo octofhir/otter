@@ -543,7 +543,7 @@ impl Interpreter {
             crate::object::set_prototype(obj, &mut self.gc_heap, Some(proto));
         }
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::Object(obj))?;
+        write_register(frame, dst, Value::object(obj))?;
         frame.pc += 1;
         Ok(())
     }
@@ -566,7 +566,7 @@ impl Interpreter {
         }
         let array = self.alloc_stack_rooted_array_from_elements(stack, elements)?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::Array(array))?;
+        write_register(frame, dst, Value::array(array))?;
         frame.pc += 1;
         Ok(())
     }
@@ -587,7 +587,7 @@ impl Interpreter {
                     message: e.to_string(),
                 }
             })?;
-        write_register(frame, dst, Value::RegExp(regex))?;
+        write_register(frame, dst, Value::regexp(regex))?;
         frame.pc += 1;
         Ok(())
     }
@@ -638,7 +638,7 @@ impl Interpreter {
             &mut external_visit,
         )?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::WeakRef(weak_ref))?;
+        write_register(frame, dst, Value::weak_ref(weak_ref))?;
         frame.pc += 1;
         Ok(())
     }
@@ -666,7 +666,7 @@ impl Interpreter {
             &mut external_visit,
         )?;
         let frame = &mut stack[top_idx];
-        write_register(frame, dst, Value::FinalizationRegistry(registry))?;
+        write_register(frame, dst, Value::finalization_registry(registry))?;
         frame.pc += 1;
         Ok(())
     }

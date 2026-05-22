@@ -714,7 +714,7 @@ impl Interpreter {
                 );
                 if captured_t.is_nan() && nan_preserving {
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Number(NumberValue::from_f64(f64::NAN)))?;
+                    write_register(frame, dst, Value::number(NumberValue::from_f64(f64::NAN)))?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     return Ok(());
                 }
@@ -795,7 +795,7 @@ impl Interpreter {
                 _ => unreachable!("guarded by method-name match"),
             };
             let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::Boolean(result))?;
+            write_register(frame, dst, Value::boolean(result))?;
             frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(());
         }
@@ -863,7 +863,7 @@ impl Interpreter {
                 _ => unreachable!("guarded by method-name match"),
             };
             let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::Boolean(result))?;
+            write_register(frame, dst, Value::boolean(result))?;
             frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(());
         }
@@ -1072,7 +1072,7 @@ impl Interpreter {
                     out.push(recv_units[pos]);
                 }
             }
-            return Ok(Value::String(
+            return Ok(Value::string(
                 JsString::from_utf16_units(&out, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?,
             ));
@@ -1852,7 +1852,7 @@ impl Interpreter {
                     &mut external_visit,
                 )?;
                 let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::BoundFunction(bound))?;
+                write_register(frame, dst, Value::bound_function(bound))?;
                 frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                 Ok(())
             }
@@ -1875,7 +1875,7 @@ impl Interpreter {
                 let s = JsString::from_str(&display, &mut self.gc_heap)
                     .map_err(|_| VmError::TypeMismatch)?;
                 let frame = &mut stack[top_idx];
-                write_register(frame, dst, Value::String(s))?;
+                write_register(frame, dst, Value::string(s))?;
                 frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                 Ok(())
             }

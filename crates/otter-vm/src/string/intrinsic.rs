@@ -118,7 +118,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         constructor,
         heap,
         "prototype",
-        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+        crate::object::PropertyDescriptor::data(Value::object(prototype), false, false, false),
     );
     // §22.1.2 — `String.length` is a non-writable, non-enumerable,
     // configurable data property whose value is 1.

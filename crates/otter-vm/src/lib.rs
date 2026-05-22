@@ -2984,7 +2984,7 @@ impl Interpreter {
                         obj
                     };
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame, dst, Value::Object(obj))?;
+                    write_register(frame, dst, Value::object(obj))?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     continue;
                 }
@@ -3019,7 +3019,7 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Boolean(true))?;
+                    write_register(frame, dst, Value::boolean(true))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3028,7 +3028,7 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Boolean(false))?;
+                    write_register(frame, dst, Value::boolean(false))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3049,7 +3049,7 @@ impl Interpreter {
                         .exec_imm32(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Number(NumberValue::Smi(imm)))?;
+                    write_register(frame, dst, Value::number(NumberValue::Smi(imm)))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3065,7 +3065,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let value = NumberValue::from_f64(f64::from_bits(bits));
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Number(value))?;
+                    write_register(frame, dst, Value::number(value))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3081,7 +3081,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let s = JsString::from_utf16_units(units, self.gc_heap_mut())?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::String(s))?;
+                    write_register(frame, dst, Value::string(s))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3097,7 +3097,7 @@ impl Interpreter {
                         .as_string()
                         .ok_or(VmError::TypeMismatch)?;
                     let len = NumberValue::from_i32(s.len() as i32);
-                    write_register(frame, dst, Value::Number(len))?;
+                    write_register(frame, dst, Value::number(len))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3110,7 +3110,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
-                    write_register(frame, dst, Value::Boolean(!truthy))?;
+                    write_register(frame, dst, Value::boolean(!truthy))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3123,7 +3123,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
-                    write_register(frame, dst, Value::Boolean(truthy))?;
+                    write_register(frame, dst, Value::boolean(truthy))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3922,7 +3922,7 @@ impl Interpreter {
                         _ => return Err(VmError::TypeMismatch),
                     };
                     let n = NumberValue::from_f64(crate::array::len(arr, &self.gc_heap) as f64);
-                    write_register(frame, dst, Value::Number(n))?;
+                    write_register(frame, dst, Value::number(n))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3936,7 +3936,7 @@ impl Interpreter {
                     let frame = &mut stack[top_idx];
                     let value = *read_register(frame, src)?;
                     let result = abstract_ops::is_array(&value);
-                    write_register(frame, dst, Value::Boolean(result))?;
+                    write_register(frame, dst, Value::boolean(result))?;
                     frame.pc += 1;
                     continue;
                 }
@@ -7691,7 +7691,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let target = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
         let descriptor =
-            object::PropertyDescriptor::data(Value::Number(NumberValue::Smi(7)), true, false, true);
+            object::PropertyDescriptor::data(Value::number(NumberValue::Smi(7)), true, false, true);
         assert!(object::define_own_property(
             target,
             interp.gc_heap_mut(),

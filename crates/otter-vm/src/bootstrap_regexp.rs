@@ -73,7 +73,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         &[&global_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -83,7 +83,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+        PropertyDescriptor::data(Value::native_function(ctor), true, false, true),
     );
 
     install_regexp_legacy_accessors(heap, ctor)?;
@@ -734,7 +734,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
                     reason: "this is not a RegExp".to_string(),
                 });
             }
-            return Ok(Value::String(
+            return Ok(Value::string(
                 JsString::from_str("(?:)", ctx.heap_mut()).map_err(|_| oom("source"))?,
             ));
         }

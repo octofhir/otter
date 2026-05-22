@@ -663,7 +663,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let revocable_desc =
-        PropertyDescriptor::data(Value::NativeFunction(revocable), true, false, true);
+        PropertyDescriptor::data(Value::native_function(revocable), true, false, true);
     if !proxy_ctor.define_own_property(heap, "revocable", revocable_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("revocable"));
     }
@@ -960,7 +960,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         }
     }
     // Install Symbol.prototype as an own property on the constructor.
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !symbol_ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -993,9 +993,9 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let for_desc =
-        PropertyDescriptor::data(Value::NativeFunction(symbol_for_fn), true, false, true);
+        PropertyDescriptor::data(Value::native_function(symbol_for_fn), true, false, true);
     let key_for_desc =
-        PropertyDescriptor::data(Value::NativeFunction(symbol_key_for_fn), true, false, true);
+        PropertyDescriptor::data(Value::native_function(symbol_key_for_fn), true, false, true);
     if !symbol_ctor.define_own_property(heap, "for", for_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("for"));
     }
@@ -1004,7 +1004,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
     // Install Symbol.prototype.constructor → Symbol.
     let constructor_desc =
-        PropertyDescriptor::data(Value::NativeFunction(symbol_ctor), true, false, true);
+        PropertyDescriptor::data(Value::native_function(symbol_ctor), true, false, true);
     if !object::define_own_property(prototype, heap, "constructor", constructor_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("constructor"));
     }
@@ -1081,7 +1081,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     ];
     for (name, tag) in well_known_pairs {
         let sym = well_known.get(*tag);
-        let desc = PropertyDescriptor::data(Value::Symbol(sym), false, false, false);
+        let desc = PropertyDescriptor::data(Value::symbol(sym), false, false, false);
         if !symbol_ctor.define_own_property(heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("well-known symbol"));
         }
@@ -1112,7 +1112,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let to_primitive_sym = well_known.get(WellKnown::ToPrimitive);
     let to_prim_desc =
-        PropertyDescriptor::data(Value::NativeFunction(to_prim_fn), false, false, true);
+        PropertyDescriptor::data(Value::native_function(to_prim_fn), false, false, true);
     if !object::define_own_symbol_property(prototype, heap, &to_primitive_sym, to_prim_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(
             "Symbol.prototype[@@toPrimitive]",
@@ -1338,7 +1338,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         array,
         heap,
         "prototype",
-        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+        crate::object::PropertyDescriptor::data(Value::object(prototype), false, false, false),
     );
     {
         let mut builder = ObjectBuilder::from_object_with_value_roots(
@@ -1457,7 +1457,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         prototype,
         heap,
         "constructor",
-        crate::object::PropertyDescriptor::data(Value::Object(array), true, false, true),
+        crate::object::PropertyDescriptor::data(Value::object(array), true, false, true),
     );
 
     define_global(global, heap, "Array", Value::Object(array));
@@ -1582,7 +1582,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         statics,
         heap,
         "prototype",
-        crate::object::PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+        crate::object::PropertyDescriptor::data(Value::object(prototype), false, false, false),
     );
     // §21.1.2 — `Number.length` is a non-writable, non-enumerable,
     // configurable data property whose value matches the formal
@@ -1681,7 +1681,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             Some(Value::String(s)) => s.to_lossy_string(ctx.heap()),
             Some(other) => other.display_string(ctx.heap()),
             None => {
-                return Ok(Value::Number(crate::number::NumberValue::from_f64(
+                return Ok(Value::number(crate::number::NumberValue::from_f64(
                     f64::NAN,
                 )));
             }
@@ -1700,7 +1700,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             Some(Value::String(s)) => s.to_lossy_string(ctx.heap()),
             Some(other) => other.display_string(ctx.heap()),
             None => {
-                return Ok(Value::Number(crate::number::NumberValue::from_f64(
+                return Ok(Value::number(crate::number::NumberValue::from_f64(
                     f64::NAN,
                 )));
             }
@@ -2008,7 +2008,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     let name = PropertyDescriptor::data(name_value, false, false, true);
     let _ = object::define_own_property(function, heap, "name", name);
     let prototype_descriptor =
-        PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+        PropertyDescriptor::data(Value::object(prototype), false, false, false);
     let _ = object::define_own_property(function, heap, "prototype", prototype_descriptor);
     let prototype_length = PropertyDescriptor::data(
         Value::Number(crate::number::NumberValue::from_i32(0)),
@@ -2037,7 +2037,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         prototype,
         &[&global_root, &function_root],
     )?;
-    let constructor = PropertyDescriptor::data(Value::Object(function), true, false, true);
+    let constructor = PropertyDescriptor::data(Value::object(function), true, false, true);
     let _ = object::define_own_property(prototype, heap, "constructor", constructor);
     define_global(global, heap, "Function", Value::Object(function));
     Ok(())
@@ -2205,17 +2205,17 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     object::set_constructor_native(object, heap, Value::NativeFunction(ctor_native));
     let length_desc =
-        PropertyDescriptor::data(Value::Number(NumberValue::from_i32(1)), false, false, true);
+        PropertyDescriptor::data(Value::number(NumberValue::from_i32(1)), false, false, true);
     if !object::define_own_property(object, heap, "length", length_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("length"));
     }
     let name_value =
         crate::JsString::from_latin1(b"Object", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let name_desc = PropertyDescriptor::data(Value::String(name_value), false, false, true);
+    let name_desc = PropertyDescriptor::data(Value::string(name_value), false, false, true);
     if !object::define_own_property(object, heap, "name", name_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("name"));
     }
-    let prototype_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let prototype_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !object::define_own_property(object, heap, "prototype", prototype_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -2270,7 +2270,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         prototype,
         heap,
         "constructor",
-        PropertyDescriptor::data(Value::Object(object), true, false, true),
+        PropertyDescriptor::data(Value::object(object), true, false, true),
     );
     define_global(global, heap, "Object", Value::Object(object));
     Ok(())
@@ -2374,7 +2374,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         constructor,
         heap,
         "prototype",
-        PropertyDescriptor::data(Value::Object(prototype), false, false, false),
+        PropertyDescriptor::data(Value::object(prototype), false, false, false),
     );
 
     // §21.4.4 Properties of the Date Prototype Object — install
@@ -2640,7 +2640,12 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
             proto,
             heap,
             "constructor",
-            crate::object::PropertyDescriptor::data(Value::NativeFunction(ctor), true, false, true),
+            crate::object::PropertyDescriptor::data(
+                Value::native_function(ctor),
+                true,
+                false,
+                true,
+            ),
         );
         define_global_value(global, heap, Self::NAME, Value::NativeFunction(ctor));
         let iterator_ctor = ctor;
@@ -2864,7 +2869,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
         regexp_string,
         heap,
         "next",
-        object::PropertyDescriptor::data(Value::NativeFunction(next_fn), true, false, true),
+        object::PropertyDescriptor::data(Value::native_function(next_fn), true, false, true),
     ) {
         return Err(JsSurfaceError::DefinePropertyFailed(
             "RegExpStringIteratorPrototype.next",

@@ -90,7 +90,7 @@ impl Interpreter {
         let closure =
             crate::closure::alloc_closure(&mut self.gc_heap, function_id, upvalues, bound_this)
                 .map_err(crate::oom_to_vm)?;
-        write_register(frame, dst, Value::Closure(closure))?;
+        write_register(frame, dst, Value::closure(closure))?;
         frame.pc += 1;
         Ok(())
     }
@@ -148,7 +148,7 @@ impl Interpreter {
             constructor_desc,
         );
         let frame = &mut stack[frame_idx];
-        write_register(frame, dst, Value::ClassConstructor(class))?;
+        write_register(frame, dst, Value::class_constructor(class))?;
         frame.pc += 1;
         Ok(())
     }
@@ -316,7 +316,7 @@ impl Interpreter {
         )?;
         let top_idx = stack.len() - 1;
         stack[top_idx].pending_bind_function = None;
-        write_register(&mut stack[top_idx], dst, Value::BoundFunction(bound))?;
+        write_register(&mut stack[top_idx], dst, Value::bound_function(bound))?;
         stack[top_idx].pc = stack[top_idx]
             .pc
             .checked_add(1)

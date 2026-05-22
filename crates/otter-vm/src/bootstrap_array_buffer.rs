@@ -111,7 +111,7 @@ fn install_array_buffer(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let ctor_root = Value::native_function(ctor);
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }
@@ -222,7 +222,7 @@ fn install_shared_array_buffer(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let ctor_root = Value::native_function(ctor);
-    let proto_desc = PropertyDescriptor::data(Value::Object(prototype), false, false, false);
+    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
     if !ctor.define_own_property(heap, "prototype", proto_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
     }

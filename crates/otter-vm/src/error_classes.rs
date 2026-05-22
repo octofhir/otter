@@ -431,13 +431,13 @@ impl ErrorClassRegistry {
             error_proto,
             gc_heap,
             "name",
-            PropertyDescriptor::data(Value::String(error_name), true, false, true),
+            PropertyDescriptor::data(Value::string(error_name), true, false, true),
         );
         let _ = object::define_own_property(
             error_proto,
             gc_heap,
             "message",
-            PropertyDescriptor::data(Value::String(empty), true, false, true),
+            PropertyDescriptor::data(Value::string(empty), true, false, true),
         );
 
         // §20.5.3.4 Error.prototype.toString — install as a real
@@ -531,7 +531,7 @@ impl ErrorClassRegistry {
                 ctor,
                 gc_heap,
                 "name",
-                PropertyDescriptor::data(Value::String(name_str), false, false, true),
+                PropertyDescriptor::data(Value::string(name_str), false, false, true),
             );
             let _ = object::define_own_property(
                 ctor,
@@ -751,13 +751,13 @@ impl ErrorClassRegistry {
             error_ctor,
             gc_heap,
             "prototype",
-            PropertyDescriptor::data(Value::Object(error_proto), false, false, false),
+            PropertyDescriptor::data(Value::object(error_proto), false, false, false),
         );
         let _ = object::define_own_property(
             error_proto,
             gc_heap,
             "constructor",
-            PropertyDescriptor::data(Value::Object(error_ctor), true, false, true),
+            PropertyDescriptor::data(Value::object(error_ctor), true, false, true),
         );
         let error_call = native_constructor_static_with_roots(
             gc_heap,
@@ -801,14 +801,14 @@ impl ErrorClassRegistry {
                 proto,
                 gc_heap,
                 "name",
-                PropertyDescriptor::data(Value::String(class_name), true, false, true),
+                PropertyDescriptor::data(Value::string(class_name), true, false, true),
             );
             let empty = JsString::from_str("", gc_heap)?;
             let _ = object::define_own_property(
                 proto,
                 gc_heap,
                 "message",
-                PropertyDescriptor::data(Value::String(empty), true, false, true),
+                PropertyDescriptor::data(Value::string(empty), true, false, true),
             );
             let mut roots = class_entry_roots(&entries);
             roots.push(Value::object(error_proto));
@@ -821,13 +821,13 @@ impl ErrorClassRegistry {
                 ctor,
                 gc_heap,
                 "prototype",
-                PropertyDescriptor::data(Value::Object(proto), false, false, false),
+                PropertyDescriptor::data(Value::object(proto), false, false, false),
             );
             let _ = object::define_own_property(
                 proto,
                 gc_heap,
                 "constructor",
-                PropertyDescriptor::data(Value::Object(ctor), true, false, true),
+                PropertyDescriptor::data(Value::object(ctor), true, false, true),
             );
             // §20.5.7.2 — `AggregateError(errors, message?)` has
             // `length` 2; every other native error has `length` 1.
@@ -954,7 +954,7 @@ impl ErrorClassRegistry {
                 global_this,
                 gc_heap,
                 name,
-                PropertyDescriptor::data(Value::Object(entry.constructor), true, false, true),
+                PropertyDescriptor::data(Value::object(entry.constructor), true, false, true),
             );
         }
     }
@@ -1028,7 +1028,7 @@ impl ErrorClassRegistry {
                 obj,
                 ctx.heap_mut(),
                 "message",
-                crate::object::PropertyDescriptor::data(Value::String(s), true, false, true),
+                crate::object::PropertyDescriptor::data(Value::string(s), true, false, true),
             );
             let _ = value_roots;
             let _ = slice_roots;

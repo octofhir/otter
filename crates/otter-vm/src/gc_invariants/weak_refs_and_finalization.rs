@@ -54,12 +54,12 @@ fn weak_ref_does_not_keep_target_alive() {
     let mut heap = otter_gc::GcHeap::new().expect("heap");
     let target = alloc_old_object(&mut heap).expect("target");
     let weak_ref = alloc_weak_ref(&mut heap, &Value::object(target)).expect("weak ref");
-    assert_eq!(weak_ref_deref(weak_ref, &heap), Value::Object(target));
+    assert_eq!(weak_ref_deref(weak_ref, &heap), Value::object(target));
 
     let mut weak_root = weak_ref.raw();
     let jobs = full_gc_with_roots(&mut heap, &mut [&mut weak_root]);
     assert!(jobs.is_empty());
-    assert_eq!(weak_ref_deref(weak_ref, &heap), Value::Undefined);
+    assert_eq!(weak_ref_deref(weak_ref, &heap), Value::undefined());
     assert_eq!(
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes,
         0
@@ -76,7 +76,7 @@ fn weak_ref_returns_target_while_strongly_rooted() {
     let mut target_root = target.raw();
     let jobs = full_gc_with_roots(&mut heap, &mut [&mut weak_root, &mut target_root]);
     assert!(jobs.is_empty());
-    assert_eq!(weak_ref_deref(weak_ref, &heap), Value::Object(target));
+    assert_eq!(weak_ref_deref(weak_ref, &heap), Value::object(target));
     assert!(
         heap.gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes > 0,
         "strong root should keep target object live"
@@ -89,10 +89,18 @@ fn weak_ref_target_becomes_unavailable_after_force_gc() {
     let target = alloc_old_object(interp.gc_heap_mut()).expect("target");
     let weak_ref = alloc_weak_ref(interp.gc_heap_mut(), &Value::object(target)).expect("weak ref");
     let global = *interp.global_this();
-    crate::object::set(global, interp.gc_heap_mut(), "wr", Value::WeakRef(weak_ref));
+    crate::object::set(
+        global,
+        interp.gc_heap_mut(),
+        "wr",
+        Value::weak_ref(weak_ref),
+    );
 
     interp.force_gc();
-    assert_eq!(weak_ref_deref(weak_ref, interp.gc_heap()), Value::Undefined);
+    assert_eq!(
+        weak_ref_deref(weak_ref, interp.gc_heap()),
+        Value::undefined()
+    );
 }
 
 #[test]
@@ -113,7 +121,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
         global,
         interp.gc_heap_mut(),
         "registry",
-        Value::FinalizationRegistry(registry),
+        Value::finalization_registry(registry),
     );
     // Stabilise the baseline before measuring: bootstrap creates
     // transient `ObjectBody` allocations (intermediate descriptor
@@ -129,7 +137,7 @@ fn finalization_registry_registers_without_strong_target_retention() {
         registry,
         interp.gc_heap_mut(),
         &Value::object(target),
-        Value::Boolean(true),
+        Value::boolean(true),
         None,
     )
     .expect("register");
@@ -167,7 +175,7 @@ fn dropped_finalization_registry_self_cycle_is_reaped() {
         registry,
         &mut heap,
         &Value::object(target),
-        Value::FinalizationRegistry(registry),
+        Value::finalization_registry(registry),
         None,
     )
     .expect("register");
@@ -196,7 +204,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
         native_value(interp.gc_heap_mut(), "cleanup", move |_, args, _| {
             calls.fetch_add(1, Ordering::Relaxed);
             seen_held.store(
-                matches!(args.first(), Some(Value::Boolean(true))),
+                args.first().is_some_and(|v| v.as_boolean() == Some(true)),
                 Ordering::Relaxed,
             );
             Ok(Value::undefined())
@@ -209,7 +217,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
         registry,
         interp.gc_heap_mut(),
         &Value::object(target),
-        Value::Boolean(true),
+        Value::boolean(true),
         None,
     )
     .expect("register");
@@ -218,7 +226,7 @@ fn finalization_registry_schedules_cleanup_microtask() {
         global,
         interp.gc_heap_mut(),
         "registry",
-        Value::FinalizationRegistry(registry),
+        Value::finalization_registry(registry),
     );
 
     interp.force_gc();
@@ -253,11 +261,11 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
         let observed_undefined = Arc::clone(&observed_undefined);
         native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args, _| {
             let interp = ctx.interp_mut();
-            let Some(Value::WeakRef(weak_ref)) = args.first() else {
+            let Some(weak_ref) = args.first().and_then(|v| v.as_weak_ref()) else {
                 return Ok(Value::undefined());
             };
             observed_undefined.store(
-                weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined,
+                weak_ref_deref(weak_ref, interp.gc_heap()) == Value::undefined(),
                 Ordering::Relaxed,
             );
             Ok(Value::undefined())
@@ -271,7 +279,7 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
         registry,
         interp.gc_heap_mut(),
         &Value::object(target),
-        Value::WeakRef(weak_ref),
+        Value::weak_ref(weak_ref),
         None,
     )
     .expect("register");
@@ -280,7 +288,7 @@ fn finalization_callback_cannot_observe_collected_target_through_weak_ref() {
         global,
         interp.gc_heap_mut(),
         "registry",
-        Value::FinalizationRegistry(registry),
+        Value::finalization_registry(registry),
     );
 
     interp.force_gc();
@@ -313,7 +321,7 @@ fn finalization_cleanup_job_carries_registry_context() {
         registry,
         interp.gc_heap_mut(),
         &Value::object(target),
-        Value::Undefined,
+        Value::undefined(),
         None,
     )
     .expect("register");
@@ -322,7 +330,7 @@ fn finalization_cleanup_job_carries_registry_context() {
         global,
         interp.gc_heap_mut(),
         "registry",
-        Value::FinalizationRegistry(registry),
+        Value::finalization_registry(registry),
     );
 
     interp.force_gc();
@@ -340,11 +348,11 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
         let observed_undefined = Arc::clone(&observed_undefined);
         native_value(interp.gc_heap_mut(), "cleanup", move |ctx, args, _| {
             let interp = ctx.interp_mut();
-            let Some(Value::WeakRef(weak_ref)) = args.first() else {
+            let Some(weak_ref) = args.first().and_then(|v| v.as_weak_ref()) else {
                 return Ok(Value::undefined());
             };
             observed_undefined.store(
-                weak_ref_deref(*weak_ref, interp.gc_heap()) == Value::Undefined,
+                weak_ref_deref(weak_ref, interp.gc_heap()) == Value::undefined(),
                 Ordering::Relaxed,
             );
             Ok(Value::undefined())
@@ -358,7 +366,7 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
         registry,
         interp.gc_heap_mut(),
         &Value::object(target),
-        Value::WeakRef(weak_ref),
+        Value::weak_ref(weak_ref),
         None,
     )
     .expect("register");
@@ -367,7 +375,7 @@ fn pending_finalization_microtask_roots_held_value_across_next_gc() {
         global,
         interp.gc_heap_mut(),
         "registry",
-        Value::FinalizationRegistry(registry),
+        Value::finalization_registry(registry),
     );
 
     interp.force_gc();
@@ -398,7 +406,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
         registry,
         interp.gc_heap_mut(),
         &Value::object(target),
-        Value::Boolean(true),
+        Value::boolean(true),
         None,
     )
     .expect("register");
@@ -407,7 +415,7 @@ fn cleanup_callback_allocates_only_after_raw_gc_sweep_boundary() {
         global,
         interp.gc_heap_mut(),
         "registry",
-        Value::FinalizationRegistry(registry),
+        Value::finalization_registry(registry),
     );
 
     interp.force_gc();
@@ -433,8 +441,8 @@ fn finalization_registry_unregister_token_removes_cells() {
         registry,
         &mut heap,
         &Value::object(target),
-        Value::Boolean(false),
-        Some(&Value::Object(token)),
+        Value::boolean(false),
+        Some(&Value::object(token)),
     )
     .expect("register");
     assert_eq!(finalization_registry_cell_count(registry, &heap), 1);

@@ -605,10 +605,10 @@ mod tests {
     use crate::string::JsString;
 
     fn impl_length(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-        let recv = match args.receiver {
-            Value::String(s) => s,
-            _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
-        };
+        let recv = args
+            .receiver
+            .as_string()
+            .ok_or(IntrinsicError::BadReceiver { expected: "string" })?;
         let n = recv.len();
         Ok(Value::string(JsString::from_str(
             &n.to_string(),
@@ -617,19 +617,18 @@ mod tests {
     }
 
     fn impl_concat_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-        let recv = match args.receiver {
-            Value::String(s) => s,
-            _ => return Err(IntrinsicError::BadReceiver { expected: "string" }),
-        };
-        let arg0 = match args.args.first() {
-            Some(Value::String(s)) => s,
-            _ => {
-                return Err(IntrinsicError::BadArgument {
+        let recv = args
+            .receiver
+            .as_string()
+            .ok_or(IntrinsicError::BadReceiver { expected: "string" })?;
+        let arg0 =
+            args.args
+                .first()
+                .and_then(|v| v.as_string())
+                .ok_or(IntrinsicError::BadArgument {
                     index: 0,
                     reason: "must be a string",
-                });
-            }
-        };
+                })?;
         let out = JsString::concat(recv, arg0, args.gc_heap)?;
         Ok(Value::string(out))
     }
@@ -673,7 +672,7 @@ mod tests {
             .lookup(IntrinsicReceiver::String, "length")
             .unwrap();
         let err = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &Value::Undefined,
+            receiver: &Value::UNDEFINED,
             args: &[],
             gc_heap: &mut gc_heap,
             allocation_roots: &[],

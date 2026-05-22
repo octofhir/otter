@@ -37,34 +37,35 @@ fn coerce_digits_arg(
     heap: &otter_gc::GcHeap,
 ) -> Result<f64, IntrinsicError> {
     use super::parse::IntegerCoercion;
-    match arg {
-        None | Some(Value::Undefined) => Ok(default_undefined),
-        Some(v) => match super::parse::to_integer_or_infinity_strict(v, heap) {
-            IntegerCoercion::Ok(n) => Ok(n),
-            IntegerCoercion::SymbolNotConvertible => Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "cannot convert a Symbol to a number",
-            }),
-            IntegerCoercion::BigIntNotConvertible => Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "cannot convert a BigInt to a number",
-            }),
-        },
+    let Some(v) = arg else {
+        return Ok(default_undefined);
+    };
+    if v.is_undefined() {
+        return Ok(default_undefined);
+    }
+    match super::parse::to_integer_or_infinity_strict(v, heap) {
+        IntegerCoercion::Ok(n) => Ok(n),
+        IntegerCoercion::SymbolNotConvertible => Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "cannot convert a Symbol to a number",
+        }),
+        IntegerCoercion::BigIntNotConvertible => Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "cannot convert a BigInt to a number",
+        }),
     }
 }
 
 fn receiver_number(args: &IntrinsicArgs<'_>) -> Result<NumberValue, IntrinsicError> {
-    match args.receiver {
-        Value::Number(n) => Ok(*n),
-        Value::Object(obj) => {
-            // Per ECMA-262 `thisNumberValue`: if `this` has a
-            // `[[NumberData]]` internal slot, use it.
-            let gc = &*args.gc_heap;
-            crate::object::number_data(*obj, gc)
-                .ok_or(IntrinsicError::BadReceiver { expected: "number" })
-        }
-        _ => Err(IntrinsicError::BadReceiver { expected: "number" }),
+    if let Some(n) = args.receiver.as_number() {
+        return Ok(n);
     }
+    if let Some(obj) = args.receiver.as_object() {
+        let gc = &*args.gc_heap;
+        return crate::object::number_data(obj, gc)
+            .ok_or(IntrinsicError::BadReceiver { expected: "number" });
+    }
+    Err(IntrinsicError::BadReceiver { expected: "number" })
 }
 
 /// `Number.prototype.toString(radix = 10)`.
@@ -74,30 +75,31 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
     // otherwise routes through `ToIntegerOrInfinity`. Out-of-range
     // (`< 2` or `> 36`) raises RangeError. Symbol / BigInt raise
     // TypeError (mapped at the intrinsic error layer).
-    let radix: u32 = match args.args.first() {
-        None | Some(Value::Undefined) => 10,
-        Some(Value::Symbol(_)) => {
+    let radix: u32 = if let Some(v) = args.args.first() {
+        if v.is_undefined() {
+            10
+        } else if v.is_symbol() {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
                 reason: "Cannot convert a Symbol value to a number",
             });
-        }
-        Some(Value::BigInt(_)) => {
+        } else if v.is_big_int() {
             return Err(IntrinsicError::BadArgument {
                 index: 0,
                 reason: "Cannot convert a BigInt value to a number",
             });
-        }
-        Some(other) => {
-            let f = match other {
-                Value::Number(n) => n.as_f64(),
-                Value::Boolean(true) => 1.0,
-                Value::Boolean(false) | Value::Null => 0.0,
-                Value::String(s) => {
-                    crate::number::parse::to_number_from_string(&s.to_lossy_string(args.gc_heap))
-                        .as_f64()
-                }
-                _ => f64::NAN,
+        } else {
+            let f = if let Some(n) = v.as_number() {
+                n.as_f64()
+            } else if let Some(b) = v.as_boolean() {
+                if b { 1.0 } else { 0.0 }
+            } else if v.is_null() {
+                0.0
+            } else if let Some(s) = v.as_string() {
+                crate::number::parse::to_number_from_string(&s.to_lossy_string(args.gc_heap))
+                    .as_f64()
+            } else {
+                f64::NAN
             };
             let trunc = if f.is_nan() { 0.0 } else { f.trunc() };
             if !trunc.is_finite() || !(2.0..=36.0).contains(&trunc) {
@@ -108,6 +110,8 @@ fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
             }
             trunc as u32
         }
+    } else {
+        10
     };
     if radix == 10 {
         return Ok(Value::string(super::ecma::number_to_string(
@@ -159,19 +163,17 @@ fn impl_to_exponential(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
     }
     // §21.1.3.2 step 2: `f = undefined ? undefined :
     //   ToIntegerOrInfinity(fractionDigits)`.
-    let digits: Option<u32> = match args.args.first() {
-        None | Some(Value::Undefined) => None,
-        Some(_) => {
-            let f = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
-            // §21.1.3.2 step 6: out-of-range raises `RangeError`.
-            if !f.is_finite() || !(0.0..=100.0).contains(&f) {
-                return Err(IntrinsicError::OutOfRange {
-                    index: 0,
-                    reason: "must be an integer in 0..=100",
-                });
-            }
-            Some(f as u32)
+    let digits: Option<u32> = if args.args.first().is_none_or(|v| v.is_undefined()) {
+        None
+    } else {
+        let f = coerce_digits_arg(args.args.first(), 0.0, args.gc_heap)?;
+        if !f.is_finite() || !(0.0..=100.0).contains(&f) {
+            return Err(IntrinsicError::OutOfRange {
+                index: 0,
+                reason: "must be an integer in 0..=100",
+            });
         }
+        Some(f as u32)
     };
     let rendered = super::ecma_fixed::number_to_exponential(value, digits);
     Ok(Value::string(JsString::from_latin1(
@@ -188,7 +190,7 @@ fn impl_to_precision(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErr
     let recv = receiver_number(args)?;
     let value = recv.as_f64();
     // §21.1.3.5 step 2: undefined precision is plain ToString.
-    if matches!(args.args.first(), None | Some(Value::Undefined)) {
+    if args.args.first().is_none_or(|v| v.is_undefined()) {
         return Ok(Value::string(super::ecma::number_to_string(
             value,
             args.gc_heap,
@@ -299,18 +301,16 @@ fn native_number_method(
             let mut out: smallvec::SmallVec<[Value; 4]> =
                 smallvec::SmallVec::with_capacity(args.len());
             for arg in args {
-                if matches!(
-                    arg,
-                    Value::Object(_)
-                        | Value::Array(_)
-                        | Value::Function { .. }
-                        | Value::Closure(_)
-                        | Value::NativeFunction(_)
-                        | Value::BoundFunction(_)
-                        | Value::ClassConstructor(_)
-                        | Value::Proxy(_)
-                        | Value::RegExp(_)
-                ) {
+                let object_like = arg.is_object()
+                    || arg.is_array()
+                    || arg.is_function()
+                    || arg.is_closure()
+                    || arg.is_native_function()
+                    || arg.is_bound_function()
+                    || arg.is_class_constructor()
+                    || arg.is_proxy()
+                    || arg.is_regexp();
+                if object_like {
                     let Some(exec) = &exec else {
                         out.push(*arg);
                         continue;

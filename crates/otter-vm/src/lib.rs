@@ -1972,7 +1972,7 @@ impl Interpreter {
             args.push(job.held_value);
             self.microtasks.enqueue(Microtask {
                 callee: job.cleanup_callback,
-                this_value: Value::Undefined,
+                this_value: Value::undefined(),
                 args,
                 context: job.context,
                 result_capability: None,
@@ -2143,28 +2143,27 @@ impl Interpreter {
                     frames: Vec::new(),
                 });
             }
-            match current {
-                Value::BoundFunction(bound) => {
-                    hops += 1;
-                    let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
-                    let mut combined: SmallVec<[Value; 8]> =
-                        SmallVec::with_capacity(bound_args.len() + effective_args.len());
-                    combined.extend(bound_args);
-                    combined.extend(effective_args);
-                    effective_this = bound_this;
-                    effective_args = combined;
-                    current = target;
-                }
-                Value::ClassConstructor(cc) => {
-                    hops += 1;
-                    current = cc.ctor(&self.gc_heap);
-                }
-                _ => break,
+            if let Some(bound) = current.as_bound_function() {
+                hops += 1;
+                let (target, bound_this, bound_args) = bound.parts(&self.gc_heap);
+                let mut combined: SmallVec<[Value; 8]> =
+                    SmallVec::with_capacity(bound_args.len() + effective_args.len());
+                combined.extend(bound_args);
+                combined.extend(effective_args);
+                effective_this = bound_this;
+                effective_args = combined;
+                current = target;
+            } else if let Some(cc) = current.as_class_constructor() {
+                hops += 1;
+                current = cc.ctor(&self.gc_heap);
+            } else {
+                break;
             }
         }
         // Native callables run inline at the drain site: no frame
         // push, no return register. Errors propagate as RunError.
-        if let Value::NativeFunction(native) = &current {
+        if let Some(native) = current.as_native_function() {
+            let native = &native;
             let call = native.call_target(&self.gc_heap);
             if let crate::native_function::NativeCallTarget::VmIntrinsic(intrinsic) = call {
                 return match self.run_vm_intrinsic_sync(
@@ -2363,9 +2362,9 @@ impl Interpreter {
             Frame::build_upvalues_for_exec(&mut self.gc_heap, main, Frame::empty_upvalues())
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
         let entry_this = if main.is_module || main.is_strict {
-            Value::Undefined
+            Value::undefined()
         } else {
-            Value::Object(self.global_this)
+            Value::object(self.global_this)
         };
         let entry = Frame::with_exec_return_upvalues_and_this(main, None, upvalues, entry_this);
         let entry_is_async = main.is_async;
@@ -2545,7 +2544,7 @@ impl Interpreter {
                     continue;
                 }
                 Op::ReturnUndefined => {
-                    if let Some(popped) = self.pop_frame(stack, Value::Undefined)? {
+                    if let Some(popped) = self.pop_frame(stack, Value::undefined())? {
                         return Ok(popped);
                     }
                     continue;
@@ -2671,7 +2670,7 @@ impl Interpreter {
                         self.run_callable_sync(
                             &capability_context,
                             &cap.resolve,
-                            Value::Undefined,
+                            Value::undefined(),
                             smallvec::smallvec![record],
                         )?;
                     }
@@ -2854,9 +2853,7 @@ impl Interpreter {
                         } else {
                             Vec::new()
                         };
-                        let callee = Value::Function {
-                            function_id: frame.function_id,
-                        };
+                        let callee = Value::function(frame.function_id);
                         (
                             elements,
                             function.arguments_object_kind,
@@ -2917,7 +2914,7 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Undefined)?;
+                    write_register(frame, dst, Value::undefined())?;
                     frame.pc += 1;
                     continue;
                 }
@@ -2926,7 +2923,7 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Hole)?;
+                    write_register(frame, dst, Value::hole())?;
                     frame.pc += 1;
                     continue;
                 }
@@ -2953,7 +2950,7 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::Null)?;
+                    write_register(frame, dst, Value::null())?;
                     frame.pc += 1;
                     continue;
                 }
@@ -3833,10 +3830,9 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    let arr = match read_register(frame, src)? {
-                        Value::Array(a) => *a,
-                        _ => return Err(VmError::TypeMismatch),
-                    };
+                    let arr = read_register(frame, src)?
+                        .as_array()
+                        .ok_or(VmError::TypeMismatch)?;
                     let n = NumberValue::from_f64(crate::array::len(arr, &self.gc_heap) as f64);
                     write_register(frame, dst, Value::number(n))?;
                     frame.pc += 1;
@@ -4123,7 +4119,7 @@ impl Interpreter {
                 self.microtasks.enqueue(j);
             }
             if stack.is_empty() {
-                return Ok(Some(Value::Undefined));
+                return Ok(Some(Value::undefined()));
             }
             return Ok(None);
         }
@@ -4290,19 +4286,21 @@ fn value_has_prototype_in_chain(
     gc_heap: &otter_gc::GcHeap,
     function_prototype: Option<object::JsObject>,
 ) -> bool {
-    match value {
-        Value::Object(_) if object_has_construct_slot(value, gc_heap) => {
+    if let Some(obj) = value.as_object() {
+        if object_has_construct_slot(value, gc_heap) {
             function_value_has_prototype_in_chain(target, gc_heap, function_prototype)
+        } else {
+            object::has_in_proto_chain(obj, gc_heap, target)
         }
-        Value::Object(obj) => object::has_in_proto_chain(*obj, gc_heap, target),
-        Value::Function { .. }
-        | Value::Closure(_)
-        | Value::BoundFunction(_)
-        | Value::NativeFunction(_)
-        | Value::ClassConstructor(_) => {
-            function_value_has_prototype_in_chain(target, gc_heap, function_prototype)
-        }
-        _ => false,
+    } else if value.is_function()
+        || value.is_closure()
+        || value.is_bound_function()
+        || value.is_native_function()
+        || value.is_class_constructor()
+    {
+        function_value_has_prototype_in_chain(target, gc_heap, function_prototype)
+    } else {
+        false
     }
 }
 
@@ -4326,7 +4324,7 @@ fn native_function_object_prototype_intercept(
     match name {
         "hasOwnProperty" => {
             let key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::Boolean(
+            Ok(Some(Value::boolean(
                 native.own_property_descriptor(gc_heap, &key)?.is_some(),
             )))
         }
@@ -4348,13 +4346,13 @@ fn bound_function_object_prototype_intercept(
     match name {
         "hasOwnProperty" => {
             let key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::Boolean(
+            Ok(Some(Value::boolean(
                 function_metadata::bound_has_own_property(bound, gc_heap, &key),
             )))
         }
         "propertyIsEnumerable" => {
             let key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::Boolean(
+            Ok(Some(Value::boolean(
                 function_metadata::bound_own_property_is_enumerable(bound, gc_heap, &key),
             )))
         }
@@ -4371,36 +4369,66 @@ fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {
 }
 
 pub(crate) fn value_kind_name(value: &Value) -> &'static str {
-    match value {
-        Value::Undefined | Value::Hole => "undefined",
-        Value::Null => "null",
-        Value::Boolean(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Symbol(_) => "symbol",
-        Value::BigInt(_) => "bigint",
-        Value::Object(_) => "object",
-        Value::Array(_) => "array",
-        Value::Function { .. } | Value::Closure(_) => "function",
-        Value::NativeFunction(_) => "function",
-        Value::BoundFunction(_) => "function",
-        Value::ClassConstructor(_) => "class constructor",
-        Value::RegExp(_) => "regexp",
-        Value::Promise(_) => "promise",
-        Value::Proxy(_) => "proxy",
-        Value::Map(_) => "map",
-        Value::Set(_) => "set",
-        Value::WeakMap(_) => "weakmap",
-        Value::WeakSet(_) => "weakset",
-        Value::WeakRef(_) => "weakref",
-        Value::FinalizationRegistry(_) => "finalization registry",
-        Value::Generator(_) => "generator",
-        Value::Iterator(_) => "iterator",
-        Value::Temporal(_) => "temporal",
-        Value::Intl(_) => "intl",
-        Value::ArrayBuffer(_) => "arraybuffer",
-        Value::DataView(_) => "dataview",
-        Value::TypedArray(_) => "typedarray",
+    if value.is_undefined() || value.is_hole() {
+        "undefined"
+    } else if value.is_null() {
+        "null"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_number() {
+        "number"
+    } else if value.is_string() {
+        "string"
+    } else if value.is_symbol() {
+        "symbol"
+    } else if value.is_big_int() {
+        "bigint"
+    } else if value.is_object() {
+        "object"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_function()
+        || value.is_closure()
+        || value.is_native_function()
+        || value.is_bound_function()
+    {
+        "function"
+    } else if value.is_class_constructor() {
+        "class constructor"
+    } else if value.is_regexp() {
+        "regexp"
+    } else if value.is_promise() {
+        "promise"
+    } else if value.is_proxy() {
+        "proxy"
+    } else if value.is_map() {
+        "map"
+    } else if value.is_set() {
+        "set"
+    } else if value.is_weak_map() {
+        "weakmap"
+    } else if value.is_weak_set() {
+        "weakset"
+    } else if value.is_weak_ref() {
+        "weakref"
+    } else if value.is_finalization_registry() {
+        "finalization registry"
+    } else if value.is_generator() {
+        "generator"
+    } else if value.is_iterator() {
+        "iterator"
+    } else if value.is_temporal() {
+        "temporal"
+    } else if value.is_intl() {
+        "intl"
+    } else if value.is_array_buffer() {
+        "arraybuffer"
+    } else if value.is_data_view() {
+        "dataview"
+    } else if value.is_typed_array() {
+        "typedarray"
+    } else {
+        "unknown"
     }
 }
 

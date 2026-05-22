@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, array,
-    number, operand_decode::register_operand, read_register, symbol, to_length, write_register,
+    operand_decode::register_operand, read_register, symbol, to_length, write_register,
 };
 
 impl Interpreter {
@@ -57,7 +57,7 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         if args.len() == 1
-            && let Value::Number(n) = &args[0]
+            && let Some(n) = args[0].as_number()
         {
             let raw = n.as_f64();
             let len = raw as u32;
@@ -81,7 +81,7 @@ impl Interpreter {
                     arr,
                     &mut self.gc_heap,
                     (len - 1) as usize,
-                    Value::Hole,
+                    Value::hole(),
                     &mut external_visit,
                 )?;
             }
@@ -128,7 +128,7 @@ impl Interpreter {
         let items = args.first().cloned().unwrap_or(Value::undefined());
         let map_fn = args.get(1).cloned().unwrap_or(Value::undefined());
         let this_arg = args.get(2).cloned().unwrap_or(Value::undefined());
-        let has_map = !matches!(map_fn, Value::Undefined);
+        let has_map = !map_fn.is_undefined();
         if has_map && !self.is_callable_runtime(&map_fn) {
             return Err(VmError::TypeError {
                 message: "Array.from mapFn must be callable".to_string(),
@@ -138,22 +138,19 @@ impl Interpreter {
         // Step 1 — built-in iterable fast paths short-circuit the
         // `@@iterator` round-trip; for everything else look up
         // `@@iterator` to decide between iterable and array-like.
-        let is_builtin_iterable = matches!(
-            items,
-            Value::Array(_)
-                | Value::String(_)
-                | Value::Set(_)
-                | Value::Map(_)
-                | Value::Generator(_)
-                | Value::Iterator(_)
-        );
-        let iterator_method = if matches!(items, Value::Undefined | Value::Null) {
-            Value::Undefined
+        let is_builtin_iterable = items.is_array()
+            || items.is_string()
+            || items.is_set()
+            || items.is_map()
+            || items.is_generator()
+            || items.is_iterator();
+        let iterator_method = if items.is_undefined() || items.is_null() {
+            Value::undefined()
         } else if is_builtin_iterable {
             // Sentinel: any non-undefined value picks the iterator
             // path below; `iterator_to_list_sync` handles built-ins
             // via its fast-path branches.
-            Value::Boolean(true)
+            Value::boolean(true)
         } else {
             let iterator_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
             match self.ordinary_get_value(
@@ -170,9 +167,10 @@ impl Interpreter {
             }
         };
 
-        let raw_values: Vec<Value> = if matches!(iterator_method, Value::Undefined | Value::Null) {
+        let raw_values: Vec<Value> = if iterator_method.is_undefined() || iterator_method.is_null()
+        {
             // Step 4 — ArrayLike path.
-            if matches!(items, Value::Undefined | Value::Null) {
+            if items.is_undefined() || items.is_null() {
                 return Err(VmError::TypeError {
                     message: "Array.from requires an iterable or array-like".to_string(),
                 });
@@ -219,7 +217,7 @@ impl Interpreter {
             if has_map {
                 let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
                 cb_args.push(value);
-                cb_args.push(Value::number(number::NumberValue::from_i32(index as i32)));
+                cb_args.push(Value::number_i32(index as i32));
                 let mapped_value = self.run_callable_sync(context, &map_fn, this_arg, cb_args)?;
                 mapped.push(mapped_value);
             } else {
@@ -326,7 +324,7 @@ mod tests {
         let mut interp = Interpreter::new();
         let source = crate::array::from_elements_old_for_fixture(
             interp.gc_heap_mut(),
-            [Value::number(crate::NumberValue::from_i32(7))],
+            [Value::number_i32(7)],
         )
         .expect("source");
         let context = empty_context();
@@ -341,7 +339,7 @@ mod tests {
             after > before,
             "Array.from should allocate its result array in young space"
         );
-        assert!(matches!(result, Value::Array(_)));
+        assert!(result.is_array());
     }
 
     #[test]
@@ -353,13 +351,7 @@ mod tests {
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let result = interp
-            .array_of_stack_rooted(
-                &stack,
-                &[
-                    Value::Number(crate::NumberValue::from_i32(1)),
-                    Value::Number(crate::NumberValue::from_i32(2)),
-                ],
-            )
+            .array_of_stack_rooted(&stack, &[Value::number_i32(1), Value::number_i32(2)])
             .expect("Array.of");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
@@ -367,7 +359,7 @@ mod tests {
             after > before,
             "Array.of should allocate its result array in young space"
         );
-        let Value::Array(array) = result else {
+        let Some(array) = result.as_array() else {
             panic!("expected array");
         };
         assert_eq!(crate::array::len(array, interp.gc_heap()), 2);
@@ -383,7 +375,7 @@ mod tests {
         let before_reserved = interp.gc_heap().stats().reserved_bytes;
 
         let result = interp
-            .array_construct_stack_rooted(&stack, &[Value::number(crate::NumberValue::from_i32(8))])
+            .array_construct_stack_rooted(&stack, &[Value::number_i32(8)])
             .expect("Array constructor");
 
         let after_alloc = interp.gc_heap().stats().new_allocated_bytes;
@@ -396,7 +388,7 @@ mod tests {
             after_reserved > before_reserved,
             "Array(length) should grow backing storage through root-aware reservation"
         );
-        let Value::Array(array) = result else {
+        let Some(array) = result.as_array() else {
             panic!("expected array");
         };
         assert_eq!(crate::array::len(array, interp.gc_heap()), 8);

@@ -36,6 +36,43 @@ enum BindMetadataGet {
     Getter(Value),
 }
 
+// Mirrors the matches! variant list used by `OrdinaryHasInstance` and
+// `function_metadata` callers: ordinary-object shapes excluding
+// Iterator / Generator / Temporal / Intl (which are not treated as
+// instance-target candidates by the existing dispatchers).
+fn is_instance_object_value(v: &Value) -> bool {
+    v.is_object()
+        || v.is_proxy()
+        || v.is_array()
+        || v.is_function()
+        || v.is_closure()
+        || v.is_native_function()
+        || v.is_bound_function()
+        || v.is_class_constructor()
+        || v.is_regexp()
+        || v.is_map()
+        || v.is_set()
+        || v.is_weak_map()
+        || v.is_weak_set()
+        || v.is_weak_ref()
+        || v.is_finalization_registry()
+        || v.is_promise()
+        || v.is_array_buffer()
+        || v.is_data_view()
+        || v.is_typed_array()
+}
+
+// Callable-or-object shapes used by the bind / metadata helpers.
+fn is_callable_or_object_value(v: &Value) -> bool {
+    v.is_object()
+        || v.is_proxy()
+        || v.is_function()
+        || v.is_closure()
+        || v.is_native_function()
+        || v.is_bound_function()
+        || v.is_class_constructor()
+}
+
 impl Interpreter {
     pub(crate) fn run_make_function_reg(
         &self,
@@ -47,7 +84,7 @@ impl Interpreter {
         let function_id = context
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
-        write_register(frame, dst, Value::Function { function_id })?;
+        write_register(frame, dst, Value::function(function_id))?;
         frame.pc += 1;
         Ok(())
     }
@@ -109,14 +146,12 @@ impl Interpreter {
         if !self.is_callable_runtime(&ctor) {
             return Err(VmError::NotCallable);
         }
-        let prototype = match read_register(frame, proto_reg)? {
-            Value::Object(o) => *o,
-            _ => return Err(VmError::TypeMismatch),
-        };
-        let statics = match read_register(frame, statics_reg)? {
-            Value::Object(o) => *o,
-            _ => return Err(VmError::TypeMismatch),
-        };
+        let prototype = read_register(frame, proto_reg)?
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
+        let statics = read_register(frame, statics_reg)?
+            .as_object()
+            .ok_or(VmError::TypeMismatch)?;
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
@@ -136,7 +171,7 @@ impl Interpreter {
         // class constructor itself rather than to the inherited
         // parent class's `constructor` slot.
         let constructor_desc = object::PropertyDescriptor::data(
-            Value::ClassConstructor(class),
+            Value::class_constructor(class),
             /* writable */ true,
             /* enumerable */ false,
             /* configurable */ true,
@@ -348,7 +383,8 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let receiver = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = match iter.next() {
-                    None | Some(Value::Undefined) | Some(Value::Null) => SmallVec::new(),
+                    None => SmallVec::new(),
+                    Some(v) if v.is_nullish() => SmallVec::new(),
                     Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
                 };
                 self.run_callable_sync(context, &this_value, receiver, forwarded)
@@ -436,38 +472,17 @@ impl Interpreter {
         if !self.is_callable_runtime(c) {
             return Ok(false);
         }
-        if let Value::BoundFunction(bound) = c {
+        if let Some(bound) = c.as_bound_function() {
             let (target, _, _) = bound.parts(&self.gc_heap);
             return self.instanceof_operator(context, o, &target);
         }
-        if !matches!(
-            o,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-        ) {
+        if !is_instance_object_value(o) {
             return Ok(false);
         }
         let Some(prototype) = self.instanceof_target_prototype(context, c)? else {
             return Ok(false);
         };
-        if !matches!(prototype, Value::Object(_) | Value::Proxy(_)) {
+        if !(prototype.is_object() || prototype.is_proxy()) {
             return Err(VmError::TypeError {
                 message: "Function has non-object prototype 'undefined' in instanceof check"
                     .to_string(),
@@ -486,39 +501,18 @@ impl Interpreter {
         if !self.is_callable_runtime(c) {
             return Ok(false);
         }
-        if let Value::BoundFunction(bound) = c {
+        if let Some(bound) = c.as_bound_function() {
             let (target, _, _) = bound.parts(&self.gc_heap);
             return self.instanceof_operator_stack_rooted(context, stack, o, &target);
         }
-        if !matches!(
-            o,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-        ) {
+        if !is_instance_object_value(o) {
             return Ok(false);
         }
         let Some(prototype) = self.instanceof_target_prototype_stack_rooted(context, stack, c)?
         else {
             return Ok(false);
         };
-        if !matches!(prototype, Value::Object(_) | Value::Proxy(_)) {
+        if !(prototype.is_object() || prototype.is_proxy()) {
             return Err(VmError::TypeError {
                 message: "Function has non-object prototype 'undefined' in instanceof check"
                     .to_string(),
@@ -537,16 +531,7 @@ impl Interpreter {
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
-        if !matches!(
-            target,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-        ) {
+        if !is_callable_or_object_value(target) {
             return Err(VmError::TypeError {
                 message: "Right-hand side of instanceof is not an object".to_string(),
             });
@@ -559,13 +544,13 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, *target, SmallVec::new())?
             }
         };
-        if !matches!(handler, Value::Undefined | Value::Null) {
+        if !handler.is_nullish() {
             if !self.is_callable_runtime(&handler) {
                 return Err(VmError::TypeError {
                     message: "@@hasInstance must be callable".to_string(),
                 });
             }
-            if let Value::NativeFunction(native) = &handler
+            if let Some(native) = handler.as_native_function()
                 && native.is_vm_intrinsic(
                     &self.gc_heap,
                     VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
@@ -593,16 +578,7 @@ impl Interpreter {
         v: &Value,
         target: &Value,
     ) -> Result<bool, VmError> {
-        if !matches!(
-            target,
-            Value::Object(_)
-                | Value::Proxy(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-        ) {
+        if !is_callable_or_object_value(target) {
             return Err(VmError::TypeError {
                 message: "Right-hand side of instanceof is not an object".to_string(),
             });
@@ -615,13 +591,13 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, *target, SmallVec::new())?
             }
         };
-        if !matches!(handler, Value::Undefined | Value::Null) {
+        if !handler.is_nullish() {
             if !self.is_callable_runtime(&handler) {
                 return Err(VmError::TypeError {
                     message: "@@hasInstance must be callable".to_string(),
                 });
             }
-            if let Value::NativeFunction(native) = &handler
+            if let Some(native) = handler.as_native_function()
                 && native.is_vm_intrinsic(
                     &self.gc_heap,
                     VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
@@ -654,28 +630,7 @@ impl Interpreter {
         // per spec), plus the exotic objects with their own
         // `[[Get]]` ladder (RegExp, ArrayBuffer, DataView,
         // TypedArray, collections, etc.).
-        if !matches!(
-            value,
-            Value::Object(_)
-                | Value::Array(_)
-                | Value::Proxy(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-                | Value::Promise(_)
-        ) {
+        if !is_instance_object_value(&value) {
             return Err(VmError::TypeError {
                 message: "Function.prototype.apply argument list must be object-like".to_string(),
             });
@@ -710,70 +665,86 @@ impl Interpreter {
         target: &Value,
         key: &str,
     ) -> Result<BindMetadataGet, VmError> {
-        match target {
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                match self.ordinary_function_own_property_descriptor(
-                    Some(context),
-                    *function_id,
-                    key,
-                )? {
-                    Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
-                    None => Ok(BindMetadataGet::Value(Value::Undefined)),
-                }
-            }
-            Value::NativeFunction(native) => {
-                match native.own_property_descriptor(&mut self.gc_heap, key)? {
-                    Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
-                    None => Ok(BindMetadataGet::Value(Value::Undefined)),
-                }
-            }
-            Value::BoundFunction(bound) => {
-                match function_metadata::bound_own_property_descriptor(
-                    bound,
-                    &mut self.gc_heap,
-                    key,
-                )? {
-                    Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
-                    None => Ok(BindMetadataGet::Value(Value::Undefined)),
-                }
-            }
-            Value::ClassConstructor(class) => {
-                let ctor = class.ctor(&self.gc_heap);
-                self.callable_bind_metadata_get(context, &ctor, key)
-            }
-            Value::Object(obj) => {
-                let obj = *obj;
-                if let Some(desc) = object::get_own_descriptor(obj, &self.gc_heap, key) {
-                    return Ok(bind_metadata_get_from_descriptor(desc));
-                }
-                match object::constructor_native(obj, &self.gc_heap) {
-                    Some(native @ Value::NativeFunction(_)) => {
-                        self.callable_bind_metadata_get(context, &native, key)
-                    }
-                    _ => Ok(BindMetadataGet::Value(Value::Undefined)),
-                }
-            }
-            _ => Ok(BindMetadataGet::Value(Value::Undefined)),
+        if let Some(function_id) = target.as_function() {
+            return match self.ordinary_function_own_property_descriptor(
+                Some(context),
+                function_id,
+                key,
+            )? {
+                Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
+                None => Ok(BindMetadataGet::Value(Value::undefined())),
+            };
         }
+        if let Some(closure) = target.as_closure() {
+            return match self.ordinary_function_own_property_descriptor(
+                Some(context),
+                closure.cached_function_id,
+                key,
+            )? {
+                Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
+                None => Ok(BindMetadataGet::Value(Value::undefined())),
+            };
+        }
+        if let Some(native) = target.as_native_function() {
+            return match native.own_property_descriptor(&mut self.gc_heap, key)? {
+                Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
+                None => Ok(BindMetadataGet::Value(Value::undefined())),
+            };
+        }
+        if let Some(bound) = target.as_bound_function() {
+            return match function_metadata::bound_own_property_descriptor(
+                &bound,
+                &mut self.gc_heap,
+                key,
+            )? {
+                Some(desc) => Ok(bind_metadata_get_from_descriptor(desc)),
+                None => Ok(BindMetadataGet::Value(Value::undefined())),
+            };
+        }
+        if let Some(class) = target.as_class_constructor() {
+            let ctor = class.ctor(&self.gc_heap);
+            return self.callable_bind_metadata_get(context, &ctor, key);
+        }
+        if let Some(obj) = target.as_object() {
+            if let Some(desc) = object::get_own_descriptor(obj, &self.gc_heap, key) {
+                return Ok(bind_metadata_get_from_descriptor(desc));
+            }
+            if let Some(native) = object::constructor_native(obj, &self.gc_heap)
+                && native.is_native_function()
+            {
+                return self.callable_bind_metadata_get(context, &native, key);
+            }
+            return Ok(BindMetadataGet::Value(Value::undefined()));
+        }
+        Ok(BindMetadataGet::Value(Value::undefined()))
     }
 
     pub(crate) fn coerce_vm_property_key(
         arg: Option<&Value>,
         heap: &otter_gc::GcHeap,
     ) -> Result<VmPropertyKey<'static>, VmError> {
-        match arg {
-            Some(Value::String(s)) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-            Some(Value::Number(n)) => Ok(VmPropertyKey::OwnedString(n.to_display_string())),
-            Some(Value::Boolean(b)) => Ok(VmPropertyKey::String(if *b { "true" } else { "false" })),
-            Some(Value::Null) => Ok(VmPropertyKey::String("null")),
-            Some(Value::Undefined) | None => Ok(VmPropertyKey::String("undefined")),
-            Some(Value::Symbol(sym)) => Ok(VmPropertyKey::Symbol(*sym)),
-            _ => Err(VmError::TypeMismatch),
+        let Some(value) = arg else {
+            return Ok(VmPropertyKey::String("undefined"));
+        };
+        if let Some(s) = value.as_string() {
+            return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
         }
+        if let Some(n) = value.as_number() {
+            return Ok(VmPropertyKey::OwnedString(n.to_display_string()));
+        }
+        if let Some(b) = value.as_boolean() {
+            return Ok(VmPropertyKey::String(if b { "true" } else { "false" }));
+        }
+        if value.is_null() {
+            return Ok(VmPropertyKey::String("null"));
+        }
+        if value.is_undefined() {
+            return Ok(VmPropertyKey::String("undefined"));
+        }
+        if let Some(sym) = value.as_symbol() {
+            return Ok(VmPropertyKey::Symbol(*sym));
+        }
+        Err(VmError::TypeMismatch)
     }
 
     pub(crate) fn function_user_bag_stack_rooted(
@@ -921,25 +892,22 @@ impl Interpreter {
         class: ClassConstructor,
     ) -> Result<Vec<String>, VmError> {
         let ctor = class.ctor(&self.gc_heap);
-        let mut keys = match ctor {
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let Some(context) = context else {
-                    return Err(VmError::InvalidOperand);
-                };
-                self.ordinary_function_own_property_keys(context, function_id)
-            }
-            Value::NativeFunction(native) => native.own_property_keys(&self.gc_heap),
-            Value::BoundFunction(bound) => {
-                function_metadata::bound_own_property_keys(&bound, &self.gc_heap)
-            }
-            Value::ClassConstructor(inner) => {
-                self.class_constructor_own_property_keys(context, inner)?
-            }
-            _ => Vec::new(),
+        let function_id = ctor
+            .as_function()
+            .or_else(|| ctor.as_closure().map(|c| c.cached_function_id));
+        let mut keys = if let Some(function_id) = function_id {
+            let Some(context) = context else {
+                return Err(VmError::InvalidOperand);
+            };
+            self.ordinary_function_own_property_keys(context, function_id)
+        } else if let Some(native) = ctor.as_native_function() {
+            native.own_property_keys(&self.gc_heap)
+        } else if let Some(bound) = ctor.as_bound_function() {
+            function_metadata::bound_own_property_keys(&bound, &self.gc_heap)
+        } else if let Some(inner) = ctor.as_class_constructor() {
+            self.class_constructor_own_property_keys(context, inner)?
+        } else {
+            Vec::new()
         };
 
         if !keys.iter().any(|key| key == "prototype") {
@@ -1062,7 +1030,7 @@ impl Interpreter {
             };
         let mut roots = Vec::with_capacity(value_roots.len() + 3);
         roots.extend_from_slice(value_roots);
-        let desc_obj_root = desc_obj.map(Value::Object);
+        let desc_obj_root = desc_obj.map(Value::object);
         if let Some(value) = &desc_obj_root {
             roots.push(value);
         }
@@ -1128,10 +1096,8 @@ impl Interpreter {
         let Some(target) = args.first().cloned() else {
             return Ok(None);
         };
-        if matches!(
-            target,
-            Value::Array(_) | Value::Function { .. } | Value::Closure(_) | Value::RegExp(_)
-        ) && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
+        if (target.is_array() || target.is_function() || target.is_closure() || target.is_regexp())
+            && matches!(method, M::Freeze | M::Seal | M::IsFrozen | M::IsSealed)
         {
             let Some(context) = context else {
                 return Err(VmError::InvalidOperand);
@@ -1180,21 +1146,20 @@ impl Interpreter {
                 _ => unreachable!("integrity methods are matched above"),
             }
         }
-        if matches!(
-            target,
-            Value::Proxy(_)
-                | Value::Array(_)
-                | Value::RegExp(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::BoundFunction(_)
-                | Value::NativeFunction(_)
-        ) && matches!(
-            method,
-            M::GetOwnPropertyDescriptor | M::HasOwn | M::Keys | M::GetOwnPropertyNames
-        ) {
+        if (target.is_proxy()
+            || target.is_array()
+            || target.is_regexp()
+            || target.is_function()
+            || target.is_closure()
+            || target.is_bound_function()
+            || target.is_native_function())
+            && matches!(
+                method,
+                M::GetOwnPropertyDescriptor | M::HasOwn | M::Keys | M::GetOwnPropertyNames
+            )
+        {
             let Some(context) = context else {
-                return if matches!(target, Value::Proxy(_)) {
+                return if target.is_proxy() {
                     Err(VmError::InvalidOperand)
                 } else {
                     Ok(None)
@@ -1211,9 +1176,9 @@ impl Interpreter {
                 let values: Vec<Value> = self
                     .own_property_keys_value(context, &target)?
                     .into_iter()
-                    .filter(|v| matches!(v, Value::String(_)))
+                    .filter(|v| v.is_string())
                     .collect();
-                return Ok(Some(Value::Array(self.function_static_array_from_values(
+                return Ok(Some(Value::array(self.function_static_array_from_values(
                     stack_roots,
                     values,
                     &[&target],
@@ -1224,17 +1189,19 @@ impl Interpreter {
                 // For Proxy targets, route through the full §10.5.11
                 // ownKeys path so trap invariants apply, then filter
                 // to enumerable strings per §20.1.2.17 Object.keys.
-                if matches!(target, Value::Proxy(_)) {
+                if target.is_proxy() {
                     let trap_keys = self.own_property_keys_value(context, &target)?;
                     let mut values: Vec<Value> = Vec::with_capacity(trap_keys.len());
                     for key in trap_keys {
-                        let Value::String(_) = &key else { continue };
-                        let vm_key = match &key {
-                            Value::String(s) => {
-                                VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
-                            }
-                            Value::Symbol(sym) => VmPropertyKey::Symbol(*sym),
-                            _ => return Err(VmError::TypeMismatch),
+                        if !key.is_string() {
+                            continue;
+                        }
+                        let vm_key = if let Some(s) = key.as_string() {
+                            VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
+                        } else if let Some(sym) = key.as_symbol() {
+                            VmPropertyKey::Symbol(*sym)
+                        } else {
+                            return Err(VmError::TypeMismatch);
                         };
                         let desc = match stack_roots {
                             Some(stack) => self
@@ -1255,7 +1222,7 @@ impl Interpreter {
                             values.push(key);
                         }
                     }
-                    return Ok(Some(Value::Array(self.function_static_array_from_values(
+                    return Ok(Some(Value::array(self.function_static_array_from_values(
                         stack_roots,
                         values,
                         &[&target],
@@ -1270,7 +1237,7 @@ impl Interpreter {
                             .map_err(|_| VmError::TypeMismatch)?,
                     ));
                 }
-                return Ok(Some(Value::Array(self.function_static_array_from_values(
+                return Ok(Some(Value::array(self.function_static_array_from_values(
                     stack_roots,
                     values,
                     &[&target],
@@ -1282,7 +1249,7 @@ impl Interpreter {
                 return Ok(Some(Value::boolean(desc.is_some())));
             }
             return match desc {
-                Some(desc) => Ok(Some(Value::Object(
+                Some(desc) => Ok(Some(Value::object(
                     self.function_static_descriptor_to_object(
                         stack_roots,
                         &desc,
@@ -1290,29 +1257,29 @@ impl Interpreter {
                         args,
                     )?,
                 ))),
-                None => Ok(Some(Value::Undefined)),
+                None => Ok(Some(Value::undefined())),
             };
         }
-        let function_id = match &target {
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => Some(*function_id),
-            Value::BoundFunction(_) => None,
-            _ => return Ok(None),
+        let function_id = if let Some(id) = target.as_function() {
+            Some(id)
+        } else if let Some(closure) = target.as_closure() {
+            Some(closure.cached_function_id)
+        } else if target.is_bound_function() {
+            None
+        } else {
+            return Ok(None);
         };
         match method {
             M::DefineProperty => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
-                let desc_obj = match args.get(2) {
-                    Some(Value::Object(obj)) => *obj,
-                    _ => return Err(VmError::TypeMismatch),
-                };
+                let desc_obj = args
+                    .get(2)
+                    .and_then(|v| v.as_object())
+                    .ok_or(VmError::TypeMismatch)?;
                 let descriptor = object_statics::coerce_to_descriptor(&desc_obj, &self.gc_heap)?;
                 let completed = descriptor.complete_for_new_property();
-                let ok = match (&target, function_id, &key) {
-                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
+                let ok = match (function_id, &key) {
+                    (Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         if !self.ordinary_function_has_own_symbol_property_for_extensibility(
                             function_id,
                             sym,
@@ -1337,7 +1304,7 @@ impl Interpreter {
                             descriptor,
                         )
                     }
-                    (_, Some(function_id), _) => self
+                    (Some(function_id), _) => self
                         .ordinary_function_define_own_property_with_roots(
                             context,
                             function_id,
@@ -1348,17 +1315,19 @@ impl Interpreter {
                             stack_roots,
                             &[&target],
                         )?,
-                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
-                    (Value::BoundFunction(bound), None, _) => {
+                    (None, VmPropertyKey::Symbol(_)) => false,
+                    (None, _) => {
+                        let Some(bound) = target.as_bound_function() else {
+                            return Ok(None);
+                        };
                         function_metadata::bound_define_own_property(
-                            bound,
+                            &bound,
                             &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                             completed,
                         )
                     }
-                    _ => return Ok(None),
                 };
                 if !ok {
                     return Err(VmError::TypeMismatch);
@@ -1367,32 +1336,34 @@ impl Interpreter {
             }
             M::GetOwnPropertyDescriptor => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
-                let desc = match (&target, function_id, &key) {
-                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => {
+                let desc = match (function_id, &key) {
+                    (Some(function_id), VmPropertyKey::Symbol(sym)) => {
                         let Some(bag) = self.function_user_props.get(&function_id).copied() else {
-                            return Ok(Some(Value::Undefined));
+                            return Ok(Some(Value::undefined()));
                         };
                         crate::object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
                     }
-                    (_, Some(function_id), _) => self.ordinary_function_own_property_descriptor(
+                    (Some(function_id), _) => self.ordinary_function_own_property_descriptor(
                         context,
                         function_id,
                         key.string_name()
                             .expect("non-symbol key has string spelling"),
                     )?,
-                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => None,
-                    (Value::BoundFunction(bound), None, _) => {
+                    (None, VmPropertyKey::Symbol(_)) => None,
+                    (None, _) => {
+                        let Some(bound) = target.as_bound_function() else {
+                            return Ok(None);
+                        };
                         function_metadata::bound_own_property_descriptor(
-                            bound,
+                            &bound,
                             &mut self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                         )?
                     }
-                    _ => return Ok(None),
                 };
                 match desc {
-                    Some(desc) => Ok(Some(Value::Object(
+                    Some(desc) => Ok(Some(Value::object(
                         self.function_static_descriptor_to_object(
                             stack_roots,
                             &desc,
@@ -1400,19 +1371,19 @@ impl Interpreter {
                             args,
                         )?,
                     ))),
-                    None => Ok(Some(Value::Undefined)),
+                    None => Ok(Some(Value::undefined())),
                 }
             }
             M::HasOwn => {
                 let key = Self::coerce_vm_property_key(args.get(1), &self.gc_heap)?;
-                let present = match (&target, function_id, &key) {
-                    (_, Some(function_id), VmPropertyKey::Symbol(sym)) => self
+                let present = match (function_id, &key) {
+                    (Some(function_id), VmPropertyKey::Symbol(sym)) => self
                         .function_user_props
                         .get(&function_id)
                         .copied()
                         .map(|bag| crate::object::has_own_symbol(bag, &self.gc_heap, sym))
                         .unwrap_or(false),
-                    (_, Some(function_id), _) => {
+                    (Some(function_id), _) => {
                         let key = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
@@ -1436,16 +1407,18 @@ impl Interpreter {
                                 },
                             )
                     }
-                    (Value::BoundFunction(_), None, VmPropertyKey::Symbol(_)) => false,
-                    (Value::BoundFunction(bound), None, _) => {
+                    (None, VmPropertyKey::Symbol(_)) => false,
+                    (None, _) => {
+                        let Some(bound) = target.as_bound_function() else {
+                            return Ok(None);
+                        };
                         function_metadata::bound_has_own_property(
-                            bound,
+                            &bound,
                             &self.gc_heap,
                             key.string_name()
                                 .expect("non-symbol key has string spelling"),
                         )
                     }
-                    _ => return Ok(None),
                 };
                 Ok(Some(Value::boolean(present)))
             }
@@ -1454,27 +1427,29 @@ impl Interpreter {
             // `[[Extensible]]` state before the generic static
             // dispatcher. This mirrors §10.1.3/§10.1.4 for the
             // side-table-backed function shape.
-            M::IsExtensible => match target {
-                Value::Function { function_id }
-                | Value::Closure(crate::closure::JsClosure {
-                    cached_function_id: function_id,
-                    ..
-                }) => Ok(Some(Value::Boolean(
-                    self.ordinary_function_is_extensible(function_id),
-                ))),
-                _ => Ok(None),
-            },
-            M::PreventExtensions => match target {
-                Value::Function { function_id }
-                | Value::Closure(crate::closure::JsClosure {
-                    cached_function_id: function_id,
-                    ..
-                }) => {
-                    self.ordinary_function_prevent_extensions(function_id);
-                    Ok(Some(target))
+            M::IsExtensible => {
+                let function_id = target
+                    .as_function()
+                    .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+                match function_id {
+                    Some(function_id) => Ok(Some(Value::boolean(
+                        self.ordinary_function_is_extensible(function_id),
+                    ))),
+                    None => Ok(None),
                 }
-                _ => Ok(None),
-            },
+            }
+            M::PreventExtensions => {
+                let function_id = target
+                    .as_function()
+                    .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+                match function_id {
+                    Some(function_id) => {
+                        self.ordinary_function_prevent_extensions(function_id);
+                        Ok(Some(target))
+                    }
+                    None => Ok(None),
+                }
+            }
             // §20.1.2 — only the methods above need the function-as-
             // object fast path; everything else falls through to the
             // ordinary object_statics dispatcher.
@@ -1548,15 +1523,15 @@ impl Interpreter {
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
                 self.set_property(result, "value", *value)?;
-                self.set_property(result, "writable", Value::Boolean(desc.writable()))?;
+                self.set_property(result, "writable", Value::boolean(desc.writable()))?;
             }
             object::DescriptorKind::Accessor { getter, setter } => {
                 self.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
                 self.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
             }
         }
-        self.set_property(result, "enumerable", Value::Boolean(desc.enumerable()))?;
-        self.set_property(result, "configurable", Value::Boolean(desc.configurable()))?;
+        self.set_property(result, "enumerable", Value::boolean(desc.enumerable()))?;
+        self.set_property(result, "configurable", Value::boolean(desc.configurable()))?;
         Ok(result)
     }
 
@@ -1637,7 +1612,7 @@ impl Interpreter {
             return Ok(v);
         }
 
-        let function_root = Value::Function { function_id };
+        let function_root = Value::function(function_id);
         let bag = self.function_user_bag_stack_rooted(stack, function_id, &[&function_root])?;
         if let Some(existing) = crate::object::get(bag, &self.gc_heap, "prototype") {
             return Ok(existing);
@@ -1646,10 +1621,10 @@ impl Interpreter {
         let bag_root = Value::object(bag);
         let proto =
             self.alloc_stack_rooted_object_with_extra_roots(stack, &[&function_root, &bag_root])?;
-        if let Some(Value::Object(object_ctor)) =
-            crate::object::get(self.global_this, &self.gc_heap, "Object")
-            && let Some(Value::Object(object_proto)) =
-                crate::object::get(object_ctor, &self.gc_heap, "prototype")
+        if let Some(object_ctor) = crate::object::get(self.global_this, &self.gc_heap, "Object")
+            .and_then(|v| v.as_object())
+            && let Some(object_proto) = crate::object::get(object_ctor, &self.gc_heap, "prototype")
+                .and_then(|v| v.as_object())
         {
             crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
         }
@@ -1689,7 +1664,7 @@ impl Interpreter {
             return Ok(v);
         }
 
-        let function_root = Value::Function { function_id };
+        let function_root = Value::function(function_id);
         let mut bag_roots = Vec::with_capacity(value_roots.len() + 1);
         bag_roots.push(&function_root);
         bag_roots.extend_from_slice(value_roots);
@@ -1704,10 +1679,10 @@ impl Interpreter {
         proto_roots.push(&bag_root);
         proto_roots.extend_from_slice(value_roots);
         let proto = self.alloc_runtime_rooted_object_with_roots(&proto_roots, slice_roots)?;
-        if let Some(Value::Object(object_ctor)) =
-            crate::object::get(self.global_this, &self.gc_heap, "Object")
-            && let Some(Value::Object(object_proto)) =
-                crate::object::get(object_ctor, &self.gc_heap, "prototype")
+        if let Some(object_ctor) = crate::object::get(self.global_this, &self.gc_heap, "Object")
+            .and_then(|v| v.as_object())
+            && let Some(object_proto) = crate::object::get(object_ctor, &self.gc_heap, "prototype")
+                .and_then(|v| v.as_object())
         {
             crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
         }
@@ -1739,7 +1714,11 @@ impl Interpreter {
         proto: JsObject,
         parent: JsObject,
     ) -> Result<(), VmError> {
-        if let Ok(Value::Object(iterator_proto)) = self.constructor_prototype_value("Iterator") {
+        if let Some(iterator_proto) = self
+            .constructor_prototype_value("Iterator")
+            .ok()
+            .and_then(|v| v.as_object())
+        {
             object::set_prototype(parent, &mut self.gc_heap, Some(iterator_proto));
         }
         let tag_name = match context.function(function_id) {
@@ -1755,7 +1734,7 @@ impl Interpreter {
             &mut self.gc_heap,
             &tag_sym,
             object::PartialPropertyDescriptor {
-                value: Some(Value::String(tag)),
+                value: Some(Value::string(tag)),
                 writable: Some(false),
                 enumerable: Some(false),
                 configurable: Some(true),
@@ -1771,14 +1750,10 @@ impl Interpreter {
         constructor_name: &str,
         name: &str,
     ) -> Option<Value> {
-        let constructor = crate::object::get(self.global_this, &self.gc_heap, constructor_name)?;
-        let Value::Object(constructor_obj) = constructor else {
-            return None;
-        };
-        let prototype = crate::object::get(constructor_obj, &self.gc_heap, "prototype")?;
-        let Value::Object(prototype_obj) = prototype else {
-            return None;
-        };
+        let constructor_obj = crate::object::get(self.global_this, &self.gc_heap, constructor_name)
+            .and_then(|v| v.as_object())?;
+        let prototype_obj = crate::object::get(constructor_obj, &self.gc_heap, "prototype")
+            .and_then(|v| v.as_object())?;
         crate::object::get(prototype_obj, &self.gc_heap, name)
     }
 
@@ -1839,7 +1814,7 @@ fn bind_metadata_get_from_descriptor(desc: object::PropertyDescriptor) -> BindMe
         object::DescriptorKind::Data { value } => BindMetadataGet::Value(value),
         object::DescriptorKind::Accessor { getter, .. } => match getter {
             Some(getter) if abstract_ops::is_callable(&getter) => BindMetadataGet::Getter(getter),
-            _ => BindMetadataGet::Value(Value::Undefined),
+            _ => BindMetadataGet::Value(Value::undefined()),
         },
     }
 }

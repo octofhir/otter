@@ -1926,7 +1926,7 @@ impl Interpreter {
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync(context, &setter, Value::Object(obj), args)?;
+                self.run_callable_sync(context, &setter, Value::object(obj), args)?;
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
@@ -1956,7 +1956,7 @@ impl Interpreter {
             object::SetOutcome::InvokeSetter { setter } => {
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
-                self.run_callable_sync(context, &setter, Value::Object(obj), args)?;
+                self.run_callable_sync(context, &setter, Value::object(obj), args)?;
                 Ok(())
             }
             object::SetOutcome::Reject { .. } => {
@@ -1973,11 +1973,11 @@ impl Interpreter {
         name: &str,
     ) -> Result<Value, VmError> {
         let proto = self.constructor_prototype_value(proto_name)?;
-        let Value::Object(proto_obj) = proto else {
+        let Some(proto_obj) = proto.as_object() else {
             return Ok(Value::undefined());
         };
         let key = VmPropertyKey::String(name);
-        match self.ordinary_get_value(context, Value::Object(proto_obj), *receiver, &key, 0)? {
+        match self.ordinary_get_value(context, Value::object(proto_obj), *receiver, &key, 0)? {
             VmGetOutcome::Value(value) => Ok(value),
             VmGetOutcome::InvokeGetter { getter } => {
                 self.run_callable_sync(context, &getter, *receiver, smallvec::SmallVec::new())
@@ -2020,8 +2020,7 @@ impl Interpreter {
         let name = atomized_key.name();
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        if let Value::Object(obj) = &receiver {
-            let obj = *obj;
+        if let Some(obj) = receiver.as_object() {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
@@ -2060,8 +2059,8 @@ impl Interpreter {
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             match self.ordinary_get_value(
                 context,
-                Value::Object(obj),
-                Value::Object(obj),
+                Value::object(obj),
+                Value::object(obj),
                 &key,
                 0,
             )? {
@@ -2069,9 +2068,9 @@ impl Interpreter {
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.invoke(stack, context, &getter, Value::Object(obj), args, dst)?;
+                        self.invoke(stack, context, &getter, Value::object(obj), args, dst)?;
                     } else {
-                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                        write_register(&mut stack[top_idx], dst, Value::undefined())?;
                     }
                 }
             }
@@ -2087,21 +2086,19 @@ impl Interpreter {
         // the Object / Proxy fast paths already use so static-key
         // reads (`iter.next`, `map.size`, `prom.then`, …) resolve
         // consistently.
-        if matches!(
-            receiver,
-            Value::Proxy(_)
-                | Value::Generator(_)
-                | Value::Iterator(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Promise(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-        ) {
+        if receiver.is_proxy()
+            || receiver.is_generator()
+            || receiver.is_iterator()
+            || receiver.is_map()
+            || receiver.is_set()
+            || receiver.is_weak_map()
+            || receiver.is_weak_set()
+            || receiver.is_weak_ref()
+            || receiver.is_finalization_registry()
+            || receiver.is_promise()
+            || receiver.is_array_buffer()
+            || receiver.is_data_view()
+        {
             let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
@@ -2112,20 +2109,18 @@ impl Interpreter {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &getter, receiver, args, dst)?;
                     } else {
-                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                        write_register(&mut stack[top_idx], dst, Value::undefined())?;
                     }
                 }
             }
             return Ok(true);
         }
-        if matches!(
-            receiver,
-            Value::Boolean(_)
-                | Value::Number(_)
-                | Value::String(_)
-                | Value::Symbol(_)
-                | Value::BigInt(_)
-        ) {
+        if receiver.is_boolean()
+            || receiver.is_number()
+            || receiver.is_string()
+            || receiver.is_symbol()
+            || receiver.is_big_int()
+        {
             let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])?;
             let key = VmPropertyKey::atom(atomized_key);
             let pc = stack[top_idx].pc;
@@ -2137,13 +2132,14 @@ impl Interpreter {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &getter, receiver, args, dst)?;
                     } else {
-                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                        write_register(&mut stack[top_idx], dst, Value::undefined())?;
                     }
                 }
             }
             return Ok(true);
         }
-        if let Value::BoundFunction(bound) = &receiver {
+        if let Some(bound) = receiver.as_bound_function() {
+            let bound = &bound;
             match function_metadata::bound_own_property_descriptor(bound, &mut self.gc_heap, name)?
             {
                 Some(object::PropertyDescriptor {
@@ -2157,7 +2153,7 @@ impl Interpreter {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.invoke(stack, context, &callee, receiver, args, dst)?;
                         }
-                        _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                        _ => write_register(&mut stack[top_idx], dst, Value::undefined())?,
                     }
                     return Ok(true);
                 }
@@ -2178,7 +2174,7 @@ impl Interpreter {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
                                 self.invoke(stack, context, &callee, receiver, args, dst)?;
                             }
-                            _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                            _ => write_register(&mut stack[top_idx], dst, Value::undefined())?,
                         }
                         return Ok(true);
                     }
@@ -2199,36 +2195,35 @@ impl Interpreter {
         // (`caller`, `arguments`) and any user-installed accessor on
         // `Function.prototype` invoke their getter rather than
         // collapsing to `undefined` through the in-frame data path.
-        if matches!(
-            receiver,
-            Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::ClassConstructor(_)
-        ) {
-            let own_present = match &receiver {
-                Value::Function { function_id }
-                | Value::Closure(crate::closure::JsClosure {
-                    cached_function_id: function_id,
-                    ..
-                }) => self
-                    .function_user_props
-                    .get(function_id)
+        if receiver.is_function()
+            || receiver.is_closure()
+            || receiver.is_native_function()
+            || receiver.is_class_constructor()
+        {
+            let own_present = if let Some(fid) = receiver
+                .as_function()
+                .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+            {
+                self.function_user_props
+                    .get(&fid)
                     .copied()
                     .is_some_and(|bag| {
                         !matches!(
                             object::lookup_own(bag, &self.gc_heap, name),
                             object::PropertyLookup::Absent
                         )
-                    }),
-                Value::ClassConstructor(c) => !matches!(
+                    })
+            } else if let Some(c) = receiver.as_class_constructor() {
+                !matches!(
                     object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, name),
                     object::PropertyLookup::Absent
-                ),
-                Value::NativeFunction(native) => native
+                )
+            } else if let Some(native) = receiver.as_native_function() {
+                native
                     .own_property_descriptor(&mut self.gc_heap, name)?
-                    .is_some(),
-                _ => false,
+                    .is_some()
+            } else {
+                false
             };
             if !own_present {
                 let proto = self.function_prototype_object()?;
@@ -2242,27 +2237,26 @@ impl Interpreter {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.invoke(stack, context, &callee, receiver, args, dst)?;
                         }
-                        _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                        _ => write_register(&mut stack[top_idx], dst, Value::undefined())?,
                     }
                     return Ok(true);
                 }
             }
         }
-        let obj = match &receiver {
-            Value::Object(o) => *o,
-            Value::ClassConstructor(c) => c.statics(&self.gc_heap),
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                let fid = *function_id;
-                match self.function_user_props.get(&fid).copied() {
-                    Some(bag) => bag,
-                    None => self.function_user_bag_with_stack_roots(stack, fid, &[&receiver])?,
-                }
+        let obj = if let Some(o) = receiver.as_object() {
+            o
+        } else if let Some(c) = receiver.as_class_constructor() {
+            c.statics(&self.gc_heap)
+        } else if let Some(fid) = receiver
+            .as_function()
+            .or_else(|| receiver.as_closure().map(|c| c.cached_function_id))
+        {
+            match self.function_user_props.get(&fid).copied() {
+                Some(bag) => bag,
+                None => self.function_user_bag_with_stack_roots(stack, fid, &[&receiver])?,
             }
-            _ => return Ok(false),
+        } else {
+            return Ok(false);
         };
         match crate::object::lookup(obj, &self.gc_heap, name) {
             object::PropertyLookup::Accessor { getter, .. } => {
@@ -2274,9 +2268,8 @@ impl Interpreter {
                         self.invoke(stack, context, &callee, receiver, args, dst)?;
                     }
                     _ => {
-                        // No getter (or non-callable) — §10.1.8.1
-                        // step 4.b returns undefined.
-                        write_register(&mut stack[top_idx], dst, Value::Undefined)?;
+                        // §10.1.8.1 step 4.b — undefined.
+                        write_register(&mut stack[top_idx], dst, Value::undefined())?;
                     }
                 }
                 Ok(true)
@@ -2391,7 +2384,7 @@ impl Interpreter {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
                             self.invoke(stack, context, &callee, receiver, args, dst)?;
                         }
-                        _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                        _ => write_register(&mut stack[top_idx], dst, Value::undefined())?,
                     }
                     return Ok(true);
                 }
@@ -2412,7 +2405,7 @@ impl Interpreter {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
                                 self.invoke(stack, context, &callee, receiver, args, dst)?;
                             }
-                            _ => write_register(&mut stack[top_idx], dst, Value::Undefined)?,
+                            _ => write_register(&mut stack[top_idx], dst, Value::undefined())?,
                         }
                         return Ok(true);
                     }

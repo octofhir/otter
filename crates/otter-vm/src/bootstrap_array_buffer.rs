@@ -24,7 +24,6 @@ use crate::bootstrap::{
 use crate::intrinsics::IntrinsicArgs;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::NativeCall;
-use crate::number::NumberValue;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
 
@@ -56,8 +55,9 @@ fn install_array_buffer(
     let global_root = Value::object(global);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
     let prototype_root = Value::object(prototype);
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -129,7 +129,7 @@ fn install_array_buffer(
         heap,
         "isView",
         PropertyDescriptor::data(
-            Value::NativeFunction(is_view_fn),
+            Value::native_function(is_view_fn),
             attrs.writable,
             attrs.enumerable,
             attrs.configurable,
@@ -168,8 +168,9 @@ fn install_shared_array_buffer(
     let global_root = Value::object(global);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root])?;
     let prototype_root = Value::object(prototype);
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -267,7 +268,7 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     // construction forwards `new.target`, so the allocated exotic
     // receives `Subclass.prototype` as its observable [[Prototype]].
     // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
     if needs_proto_override
         && let Some(proto) =
             crate::bootstrap::native_new_target_prototype(ctx, "SharedArrayBuffer")?
@@ -297,16 +298,16 @@ pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "SharedArrayBuffer") else {
+    let Some(ctor) =
+        object::get(global, heap, "SharedArrayBuffer").and_then(|v| v.as_native_function())
+    else {
         return Ok(());
     };
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
@@ -319,7 +320,7 @@ pub fn install_shared_array_buffer_well_knowns_post_bootstrap(
         heap,
         &well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
-            value: Some(Value::String(tag)),
+            value: Some(Value::string(tag)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -337,16 +338,15 @@ pub fn install_array_buffer_well_knowns_post_bootstrap(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "ArrayBuffer") else {
+    let Some(ctor) = object::get(global, heap, "ArrayBuffer").and_then(|v| v.as_native_function())
+    else {
         return Ok(());
     };
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
@@ -359,7 +359,7 @@ pub fn install_array_buffer_well_knowns_post_bootstrap(
         heap,
         &well_known.get(WellKnown::ToStringTag),
         PartialPropertyDescriptor {
-            value: Some(Value::String(tag)),
+            value: Some(Value::string(tag)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -404,7 +404,7 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     // construction forwards `new.target`, so the allocated exotic
     // receives `Subclass.prototype` as its observable [[Prototype]].
     // <https://tc39.es/ecma262/#sec-getprototypefromconstructor>
-    let needs_proto_override = !matches!(ctx.new_target(), Some(Value::NativeFunction(_)));
+    let needs_proto_override = ctx.new_target().is_none_or(|v| !v.is_native_function());
     if needs_proto_override
         && let Some(proto) = crate::bootstrap::native_new_target_prototype(ctx, "ArrayBuffer")?
     {
@@ -482,7 +482,8 @@ fn install_accessor(
     roots.extend_from_slice(value_roots);
     let getter = native_static_with_value_roots(heap, name, 0, call, roots.as_slice())
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
+    let desc =
+        PropertyDescriptor::accessor(Some(Value::native_function(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
     }
@@ -492,18 +493,14 @@ fn install_accessor(
 fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.byteLength")?;
     if b.is_detached(ctx.heap()) {
-        return Ok(Value::number(NumberValue::from_i32(0)));
+        return Ok(Value::number_i32(0));
     }
-    Ok(Value::number(NumberValue::from_i32(
-        b.byte_length(ctx.heap()) as i32,
-    )))
+    Ok(Value::number_i32(b.byte_length(ctx.heap()) as i32))
 }
 
 fn ab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.maxByteLength")?;
-    Ok(Value::number(NumberValue::from_i32(
-        b.max_byte_length(ctx.heap()) as i32,
-    )))
+    Ok(Value::number_i32(b.max_byte_length(ctx.heap()) as i32))
 }
 
 fn ab_resizable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -520,12 +517,13 @@ fn receiver_ab(
     ctx: &NativeCtx<'_>,
     name: &'static str,
 ) -> Result<crate::binary::array_buffer::JsArrayBuffer, NativeError> {
-    match ctx.this_value() {
-        Value::ArrayBuffer(b) => Ok(*b),
-        _ => Err(NativeError::TypeError {
+    if let Some(b) = ctx.this_value().as_array_buffer() {
+        Ok(b)
+    } else {
+        Err(NativeError::TypeError {
             name,
             reason: "this is not an ArrayBuffer".to_string(),
-        }),
+        })
     }
 }
 

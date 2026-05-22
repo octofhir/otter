@@ -25,10 +25,9 @@ use crate::string::JsString;
 use crate::{JsSymbol, Value};
 
 fn receiver_symbol<'a>(args: &'a IntrinsicArgs<'_>) -> Result<&'a JsSymbol, IntrinsicError> {
-    match args.receiver {
-        Value::Symbol(s) => Ok(s),
-        _ => Err(IntrinsicError::BadReceiver { expected: "symbol" }),
-    }
+    args.receiver
+        .as_symbol()
+        .ok_or(IntrinsicError::BadReceiver { expected: "symbol" })
 }
 
 /// `Symbol.prototype.toString` — Spec §20.4.3.3. Returns
@@ -70,7 +69,7 @@ pub fn load_property(sym: &JsSymbol, name: &str) -> Value {
             None => Value::undefined(),
         }
     } else {
-        Value::Undefined
+        Value::undefined()
     }
 }
 
@@ -123,9 +122,6 @@ mod tests {
         let value = load_property(&sym, "description");
         assert_eq!(value.display_string(&gc_heap), "ok");
         let no_desc = JsSymbol::new(&mut gc_heap, None).unwrap();
-        assert!(matches!(
-            load_property(&no_desc, "description"),
-            Value::Undefined
-        ));
+        assert!(load_property(&no_desc, "description").is_undefined());
     }
 }

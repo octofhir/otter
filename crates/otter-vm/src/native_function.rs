@@ -1139,7 +1139,6 @@ impl From<otter_gc::OutOfMemory> for NativeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::number::NumberValue;
 
     #[test]
     fn native_value_dispatches() {
@@ -1148,14 +1147,10 @@ mod tests {
             Ok(args.first().cloned().unwrap_or(Value::undefined()))
         })
         .expect("native");
-        let Value::NativeFunction(native) = &f else {
-            panic!("expected NativeFunction")
-        };
+        let native = f.as_native_function().expect("expected NativeFunction");
         let call = native.call_target(interp.gc_heap());
         let mut ctx = NativeCtx::new(&mut interp);
-        let r = call
-            .invoke(&mut ctx, &[Value::number(NumberValue::from_i32(7))])
-            .unwrap();
+        let r = call.invoke(&mut ctx, &[Value::number_i32(7)]).unwrap();
         assert_eq!(r.display_string(ctx.heap()), "7");
     }
 
@@ -1176,9 +1171,7 @@ mod tests {
             },
         )
         .expect("native");
-        let Value::NativeFunction(native) = &f else {
-            panic!()
-        };
+        let native = f.as_native_function().expect("NativeFunction");
         let call = native.call_target(interp.gc_heap());
         let mut ctx = NativeCtx::new(&mut interp);
         let err = call.invoke(&mut ctx, &[]).unwrap_err();
@@ -1193,9 +1186,7 @@ mod tests {
 
         let mut interp = crate::Interpreter::new();
         let f = native_value_static(interp.gc_heap_mut(), "id", 1, id).expect("native");
-        let Value::NativeFunction(native) = &f else {
-            panic!("expected NativeFunction")
-        };
+        let native = f.as_native_function().expect("expected NativeFunction");
         assert!(native.is_static_call(interp.gc_heap()));
         assert_eq!(native.length(interp.gc_heap()), 1);
     }

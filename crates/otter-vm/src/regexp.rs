@@ -226,7 +226,7 @@ impl otter_gc::SafeTraceable for JsRegExpBody {
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         self.last_index.borrow().trace_value_slots(visitor);
         if let Some(expando) = &self.expando {
-            Value::Object(*expando).trace_value_slots(visitor);
+            Value::object(*expando).trace_value_slots(visitor);
         }
         if let Some(proto) = &self.prototype_override {
             proto.trace_value_slots(visitor);
@@ -274,7 +274,7 @@ impl JsRegExp {
                 pattern_utf16: pattern_utf16.to_vec(),
                 source,
                 flags,
-                last_index: RefCell::new(Value::Number(NumberValue::from_i32(0))),
+                last_index: RefCell::new(Value::number_i32(0)),
                 last_index_writable: true,
                 expando: None,
                 extensible: true,
@@ -497,16 +497,19 @@ impl JsRegExp {
 }
 
 fn last_index_to_u32(value: &Value, heap: &otter_gc::GcHeap) -> u32 {
-    let raw = match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s
-            .to_lossy_string(heap)
+    let raw = if let Some(n) = value.as_number() {
+        n.as_f64()
+    } else if let Some(s) = value.as_string() {
+        s.to_lossy_string(heap)
             .trim()
             .parse::<f64>()
-            .unwrap_or(f64::NAN),
-        Value::Boolean(true) => 1.0,
-        Value::Boolean(false) | Value::Null => 0.0,
-        _ => f64::NAN,
+            .unwrap_or(f64::NAN)
+    } else if let Some(b) = value.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if value.is_null() {
+        0.0
+    } else {
+        f64::NAN
     };
     if raw.is_nan() || raw <= 0.0 {
         0

@@ -42,8 +42,9 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         }
     }
     crate::object::set_boolean_data(prototype, heap, false);
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -60,8 +61,9 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
     let ctor_native_root = Value::native_function(ctor_native);
     let statics =
         alloc_object_with_value_roots(heap, &[&global_root, &prototype_root, &ctor_native_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(statics, heap, Some(object_proto));
     }
@@ -81,12 +83,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         statics,
         heap,
         "length",
-        crate::object::PropertyDescriptor::data(
-            Value::Number(crate::number::NumberValue::from_i32(1)),
-            false,
-            false,
-            true,
-        ),
+        crate::object::PropertyDescriptor::data(Value::number_i32(1), false, false, true),
     );
     // §20.3.2 — `Boolean.name` is `"Boolean"`, non-writable,
     // non-enumerable, configurable.
@@ -125,7 +122,7 @@ fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     let value = args.first().is_some_and(|v| v.to_boolean(ctx.heap()));
     if ctx.is_construct_call() {
         let this = *ctx.this_value();
-        if let Value::Object(obj) = this {
+        if let Some(obj) = this.as_object() {
             crate::object::set_boolean_data(obj, ctx.heap_mut(), value);
             Ok(Value::object(obj))
         } else {

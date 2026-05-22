@@ -1721,6 +1721,21 @@ impl Default for Value {
     }
 }
 
+/// Outgoing GC edge enumeration for the write barrier.
+///
+/// Every pointer-tagged variant emits at most one edge — the
+/// 32-bit GC offset packed in the low 32 bits of `self.0`.
+/// Immediate variants emit none.
+impl otter_gc::GcStore for Value {
+    fn visit_gc_edges(&self, visitor: &mut dyn FnMut(otter_gc::GcEdge)) {
+        if let Some(raw) = self.as_raw_gc()
+            && let Some(edge) = otter_gc::GcEdge::from_raw(raw)
+        {
+            visitor(edge);
+        }
+    }
+}
+
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {

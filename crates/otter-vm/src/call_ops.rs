@@ -121,7 +121,7 @@ impl Interpreter {
             function,
             return_register,
             upvalues,
-            Value::Object(receiver),
+            Value::object(receiver),
         );
         frame.construct_target = Some(receiver);
         frame.new_target = Some(new_target);
@@ -149,7 +149,7 @@ impl Interpreter {
             function,
             return_register,
             upvalues,
-            Value::Object(receiver),
+            Value::object(receiver),
         );
         frame.construct_target = Some(receiver);
         frame.new_target = Some(new_target);
@@ -469,7 +469,7 @@ impl Interpreter {
 
     /// Handle `Op::Call`: push a new frame for the callee with
     /// arguments copied into the parameter slots and `this` bound
-    /// to `Value::Undefined` (foundation strict default).
+    /// to `Value::undefined()` (foundation strict default).
     pub(crate) fn do_call(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
@@ -493,7 +493,7 @@ impl Interpreter {
             stack,
             context,
             &callee,
-            Value::Undefined,
+            Value::undefined(),
             operands,
             3,
             argc as usize,
@@ -505,7 +505,7 @@ impl Interpreter {
             stack,
             context,
             &callee,
-            Value::Undefined,
+            Value::undefined(),
             operands,
             3,
             argc as usize,
@@ -515,7 +515,7 @@ impl Interpreter {
         }
         let args = BytecodeArgumentWindow::new(&stack[top_idx], operands, 3, argc as usize)
             .to_smallvec8()?;
-        self.invoke(stack, context, &callee, Value::Undefined, args, dst)
+        self.invoke(stack, context, &callee, Value::undefined(), args, dst)
     }
 
     /// Invoke `callee` with the explicit receiver `this_value` and
@@ -639,7 +639,7 @@ impl Interpreter {
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
                 effective_this,
-                Value::Array(argv_array),
+                Value::array(argv_array),
             ];
             let result = match self.invoke_proxy_trap(context, &proxy, "apply", trap_args)? {
                 Some(v) => v,
@@ -879,7 +879,7 @@ impl Interpreter {
             )?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
-                Value::Array(argv_array),
+                Value::array(argv_array),
                 new_target,
             ];
             let result = match self.invoke_proxy_trap(context, &proxy, "construct", trap_args)? {
@@ -914,7 +914,7 @@ impl Interpreter {
             let constructed = self.invoke_native_construct(
                 context,
                 native,
-                &Value::Undefined,
+                &Value::undefined(),
                 &new_target,
                 args.as_slice(),
             )?;
@@ -1267,28 +1267,24 @@ impl Interpreter {
                                 self.run_callable_sync(context, &getter, handler, SmallVec::new())?
                             }
                         };
-                    match trap_value {
-                        trap if self.is_callable_runtime(&trap) => {
-                            let argv_array = self.alloc_runtime_rooted_array_from_values(
-                                effective_args.iter().cloned(),
-                                &[&current, &effective_this, &handler, &trap],
-                                &[effective_args.as_slice()],
-                            )?;
-                            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                                proxy.target(&self.gc_heap),
-                                effective_this,
-                                Value::Array(argv_array),
-                            ];
-                            return self.run_callable_sync(context, &trap, handler, trap_args);
-                        }
-                        Value::Undefined | Value::Null => {
-                            current = proxy.target(&self.gc_heap);
-                        }
-                        _ => {
-                            return Err(VmError::TypeError {
-                                message: "Proxy apply trap is not callable".to_string(),
-                            });
-                        }
+                    if self.is_callable_runtime(&trap_value) {
+                        let argv_array = self.alloc_runtime_rooted_array_from_values(
+                            effective_args.iter().cloned(),
+                            &[&current, &effective_this, &handler, &trap_value],
+                            &[effective_args.as_slice()],
+                        )?;
+                        let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                            proxy.target(&self.gc_heap),
+                            effective_this,
+                            Value::array(argv_array),
+                        ];
+                        return self.run_callable_sync(context, &trap_value, handler, trap_args);
+                    } else if trap_value.is_undefined() || trap_value.is_null() {
+                        current = proxy.target(&self.gc_heap);
+                    } else {
+                        return Err(VmError::TypeError {
+                            message: "Proxy apply trap is not callable".to_string(),
+                        });
                     }
                 }
                 _ => break,
@@ -1435,42 +1431,38 @@ impl Interpreter {
                                 self.run_callable_sync(context, &getter, handler, SmallVec::new())?
                             }
                         };
-                    match trap_value {
-                        trap if self.is_callable_runtime(&trap) => {
-                            let target_value = proxy.target(&self.gc_heap);
-                            let argv_array = self.alloc_runtime_rooted_array_from_values(
-                                effective_args.iter().cloned(),
-                                &[
-                                    &current,
-                                    &target_value,
-                                    &effective_new_target,
-                                    &handler,
-                                    &trap,
-                                ],
-                                &[effective_args.as_slice()],
-                            )?;
-                            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                                target_value,
-                                Value::Array(argv_array),
-                                effective_new_target,
-                            ];
-                            let result =
-                                self.run_callable_sync(context, &trap, handler, trap_args)?;
-                            if !constructor_return_is_object(&result) {
-                                return Err(VmError::TypeError {
-                                    message: "Proxy construct trap returned non-object".to_string(),
-                                });
-                            }
-                            return Ok(result);
-                        }
-                        Value::Undefined | Value::Null => {
-                            current = proxy.target(&self.gc_heap);
-                        }
-                        _ => {
+                    if self.is_callable_runtime(&trap_value) {
+                        let target_value = proxy.target(&self.gc_heap);
+                        let argv_array = self.alloc_runtime_rooted_array_from_values(
+                            effective_args.iter().cloned(),
+                            &[
+                                &current,
+                                &target_value,
+                                &effective_new_target,
+                                &handler,
+                                &trap_value,
+                            ],
+                            &[effective_args.as_slice()],
+                        )?;
+                        let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
+                            target_value,
+                            Value::array(argv_array),
+                            effective_new_target,
+                        ];
+                        let result =
+                            self.run_callable_sync(context, &trap_value, handler, trap_args)?;
+                        if !constructor_return_is_object(&result) {
                             return Err(VmError::TypeError {
-                                message: "Proxy construct trap is not callable".to_string(),
+                                message: "Proxy construct trap returned non-object".to_string(),
                             });
                         }
+                        return Ok(result);
+                    } else if trap_value.is_undefined() || trap_value.is_null() {
+                        current = proxy.target(&self.gc_heap);
+                    } else {
+                        return Err(VmError::TypeError {
+                            message: "Proxy construct trap is not callable".to_string(),
+                        });
                     }
                 }
                 _ => break,
@@ -1481,7 +1473,7 @@ impl Interpreter {
             return self.invoke_native_construct(
                 context,
                 native,
-                &Value::Undefined,
+                &Value::undefined(),
                 &effective_new_target,
                 effective_args.as_slice(),
             );

@@ -134,6 +134,14 @@ impl Value {
     // no behavioural change.
     // -----------------------------------------------------------------
 
+    /// `Value::Undefined` const — matches tagged-Value surface so
+    /// `&Value::UNDEFINED` call sites survive the final swap.
+    pub const UNDEFINED: Value = Value::Undefined;
+    /// `Value::Null` const.
+    pub const NULL: Value = Value::Null;
+    /// `Value::Hole` const.
+    pub const HOLE: Value = Value::Hole;
+
     /// `Value::Undefined` constructor.
     #[inline]
     #[must_use]

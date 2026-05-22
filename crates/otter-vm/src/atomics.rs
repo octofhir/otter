@@ -75,9 +75,10 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
             vec![global_root],
         )?
         .build()?;
-        if let Some(Value::Object(object_ctor)) = crate::object::get(global, heap, "Object")
-            && let Some(Value::Object(object_proto)) =
-                crate::object::get(object_ctor, heap, "prototype")
+        if let Some(object_ctor) =
+            crate::object::get(global, heap, "Object").and_then(|v| v.as_object())
+            && let Some(object_proto) =
+                crate::object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
         {
             crate::object::set_prototype(namespace, heap, Some(object_proto));
         }
@@ -85,7 +86,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
             global,
             heap,
             <Self as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-            Value::Object(namespace),
+            Value::object(namespace),
         );
         Ok(())
     }
@@ -137,15 +138,9 @@ fn validate_integer_typed_array(
     waitable: bool,
     method_name: &'static str,
 ) -> Result<JsTypedArray, NativeError> {
-    let ta = match value {
-        Value::TypedArray(t) => *t,
-        _ => {
-            return Err(type_err(
-                method_name,
-                "argument is not a TypedArray".to_string(),
-            ));
-        }
-    };
+    let ta = value
+        .as_typed_array()
+        .ok_or_else(|| type_err(method_name, "argument is not a TypedArray".to_string()))?;
     let kind = ta.kind();
     if !accepts_atomic_kind(kind) {
         return Err(type_err(
@@ -199,20 +194,17 @@ fn coerce_to_index(
     method_name: &'static str,
 ) -> Result<usize, NativeError> {
     let primitive = to_primitive_number(ctx, value, method_name)?;
-    match &primitive {
-        Value::Symbol(_) => {
-            return Err(type_err(
-                method_name,
-                "cannot convert Symbol to a number".to_string(),
-            ));
-        }
-        Value::BigInt(_) => {
-            return Err(type_err(
-                method_name,
-                "cannot convert BigInt to a number".to_string(),
-            ));
-        }
-        _ => {}
+    if primitive.is_symbol() {
+        return Err(type_err(
+            method_name,
+            "cannot convert Symbol to a number".to_string(),
+        ));
+    }
+    if primitive.is_big_int() {
+        return Err(type_err(
+            method_name,
+            "cannot convert BigInt to a number".to_string(),
+        ));
     }
     let n = to_integer_or_infinity(&primitive, ctx.heap());
     if !n.is_finite() {
@@ -293,54 +285,48 @@ fn coerce_element_value(
                 ),
             )
         };
-        match primitive {
-            Value::BigInt(b) => Ok(Value::big_int(b)),
-            Value::Boolean(b) => {
-                let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
-                    .map_err(oom_to_err)?;
-                Ok(Value::big_int(handle))
-            }
-            Value::String(s) => {
-                let txt = s.to_lossy_string(heap);
-                let trimmed = txt.trim();
-                let parsed = trimmed.parse::<num_bigint::BigInt>().map_err(|_| {
-                    type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
-                })?;
-                let handle = BigIntValue::from_inner(heap, parsed).map_err(oom_to_err)?;
-                Ok(Value::big_int(handle))
-            }
-            Value::Number(_) => Err(type_err(
+        if let Some(b) = primitive.as_big_int() {
+            Ok(Value::big_int(b))
+        } else if let Some(b) = primitive.as_boolean() {
+            let handle = BigIntValue::from_inner(heap, num_bigint::BigInt::from(i64::from(b)))
+                .map_err(oom_to_err)?;
+            Ok(Value::big_int(handle))
+        } else if let Some(s) = primitive.as_string() {
+            let txt = s.to_lossy_string(heap);
+            let trimmed = txt.trim();
+            let parsed = trimmed.parse::<num_bigint::BigInt>().map_err(|_| {
+                type_err(method_name, format!("cannot convert {trimmed:?} to BigInt"))
+            })?;
+            let handle = BigIntValue::from_inner(heap, parsed).map_err(oom_to_err)?;
+            Ok(Value::big_int(handle))
+        } else if primitive.is_number() {
+            Err(type_err(
                 method_name,
                 "cannot mix BigInt and Number".to_string(),
-            )),
-            _ => Err(type_err(
+            ))
+        } else {
+            Err(type_err(
                 method_name,
                 "cannot convert value to BigInt".to_string(),
-            )),
+            ))
         }
+    } else if primitive.is_big_int() {
+        Err(type_err(
+            method_name,
+            "cannot mix BigInt and Number".to_string(),
+        ))
+    } else if primitive.is_symbol() {
+        Err(type_err(
+            method_name,
+            "cannot convert Symbol to a number".to_string(),
+        ))
     } else {
-        match primitive {
-            Value::BigInt(_) => Err(type_err(
-                method_name,
-                "cannot mix BigInt and Number".to_string(),
-            )),
-            Value::Symbol(_) => Err(type_err(
-                method_name,
-                "cannot convert Symbol to a number".to_string(),
-            )),
-            other => {
-                let mut n = to_integer_or_infinity(&other, ctx.heap());
-                // §7.1.5 step 2 — `ToIntegerOrInfinity` collapses
-                // `+0` / `-0` / `NaN` to `0` (positive zero). Force
-                // the sign here so `Atomics.store(view, 0, -0)`
-                // returns `+0` per the test262
-                // `expected-return-value-negative-zero` case.
-                if n == 0.0 {
-                    n = 0.0;
-                }
-                Ok(Value::number(NumberValue::from_f64(n)))
-            }
+        let mut n = to_integer_or_infinity(&primitive, ctx.heap());
+        // §7.1.5 step 2 — collapse `+0` / `-0` / `NaN` to `0`.
+        if n == 0.0 {
+            n = 0.0;
         }
+        Ok(Value::number(NumberValue::from_f64(n)))
     }
 }
 
@@ -367,19 +353,19 @@ const fn spec_name(method: &'static str) -> &'static str {
 
 // =====================================================================
 // Native method handlers — primary entry points after the property
-// lookup path resolves `Atomics.<method>` to a `Value::NativeFunction`.
+// lookup path resolves `Atomics.<method>` to a native function.
 // =====================================================================
 
 fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::Undefined),
+        args.first().unwrap_or(&Value::UNDEFINED),
         false,
         "Atomics.load",
     )?;
     let idx = validate_atomic_access(
         ctx,
         &ta,
-        args.get(1).unwrap_or(&Value::Undefined),
+        args.get(1).unwrap_or(&Value::UNDEFINED),
         "Atomics.load",
     )?;
     let heap = ctx.interp_mut().gc_heap_mut();
@@ -397,20 +383,20 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::Undefined),
+        args.first().unwrap_or(&Value::UNDEFINED),
         false,
         "Atomics.store",
     )?;
     let idx = validate_atomic_access(
         ctx,
         &ta,
-        args.get(1).unwrap_or(&Value::Undefined),
+        args.get(1).unwrap_or(&Value::UNDEFINED),
         "Atomics.store",
     )?;
     let value = coerce_element_value(
         ctx,
         ta.kind(),
-        args.get(2).unwrap_or(&Value::Undefined),
+        args.get(2).unwrap_or(&Value::UNDEFINED),
         "Atomics.store",
     )?;
     ta.set(ctx.interp_mut().gc_heap_mut(), idx, &value);
@@ -425,20 +411,20 @@ fn modify_op(
     op_big: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
 ) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::Undefined),
+        args.first().unwrap_or(&Value::UNDEFINED),
         false,
         method_name,
     )?;
     let idx = validate_atomic_access(
         ctx,
         &ta,
-        args.get(1).unwrap_or(&Value::Undefined),
+        args.get(1).unwrap_or(&Value::UNDEFINED),
         method_name,
     )?;
     let coerced = coerce_element_value(
         ctx,
         ta.kind(),
-        args.get(2).unwrap_or(&Value::Undefined),
+        args.get(2).unwrap_or(&Value::UNDEFINED),
         method_name,
     )?;
     let heap = ctx.interp_mut().gc_heap_mut();
@@ -454,26 +440,20 @@ fn modify_op(
     };
     let prev = ta.get(heap, idx).map_err(oom_to_err)?;
     if ta.kind().is_bigint() {
-        let prev_b = match &prev {
-            Value::BigInt(b) => b.clone_inner(heap),
-            _ => num_bigint::BigInt::from(0),
-        };
-        let v_b = match &coerced {
-            Value::BigInt(b) => b.clone_inner(heap),
-            _ => num_bigint::BigInt::from(0),
-        };
+        let prev_b = prev
+            .as_big_int()
+            .map(|b| b.clone_inner(heap))
+            .unwrap_or_else(|| num_bigint::BigInt::from(0));
+        let v_b = coerced
+            .as_big_int()
+            .map(|b| b.clone_inner(heap))
+            .unwrap_or_else(|| num_bigint::BigInt::from(0));
         let new_b = op_big(&prev_b, &v_b);
         let handle = BigIntValue::from_inner(heap, new_b).map_err(oom_to_err)?;
         ta.set(heap, idx, &Value::big_int(handle));
     } else {
-        let prev_n = match &prev {
-            Value::Number(n) => n.as_f64() as i64,
-            _ => 0,
-        };
-        let v_n = match &coerced {
-            Value::Number(n) => n.as_f64() as i64,
-            _ => 0,
-        };
+        let prev_n = prev.as_number().map(|n| n.as_f64() as i64).unwrap_or(0);
+        let v_n = coerced.as_number().map(|n| n.as_f64() as i64).unwrap_or(0);
         let new_n = op(prev_n, v_n);
         ta.set(
             heap,
@@ -518,20 +498,20 @@ fn native_xor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::Undefined),
+        args.first().unwrap_or(&Value::UNDEFINED),
         false,
         "Atomics.exchange",
     )?;
     let idx = validate_atomic_access(
         ctx,
         &ta,
-        args.get(1).unwrap_or(&Value::Undefined),
+        args.get(1).unwrap_or(&Value::UNDEFINED),
         "Atomics.exchange",
     )?;
     let value = coerce_element_value(
         ctx,
         ta.kind(),
-        args.get(2).unwrap_or(&Value::Undefined),
+        args.get(2).unwrap_or(&Value::UNDEFINED),
         "Atomics.exchange",
     )?;
     let heap = ctx.interp_mut().gc_heap_mut();
@@ -551,26 +531,26 @@ fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 
 fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::Undefined),
+        args.first().unwrap_or(&Value::UNDEFINED),
         false,
         "Atomics.compareExchange",
     )?;
     let idx = validate_atomic_access(
         ctx,
         &ta,
-        args.get(1).unwrap_or(&Value::Undefined),
+        args.get(1).unwrap_or(&Value::UNDEFINED),
         "Atomics.compareExchange",
     )?;
     let expected = coerce_element_value(
         ctx,
         ta.kind(),
-        args.get(2).unwrap_or(&Value::Undefined),
+        args.get(2).unwrap_or(&Value::UNDEFINED),
         "Atomics.compareExchange",
     )?;
     let replacement = coerce_element_value(
         ctx,
         ta.kind(),
-        args.get(3).unwrap_or(&Value::Undefined),
+        args.get(3).unwrap_or(&Value::UNDEFINED),
         "Atomics.compareExchange",
     )?;
     // §25.4.3.5 step 8 — expected must be narrowed through the
@@ -617,7 +597,7 @@ fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     // by failing the `matches!(.., 1|2|4|8)` filter.
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     let primitive = to_primitive_number(ctx, &arg, "Atomics.isLockFree")?;
-    if matches!(primitive, Value::Symbol(_)) {
+    if primitive.is_symbol() {
         return Err(type_err(
             "Atomics.isLockFree",
             "cannot convert Symbol to a number".to_string(),
@@ -638,9 +618,9 @@ fn native_pause(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     // itself. Anything else throws TypeError. A single-threaded VM
     // can simply yield; we choose the trivial no-op.
     if let Some(v) = args.first()
-        && !matches!(v, Value::Undefined)
+        && !v.is_undefined()
     {
-        let Value::Number(n) = v else {
+        let Some(n) = v.as_number() else {
             return Err(type_err(
                 "Atomics.pause",
                 "iterationNumber must be an integral Number".to_string(),
@@ -672,7 +652,7 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
         "Atomics.wait"
     };
     let ta =
-        validate_integer_typed_array(args.first().unwrap_or(&Value::Undefined), true, method_name)?;
+        validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), true, method_name)?;
     // §25.4.3.13 Atomics.wait — buffer must be a SharedArrayBuffer.
     if !ta.buffer(ctx.heap()).is_shared() {
         return Err(type_err(
@@ -687,23 +667,24 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     let idx = validate_atomic_access(
         ctx,
         &ta,
-        args.get(1).unwrap_or(&Value::Undefined),
+        args.get(1).unwrap_or(&Value::UNDEFINED),
         method_name,
     )?;
     // Coerce expected `value` before timeout for spec-faithful order.
     let expected = coerce_element_value(
         ctx,
         ta.kind(),
-        args.get(2).unwrap_or(&Value::Undefined),
+        args.get(2).unwrap_or(&Value::UNDEFINED),
         method_name,
     )?;
     // §25.4.3.13 step 11 — timeout is `ToNumber(q)`; NaN → +∞;
     // observable side-effects fire even on a single-threaded VM.
     let timeout = match args.get(3) {
-        None | Some(Value::Undefined) => f64::INFINITY,
+        None => f64::INFINITY,
+        Some(v) if v.is_undefined() => f64::INFINITY,
         Some(v) => {
             let primitive = to_primitive_number(ctx, v, method_name)?;
-            if matches!(primitive, Value::Symbol(_)) {
+            if primitive.is_symbol() {
                 return Err(type_err(
                     method_name,
                     "cannot convert Symbol to a number".to_string(),
@@ -763,7 +744,7 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
         let result = ctx
             .alloc_object_with_roots(&[&label_value, &promise_value], &[args])
             .map_err(|e| type_err(method_name, format!("object allocation failed: {e}")))?;
-        ctx.set_property(result, "async", Value::Boolean(false))
+        ctx.set_property(result, "async", Value::boolean(false))
             .map_err(|e| type_err(method_name, e.to_string()))?;
         ctx.set_property(result, "value", promise_value)
             .map_err(|e| type_err(method_name, e.to_string()))?;
@@ -779,23 +760,24 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     // requirement — the spec returns 0 for a non-shared buffer
     // because no thread can be waiting on a non-shared backing.
     let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::Undefined),
+        args.first().unwrap_or(&Value::UNDEFINED),
         true,
         "Atomics.notify",
     )?;
     let idx = validate_atomic_access(
         ctx,
         &ta,
-        args.get(1).unwrap_or(&Value::Undefined),
+        args.get(1).unwrap_or(&Value::UNDEFINED),
         "Atomics.notify",
     )?;
     // count: ToIntegerOrInfinity with negative clamped to 0 per
     // §25.4.3.12 step 5; +Infinity means "wake every waiter".
     let count = match args.get(2) {
-        None | Some(Value::Undefined) => usize::MAX,
+        None => usize::MAX,
+        Some(v) if v.is_undefined() => usize::MAX,
         Some(v) => {
             let primitive = to_primitive_number(ctx, v, "Atomics.notify")?;
-            if matches!(primitive, Value::Symbol(_)) {
+            if primitive.is_symbol() {
                 return Err(type_err(
                     "Atomics.notify",
                     "cannot convert Symbol to a number".to_string(),
@@ -821,9 +803,11 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn values_equal_strict(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => crate::number::equals(*x, *y),
-        (Value::BigInt(x), Value::BigInt(y)) => x.numeric_eq(*y, heap),
-        _ => false,
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        crate::number::equals(x, y)
+    } else if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
+        x.numeric_eq(y, heap)
+    } else {
+        false
     }
 }

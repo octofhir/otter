@@ -1123,6 +1123,95 @@ impl Value {
         true
     }
 
+    /// Render the value as a debug-style string suitable for CLI
+    /// preview output. The BigInt / String / Symbol arms read the body
+    /// through `heap`; every other primitive short-circuits without
+    /// touching the heap.
+    #[must_use]
+    #[allow(dead_code)] // Wired up at Phase-1 swap; ~25 call sites flip over from legacy::Value.
+    pub fn display_string(self, heap: &otter_gc::GcHeap) -> String {
+        match self.kind() {
+            ValueKind::Number | ValueKind::Int32 => self
+                .as_number()
+                .map(|n| n.to_display_string())
+                .unwrap_or_default(),
+            ValueKind::Special => {
+                if self.is_undefined() || self.is_hole() {
+                    "undefined".to_string()
+                } else if self.is_null() {
+                    "null".to_string()
+                } else if self == Self::TRUE {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+            ValueKind::FunctionId => {
+                format!("[Function #{}]", self.as_function_id().unwrap_or(0))
+            }
+            ValueKind::PtrString => self
+                .as_string(heap)
+                .map(|s| s.to_lossy_string(heap))
+                .unwrap_or_default(),
+            ValueKind::PtrFunction => match self.function_family_kind() {
+                Some(FunctionFamilyKind::Closure) => {
+                    let id = self.as_closure(heap).map(|c| c.function_id()).unwrap_or(0);
+                    format!("[Function #{id}]")
+                }
+                Some(FunctionFamilyKind::Bound) => "[BoundFunction]".to_string(),
+                Some(FunctionFamilyKind::Native) => "[NativeFunction]".to_string(),
+                Some(FunctionFamilyKind::ClassConstructor) => "[class]".to_string(),
+                _ => "[Function]".to_string(),
+            },
+            ValueKind::PtrObject => match self.object_family_kind() {
+                Some(ObjectFamilyKind::Object) => "[object Object]".to_string(),
+                Some(ObjectFamilyKind::Array) => "[object Array]".to_string(),
+                Some(ObjectFamilyKind::Map) => "[object Map]".to_string(),
+                Some(ObjectFamilyKind::Set) => "[object Set]".to_string(),
+                Some(ObjectFamilyKind::WeakMap) => "[object WeakMap]".to_string(),
+                Some(ObjectFamilyKind::WeakSet) => "[object WeakSet]".to_string(),
+                Some(ObjectFamilyKind::WeakRef) => "[object WeakRef]".to_string(),
+                Some(ObjectFamilyKind::FinalizationRegistry) => {
+                    "[object FinalizationRegistry]".to_string()
+                }
+                Some(ObjectFamilyKind::Promise) => "[object Promise]".to_string(),
+                Some(ObjectFamilyKind::Iterator) => "[object Iterator]".to_string(),
+                Some(ObjectFamilyKind::Generator) => "[object Generator]".to_string(),
+                Some(ObjectFamilyKind::RegExp) => "[object RegExp]".to_string(),
+                Some(ObjectFamilyKind::Temporal) => self
+                    .as_temporal(heap)
+                    .map(|t| format!("[object Temporal.{}]", t.kind().class_name()))
+                    .unwrap_or_else(|| "[object Temporal]".to_string()),
+                Some(ObjectFamilyKind::Intl) => self
+                    .as_intl(heap)
+                    .map(|i| format!("[object Intl.{}]", i.kind().class_name()))
+                    .unwrap_or_else(|| "[object Intl]".to_string()),
+                Some(ObjectFamilyKind::Proxy) => "[object Proxy]".to_string(),
+                Some(ObjectFamilyKind::DataView) => "[object DataView]".to_string(),
+                Some(ObjectFamilyKind::TypedArray) => self
+                    .as_typed_array(heap)
+                    .map(|t| format!("[object {}]", t.kind().name()))
+                    .unwrap_or_else(|| "[object TypedArray]".to_string()),
+                Some(ObjectFamilyKind::LocalArrayBuffer) => "[object ArrayBuffer]".to_string(),
+                Some(ObjectFamilyKind::SharedArrayBuffer) => {
+                    "[object SharedArrayBuffer]".to_string()
+                }
+                _ => "[object Object]".to_string(),
+            },
+            ValueKind::PtrOther => match self.other_family_kind() {
+                Some(OtherFamilyKind::Symbol) => self
+                    .as_symbol(heap)
+                    .map(|s| s.descriptive_string(heap))
+                    .unwrap_or_default(),
+                Some(OtherFamilyKind::BigInt) => self
+                    .as_big_int()
+                    .map(|b| b.to_decimal_string(heap))
+                    .unwrap_or_default(),
+                _ => String::new(),
+            },
+        }
+    }
+
     /// Generator handle.
     #[inline]
     #[must_use]

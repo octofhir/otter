@@ -1096,6 +1096,33 @@ impl Value {
         None
     }
 
+    /// Spec [`ToBoolean`](https://tc39.es/ecma262/#sec-toboolean).
+    ///
+    /// Full ladder including the heap-touching arms:
+    /// - String → false iff length is zero (cached on the handle).
+    /// - BigInt → false iff body decodes to 0 ([`crate::bigint::BigIntValue::is_zero`]).
+    /// - Symbol → always true.
+    ///
+    /// Everything decidable without heap is delegated to
+    /// [`Self::to_boolean_pure`].
+    #[inline]
+    #[must_use]
+    #[allow(dead_code)] // Wired up at Phase-1 swap; ~50 call sites flip over from legacy::Value.
+    pub fn to_boolean(self, heap: &otter_gc::GcHeap) -> bool {
+        if let Some(b) = self.to_boolean_pure() {
+            return b;
+        }
+        if self.is_string() {
+            return self.as_string(heap).map(|s| !s.is_empty()).unwrap_or(false);
+        }
+        if self.is_big_int() {
+            return self.as_big_int().map(|b| !b.is_zero(heap)).unwrap_or(false);
+        }
+        // Remaining TAG_PTR_OTHER residue (Symbol, plus any future
+        // `other`-family body) is truthy per §7.1.2 step 7.
+        true
+    }
+
     /// Generator handle.
     #[inline]
     #[must_use]

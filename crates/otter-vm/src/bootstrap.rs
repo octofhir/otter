@@ -94,21 +94,23 @@ pub(crate) fn native_new_target_prototype(
             ),
         }
     } else {
-        match new_target {
-            Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
-            Value::Object(obj) => object::get(obj, ctx.heap(), "prototype"),
-            Value::NativeFunction(native) => native
+        if let Some(class) = new_target.as_class_constructor() {
+            Some(Value::object(class.prototype(ctx.heap())))
+        } else if let Some(obj) = new_target.as_object() {
+            object::get(obj, ctx.heap(), "prototype")
+        } else if let Some(native) = new_target.as_native_function() {
+            native
                 .own_property_descriptor(ctx.heap_mut(), "prototype")
                 .map_err(|err| NativeError::TypeError {
                     name,
                     reason: err.to_string(),
                 })?
-                .map(|descriptor| descriptor_value(&descriptor)),
-            _ => None,
+                .map(|descriptor| descriptor_value(&descriptor))
+        } else {
+            None
         }
     };
-    Ok(proto
-        .filter(|value| constructor_return_is_object(value) || matches!(value, Value::Proxy(_))))
+    Ok(proto.filter(|value| constructor_return_is_object(value) || value.is_proxy()))
 }
 
 fn native_new_target_error(name: &'static str, err: crate::VmError) -> NativeError {
@@ -457,7 +459,7 @@ fn build_global_this_impl(
     });
 
     let global = alloc_object_with_value_roots(heap, &[])?;
-    object::set(global, heap, "globalThis", Value::Object(global));
+    object::set(global, heap, "globalThis", Value::object(global));
     // §19.1 — `NaN`, `Infinity`, `undefined` are own properties of
     // the global object with writable / enumerable / configurable
     // all false. Reflective lookups (`Object.getOwnPropertyDescriptor(
@@ -466,19 +468,14 @@ fn build_global_this_impl(
         global,
         heap,
         "NaN",
-        crate::object::PropertyDescriptor::data(
-            Value::Number(crate::number::NumberValue::from_f64(f64::NAN)),
-            false,
-            false,
-            false,
-        ),
+        crate::object::PropertyDescriptor::data(Value::number_f64(f64::NAN), false, false, false),
     );
     object::define_own_property(
         global,
         heap,
         "Infinity",
         crate::object::PropertyDescriptor::data(
-            Value::Number(crate::number::NumberValue::from_f64(f64::INFINITY)),
+            Value::number_f64(f64::INFINITY),
             false,
             false,
             false,
@@ -488,7 +485,7 @@ fn build_global_this_impl(
         global,
         heap,
         "undefined",
-        crate::object::PropertyDescriptor::data(Value::Undefined, false, false, false),
+        crate::object::PropertyDescriptor::data(Value::undefined(), false, false, false),
     );
     if let Some(t) = telemetry.as_deref_mut() {
         t.record_global_this();
@@ -507,8 +504,9 @@ fn build_global_this_impl(
             t.record_skipped_entry();
         }
     }
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(global, heap, Some(object_proto));
     }
@@ -531,8 +529,8 @@ fn install_placeholder(
     let placeholder = alloc_object_with_value_roots(heap, &[&global_root])?;
     let placeholder_root = Value::object(placeholder);
     let proto = alloc_object_with_value_roots(heap, &[&global_root, &placeholder_root])?;
-    object::set(placeholder, heap, "prototype", Value::Object(proto));
-    define_global(global, heap, name, Value::Object(placeholder));
+    object::set(placeholder, heap, "prototype", Value::object(proto));
+    define_global(global, heap, name, Value::object(placeholder));
     Ok(())
 }
 
@@ -540,32 +538,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     use crate::{NativeCtx, NativeError};
 
     fn proxy_target_is_object(value: &Value) -> bool {
-        matches!(
-            value,
-            Value::Object(_)
-                | Value::Array(_)
-                | Value::Function { .. }
-                | Value::Closure(_)
-                | Value::NativeFunction(_)
-                | Value::BoundFunction(_)
-                | Value::ClassConstructor(_)
-                | Value::Promise(_)
-                | Value::Iterator(_)
-                | Value::RegExp(_)
-                | Value::Map(_)
-                | Value::Set(_)
-                | Value::WeakMap(_)
-                | Value::WeakSet(_)
-                | Value::WeakRef(_)
-                | Value::FinalizationRegistry(_)
-                | Value::Temporal(_)
-                | Value::Intl(_)
-                | Value::ArrayBuffer(_)
-                | Value::DataView(_)
-                | Value::TypedArray(_)
-                | Value::Generator(_)
-                | Value::Proxy(_)
-        )
+        value.is_object_like()
     }
 
     fn proxy_target_arg(args: &[Value]) -> Result<Value, NativeError> {
@@ -623,7 +596,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 &[],
                 &[args],
                 move |ctx, _, captures| {
-                    if let Some(Value::Proxy(proxy)) = captures.first() {
+                    if let Some(proxy) = captures.first().and_then(|v| v.as_proxy()) {
                         proxy.revoke(ctx.heap_mut());
                     }
                     Ok(Value::undefined())
@@ -667,7 +640,7 @@ fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     if !proxy_ctor.define_own_property(heap, "revocable", revocable_desc) {
         return Err(JsSurfaceError::DefinePropertyFailed("revocable"));
     }
-    define_global(global, heap, "Proxy", Value::NativeFunction(proxy_ctor));
+    define_global(global, heap, "Proxy", Value::native_function(proxy_ctor));
     Ok(())
 }
 
@@ -689,7 +662,8 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             });
         }
         let description = match args.first() {
-            None | Some(Value::Undefined) => None,
+            None => None,
+            Some(v) if v.is_undefined() => None,
             Some(other) => {
                 let context =
                     ctx.execution_context()
@@ -736,7 +710,8 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
 
     fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
         let key = match args.first() {
-            None | Some(Value::Undefined) => "undefined".to_string(),
+            None => "undefined".to_string(),
+            Some(v) if v.is_undefined() => "undefined".to_string(),
             Some(other) => {
                 let context =
                     ctx.execution_context()
@@ -775,7 +750,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     }
 
     fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let Some(Value::Symbol(sym)) = args.first() else {
+        let Some(sym) = args.first().and_then(|v| v.as_symbol()) else {
             return Err(NativeError::TypeError {
                 name: "Symbol.keyFor",
                 reason: "argument must be a symbol".to_string(),
@@ -802,21 +777,19 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _args: &[Value],
     ) -> Result<Value, NativeError> {
         let this = *ctx.this_value();
-        let sym = match &this {
-            Value::Symbol(sym) => *sym,
-            Value::Object(obj) => {
-                let heap = ctx.interp_mut().gc_heap();
-                crate::object::symbol_data(*obj, heap).ok_or_else(|| NativeError::TypeError {
-                    name: "Symbol.prototype.toString",
-                    reason: "this is not a Symbol".to_string(),
-                })?
-            }
-            _ => {
-                return Err(NativeError::TypeError {
-                    name: "Symbol.prototype.toString",
-                    reason: "this is not a Symbol".to_string(),
-                });
-            }
+        let sym = if let Some(sym) = this.as_symbol() {
+            *sym
+        } else if let Some(obj) = this.as_object() {
+            let heap = ctx.interp_mut().gc_heap();
+            crate::object::symbol_data(obj, heap).ok_or_else(|| NativeError::TypeError {
+                name: "Symbol.prototype.toString",
+                reason: "this is not a Symbol".to_string(),
+            })?
+        } else {
+            return Err(NativeError::TypeError {
+                name: "Symbol.prototype.toString",
+                reason: "this is not a Symbol".to_string(),
+            });
         };
 
         let s =
@@ -832,44 +805,46 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         ctx: &mut NativeCtx<'_>,
         _args: &[Value],
     ) -> Result<Value, NativeError> {
-        match *ctx.this_value() {
-            Value::Symbol(sym) => Ok(Value::symbol(sym)),
-            Value::Object(obj) => {
-                let heap = ctx.interp_mut().gc_heap();
-                crate::object::symbol_data(obj, heap)
-                    .map(Value::Symbol)
-                    .ok_or_else(|| NativeError::TypeError {
-                        name: "Symbol.prototype.valueOf",
-                        reason: "this is not a Symbol".to_string(),
-                    })
-            }
-            _ => Err(NativeError::TypeError {
-                name: "Symbol.prototype.valueOf",
-                reason: "this is not a Symbol".to_string(),
-            }),
+        let this = *ctx.this_value();
+        if let Some(sym) = this.as_symbol() {
+            return Ok(Value::symbol(*sym));
         }
+        if let Some(obj) = this.as_object() {
+            let heap = ctx.interp_mut().gc_heap();
+            return crate::object::symbol_data(obj, heap)
+                .map(Value::symbol)
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "Symbol.prototype.valueOf",
+                    reason: "this is not a Symbol".to_string(),
+                });
+        }
+        Err(NativeError::TypeError {
+            name: "Symbol.prototype.valueOf",
+            reason: "this is not a Symbol".to_string(),
+        })
     }
 
     fn symbol_proto_to_primitive(
         ctx: &mut NativeCtx<'_>,
         _args: &[Value],
     ) -> Result<Value, NativeError> {
-        match *ctx.this_value() {
-            Value::Symbol(sym) => Ok(Value::symbol(sym)),
-            Value::Object(obj) => {
-                let heap = ctx.interp_mut().gc_heap();
-                crate::object::symbol_data(obj, heap)
-                    .map(Value::Symbol)
-                    .ok_or_else(|| NativeError::TypeError {
-                        name: "Symbol.prototype[@@toPrimitive]",
-                        reason: "this is not a Symbol".to_string(),
-                    })
-            }
-            _ => Err(NativeError::TypeError {
-                name: "Symbol.prototype[@@toPrimitive]",
-                reason: "this is not a Symbol".to_string(),
-            }),
+        let this = *ctx.this_value();
+        if let Some(sym) = this.as_symbol() {
+            return Ok(Value::symbol(*sym));
         }
+        if let Some(obj) = this.as_object() {
+            let heap = ctx.interp_mut().gc_heap();
+            return crate::object::symbol_data(obj, heap)
+                .map(Value::symbol)
+                .ok_or_else(|| NativeError::TypeError {
+                    name: "Symbol.prototype[@@toPrimitive]",
+                    reason: "this is not a Symbol".to_string(),
+                });
+        }
+        Err(NativeError::TypeError {
+            name: "Symbol.prototype[@@toPrimitive]",
+            reason: "this is not a Symbol".to_string(),
+        })
     }
 
     // The Symbol constructor itself is a callable NativeFunction.
@@ -891,8 +866,9 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // §20.4.3 Symbol.prototype — ordinary object linked to %Object.prototype%.
     let symbol_ctor_root = Value::native_function(symbol_ctor);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &symbol_ctor_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -900,29 +876,30 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         ctx: &mut NativeCtx<'_>,
         _args: &[Value],
     ) -> Result<Value, NativeError> {
-        match *ctx.this_value() {
-            Value::Symbol(sym) => match sym.description() {
+        let this = *ctx.this_value();
+        if let Some(sym) = this.as_symbol() {
+            return match sym.description() {
                 Some(s) => Ok(Value::string(*s)),
                 None => Ok(Value::undefined()),
-            },
-            Value::Object(obj) => {
-                let heap = ctx.interp_mut().gc_heap();
-                match crate::object::symbol_data(obj, heap) {
-                    Some(sym) => match sym.description() {
-                        Some(s) => Ok(Value::string(*s)),
-                        None => Ok(Value::undefined()),
-                    },
-                    None => Err(NativeError::TypeError {
-                        name: "get Symbol.prototype.description",
-                        reason: "this is not a Symbol".to_string(),
-                    }),
-                }
-            }
-            _ => Err(NativeError::TypeError {
-                name: "get Symbol.prototype.description",
-                reason: "this is not a Symbol".to_string(),
-            }),
+            };
         }
+        if let Some(obj) = this.as_object() {
+            let heap = ctx.interp_mut().gc_heap();
+            return match crate::object::symbol_data(obj, heap) {
+                Some(sym) => match sym.description() {
+                    Some(s) => Ok(Value::string(*s)),
+                    None => Ok(Value::undefined()),
+                },
+                None => Err(NativeError::TypeError {
+                    name: "get Symbol.prototype.description",
+                    reason: "this is not a Symbol".to_string(),
+                }),
+            };
+        }
+        Err(NativeError::TypeError {
+            name: "get Symbol.prototype.description",
+            reason: "this is not a Symbol".to_string(),
+        })
     }
 
     {
@@ -954,7 +931,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let desc_desc =
-            PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
+            PropertyDescriptor::accessor(Some(Value::native_function(getter)), None, false, true);
         if !object::define_own_property(prototype, heap, "description", desc_desc) {
             return Err(JsSurfaceError::DefinePropertyFailed("description"));
         }
@@ -1013,7 +990,7 @@ fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // the per-realm well-known JsSymbol singleton.
     let _ = WellKnown::Iterator; // silence the unused-import lint
     let _ = symbol_proto_to_primitive;
-    define_global(global, heap, "Symbol", Value::NativeFunction(symbol_ctor));
+    define_global(global, heap, "Symbol", Value::native_function(symbol_ctor));
     Ok(())
 }
 
@@ -1038,30 +1015,30 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         ctx: &mut crate::NativeCtx<'_>,
         _args: &[Value],
     ) -> Result<Value, crate::NativeError> {
-        match *ctx.this_value() {
-            Value::Symbol(sym) => Ok(Value::symbol(sym)),
-            Value::Object(obj) => {
-                let heap = ctx.interp_mut().gc_heap();
-                crate::object::symbol_data(obj, heap)
-                    .map(Value::Symbol)
-                    .ok_or_else(|| crate::NativeError::TypeError {
-                        name: "Symbol.prototype[@@toPrimitive]",
-                        reason: "this is not a Symbol".to_string(),
-                    })
-            }
-            _ => Err(crate::NativeError::TypeError {
-                name: "Symbol.prototype[@@toPrimitive]",
-                reason: "this is not a Symbol".to_string(),
-            }),
+        let this = *ctx.this_value();
+        if let Some(sym) = this.as_symbol() {
+            return Ok(Value::symbol(*sym));
         }
+        if let Some(obj) = this.as_object() {
+            let heap = ctx.interp_mut().gc_heap();
+            return crate::object::symbol_data(obj, heap)
+                .map(Value::symbol)
+                .ok_or_else(|| crate::NativeError::TypeError {
+                    name: "Symbol.prototype[@@toPrimitive]",
+                    reason: "this is not a Symbol".to_string(),
+                });
+        }
+        Err(crate::NativeError::TypeError {
+            name: "Symbol.prototype[@@toPrimitive]",
+            reason: "this is not a Symbol".to_string(),
+        })
     }
 
     let Some(symbol_ctor_value) = object::get(global, heap, "Symbol") else {
         return Ok(());
     };
-    let symbol_ctor = match symbol_ctor_value {
-        Value::NativeFunction(f) => f,
-        _ => return Ok(()),
+    let Some(symbol_ctor) = symbol_ctor_value.as_native_function() else {
+        return Ok(());
     };
 
     let well_known_pairs: &[(&'static str, WellKnown)] = &[
@@ -1092,9 +1069,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match proto_desc.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
@@ -1127,25 +1102,23 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     // `Object.prototype.value` shadowing during `ToPropertyDescriptor`)
     // resolve correctly.
     let to_string_tag_sym = well_known.get(WellKnown::ToStringTag);
-    let object_proto = object::get(global, heap, "Object").and_then(|v| match v {
-        Value::NativeFunction(ctor) => ctor
-            .own_property_descriptor(heap, "prototype")
-            .ok()
-            .flatten()
-            .and_then(|d| match d.kind {
-                crate::object::DescriptorKind::Data {
-                    value: Value::Object(p),
-                } => Some(p),
-                _ => None,
-            }),
-        Value::Object(ctor) => match object::get(ctor, heap, "prototype") {
-            Some(Value::Object(p)) => Some(p),
-            _ => None,
-        },
-        _ => None,
+    let object_proto = object::get(global, heap, "Object").and_then(|v| {
+        if let Some(ctor) = v.as_native_function() {
+            ctor.own_property_descriptor(heap, "prototype")
+                .ok()
+                .flatten()
+                .and_then(|d| match d.kind {
+                    crate::object::DescriptorKind::Data { value } => value.as_object(),
+                    _ => None,
+                })
+        } else if let Some(ctor) = v.as_object() {
+            object::get(ctor, heap, "prototype").and_then(|v| v.as_object())
+        } else {
+            None
+        }
     });
     for ns_name in ["Math", "JSON", "Reflect", "Atomics"] {
-        if let Some(Value::Object(ns)) = object::get(global, heap, ns_name) {
+        if let Some(ns) = object::get(global, heap, ns_name).and_then(|v| v.as_object()) {
             if let Some(proto) = object_proto {
                 object::set_prototype(ns, heap, Some(proto));
             }
@@ -1156,7 +1129,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
                 heap,
                 &to_string_tag_sym,
                 crate::object::PartialPropertyDescriptor {
-                    value: Some(Value::String(tag)),
+                    value: Some(Value::string(tag)),
                     writable: Some(false),
                     enumerable: Some(false),
                     configurable: Some(true),
@@ -1173,7 +1146,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         heap,
         &to_string_tag_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::String(symbol_tag)),
+            value: Some(Value::string(symbol_tag)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -1278,32 +1251,32 @@ fn install_constructor_species_accessor(
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let species_sym = well_known.get(WellKnown::Species);
-    let installed = match ctor_value {
-        Value::NativeFunction(f) => f.define_own_symbol_property(
+    let installed = if let Some(f) = ctor_value.as_native_function() {
+        f.define_own_symbol_property(
             heap,
             &species_sym,
             crate::object::PartialPropertyDescriptor {
-                get: Some(Value::NativeFunction(species_getter)),
+                get: Some(Value::native_function(species_getter)),
                 enumerable: Some(false),
                 configurable: Some(true),
                 ..Default::default()
             },
-        ),
-        Value::Object(obj) => {
-            crate::object::define_own_symbol_property_partial(
-                obj,
-                heap,
-                &species_sym,
-                crate::object::PartialPropertyDescriptor {
-                    get: Some(Value::NativeFunction(species_getter)),
-                    enumerable: Some(false),
-                    configurable: Some(true),
-                    ..Default::default()
-                },
-            );
-            true
-        }
-        _ => return Ok(()),
+        )
+    } else if let Some(obj) = ctor_value.as_object() {
+        crate::object::define_own_symbol_property_partial(
+            obj,
+            heap,
+            &species_sym,
+            crate::object::PartialPropertyDescriptor {
+                get: Some(Value::native_function(species_getter)),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+        true
+    } else {
+        return Ok(());
     };
     if !installed {
         return Err(JsSurfaceError::DefinePropertyFailed(
@@ -1328,8 +1301,9 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     // `Value::Array` operands — without it, `[1,2,3] + ""` walks an
     // empty proto chain and reaches the foundation TypeError ladder.
     // <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(array, heap, Some(object_proto));
         object::set_prototype(prototype, heap, Some(object_proto));
@@ -1344,7 +1318,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         let mut builder = ObjectBuilder::from_object_with_value_roots(
             heap,
             array,
-            vec![global_root, Value::Object(prototype)],
+            vec![global_root, Value::object(prototype)],
         );
         for method in array_statics::ARRAY_STATIC_METHODS {
             builder.method_from_spec(method)?;
@@ -1367,7 +1341,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     // collects values verbatim.
     // <https://tc39.es/ecma262/#sec-array>
     fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        if !(args.len() == 1 && matches!(args.first(), Some(Value::Number(_)))) {
+        if !(args.len() == 1 && args.first().is_some_and(|v| v.is_number())) {
             let arr = ctx.array_from_elements(args.iter().cloned()).map_err(|_| {
                 NativeError::TypeError {
                     name: "Array",
@@ -1383,7 +1357,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                     name: "Array",
                     reason: "out of memory while allocating array".to_string(),
                 })?;
-        if let Value::Number(n) = &args[0] {
+        if let Some(n) = args[0].as_number() {
             let raw = n.as_f64();
             let len = raw as u32;
             if !raw.is_finite() || raw < 0.0 || raw != f64::from(len) {
@@ -1397,7 +1371,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
                 // writing the trailing slot also fills every index
                 // in `[0, len-1)` with a hole.
                 let last = (len - 1) as usize;
-                ctx.array_set(arr, last, Value::Hole)
+                ctx.array_set(arr, last, Value::hole())
                     .map_err(|_| NativeError::TypeError {
                         name: "Array",
                         reason: "out of memory while sizing array".to_string(),
@@ -1416,22 +1390,22 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         let Some(new_target) = ctx.new_target().cloned() else {
             return Ok(());
         };
-        let proto = match new_target {
-            Value::ClassConstructor(class) => Some(Value::Object(class.prototype(ctx.heap()))),
-            Value::Object(obj) => object::get(obj, ctx.heap(), "prototype").filter(|value| {
-                constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
-            }),
-            Value::NativeFunction(native) => native
+        let proto = if let Some(class) = new_target.as_class_constructor() {
+            Some(Value::object(class.prototype(ctx.heap())))
+        } else if let Some(obj) = new_target.as_object() {
+            object::get(obj, ctx.heap(), "prototype")
+                .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+        } else if let Some(native) = new_target.as_native_function() {
+            native
                 .own_property_descriptor(ctx.heap_mut(), "prototype")
                 .map_err(|err| NativeError::TypeError {
                     name: "Array",
                     reason: err.to_string(),
                 })?
                 .map(|descriptor| descriptor_value(&descriptor))
-                .filter(|value| {
-                    constructor_return_is_object(value) || matches!(value, Value::Proxy(_))
-                }),
-            _ => None,
+                .filter(|value| constructor_return_is_object(value) || value.is_proxy())
+        } else {
+            None
         };
         if let Some(proto) = proto {
             array::set_prototype_override(arr, ctx.heap_mut(), Some(proto));
@@ -1449,7 +1423,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
     // Wire the callable+constructable bridge as an internal object
     // slot. This must not appear in JS own-property reflection.
-    object::set_constructor_native(array, heap, Value::NativeFunction(ctor_native));
+    object::set_constructor_native(array, heap, Value::native_function(ctor_native));
 
     // §23.1.3.1 — `Array.prototype.constructor = Array`, writable,
     // non-enumerable, configurable.
@@ -1460,7 +1434,7 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
         crate::object::PropertyDescriptor::data(Value::object(array), true, false, true),
     );
 
-    define_global(global, heap, "Array", Value::Object(array));
+    define_global(global, heap, "Array", Value::object(array));
     Ok(())
 }
 
@@ -1523,7 +1497,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         };
         if ctx.is_construct_call() {
             let this = *ctx.this_value();
-            if let Value::Object(obj) = this {
+            if let Some(obj) = this.as_object() {
                 crate::object::set_number_data(obj, ctx.heap_mut(), value);
                 Ok(Value::object(obj))
             } else {
@@ -1559,15 +1533,17 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     // isPrototypeOf, etc.) resolve through ordinary property
     // lookup. Object is installed earlier in BOOTSTRAP_ENTRIES, so
     // `Object.prototype` is already reachable.
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(statics, heap, Some(object_proto));
     }
     // Same chaining for `Number.prototype`, so
     // `Number.prototype.hasOwnProperty(...)` resolves.
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -1591,12 +1567,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         statics,
         heap,
         "length",
-        crate::object::PropertyDescriptor::data(
-            Value::Number(crate::number::NumberValue::from_i32(1)),
-            false,
-            false,
-            true,
-        ),
+        crate::object::PropertyDescriptor::data(Value::number_i32(1), false, false, true),
     );
     // §21.1.2 — `Number.name` is `"Number"`, non-writable,
     // non-enumerable, configurable.
@@ -1633,11 +1604,7 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
             vec![global_root, prototype_root],
         );
         for (name, value) in constants {
-            builder.property(
-                name,
-                Value::Number(crate::number::NumberValue::from_f64(*value)),
-                Attr::read_only(),
-            )?;
+            builder.property(name, Value::number_f64(*value), Attr::read_only())?;
         }
     }
 
@@ -1649,14 +1616,20 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         _ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let result = matches!(args.first(), Some(Value::Number(n)) if n.as_f64().is_nan());
+        let result = args
+            .first()
+            .and_then(|v| v.as_number())
+            .is_some_and(|n| n.as_f64().is_nan());
         Ok(Value::boolean(result))
     }
     fn number_is_finite_native(
         _ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let result = matches!(args.first(), Some(Value::Number(n)) if n.as_f64().is_finite());
+        let result = args
+            .first()
+            .and_then(|v| v.as_number())
+            .is_some_and(|n| n.as_f64().is_finite());
         Ok(Value::boolean(result))
     }
     fn number_is_integer_native(
@@ -1677,33 +1650,37 @@ fn install_number(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let s = match args.first() {
-            Some(Value::String(s)) => s.to_lossy_string(ctx.heap()),
-            Some(other) => other.display_string(ctx.heap()),
-            None => {
-                return Ok(Value::number(crate::number::NumberValue::from_f64(
-                    f64::NAN,
-                )));
+        let s = if let Some(arg) = args.first() {
+            if let Some(s) = arg.as_string() {
+                s.to_lossy_string(ctx.heap())
+            } else {
+                arg.display_string(ctx.heap())
             }
+        } else {
+            return Ok(Value::number(crate::number::NumberValue::from_f64(
+                f64::NAN,
+            )));
         };
-        let radix = match args.get(1) {
-            Some(Value::Number(n)) => n.as_f64() as i32,
-            _ => 0,
-        };
+        let radix = args
+            .get(1)
+            .and_then(|v| v.as_number())
+            .map_or(0, |n| n.as_f64() as i32);
         Ok(Value::number(crate::number::parse::parse_int(&s, radix)))
     }
     fn number_parse_float_native(
         ctx: &mut NativeCtx<'_>,
         args: &[Value],
     ) -> Result<Value, NativeError> {
-        let s = match args.first() {
-            Some(Value::String(s)) => s.to_lossy_string(ctx.heap()),
-            Some(other) => other.display_string(ctx.heap()),
-            None => {
-                return Ok(Value::number(crate::number::NumberValue::from_f64(
-                    f64::NAN,
-                )));
+        let s = if let Some(arg) = args.first() {
+            if let Some(s) = arg.as_string() {
+                s.to_lossy_string(ctx.heap())
+            } else {
+                arg.display_string(ctx.heap())
             }
+        } else {
+            return Ok(Value::number(crate::number::NumberValue::from_f64(
+                f64::NAN,
+            )));
         };
         Ok(Value::number(crate::number::parse::parse_float(&s)))
     }
@@ -1953,7 +1930,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
                     },
                 }
             })?;
-        if let (Value::NativeFunction(native), Some(proto)) = (&result, new_target_proto) {
+        if let (Some(native), Some(proto)) = (result.as_native_function(), new_target_proto) {
             native.set_prototype_override(interp.gc_heap_mut(), Some(proto));
         }
         Ok(result)
@@ -1964,8 +1941,9 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     let function_root = Value::object(function);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &function_root])?;
     let prototype_root = Value::object(prototype);
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -1993,13 +1971,8 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
         ],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_call_native(prototype, heap, Value::NativeFunction(prototype_call));
-    let length = PropertyDescriptor::data(
-        Value::Number(crate::number::NumberValue::from_i32(1)),
-        false,
-        false,
-        true,
-    );
+    object::set_call_native(prototype, heap, Value::native_function(prototype_call));
+    let length = PropertyDescriptor::data(Value::number_i32(1), false, false, true);
     let _ = object::define_own_property(function, heap, "length", length);
     let name_value = Value::string(
         crate::string::JsString::from_str("Function", heap)
@@ -2010,12 +1983,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     let prototype_descriptor =
         PropertyDescriptor::data(Value::object(prototype), false, false, false);
     let _ = object::define_own_property(function, heap, "prototype", prototype_descriptor);
-    let prototype_length = PropertyDescriptor::data(
-        Value::Number(crate::number::NumberValue::from_i32(0)),
-        false,
-        false,
-        true,
-    );
+    let prototype_length = PropertyDescriptor::data(Value::number_i32(0), false, false, true);
     let _ = object::define_own_property(prototype, heap, "length", prototype_length);
     let prototype_name_value = Value::string(
         crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
@@ -2039,7 +2007,7 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
     )?;
     let constructor = PropertyDescriptor::data(Value::object(function), true, false, true);
     let _ = object::define_own_property(prototype, heap, "constructor", constructor);
-    define_global(global, heap, "Function", Value::Object(function));
+    define_global(global, heap, "Function", Value::object(function));
     Ok(())
 }
 
@@ -2066,128 +2034,120 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
     ///
     /// <https://tc39.es/ecma262/#sec-object-value>
     fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        if ctx.is_construct_call() && !matches!(ctx.new_target(), Some(Value::Object(_))) {
+        if ctx.is_construct_call() && !ctx.new_target().is_some_and(|v| v.is_object()) {
             return Ok(*ctx.this_value());
         }
-        match args.first() {
-            None | Some(Value::Undefined | Value::Null) => {
-                let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
-                    name: "Object",
-                    reason: "object allocation failed".to_string(),
-                })?;
-                let interp = ctx.interp_mut();
-                if let Ok(Value::Object(proto)) = interp.constructor_prototype_value("Object") {
-                    crate::object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
-                }
-                Ok(Value::object(obj))
+        let first_is_nullish = args.first().is_none_or(|v| v.is_nullish());
+        if first_is_nullish {
+            let obj = ctx.alloc_object().map_err(|_| NativeError::TypeError {
+                name: "Object",
+                reason: "object allocation failed".to_string(),
+            })?;
+            let interp = ctx.interp_mut();
+            if let Some(proto) = interp
+                .constructor_prototype_value("Object")
+                .ok()
+                .and_then(|v| v.as_object())
+            {
+                crate::object::set_prototype(obj, &mut interp.gc_heap, Some(proto));
             }
-            Some(value) => {
-                // §7.1.18 ToObject — wrap a primitive with its
-                // %X.prototype% and the matching internal data slot
-                // (so the wrapper's inherited `toString` / `valueOf`
-                // unbox correctly). Object-typed operands fall through
-                // and return unchanged.
-                let v = *value;
-                match &v {
-                    Value::Boolean(b) => {
-                        let b = *b;
-                        let interp = ctx.interp_mut();
-                        let proto =
-                            interp
-                                .primitive_wrapper_prototype("Boolean")
-                                .map_err(|err| NativeError::TypeError {
-                                    name: "Object",
-                                    reason: err.to_string(),
-                                })?;
-                        let obj = interp
-                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
-                        crate::object::set_boolean_data(obj, &mut interp.gc_heap, b);
-                        Ok(Value::object(obj))
-                    }
-                    Value::Number(n) => {
-                        let n = *n;
-                        let interp = ctx.interp_mut();
-                        let proto =
-                            interp
-                                .primitive_wrapper_prototype("Number")
-                                .map_err(|err| NativeError::TypeError {
-                                    name: "Object",
-                                    reason: err.to_string(),
-                                })?;
-                        let obj = interp
-                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
-                        crate::object::set_number_data(obj, &mut interp.gc_heap, n);
-                        Ok(Value::object(obj))
-                    }
-                    Value::String(s) => {
-                        let s = *s;
-                        let interp = ctx.interp_mut();
-                        let proto =
-                            interp
-                                .primitive_wrapper_prototype("String")
-                                .map_err(|err| NativeError::TypeError {
-                                    name: "Object",
-                                    reason: err.to_string(),
-                                })?;
-                        let obj = interp
-                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
-                        crate::object::set_string_data(obj, &mut interp.gc_heap, s);
-                        Ok(Value::object(obj))
-                    }
-                    Value::Symbol(sym) => {
-                        let sym = *sym;
-                        let interp = ctx.interp_mut();
-                        let proto =
-                            interp
-                                .primitive_wrapper_prototype("Symbol")
-                                .map_err(|err| NativeError::TypeError {
-                                    name: "Object",
-                                    reason: err.to_string(),
-                                })?;
-                        let obj = interp
-                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
-                        crate::object::set_symbol_data(obj, &mut interp.gc_heap, sym);
-                        Ok(Value::object(obj))
-                    }
-                    Value::BigInt(bigint) => {
-                        let bigint = *bigint;
-                        let interp = ctx.interp_mut();
-                        let proto =
-                            interp
-                                .primitive_wrapper_prototype("BigInt")
-                                .map_err(|err| NativeError::TypeError {
-                                    name: "Object",
-                                    reason: err.to_string(),
-                                })?;
-                        let obj = interp
-                            .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
-                            .map_err(|err| NativeError::TypeError {
-                                name: "Object",
-                                reason: err.to_string(),
-                            })?;
-                        crate::object::set_bigint_data(obj, &mut interp.gc_heap, bigint);
-                        Ok(Value::object(obj))
-                    }
-                    _ => Ok(v),
-                }
-            }
+            return Ok(Value::object(obj));
         }
+        let Some(value) = args.first() else {
+            unreachable!("first_is_nullish covers None path");
+        };
+        // §7.1.18 ToObject — wrap a primitive with its %X.prototype%
+        // and the matching internal data slot. Object-typed operands
+        // fall through and return unchanged.
+        let v = *value;
+        if let Some(b) = v.as_boolean() {
+            let interp = ctx.interp_mut();
+            let proto = interp
+                .primitive_wrapper_prototype("Boolean")
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            let obj = interp
+                .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            crate::object::set_boolean_data(obj, &mut interp.gc_heap, b);
+            return Ok(Value::object(obj));
+        }
+        if let Some(n) = v.as_number() {
+            let interp = ctx.interp_mut();
+            let proto = interp
+                .primitive_wrapper_prototype("Number")
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            let obj = interp
+                .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            crate::object::set_number_data(obj, &mut interp.gc_heap, n);
+            return Ok(Value::object(obj));
+        }
+        if let Some(s) = v.as_string() {
+            let s = *s;
+            let interp = ctx.interp_mut();
+            let proto = interp
+                .primitive_wrapper_prototype("String")
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            let obj = interp
+                .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            crate::object::set_string_data(obj, &mut interp.gc_heap, s);
+            return Ok(Value::object(obj));
+        }
+        if let Some(sym) = v.as_symbol() {
+            let sym = *sym;
+            let interp = ctx.interp_mut();
+            let proto = interp
+                .primitive_wrapper_prototype("Symbol")
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            let obj = interp
+                .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            crate::object::set_symbol_data(obj, &mut interp.gc_heap, sym);
+            return Ok(Value::object(obj));
+        }
+        if let Some(bigint) = v.as_big_int() {
+            let interp = ctx.interp_mut();
+            let proto = interp
+                .primitive_wrapper_prototype("BigInt")
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            let obj = interp
+                .alloc_runtime_rooted_object_with_proto(proto, &[&v], &[])
+                .map_err(|err| NativeError::TypeError {
+                    name: "Object",
+                    reason: err.to_string(),
+                })?;
+            crate::object::set_bigint_data(obj, &mut interp.gc_heap, bigint);
+            return Ok(Value::object(obj));
+        }
+        Ok(v)
     }
 
     let global_root = Value::object(global);
@@ -2203,7 +2163,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         &[&global_root, &object_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_constructor_native(object, heap, Value::NativeFunction(ctor_native));
+    object::set_constructor_native(object, heap, Value::native_function(ctor_native));
     let length_desc =
         PropertyDescriptor::data(Value::number(NumberValue::from_i32(1)), false, false, true);
     if !object::define_own_property(object, heap, "length", length_desc) {
@@ -2257,8 +2217,8 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let desc = PropertyDescriptor::accessor(
-            Some(Value::NativeFunction(getter)),
-            Some(Value::NativeFunction(setter)),
+            Some(Value::native_function(getter)),
+            Some(Value::native_function(setter)),
             false,
             true,
         );
@@ -2272,7 +2232,7 @@ fn install_object(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), J
         "constructor",
         PropertyDescriptor::data(Value::object(object), true, false, true),
     );
-    define_global(global, heap, "Object", Value::Object(object));
+    define_global(global, heap, "Object", Value::object(object));
     Ok(())
 }
 
@@ -2329,7 +2289,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
             // is already a freshly allocated JsObject (via
             // OrdinaryCreateFromConstructor on `Date`). Install
             // the `[[DateValue]]` internal slot and return it.
-            if let Value::Object(obj) = *ctx.this_value() {
+            if let Some(obj) = ctx.this_value().as_object() {
                 crate::object::set_date_data(obj, ctx.heap_mut(), time);
                 return Ok(Value::object(obj));
             }
@@ -2354,8 +2314,9 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
     let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
     let constructor_root = Value::object(constructor);
     let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(constructor, heap, Some(object_proto));
         object::set_prototype(prototype, heap, Some(object_proto));
@@ -2369,7 +2330,7 @@ fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsS
         &[&global_root, &constructor_root, &prototype_root],
     )
     .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_constructor_native(constructor, heap, Value::NativeFunction(ctor_native));
+    object::set_constructor_native(constructor, heap, Value::native_function(ctor_native));
     let _ = object::define_own_property(
         constructor,
         heap,
@@ -2581,25 +2542,23 @@ fn iterator_ctor_call(
             name: "Iterator",
             reason: "out of memory".to_string(),
         })?;
-    let proto = match &new_target {
-        Value::NativeFunction(nf) => {
-            let heap = ctx.heap_mut();
-
-            nf.own_property_descriptor(heap, "prototype")
-                .ok()
-                .flatten()
-                .and_then(|d| match d.kind {
-                    crate::object::DescriptorKind::Data { value } => Some(value),
-                    _ => None,
-                })
-        }
-        Value::Object(target_obj) => crate::object::get(*target_obj, ctx.heap(), "prototype"),
-        Value::ClassConstructor(c) => {
-            crate::object::get(c.statics(ctx.heap()), ctx.heap(), "prototype")
-        }
-        _ => None,
+    let proto = if let Some(nf) = new_target.as_native_function() {
+        let heap = ctx.heap_mut();
+        nf.own_property_descriptor(heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|d| match d.kind {
+                crate::object::DescriptorKind::Data { value } => Some(value),
+                _ => None,
+            })
+    } else if let Some(target_obj) = new_target.as_object() {
+        crate::object::get(target_obj, ctx.heap(), "prototype")
+    } else if let Some(c) = new_target.as_class_constructor() {
+        crate::object::get(c.statics(ctx.heap()), ctx.heap(), "prototype")
+    } else {
+        None
     };
-    if let Some(Value::Object(proto_obj)) = proto {
+    if let Some(proto_obj) = proto.and_then(|v| v.as_object()) {
         crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto_obj));
     }
     Ok(Value::object(obj))
@@ -2647,14 +2606,14 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
                 true,
             ),
         );
-        define_global_value(global, heap, Self::NAME, Value::NativeFunction(ctor));
+        define_global_value(global, heap, Self::NAME, Value::native_function(ctor));
         let iterator_ctor = ctor;
         let ctor_root = Value::native_function(iterator_ctor);
         let from_fn =
             native_static_with_value_roots(heap, "from", 1, iterator_from_native, &[&ctor_root])
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let from_desc = crate::object::PropertyDescriptor::data(
-            Value::NativeFunction(from_fn),
+            Value::native_function(from_fn),
             true,
             false,
             true,
@@ -2672,8 +2631,9 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
         // `%Object.prototype%` so reflective walks
         // (`Object.getPrototypeOf(Iterator.prototype) === Object.prototype`)
         // terminate at the realm-wide Object root.
-        if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-            && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+        if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+            && let Some(object_proto) =
+                object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
         {
             object::set_prototype(prototype, heap, Some(object_proto));
         }
@@ -2684,7 +2644,7 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
          -> Result<(), JsSurfaceError> {
             let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
                 .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            object::set(prototype, heap, name, Value::NativeFunction(f));
+            object::set(prototype, heap, name, Value::native_function(f));
             Ok(())
         };
         install_proto(heap, "map", 1, iterator_proto_map)?;
@@ -2735,22 +2695,19 @@ pub fn install_iterator_well_knowns_post_bootstrap(
     well_known: &crate::symbol::WellKnownSymbols,
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
-    let prototype = match object::get(global, heap, "Iterator") {
-        Some(Value::NativeFunction(ctor)) => ctor
-            .own_property_descriptor(heap, "prototype")
+    let iter_value = object::get(global, heap, "Iterator");
+    let prototype = if let Some(ctor) = iter_value.as_ref().and_then(|v| v.as_native_function()) {
+        ctor.own_property_descriptor(heap, "prototype")
             .ok()
             .flatten()
             .and_then(|d| match d.kind {
-                crate::object::DescriptorKind::Data {
-                    value: Value::Object(p),
-                } => Some(p),
+                crate::object::DescriptorKind::Data { value } => value.as_object(),
                 _ => None,
-            }),
-        Some(Value::Object(iterator_ctor)) => match object::get(iterator_ctor, heap, "prototype") {
-            Some(Value::Object(p)) => Some(p),
-            _ => None,
-        },
-        _ => None,
+            })
+    } else if let Some(iterator_ctor) = iter_value.and_then(|v| v.as_object()) {
+        object::get(iterator_ctor, heap, "prototype").and_then(|v| v.as_object())
+    } else {
+        None
     };
     let Some(prototype) = prototype else {
         return Ok(());
@@ -2770,7 +2727,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
         heap,
         &iter_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(symbol_iter_fn)),
+            value: Some(Value::native_function(symbol_iter_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -2785,7 +2742,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
         heap,
         &tag_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::String(tag)),
+            value: Some(Value::string(tag)),
             writable: Some(false),
             enumerable: Some(false),
             configurable: Some(true),
@@ -2843,7 +2800,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
             heap,
             &tag_sym,
             object::PartialPropertyDescriptor {
-                value: Some(Value::String(tag_string)),
+                value: Some(Value::string(tag_string)),
                 writable: Some(false),
                 enumerable: Some(false),
                 configurable: Some(true),
@@ -2889,78 +2846,74 @@ fn iterator_receiver(
     name: &'static str,
 ) -> Result<crate::IteratorHandle, crate::NativeError> {
     let this_value = *ctx.this_value();
-    match this_value {
-        Value::Iterator(h) => Ok(h),
-        // §27.1.2 step 1 — `Iterator.prototype.X.call(generator, ...)`
-        // accepts a Generator receiver by wrapping it into
-        // `IteratorState::Generator` so the lazy combinators and
-        // eager terminals share the iterator dispatch path.
-        Value::Generator(g) => {
-            let gen_value = Value::generator(g);
-            let state = crate::IteratorState::Generator { handle: g };
-            ctx.alloc_iterator_state(state, &[&gen_value], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name,
-                    reason: "iterator allocation failed".to_string(),
-                })
-        }
-        // §27.1.4.1.1 GetIteratorDirect — the `Iterator.prototype.X`
-        // helpers (drop / take / map / filter / forEach / every /
-        // some / find / reduce / toArray / flatMap) accept any
-        // receiver that implements the iterator protocol via a
-        // callable `next` method; they do NOT walk `@@iterator`.
-        // The original wrapper required a built-in iterator-shaped
-        // Value, so plain-object iterator-protocol receivers
-        // (`{ next: () => …, return: () => … }`) were rejected
-        // with "this is not an iterator". Probe `next` directly and
-        // wrap as `IteratorState::User`.
-        // <https://tc39.es/ecma262/#sec-getiteratordirect>
-        Value::Object(_) | Value::Map(_) | Value::Set(_) | Value::Array(_) | Value::String(_) => {
-            let (interp, exec_ctx) = ctx.interp_mut_and_context();
-            let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
-                name,
-                reason: "missing execution context".to_string(),
-            })?;
-            let next_key = crate::VmPropertyKey::String("next");
-            let outcome = interp
-                .ordinary_get_value(&exec_ctx, this_value, this_value, &next_key, 0)
-                .map_err(|e| crate::NativeError::TypeError {
-                    name,
-                    reason: e.to_string(),
-                })?;
-            let next_method = match outcome {
-                crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                    interp
-                        .run_callable_sync(&exec_ctx, &getter, this_value, args)
-                        .map_err(|e| crate::NativeError::TypeError {
-                            name,
-                            reason: e.to_string(),
-                        })?
-                }
-            };
-            if !interp.is_callable_runtime(&next_method) {
-                return Err(crate::NativeError::TypeError {
-                    name,
-                    reason: "this is not an iterator".to_string(),
-                });
-            }
-            let this_root = this_value;
-            let state = crate::IteratorState::User {
-                iterator: this_value,
-            };
-            ctx.alloc_iterator_state(state, &[&this_root], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name,
-                    reason: "iterator allocation failed".to_string(),
-                })
-        }
-        _ => Err(crate::NativeError::TypeError {
-            name,
-            reason: "this is not an iterator".to_string(),
-        }),
+    if let Some(h) = this_value.as_iterator() {
+        return Ok(h);
     }
+    if let Some(g) = this_value.as_generator() {
+        let gen_value = Value::generator(g);
+        let state = crate::IteratorState::Generator { handle: g };
+        return ctx
+            .alloc_iterator_state(state, &[&gen_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "iterator allocation failed".to_string(),
+            });
+    }
+    // §27.1.4.1.1 GetIteratorDirect — the `Iterator.prototype.X`
+    // helpers accept any receiver that implements the iterator
+    // protocol via a callable `next` method; they do NOT walk
+    // `@@iterator`. Probe `next` directly and wrap as `IteratorState::User`.
+    if this_value.is_object()
+        || this_value.is_map()
+        || this_value.is_set()
+        || this_value.is_array()
+        || this_value.is_string()
+    {
+        let (interp, exec_ctx) = ctx.interp_mut_and_context();
+        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        let next_key = crate::VmPropertyKey::String("next");
+        let outcome = interp
+            .ordinary_get_value(&exec_ctx, this_value, this_value, &next_key, 0)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?;
+        let next_method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp
+                    .run_callable_sync(&exec_ctx, &getter, this_value, args)
+                    .map_err(|e| crate::NativeError::TypeError {
+                        name,
+                        reason: e.to_string(),
+                    })?
+            }
+        };
+        if !interp.is_callable_runtime(&next_method) {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "this is not an iterator".to_string(),
+            });
+        }
+        let this_root = this_value;
+        let state = crate::IteratorState::User {
+            iterator: this_value,
+        };
+        return ctx
+            .alloc_iterator_state(state, &[&this_root], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "iterator allocation failed".to_string(),
+            });
+    }
+    Err(crate::NativeError::TypeError {
+        name,
+        reason: "this is not an iterator".to_string(),
+    })
 }
 
 /// Strict iterator receiver used by `%IteratorPrototype%.next/return/throw`.
@@ -2976,22 +2929,23 @@ fn iterator_receiver_builtin(
     name: &'static str,
 ) -> Result<crate::IteratorHandle, crate::NativeError> {
     let this_value = *ctx.this_value();
-    match this_value {
-        Value::Iterator(h) => Ok(h),
-        Value::Generator(g) => {
-            let gen_value = Value::generator(g);
-            let state = crate::IteratorState::Generator { handle: g };
-            ctx.alloc_iterator_state(state, &[&gen_value], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name,
-                    reason: "iterator allocation failed".to_string(),
-                })
-        }
-        _ => Err(crate::NativeError::TypeError {
-            name,
-            reason: "this is not a built-in iterator".to_string(),
-        }),
+    if let Some(h) = this_value.as_iterator() {
+        return Ok(h);
     }
+    if let Some(g) = this_value.as_generator() {
+        let gen_value = Value::generator(g);
+        let state = crate::IteratorState::Generator { handle: g };
+        return ctx
+            .alloc_iterator_state(state, &[&gen_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "iterator allocation failed".to_string(),
+            });
+    }
+    Err(crate::NativeError::TypeError {
+        name,
+        reason: "this is not a built-in iterator".to_string(),
+    })
 }
 
 fn require_callable_arg(
@@ -3219,7 +3173,7 @@ fn iterator_proto_for_each(
         cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
         ctx.cx
             .interp
-            .run_callable_sync(&exec_ctx, &callback, Value::Undefined, cb_args)
+            .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
             .map_err(|e| crate::NativeError::TypeError {
                 name: "Iterator.prototype.forEach",
                 reason: e.to_string(),
@@ -3246,7 +3200,7 @@ fn iterator_proto_reduce(
     let mut acc = if has_initial {
         args[1]
     } else {
-        Value::Undefined
+        Value::undefined()
     };
     // `has_acc` flips to true once `acc` holds a real value — either
     // the caller-supplied initial value or the first yielded element
@@ -3278,7 +3232,7 @@ fn iterator_proto_reduce(
         acc = ctx
             .cx
             .interp
-            .run_callable_sync(&exec_ctx, &reducer, Value::Undefined, cb_args)
+            .run_callable_sync(&exec_ctx, &reducer, Value::undefined(), cb_args)
             .map_err(|e| crate::NativeError::TypeError {
                 name: "Iterator.prototype.reduce",
                 reason: e.to_string(),
@@ -3340,7 +3294,7 @@ fn iterator_proto_find(
         let kept = ctx
             .cx
             .interp
-            .run_callable_sync(&exec_ctx, &predicate, Value::Undefined, cb_args)
+            .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
             .map_err(|e| crate::NativeError::TypeError {
                 name: "Iterator.prototype.find",
                 reason: e.to_string(),
@@ -3391,7 +3345,7 @@ fn iterator_proto_next(
             name: "Iterator.prototype.next",
             reason: e.to_string(),
         })?;
-    ctx.set_property(obj, "done", Value::Boolean(done))
+    ctx.set_property(obj, "done", Value::boolean(done))
         .map_err(|e| crate::NativeError::TypeError {
             name: "Iterator.prototype.next",
             reason: e.to_string(),
@@ -3410,7 +3364,7 @@ fn regexp_string_iterator_proto_next(
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExpStringIteratorPrototype.next";
     let this_value = *ctx.this_value();
-    let Value::Iterator(handle) = this_value else {
+    let Some(handle) = this_value.as_iterator() else {
         return Err(crate::NativeError::TypeError {
             name,
             reason: "this is not a RegExp String Iterator".to_string(),
@@ -3456,7 +3410,7 @@ fn regexp_string_iterator_proto_next(
             name,
             reason: e.to_string(),
         })?;
-    ctx.set_property(obj, "done", Value::Boolean(done))
+    ctx.set_property(obj, "done", Value::boolean(done))
         .map_err(|e| crate::NativeError::TypeError {
             name,
             reason: e.to_string(),
@@ -3495,7 +3449,7 @@ fn iterator_proto_return(
             name: "Iterator.prototype.return",
             reason: e.to_string(),
         })?;
-    ctx.set_property(obj, "done", Value::Boolean(true))
+    ctx.set_property(obj, "done", Value::boolean(true))
         .map_err(|e| crate::NativeError::TypeError {
             name: "Iterator.prototype.return",
             reason: e.to_string(),
@@ -3557,7 +3511,7 @@ fn iterator_predicate_drain(
         let kept = ctx
             .cx
             .interp
-            .run_callable_sync(&exec_ctx, &predicate, Value::Undefined, cb_args)
+            .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
             .map_err(|e| crate::NativeError::TypeError {
                 name,
                 reason: e.to_string(),
@@ -3582,126 +3536,123 @@ fn iterator_from_native(
     args: &[Value],
 ) -> Result<Value, crate::NativeError> {
     let input = args.first().cloned().unwrap_or(Value::undefined());
-    match &input {
-        Value::Iterator(_) => Ok(input),
-        Value::Array(arr) => {
-            let arr_value = Value::array(*arr);
-            let state = crate::IteratorState::Array {
-                array: *arr,
-                index: 0,
-                origin: crate::BuiltinIteratorOrigin::Array,
-            };
-            let handle = ctx
-                .alloc_iterator_state(state, &[&arr_value], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name: "Iterator.from",
-                    reason: "iterator allocation failed".to_string(),
-                })?;
-            Ok(Value::iterator(handle))
-        }
-        Value::Generator(g) => {
-            let state = crate::IteratorState::Generator { handle: *g };
-            let handle = ctx
-                .alloc_iterator_state(state, &[&input], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name: "Iterator.from",
-                    reason: "iterator allocation failed".to_string(),
-                })?;
-            Ok(Value::iterator(handle))
-        }
-        // §27.1.4.1 step 1 — `iterable` may also be an Object with
-        // `@@iterator`; look up the method, call it, and wrap the
-        // resulting iterator object in `IteratorState::User`. When
-        // the receiver already exposes `.next` directly (the
-        // already-iterator path) we wrap it as-is so subsequent
-        // `IteratorNext` invocations drive it through the user
-        // dispatcher.
-        Value::Object(_)
-        | Value::Set(_)
-        | Value::Map(_)
-        | Value::Function { .. }
-        | Value::Closure(_)
-        | Value::NativeFunction(_)
-        | Value::BoundFunction(_)
-        | Value::ClassConstructor(_)
-        | Value::Proxy(_) => {
-            let iterator_sym = ctx
-                .cx
-                .interp
-                .well_known_symbols()
-                .get(crate::symbol::WellKnown::Iterator);
-            let (interp, exec_ctx) = ctx.interp_mut_and_context();
-            let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+    if input.is_iterator() {
+        return Ok(input);
+    }
+    if let Some(arr) = input.as_array() {
+        let arr_value = Value::array(arr);
+        let state = crate::IteratorState::Array {
+            array: arr,
+            index: 0,
+            origin: crate::BuiltinIteratorOrigin::Array,
+        };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&arr_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
                 name: "Iterator.from",
-                reason: "missing execution context".to_string(),
+                reason: "iterator allocation failed".to_string(),
             })?;
-            let key = crate::VmPropertyKey::Symbol(iterator_sym);
-            let outcome = interp
-                .ordinary_get_value(&exec_ctx, input, input, &key, 0)
-                .map_err(|e| crate::NativeError::TypeError {
-                    name: "Iterator.from",
-                    reason: e.to_string(),
-                })?;
-            let iter_method = match outcome {
-                crate::VmGetOutcome::Value(v) => v,
-                crate::VmGetOutcome::InvokeGetter { getter } => {
-                    let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-                    interp
-                        .run_callable_sync(&exec_ctx, &getter, input, args)
-                        .map_err(|e| crate::NativeError::TypeError {
-                            name: "Iterator.from",
-                            reason: e.to_string(),
-                        })?
-                }
-            };
-            let iter_value = if matches!(iter_method, Value::Undefined | Value::Null) {
-                input
-            } else if interp.is_callable_runtime(&iter_method) {
+        return Ok(Value::iterator(handle));
+    }
+    if let Some(g) = input.as_generator() {
+        let state = crate::IteratorState::Generator { handle: g };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&input], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        return Ok(Value::iterator(handle));
+    }
+    if let Some(s) = input.as_string() {
+        let state = crate::IteratorState::String {
+            string: *s,
+            index: 0,
+        };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&input], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        return Ok(Value::iterator(handle));
+    }
+    // §27.1.4.1 step 1 — `iterable` may also be an Object with
+    // `@@iterator`; look up the method, call it, and wrap the
+    // resulting iterator object in `IteratorState::User`.
+    if input.is_object()
+        || input.is_set()
+        || input.is_map()
+        || input.is_function()
+        || input.is_closure()
+        || input.is_native_function()
+        || input.is_bound_function()
+        || input.is_class_constructor()
+        || input.is_proxy()
+    {
+        let iterator_sym = ctx
+            .cx
+            .interp
+            .well_known_symbols()
+            .get(crate::symbol::WellKnown::Iterator);
+        let (interp, exec_ctx) = ctx.interp_mut_and_context();
+        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+            name: "Iterator.from",
+            reason: "missing execution context".to_string(),
+        })?;
+        let key = crate::VmPropertyKey::Symbol(iterator_sym);
+        let outcome = interp
+            .ordinary_get_value(&exec_ctx, input, input, &key, 0)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: e.to_string(),
+            })?;
+        let iter_method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
                 let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
                 interp
-                    .run_callable_sync(&exec_ctx, &iter_method, input, args)
+                    .run_callable_sync(&exec_ctx, &getter, input, args)
                     .map_err(|e| crate::NativeError::TypeError {
                         name: "Iterator.from",
                         reason: e.to_string(),
                     })?
-            } else {
-                return Err(crate::NativeError::TypeError {
-                    name: "Iterator.from",
-                    reason: "argument is not iterable".to_string(),
-                });
-            };
-            if let Value::Iterator(_) = &iter_value {
-                return Ok(iter_value);
             }
-            let state = crate::IteratorState::User {
-                iterator: iter_value,
-            };
-            let handle = ctx
-                .alloc_iterator_state(state, &[&iter_value], &[])
-                .map_err(|_| crate::NativeError::TypeError {
+        };
+        let iter_value = if iter_method.is_nullish() {
+            input
+        } else if interp.is_callable_runtime(&iter_method) {
+            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+            interp
+                .run_callable_sync(&exec_ctx, &iter_method, input, args)
+                .map_err(|e| crate::NativeError::TypeError {
                     name: "Iterator.from",
-                    reason: "iterator allocation failed".to_string(),
-                })?;
-            Ok(Value::iterator(handle))
+                    reason: e.to_string(),
+                })?
+        } else {
+            return Err(crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "argument is not iterable".to_string(),
+            });
+        };
+        if iter_value.is_iterator() {
+            return Ok(iter_value);
         }
-        Value::String(s) => {
-            let state = crate::IteratorState::String {
-                string: *s,
-                index: 0,
-            };
-            let handle = ctx
-                .alloc_iterator_state(state, &[&input], &[])
-                .map_err(|_| crate::NativeError::TypeError {
-                    name: "Iterator.from",
-                    reason: "iterator allocation failed".to_string(),
-                })?;
-            Ok(Value::iterator(handle))
-        }
-        _ => Err(crate::NativeError::TypeError {
-            name: "Iterator.from",
-            reason: "argument is not iterable".to_string(),
-        }),
+        let state = crate::IteratorState::User {
+            iterator: iter_value,
+        };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&iter_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        return Ok(Value::iterator(handle));
     }
+    Err(crate::NativeError::TypeError {
+        name: "Iterator.from",
+        reason: "argument is not iterable".to_string(),
+    })
 }
 
 fn define_global(global: JsObject, heap: &mut otter_gc::GcHeap, name: &'static str, value: Value) {
@@ -3886,7 +3837,10 @@ mod tests {
     fn math_installs_with_static_native_methods_and_attrs() {
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let global = build_global_this(&mut heap).expect("global");
-        let Value::Object(math) = object::get(global, &heap, "Math").expect("Math") else {
+        let Some(math) = object::get(global, &heap, "Math")
+            .expect("Math")
+            .as_object()
+        else {
             panic!("Math should be an object")
         };
 
@@ -3895,7 +3849,10 @@ mod tests {
         assert!(!pi.enumerable());
         assert!(!pi.configurable());
 
-        let Value::NativeFunction(abs) = object::get(math, &heap, "abs").expect("abs") else {
+        let Some(abs) = object::get(math, &heap, "abs")
+            .expect("abs")
+            .as_native_function()
+        else {
             panic!("Math.abs should be native")
         };
         assert!(NativeFunction::is_static_call(&abs, &heap));

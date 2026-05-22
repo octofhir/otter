@@ -2541,197 +2541,309 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(VmGetOutcome::Value(Value::undefined()));
         }
-        match base {
-            Value::Object(obj) => {
-                if let Some(value) = self.string_object_exotic_get(obj, key)? {
-                    return Ok(VmGetOutcome::Value(value));
-                }
-                match self.lookup_own_vm_property_key(obj, key) {
-                    object::PropertyLookup::Data { value, .. } => Ok(VmGetOutcome::Value(value)),
-                    object::PropertyLookup::Accessor { getter, .. } => match getter {
-                        Some(getter) if abstract_ops::is_callable(&getter) => {
-                            Ok(VmGetOutcome::InvokeGetter { getter })
-                        }
-                        _ => Ok(VmGetOutcome::Value(Value::undefined())),
-                    },
-                    object::PropertyLookup::Absent => {
-                        match object::prototype_value(obj, &self.gc_heap) {
-                            Some(proto) => {
-                                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
-                            }
-                            None => Ok(VmGetOutcome::Value(Value::undefined())),
-                        }
-                    }
-                }
+        if let Some(obj) = base.as_object() {
+            if let Some(value) = self.string_object_exotic_get(obj, key)? {
+                return Ok(VmGetOutcome::Value(value));
             }
-            Value::Proxy(proxy) => {
-                let key_value = self.vm_property_key_to_value(key)?;
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value, receiver];
-                match self.invoke_proxy_trap(context, &proxy, "get", trap_args)? {
-                    Some(value) => {
-                        self.validate_proxy_get_invariants(
-                            &proxy.target(&self.gc_heap),
+            return match self.lookup_own_vm_property_key(obj, key) {
+                object::PropertyLookup::Data { value, .. } => Ok(VmGetOutcome::Value(value)),
+                object::PropertyLookup::Accessor { getter, .. } => match getter {
+                    Some(getter) if abstract_ops::is_callable(&getter) => {
+                        Ok(VmGetOutcome::InvokeGetter { getter })
+                    }
+                    _ => Ok(VmGetOutcome::Value(Value::undefined())),
+                },
+                object::PropertyLookup::Absent => match object::prototype_value(obj, &self.gc_heap)
+                {
+                    Some(proto) => self.ordinary_get_value(context, proto, receiver, key, hops + 1),
+                    None => Ok(VmGetOutcome::Value(Value::undefined())),
+                },
+            };
+        }
+        if let Some(proxy) = base.as_proxy() {
+            let key_value = self.vm_property_key_to_value(key)?;
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(&self.gc_heap), key_value, receiver];
+            return match self.invoke_proxy_trap(context, &proxy, "get", trap_args)? {
+                Some(value) => {
+                    self.validate_proxy_get_invariants(&proxy.target(&self.gc_heap), key, &value)?;
+                    Ok(VmGetOutcome::Value(value))
+                }
+                None => self.ordinary_get_value(
+                    context,
+                    proxy.target(&self.gc_heap),
+                    receiver,
+                    key,
+                    hops + 1,
+                ),
+            };
+        }
+        if let Some(arr) = base.as_array() {
+            let value = match key {
+                VmPropertyKey::Symbol(sym) => {
+                    if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
+                        v
+                    } else if sym
+                        .well_known_tag()
+                        .is_some_and(|t| t == symbol::WellKnown::Iterator)
+                    {
+                        make_array_iterator_factory_runtime_rooted(self, arr)?
+                    } else if let Some(p) = self
+                        .constructor_prototype_value("Array")
+                        .ok()
+                        .and_then(|v| v.as_object())
+                    {
+                        return self.ordinary_get_value(
+                            context,
+                            Value::object(p),
+                            receiver,
                             key,
-                            &value,
-                        )?;
-                        Ok(VmGetOutcome::Value(value))
+                            hops + 1,
+                        );
+                    } else {
+                        Value::undefined()
                     }
-                    None => self.ordinary_get_value(
-                        context,
-                        proxy.target(&self.gc_heap),
-                        receiver,
-                        key,
-                        hops + 1,
-                    ),
                 }
-            }
-            Value::Array(arr) => {
-                let value = match key {
-                    VmPropertyKey::Symbol(sym) => {
-                        // §22.1 Array exotic — own symbol-keyed slot
-                        // wins over the prototype walk, matching the
-                        // `OrdinaryGet` ladder for ordinary objects.
-                        if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym)
-                        {
-                            v
-                        } else if sym
-                            .well_known_tag()
-                            .is_some_and(|t| t == symbol::WellKnown::Iterator)
-                        {
-                            make_array_iterator_factory_runtime_rooted(self, arr)?
-                        } else {
-                            // §22.1.3 — walk Array.prototype for
-                            // inherited symbol-keyed members
-                            // (`@@toStringTag` accessor, etc.).
-                            match self.constructor_prototype_value("Array") {
-                                Ok(Value::Object(p)) => {
-                                    return self.ordinary_get_value(
-                                        context,
-                                        Value::Object(p),
-                                        receiver,
-                                        key,
-                                        hops + 1,
-                                    );
-                                }
-                                Ok(_) | Err(_) => Value::undefined(),
+                _ => {
+                    let key_str = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    if let Some((getter, _)) =
+                        crate::array::get_accessor(arr, &self.gc_heap, key_str)
+                    {
+                        match getter {
+                            Some(callable) if abstract_ops::is_callable(&callable) => {
+                                return Ok(VmGetOutcome::InvokeGetter { getter: callable });
                             }
+                            _ => return Ok(VmGetOutcome::Value(Value::undefined())),
                         }
                     }
-                    _ => {
-                        let key_str = key
-                            .string_name()
-                            .expect("non-symbol key has string spelling");
-                        // §10.4.2 — installed accessor descriptors
-                        // take precedence over dense / named data.
-                        if let Some((getter, _)) =
-                            crate::array::get_accessor(arr, &self.gc_heap, key_str)
-                        {
-                            match getter {
-                                Some(callable) if abstract_ops::is_callable(&callable) => {
-                                    return Ok(VmGetOutcome::InvokeGetter { getter: callable });
-                                }
-                                _ => return Ok(VmGetOutcome::Value(Value::undefined())),
+                    match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
+                        Some(v) => v,
+                        None => {
+                            let proto = self.constructor_prototype_value("Array")?;
+                            if let Some(proto_obj) = proto.as_object() {
+                                return self.ordinary_get_value(
+                                    context,
+                                    Value::object(proto_obj),
+                                    receiver,
+                                    key,
+                                    hops + 1,
+                                );
                             }
-                        }
-                        match crate::array::get_named_property(arr, &self.gc_heap, key_str) {
-                            Some(v) => v,
-                            None => {
-                                // §22.1.3 — fall through to
-                                // `Array.prototype` so inherited
-                                // methods (`toString`, `join`,
-                                // `map`, …) and user-installed
-                                // overrides resolve through ordinary
-                                // [[Get]]. Returning `Undefined`
-                                // here previously broke the
-                                // §7.1.1 ToPrimitive ladder for
-                                // plain arrays.
-                                // <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
-                                let proto = self.constructor_prototype_value("Array")?;
-                                if let Value::Object(proto_obj) = proto {
-                                    return self.ordinary_get_value(
-                                        context,
-                                        Value::Object(proto_obj),
-                                        receiver,
-                                        key,
-                                        hops + 1,
-                                    );
-                                }
-                                Value::Undefined
-                            }
+                            Value::undefined()
                         }
                     }
-                };
-                Ok(VmGetOutcome::Value(value))
+                }
+            };
+            return Ok(VmGetOutcome::Value(value));
+        }
+        let fid = base
+            .as_function()
+            .or_else(|| base.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            let lookup = match key {
+                VmPropertyKey::Symbol(sym) => {
+                    match self
+                        .function_user_props
+                        .get(&function_id)
+                        .copied()
+                        .and_then(|bag| object::get_own_symbol_descriptor(bag, &self.gc_heap, sym))
+                    {
+                        Some(desc) => descriptor_to_lookup(desc),
+                        None => self
+                            .function_kind_prototype_for(context, function_id)
+                            .and_then(|proto| {
+                                match object::lookup_symbol(proto, &self.gc_heap, sym) {
+                                    object::PropertyLookup::Absent => None,
+                                    lookup => Some(lookup),
+                                }
+                            })
+                            .or_else(|| {
+                                self.function_prototype_object()
+                                    .ok()
+                                    .map(|proto| object::lookup_symbol(proto, &self.gc_heap, sym))
+                            })
+                            .unwrap_or(object::PropertyLookup::Absent),
+                    }
+                }
+                _ => {
+                    let key_name = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    let own = self.ordinary_function_own_property_descriptor(
+                        Some(context),
+                        function_id,
+                        key_name,
+                    )?;
+                    match own {
+                        Some(desc) => descriptor_to_lookup(desc),
+                        None => self
+                            .function_kind_prototype_for(context, function_id)
+                            .and_then(|proto| {
+                                match object::lookup(proto, &self.gc_heap, key_name) {
+                                    object::PropertyLookup::Absent => None,
+                                    lookup => Some(lookup),
+                                }
+                            })
+                            .or_else(|| {
+                                self.function_prototype_object()
+                                    .ok()
+                                    .map(|proto| object::lookup(proto, &self.gc_heap, key_name))
+                            })
+                            .unwrap_or(object::PropertyLookup::Absent),
+                    }
+                }
+            };
+            let value = match lookup {
+                object::PropertyLookup::Data { value, .. } => value,
+                object::PropertyLookup::Accessor { getter, .. } => {
+                    return Ok(match getter {
+                        Some(getter) if abstract_ops::is_callable(&getter) => {
+                            VmGetOutcome::InvokeGetter { getter }
+                        }
+                        _ => VmGetOutcome::Value(Value::undefined()),
+                    });
+                }
+                object::PropertyLookup::Absent => Value::undefined(),
+            };
+            if let Some(outcome) = self.callable_realm_prototype_accessor_outcome(&value, key)? {
+                return Ok(outcome);
             }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
+            return Ok(VmGetOutcome::Value(value));
+        }
+        if let Some(native) = base.as_native_function() {
+            let value = match key {
+                VmPropertyKey::Symbol(sym) => {
+                    match native.own_symbol_property_descriptor(&self.gc_heap, sym) {
+                        Some(object::PropertyDescriptor {
+                            kind: object::DescriptorKind::Data { value },
+                            ..
+                        }) => value,
+                        Some(object::PropertyDescriptor {
+                            kind: object::DescriptorKind::Accessor { getter, .. },
+                            ..
+                        }) => {
+                            return Ok(match getter {
+                                Some(getter) if abstract_ops::is_callable(&getter) => {
+                                    VmGetOutcome::InvokeGetter { getter }
+                                }
+                                _ => VmGetOutcome::Value(Value::undefined()),
+                            });
+                        }
+                        None => self
+                            .function_prototype_object()
+                            .ok()
+                            .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                            .unwrap_or(Value::undefined()),
+                    }
+                }
+                _ => {
+                    let key = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    match native.own_property_descriptor(&mut self.gc_heap, key)? {
+                        Some(object::PropertyDescriptor {
+                            kind: object::DescriptorKind::Data { value },
+                            ..
+                        }) => value,
+                        Some(object::PropertyDescriptor {
+                            kind: object::DescriptorKind::Accessor { getter, .. },
+                            ..
+                        }) => {
+                            return Ok(match getter {
+                                Some(getter) if abstract_ops::is_callable(&getter) => {
+                                    VmGetOutcome::InvokeGetter { getter }
+                                }
+                                _ => VmGetOutcome::Value(Value::undefined()),
+                            });
+                        }
+                        None => self
+                            .load_function_prototype_method(key)
+                            .or_else(|| self.load_object_prototype_method(key))
+                            .unwrap_or(Value::undefined()),
+                    }
+                }
+            };
+            if let Some(outcome) = self.callable_realm_prototype_accessor_outcome(&value, key)? {
+                return Ok(outcome);
+            }
+            return Ok(VmGetOutcome::Value(value));
+        }
+        if let Some(bound) = base.as_bound_function() {
+            let value = match key {
+                VmPropertyKey::Symbol(sym) => self
+                    .function_prototype_object()
+                    .ok()
+                    .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
+                    .unwrap_or(Value::undefined()),
+                _ => {
+                    let key = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    match function_metadata::bound_own_property_descriptor(
+                        &bound,
+                        &mut self.gc_heap,
+                        key,
+                    )? {
+                        Some(desc) => match &desc.kind {
+                            object::DescriptorKind::Data { value } => *value,
+                            object::DescriptorKind::Accessor { getter, .. } => {
+                                return Ok(match getter {
+                                    Some(getter) if abstract_ops::is_callable(getter) => {
+                                        VmGetOutcome::InvokeGetter { getter: *getter }
+                                    }
+                                    _ => VmGetOutcome::Value(Value::undefined()),
+                                });
+                            }
+                        },
+                        None => self
+                            .load_function_prototype_method(key)
+                            .or_else(|| self.load_object_prototype_method(key))
+                            .unwrap_or(Value::undefined()),
+                    }
+                }
+            };
+            if let Some(outcome) = self.callable_realm_prototype_accessor_outcome(&value, key)? {
+                return Ok(outcome);
+            }
+            return Ok(VmGetOutcome::Value(value));
+        }
+        if let Some(class) = base.as_class_constructor() {
+            if key.string_name().is_some_and(|k| k == "prototype") {
+                return Ok(VmGetOutcome::Value(Value::object(
+                    class.prototype(&self.gc_heap),
+                )));
+            }
+            let statics = class.statics(&self.gc_heap);
+            let outcome =
+                self.ordinary_get_value(context, Value::object(statics), receiver, key, hops + 1)?;
+            let value = match &outcome {
+                VmGetOutcome::Value(v) => *v,
+                VmGetOutcome::InvokeGetter { .. } => return Ok(outcome),
+            };
+            if let Some(outcome) = self.callable_realm_prototype_accessor_outcome(&value, key)? {
+                return Ok(outcome);
+            }
+            return Ok(VmGetOutcome::Value(value));
+        }
+        if let Some(re) = base.as_regexp() {
+            if let Some(bag) = re.expando(&self.gc_heap) {
                 let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
-                        // §10.2 ordinary function exotic — own
-                        // symbol-keyed properties live in the lazy
-                        // user-props bag (`f[Symbol.toStringTag] =
-                        // "tag"`). Surface those before walking
-                        // `Function.prototype` so reflective probes
-                        // (`Object.prototype.toString.call(f)`)
-                        // observe the override.
-                        match self
-                            .function_user_props
-                            .get(&function_id)
-                            .copied()
-                            .and_then(|bag| {
-                                object::get_own_symbol_descriptor(bag, &self.gc_heap, sym)
-                            }) {
-                            Some(desc) => descriptor_to_lookup(desc),
-                            None => self
-                                .function_kind_prototype_for(context, function_id)
-                                .and_then(|proto| {
-                                    match object::lookup_symbol(proto, &self.gc_heap, sym) {
-                                        object::PropertyLookup::Absent => None,
-                                        lookup => Some(lookup),
-                                    }
-                                })
-                                .or_else(|| {
-                                    self.function_prototype_object().ok().map(|proto| {
-                                        object::lookup_symbol(proto, &self.gc_heap, sym)
-                                    })
-                                })
-                                .unwrap_or(object::PropertyLookup::Absent),
-                        }
+                        object::lookup_own_symbol(bag, &self.gc_heap, sym)
                     }
                     _ => {
-                        let key_name = key
+                        let key = key
                             .string_name()
                             .expect("non-symbol key has string spelling");
-                        let own = self.ordinary_function_own_property_descriptor(
-                            Some(context),
-                            function_id,
-                            key_name,
-                        )?;
-                        match own {
-                            Some(desc) => descriptor_to_lookup(desc),
-                            None => self
-                                .function_kind_prototype_for(context, function_id)
-                                .and_then(|proto| {
-                                    match object::lookup(proto, &self.gc_heap, key_name) {
-                                        object::PropertyLookup::Absent => None,
-                                        lookup => Some(lookup),
-                                    }
-                                })
-                                .or_else(|| {
-                                    self.function_prototype_object()
-                                        .ok()
-                                        .map(|proto| object::lookup(proto, &self.gc_heap, key_name))
-                                })
-                                .unwrap_or(object::PropertyLookup::Absent),
-                        }
+                        object::lookup_own(bag, &self.gc_heap, key)
                     }
                 };
-                let value = match lookup {
-                    object::PropertyLookup::Data { value, .. } => value,
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
                     object::PropertyLookup::Accessor { getter, .. } => {
                         return Ok(match getter {
                             Some(getter) if abstract_ops::is_callable(&getter) => {
@@ -2740,414 +2852,186 @@ impl Interpreter {
                             _ => VmGetOutcome::Value(Value::undefined()),
                         });
                     }
-                    object::PropertyLookup::Absent => Value::undefined(),
-                };
-                if let Some(outcome) =
-                    self.callable_realm_prototype_accessor_outcome(&value, key)?
-                {
-                    return Ok(outcome);
+                    object::PropertyLookup::Absent => {}
                 }
-                Ok(VmGetOutcome::Value(value))
             }
-            Value::NativeFunction(native) => {
-                let value = match key {
+            let direct = match key {
+                VmPropertyKey::Symbol(_) => Value::undefined(),
+                _ => {
+                    let key = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    regexp_prototype::load_property(&re, &mut self.gc_heap, key)
+                }
+            };
+            return if direct.is_undefined() {
+                let proto = self.constructor_prototype_value("RegExp")?;
+                if proto.is_nullish() {
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            } else {
+                Ok(VmGetOutcome::Value(direct))
+            };
+        }
+        if base.is_map() || base.is_set() || base.is_weak_map() || base.is_weak_set() {
+            let proto_name = if base.is_map() {
+                "Map"
+            } else if base.is_set() {
+                "Set"
+            } else if base.is_weak_map() {
+                "WeakMap"
+            } else {
+                "WeakSet"
+            };
+            let proto = self.constructor_prototype_value(proto_name)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if let Some(promise) = base.as_promise() {
+            if let Some(bag) = promise.expando(&self.gc_heap) {
+                let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {
-                        match native.own_symbol_property_descriptor(&self.gc_heap, sym) {
-                            Some(object::PropertyDescriptor {
-                                kind: object::DescriptorKind::Data { value },
-                                ..
-                            }) => value,
-                            Some(object::PropertyDescriptor {
-                                kind: object::DescriptorKind::Accessor { getter, .. },
-                                ..
-                            }) => {
-                                return Ok(match getter {
-                                    Some(getter) if abstract_ops::is_callable(&getter) => {
-                                        VmGetOutcome::InvokeGetter { getter }
-                                    }
-                                    _ => VmGetOutcome::Value(Value::undefined()),
-                                });
+                        object::lookup_own_symbol(bag, &self.gc_heap, sym)
+                    }
+                    _ => {
+                        let name = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, name)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(g) if abstract_ops::is_callable(&g) => {
+                                VmGetOutcome::InvokeGetter { getter: g }
                             }
-                            None => self
-                                .function_prototype_object()
-                                .ok()
-                                .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                                .unwrap_or(Value::undefined()),
-                        }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
                     }
-                    _ => {
-                        let key = key
-                            .string_name()
-                            .expect("non-symbol key has string spelling");
-                        match native.own_property_descriptor(&mut self.gc_heap, key)? {
-                            Some(object::PropertyDescriptor {
-                                kind: object::DescriptorKind::Data { value },
-                                ..
-                            }) => value,
-                            Some(object::PropertyDescriptor {
-                                kind: object::DescriptorKind::Accessor { getter, .. },
-                                ..
-                            }) => {
-                                return Ok(match getter {
-                                    Some(getter) if abstract_ops::is_callable(&getter) => {
-                                        VmGetOutcome::InvokeGetter { getter }
-                                    }
-                                    _ => VmGetOutcome::Value(Value::undefined()),
-                                });
-                            }
-                            None => self
-                                .load_function_prototype_method(key)
-                                .or_else(|| self.load_object_prototype_method(key))
-                                .unwrap_or(Value::undefined()),
-                        }
-                    }
-                };
-                if let Some(outcome) =
-                    self.callable_realm_prototype_accessor_outcome(&value, key)?
+                    object::PropertyLookup::Absent => {}
+                }
+            }
+            let proto = match promise.prototype_override(&self.gc_heap) {
+                Some(over) => over,
+                None => self.constructor_prototype_value("Promise")?,
+            };
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if base.is_big_int() {
+            let proto = self.constructor_prototype_value("BigInt")?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if base.is_boolean() || base.is_number() || base.is_symbol() {
+            let proto_name = if base.is_boolean() {
+                "Boolean"
+            } else if base.is_number() {
+                "Number"
+            } else {
+                "Symbol"
+            };
+            let proto = self.constructor_prototype_value(proto_name)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if let Some(s) = base.as_string() {
+            if let Some(name) = key.string_name() {
+                if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
+                    && n.is_finite()
+                    && n.fract() == 0.0
+                    && n >= 0.0
+                    && (n as usize) < s.len() as usize
                 {
-                    return Ok(outcome);
+                    let unit = s.char_code_at(n as u32, &self.gc_heap).unwrap_or(0);
+                    let unit_str = crate::JsString::from_utf16_units(&[unit], &mut self.gc_heap)?;
+                    return Ok(VmGetOutcome::Value(Value::string(unit_str)));
                 }
-                Ok(VmGetOutcome::Value(value))
-            }
-            Value::BoundFunction(bound) => {
-                let value = match key {
-                    VmPropertyKey::Symbol(sym) => self
-                        .function_prototype_object()
-                        .ok()
-                        .and_then(|p| object::get_symbol(p, &self.gc_heap, sym))
-                        .unwrap_or(Value::undefined()),
-                    _ => {
-                        let key = key
-                            .string_name()
-                            .expect("non-symbol key has string spelling");
-                        match function_metadata::bound_own_property_descriptor(
-                            &bound,
-                            &mut self.gc_heap,
-                            key,
-                        )? {
-                            Some(desc) => match &desc.kind {
-                                object::DescriptorKind::Data { value } => *value,
-                                object::DescriptorKind::Accessor { getter, .. } => {
-                                    return Ok(match getter {
-                                        Some(getter) if abstract_ops::is_callable(getter) => {
-                                            VmGetOutcome::InvokeGetter { getter: *getter }
-                                        }
-                                        _ => VmGetOutcome::Value(Value::undefined()),
-                                    });
-                                }
-                            },
-                            None => self
-                                .load_function_prototype_method(key)
-                                .or_else(|| self.load_object_prototype_method(key))
-                                .unwrap_or(Value::undefined()),
-                        }
-                    }
-                };
-                if let Some(outcome) =
-                    self.callable_realm_prototype_accessor_outcome(&value, key)?
-                {
-                    return Ok(outcome);
-                }
-                Ok(VmGetOutcome::Value(value))
-            }
-            Value::ClassConstructor(class) => {
-                if key.string_name().is_some_and(|k| k == "prototype") {
-                    return Ok(VmGetOutcome::Value(Value::object(
-                        class.prototype(&self.gc_heap),
-                    )));
-                }
-                // §15.7.10 ClassDefinitionEvaluation step 6.b — the
-                // statics object's [[Prototype]] chains to the parent
-                // class value (a NativeFunction for `extends Promise`,
-                // a ClassConstructor for `extends UserClass`, an
-                // Object otherwise). Route through `ordinary_get_value`
-                // on the statics receiver so the proto walk handles
-                // every prototype kind uniformly.
-                let statics = class.statics(&self.gc_heap);
-                let outcome = self.ordinary_get_value(
-                    context,
-                    Value::Object(statics),
-                    receiver,
-                    key,
-                    hops + 1,
-                )?;
-                let value = match &outcome {
-                    VmGetOutcome::Value(v) => *v,
-                    VmGetOutcome::InvokeGetter { .. } => return Ok(outcome),
-                };
-                if let Some(outcome) =
-                    self.callable_realm_prototype_accessor_outcome(&value, key)?
-                {
-                    return Ok(outcome);
-                }
-                Ok(VmGetOutcome::Value(value))
-            }
-            Value::RegExp(re) => {
-                // §22.2.6 — user-installed own properties on a
-                // `RegExp` instance live in the lazy expando bag and
-                // shadow the spec-mandated accessors. Mirror the same
-                // precedence the bytecode property-dispatch path uses
-                // (property_dispatch::load_property RegExp arm) so
-                // reflective entry points
-                // (`ToPropertyDescriptor`, accessor-aware `[[Get]]`)
-                // observe the same value the VM hands out.
-                if let Some(bag) = re.expando(&self.gc_heap) {
-                    let lookup = match key {
-                        VmPropertyKey::Symbol(sym) => {
-                            object::lookup_own_symbol(bag, &self.gc_heap, sym)
-                        }
-                        _ => {
-                            let key = key
-                                .string_name()
-                                .expect("non-symbol key has string spelling");
-                            object::lookup_own(bag, &self.gc_heap, key)
-                        }
-                    };
-                    match lookup {
-                        object::PropertyLookup::Data { value, .. } => {
-                            return Ok(VmGetOutcome::Value(value));
-                        }
-                        object::PropertyLookup::Accessor { getter, .. } => {
-                            return Ok(match getter {
-                                Some(getter) if abstract_ops::is_callable(&getter) => {
-                                    VmGetOutcome::InvokeGetter { getter }
-                                }
-                                _ => VmGetOutcome::Value(Value::undefined()),
-                            });
-                        }
-                        object::PropertyLookup::Absent => {}
-                    }
-                }
-                let direct = match key {
-                    VmPropertyKey::Symbol(_) => Value::undefined(),
-                    _ => {
-                        let key = key
-                            .string_name()
-                            .expect("non-symbol key has string spelling");
-                        regexp_prototype::load_property(&re, &mut self.gc_heap, key)
-                    }
-                };
-                match direct {
-                    Value::Undefined => {
-                        // §22.2.6 — walk `RegExp.prototype` so
-                        // installed methods and accessors resolve.
-                        let proto = self.constructor_prototype_value("RegExp")?;
-                        if proto.is_nullish() {
-                            return Ok(VmGetOutcome::Value(Value::undefined()));
-                        }
-                        self.ordinary_get_value(context, proto, receiver, key, hops + 1)
-                    }
-                    value => Ok(VmGetOutcome::Value(value)),
+                if name == "length" {
+                    return Ok(VmGetOutcome::Value(Value::number_i32(s.len() as i32)));
                 }
             }
-            // §24.* — collection instances have no own string keys
-            // outside `size`-style accessors that live on the
-            // prototype. Walk the realm prototype so user-installed
-            // overrides on `Map.prototype` / `Set.prototype` / etc.
-            // resolve through the same internal-method substrate that
-            // Reflect/Proxy use.
-            Value::Map(_) | Value::Set(_) | Value::WeakMap(_) | Value::WeakSet(_) => {
-                let proto_name = match base {
-                    Value::Map(_) => "Map",
-                    Value::Set(_) => "Set",
-                    Value::WeakMap(_) => "WeakMap",
-                    Value::WeakSet(_) => "WeakSet",
-                    _ => unreachable!(),
-                };
-                let proto = self.constructor_prototype_value(proto_name)?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            let proto = self.constructor_prototype_value("String")?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            // §27.2.5 — Promise instances expose no own string keys.
-            // Walk `Promise.prototype` so `then` / `catch` /
-            // `finally` / `constructor` resolve through the same
-            // internal-method substrate as other builtins.
-            Value::Promise(promise) => {
-                // §10.1.8.1 OrdinaryGet — expando own properties may
-                // be accessor descriptors installed via
-                // `Object.defineProperty(p, key, {get: ...})`.
-                // Surface them through `InvokeGetter` so callers like
-                // SpeciesConstructor observe poisoned getters.
-                if let Some(bag) = promise.expando(&self.gc_heap) {
-                    let lookup = match key {
-                        VmPropertyKey::Symbol(sym) => {
-                            object::lookup_own_symbol(bag, &self.gc_heap, sym)
-                        }
-                        _ => {
-                            let name = key
-                                .string_name()
-                                .expect("non-symbol key has string spelling");
-                            object::lookup_own(bag, &self.gc_heap, name)
-                        }
-                    };
-                    match lookup {
-                        object::PropertyLookup::Data { value, .. } => {
-                            return Ok(VmGetOutcome::Value(value));
-                        }
-                        object::PropertyLookup::Accessor { getter, .. } => {
-                            return Ok(match getter {
-                                Some(g) if abstract_ops::is_callable(&g) => {
-                                    VmGetOutcome::InvokeGetter { getter: g }
-                                }
-                                _ => VmGetOutcome::Value(Value::undefined()),
-                            });
-                        }
-                        object::PropertyLookup::Absent => {}
-                    }
-                }
-                // §27.2.4.7.1 — subclass instances built via
-                // `OrdinaryCreateFromConstructor(SubPromise, ...)`
-                // override [[Prototype]]; honour the override so
-                // `promise.constructor` walks the subclass chain
-                // rather than the realm `%Promise.prototype%`.
-                let proto = match promise.prototype_override(&self.gc_heap) {
-                    Some(over) => over,
-                    None => self.constructor_prototype_value("Promise")?,
-                };
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if base.is_weak_ref() || base.is_finalization_registry() {
+            let proto_name = if base.is_weak_ref() {
+                "WeakRef"
+            } else {
+                "FinalizationRegistry"
+            };
+            let proto = self.constructor_prototype_value(proto_name)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            // §21.2.5 — BigInt primitive values walk
-            // `BigInt.prototype` for `toString` / `valueOf` /
-            // `constructor`.
-            Value::BigInt(_) => {
-                let proto = self.constructor_prototype_value("BigInt")?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if base.is_array_buffer() || base.is_data_view() {
+            let proto = self.get_prototype_for_op(&base)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            // §7.1.18 ToObject — primitive Boolean / Number / Symbol
-            // receivers walk the matching wrapper prototype so
-            // inherited `Object.prototype.*` methods surface for
-            // direct property reads (`(true).toLocaleString`,
-            // `(1).hasOwnProperty`, …). Strings have a richer custom
-            // path (indexed chars + `length`) higher up.
-            Value::Boolean(_) | Value::Number(_) | Value::Symbol(_) => {
-                let proto_name = match base {
-                    Value::Boolean(_) => "Boolean",
-                    Value::Number(_) => "Number",
-                    Value::Symbol(_) => "Symbol",
-                    _ => unreachable!(),
-                };
-                let proto = self.constructor_prototype_value(proto_name)?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if base.is_generator() || base.is_iterator() {
+            let proto = self.get_prototype_for_op(&base)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
             }
-            // §7.1.18 ToObject — primitive String receiver. Surface
-            // the §22.1.4 indexed-character exotic + `length` first;
-            // anything else walks `String.prototype` so inherited
-            // methods (`charAt`, `slice`, monkey-patched `.then`, …)
-            // resolve through the same ladder as for boxed wrappers.
-            Value::String(ref s) => {
-                if let Some(name) = key.string_name() {
-                    if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
-                        && n.is_finite()
-                        && n.fract() == 0.0
-                        && n >= 0.0
-                        && (n as usize) < s.len() as usize
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
+        if let Some(t) = base.as_typed_array() {
+            if let Some(name) = key.string_name() {
+                if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name) {
+                    if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
+                        || !n.is_finite()
+                        || n.fract() != 0.0
+                        || n < 0.0
+                        || (n as usize) >= t.length(&self.gc_heap)
                     {
-                        let unit = s.char_code_at(n as u32, &self.gc_heap).unwrap_or(0);
-                        let unit_str =
-                            crate::JsString::from_utf16_units(&[unit], &mut self.gc_heap)?;
-                        return Ok(VmGetOutcome::Value(Value::String(unit_str)));
+                        return Ok(VmGetOutcome::Value(Value::undefined()));
                     }
-                    if name == "length" {
-                        return Ok(VmGetOutcome::Value(Value::Number(
-                            crate::number::NumberValue::from_i32(s.len() as i32),
-                        )));
-                    }
+                    return Ok(VmGetOutcome::Value(
+                        t.get(&mut self.gc_heap, n as usize)
+                            .map_err(crate::oom_to_vm)?,
+                    ));
                 }
-                let proto = self.constructor_prototype_value("String")?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
-            }
-            // §26.1.4 / §26.2.4 — walk the realm prototype for
-            // `WeakRef` / `FinalizationRegistry` instances.
-            Value::WeakRef(_) | Value::FinalizationRegistry(_) => {
-                let proto_name = match base {
-                    Value::WeakRef(_) => "WeakRef",
-                    Value::FinalizationRegistry(_) => "FinalizationRegistry",
-                    _ => unreachable!(),
-                };
-                let proto = self.constructor_prototype_value(proto_name)?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
-            }
-            // ArrayBuffer / DataView — walk realm prototypes for
-            // instance method lookups.
-            Value::ArrayBuffer(_) | Value::DataView(_) => {
-                let proto = self.get_prototype_for_op(&base)?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
-            }
-            // §27.5 Generator / §27.1 Iterator — walk the realm
-            // prototype so `next` / `return` / `throw` / `toString`
-            // / `@@toStringTag` / `@@toPrimitive` resolve, and so
-            // the value flows through `ToPrimitive` (and therefore
-            // `ToPropertyKey`) without tripping `TypeMismatch` on
-            // the catch-all arm. Generator instances expose no own
-            // string keys.
-            Value::Generator(_) | Value::Iterator(_) => {
-                let proto = self.get_prototype_for_op(&base)?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
-            }
-            // §10.4.5.4 IntegerIndexedExoticObject [[Get]] —
-            // canonical-numeric-index short-circuit, then the lazy
-            // expando bag, then the per-kind prototype chain.
-            Value::TypedArray(t) => {
-                if let Some(name) = key.string_name() {
-                    if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name)
-                    {
-                        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
-                            || !n.is_finite()
-                            || n.fract() != 0.0
-                            || n < 0.0
-                            || (n as usize) >= t.length(&self.gc_heap)
-                        {
-                            return Ok(VmGetOutcome::Value(Value::undefined()));
-                        }
-                        return Ok(VmGetOutcome::Value(
-                            t.get(&mut self.gc_heap, n as usize)
-                                .map_err(crate::oom_to_vm)?,
-                        ));
-                    }
-                    if let Some(bag) = t.expando(&self.gc_heap)
-                        && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
-                    {
-                        return Ok(VmGetOutcome::Value(v));
-                    }
-                }
-                if let VmPropertyKey::Symbol(sym) = key
-                    && let Some(bag) = t.expando(&self.gc_heap)
-                    && let Some(v) = crate::object::get_symbol(bag, &self.gc_heap, sym)
+                if let Some(bag) = t.expando(&self.gc_heap)
+                    && let Some(v) = crate::object::get(bag, &self.gc_heap, name)
                 {
                     return Ok(VmGetOutcome::Value(v));
                 }
-                let this_value = Value::typed_array(t);
-                let proto = self.get_prototype_for_op(&this_value)?;
-                if proto.is_nullish() {
-                    return Ok(VmGetOutcome::Value(Value::undefined()));
-                }
-                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
             }
-            _ => Err(VmError::TypeMismatch),
+            if let VmPropertyKey::Symbol(sym) = key
+                && let Some(bag) = t.expando(&self.gc_heap)
+                && let Some(v) = crate::object::get_symbol(bag, &self.gc_heap, sym)
+            {
+                return Ok(VmGetOutcome::Value(v));
+            }
+            let this_value = Value::typed_array(t);
+            let proto = self.get_prototype_for_op(&this_value)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
+        Err(VmError::TypeMismatch)
     }
 
     pub(crate) fn ordinary_has_property_value(
@@ -3160,81 +3044,73 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(false);
         }
-        match base {
-            Value::Object(obj) => {
-                if !matches!(
-                    self.lookup_own_vm_property_key(obj, key),
-                    object::PropertyLookup::Absent
-                ) {
-                    return Ok(true);
-                }
-                match object::prototype_value(obj, &self.gc_heap) {
-                    Some(proto) => self.ordinary_has_property_value(context, proto, key, hops + 1),
-                    None => Ok(false),
-                }
+        if let Some(obj) = base.as_object() {
+            if !matches!(
+                self.lookup_own_vm_property_key(obj, key),
+                object::PropertyLookup::Absent
+            ) {
+                return Ok(true);
             }
-            Value::Proxy(proxy) => {
-                let key_value = self.vm_property_key_to_value(key)?;
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
-                match self.invoke_proxy_trap(context, &proxy, "has", trap_args)? {
-                    Some(value) => {
-                        let result = value.to_boolean(&self.gc_heap);
-                        // §10.5.8 invariants — when the trap reports
-                        // false, the target must not have the
-                        // property as a non-configurable own property
-                        // or be non-extensible while the property
-                        // exists.
-                        if !result {
-                            let target_value = proxy.target(&self.gc_heap);
-                            let target_desc = self
-                                .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                    context,
-                                    target_value,
-                                    key,
-                                    hops + 1,
-                                    &[&target_value],
-                                    &[],
-                                )?;
-                            if let Some(desc) = target_desc {
-                                if !desc.configurable() {
-                                    return Err(VmError::TypeError {
-                                        message:
-                                            "Proxy has trap returned false but target has the property as non-configurable"
-                                                .to_string(),
-                                    });
-                                }
-                                let target_extensible =
-                                    self.is_extensible_value(context, &target_value)?;
-                                if !target_extensible {
-                                    return Err(VmError::TypeError {
-                                        message:
-                                            "Proxy has trap returned false but target has the property and is non-extensible"
-                                                .to_string(),
-                                    });
-                                }
+            return match object::prototype_value(obj, &self.gc_heap) {
+                Some(proto) => self.ordinary_has_property_value(context, proto, key, hops + 1),
+                None => Ok(false),
+            };
+        }
+        if let Some(proxy) = base.as_proxy() {
+            let key_value = self.vm_property_key_to_value(key)?;
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
+            return match self.invoke_proxy_trap(context, &proxy, "has", trap_args)? {
+                Some(value) => {
+                    let result = value.to_boolean(&self.gc_heap);
+                    if !result {
+                        let target_value = proxy.target(&self.gc_heap);
+                        let target_desc = self
+                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                                context,
+                                target_value,
+                                key,
+                                hops + 1,
+                                &[&target_value],
+                                &[],
+                            )?;
+                        if let Some(desc) = target_desc {
+                            if !desc.configurable() {
+                                return Err(VmError::TypeError {
+                                    message:
+                                        "Proxy has trap returned false but target has the property as non-configurable"
+                                            .to_string(),
+                                });
+                            }
+                            let target_extensible =
+                                self.is_extensible_value(context, &target_value)?;
+                            if !target_extensible {
+                                return Err(VmError::TypeError {
+                                    message:
+                                        "Proxy has trap returned false but target has the property and is non-extensible"
+                                            .to_string(),
+                                });
                             }
                         }
-                        Ok(result)
                     }
-                    None => {
-                        self.ordinary_has_property_value(context, proxy.target(&self.gc_heap), key, hops + 1)
-                    }
+                    Ok(result)
                 }
-            }
-            // Other heap-allocated value kinds: probe own keys plus the
-            // implied prototype so nested-Proxy fall-through reaches
-            // the underlying spec behaviour.
-            Value::Array(arr) => match key {
+                None => self.ordinary_has_property_value(
+                    context,
+                    proxy.target(&self.gc_heap),
+                    key,
+                    hops + 1,
+                ),
+            };
+        }
+        if let Some(arr) = base.as_array() {
+            return match key {
                 VmPropertyKey::Symbol(sym)
                     if sym.well_known_tag() == Some(symbol::WellKnown::Iterator) =>
                 {
                     Ok(true)
                 }
                 VmPropertyKey::Symbol(sym) => {
-                    // Own symbol-keyed slot → present; otherwise
-                    // walk Array.prototype so inherited symbol keys
-                    // resolve (`@@toStringTag` accessor, etc.).
                     if array::get_symbol_property(arr, &self.gc_heap, sym).is_some() {
                         return Ok(true);
                     }
@@ -3249,57 +3125,45 @@ impl Interpreter {
                     let k = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    if let Some(idx) = object::array_index_property_name(k)
-                        .map(|idx| idx as usize)
+                    if let Some(idx) = object::array_index_property_name(k).map(|idx| idx as usize)
                         && array::has_own_element(arr, &self.gc_heap, idx)
                     {
                         return Ok(true);
                     }
-                    // §22.1.4 — Array exotic objects expose
-                    // user-installed extra string-keyed properties
-                    // through the named-properties side table.
-                    // `HasProperty` must consult it before walking
-                    // the prototype chain so e.g. `'value' in
-                    // arr_with_value_named_prop` returns true.
                     if array::get_named_property(arr, &self.gc_heap, k).is_some() {
                         return Ok(true);
                     }
-                    // Walk Array.prototype chain.
                     let proto = self.constructor_prototype_value("Array")?;
                     if proto.is_null() {
                         return Ok(false);
                     }
                     self.ordinary_has_property_value(context, proto, key, hops + 1)
                 }
-            },
-            Value::Function { .. }
-            | Value::Closure(_)
-            | Value::BoundFunction(_)
-            | Value::NativeFunction(_)
-            | Value::ClassConstructor(_)
-            // §22.2.6 / §24.* / §27.2.5 — exotic objects whose own
-            // string-keyed surface lives on the prototype. Probing
-            // via Get keeps `HasProperty` consistent with the
-            // `[[GetOwnProperty]] + walk-prototype` ladder these
-            // value kinds expose elsewhere.
-            | Value::RegExp(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::Promise(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_) => {
-                match self.ordinary_get_value(context, base, base, key, hops + 1)? {
-                    VmGetOutcome::Value(Value::Undefined) => Ok(false),
-                    _ => Ok(true),
-                }
-            }
-            _ => Err(VmError::TypeMismatch),
+            };
         }
+        if base.is_function()
+            || base.is_closure()
+            || base.is_bound_function()
+            || base.is_native_function()
+            || base.is_class_constructor()
+            || base.is_regexp()
+            || base.is_map()
+            || base.is_set()
+            || base.is_weak_map()
+            || base.is_weak_set()
+            || base.is_promise()
+            || base.is_array_buffer()
+            || base.is_data_view()
+            || base.is_typed_array()
+            || base.is_weak_ref()
+            || base.is_finalization_registry()
+        {
+            return match self.ordinary_get_value(context, base, base, key, hops + 1)? {
+                VmGetOutcome::Value(v) if v.is_undefined() => Ok(false),
+                _ => Ok(true),
+            };
+        }
+        Err(VmError::TypeMismatch)
     }
     pub(crate) fn try_proxy_object_static_call(
         &mut self,
@@ -3396,10 +3260,7 @@ impl Interpreter {
             M::GetOwnPropertyNames => {
                 let target_clone = *target;
                 let trap_keys = self.own_property_keys_value(context, &target_clone)?;
-                let values: Vec<Value> = trap_keys
-                    .into_iter()
-                    .filter(|v| matches!(v, Value::String(_)))
-                    .collect();
+                let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_string()).collect();
                 let array = match stack_roots {
                     Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
@@ -3418,10 +3279,7 @@ impl Interpreter {
             M::GetOwnPropertySymbols => {
                 let target_clone = *target;
                 let trap_keys = self.own_property_keys_value(context, &target_clone)?;
-                let values: Vec<Value> = trap_keys
-                    .into_iter()
-                    .filter(|v| matches!(v, Value::Symbol(_)))
-                    .collect();
+                let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_symbol()).collect();
                 let array = match stack_roots {
                     Some(stack) => self.alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
@@ -3502,10 +3360,9 @@ impl Interpreter {
             return Ok(value);
         }
         let to_prim_sym = self.well_known_symbols.get(symbol::WellKnown::ToPrimitive);
-        let to_prim = match &value {
-            Value::Object(o) => crate::object::get_symbol(*o, &self.gc_heap, &to_prim_sym),
-            _ => None,
-        };
+        let to_prim = value
+            .as_object()
+            .and_then(|o| crate::object::get_symbol(o, &self.gc_heap, &to_prim_sym));
         if let Some(callee) = to_prim
             && self.is_callable_runtime(&callee)
         {
@@ -3550,130 +3407,120 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(Vec::new());
         }
-        match target {
-            Value::Proxy(proxy) => {
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap)];
-                let keys = match self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)? {
-                    Some(Value::Array(arr)) => {
-                        crate::array::with_elements(arr, &self.gc_heap, |elements| {
-                            elements.to_vec()
-                        })
-                    }
-                    Some(Value::Undefined) | Some(Value::Null) | None => {
-                        return self.enumerable_own_string_keys_for_value(
-                            context,
-                            proxy.target(&self.gc_heap),
-                            hops + 1,
-                        );
-                    }
-                    Some(_) => {
-                        return Err(VmError::TypeError {
-                            message: "Proxy ownKeys trap returned non-array".to_string(),
-                        });
-                    }
-                };
-                let mut enumerable = Vec::new();
-                for key in &keys {
-                    let Value::String(name) = key else {
-                        continue;
-                    };
-                    let name = name.to_lossy_string(&self.gc_heap);
-                    let proxy_root = Value::proxy(proxy);
-                    let slice_roots: [&[Value]; 1] = [keys.as_slice()];
-                    let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+        if let Some(proxy) = target.as_proxy() {
+            let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![proxy.target(&self.gc_heap)];
+            let trap_result = self.invoke_proxy_trap(context, &proxy, "ownKeys", trap_args)?;
+            let keys = if let Some(arr) = trap_result.and_then(|v| v.as_array()) {
+                crate::array::with_elements(arr, &self.gc_heap, |elements| elements.to_vec())
+            } else if let Some(v) = trap_result {
+                if v.is_nullish() {
+                    return self.enumerable_own_string_keys_for_value(
                         context,
-                        proxy_root,
-                        &VmPropertyKey::OwnedString(name.clone()),
+                        proxy.target(&self.gc_heap),
                         hops + 1,
-                        &[&proxy_root],
-                        &slice_roots,
-                    )?;
-                    if desc
-                        .as_ref()
-                        .is_some_and(object::PropertyDescriptor::enumerable)
-                    {
-                        enumerable.push(name);
-                    }
+                    );
                 }
-                Ok(enumerable)
-            }
-            Value::Object(obj) => {
-                let mut keys = Vec::new();
-                if let Some(value) = object::string_data(obj, &self.gc_heap) {
-                    keys.extend((0..value.len()).map(|idx| idx.to_string()));
+                return Err(VmError::TypeError {
+                    message: "Proxy ownKeys trap returned non-array".to_string(),
+                });
+            } else {
+                return self.enumerable_own_string_keys_for_value(
+                    context,
+                    proxy.target(&self.gc_heap),
+                    hops + 1,
+                );
+            };
+            let mut enumerable = Vec::new();
+            for key in &keys {
+                let Some(name) = key.as_string() else {
+                    continue;
+                };
+                let name = name.to_lossy_string(&self.gc_heap);
+                let proxy_root = Value::proxy(proxy);
+                let slice_roots: [&[Value]; 1] = [keys.as_slice()];
+                let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    context,
+                    proxy_root,
+                    &VmPropertyKey::OwnedString(name.clone()),
+                    hops + 1,
+                    &[&proxy_root],
+                    &slice_roots,
+                )?;
+                if desc
+                    .as_ref()
+                    .is_some_and(object::PropertyDescriptor::enumerable)
+                {
+                    enumerable.push(name);
                 }
-                keys.extend(crate::object::with_properties(obj, &self.gc_heap, |p| {
-                    p.enumerable_keys().map(str::to_string).collect::<Vec<_>>()
-                }));
-                Ok(keys)
             }
-            Value::Array(arr) => {
-                let target = Value::array(arr);
-                let own_keys = self.own_property_keys_value(context, &target)?;
-                let mut out = Vec::new();
-                for key_value in own_keys {
-                    let Value::String(name) = key_value else {
-                        continue;
-                    };
-                    let key = name.to_lossy_string(&self.gc_heap);
-                    if let Some(desc) = self
-                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                            context,
-                            target,
-                            &VmPropertyKey::OwnedString(key.clone()),
-                            hops + 1,
-                            &[&target],
-                            &[],
-                        )?
-                        && desc.enumerable()
-                    {
-                        out.push(key);
-                    }
+            return Ok(enumerable);
+        }
+        if let Some(obj) = target.as_object() {
+            let mut keys = Vec::new();
+            if let Some(value) = object::string_data(obj, &self.gc_heap) {
+                keys.extend((0..value.len()).map(|idx| idx.to_string()));
+            }
+            keys.extend(crate::object::with_properties(obj, &self.gc_heap, |p| {
+                p.enumerable_keys().map(str::to_string).collect::<Vec<_>>()
+            }));
+            return Ok(keys);
+        }
+        if let Some(arr) = target.as_array() {
+            let target = Value::array(arr);
+            let own_keys = self.own_property_keys_value(context, &target)?;
+            let mut out = Vec::new();
+            for key_value in own_keys {
+                let Some(name) = key_value.as_string() else {
+                    continue;
+                };
+                let key = name.to_lossy_string(&self.gc_heap);
+                if let Some(desc) = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
+                    context,
+                    target,
+                    &VmPropertyKey::OwnedString(key.clone()),
+                    hops + 1,
+                    &[&target],
+                    &[],
+                )? && desc.enumerable()
+                {
+                    out.push(key);
                 }
-                Ok(out)
             }
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => {
-                // §20.1.2.5 / §10.2.4 — enumerable own string keys in
-                // spec creation order. Intrinsic metadata (`length`,
-                // `name`, non-arrow `prototype`) is older than any
-                // user-installed bag property; route through
-                // `ordinary_function_own_property_keys` for the
-                // canonical order, then filter by enumerability via
-                // the descriptor reader (the default builtin attrs
-                // are non-enumerable; `defineProperty` migrating one
-                // into the user bag with `enumerable: true` lifts
-                // it).
-                let keys = self.ordinary_function_own_property_keys(context, function_id);
-                let mut out = Vec::with_capacity(keys.len());
-                for key in keys {
-                    if let Some(desc) = self.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        function_id,
-                        &key,
-                    )? && desc.enumerable()
-                    {
-                        out.push(key);
-                    }
+            return Ok(out);
+        }
+        let fid = target
+            .as_function()
+            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            let keys = self.ordinary_function_own_property_keys(context, function_id);
+            let mut out = Vec::with_capacity(keys.len());
+            for key in keys {
+                if let Some(desc) = self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    function_id,
+                    &key,
+                )? && desc.enumerable()
+                {
+                    out.push(key);
                 }
-                Ok(out)
             }
-            Value::NativeFunction(native) => Ok(native
+            return Ok(out);
+        }
+        if let Some(native) = target.as_native_function() {
+            return Ok(native
                 .enumerable_own_property_keys(&self.gc_heap)
                 .into_iter()
-                .collect()),
-            Value::BoundFunction(bound) => Ok(
-                function_metadata::bound_enumerable_own_property_keys(&bound, &self.gc_heap)
-                    .into_iter()
-                    .collect(),
-            ),
-            Value::RegExp(_) => Ok(Vec::new()),
-            _ => Ok(Vec::new()),
+                .collect());
         }
+        if let Some(bound) = target.as_bound_function() {
+            return Ok(function_metadata::bound_enumerable_own_property_keys(
+                &bound,
+                &self.gc_heap,
+            )
+            .into_iter()
+            .collect());
+        }
+        Ok(Vec::new())
     }
 
     pub(crate) fn enumerable_for_in_string_keys_for_value(
@@ -3696,7 +3543,7 @@ impl Interpreter {
 
             let keys = self.own_property_keys_value(context, &current)?;
             for key in &keys {
-                let Value::String(name) = key else {
+                let Some(name) = key.as_string() else {
                     continue;
                 };
                 let name = name.to_lossy_string(&self.gc_heap);
@@ -3737,88 +3584,78 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(true);
         }
-        match target {
-            Value::Proxy(proxy) => {
-                let key_value = self.vm_property_key_to_value(key)?;
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
-                match self.invoke_proxy_trap(context, &proxy, "deleteProperty", trap_args)? {
-                    Some(value) => {
-                        let result = value.to_boolean(&self.gc_heap);
-                        if !result {
-                            return Ok(false);
-                        }
-                        // §10.5.10 invariants — when the trap reports
-                        // success, the target must not retain a
-                        // non-configurable own property at `P`, and
-                        // configurable properties may only disappear
-                        // from an extensible target.
-                        let target_value = proxy.target(&self.gc_heap);
-                        let target_desc = self
-                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                context,
-                                target_value,
-                                key,
-                                hops + 1,
-                                &[&target_value],
-                                &[],
-                            )?;
-                        if let Some(desc) = target_desc {
-                            if !desc.configurable() {
-                                return Err(VmError::TypeError {
-                                    message:
-                                        "Proxy deleteProperty trap returned true but target has the property as non-configurable"
-                                            .to_string(),
-                                });
-                            }
-                            let target_extensible =
-                                self.is_extensible_value(context, &target_value)?;
-                            if !target_extensible {
-                                return Err(VmError::TypeError {
-                                    message:
-                                        "Proxy deleteProperty trap returned true but target is non-extensible"
-                                            .to_string(),
-                                });
-                            }
-                        }
-                        Ok(true)
+        if let Some(proxy) = target.as_proxy() {
+            let key_value = self.vm_property_key_to_value(key)?;
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(&self.gc_heap), key_value];
+            return match self.invoke_proxy_trap(context, &proxy, "deleteProperty", trap_args)? {
+                Some(value) => {
+                    let result = value.to_boolean(&self.gc_heap);
+                    if !result {
+                        return Ok(false);
                     }
-                    None => self.ordinary_delete_value(
-                        context,
-                        proxy.target(&self.gc_heap),
-                        key,
-                        hops + 1,
-                    ),
+                    let target_value = proxy.target(&self.gc_heap);
+                    let target_desc = self
+                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                            context,
+                            target_value,
+                            key,
+                            hops + 1,
+                            &[&target_value],
+                            &[],
+                        )?;
+                    if let Some(desc) = target_desc {
+                        if !desc.configurable() {
+                            return Err(VmError::TypeError {
+                                message:
+                                    "Proxy deleteProperty trap returned true but target has the property as non-configurable"
+                                        .to_string(),
+                            });
+                        }
+                        let target_extensible = self.is_extensible_value(context, &target_value)?;
+                        if !target_extensible {
+                            return Err(VmError::TypeError {
+                                message:
+                                    "Proxy deleteProperty trap returned true but target is non-extensible"
+                                        .to_string(),
+                            });
+                        }
+                    }
+                    Ok(true)
                 }
+                None => {
+                    self.ordinary_delete_value(context, proxy.target(&self.gc_heap), key, hops + 1)
+                }
+            };
+        }
+        if let Some(obj) = target.as_object() {
+            if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
+                && !desc.configurable()
+            {
+                return Ok(false);
             }
-            Value::Object(obj) => {
-                if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
-                    && !desc.configurable()
-                {
-                    return Ok(false);
-                }
-                Ok(if let Some(key) = key.string_name() {
-                    object::delete(obj, &mut self.gc_heap, key)
-                } else if let VmPropertyKey::Symbol(sym) = key {
-                    object::delete_symbol(obj, &mut self.gc_heap, sym)
-                } else {
-                    true
-                })
-            }
-            Value::Array(arr) => Ok(match key {
-                VmPropertyKey::Symbol(sym) => {
-                    array::delete_symbol_property(arr, &mut self.gc_heap, sym)
-                }
-                _ => match key.string_name() {
-                    Some(k) => array::delete_named_property(arr, &mut self.gc_heap, k),
-                    None => true,
-                },
-            }),
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => Ok(if let Some(key) = key.string_name() {
+            return Ok(if let Some(key) = key.string_name() {
+                object::delete(obj, &mut self.gc_heap, key)
+            } else if let VmPropertyKey::Symbol(sym) = key {
+                object::delete_symbol(obj, &mut self.gc_heap, sym)
+            } else {
+                true
+            });
+        }
+        if let Some(arr) = target.as_array() {
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                array::delete_symbol_property(arr, &mut self.gc_heap, sym)
+            } else if let Some(k) = key.string_name() {
+                array::delete_named_property(arr, &mut self.gc_heap, k)
+            } else {
+                true
+            });
+        }
+        let fid = target
+            .as_function()
+            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            return Ok(if let Some(key) = key.string_name() {
                 self.ordinary_function_delete_own_property(function_id, key)
             } else if let VmPropertyKey::Symbol(sym) = key {
                 self.function_user_props
@@ -3828,23 +3665,29 @@ impl Interpreter {
                     .unwrap_or(true)
             } else {
                 true
-            }),
-            Value::NativeFunction(native) => Ok(match key.string_name() {
+            });
+        }
+        if let Some(native) = target.as_native_function() {
+            return Ok(match key.string_name() {
                 Some(key) => native.delete_own_property(&mut self.gc_heap, key),
                 None if let VmPropertyKey::Symbol(sym) = key => {
                     native.delete_own_symbol_property(&mut self.gc_heap, sym)
                 }
                 None => true,
-            }),
-            Value::BoundFunction(bound) => Ok(match key.string_name() {
+            });
+        }
+        if let Some(bound) = target.as_bound_function() {
+            return Ok(match key.string_name() {
                 Some(key) => {
                     function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, key)
                 }
                 None => true,
-            }),
-            Value::RegExp(_) => Ok(key.string_name().is_none_or(|key| key != "lastIndex")),
-            _ => Ok(true),
+            });
         }
+        if target.is_regexp() {
+            return Ok(key.string_name().is_none_or(|key| key != "lastIndex"));
+        }
+        Ok(true)
     }
 
     pub(crate) fn ordinary_set_data_value(
@@ -3859,113 +3702,109 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(false);
         }
-        match target {
-            Value::Proxy(proxy) => {
-                if proxy.is_revoked(&self.gc_heap) {
-                    return Err(VmError::TypeError {
-                        message: "Cannot perform 'set' on a proxy that has been revoked"
-                            .to_string(),
-                    });
-                }
-                let key_value = self.vm_property_key_to_value(key)?;
-                let trap_args: SmallVec<[Value; 8]> =
-                    smallvec::smallvec![proxy.target(&self.gc_heap), key_value, value, receiver,];
-                match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
-                    Some(result) => {
-                        let ok = result.to_boolean(&self.gc_heap);
-                        if !ok {
-                            return Ok(false);
-                        }
-                        // §10.5.9 invariants — when the trap reports
-                        // success, verify the target descriptor admits
-                        // the new value.
-                        let target_value = proxy.target(&self.gc_heap);
-                        let target_desc = self
-                            .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                                context,
-                                target_value,
-                                key,
-                                hops + 1,
-                                &[&target_value, &value, &receiver],
-                                &[],
-                            )?;
-                        if let Some(desc) = target_desc.as_ref()
-                            && !desc.configurable()
-                        {
-                            match &desc.kind {
-                                object::DescriptorKind::Data { value: target_v }
-                                    if !desc.writable()
-                                        && !abstract_ops::same_value(
-                                            target_v,
-                                            &value,
-                                            &self.gc_heap,
-                                        ) =>
-                                {
-                                    return Err(VmError::TypeError {
-                                            message:
-                                                "Proxy set trap reported success but target is non-configurable non-writable with a different value"
-                                                    .to_string(),
-                                        });
-                                }
-                                object::DescriptorKind::Accessor { setter: None, .. } => {
-                                    return Err(VmError::TypeError {
-                                        message:
-                                            "Proxy set trap reported success but target is a non-configurable accessor without a setter"
-                                                .to_string(),
-                                    });
-                                }
-                                _ => {}
+        if let Some(proxy) = target.as_proxy() {
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform 'set' on a proxy that has been revoked".to_string(),
+                });
+            }
+            let key_value = self.vm_property_key_to_value(key)?;
+            let trap_args: SmallVec<[Value; 8]> =
+                smallvec::smallvec![proxy.target(&self.gc_heap), key_value, value, receiver,];
+            return match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
+                Some(result) => {
+                    let ok = result.to_boolean(&self.gc_heap);
+                    if !ok {
+                        return Ok(false);
+                    }
+                    let target_value = proxy.target(&self.gc_heap);
+                    let target_desc = self
+                        .ordinary_get_own_property_descriptor_value_runtime_rooted(
+                            context,
+                            target_value,
+                            key,
+                            hops + 1,
+                            &[&target_value, &value, &receiver],
+                            &[],
+                        )?;
+                    if let Some(desc) = target_desc.as_ref()
+                        && !desc.configurable()
+                    {
+                        match &desc.kind {
+                            object::DescriptorKind::Data { value: target_v }
+                                if !desc.writable()
+                                    && !abstract_ops::same_value(
+                                        target_v,
+                                        &value,
+                                        &self.gc_heap,
+                                    ) =>
+                            {
+                                return Err(VmError::TypeError {
+                                    message:
+                                        "Proxy set trap reported success but target is non-configurable non-writable with a different value"
+                                            .to_string(),
+                                });
                             }
+                            object::DescriptorKind::Accessor { setter: None, .. } => {
+                                return Err(VmError::TypeError {
+                                    message:
+                                        "Proxy set trap reported success but target is a non-configurable accessor without a setter"
+                                            .to_string(),
+                                });
+                            }
+                            _ => {}
                         }
-                        Ok(true)
                     }
-                    None => self.ordinary_set_data_value(
-                        context,
-                        proxy.target(&self.gc_heap),
-                        key,
-                        value,
-                        receiver,
-                        hops + 1,
-                    ),
+                    Ok(true)
                 }
+                None => self.ordinary_set_data_value(
+                    context,
+                    proxy.target(&self.gc_heap),
+                    key,
+                    value,
+                    receiver,
+                    hops + 1,
+                ),
+            };
+        }
+        if let Some(arr) = target.as_array() {
+            if let Some(key) = key.string_name() {
+                array::set_named_property(arr, &mut self.gc_heap, key, value)
+                    .map_err(|_| VmError::TypeMismatch)?;
             }
-            Value::Array(arr) => {
-                if let Some(key) = key.string_name() {
-                    array::set_named_property(arr, &mut self.gc_heap, key, value)
-                        .map_err(|_| VmError::TypeMismatch)?;
-                }
-                Ok(true)
+            return Ok(true);
+        }
+        if let Some(obj) = target.as_object() {
+            if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
+                && !desc.writable()
+            {
+                return Ok(false);
             }
-            Value::Object(obj) => {
-                if let Some(desc) = self.string_object_exotic_descriptor(obj, key)?
-                    && !desc.writable()
-                {
-                    return Ok(false);
-                }
-                Ok(match key {
-                    VmPropertyKey::Symbol(sym) => {
-                        object::set_symbol(obj, &mut self.gc_heap, *sym, value)
-                    }
-                    _ => self.ordinary_set_data_property(
-                        obj,
-                        key.string_name()
-                            .expect("non-symbol key has string spelling"),
-                        value,
-                    )?,
-                })
-            }
-            Value::RegExp(re) => match key {
+            return Ok(if let VmPropertyKey::Symbol(sym) = key {
+                object::set_symbol(obj, &mut self.gc_heap, *sym, value)
+            } else {
+                self.ordinary_set_data_property(
+                    obj,
+                    key.string_name()
+                        .expect("non-symbol key has string spelling"),
+                    value,
+                )?
+            });
+        }
+        if let Some(re) = target.as_regexp() {
+            return match key {
                 VmPropertyKey::String(key) if *key == "lastIndex" => {
                     regexp_prototype::store_property(&re, &mut self.gc_heap, key, value);
                     Ok(true)
                 }
                 _ => Ok(false),
-            },
-            Value::Function { function_id }
-            | Value::Closure(crate::closure::JsClosure {
-                cached_function_id: function_id,
-                ..
-            }) => match key {
+            };
+        }
+        let fid = target
+            .as_function()
+            .or_else(|| target.as_closure().map(|c| c.cached_function_id));
+        if let Some(function_id) = fid {
+            return match key {
                 VmPropertyKey::Symbol(sym) => {
                     if !self.ordinary_function_has_own_symbol_property_for_extensibility(
                         function_id,
@@ -4012,9 +3851,9 @@ impl Interpreter {
                         descriptor,
                     )
                 }
-            },
-            _ => Ok(false),
+            };
         }
+        Ok(false)
     }
 }
 
@@ -4062,21 +3901,13 @@ fn is_compatible_partial_descriptor(
             } = &target_desc.kind
         {
             if let Some(g) = &incoming.get {
-                let normalised = if matches!(g, Value::Undefined) {
-                    None
-                } else {
-                    Some(*g)
-                };
+                let normalised = if g.is_undefined() { None } else { Some(*g) };
                 if !optional_value_eq_pair(ex_get, &normalised, heap) {
                     return false;
                 }
             }
             if let Some(s) = &incoming.set {
-                let normalised = if matches!(s, Value::Undefined) {
-                    None
-                } else {
-                    Some(*s)
-                };
+                let normalised = if s.is_undefined() { None } else { Some(*s) };
                 if !optional_value_eq_pair(ex_set, &normalised, heap) {
                     return false;
                 }
@@ -4097,11 +3928,13 @@ fn optional_value_eq_pair(a: &Option<Value>, b: &Option<Value>, heap: &otter_gc:
 /// SameValue restricted to PropertyKey-typed values (Strings and
 /// Symbols). Used by §10.5.11 Proxy `ownKeys` invariant validation.
 fn same_property_key(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
-    match (a, b) {
-        (Value::String(x), Value::String(y)) => x.to_lossy_string(heap) == y.to_lossy_string(heap),
-        (Value::Symbol(x), Value::Symbol(y)) => x.ptr_eq(y),
-        _ => false,
+    if let (Some(x), Some(y)) = (a.as_string(), b.as_string()) {
+        return x.to_lossy_string(heap) == y.to_lossy_string(heap);
     }
+    if let (Some(x), Some(y)) = (a.as_symbol(), b.as_symbol()) {
+        return x.ptr_eq(y);
+    }
+    false
 }
 
 /// Convert a PropertyKey-typed [`Value`] (String or Symbol) into a
@@ -4112,9 +3945,11 @@ fn property_key_from_value(
     value: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<VmPropertyKey<'static>, VmError> {
-    match value {
-        Value::String(s) => Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap))),
-        Value::Symbol(sym) => Ok(VmPropertyKey::Symbol(*sym)),
-        _ => Err(VmError::TypeMismatch),
+    if let Some(s) = value.as_string() {
+        return Ok(VmPropertyKey::OwnedString(s.to_lossy_string(heap)));
     }
+    if let Some(sym) = value.as_symbol() {
+        return Ok(VmPropertyKey::Symbol(*sym));
+    }
+    Err(VmError::TypeMismatch)
 }

@@ -14,12 +14,12 @@
 //!
 //! # Invariants
 //! - `new RegExp(pattern, flags)` and bare `RegExp(...)` both
-//!   produce a fresh `Value::RegExp`. Per §22.2.3.1 step 1, when
+//!   produce a fresh RegExp value. Per §22.2.3.1 step 1, when
 //!   `pattern` is itself a RegExp and `flags` is `undefined` and
 //!   the new-target is the active `RegExp` constructor, the
 //!   incoming RegExp is returned unchanged.
 //! - The prototype accessor getters throw `TypeError` when `this`
-//!   is not a `Value::RegExp` (with the spec-mandated exception
+//!   is not a RegExp (with the spec-mandated exception
 //!   that `RegExp.prototype` itself returns the sentinel values
 //!   `""` for `source` and `""` for `flags`).
 //! - The prototype intrinsic fast-path at the `Op::CallMethod`
@@ -55,8 +55,9 @@ impl crate::intrinsic_install::BuiltinIntrinsic for Intrinsic {
 fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     let global_root = Value::object(global);
     let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
-    if let Some(Value::Object(object_ctor)) = object::get(global, heap, "Object")
-        && let Some(Value::Object(object_proto)) = object::get(object_ctor, heap, "prototype")
+    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+        && let Some(object_proto) =
+            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
     {
         object::set_prototype(prototype, heap, Some(object_proto));
     }
@@ -92,7 +93,7 @@ fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfac
         global,
         heap,
         <Intrinsic as crate::intrinsic_install::BuiltinIntrinsic>::NAME,
-        Value::NativeFunction(ctor),
+        Value::native_function(ctor),
     );
     Ok(())
 }
@@ -132,7 +133,7 @@ fn install_regexp_legacy_accessors(
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let desc =
-            PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
+            PropertyDescriptor::accessor(Some(Value::native_function(getter)), None, false, true);
         if !ctor.define_own_property(heap, name, desc) {
             return Err(JsSurfaceError::DefinePropertyFailed(name));
         }
@@ -166,8 +167,8 @@ fn install_regexp_legacy_accessors(
         )
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
         let desc = PropertyDescriptor::accessor(
-            Some(Value::NativeFunction(getter)),
-            Some(Value::NativeFunction(setter)),
+            Some(Value::native_function(getter)),
+            Some(Value::native_function(setter)),
             false,
             true,
         );
@@ -250,8 +251,8 @@ fn legacy_accessor_setter(
 }
 
 fn values_strict_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::NativeFunction(x), Value::NativeFunction(y)) => x.ptr_eq(y),
+    match (a.as_native_function(), b.as_native_function()) {
+        (Some(x), Some(y)) => x.ptr_eq(&y),
         _ => false,
     }
 }
@@ -270,16 +271,15 @@ pub fn install_regexp_well_knowns_post_bootstrap(
 ) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
 
-    let Some(Value::NativeFunction(ctor)) = object::get(global, heap, "RegExp") else {
+    let Some(ctor) = object::get(global, heap, "RegExp").and_then(|v| v.as_native_function())
+    else {
         return Ok(());
     };
     let descriptor = ctor
         .own_property_descriptor(heap, "prototype")
         .map_err(|_| JsSurfaceError::OutOfMemory)?;
     let prototype = match descriptor.and_then(|d| match d.kind {
-        crate::object::DescriptorKind::Data {
-            value: Value::Object(p),
-        } => Some(p),
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
         _ => None,
     }) {
         Some(p) => p,
@@ -344,7 +344,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         &match_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(match_fn)),
+            value: Some(Value::native_function(match_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -356,7 +356,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         &search_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(search_fn)),
+            value: Some(Value::native_function(search_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -368,7 +368,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         &replace_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(replace_fn)),
+            value: Some(Value::native_function(replace_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -380,7 +380,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         &split_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(split_fn)),
+            value: Some(Value::native_function(split_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -392,7 +392,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
         heap,
         &match_all_sym,
         crate::object::PartialPropertyDescriptor {
-            value: Some(Value::NativeFunction(match_all_fn)),
+            value: Some(Value::native_function(match_all_fn)),
             writable: Some(true),
             enumerable: Some(false),
             configurable: Some(true),
@@ -416,7 +416,7 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     // RegExp-like input unchanged only when its observable
     // `constructor` is the active `%RegExp%` constructor.
     if pattern_is_regexp
-        && matches!(flags_arg, Value::Undefined)
+        && flags_arg.is_undefined()
         && !ctx.is_construct_call()
         && regexp_constructor_matches(ctx, &pattern_arg)?
     {
@@ -427,7 +427,7 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     let (pattern_source, flags_value) = if pattern_is_regexp {
         let source =
             crate::regexp_prototype::get_property_runtime(ctx, &pattern_arg, "source", "RegExp")?;
-        let flags = if matches!(flags_arg, Value::Undefined) {
+        let flags = if flags_arg.is_undefined() {
             crate::regexp_prototype::get_property_runtime(ctx, &pattern_arg, "flags", "RegExp")?
         } else {
             flags_arg
@@ -436,13 +436,13 @@ fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     } else {
         (pattern_arg, flags_arg)
     };
-    let pattern_utf16 = if matches!(pattern_source, Value::Undefined) {
+    let pattern_utf16 = if pattern_source.is_undefined() {
         Vec::new()
     } else {
         crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &pattern_source, "RegExp")?
             .to_utf16_vec(ctx.heap())
     };
-    let flags_str = if matches!(flags_value, Value::Undefined) {
+    let flags_str = if flags_value.is_undefined() {
         String::new()
     } else {
         crate::regexp_prototype::coerce_to_jsstring_runtime(ctx, &flags_value, "RegExp")?
@@ -477,10 +477,10 @@ fn is_regexp_runtime(
         .get(crate::symbol::WellKnown::Match);
     let matcher =
         crate::regexp_prototype::get_symbol_property_runtime(ctx, value, &match_sym, name)?;
-    if !matches!(matcher, Value::Undefined) {
+    if !matcher.is_undefined() {
         return Ok(matcher.to_boolean(ctx.heap()));
     }
-    Ok(matches!(value, Value::RegExp(_)))
+    Ok(value.is_regexp())
 }
 
 fn regexp_constructor_matches(
@@ -542,7 +542,7 @@ fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let result = proto_exec(ctx, args)?;
-    Ok(Value::boolean(!matches!(result, Value::Null)))
+    Ok(Value::boolean(!result.is_null()))
 }
 
 /// §B.2.4.1 `RegExp.prototype.compile(pattern, flags)` — native
@@ -558,31 +558,26 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     }
     let pattern_raw = args.first().cloned().unwrap_or(Value::undefined());
     let flags_raw = args.get(1).cloned().unwrap_or(Value::undefined());
-    let (pattern_units, flags_str) = match pattern_raw {
-        Value::RegExp(other) => {
-            if !matches!(flags_raw, Value::Undefined) {
-                return Err(NativeError::TypeError {
-                    name: "RegExp.prototype.compile",
-                    reason: "Cannot supply flags when constructing one RegExp from another"
-                        .to_string(),
-                });
-            }
-            let heap = ctx.heap();
-            (other.pattern_utf16(heap), other.flags(heap).to_js_string())
+    let (pattern_units, flags_str) = if let Some(other) = pattern_raw.as_regexp() {
+        if !flags_raw.is_undefined() {
+            return Err(NativeError::TypeError {
+                name: "RegExp.prototype.compile",
+                reason: "Cannot supply flags when constructing one RegExp from another".to_string(),
+            });
         }
-        Value::Undefined => {
-            let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
-            (Vec::<u16>::new(), flags_text)
-        }
-        other => {
-            let pattern = crate::regexp_prototype::coerce_to_jsstring_runtime(
-                ctx,
-                &other,
-                "RegExp.prototype.compile",
-            )?;
-            let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
-            (pattern.to_utf16_vec(ctx.heap()), flags_text)
-        }
+        let heap = ctx.heap();
+        (other.pattern_utf16(heap), other.flags(heap).to_js_string())
+    } else if pattern_raw.is_undefined() {
+        let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
+        (Vec::<u16>::new(), flags_text)
+    } else {
+        let pattern = crate::regexp_prototype::coerce_to_jsstring_runtime(
+            ctx,
+            &pattern_raw,
+            "RegExp.prototype.compile",
+        )?;
+        let flags_text = compile_flags_to_string(ctx, &flags_raw)?;
+        (pattern.to_utf16_vec(ctx.heap()), flags_text)
     };
     let old_last_index = re.last_index_value(ctx.heap());
     re.reinitialize(ctx.heap_mut(), &pattern_units, &flags_str)
@@ -598,7 +593,7 @@ fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 fn compile_flags_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {
-    if matches!(value, Value::Undefined) {
+    if value.is_undefined() {
         return Ok(String::new());
     }
     Ok(
@@ -700,7 +695,8 @@ fn install_accessor(
     let getter =
         crate::bootstrap::native_static_with_value_roots(heap, name, 0, call, roots.as_slice())
             .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let desc = PropertyDescriptor::accessor(Some(Value::NativeFunction(getter)), None, false, true);
+    let desc =
+        PropertyDescriptor::accessor(Some(Value::native_function(getter)), None, false, true);
     if !object::define_own_property(prototype, heap, name, desc) {
         return Err(JsSurfaceError::DefinePropertyFailed(name));
     }
@@ -716,34 +712,29 @@ fn install_accessor(
 fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
 
-    let raw = match &receiver {
-        Value::RegExp(re) => re.source(ctx.heap()),
-        Value::Object(obj) => {
-            let is_proto = ctx
-                .interp_mut()
-                .constructor_prototype_value("RegExp")
-                .ok()
-                .and_then(|p| match p {
-                    Value::Object(p) => Some(p),
-                    _ => None,
-                })
-                .is_some_and(|p| p == *obj);
-            if !is_proto {
-                return Err(NativeError::TypeError {
-                    name: "get RegExp.prototype.source",
-                    reason: "this is not a RegExp".to_string(),
-                });
-            }
-            return Ok(Value::string(
-                JsString::from_str("(?:)", ctx.heap_mut()).map_err(|_| oom("source"))?,
-            ));
-        }
-        _ => {
+    let raw = if let Some(re) = receiver.as_regexp() {
+        re.source(ctx.heap())
+    } else if let Some(obj) = receiver.as_object() {
+        let is_proto = ctx
+            .interp_mut()
+            .constructor_prototype_value("RegExp")
+            .ok()
+            .and_then(|p| p.as_object())
+            .is_some_and(|p| p == obj);
+        if !is_proto {
             return Err(NativeError::TypeError {
                 name: "get RegExp.prototype.source",
                 reason: "this is not a RegExp".to_string(),
             });
         }
+        return Ok(Value::string(
+            JsString::from_str("(?:)", ctx.heap_mut()).map_err(|_| oom("source"))?,
+        ));
+    } else {
+        return Err(NativeError::TypeError {
+            name: "get RegExp.prototype.source",
+            reason: "this is not a RegExp".to_string(),
+        });
     };
     let escaped = crate::regexp_prototype::escape_regexp_pattern(&raw);
     Ok(Value::string(
@@ -758,28 +749,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 /// multiline, dotAll, unicode, unicodeSets, sticky).
 fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
-    if !matches!(
-        receiver,
-        Value::Object(_)
-            | Value::RegExp(_)
-            | Value::Proxy(_)
-            | Value::Array(_)
-            | Value::Function { .. }
-            | Value::Closure(_)
-            | Value::NativeFunction(_)
-            | Value::BoundFunction(_)
-            | Value::ClassConstructor(_)
-            | Value::Map(_)
-            | Value::Set(_)
-            | Value::WeakMap(_)
-            | Value::WeakSet(_)
-            | Value::WeakRef(_)
-            | Value::FinalizationRegistry(_)
-            | Value::Promise(_)
-            | Value::ArrayBuffer(_)
-            | Value::DataView(_)
-            | Value::TypedArray(_)
-    ) {
+    if !receiver.is_object_like() {
         return Err(NativeError::TypeError {
             name: "get RegExp.prototype.flags",
             reason: "this value must be an Object".to_string(),
@@ -890,13 +860,12 @@ fn flag_bool(
 // ---------------------------------------------------------------
 
 fn receiver_regexp(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsRegExp, NativeError> {
-    match ctx.this_value() {
-        Value::RegExp(r) => Ok(*r),
-        _ => Err(NativeError::TypeError {
+    ctx.this_value()
+        .as_regexp()
+        .ok_or_else(|| NativeError::TypeError {
             name,
             reason: "this is not a RegExp".to_string(),
-        }),
-    }
+        })
 }
 
 fn coerce_to_string(
@@ -904,7 +873,7 @@ fn coerce_to_string(
     v: &Value,
     name: &'static str,
 ) -> Result<JsString, NativeError> {
-    if let Value::String(s) = v {
+    if let Some(s) = v.as_string() {
         return Ok(*s);
     }
     let s = v.display_string(ctx.heap());

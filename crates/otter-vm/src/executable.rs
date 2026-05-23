@@ -1,23 +1,30 @@
 //! Frozen execution bytecode for the VM dispatch loop.
 //!
 //! `otter-bytecode` owns the compiler/debug DTO shape. The VM owns this
-//! compact view so hot dispatch can stop reading per-instruction `pc`
-//! fields and avoid following heap operand vectors for fixed-width
-//! instructions.
+//! compact view so hot dispatch reads opcodes, operands, byte offsets,
+//! and named-property IC sites without following heap operand vectors
+//! for fixed-width instructions.
 //!
 //! # Contents
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
-//! - [`ExecutableFunction`] — one function's compact instruction stream.
-//! - [`ExecInstr`] — hot instruction record with inline operands.
+//! - [`ExecutableFunction`] — one function body: hot instructions, byte-stream
+//!   length, byte-offset source-map spans.
+//! - [`ExecInstr`] — hot instruction record with inline operands, byte length,
+//!   and byte-offset PC.
 //!
 //! # Invariants
-//! - `ExecInstr` never stores a program counter; the vector index is the PC.
-//! - Instructions with three or fewer operands store them inline.
-//! - Variadic instructions store operands in the module side table and carry
-//!   only a compact span into that table.
-//! - Named property IC sites get dense VM-local ids during executable
-//!   construction; bytecode JSON stays unchanged.
+//! - `frame.pc` is a byte offset into the function's encoded stream.
+//! - Each `ExecInstr` carries its own `byte_pc` and `byte_len` so the
+//!   dispatch loop advances by `byte_len` and resolves jump targets in the
+//!   same coordinate system as the source-map spans.
+//! - Instructions with three or fewer operands store them inline; variadic
+//!   instructions spill into a per-module side table addressed by `side_start`.
+//! - Branch-class `Imm32` operands hold byte-offset deltas relative to
+//!   `(byte_pc + 1)`. `NO_HANDLER_OFFSET` is preserved verbatim for absent
+//!   try-handler slots.
+//! - Named property IC sites receive dense VM-local ids during build; the
+//!   bytecode JSON dump stays unchanged.
 //!
 //! # See also
 //! - [`crate::execution_context`]
@@ -139,7 +146,6 @@ impl ExecutableModule {
     }
 }
 
-#[allow(dead_code)]
 impl ExecutableFunction {
     /// Byte-offset source-map entries, sorted by `pc`. Empty when the
     /// underlying [`Function::spans`] is empty.
@@ -148,17 +154,16 @@ impl ExecutableFunction {
         &self.byte_spans
     }
 
-    /// Total length in bytes of this function's canonical v2
-    /// byte-stream encoding.
+    /// Total length in bytes of this function's encoded stream.
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) const fn code_byte_len(&self) -> u32 {
         self.code_byte_len
     }
 
-    /// Resolve a v2 byte-offset PC to its corresponding [`ExecInstr`]
-    /// in `code`. Returns `None` if `byte_pc` does not fall on a known
-    /// instruction boundary. Used while the dispatch loop flips from
-    /// instruction-index to byte-offset PC semantics.
+    /// Resolve a byte-offset PC to its `ExecInstr`. Returns `None` when
+    /// `byte_pc` does not fall on an instruction boundary (which only
+    /// happens on corrupt bytecode).
     #[must_use]
     pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&ExecInstr> {
         let idx = self
@@ -202,21 +207,16 @@ pub(crate) struct ExecutableFunction {
     pub(crate) is_module: bool,
     /// Source module URL carried by frames for module resolution.
     pub(crate) module_url: Box<str>,
-    /// Compact instruction stream. The index is the v1 instruction-index
-    /// program counter; each [`ExecInstr`] also carries its v2 byte-offset
-    /// (`byte_pc`) and `byte_len` so the dispatch loop can flip from
-    /// instruction-index to byte-offset PC without changing storage shape.
+    /// Hot instruction stream. Indexed in source order; the dispatch
+    /// loop resolves a frame's byte-offset PC to an entry via
+    /// [`Self::instr_at_byte_pc`] (`O(log N)` binary search on `byte_pc`).
     pub(crate) code: Box<[ExecInstr]>,
-    /// Source-map entries with `pc` already remapped to byte offsets
-    /// via [`translate_spans_to_byte_pcs`]. Empty when the underlying
-    /// [`Function::spans`] is empty. Wired in once
-    /// [`crate::error_ops::snapshot_frames`] flips to byte-offset PC.
-    #[allow(dead_code)]
+    /// Source-map entries with `pc` expressed as a byte offset into the
+    /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
     pub(crate) byte_spans: Box<[SpanEntry]>,
-    /// Total length in bytes of the canonical v2 byte-stream encoding
-    /// of this function body. Stored so source-map lookups and end-of-
-    /// stream jumps key off the same upper bound the encoder produced.
-    #[allow(dead_code)]
+    /// Total length in bytes of this function's encoded stream. Acts as
+    /// the upper bound for jump targets that fall off the end of the
+    /// last instruction.
     pub(crate) code_byte_len: u32,
 }
 
@@ -257,11 +257,12 @@ impl ExecutableFunction {
                     .copied()
                     .unwrap_or(code_byte_len);
                 let byte_len = u8::try_from(next_byte_pc - byte_pc)
-                    .expect("single instruction exceeds 255-byte v2 encoding");
-                // Rewrite branch-class Imm32 operands from v1 instruction-
-                // index deltas to v2 byte-offset deltas relative to
-                // `(byte_pc + 1)` so the dispatch loop's apply_branch can
-                // run in byte-offset PC mode unchanged.
+                    .expect("single instruction exceeds 255-byte encoding");
+                // Compiler emits branch deltas in instruction-index units;
+                // the dispatcher resolves them as byte offsets relative to
+                // `(byte_pc + 1)` (the byte right after the opcode), so the
+                // executable builder rewrites each branch operand into the
+                // dispatcher's coordinate system here.
                 let operands = rewrite_branch_operands(
                     instr.op,
                     instr.operands.as_slice(),
@@ -315,10 +316,9 @@ impl ExecutableFunction {
     }
 }
 
-/// Compute v2 byte-offset deltas for Jump-class operands and replace the
-/// raw v1 instruction-index deltas the compiler emitted. Returns the
-/// rewritten operand slice (a fresh `Vec` so the caller can hand it to
-/// [`ExecInstr::from_operands`]). Non-branch opcodes pass through.
+/// Translate branch-class `Imm32` operands from compiler-emitted
+/// instruction-index deltas into byte-offset deltas relative to
+/// `(jump_byte_pc + 1)`. Non-branch opcodes pass through.
 fn rewrite_branch_operands(
     op: Op,
     operands: &[Operand],
@@ -370,7 +370,7 @@ pub(crate) struct ExecInstr {
     op: Op,
     /// Operand count. Values greater than three read from the side table.
     operand_len: u8,
-    /// Byte length of this instruction in the canonical v2 wire encoding
+    /// Byte length of this instruction in the encoded stream
     /// (`opcode` + `operand_count` header + tagged operand bytes).
     byte_len: u8,
     /// Inline operand slots for common fixed-width instructions.
@@ -379,9 +379,7 @@ pub(crate) struct ExecInstr {
     side_start: u32,
     /// Dense module-local property IC site id for named property ops.
     property_ic_site: u32,
-    /// Byte-offset PC of this instruction in the v2 byte stream. Kept
-    /// in lock-step with the v1 instruction-index PC so the dispatch
-    /// loop can flip to byte-offset semantics opcode-by-opcode.
+    /// Byte-offset PC of this instruction in the encoded stream.
     byte_pc: u32,
 }
 
@@ -430,14 +428,13 @@ impl ExecInstr {
         self.op
     }
 
-    /// Byte length of this instruction in the v2 wire encoding.
-    #[allow(dead_code)]
+    /// Byte length of this instruction in the encoded stream.
     #[must_use]
     pub(crate) const fn byte_len(&self) -> u32 {
         self.byte_len as u32
     }
 
-    /// Byte-offset PC of this instruction in the v2 byte stream.
+    /// Byte-offset PC of this instruction in the encoded stream.
     #[must_use]
     pub(crate) const fn byte_pc(&self) -> u32 {
         self.byte_pc

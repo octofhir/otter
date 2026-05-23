@@ -33,8 +33,11 @@ pub(crate) fn const_operand(operand: Option<&Operand>) -> Result<u32, VmError> {
     }
 }
 
-/// Apply a relative branch. Negative offsets are back-edges and poll the
-/// interrupt flag.
+/// Apply a relative branch. `offset` is a signed byte-offset delta
+/// relative to `(frame.pc + 1)` — the byte right after the branch
+/// opcode — matching the encoding produced by the executable builder.
+/// Negative offsets are back-edges and poll the interrupt flag so a
+/// long-running loop can be cancelled cooperatively.
 pub(crate) fn apply_branch(
     frame: &mut Frame,
     offset: i32,

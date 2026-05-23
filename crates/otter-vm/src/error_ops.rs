@@ -307,18 +307,16 @@ pub(crate) fn snapshot_frames(
         .rev()
         .map(|f| {
             let function = context.function(f.function_id);
+            let exec_function = context.exec_function(f.function_id);
             let function_name = function
                 .map(|fun| fun.name.clone())
                 .unwrap_or_else(|| "<unknown>".to_string());
-            // Per-function `spans` is in PC order (compiler emits
-            // entries in lowering order). Use `partition_point` to
-            // locate the predecessor entry — the largest `pc <=
-            // frame.pc`. `partition_point(|s| s.pc <= f.pc)`
-            // returns the first index that violates the predicate,
-            // so `idx - 1` is the predecessor.
-            let span = function
+            // `byte_spans` is sorted by `pc`. `partition_point` finds
+            // the predecessor entry (largest `pc <= f.pc`), so
+            // `idx - 1` is the matching span.
+            let span = exec_function
                 .and_then(|fun| {
-                    let spans = fun.spans.as_slice();
+                    let spans = fun.byte_spans();
                     let idx = spans.partition_point(|s| s.pc <= f.pc);
                     if idx == 0 {
                         spans.first().map(|s| s.span)

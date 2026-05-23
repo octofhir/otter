@@ -273,10 +273,8 @@ pub struct Interpreter {
     /// Byte length of the instruction currently being dispatched. Set
     /// by `dispatch_loop_inner` right after each fetch and consumed by
     /// every `frame.advance_pc(self.current_byte_len)?` call along
-    /// the dispatch path. Acts as the chokepoint that flipped PC
-    /// advance from `+= 1` (v1 instruction-index) to
-    /// `+= instr.byte_len()` (v2 byte-offset) without threading the
-    /// byte length through every helper signature.
+    /// the dispatch path. Centralises the PC advance so opcode helpers
+    /// stay byte-length agnostic.
     current_byte_len: u32,
     /// Per-isolate GC heap. Owned here so allocator-bearing
     /// opcodes (e.g. `Op::MakeClosure`'s upvalue alloc since

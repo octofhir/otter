@@ -45,7 +45,7 @@ const _: () = assert!(
 pub struct Frame {
     /// Index into the bytecode container's function table.
     pub function_id: u32,
-    /// Current program counter (instruction index, not byte offset).
+    /// Byte offset into the executable function's encoded stream.
     pub pc: u32,
     /// Register window for this frame.
     pub registers: SmallVec<[Value; 8]>,
@@ -244,11 +244,11 @@ pub struct TryHandler {
 }
 
 impl Frame {
-    /// Advance the program counter by `byte_len` units. Surfaces
-    /// [`VmError::InvalidOperand`] on overflow. Threaded through the
-    /// dispatch loop and helper opcodes so the same call site can flip
-    /// from v1 instruction-index (`byte_len = 1`) to v2 byte-offset
-    /// (`byte_len = instr.byte_len()`) semantics.
+    /// Advance the program counter by `byte_len` bytes. Surfaces
+    /// [`VmError::InvalidOperand`] on overflow. The dispatch loop
+    /// passes the byte length of the instruction it just executed;
+    /// helper opcodes read it indirectly via
+    /// [`Interpreter::current_byte_len`].
     pub(crate) fn advance_pc(&mut self, byte_len: u32) -> Result<(), VmError> {
         self.pc = self
             .pc

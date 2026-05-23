@@ -3982,11 +3982,6 @@ impl Interpreter {
                     self.run_static_call_operands(op, context, frame, operands)?;
                     continue;
                 }
-                Op::IteratorCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_iterator_static_call_operands(stack, operands)?;
-                    continue;
-                }
                 Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {
                     let operands = context.exec_operands(instr);
                     self.run_array_static_operands(op, context, stack, operands)?;
@@ -5600,57 +5595,6 @@ mod tests {
                 Value::number(NumberValue::from_i32(1)),
                 Value::number(NumberValue::from_i32(10)),
             ]
-        );
-    }
-
-    #[test]
-    fn iterator_from_map_uses_stack_rooted_snapshot_and_state_allocation() {
-        let module = module_with(Vec::new(), 5);
-        let mut interp = Interpreter::new();
-        let map = crate::collections::alloc_map(interp.gc_heap_mut()).unwrap();
-        crate::collections::map_set(
-            map,
-            interp.gc_heap_mut(),
-            Value::number(NumberValue::from_i32(4)),
-            Value::number(NumberValue::from_i32(40)),
-        )
-        .unwrap();
-
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::map(map);
-        stack.push(frame);
-        let operands = vec![
-            Operand::Register(1),
-            Operand::ConstIndex(1),
-            Operand::ConstIndex(1),
-            Operand::Register(0),
-        ];
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-
-        interp
-            .run_iterator_static_call_operands(&mut stack, &operands)
-            .unwrap();
-
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Iterator.from(Map) should allocate pair arrays, snapshot array, and iterator state through stack roots"
-        );
-        interp
-            .run_iterator_next_regs(&mut stack[0], 2, 3, 1)
-            .unwrap();
-        assert_eq!(stack[0].registers[3], Value::boolean(false));
-        let Some(pair) = (stack[0].registers[2]).as_array() else {
-            panic!("Iterator.from(Map) should yield entry arrays");
-        };
-        assert_eq!(
-            crate::array::get(pair, interp.gc_heap(), 0),
-            Value::number(NumberValue::from_i32(4))
-        );
-        assert_eq!(
-            crate::array::get(pair, interp.gc_heap(), 1),
-            Value::number(NumberValue::from_i32(40))
         );
     }
 

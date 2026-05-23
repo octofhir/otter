@@ -289,8 +289,7 @@ pub(crate) const fn opcode_reductions(op: Op) -> u64 {
         | Op::HasProperty
         | Op::DeleteProperty
         | Op::GetIterator
-        | Op::IteratorNext
-        | Op::IteratorCall => 4,
+        | Op::IteratorNext => 4,
         Op::Eval | Op::NewFunction => 16,
         _ => 1,
     }

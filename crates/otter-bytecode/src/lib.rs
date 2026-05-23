@@ -891,18 +891,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
     SharedArrayBufferCall,
-    /// `r<dst> = Iterator.<name>(args...)`. Operands:
-    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
-    ///
-    /// Routes the iterator-helpers static surface (currently
-    /// `Iterator.from`) through one variadic dispatcher. The
-    /// constructor form (`new Iterator(...)`) is reserved by the
-    /// proposal and lowered to a TypeError when invoked.
-    ///
-    /// # See also
-    /// - <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
-    IteratorCall,
     /// `r<dst> = ToPrimitive(r<src>, hint)`. Operands:
     /// `Register(dst), Register(src), ConstIndex(hint_const)`.
     ///
@@ -1053,7 +1041,6 @@ impl Op {
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
             Op::DataViewCall => "DATA_VIEW_CALL",
             Op::TypedArrayCall => "TYPED_ARRAY_CALL",
-            Op::IteratorCall => "ITERATOR_CALL",
             Op::Yield => "YIELD",
             Op::SharedArrayBufferCall => "SHARED_ARRAY_BUFFER_CALL",
         }
@@ -1178,7 +1165,6 @@ impl Op {
             Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::DataViewCall => 3,    // dst, name_const, argc — args follow
             Op::TypedArrayCall => 4,  // dst, kind_const, name_const, argc — args follow
-            Op::IteratorCall => 3,    // dst, name_const, argc — args follow
             Op::Yield => 2,           // dst, src
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
@@ -1267,7 +1253,6 @@ impl Op {
             | Op::BigIntCall
             | Op::ArrayBufferCall
             | Op::DataViewCall
-            | Op::IteratorCall
             | Op::SharedArrayBufferCall => false,
             // `dst, kind_id, method_id, argc` — both kind_id and
             // method_id are raw enum values, not pool refs.

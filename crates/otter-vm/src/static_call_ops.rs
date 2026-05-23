@@ -22,8 +22,8 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, IteratorState, Value, VmError, VmPropertyKey,
-    array, bigint, binary, collections, global_functions, object, object_statics,
+    ExecutionContext, Frame, Interpreter, Value, VmError, VmPropertyKey,
+    array, bigint, binary, global_functions, object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
@@ -1308,97 +1308,6 @@ impl Interpreter {
         Ok(result)
     }
 
-    pub(crate) fn run_iterator_static_call_operands(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        let (dst, method_idx, args) = {
-            let frame = &stack[top_idx];
-            decode_static_call(frame, operands, 1, 2, 3)?
-        };
-        let method =
-            method_id::IteratorMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-        let result = self.iterator_static_call_stack_rooted(stack, method, &args)?;
-        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
-    }
-
-    fn iterator_static_call_stack_rooted(
-        &mut self,
-        stack: &SmallVec<[Frame; 8]>,
-        method: method_id::IteratorMethod,
-        args: &[Value],
-    ) -> Result<Value, VmError> {
-        use method_id::IteratorMethod as M;
-        match method {
-            M::Construct => Err(VmError::TypeMismatch),
-            M::From => {
-                let value = args.first().cloned().unwrap_or(Value::undefined());
-                let state = if let Some(rc) = value.as_iterator() {
-                    return Ok(Value::iterator(rc));
-                } else if let Some(handle) = value.as_generator() {
-                    IteratorState::Generator { handle }
-                } else if let Some(arr) = value.as_array() {
-                    IteratorState::Array {
-                        array: arr,
-                        index: 0,
-                        origin: crate::BuiltinIteratorOrigin::Array,
-                    }
-                } else if let Some(s) = value.as_string(&self.gc_heap) {
-                    IteratorState::String {
-                        string: s,
-                        index: 0,
-                    }
-                } else if let Some(s) = value.as_set() {
-                    let value_root = Value::set(s);
-                    let snap: SmallVec<[Value; 4]> = collections::set_values(s, self.gc_heap())
-                        .into_iter()
-                        .collect();
-                    let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                        stack,
-                        snap,
-                        &[&value_root],
-                        &[args],
-                    )?;
-                    IteratorState::Array {
-                        array,
-                        index: 0,
-                        origin: crate::BuiltinIteratorOrigin::Set,
-                    }
-                } else if let Some(m) = value.as_map() {
-                    let value_root = Value::map(m);
-                    let mut entries: Vec<Value> = Vec::new();
-                    for (k, v) in collections::map_entries(m, self.gc_heap()) {
-                        let pair = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                            stack,
-                            [k, v],
-                            &[&value_root],
-                            &[args, entries.as_slice()],
-                        )?;
-                        entries.push(Value::array(pair));
-                    }
-                    let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
-                        stack,
-                        entries,
-                        &[&value_root],
-                        &[args],
-                    )?;
-                    IteratorState::Array {
-                        array,
-                        index: 0,
-                        origin: crate::BuiltinIteratorOrigin::Map,
-                    }
-                } else if value.is_object() {
-                    IteratorState::User { iterator: value }
-                } else {
-                    return Err(VmError::TypeMismatch);
-                };
-                let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[], &[args])?;
-                Ok(Value::iterator(iter))
-            }
-        }
-    }
 }
 
 /// §6.2.5.5 + §20.1.2.3 — enumerate the own enumerable property keys

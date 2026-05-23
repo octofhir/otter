@@ -304,7 +304,7 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::IteratorCall`](crate::Op::IteratorCall).
+    /// Methods dispatched by the `Iterator` namespace native functions.
     IteratorMethod {
         Construct = 0 => "",
         From = 1 => "from",

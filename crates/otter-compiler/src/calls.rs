@@ -124,32 +124,10 @@ pub(crate) fn compile_method_call(
         // namespace bootstrap, so the dedicated `Op::ReflectCall`
         // shortcut is no longer emitted. User shadowing of
         // `Reflect.<method>` is therefore observable.
-        // Iterator-helpers proposal — `Iterator.from(iter)` and
-        // future statics. Typed dispatch via [`IteratorMethod`].
-        // <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Iterator"
-            && cx.lookup_binding("Iterator").is_none()
-            && find_module_import_binding(cx, "Iterator").is_none()
-        {
-            let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::IteratorMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Iterator.{method_name}"),
-                    span,
-                });
-            };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::IteratorCall, operands, span);
-            return Ok(dst);
-        }
+        // Iterator-helpers proposal — `Iterator.from(...)` flows
+        // through the real `NativeFunction` installed by the
+        // `Iterator` bootstrap, so the dedicated `Op::IteratorCall`
+        // shortcut is no longer emitted.
         // §23.2.2 TypedArray statics — `<T>.from(...)` / `<T>.of(...)`.
         // Encodes the kind discriminant plus the typed
         // [`TypedArrayMethod`].

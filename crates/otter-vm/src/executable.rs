@@ -36,19 +36,16 @@ use otter_bytecode::{
     bytecode_v2::{EncodedFunction, encode_function, translate_spans_to_byte_pcs},
 };
 
-const INLINE_OPERANDS: usize = 3;
-const EMPTY_OPERAND: Operand = Operand::Imm32(0);
 const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
 /// Transient builder for [`ExecutableModule`].
 ///
-/// The builder owns mutable side tables and dense IC-site assignment while the
-/// VM creates an [`crate::ExecutionContext`]. Dispatch receives only the frozen
+/// The builder owns dense IC-site assignment while the VM creates an
+/// [`crate::ExecutionContext`]. Dispatch receives only the frozen
 /// [`ExecutableModule`] produced by [`Self::freeze`].
 #[derive(Debug, Default)]
 pub(crate) struct ExecutableModuleBuilder {
     functions: Vec<ExecutableFunction>,
-    side_operands: Vec<Operand>,
     next_property_ic_site: u32,
 }
 
@@ -58,7 +55,6 @@ impl ExecutableModuleBuilder {
     pub(crate) fn from_bytecode(module: &BytecodeModule) -> Self {
         let mut builder = Self {
             functions: Vec::with_capacity(module.functions.len()),
-            side_operands: Vec::new(),
             next_property_ic_site: 0,
         };
         for function in &module.functions {
@@ -68,11 +64,7 @@ impl ExecutableModuleBuilder {
     }
 
     fn push_function(&mut self, function: &Function) {
-        let function = ExecutableFunction::from_bytecode(
-            function,
-            &mut self.side_operands,
-            &mut self.next_property_ic_site,
-        );
+        let function = ExecutableFunction::from_bytecode(function, &mut self.next_property_ic_site);
         self.functions.push(function);
     }
 
@@ -81,7 +73,6 @@ impl ExecutableModuleBuilder {
     pub(crate) fn freeze(self) -> ExecutableModule {
         ExecutableModule {
             functions: self.functions.into_boxed_slice(),
-            side_operands: self.side_operands.into_boxed_slice(),
             property_ic_site_count: self.next_property_ic_site,
         }
     }
@@ -91,7 +82,6 @@ impl ExecutableModuleBuilder {
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutableModule {
     functions: Box<[ExecutableFunction]>,
-    side_operands: Box<[Operand]>,
     property_ic_site_count: u32,
 }
 
@@ -110,33 +100,33 @@ impl ExecutableModule {
 
     /// Return an instruction's operands in declaration order.
     #[must_use]
-    pub(crate) fn operands<'a>(&'a self, instr: &'a ExecInstr) -> &'a [Operand] {
-        instr.operands(&self.side_operands)
+    pub(crate) fn operands<'a>(&self, instr: &'a ExecInstr) -> &'a [Operand] {
+        instr.operands()
     }
 
     /// Return one instruction operand by index without materialising the
     /// whole operand slice at the call site.
     #[must_use]
-    pub(crate) fn operand<'a>(&'a self, instr: &'a ExecInstr, index: usize) -> Option<&'a Operand> {
-        instr.operand(&self.side_operands, index)
+    pub(crate) fn operand<'a>(&self, instr: &'a ExecInstr, index: usize) -> Option<&'a Operand> {
+        instr.operand(index)
     }
 
     /// Decode one register operand.
     #[must_use]
     pub(crate) fn register(&self, instr: &ExecInstr, index: usize) -> Option<u16> {
-        instr.register(&self.side_operands, index)
+        instr.register(index)
     }
 
     /// Decode one constant-pool index operand.
     #[must_use]
     pub(crate) fn const_index(&self, instr: &ExecInstr, index: usize) -> Option<u32> {
-        instr.const_index(&self.side_operands, index)
+        instr.const_index(index)
     }
 
     /// Decode one signed immediate operand.
     #[must_use]
     pub(crate) fn imm32(&self, instr: &ExecInstr, index: usize) -> Option<i32> {
-        instr.imm32(&self.side_operands, index)
+        instr.imm32(index)
     }
 
     /// Number of dense named-property IC sites in this module.
@@ -221,11 +211,7 @@ pub(crate) struct ExecutableFunction {
 }
 
 impl ExecutableFunction {
-    fn from_bytecode(
-        function: &Function,
-        side_operands: &mut Vec<Operand>,
-        next_property_ic_site: &mut u32,
-    ) -> Self {
+    fn from_bytecode(function: &Function, next_property_ic_site: &mut u32) -> Self {
         let register_count = function
             .param_count
             .saturating_add(function.locals)
@@ -271,14 +257,7 @@ impl ExecutableFunction {
                     &instr_to_byte_pc,
                     code_byte_len,
                 );
-                ExecInstr::from_operands(
-                    instr.op,
-                    &operands,
-                    side_operands,
-                    property_ic_site,
-                    byte_pc,
-                    byte_len,
-                )
+                ExecInstr::from_operands(instr.op, operands, property_ic_site, byte_pc, byte_len)
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -363,62 +342,40 @@ pub(crate) struct ExecMappedArgumentBinding {
     pub(crate) storage: ArgumentBindingStorage,
 }
 
-/// Hot dispatch instruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Hot dispatch instruction. Owns its operand slice so dispatch only
+/// touches the instruction record and the per-instruction operand
+/// allocation; there is no module-level side table to chase through.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExecInstr {
     /// Opcode.
     op: Op,
-    /// Operand count. Values greater than three read from the side table.
-    operand_len: u8,
     /// Byte length of this instruction in the encoded stream
     /// (`opcode` + `operand_count` header + tagged operand bytes).
     byte_len: u8,
-    /// Inline operand slots for common fixed-width instructions.
-    inline_operands: [Operand; INLINE_OPERANDS],
-    /// Start index in [`ExecutableModule::side_operands`] for variadic ops.
-    side_start: u32,
     /// Dense module-local property IC site id for named property ops.
     property_ic_site: u32,
     /// Byte-offset PC of this instruction in the encoded stream.
     byte_pc: u32,
+    /// Operands in declaration order. Variadic opcodes (e.g. `Call`,
+    /// `NewArray`, `MakeClosure`) just lengthen the slice; there is no
+    /// fixed-width inline fast path.
+    operands: Box<[Operand]>,
 }
 
 impl ExecInstr {
     fn from_operands(
         op: Op,
-        operands: &[Operand],
-        side_operands: &mut Vec<Operand>,
+        operands: Vec<Operand>,
         property_ic_site: u32,
         byte_pc: u32,
         byte_len: u8,
     ) -> Self {
-        let operand_len =
-            u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
-        if operands.len() <= INLINE_OPERANDS {
-            let mut inline_operands = [EMPTY_OPERAND; INLINE_OPERANDS];
-            inline_operands[..operands.len()].copy_from_slice(operands);
-            Self {
-                op,
-                operand_len,
-                byte_len,
-                inline_operands,
-                side_start: 0,
-                property_ic_site,
-                byte_pc,
-            }
-        } else {
-            let side_start = u32::try_from(side_operands.len())
-                .expect("executable side operand table too large");
-            side_operands.extend_from_slice(operands);
-            Self {
-                op,
-                operand_len,
-                byte_len,
-                inline_operands: [EMPTY_OPERAND; INLINE_OPERANDS],
-                side_start,
-                property_ic_site,
-                byte_pc,
-            }
+        Self {
+            op,
+            byte_len,
+            property_ic_site,
+            byte_pc,
+            operands: operands.into_boxed_slice(),
         }
     }
 
@@ -450,43 +407,30 @@ impl ExecInstr {
         }
     }
 
-    fn operands<'a>(&'a self, side_operands: &'a [Operand]) -> &'a [Operand] {
-        let len = self.operand_len as usize;
-        if len <= INLINE_OPERANDS {
-            &self.inline_operands[..len]
-        } else {
-            let start = self.side_start as usize;
-            &side_operands[start..start + len]
-        }
+    fn operands(&self) -> &[Operand] {
+        &self.operands
     }
 
-    fn operand<'a>(&'a self, side_operands: &'a [Operand], index: usize) -> Option<&'a Operand> {
-        if index >= self.operand_len as usize {
-            return None;
-        }
-        if self.operand_len as usize <= INLINE_OPERANDS {
-            self.inline_operands.get(index)
-        } else {
-            side_operands.get(self.side_start as usize + index)
-        }
+    fn operand(&self, index: usize) -> Option<&Operand> {
+        self.operands.get(index)
     }
 
-    fn register(&self, side_operands: &[Operand], index: usize) -> Option<u16> {
-        match self.operand(side_operands, index) {
+    fn register(&self, index: usize) -> Option<u16> {
+        match self.operand(index) {
             Some(Operand::Register(reg)) => Some(*reg),
             _ => None,
         }
     }
 
-    fn const_index(&self, side_operands: &[Operand], index: usize) -> Option<u32> {
-        match self.operand(side_operands, index) {
+    fn const_index(&self, index: usize) -> Option<u32> {
+        match self.operand(index) {
             Some(Operand::ConstIndex(idx)) => Some(*idx),
             _ => None,
         }
     }
 
-    fn imm32(&self, side_operands: &[Operand], index: usize) -> Option<i32> {
-        match self.operand(side_operands, index) {
+    fn imm32(&self, index: usize) -> Option<i32> {
+        match self.operand(index) {
             Some(Operand::Imm32(value)) => Some(*value),
             _ => None,
         }
@@ -536,8 +480,6 @@ mod tests {
         let instr = &executable.function(0).unwrap().code[0];
 
         assert_eq!(instr.op(), Op::Add);
-        assert_eq!(instr.side_start, 0);
-        assert!(executable.side_operands.is_empty());
         assert_eq!(executable.register(instr, 0), Some(0));
         assert_eq!(executable.register(instr, 1), Some(1));
         assert_eq!(executable.register(instr, 2), Some(2));
@@ -553,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn variadic_operands_use_side_table() {
+    fn variadic_operands_are_owned_by_the_instruction() {
         let operands = vec![
             Operand::Register(0),
             Operand::Register(1),
@@ -572,7 +514,6 @@ mod tests {
         let instr = &executable.function(0).unwrap().code[0];
 
         assert_eq!(instr.op(), Op::Call);
-        assert_eq!(executable.side_operands.as_ref(), operands.as_slice());
         assert_eq!(executable.register(instr, 0), Some(0));
         assert_eq!(executable.register(instr, 1), Some(1));
         assert_eq!(executable.const_index(instr, 2), Some(4));
@@ -618,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn builder_freezes_side_operands_and_ic_site_count() {
+    fn builder_assigns_ic_sites_and_carries_variadic_operands() {
         let function = function(vec![
             Instruction {
                 pc: 0,
@@ -646,14 +587,14 @@ mod tests {
 
         let builder = ExecutableModuleBuilder::from_bytecode(&module);
         assert_eq!(builder.functions.len(), 1);
-        assert_eq!(builder.side_operands.len(), 4);
         assert_eq!(builder.next_property_ic_site, 1);
 
         let executable = builder.freeze();
-        assert_eq!(executable.function(0).unwrap().code.len(), 2);
+        let exec_fn = executable.function(0).unwrap();
+        assert_eq!(exec_fn.code.len(), 2);
         assert_eq!(executable.property_ic_site_count(), 1);
         assert_eq!(
-            executable.side_operands.as_ref(),
+            executable.operands(&exec_fn.code[1]),
             &[
                 Operand::Register(2),
                 Operand::Register(3),

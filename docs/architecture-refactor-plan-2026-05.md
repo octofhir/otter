@@ -492,7 +492,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
   would not cross another cache-line boundary and would add more
   parking-detach plumbing for no further hot-path win.
 
-### Task 1.4 — GC Extra-Roots Callback (new, opened by Phase 1)
+### Task 1.4 — GC Extra-Roots Callback — DONE 2026-05-23
 
 - Goal: allow cap-trigger `collect_full` to see the interpreter's
   `error_classes` (and other `RuntimeState`-owned) GC roots without
@@ -530,7 +530,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 
 ## Phase 2 — Bytecode, Dispatch, IC, JIT-Ready ABI
 
-### Task 2.1 — Define Bytecode v2 Schema
+### Task 2.1 — Bytecode wire format + byte-offset PC — DONE 2026-05-23
 
 - Goal: make bytecode a versioned byte stream.
 - Touches: `crates/otter-bytecode`, `crates/otter-vm/src/executable.rs`,
@@ -542,6 +542,21 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: High.
 - Effort: L.
 - Depends on: 1.1.
+- **Status:** Shipped. Wire format lives in
+  `crates/otter-bytecode/src/encoding.rs` (writer, decoder, jump
+  fixup, span translator, `BYTECODE_FORMAT_VERSION = 2`).
+  `ExecutableFunction` stores per-instruction `byte_pc` / `byte_len`
+  + a single owned `Box<[Operand]>` per instruction (module-level
+  side-operand table deleted). `frame.pc` is a byte offset; the
+  dispatch loop fetches via `ExecutableFunction::instr_at_byte_pc`
+  and advances by `instr.byte_len()` through `Frame::advance_pc`
+  routed via `Interpreter::current_byte_len` (saved/restored across
+  nested dispatch). Branch operands rewritten to byte-offset deltas
+  relative to `(jump_pc + 1)`. `snapshot_frames` reads
+  `ExecutableFunction::byte_spans`. 539/539 `otter-vm --lib`,
+  123/123 `otter-runtime --lib`, 22/22 `otter-bytecode --lib`,
+  workspace clippy clean. Test262 baselines hold (try 156/44/2,
+  generators 165/101/0, await 18/4/0).
 
 ### Task 2.2 — Collapse Dispatch To One Loop
 

@@ -2636,10 +2636,10 @@ impl Interpreter {
                 .ok_or(VmError::InvalidOperand)?;
             let pc = stack[top_idx].pc;
             let instr = function
-                .code
-                .get(pc as usize)
+                .instr_at_byte_pc(pc)
                 .ok_or(VmError::MissingReturn)?;
             let op = instr.op();
+            self.current_byte_len = instr.byte_len();
             self.record_runtime_reductions(runtime_budget::opcode_reductions(op));
             self.enforce_runtime_budget_checkpoint()?;
             self.observe_runtime_stack_depth(stack.len());

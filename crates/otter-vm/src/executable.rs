@@ -24,7 +24,8 @@
 //! - [`otter_bytecode::Instruction`]
 
 use otter_bytecode::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, Op, Operand, SpanEntry,
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, NO_HANDLER_OFFSET, Op,
+    Operand, SpanEntry,
     bytecode_v2::{EncodedFunction, encode_function, translate_spans_to_byte_pcs},
 };
 
@@ -257,9 +258,21 @@ impl ExecutableFunction {
                     .unwrap_or(code_byte_len);
                 let byte_len = u8::try_from(next_byte_pc - byte_pc)
                     .expect("single instruction exceeds 255-byte v2 encoding");
-                ExecInstr::from_operands(
+                // Rewrite branch-class Imm32 operands from v1 instruction-
+                // index deltas to v2 byte-offset deltas relative to
+                // `(byte_pc + 1)` so the dispatch loop's apply_branch can
+                // run in byte-offset PC mode unchanged.
+                let operands = rewrite_branch_operands(
                     instr.op,
                     instr.operands.as_slice(),
+                    idx,
+                    byte_pc,
+                    &instr_to_byte_pc,
+                    code_byte_len,
+                );
+                ExecInstr::from_operands(
+                    instr.op,
+                    &operands,
                     side_operands,
                     property_ic_site,
                     byte_pc,
@@ -300,6 +313,45 @@ impl ExecutableFunction {
             code_byte_len,
         }
     }
+}
+
+/// Compute v2 byte-offset deltas for Jump-class operands and replace the
+/// raw v1 instruction-index deltas the compiler emitted. Returns the
+/// rewritten operand slice (a fresh `Vec` so the caller can hand it to
+/// [`ExecInstr::from_operands`]). Non-branch opcodes pass through.
+fn rewrite_branch_operands(
+    op: Op,
+    operands: &[Operand],
+    jump_idx: usize,
+    jump_byte_pc: u32,
+    instr_to_byte_pc: &[u32],
+    code_byte_len: u32,
+) -> Vec<Operand> {
+    let branch_slots: &[usize] = match op {
+        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => &[0],
+        Op::EnterTry => &[0, 1],
+        _ => return operands.to_vec(),
+    };
+    let mut out = operands.to_vec();
+    for &slot in branch_slots {
+        let Some(Operand::Imm32(raw)) = out.get(slot).copied() else {
+            continue;
+        };
+        if raw == NO_HANDLER_OFFSET {
+            continue;
+        }
+        let target_idx = jump_idx as i64 + 1 + raw as i64;
+        let target_byte_pc = if target_idx as usize >= instr_to_byte_pc.len() {
+            code_byte_len
+        } else {
+            instr_to_byte_pc[target_idx as usize]
+        };
+        let byte_delta = i64::from(target_byte_pc) - (i64::from(jump_byte_pc) + 1);
+        let byte_delta_i32 =
+            i32::try_from(byte_delta).expect("branch byte-offset delta exceeds i32 range");
+        out[slot] = Operand::Imm32(byte_delta_i32);
+    }
+    out
 }
 
 /// Compact mapped-arguments alias entry.

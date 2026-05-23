@@ -398,6 +398,18 @@ impl Interpreter {
         &mut self,
         constructor_name: &str,
     ) -> Result<Value, VmError> {
+        // Fast path: typed slot for well-known intrinsics. Avoids the
+        // global → ctor → prototype double-lookup that fires on every
+        // `OrdinaryCreateFromConstructor` style allocation.
+        let cached = match constructor_name {
+            "Object" => self.realm_intrinsics.object_prototype,
+            "Function" => self.realm_intrinsics.function_prototype,
+            "Array" => self.realm_intrinsics.array_prototype,
+            _ => None,
+        };
+        if let Some(proto) = cached {
+            return Ok(Value::object(proto));
+        }
         let Some(v) = object::get(self.global_this, &self.gc_heap, constructor_name) else {
             return Err(VmError::InvalidOperand);
         };

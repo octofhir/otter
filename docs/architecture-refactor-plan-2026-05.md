@@ -625,7 +625,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
   bookkeeping + the `build_global_this_impl` driver + telemetry
   helpers, all genuinely centralised state.
 
-### Task 3.2 — Add `RealmIntrinsics`
+### Task 3.2 — Add `RealmIntrinsics` — DONE 2026-05-23
 
 - Goal: remove installer string lookup and make intrinsic identity explicit.
 - Touches: VM bootstrap, object/native constructors, runtime initialization.
@@ -636,6 +636,23 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: Medium.
 - Effort: M.
 - Depends on: 3.1.
+- **Status:** Shipped. `crates/otter-vm/src/realm_intrinsics.rs`
+  holds typed slots for `%Object%`, `%Object.prototype%`,
+  `%Function.prototype%`, `%Array%`, `%Array.prototype%` — the
+  JsObject-shaped well-knowns hit on every
+  `OrdinaryCreateFromConstructor`-style allocation. Populated once
+  at the end of `build_global_this_impl` by walking `globalThis`;
+  runtime lookups (`object_prototype_object_opt`,
+  `function_prototype_object`, `constructor_prototype_value`) check
+  the slot first and fall back to the string-lookup path for
+  non-default globals. Focused tests assert `Object.prototype` and
+  `Function.prototype` slot identity matches the global walk, plus
+  bootstrap-populates-slots smoke test. NativeFunction-shaped
+  constructors (`Promise`, `RegExp`, `Date`, `Iterator`, …) excluded
+  from slots for now — they take a different resolution path and
+  the per-call savings don't yet justify per-slot polymorphism.
+  539/539 `otter-vm --lib`, 123/123 `otter-runtime --lib`, clippy
+  clean.
 
 ### Task 3.3 — Decide Snapshot Checkpoint
 

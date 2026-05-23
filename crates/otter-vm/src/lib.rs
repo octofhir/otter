@@ -100,6 +100,7 @@ mod reflect_ops;
 pub mod regexp;
 pub mod regexp_prototype;
 pub mod run_control;
+pub mod realm_intrinsics;
 pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
@@ -469,6 +470,11 @@ pub struct Interpreter {
     /// acquires a slot the first time an opcode needs cold state.
     /// See [`crate::cold_frame`] for the contract.
     cold_frames: cold_frame::ColdFramePool,
+    /// Resolved per-realm intrinsic handles. Populated at the end of
+    /// `build_global_this_impl`; runtime lookups consult these before
+    /// falling back to the string-name path. See
+    /// [`crate::realm_intrinsics::RealmIntrinsics`].
+    realm_intrinsics: realm_intrinsics::RealmIntrinsics,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -656,7 +662,15 @@ impl Interpreter {
             regexp_string_iterator_prototype: None,
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
             cold_frames: cold_frame::ColdFramePool::new(),
+            realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
         };
+        // Cache typed handles for the well-known constructors and
+        // prototypes that bootstrap just installed (Phase 3.2).
+        // Subsequent runtime lookups go through the slots and avoid
+        // the global → ctor → prototype string walk.
+        interp
+            .realm_intrinsics
+            .populate(&interp.gc_heap, global_this);
         let extra_roots = otter_gc::ExtraRoots::new(&interp);
         let previous = interp.gc_heap.install_extra_roots(Some(extra_roots));
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
@@ -1164,12 +1178,22 @@ impl Interpreter {
     }
 
     pub(crate) fn object_prototype_object_opt(&self) -> Option<JsObject> {
+        // Fast path: typed slot populated by RealmIntrinsics::populate.
+        if let Some(proto) = self.realm_intrinsics.object_prototype {
+            return Some(proto);
+        }
+        // Fallback for embedders that build a non-default global
+        // (e.g. feature-gated bootstrap that omits Object).
         let ctor =
             object::get(self.global_this, &self.gc_heap, "Object").and_then(|v| v.as_object())?;
         object::get(ctor, &self.gc_heap, "prototype").and_then(|v| v.as_object())
     }
 
     pub(crate) fn function_prototype_object(&self) -> Result<JsObject, VmError> {
+        // Fast path: typed slot.
+        if let Some(proto) = self.realm_intrinsics.function_prototype {
+            return Ok(proto);
+        }
         let function_ctor = object::get(self.global_this, &self.gc_heap, "Function")
             .and_then(|v| v.as_object())
             .ok_or(VmError::TypeMismatch)?;
@@ -1997,6 +2021,14 @@ impl Interpreter {
     #[must_use]
     pub(crate) fn cold_frames(&self) -> &cold_frame::ColdFramePool {
         &self.cold_frames
+    }
+
+    /// Borrow the per-realm typed intrinsic slots.
+    #[inline]
+    #[must_use]
+    #[allow(dead_code)] // currently consumed only via direct field reads in lookup helpers + tests.
+    pub(crate) fn realm_intrinsics(&self) -> &realm_intrinsics::RealmIntrinsics {
+        &self.realm_intrinsics
     }
 
     /// Borrow the per-isolate GC heap (read-only).

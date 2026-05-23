@@ -24,7 +24,7 @@ use otter_bytecode::Function;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
-    ExecutableFunction, JsPromiseHandle, UpvalueCell, Value, abstract_ops, alloc_upvalue,
+    ExecutableFunction, JsPromiseHandle, UpvalueCell, Value, VmError, abstract_ops, alloc_upvalue,
     cold_frame::ColdFrameIdx,
 };
 
@@ -244,6 +244,19 @@ pub struct TryHandler {
 }
 
 impl Frame {
+    /// Advance the program counter by `byte_len` units. Surfaces
+    /// [`VmError::InvalidOperand`] on overflow. Threaded through the
+    /// dispatch loop and helper opcodes so the same call site can flip
+    /// from v1 instruction-index (`byte_len = 1`) to v2 byte-offset
+    /// (`byte_len = instr.byte_len()`) semantics.
+    pub(crate) fn advance_pc(&mut self, byte_len: u32) -> Result<(), VmError> {
+        self.pc = self
+            .pc
+            .checked_add(byte_len)
+            .ok_or(VmError::InvalidOperand)?;
+        Ok(())
+    }
+
     /// Shared empty upvalue slice for plain functions without captured
     /// parent cells.
     pub(crate) fn empty_upvalues() -> std::rc::Rc<[UpvalueCell]> {

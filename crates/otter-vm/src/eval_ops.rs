@@ -44,7 +44,7 @@ impl Interpreter {
         let result = self.run_eval(&value, force_strict)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
-        frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -66,7 +66,7 @@ impl Interpreter {
         )?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
-        frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        frame.advance_pc(1)?;
         Ok(())
     }
 

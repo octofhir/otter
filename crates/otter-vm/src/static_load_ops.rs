@@ -36,7 +36,7 @@ impl Interpreter {
             name: format!("Math.{name}"),
         })?;
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -52,7 +52,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let value = symbol_dispatch::load_static(self, name).map_err(symbol_to_vm_error)?;
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -68,7 +68,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let value = temporal::load_static(name).map_err(temporal_to_vm_error)?;
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 }

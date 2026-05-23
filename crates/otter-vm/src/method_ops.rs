@@ -117,7 +117,7 @@ impl Interpreter {
             let top_idx = stack.len() - 1;
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
 
@@ -145,7 +145,7 @@ impl Interpreter {
             };
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
 
@@ -226,14 +226,14 @@ impl Interpreter {
                     }
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, promise)?;
-                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    frame.advance_pc(1)?;
                     return Ok(());
                 }
                 match self.resume_generator(context, &g, kind) {
                     Ok(result) => {
                         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                         write_register(frame, dst, result)?;
-                        frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        frame.advance_pc(1)?;
                         return Ok(());
                     }
                     Err(err) => {
@@ -425,10 +425,7 @@ impl Interpreter {
                     *slot = Value::string(JsString::from_str(&coerced, self.gc_heap_mut())?);
                 }
             }
-            stack[top_idx].pc = stack[top_idx]
-                .pc
-                .checked_add(1)
-                .ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             let result = self.dispatch_string_callable_replace(
                 context,
                 &recv_value,
@@ -720,7 +717,7 @@ impl Interpreter {
                 if captured_t.is_nan() && nan_preserving {
                     let frame = &mut stack[top_idx];
                     write_register(frame, dst, Value::number(NumberValue::from_f64(f64::NAN)))?;
-                    frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    frame.advance_pc(1)?;
                     return Ok(());
                 }
                 crate::object::set_date_data(obj, &mut self.gc_heap, captured_t);
@@ -737,7 +734,7 @@ impl Interpreter {
             };
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
 
@@ -754,7 +751,7 @@ impl Interpreter {
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
 
@@ -802,7 +799,7 @@ impl Interpreter {
             };
             let frame = &mut stack[top_idx];
             write_register(frame, dst, Value::boolean(result))?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
         if let Some(native) = recv_value.as_native_function()
@@ -815,7 +812,7 @@ impl Interpreter {
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
         if let Some(bound) = recv_value.as_bound_function()
@@ -824,7 +821,7 @@ impl Interpreter {
         {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
         // §7.1.18 ToObject — `String.prototype.hasOwnProperty(idx)`,
@@ -867,7 +864,7 @@ impl Interpreter {
             };
             let frame = &mut stack[top_idx];
             write_register(frame, dst, Value::boolean(result))?;
-            frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            frame.advance_pc(1)?;
             return Ok(());
         }
 
@@ -982,10 +979,7 @@ impl Interpreter {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
-            stack[top_idx].pc = stack[top_idx]
-                .pc
-                .checked_add(1)
-                .ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
@@ -1151,10 +1145,7 @@ impl Interpreter {
         // callback returns to the next instruction in the caller
         // frame.
         let top_idx = stack.len() - 1;
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         // Write `undefined` into the dst slot — `forEach` returns
         // `undefined` synchronously, even if the callback chain
         // produces values.
@@ -1248,10 +1239,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         // Advance pc up front so each synchronous callback returns to
         // the next caller instruction.
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
 
         // §23.1.3.* — the iteration helpers that accept a `thisArg`
         // second positional pass it through `OrdinaryCallBindThis`.
@@ -1559,10 +1547,7 @@ impl Interpreter {
         };
 
         let top_idx = stack.len() - 1;
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
 
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
@@ -1783,10 +1768,7 @@ impl Interpreter {
                 let mut iter = args.into_iter();
                 let this_value = iter.next().unwrap_or(Value::undefined());
                 let forwarded: SmallVec<[Value; 8]> = iter.collect();
-                stack[top_idx].pc = stack[top_idx]
-                    .pc
-                    .checked_add(1)
-                    .ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
             }
             "apply" => {
@@ -1797,10 +1779,7 @@ impl Interpreter {
                     Some(v) if v.is_nullish() => SmallVec::new(),
                     Some(arg_array) => self.create_list_from_array_like(context, arg_array)?,
                 };
-                stack[top_idx].pc = stack[top_idx]
-                    .pc
-                    .checked_add(1)
-                    .ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 self.invoke(stack, context, callee, this_value, forwarded, dst)
             }
             "bind" => {
@@ -1839,7 +1818,7 @@ impl Interpreter {
                 )?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::bound_function(bound))?;
-                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                frame.advance_pc(1)?;
                 Ok(())
             }
             // §20.2.3.5 Function.prototype.toString — foundation
@@ -1862,7 +1841,7 @@ impl Interpreter {
                     .map_err(|_| VmError::TypeMismatch)?;
                 let frame = &mut stack[top_idx];
                 write_register(frame, dst, Value::string(s))?;
-                frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                frame.advance_pc(1)?;
                 Ok(())
             }
             _ => Err(VmError::UnknownIntrinsic {

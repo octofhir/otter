@@ -109,7 +109,7 @@ impl Interpreter {
             }
         };
         write_register(frame, dst, result)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -142,7 +142,7 @@ impl Interpreter {
             _ => return Err(VmError::TypeMismatch),
         };
         write_register(frame, dst, result)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -164,7 +164,7 @@ impl Interpreter {
                 }
             };
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -186,7 +186,7 @@ impl Interpreter {
                 }
             };
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -206,7 +206,7 @@ impl Interpreter {
         // BigInt comparison.
         let eq = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -222,7 +222,7 @@ impl Interpreter {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         let eq = self.loose_equal_with_context(context, &lhs, &rhs)?;
         write_register(frame, dst, Value::boolean(eq ^ negate))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -274,7 +274,7 @@ impl Interpreter {
         let (dst, lhs, rhs) = binop_values(frame, dst, lhs, rhs)?;
         let result = abstract_ops::same_value(&lhs, &rhs, &self.gc_heap);
         write_register(frame, dst, Value::boolean(result))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 }
@@ -313,7 +313,7 @@ fn run_numeric_values(
         _ => return Err(VmError::TypeMismatch),
     };
     write_register(frame, dst, result)?;
-    frame.pc += 1;
+    frame.advance_pc(1)?;
     Ok(())
 }
 
@@ -351,7 +351,7 @@ fn run_compare_values(
         _ => unreachable!("run_compare_values called with non-relational op"),
     };
     write_register(frame, dst, Value::boolean(truthy))?;
-    frame.pc += 1;
+    frame.advance_pc(1)?;
     Ok(())
 }
 

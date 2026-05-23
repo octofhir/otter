@@ -209,7 +209,7 @@ impl Interpreter {
             false
         };
         write_register(frame, dst, Value::boolean(result))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -304,7 +304,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         };
         write_register(frame, dst, Value::boolean(present))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -369,7 +369,7 @@ impl Interpreter {
             });
         }
         write_register(frame, dst, Value::boolean(removed))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -495,7 +495,7 @@ impl Interpreter {
             });
         }
         write_register(frame, dst, Value::boolean(removed))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -508,7 +508,7 @@ impl Interpreter {
         let value = *read_register(frame, src)?;
         let result = self.get_prototype_for_op(&value)?;
         write_register(frame, dst, result)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -571,7 +571,7 @@ impl Interpreter {
         } else {
             return Err(VmError::TypeMismatch);
         }
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -853,7 +853,7 @@ impl Interpreter {
         };
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -919,7 +919,7 @@ impl Interpreter {
                                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                                 args.push(value);
                                 self.run_callable_sync(context, &setter, Value::array(a), args)?;
-                                stack[top_idx].pc += 1;
+                                stack[top_idx].advance_pc(1)?;
                                 return Ok(());
                             }
                             object::SetOutcome::Reject { .. } => {
@@ -927,7 +927,7 @@ impl Interpreter {
                                     strict,
                                     format!("Cannot assign to property '{name}'"),
                                 )?;
-                                stack[top_idx].pc += 1;
+                                stack[top_idx].advance_pc(1)?;
                                 return Ok(());
                             }
                             object::SetOutcome::AssignData => {}
@@ -1103,7 +1103,7 @@ impl Interpreter {
         if let Some(target) = target {
             self.set_property(target, name, value)?;
         }
-        stack[top_idx].pc += 1;
+        stack[top_idx].advance_pc(1)?;
         Ok(())
     }
 
@@ -1503,7 +1503,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         };
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -1581,7 +1581,7 @@ impl Interpreter {
                         strict,
                         "Cannot add symbol property to non-extensible function",
                     )?;
-                    stack[top_idx].pc += 1;
+                    stack[top_idx].advance_pc(1)?;
                     return Ok(());
                 }
                 let bag =
@@ -1708,7 +1708,7 @@ impl Interpreter {
                                         Value::array(arr),
                                         args,
                                     )?;
-                                    stack[top_idx].pc += 1;
+                                    stack[top_idx].advance_pc(1)?;
                                     return Ok(());
                                 }
                                 object::SetOutcome::Reject { .. } => {
@@ -1716,7 +1716,7 @@ impl Interpreter {
                                         strict,
                                         format!("Cannot assign to property '{name}'"),
                                     )?;
-                                    stack[top_idx].pc += 1;
+                                    stack[top_idx].advance_pc(1)?;
                                     return Ok(());
                                 }
                                 object::SetOutcome::AssignData => {}
@@ -1807,7 +1807,7 @@ impl Interpreter {
                         strict,
                         "Cannot add symbol property to non-extensible RegExp",
                     )?;
-                    stack[top_idx].pc += 1;
+                    stack[top_idx].advance_pc(1)?;
                     return Ok(());
                 }
                 let bag = regexp_ensure_expando(self, &r, &recv)?;
@@ -1859,7 +1859,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         }
         let frame = &mut stack[top_idx];
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 

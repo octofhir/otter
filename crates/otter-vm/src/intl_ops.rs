@@ -35,7 +35,7 @@ impl Interpreter {
         let value = intl::construct(class, &locale, &options, &mut self.gc_heap)
             .map_err(intl_to_vm_error)?;
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 }

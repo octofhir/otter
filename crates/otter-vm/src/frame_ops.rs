@@ -30,7 +30,7 @@ impl Interpreter {
     pub(crate) fn run_load_this_reg(&self, frame: &mut Frame, dst: u16) -> Result<(), VmError> {
         let value = frame.this_value;
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -44,7 +44,7 @@ impl Interpreter {
             .and_then(|c| c.new_target)
             .unwrap_or(Value::undefined());
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -63,7 +63,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let value = read_upvalue(&self.gc_heap, cell);
         write_register(frame, dst, value)?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -82,7 +82,7 @@ impl Interpreter {
             .get(idx as usize)
             .ok_or(VmError::InvalidOperand)?;
         store_upvalue(&mut self.gc_heap, cell, value);
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -101,7 +101,7 @@ impl Interpreter {
         let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::array(array))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -111,7 +111,7 @@ impl Interpreter {
         dst: u16,
     ) -> Result<(), VmError> {
         write_register(frame, dst, Value::undefined())?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -143,7 +143,7 @@ impl Interpreter {
             finally_pc,
             exc_register,
         });
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -152,7 +152,7 @@ impl Interpreter {
         if popped.is_none() {
             return Err(VmError::InvalidOperand);
         }
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 }

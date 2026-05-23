@@ -158,7 +158,7 @@ impl Interpreter {
             // Already-an-iterator should pass through unchanged.
             let frame = &mut stack[top_idx];
             write_register(frame, dst, Value::iterator(rc))?;
-            frame.pc += 1;
+            frame.advance_pc(1)?;
             return Ok(());
         } else {
             return Err(VmError::TypeMismatch);
@@ -166,7 +166,7 @@ impl Interpreter {
         let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[&value], &[])?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::iterator(iter))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -183,7 +183,7 @@ impl Interpreter {
         let (value, done) = step_iterator(iter, &mut self.gc_heap)?;
         write_register(frame, value_dst, value)?;
         write_register(frame, done_dst, Value::boolean(done))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -723,7 +723,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, result)?;
-        frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        frame.advance_pc(1)?;
         Ok(true)
     }
 

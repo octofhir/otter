@@ -1906,7 +1906,7 @@ fn collect_call_args(
 
 fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), VmError> {
     write_register(frame, dst, result)?;
-    frame.pc += 1;
+    frame.advance_pc(1)?;
     Ok(())
 }
 

@@ -137,7 +137,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let value = to_number_primitive(read_register(frame, src)?, &self.gc_heap)?;
         write_register(frame, dst, Value::number(value))?;
-        frame.pc += 1;
+        frame.advance_pc(1)?;
         Ok(())
     }
 
@@ -183,10 +183,7 @@ impl Interpreter {
         let hint = JsString::from_str("number", self.gc_heap_mut())?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
         args.push(Value::string(hint));
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         self.invoke(stack, context, &callee, recv, args, dst)?;
         Ok(Some(()))
     }
@@ -639,10 +636,7 @@ impl Interpreter {
                                 cold.pending_to_primitive = None;
                             }
                             write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].pc = stack[top_idx]
-                                .pc
-                                .checked_add(1)
-                                .ok_or(VmError::InvalidOperand)?;
+                            stack[top_idx].advance_pc(1)?;
                             return Ok(false);
                         }
                     }
@@ -696,10 +690,7 @@ impl Interpreter {
                                 cold.pending_to_primitive = None;
                             }
                             write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].pc = stack[top_idx]
-                                .pc
-                                .checked_add(1)
-                                .ok_or(VmError::InvalidOperand)?;
+                            stack[top_idx].advance_pc(1)?;
                             return Ok(false);
                         }
                     }

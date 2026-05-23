@@ -514,10 +514,7 @@ impl Interpreter {
 
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         if self.try_push_bytecode_call_frame_from_window(
             stack,
             context,
@@ -719,10 +716,7 @@ impl Interpreter {
         if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         if self.try_dispatch_construct_from_window(
             stack,
             context,
@@ -812,10 +806,7 @@ impl Interpreter {
             crate::array::with_elements(arr, &self.gc_heap, |elements| {
                 elements.iter().cloned().collect()
             });
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         self.dispatch_construct(stack, context, callee, args, dst)
     }
 
@@ -845,10 +836,7 @@ impl Interpreter {
             crate::array::with_elements(arr, &self.gc_heap, |elements| {
                 elements.iter().cloned().collect()
             });
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         self.dispatch_construct_with_new_target(stack, context, callee, new_target, args, dst)
     }
 
@@ -1180,10 +1168,7 @@ impl Interpreter {
             crate::array::with_elements(args_array, &self.gc_heap, |elements| {
                 elements.iter().cloned().collect()
             });
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         self.invoke(stack, context, &callee, this_value, args, dst)
     }
 
@@ -1207,10 +1192,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let callee = *read_register(&stack[top_idx], callee_reg)?;
         let this_value = *read_register(&stack[top_idx], this_reg)?;
-        stack[top_idx].pc = stack[top_idx]
-            .pc
-            .checked_add(1)
-            .ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         if self.try_push_bytecode_call_frame_from_window(
             stack,
             context,

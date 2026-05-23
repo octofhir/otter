@@ -23,8 +23,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, IteratorState, Value, VmError, VmPropertyKey,
-    abstract_ops, array, bigint, binary, collections, global_functions,
-    native_function, object, object_statics,
+    array, bigint, binary, collections, global_functions, object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
@@ -1325,79 +1324,6 @@ impl Interpreter {
         finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
-    pub(crate) fn run_proxy_static_call_operands(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        let (dst, method_idx, args) = {
-            let frame = &stack[top_idx];
-            decode_static_call(frame, operands, 1, 2, 3)?
-        };
-        let method = method_id::ProxyMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-        let result = self.proxy_static_call_stack_rooted(stack, method, &args)?;
-        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
-    }
-
-    fn proxy_static_call_stack_rooted(
-        &mut self,
-        stack: &SmallVec<[Frame; 8]>,
-        method: method_id::ProxyMethod,
-        args: &[Value],
-    ) -> Result<Value, VmError> {
-        use method_id::ProxyMethod as M;
-        match method {
-            M::Construct => {
-                let target = coerce_proxy_target(args.first())?;
-                let handler = coerce_proxy_target(args.get(1))?;
-                let proxy = crate::proxy::JsProxy::new(&mut self.gc_heap, target, handler)
-                    .map_err(crate::oom_to_vm)?;
-                Ok(Value::proxy(proxy))
-            }
-            M::Revocable => {
-                let target = coerce_proxy_target(args.first())?;
-                let handler = coerce_proxy_target(args.get(1))?;
-                let proxy = crate::proxy::JsProxy::new(&mut self.gc_heap, target, handler)
-                    .map_err(crate::oom_to_vm)?;
-                let proxy_value = Value::proxy(proxy);
-                let target_root = target;
-                let handler_root = handler;
-                let roots = self.collect_allocation_roots(stack);
-                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                    for &slot in &roots {
-                        visitor(slot);
-                    }
-                    target_root.trace_value_slots(visitor);
-                    handler_root.trace_value_slots(visitor);
-                    for value in args {
-                        value.trace_value_slots(visitor);
-                    }
-                };
-                let revoke = native_function::native_value_with_captures_unchecked_with_roots(
-                    &mut self.gc_heap,
-                    "revoke",
-                    smallvec::smallvec![proxy_value],
-                    &mut external_visit,
-                    move |ctx, _, captures| {
-                        if let Some(proxy) = captures.first().and_then(|v| v.as_proxy()) {
-                            proxy.revoke(ctx.heap_mut());
-                        }
-                        Ok(Value::undefined())
-                    },
-                )?;
-                let obj = self.alloc_stack_rooted_object_with_value_roots(
-                    stack,
-                    &[&proxy_value, &revoke],
-                    args,
-                )?;
-                self.set_property(obj, "proxy", proxy_value)?;
-                self.set_property(obj, "revoke", revoke)?;
-                Ok(Value::object(obj))
-            }
-        }
-    }
-
     fn iterator_static_call_stack_rooted(
         &mut self,
         stack: &SmallVec<[Frame; 8]>,
@@ -1568,13 +1494,6 @@ fn property_key_label(key: &VmPropertyKey<'_>, heap: &otter_gc::GcHeap) -> Strin
             .string_name()
             .expect("non-symbol key has string spelling")
             .to_string(),
-    }
-}
-
-fn coerce_proxy_target(arg: Option<&Value>) -> Result<Value, VmError> {
-    match arg {
-        Some(v) if v.is_object_type() || abstract_ops::is_callable(v) => Ok(*v),
-        _ => Err(VmError::TypeMismatch),
     }
 }
 

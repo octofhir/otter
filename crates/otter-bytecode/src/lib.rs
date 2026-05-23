@@ -891,17 +891,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
     SharedArrayBufferCall,
-    /// `r<dst> = Proxy(args...)` / `Proxy.<name>(args...)`. Operands:
-    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
-    ///
-    /// Empty `name` selects the §28.2.1 `new Proxy(target, handler)`
-    /// constructor; otherwise the runtime dispatches `revocable`
-    /// per §28.2.2.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-proxy-constructor>
-    ProxyCall,
     /// `r<dst> = Iterator.<name>(args...)`. Operands:
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -1066,7 +1055,6 @@ impl Op {
             Op::TypedArrayCall => "TYPED_ARRAY_CALL",
             Op::IteratorCall => "ITERATOR_CALL",
             Op::Yield => "YIELD",
-            Op::ProxyCall => "PROXY_CALL",
             Op::SharedArrayBufferCall => "SHARED_ARRAY_BUFFER_CALL",
         }
     }
@@ -1192,7 +1180,6 @@ impl Op {
             Op::TypedArrayCall => 4,  // dst, kind_const, name_const, argc — args follow
             Op::IteratorCall => 3,    // dst, name_const, argc — args follow
             Op::Yield => 2,           // dst, src
-            Op::ProxyCall => 3,       // dst, name_const, argc — args follow
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
             Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
@@ -1281,8 +1268,7 @@ impl Op {
             | Op::ArrayBufferCall
             | Op::DataViewCall
             | Op::IteratorCall
-            | Op::SharedArrayBufferCall
-            | Op::ProxyCall => false,
+            | Op::SharedArrayBufferCall => false,
             // `dst, kind_id, method_id, argc` — both kind_id and
             // method_id are raw enum values, not pool refs.
             Op::TypedArrayCall => false,

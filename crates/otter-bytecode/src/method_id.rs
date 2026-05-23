@@ -277,7 +277,7 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::ProxyCall`](crate::Op::ProxyCall).
+    /// Methods dispatched by the `Proxy` namespace native functions.
     ProxyMethod {
         Construct = 0 => "",
         Revocable = 1 => "revocable",

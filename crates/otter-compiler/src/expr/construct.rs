@@ -185,26 +185,10 @@ pub(crate) fn compile_new(
     // `bootstrap_weak_refs` — the dedicated `Op::NewWeakRef` /
     // `Op::NewFinalizationRegistry` lowering is no longer
     // needed.
-    // §28.2.1 `new Proxy(target, handler)` — lower via
-    // [`ProxyMethod::Construct`].
-    // <https://tc39.es/ecma262/#sec-proxy-constructor>
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Proxy"
-        && cx.lookup_binding("Proxy").is_none()
-        && find_module_import_binding(cx, "Proxy").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(
-            otter_bytecode::method_id::ProxyMethod::Construct.as_u32(),
-        ));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::ProxyCall, operands, new_span);
-        return Ok(dst);
-    }
+    // §28.2.1 `new Proxy(target, handler)` resolves through the real
+    // `NativeFunction` constructor installed by the `Proxy`
+    // bootstrap, so the dedicated `Op::ProxyCall` `Construct`
+    // shortcut is no longer emitted.
     // `new Promise(executor)` previously lowered to a
     // dedicated `Op::PromiseNew` that bypassed the real
     // `Promise` constructor. With the bootstrap installer

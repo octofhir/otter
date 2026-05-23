@@ -105,32 +105,10 @@ pub(crate) fn compile_method_call(
         // `NativeFunction` installed by `bootstrap_array_buffer` —
         // `Op::ArrayBufferCall` for the static-method shape is no
         // longer emitted from the compiler.
-        // §28.2.2 `Proxy.<method>(target, handler)` — typed dispatch
-        // via [`ProxyMethod`].
-        // <https://tc39.es/ecma262/#sec-proxy.revocable>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Proxy"
-            && cx.lookup_binding("Proxy").is_none()
-            && find_module_import_binding(cx, "Proxy").is_none()
-        {
-            let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::ProxyMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Proxy.{method_name}"),
-                    span,
-                });
-            };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::ProxyCall, operands, span);
-            return Ok(dst);
-        }
+        // §28.2.2 `Proxy.revocable(...)` flows through the real
+        // `NativeFunction` installed by the `Proxy` bootstrap, so
+        // the dedicated `Op::ProxyCall` shortcut is no longer
+        // emitted.
         // §25.4 `Atomics.<method>(args)` — routed through the
         // namespace native function table installed by
         // `bootstrap::install_atomics`. The dedicated

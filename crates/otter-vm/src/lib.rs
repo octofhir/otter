@@ -3982,11 +3982,6 @@ impl Interpreter {
                     self.run_static_call_operands(op, context, frame, operands)?;
                     continue;
                 }
-                Op::ProxyCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_proxy_static_call_operands(stack, operands)?;
-                    continue;
-                }
                 Op::IteratorCall => {
                     let operands = context.exec_operands(instr);
                     self.run_iterator_static_call_operands(stack, operands)?;
@@ -7434,45 +7429,6 @@ mod tests {
         interp.do_call(&mut stack, &context, &operands).unwrap();
 
         assert_eq!(stack[0].registers[3], Value::number(NumberValue::Smi(21)));
-    }
-
-    #[test]
-    fn proxy_revocable_uses_stack_rooted_result_allocation() {
-        let module = module_with(vec![], 4);
-        let mut interp = Interpreter::new();
-        let target = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-        let handler = object::alloc_object_old_for_fixture(interp.gc_heap_mut()).unwrap();
-
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = Value::object(target);
-        frame.registers[1] = Value::object(handler);
-        stack.push(frame);
-        let operands = vec![
-            Operand::Register(2),
-            Operand::ConstIndex(1),
-            Operand::ConstIndex(2),
-            Operand::Register(0),
-            Operand::Register(1),
-        ];
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-
-        interp
-            .run_proxy_static_call_operands(&mut stack, &operands)
-            .unwrap();
-
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Proxy.revocable should allocate revoke function and result object through stack roots"
-        );
-        let Some(record) = (stack[0].registers[2]).as_object() else {
-            panic!("Proxy.revocable should return an object");
-        };
-        assert!(object::get(record, interp.gc_heap(), "proxy").is_some_and(|v| v.is_proxy()));
-        assert!(
-            object::get(record, interp.gc_heap(), "revoke").is_some_and(|v| v.is_native_function())
-        );
     }
 
     #[test]

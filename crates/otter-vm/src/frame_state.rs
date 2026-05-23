@@ -28,6 +28,16 @@ use crate::{
     cold_frame::ColdFrameIdx,
 };
 
+// JIT-readiness target (Task 1.3): hot frame fits in two 64 B cache
+// lines. The cold half of the frame's data (try handlers, async
+// parking, pending ToPrimitive/bind/iterator ladders, rest/incoming
+// args, …) lives in [`crate::cold_frame::ColdFramePool`] and is
+// reached lazily through `frame.cold`.
+const _: () = assert!(
+    std::mem::size_of::<Frame>() <= 128,
+    "hot Frame must stay within two cache lines; cold-state fields belong in ColdFrame",
+);
+
 /// One call frame. Compact and cache-conscious per foundation
 /// plan §M7. Slice 13 promotes the interpreter to a real frame
 /// stack (`SmallVec<[Frame; 8]>` inside the dispatcher) so
@@ -65,19 +75,6 @@ pub struct Frame {
     /// re-pushes it from a microtask once the awaited promise
     /// settles. `None` for ordinary (non-async) frames.
     pub async_state: Option<AsyncFrameState>,
-    /// Source-module URL the running function was compiled from.
-    /// Snapshot of [`otter_bytecode::Function::module_url`] at
-    /// frame-push time. Read by [`Op::ImportNamespace`] to look
-    /// up specifier resolutions in the linker's pre-built
-    /// `module_resolutions` table — the caller frame's URL is
-    /// the referrer for the import-resolution algorithm.
-    ///
-    /// Empty string for non-module functions (e.g. the linker's
-    /// synthesised `<entry>` driver) — those frames inherit the
-    /// caller's URL when invoking module-init functions, but
-    /// `Op::ImportNamespace` itself never executes from a
-    /// non-module frame in well-formed bytecode.
-    pub module_url: std::rc::Rc<str>,
     /// Handle into the per-interpreter
     /// [`crate::cold_frame::ColdFramePool`] when this frame has
     /// acquired a cold side record (try handlers, async parking,
@@ -383,7 +380,6 @@ impl Frame {
             upvalues,
             this_value,
             async_state: None,
-            module_url: std::rc::Rc::from(function.module_url.as_str()),
             cold: None,
             generator_owner: None,
         }
@@ -411,7 +407,6 @@ impl Frame {
             upvalues,
             this_value,
             async_state: None,
-            module_url: std::rc::Rc::from(function.module_url.as_ref()),
             cold: None,
             generator_owner: None,
         }

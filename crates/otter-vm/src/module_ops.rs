@@ -36,9 +36,12 @@ impl Interpreter {
         let specifier = context
             .string_constant_str(spec_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let referrer = frame.module_url.clone();
+        let referrer: String = context
+            .exec_function(frame.function_id)
+            .map(|f| f.module_url.as_ref().to_string())
+            .unwrap_or_default();
         let namespace = self
-            .resolve_module_namespace(context, referrer.as_ref(), specifier)
+            .resolve_module_namespace(context, referrer.as_str(), specifier)
             .ok_or_else(|| VmError::UnknownIntrinsic {
                 name: format!("import \"{specifier}\""),
             })?;
@@ -49,6 +52,7 @@ impl Interpreter {
 
     pub(crate) fn run_import_meta_resolve_regs(
         &mut self,
+        context: &ExecutionContext,
         frame: &mut Frame,
         dst: u16,
         spec_reg: u16,
@@ -58,7 +62,10 @@ impl Interpreter {
             .as_string(&self.gc_heap)
             .ok_or(VmError::TypeMismatch)?
             .to_lossy_string(&self.gc_heap);
-        let resolved = resolve_relative_url(Some(&frame.module_url), &specifier);
+        let referrer: Option<&str> = context
+            .exec_function(frame.function_id)
+            .map(|f| f.module_url.as_ref());
+        let resolved = resolve_relative_url(referrer, &specifier);
         let resolved_str =
             JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
         write_register(frame, dst, Value::string(resolved_str))?;
@@ -76,13 +83,16 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let spec_reg = register_operand(operands.get(1))?;
         let spec_value = *read_register(&stack[top_idx], spec_reg)?;
-        let referrer = stack[top_idx].module_url.clone();
+        let referrer: String = context
+            .exec_function(stack[top_idx].function_id)
+            .map(|f| f.module_url.as_ref().to_string())
+            .unwrap_or_default();
         let import_context = context.clone();
         let promise =
             if let Some(s) = spec_value.as_string(&self.gc_heap) {
                 let specifier = s.to_lossy_string(&self.gc_heap);
                 if let Some(ns) =
-                    self.resolve_module_namespace(context, referrer.as_ref(), &specifier)
+                    self.resolve_module_namespace(context, referrer.as_str(), &specifier)
                 {
                     let namespace_value = Value::object(ns);
                     promise_dispatch::PromiseBuilder::with_context(import_context.clone())
@@ -95,7 +105,7 @@ impl Interpreter {
                         .dynamic_import_registry
                         .insert(pending, import_context.clone());
                     self.record_runtime_host_op_enqueued();
-                    loader.schedule(token, specifier, referrer.as_ref().to_string());
+                    loader.schedule(token, specifier, referrer.clone());
                     pending
                 } else {
                     let reason = self.make_type_error_with_stack_roots(

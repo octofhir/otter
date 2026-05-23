@@ -3521,7 +3521,7 @@ impl Interpreter {
                         .exec_register(instr, 1)
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
-                    self.run_import_meta_resolve_regs(frame, dst, spec_reg)?;
+                    self.run_import_meta_resolve_regs(context, frame, dst, spec_reg)?;
                     continue;
                 }
                 Op::PromiseFulfilledOf => {

@@ -427,15 +427,9 @@ pub(crate) fn compile_class(
                 ],
                 method_span,
             );
-            let define_dst = cx.alloc_scratch();
             cx.emit(
-                Op::ObjectCall,
-                vec![
-                    Operand::Register(define_dst),
-                    Operand::ConstIndex(
-                        otter_bytecode::method_id::ObjectMethod::DefineProperty.as_u32(),
-                    ),
-                    Operand::ConstIndex(3),
+                Op::DefineOwnProperty,
+                [
                     Operand::Register(target_reg),
                     Operand::Register(key_reg),
                     Operand::Register(desc_reg),

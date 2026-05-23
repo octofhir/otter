@@ -767,16 +767,9 @@ pub(crate) fn assign_object_pattern(
         // BindingPattern variant.
         let rest_obj = cx.alloc_scratch();
         cx.emit(Op::NewObject, [Operand::Register(rest_obj)], span);
-        let scratch = cx.alloc_scratch();
         cx.emit(
-            Op::ObjectCall,
-            vec![
-                Operand::Register(scratch),
-                Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Assign.as_u32()),
-                Operand::ConstIndex(2),
-                Operand::Register(rest_obj),
-                Operand::Register(value_reg),
-            ],
+            Op::CopyDataProperties,
+            [Operand::Register(rest_obj), Operand::Register(value_reg)],
             span,
         );
         for key in &extracted_keys {

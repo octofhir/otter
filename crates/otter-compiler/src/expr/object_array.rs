@@ -216,15 +216,9 @@ pub(crate) fn compile_object_literal(
                             key_span,
                         );
                     }
-                    let define_dst = cx.alloc_scratch();
                     cx.emit(
-                        Op::ObjectCall,
-                        vec![
-                            Operand::Register(define_dst),
-                            Operand::ConstIndex(
-                                otter_bytecode::method_id::ObjectMethod::DefineProperty.as_u32(),
-                            ),
-                            Operand::ConstIndex(3),
+                        Op::DefineOwnProperty,
+                        [
                             Operand::Register(dst),
                             Operand::Register(key_reg),
                             Operand::Register(desc_reg),
@@ -286,28 +280,13 @@ pub(crate) fn compile_object_literal(
             // §13.2.5.5 PropertyDefinitionEvaluation —
             // `{ ...source }` copies enumerable own
             // properties from `source` onto the object
-            // under construction. Foundation lowers this as
-            // a `LoadElement`-loop over `Object.keys(source)`.
-            // The runtime helper in `vm` walks the source
-            // object once (Op::ObjectCall("keys", source)
-            // → array of keys → for each key, copy).
+            // under construction via §7.3.31 CopyDataProperties.
             oxc_ast::ast::ObjectPropertyKind::SpreadProperty(s) => {
                 let s_span = (s.span.start, s.span.end);
                 let src = compile_expr(cx, &s.argument, s_span)?;
-                // Lower the spread to `Object.assign(dst, src)` via
-                // the typed [`ObjectMethod::Assign`].
-                let scratch = cx.alloc_scratch();
                 cx.emit(
-                    Op::ObjectCall,
-                    vec![
-                        Operand::Register(scratch),
-                        Operand::ConstIndex(
-                            otter_bytecode::method_id::ObjectMethod::Assign.as_u32(),
-                        ),
-                        Operand::ConstIndex(2),
-                        Operand::Register(dst),
-                        Operand::Register(src),
-                    ],
+                    Op::CopyDataProperties,
+                    [Operand::Register(dst), Operand::Register(src)],
                     s_span,
                 );
             }

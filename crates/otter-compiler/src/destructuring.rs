@@ -286,16 +286,9 @@ pub(crate) fn destructure_object_inner(
         // each previously-extracted key.
         let rest_obj = parent.alloc_scratch();
         parent.emit(Op::NewObject, [Operand::Register(rest_obj)], span);
-        let scratch = parent.alloc_scratch();
         parent.emit(
-            Op::ObjectCall,
-            vec![
-                Operand::Register(scratch),
-                Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::Assign.as_u32()),
-                Operand::ConstIndex(2),
-                Operand::Register(rest_obj),
-                Operand::Register(src_reg),
-            ],
+            Op::CopyDataProperties,
+            [Operand::Register(rest_obj), Operand::Register(src_reg)],
             span,
         );
         for key in &extracted_keys {

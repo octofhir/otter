@@ -140,7 +140,7 @@ pub(crate) fn compile_for_in_statement(
     //
     // We emit:
     //   r_obj = <right>;
-    //   r_keys = Object.__forInKeys(r_obj);   // internal Op::ObjectCall
+    //   r_keys = ForInKeys(r_obj);            // spec primitive opcode
     //   r_iter = GetIterator(r_keys);
     //   loop_top:
     //     IteratorNext r_value, r_done, r_iter
@@ -152,13 +152,8 @@ pub(crate) fn compile_for_in_statement(
     let obj_reg = compile_expr(cx, &s.right, span)?;
     let keys_reg = cx.alloc_scratch();
     cx.emit(
-        Op::ObjectCall,
-        vec![
-            Operand::Register(keys_reg),
-            Operand::ConstIndex(otter_bytecode::method_id::ObjectMethod::ForInKeys.as_u32()),
-            Operand::ConstIndex(1),
-            Operand::Register(obj_reg),
-        ],
+        Op::ForInKeys,
+        [Operand::Register(keys_reg), Operand::Register(obj_reg)],
         span,
     );
 

@@ -285,7 +285,7 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::ReflectCall`](crate::Op::ReflectCall).
+    /// Methods dispatched by the `Reflect` namespace native functions.
     ReflectMethod {
         Apply = 0 => "apply",
         Construct = 1 => "construct",

@@ -902,16 +902,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-proxy-constructor>
     ProxyCall,
-    /// `r<dst> = Reflect.<name>(args...)`. Operands:
-    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
-    ///
-    /// Routes the §28.1 Reflect static surface through one
-    /// dispatcher.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-reflect-object>
-    ReflectCall,
     /// `r<dst> = Iterator.<name>(args...)`. Operands:
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -1076,7 +1066,6 @@ impl Op {
             Op::TypedArrayCall => "TYPED_ARRAY_CALL",
             Op::IteratorCall => "ITERATOR_CALL",
             Op::Yield => "YIELD",
-            Op::ReflectCall => "REFLECT_CALL",
             Op::ProxyCall => "PROXY_CALL",
             Op::SharedArrayBufferCall => "SHARED_ARRAY_BUFFER_CALL",
         }
@@ -1203,7 +1192,6 @@ impl Op {
             Op::TypedArrayCall => 4,  // dst, kind_const, name_const, argc — args follow
             Op::IteratorCall => 3,    // dst, name_const, argc — args follow
             Op::Yield => 2,           // dst, src
-            Op::ReflectCall => 3,     // dst, name_const, argc — args follow
             Op::ProxyCall => 3,       // dst, name_const, argc — args follow
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
@@ -1294,8 +1282,7 @@ impl Op {
             | Op::DataViewCall
             | Op::IteratorCall
             | Op::SharedArrayBufferCall
-            | Op::ProxyCall
-            | Op::ReflectCall => false,
+            | Op::ProxyCall => false,
             // `dst, kind_id, method_id, argc` — both kind_id and
             // method_id are raw enum values, not pool refs.
             Op::TypedArrayCall => false,

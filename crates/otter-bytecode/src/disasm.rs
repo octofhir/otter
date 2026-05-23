@@ -277,7 +277,6 @@ mod tests {
             Op::Yield,
             Op::SharedArrayBufferCall,
             Op::ProxyCall,
-            Op::ReflectCall,
             Op::IteratorCall,
             Op::ToPrimitive,
         ]
@@ -332,7 +331,6 @@ mod tests {
             | Op::DataViewCall
             | Op::SharedArrayBufferCall
             | Op::ProxyCall
-            | Op::ReflectCall
             | Op::IteratorCall
             | Op::LoadGlobalOrThrow
             | Op::LoadGlobalOrUndefined
@@ -559,8 +557,7 @@ mod tests {
 000121 YIELD
 000122 SHARED_ARRAY_BUFFER_CALL
 000123 PROXY_CALL
-000124 REFLECT_CALL
-000125 ITERATOR_CALL
-000126 TO_PRIMITIVE
+000124 ITERATOR_CALL
+000125 TO_PRIMITIVE
 ";
 }

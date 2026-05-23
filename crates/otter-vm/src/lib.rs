@@ -100,7 +100,6 @@ mod property_ic;
 pub mod proxy;
 pub mod realm_intrinsics;
 pub mod reflect;
-mod reflect_ops;
 pub mod regexp;
 pub mod regexp_prototype;
 pub mod run_control;
@@ -3991,11 +3990,6 @@ impl Interpreter {
                 Op::IteratorCall => {
                     let operands = context.exec_operands(instr);
                     self.run_iterator_static_call_operands(stack, operands)?;
-                    continue;
-                }
-                Op::ReflectCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_reflect_call_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {

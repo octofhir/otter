@@ -141,31 +141,11 @@ pub(crate) fn compile_method_call(
         // backwards-compatibility with older bytecode.
         // <https://tc39.es/ecma262/#sec-atomics-object>
         //
-        // §28.1 `Reflect.<method>(args)` — typed dispatch via
-        // [`ReflectMethod`].
-        // <https://tc39.es/ecma262/#sec-reflect-object>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Reflect"
-            && cx.lookup_binding("Reflect").is_none()
-            && find_module_import_binding(cx, "Reflect").is_none()
-        {
-            let method_name = member.property.name.as_str();
-            if let Some(method_id) = otter_bytecode::method_id::ReflectMethod::from_str(method_name)
-            {
-                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(method_id.as_u32()));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::ReflectCall, operands, span);
-                return Ok(dst);
-            }
-            // Not every property read from the Reflect namespace is a
-            // Reflect intrinsic. Let ordinary property-call lowering
-            // handle cases such as `Reflect.hasOwnProperty(...)`.
-        }
+        // §28.1 `Reflect.<method>(args)` flows through the real
+        // `NativeFunction` entries installed by the `Reflect`
+        // namespace bootstrap, so the dedicated `Op::ReflectCall`
+        // shortcut is no longer emitted. User shadowing of
+        // `Reflect.<method>` is therefore observable.
         // Iterator-helpers proposal — `Iterator.from(iter)` and
         // future statics. Typed dispatch via [`IteratorMethod`].
         // <https://tc39.es/proposal-iterator-helpers/#sec-iterator.from>

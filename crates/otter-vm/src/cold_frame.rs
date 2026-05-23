@@ -33,6 +33,7 @@ use crate::frame_state::{
     PendingBindFunction, PendingGetIterator, PendingIteratorNext, PendingToPrimitive,
 };
 use crate::{JsObject, Value};
+use smallvec::SmallVec;
 
 /// Niche-encoded handle into a [`ColdFramePool`]. Stored as
 /// `Option<ColdFrameIdx>` (4 bytes) on the hot frame; `None` means no
@@ -87,6 +88,14 @@ pub struct ColdFrame {
     /// `new.target` visible to the active function body. Set only for
     /// frames entered through `[[Construct]]`.
     pub new_target: Option<Value>,
+    /// Trailing arguments past the declared `param_count`. Populated
+    /// by the call dispatcher only when the callee declares a rest
+    /// parameter; consumed by `Op::CollectRest`.
+    pub rest_args: SmallVec<[Value; 4]>,
+    /// Full incoming-argument list captured at call entry. Populated
+    /// only when the callee was compiled with `needs_arguments`;
+    /// consumed by `Op::CollectArguments`.
+    pub incoming_args: SmallVec<[Value; 4]>,
 }
 
 impl ColdFrame {
@@ -101,6 +110,8 @@ impl ColdFrame {
             && self.pending_throw.is_none()
             && self.construct_target.is_none()
             && self.new_target.is_none()
+            && self.rest_args.is_empty()
+            && self.incoming_args.is_empty()
     }
 
     /// Trace GC slots reachable through cold protocol state.
@@ -134,6 +145,12 @@ impl ColdFrame {
             visitor(p);
         }
         if let Some(v) = &self.new_target {
+            v.trace_value_slots(visitor);
+        }
+        for v in &self.rest_args {
+            v.trace_value_slots(visitor);
+        }
+        for v in &self.incoming_args {
             v.trace_value_slots(visitor);
         }
     }

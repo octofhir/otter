@@ -94,16 +94,23 @@ impl<'a> BytecodeArgumentWindow<'a> {
         Ok(args)
     }
 
+    /// Bind the window into the callee `frame`'s register window and
+    /// return any rest / incoming-args side records the caller must
+    /// install into the frame's cold slot. Splitting it this way
+    /// avoids passing a `&mut Interpreter` through every argument-
+    /// window call site.
     pub(crate) fn bind_into(
         &self,
         function: &ExecutableFunction,
         frame: &mut Frame,
-    ) -> Result<(), VmError> {
+    ) -> Result<BoundExtras, VmError> {
         let bind_count = (function.param_count as usize).min(self.len);
+        let mut rest_args: SmallVec<[Value; 4]> = SmallVec::new();
+        let mut incoming_args: SmallVec<[Value; 4]> = SmallVec::new();
         for index in 0..self.len {
             let value = *self.get(index)?;
             if function.needs_arguments {
-                frame.incoming_args.push(value);
+                incoming_args.push(value);
             }
             if index < bind_count {
                 let slot = frame
@@ -112,9 +119,26 @@ impl<'a> BytecodeArgumentWindow<'a> {
                     .ok_or(VmError::InvalidOperand)?;
                 *slot = value;
             } else if function.has_rest {
-                frame.rest_args.push(value);
+                rest_args.push(value);
             }
         }
-        Ok(())
+        Ok(BoundExtras {
+            rest_args,
+            incoming_args,
+        })
+    }
+}
+
+/// Side records produced by [`BytecodeArgumentWindow::bind_into`] and
+/// installed into the callee frame's cold slot by the caller.
+pub(crate) struct BoundExtras {
+    pub rest_args: SmallVec<[Value; 4]>,
+    pub incoming_args: SmallVec<[Value; 4]>,
+}
+
+impl BoundExtras {
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rest_args.is_empty() && self.incoming_args.is_empty()
     }
 }

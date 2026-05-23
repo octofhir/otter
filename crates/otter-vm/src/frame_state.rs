@@ -60,20 +60,6 @@ pub struct Frame {
     /// by [`Op::LeaveTry`] or by an exception unwind landing on a
     /// matching catch / finally. Innermost handler is on top.
     pub handlers: SmallVec<[TryHandler; 4]>,
-    /// Trailing arguments past the declared `param_count`. Populated
-    /// by the call dispatcher only when the callee declares a rest
-    /// parameter (`function f(...rest) { … }`); consumed by
-    /// [`otter_bytecode::Op::CollectRest`] which packs them into a
-    /// fresh `JsArray`. Always empty for non-rest callees so the
-    /// allocation cost is paid only when needed.
-    pub rest_args: SmallVec<[Value; 4]>,
-    /// Full incoming-argument list captured at call entry. Used by
-    /// [`otter_bytecode::Op::CollectArguments`] to materialise an
-    /// `arguments`-style array containing every value the caller
-    /// supplied — including the named parameters. Populated only
-    /// when the callee was compiled with `needs_arguments = true`
-    /// so non-arguments-using functions pay no allocation cost.
-    pub incoming_args: SmallVec<[Value; 4]>,
     /// Async-call state: `Some` when this frame belongs to an
     /// `async` function. The result promise was created at call
     /// entry and written into the caller's destination register
@@ -401,8 +387,6 @@ impl Frame {
             upvalues,
             this_value,
             handlers: SmallVec::new(),
-            rest_args: SmallVec::new(),
-            incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_str()),
             cold: None,
@@ -432,8 +416,6 @@ impl Frame {
             upvalues,
             this_value,
             handlers: SmallVec::new(),
-            rest_args: SmallVec::new(),
-            incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_ref()),
             cold: None,
@@ -452,12 +434,6 @@ impl Frame {
             visitor(p);
         }
         self.this_value.trace_value_slots(visitor);
-        for value in &self.rest_args {
-            value.trace_value_slots(visitor);
-        }
-        for value in &self.incoming_args {
-            value.trace_value_slots(visitor);
-        }
         if let Some(async_state) = &self.async_state {
             async_state.result_promise.trace_value_slots(visitor);
         }

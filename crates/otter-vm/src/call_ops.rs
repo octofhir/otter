@@ -41,23 +41,38 @@ struct PreparedBytecodeFrame {
 
 impl Interpreter {
     pub(crate) fn bind_bytecode_call_arguments(
+        &mut self,
         function: &ExecutableFunction,
         frame: &mut Frame,
         args: SmallVec<[Value; 8]>,
     ) -> Result<(), VmError> {
         let bind_count = (function.param_count as usize).min(args.len());
         let total_args = args.len();
-        if function.needs_arguments {
-            frame.incoming_args = args.iter().cloned().collect();
-        }
+        let incoming: Option<SmallVec<[Value; 4]>> = if function.needs_arguments {
+            Some(args.iter().cloned().collect())
+        } else {
+            None
+        };
         let mut iter = args.into_iter();
         for i in 0..bind_count {
             let value = iter.next().expect("bind_count <= len");
             let slot = frame.registers.get_mut(i).ok_or(VmError::InvalidOperand)?;
             *slot = value;
         }
-        if function.has_rest && total_args > function.param_count as usize {
-            frame.rest_args = iter.collect();
+        let rest: Option<SmallVec<[Value; 4]>> =
+            if function.has_rest && total_args > function.param_count as usize {
+                Some(iter.collect())
+            } else {
+                None
+            };
+        if incoming.is_some() || rest.is_some() {
+            let cold = self.frame_ensure_cold(frame);
+            if let Some(v) = incoming {
+                cold.incoming_args = v;
+            }
+            if let Some(v) = rest {
+                cold.rest_args = v;
+            }
         }
         Ok(())
     }
@@ -126,7 +141,7 @@ impl Interpreter {
             cold.construct_target = Some(receiver);
             cold.new_target = Some(new_target);
         }
-        Self::bind_bytecode_call_arguments(function, &mut frame, args)?;
+        self.bind_bytecode_call_arguments(function, &mut frame, args)?;
         Ok(frame)
     }
 
@@ -152,12 +167,16 @@ impl Interpreter {
             upvalues,
             Value::object(receiver),
         );
+        let extras = args.bind_into(function, &mut frame)?;
         {
             let cold = self.frame_ensure_cold(&mut frame);
             cold.construct_target = Some(receiver);
             cold.new_target = Some(new_target);
+            if !extras.is_empty() {
+                cold.rest_args = extras.rest_args;
+                cold.incoming_args = extras.incoming_args;
+            }
         }
-        args.bind_into(function, &mut frame)?;
         Ok(frame)
     }
 
@@ -247,7 +266,7 @@ impl Interpreter {
             this_for_callee,
         );
         new_frame.async_state = async_state;
-        Self::bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
+        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5 Generator-call entry: instead of pushing the frame
         // onto the dispatch stack, hand the caller a paused
         // [`Value::Generator`] handle that owns the prepared frame.
@@ -307,7 +326,12 @@ impl Interpreter {
             this_for_callee,
         );
         frame.async_state = async_state;
-        args.bind_into(function, &mut frame)?;
+        let extras = args.bind_into(function, &mut frame)?;
+        if !extras.is_empty() {
+            let cold = self.frame_ensure_cold(&mut frame);
+            cold.rest_args = extras.rest_args;
+            cold.incoming_args = extras.incoming_args;
+        }
         Ok(PreparedBytecodeFrame {
             frame,
             is_generator: function.is_generator,
@@ -1358,7 +1382,7 @@ impl Interpreter {
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
-        Self::bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
+        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5.1 GeneratorFunction call evaluation returns a
         // generator object without executing the body. `invoke`
         // handles this for opcode calls; the synchronous re-entry

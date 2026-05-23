@@ -2332,7 +2332,7 @@ impl Interpreter {
             upvalues,
             this_for_callee,
         );
-        Self::bind_bytecode_call_arguments(function, &mut new_frame, effective_args).map_err(
+        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args).map_err(
             |error| RunError {
                 error,
                 frames: Vec::new(),
@@ -2880,11 +2880,16 @@ impl Interpreter {
                     // descriptor-backed arguments object.
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let (elements, kind, mapped_entries, callee) = {
-                        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                        let function_id =
+                            stack.last().ok_or(VmError::InvalidOperand)?.function_id;
                         let function = context
-                            .exec_function(frame.function_id)
+                            .exec_function(function_id)
                             .ok_or(VmError::InvalidOperand)?;
-                        let elements = std::mem::take(&mut frame.incoming_args);
+                        let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                        let elements: SmallVec<[Value; 4]> = self
+                            .frame_cold_mut(frame)
+                            .map(|c| std::mem::take(&mut c.incoming_args))
+                            .unwrap_or_default();
                         let mapped_entries = if function.arguments_object_kind
                             == ArgumentsObjectKind::Mapped
                         {

@@ -94,8 +94,10 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         // Drain rather than clone: the rest array is built once per call and
         // CollectRest is the single consumer.
-        let frame = &mut stack[top_idx];
-        let elements: SmallVec<[Value; 4]> = std::mem::take(&mut frame.rest_args);
+        let elements: SmallVec<[Value; 4]> = self
+            .frame_cold_mut(&mut stack[top_idx])
+            .map(|c| std::mem::take(&mut c.rest_args))
+            .unwrap_or_default();
         let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::array(array))?;

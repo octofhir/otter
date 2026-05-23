@@ -31,7 +31,7 @@
 //! [`op_to_byte`] / [`op_from_byte`] table covers the smoke-test
 //! opcode subset.
 
-use crate::{Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList};
+use crate::{Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList, SpanEntry};
 
 /// Current bytecode wire-format version.
 pub const BYTECODE_SCHEMA_VERSION: u16 = 2;
@@ -300,6 +300,36 @@ fn branch_imm32_operand_slots(op: Op) -> &'static [usize] {
         Op::EnterTry => &[0, 1],
         _ => &[],
     }
+}
+
+/// Translate a v1 source-map (`pc` = instruction index) into the v2
+/// byte-offset form using the `instr_to_byte_pc` map produced by
+/// [`encode_function`]. Out-of-range entries fall back to the end of
+/// the byte stream (`total_bytes`), which matches the
+/// "jump past the last instruction" convention used by the encoder
+/// itself.
+///
+/// Order is preserved; the caller may pass either a `Vec` or a slice
+/// borrowed from [`crate::Function::spans`].
+#[must_use]
+pub fn translate_spans_to_byte_pcs(
+    spans: &[SpanEntry],
+    instr_to_byte_pc: &[u32],
+    total_bytes: u32,
+) -> Vec<SpanEntry> {
+    spans
+        .iter()
+        .map(|entry| {
+            let byte_pc = instr_to_byte_pc
+                .get(entry.pc as usize)
+                .copied()
+                .unwrap_or(total_bytes);
+            SpanEntry {
+                pc: byte_pc,
+                span: entry.span,
+            }
+        })
+        .collect()
 }
 
 /// Decode a whole function body into the corresponding
@@ -854,6 +884,54 @@ mod tests {
         };
         let resolved = (jump_byte_pc as i64) + 1 + (delta as i64);
         assert_eq!(resolved as u32, total_len);
+    }
+
+    #[test]
+    fn translate_spans_maps_to_byte_offsets() {
+        // Three instructions: LoadInt32 (10), Nop (2), Return (5).
+        let instructions = vec![
+            make_instr(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(0)]),
+            make_instr(Op::Nop, &[]),
+            make_instr(Op::Return, &[Operand::Register(0)]),
+        ];
+        let encoded = encode_function(&instructions);
+        let spans = vec![
+            SpanEntry {
+                pc: 0,
+                span: (10, 20),
+            },
+            SpanEntry {
+                pc: 1,
+                span: (20, 25),
+            },
+            SpanEntry {
+                pc: 2,
+                span: (25, 30),
+            },
+        ];
+        let translated = translate_spans_to_byte_pcs(
+            &spans,
+            &encoded.instr_to_byte_pc,
+            encoded.code.len() as u32,
+        );
+        assert_eq!(translated.len(), spans.len());
+        for (i, entry) in translated.iter().enumerate() {
+            assert_eq!(entry.pc, encoded.instr_to_byte_pc[i]);
+            assert_eq!(entry.span, spans[i].span);
+        }
+    }
+
+    #[test]
+    fn translate_spans_out_of_range_pc_falls_back_to_stream_end() {
+        let instructions = vec![make_instr(Op::Nop, &[])];
+        let encoded = encode_function(&instructions);
+        let total = encoded.code.len() as u32;
+        let spans = vec![SpanEntry {
+            pc: 5,
+            span: (0, 1),
+        }];
+        let translated = translate_spans_to_byte_pcs(&spans, &encoded.instr_to_byte_pc, total);
+        assert_eq!(translated[0].pc, total);
     }
 
     #[test]

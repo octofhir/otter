@@ -12,10 +12,17 @@ in cut-over. `pub struct Value(u64)` canonical at
 `crates/otter-vm/src/value/mod.rs:90`; sub-tags
 `0x7FFC..0x7FFF` per the historical MEMORY layout. Boxed-value migration
 of dependent layers (closures, upvalue-on-boxed-value rewrite) included.
-532/532 `otter-vm --lib` + 123/123 `otter-runtime --lib` passing;
+535/535 `otter-vm --lib` + 123/123 `otter-runtime --lib` passing;
 workspace clippy + fmt clean; one `#[ignore]` test remains
 (`runtime_array_cap_is_catchable_as_range_error`) tracked as new Task
 1.4 below.
+
+**Phase 1.3 (Hot/Cold Frame Split) DONE 2026-05-23.** Hot `Frame`
+collapses from 488 B to **128 B** (two cache lines) with a const
+assertion locking the target. Cold protocol state moves into a
+per-`Interpreter` `ColdFramePool`, lazily acquired; async-await /
+generator-yield detach the cold record so pool slots rotate freely
+while frames sleep. See Task 1.3 below.
 
 **Phase 2/3/4 status:** unchanged — not started.
 
@@ -459,9 +466,32 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: High.
 - Effort: L.
 - Depends on: 1.1.
-- **Status:** Not started. Phase 1 unblocks this — `Frame.this` /
-  `Frame.return_register` slots are now `Value(u64)` (`Copy`) so the
-  split can land without touching value-shape code.
+- **Status:** DONE 2026-05-23. Hot `Frame` shrinks from 488 B to
+  128 B (two cache lines) and a `const _: () = assert!(...)` in
+  `crates/otter-vm/src/frame_state.rs` pins the target so future
+  additions are compile errors. Cold protocol state — try handlers,
+  pending ToPrimitive/bind/iterator ladders, `pending_throw`,
+  `construct_target`, `new_target`, `rest_args`, `incoming_args` —
+  lives in `crates/otter-vm/src/cold_frame.rs` (`ColdFramePool`
+  on `Interpreter`, lazily acquired through
+  `Interpreter::frame_ensure_cold`). Across async-await / generator-yield
+  parking the cold record detaches into the parked container
+  (`ParkedFrameBody.cold` / `GeneratorBody.cold` /
+  `MicrotaskKind::AsyncResume{cold,…}` /
+  `MicrotaskKind::AsyncGenResume{cold,…}`) so pool slots can rotate
+  while frames sleep; resume re-attaches via
+  `Interpreter::frame_attach_cold`. `Frame.module_url` removed
+  entirely — import opcodes now read the referrer from
+  `ExecutableFunction::module_url` via `context.exec_function(...)`.
+  Byte-offset PC stays deferred to Phase 2.1 (the layout-only split
+  doesn't depend on it). Design note:
+  [`docs/task-1.3-frame-split.md`](task-1.3-frame-split.md). All
+  tests green: `otter-vm --lib` 535/535, `otter-runtime --lib`
+  123/123, workspace `cargo test --all --all-features` clean, clippy
+  clean. Remaining `Frame` cold fields (`async_state`,
+  `generator_owner`, 16 B total) stay on the hot frame — moving them
+  would not cross another cache-line boundary and would add more
+  parking-detach plumbing for no further hot-path win.
 
 ### Task 1.4 — GC Extra-Roots Callback (new, opened by Phase 1)
 

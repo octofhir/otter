@@ -593,7 +593,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 
 ## Phase 3 — Bootstrap & IntrinsicRegistry
 
-### Task 3.1 — Split Bootstrap Bodies
+### Task 3.1 — Split Bootstrap Bodies — DONE 2026-05-23
 
 - Goal: make bootstrap maintainable and auditable.
 - Touches: `crates/otter-vm/src/bootstrap.rs`, new `crates/otter-vm/src/intrinsics/`.
@@ -604,6 +604,26 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: Low/Medium.
 - Effort: M.
 - Depends on: 0.4.
+- **Status:** Shipped. `bootstrap.rs` shrank from **3859 LoC → 638
+  LoC** (84% reduction). Per-intrinsic installer bodies live under
+  `crates/otter-vm/src/intrinsics/`: `array.rs`, `date.rs`,
+  `function.rs`, `iterator.rs`, `number.rs`, `object.rs`,
+  `placeholders.rs` (Intl / Temporal / AggregateError), `proxy.rs`,
+  `symbol.rs`. Shared value-rooted allocation / native-function /
+  global-binding helpers (`alloc_object_with_value_roots`,
+  `native_constructor_static_with_value_roots`,
+  `native_static_with_value_roots`, `native_new_target_prototype`,
+  `install_placeholder`, `define_global`, `define_global_value`) live
+  in `intrinsics/shared.rs` and are re-exported under
+  `crate::bootstrap::` so existing import paths keep resolving.
+  `BOOTSTRAP_ENTRIES` entries now reference
+  `crate::intrinsics::<name>::Intrinsic` adapters (with the
+  multi-adapter `placeholders` module exporting the three placeholder
+  structs by name). 535/535 `otter-vm --lib` + 123/123
+  `otter-runtime --lib` passing; clippy clean. Target "<600 LoC"
+  missed by 38 lines — bootstrap.rs is now just registry
+  bookkeeping + the `build_global_this_impl` driver + telemetry
+  helpers, all genuinely centralised state.
 
 ### Task 3.2 — Add `RealmIntrinsics`
 

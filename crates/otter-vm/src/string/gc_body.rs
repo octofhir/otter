@@ -180,6 +180,14 @@ pub fn alloc_flat_string_body_with_roots(
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     let len = units.len() as u32;
     let hash = hash_utf16(units);
+    // Reserve cap budget for the heap-tracked `Vec<u16>` storage so
+    // the body's off-slot bytes count against `max_heap_bytes`. Without
+    // this, an unbounded `s += chunk` loop with cons-rope flatten
+    // bounds itself memory-wise (each epoch reclaims the prior tree)
+    // and the cap never fires — even though the actual Rust heap
+    // usage keeps doubling.
+    let bytes = (units.len() as u64).saturating_mul(2);
+    heap.reserve_bytes_with_roots(bytes, external_visit)?;
     heap.alloc_with_roots(
         JsStringBody {
             id,
@@ -203,6 +211,7 @@ pub fn alloc_latin1_string_body_with_roots(
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     let len = bytes.len() as u32;
     let hash = hash_latin1(bytes);
+    heap.reserve_bytes_with_roots(bytes.len() as u64, external_visit)?;
     heap.alloc_with_roots(
         JsStringBody {
             id,

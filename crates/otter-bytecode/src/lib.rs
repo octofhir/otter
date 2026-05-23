@@ -666,14 +666,6 @@ pub enum Op {
     /// runtime resolves `<name>` against the well-known table per
     /// ECMA-262 §6.1.5.1.
     SymbolLoad,
-    /// `r<dst> = Symbol(...) | Symbol.<method>(args...)`.
-    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`. When `name` is the empty-string sentinel
-    /// the runtime executes the bare `Symbol(desc)` constructor;
-    /// otherwise it dispatches `Symbol.for` / `Symbol.keyFor` /
-    /// other registered statics. Variadic, same shape as the
-    /// other namespace-call shortcuts.
-    SymbolCall,
     /// `r<dst> = typeof r<src>`. Operands:
     /// `Register(dst), Register(src)`. Returns one of `"undefined"`,
     /// `"object"`, `"boolean"`, `"number"`, `"bigint"`, `"string"`,
@@ -1060,7 +1052,6 @@ impl Op {
             Op::PromiseFulfilledOf => "PROMISE_FULFILLED_OF",
             Op::Await => "AWAIT",
             Op::SymbolLoad => "SYMBOL_LOAD",
-            Op::SymbolCall => "SYMBOL_CALL",
             Op::TypeOf => "TYPEOF",
             Op::DeleteElement => "DELETE_ELEMENT",
             Op::NewCollection => "NEW_COLLECTION",
@@ -1215,7 +1206,6 @@ impl Op {
             // recv, key, src, scratch_dst for accessor setters.
             Op::StoreElement => 4,
             Op::CallMethodValue => 4, // dst, recv, name_const, argc
-            Op::SymbolCall => 3,      // dst, name_const, argc — args follow
             Op::ObjectCall => 3,      // dst, name_const, argc — args follow
             // dst, argc — args follow as `Register(arg0)…`.
             Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
@@ -1311,7 +1301,6 @@ impl Op {
             // offset these slots — doing so silently rebinds the
             // call to a different builtin method after merge.
             Op::PromiseCall
-            | Op::SymbolCall
             | Op::ObjectCall
             | Op::GlobalCall
             | Op::BigIntCall

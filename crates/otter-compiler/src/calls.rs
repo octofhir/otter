@@ -324,28 +324,10 @@ pub(crate) fn compile_method_call(
             cx.emit(Op::TemporalCall, operands, span);
             return Ok(dst);
         }
-        // `Symbol.<method>(args)` — typed dispatch via [`SymbolMethod`].
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Symbol"
-        {
-            let method_name = member.property.name.as_str();
-            let Some(method_id) = otter_bytecode::method_id::SymbolMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Symbol.{method_name}"),
-                    span,
-                });
-            };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::SymbolCall, operands, span);
-            return Ok(dst);
-        }
+        // `Symbol.<method>(args)` flows through the real `NativeFunction`
+        // entries installed by the `Symbol` bootstrap, so the dedicated
+        // `Op::SymbolCall` shortcut is no longer emitted. User shadowing
+        // of `Symbol.for` / `Symbol.keyFor` is therefore observable.
         // §21.1.2 Number static surface — `Number.parseInt` /
         // `Number.parseFloat` are aliases of the global functions
         // (§21.1.2.13 / §21.1.2.12); `Number.isNaN` /
@@ -384,23 +366,10 @@ pub(crate) fn compile_method_call(
             }
         }
     }
-    // Bare `Symbol(desc)` — fresh primitive symbol per call.
-    // Lowers through `Op::SymbolCall` with [`SymbolMethod::Construct`].
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Symbol"
-    {
-        let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(
-            otter_bytecode::method_id::SymbolMethod::Construct.as_u32(),
-        ));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::SymbolCall, operands, span);
-        return Ok(dst);
-    }
+    // Bare `Symbol(desc)` resolves against the `NativeFunction`
+    // installed by the `Symbol` bootstrap, so the dedicated
+    // `Op::SymbolCall` `Construct` shortcut is no longer emitted.
+    // User shadowing of `globalThis.Symbol` is therefore observable.
     // §20.3.1 `Boolean(value)` — coerces to boolean. The foundation
     // ships primitive-only Booleans (no wrapper object), so the
     // bare-call form is identical to `!!value`.

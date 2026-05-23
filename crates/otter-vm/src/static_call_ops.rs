@@ -28,7 +28,7 @@ use crate::{
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
-    symbol_dispatch, symbol_to_vm_error, temporal, temporal_to_vm_error, write_register,
+    temporal, temporal_to_vm_error, write_register,
 };
 
 /// Full property-bearing object-like family used by Object.* and
@@ -61,7 +61,7 @@ impl Interpreter {
     pub(crate) fn run_static_call_operands(
         &mut self,
         op: Op,
-        context: &ExecutionContext,
+        _context: &ExecutionContext,
         frame: &mut Frame,
         operands: &[Operand],
     ) -> Result<(), VmError> {
@@ -122,26 +122,6 @@ impl Interpreter {
                 let result = global_functions::call(method, &args, &mut self.gc_heap)?;
                 finish_static_call(frame, dst, result, self.current_byte_len)
             }
-            Op::SymbolCall => {
-                let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
-                let method =
-                    method_id::SymbolMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                // §20.4.1.1 / §20.4.2.4 — `Symbol(desc)` and
-                // `Symbol.for(key)` flow through `ToString`, so object
-                // operands need the observable `ToPrimitive("string")`
-                // ladder here. §20.4.2.6 `Symbol.keyFor(sym)` instead
-                // requires an actual Symbol argument and must not unwrap
-                // Symbol wrapper objects before the type check.
-                let coerced = match method {
-                    method_id::SymbolMethod::Construct | method_id::SymbolMethod::For => {
-                        self.symbol_coerce_first_arg(context, args)?
-                    }
-                    method_id::SymbolMethod::KeyFor => args,
-                };
-                let result =
-                    symbol_dispatch::call(self, method, &coerced).map_err(symbol_to_vm_error)?;
-                finish_static_call(frame, dst, result, self.current_byte_len)
-            }
             Op::TemporalCall => {
                 let dst = register_operand(operands.first())?;
                 let class_idx = const_operand(operands.get(1))?;
@@ -157,27 +137,6 @@ impl Interpreter {
             }
             _ => Err(VmError::InvalidOperand),
         }
-    }
-
-    /// Coerce the first positional argument of a `Symbol(...)` /
-    /// `Symbol.for(...)` invocation through `ToPrimitive(arg,
-    /// "string")` so user-defined `@@toPrimitive` / `valueOf` /
-    /// `toString` overrides fire per §7.1.1. The remaining args (none
-    /// today; `Symbol.keyFor` takes a Symbol that must not be coerced)
-    /// pass through untouched. Delegates to the shared
-    /// `Interpreter::coerce_to_primitive` ladder.
-    fn symbol_coerce_first_arg(
-        &mut self,
-        context: &ExecutionContext,
-        mut args: SmallVec<[Value; 4]>,
-    ) -> Result<SmallVec<[Value; 4]>, VmError> {
-        let Some(first) = args.first_mut() else {
-            return Ok(args);
-        };
-        let coerced =
-            self.coerce_to_primitive(context, first, abstract_ops::ToPrimitiveHint::String)?;
-        *first = coerced;
-        Ok(args)
     }
 
     /// Stack-rooted dispatcher for `Op::DateCall`. Construct

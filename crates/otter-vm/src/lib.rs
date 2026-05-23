@@ -4045,12 +4045,6 @@ impl Interpreter {
                     self.drive_bind_function(stack, context, operands)?;
                     continue;
                 }
-                Op::SymbolCall => {
-                    let operands = context.exec_operands(instr);
-                    let frame = &mut stack[top_idx];
-                    self.run_static_call_operands(op, context, frame, operands)?;
-                    continue;
-                }
                 Op::TemporalCall => {
                     let operands = context.exec_operands(instr);
                     let frame = &mut stack[top_idx];

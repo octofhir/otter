@@ -4000,121 +4000,8 @@ impl Interpreter {
             let operands = context.exec_operands(instr);
             let frame = &mut stack[top_idx];
             match op {
-                Op::Eval | Op::NewFunction => {
-                    unreachable!("stack-modifying ops handled earlier in this loop")
-                }
-                Op::Return
-                | Op::ReturnValue
-                | Op::ReturnUndefined
-                | Op::Call
-                | Op::CallWithThis
-                | Op::CallMethodValue
-                | Op::CallSpread
-                | Op::New
-                | Op::NewSpread
-                | Op::SuperConstructSpread
-                | Op::Throw
-                | Op::EndFinally
-                | Op::Await
-                | Op::Yield => {
-                    unreachable!("stack-modifying ops handled earlier in this loop")
-                }
-                Op::Nop
-                | Op::LoadUndefined
-                | Op::LoadHole
-                | Op::LoadString
-                | Op::LoadLength
-                | Op::LoadNumber
-                | Op::LoadInt32
-                | Op::LoadTrue
-                | Op::LoadFalse
-                | Op::LoadNull
-                | Op::LogicalNot
-                | Op::ToBoolean
-                | Op::ToNumber
-                | Op::GetStringIndex
-                | Op::TypeOf
-                | Op::LoadThis
-                | Op::LoadNewTarget
-                | Op::DeleteProperty
-                | Op::DeleteElement
-                | Op::GetPrototype
-                | Op::SetPrototype
-                | Op::NewObject
-                | Op::NewArray
-                | Op::LoadRegExp
-                | Op::LoadBigInt
-                | Op::LoadUpvalue
-                | Op::StoreUpvalue
-                | Op::LoadProperty
-                | Op::StoreProperty
-                | Op::LoadElement
-                | Op::StoreElement
-                | Op::GetIterator
-                | Op::IteratorNext
-                | Op::MakeFunction
-                | Op::MakeClass
-                | Op::NewError
-                | Op::NewBuiltinError
-                | Op::LoadBuiltinError
-                | Op::LoadGlobalThis
-                | Op::LoadGlobalOrThrow
-                | Op::LoadGlobalOrUndefined
-                | Op::DefineGlobalVar
-                | Op::CollectRest
-                | Op::CollectArguments
-                | Op::ImportNamespace
-                | Op::ImportMetaResolve
-                | Op::PromiseFulfilledOf
-                | Op::ArrayPush
-                | Op::NewWeakRef
-                | Op::NewFinalizationRegistry
-                | Op::NewCollection
-                | Op::NewIntl
-                | Op::MathLoad
-                | Op::SymbolLoad
-                | Op::TemporalLoad
-                | Op::EnterTry
-                | Op::LeaveTry
-                | Op::Jump
-                | Op::JumpIfTrue
-                | Op::JumpIfFalse
-                | Op::JumpIfNullish
-                | Op::LoadLocal
-                | Op::StoreLocal
-                | Op::TdzError => {
-                    unreachable!("fixed-width ops handled earlier in this loop")
-                }
                 Op::MakeClosure => {
                     self.run_make_closure_operands(context, frame, operands)?;
-                }
-                Op::ArrayLength | Op::IsArray | Op::Instanceof | Op::HasProperty => {
-                    unreachable!("property predicates handled earlier in this loop")
-                }
-                Op::Add
-                | Op::Sub
-                | Op::Mul
-                | Op::Div
-                | Op::Rem
-                | Op::Pow
-                | Op::BitwiseAnd
-                | Op::BitwiseOr
-                | Op::BitwiseXor
-                | Op::Shl
-                | Op::Shr
-                | Op::Ushr
-                | Op::LessThan
-                | Op::LessEq
-                | Op::GreaterThan
-                | Op::GreaterEq
-                | Op::Neg
-                | Op::BitwiseNot
-                | Op::Equal
-                | Op::NotEqual
-                | Op::LooseEqual
-                | Op::LooseNotEqual
-                | Op::SameValue => {
-                    unreachable!("register binary ops handled earlier in this loop")
                 }
                 Op::JsonCall => {
                     self.run_json_static_call_operands(Some(context), stack, operands)?;
@@ -4193,11 +4080,10 @@ impl Interpreter {
                 Op::TemporalCall => {
                     self.run_static_call_operands(op, context, frame, operands)?;
                 }
-                Op::ToPrimitive => {
-                    // Stack-modifying ladder dispatched in the
-                    // pre-frame-borrow block above.
-                    unreachable!("Op::ToPrimitive is handled by the pre-dispatch ladder")
-                }
+                _ => unreachable!(
+                    "opcode {:?} should not reach the trailing static-call match",
+                    op
+                ),
             }
         }
     }

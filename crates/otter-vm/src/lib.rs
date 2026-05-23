@@ -3977,11 +3977,6 @@ impl Interpreter {
                     self.run_shared_array_buffer_static_call_operands(stack, operands)?;
                     continue;
                 }
-                Op::DateCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_date_static_call_operands(stack, context, operands)?;
-                    continue;
-                }
                 Op::BigIntCall | Op::DataViewCall => {
                     let operands = context.exec_operands(instr);
                     let frame = &mut stack[top_idx];

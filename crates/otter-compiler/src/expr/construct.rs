@@ -103,26 +103,10 @@ pub(crate) fn compile_new(
     // is no longer emitted. (Static-side `<T>.from(...)` /
     // `<T>.of(...)` shortcuts elsewhere stay in place until
     // the static methods are wired through the real ctor.)
-    // §21.4.2 `new Date(...)` — variadic constructor.
-    // Lowers via [`DateMethod::Construct`].
-    // <https://tc39.es/ecma262/#sec-date-constructor>
-    if let Expression::Identifier(id) = callee
-        && id.name.as_str() == "Date"
-        && cx.lookup_binding("Date").is_none()
-        && find_module_import_binding(cx, "Date").is_none()
-    {
-        let arg_regs = compile_call_args(cx, &new_expr.arguments, new_span)?;
-        let dst = cx.alloc_scratch();
-        let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-        operands.push(Operand::Register(dst));
-        operands.push(Operand::ConstIndex(
-            otter_bytecode::method_id::DateMethod::Construct.as_u32(),
-        ));
-        operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-        operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::DateCall, operands, new_span);
-        return Ok(dst);
-    }
+    // §21.4.2 `new Date(...)` resolves against the real
+    // `NativeFunction` constructor installed by the `Date`
+    // bootstrap, so the dedicated `Op::DateCall` `Construct`
+    // shortcut is no longer emitted.
     // §20.2.1.1 `new Function(arg0, …, body)` — every
     // argument coerces to a string at runtime; the leading
     // ones become parameter names and the last one is the

@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, IteratorState, Value, VmError, VmPropertyKey,
-    abstract_ops, array, bigint, binary, collections, date, global_functions,
+    abstract_ops, array, bigint, binary, collections, global_functions,
     native_function, object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register,
@@ -66,7 +66,6 @@ impl Interpreter {
         operands: &[Operand],
     ) -> Result<(), VmError> {
         match op {
-            Op::DateCall => unreachable!("DateCall requires stack-rooted dispatch"),
             Op::BigIntCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method =
@@ -137,91 +136,6 @@ impl Interpreter {
             }
             _ => Err(VmError::InvalidOperand),
         }
-    }
-
-    /// Stack-rooted dispatcher for `Op::DateCall`. Construct
-    /// allocates a fresh ordinary object with the
-    /// `[[DateValue]]` internal slot wired through
-    /// [`crate::object::set_date_data`]; the other static methods
-    /// (Now / Parse / UTC) just return Numbers but route through
-    /// here for uniformity.
-    ///
-    /// # Spec
-    /// - <https://tc39.es/ecma262/#sec-date-constructor>
-    pub(crate) fn run_date_static_call_operands(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        let (dst, method_idx, args) = {
-            let frame = &stack[top_idx];
-            decode_static_call(frame, operands, 1, 2, 3)?
-        };
-        let method = method_id::DateMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-        // §21.4.2.1 step 4 / §21.4.3.4 step 1 — `new Date(year, month,
-        // ...)` and `Date.UTC` walk their arguments through
-        // `ToNumber` in declaration order **before** assembling the
-        // resulting time value. Pre-coerce here so user
-        // `@@toPrimitive` / `valueOf` / `toString` overrides fire per
-        // spec and abrupt completions halt subsequent coercions.
-        // Single-arg `new Date(value)` (§21.4.2.2 step 3) follows
-        // its own ToPrimitive(`number`) ladder, handled inside
-        // `date::dispatch::construct_time_value`.
-        let mut args = args;
-        let needs_to_number = matches!(method, method_id::DateMethod::UTC)
-            || (matches!(method, method_id::DateMethod::Construct) && args.len() >= 2);
-        if needs_to_number {
-            for slot in args.iter_mut() {
-                let coerced = self.coerce_to_number(context, slot)?;
-                *slot = Value::number(coerced);
-            }
-        } else if matches!(method, method_id::DateMethod::Construct) && args.len() == 1 {
-            // §21.4.2.2 step 3.b — single-arg `new Date(value)` runs
-            // `ToPrimitive(value)` (hint "default") when `value` is
-            // not already a Date instance. `String` results then
-            // drive Date.parse; everything else flows through
-            // ToNumber. Objects with `[[DateValue]]` skip ToPrimitive
-            // entirely (§21.4.2.2 step 3.a) so subclass instances
-            // copy the underlying time value verbatim.
-            let slot = &mut args[0];
-            let is_date_instance = slot
-                .as_object()
-                .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some());
-            if !is_date_instance {
-                let primitive = self.coerce_to_primitive(
-                    context,
-                    slot,
-                    crate::abstract_ops::ToPrimitiveHint::Default,
-                )?;
-                *slot = primitive;
-            }
-        }
-        // Resolve `%Date.prototype%` so the freshly allocated
-        // instance inherits the right method bag. Cheap lookup —
-        // two property reads on the realm globals.
-        let date_prototype = self
-            .constructor_prototype_value("Date")
-            .ok()
-            .and_then(|v| v.as_object());
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            for arg in &args {
-                arg.trace_value_slots(visitor);
-            }
-        };
-        let result = date::dispatch::call(
-            method,
-            &args,
-            &mut self.gc_heap,
-            date_prototype,
-            &mut external_visit,
-        )?;
-        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     pub(crate) fn run_array_buffer_static_call_operands(

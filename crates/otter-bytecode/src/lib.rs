@@ -771,18 +771,6 @@ pub enum Op {
     /// Variadic. Empty `name` (sentinel) selects the constructor
     /// form (coerces argument via §7.1.17 ToString); otherwise the
     /// runtime dispatches `fromCharCode` / `fromCodePoint` via
-    /// `r<dst> = new Date(args...)` / `Date.<name>(args...)`.
-    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
-    ///
-    /// Variadic. Empty `name` (sentinel) selects the constructor
-    /// form; otherwise the runtime dispatches `now` / `parse` /
-    /// `UTC` against [`crate::date::dispatch::call`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-date-objects>
-    DateCall,
-
     /// `r<dst> = BigInt(args...)` / `BigInt.<name>(args...)`.
     /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -1072,7 +1060,6 @@ impl Op {
             Op::ArrayFrom => "ARRAY_FROM",
             Op::ArrayOf => "ARRAY_OF",
             Op::BigIntCall => "BIGINT_CALL",
-            Op::DateCall => "DATE_CALL",
             Op::HasProperty => "HAS_PROPERTY",
             Op::ImportNamespaceDynamic => "IMPORT_NAMESPACE_DYNAMIC",
             Op::ImportMetaResolve => "IMPORT_META_RESOLVE",
@@ -1210,7 +1197,6 @@ impl Op {
             // dst, argc — args follow as `Register(arg0)…`.
             Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
             Op::BigIntCall => 3,      // dst, name_const, argc — args follow
-            Op::DateCall => 3,        // dst, name_const, argc — args follow
             Op::GlobalCall => 3,      // dst, name_const, argc — args follow
             Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::DataViewCall => 3,    // dst, name_const, argc — args follow
@@ -1304,7 +1290,6 @@ impl Op {
             | Op::ObjectCall
             | Op::GlobalCall
             | Op::BigIntCall
-            | Op::DateCall
             | Op::ArrayBufferCall
             | Op::DataViewCall
             | Op::IteratorCall

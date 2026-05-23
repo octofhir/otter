@@ -477,27 +477,11 @@ pub(crate) fn compile_method_call(
         cx.emit(Op::NewObject, [Operand::Register(dst)], span);
         return Ok(dst);
     }
-    // §21.4.3 Date statics — typed dispatch via [`DateMethod`].
-    // <https://tc39.es/ecma262/#sec-properties-of-the-date-constructor>
-    if let Expression::StaticMemberExpression(member) = callee
-        && let Expression::Identifier(id) = &member.object
-        && id.name.as_str() == "Date"
-        && cx.lookup_binding("Date").is_none()
-        && find_module_import_binding(cx, "Date").is_none()
-    {
-        let method_name = member.property.name.as_str();
-        if let Some(method_id) = otter_bytecode::method_id::DateMethod::from_str(method_name) {
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::DateCall, operands, span);
-            return Ok(dst);
-        };
-    }
+    // §21.4.3 `Date.<method>(args)` — `Date.now` / `Date.parse` /
+    // `Date.UTC` flow through the real `NativeFunction` entries
+    // installed by the `Date` bootstrap. The dedicated `Op::DateCall`
+    // shortcut for the static surface is no longer emitted, so user
+    // shadows of `Date.<method>` are observable per ECMA-262.
     // `BigInt(value)` and `BigInt.asIntN/asUintN(args)` route
     // through the real `NativeFunction` installed by
     // `bootstrap_bigint` — the dedicated `Op::BigIntCall` shortcut

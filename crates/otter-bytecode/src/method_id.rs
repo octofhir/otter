@@ -211,7 +211,7 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::DateCall`](crate::Op::DateCall).
+    /// Methods dispatched by the `Date` namespace native functions.
     /// Includes the constructor (`Construct`) plus the static
     /// surface.
     DateMethod {

@@ -550,21 +550,20 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::LooseNotEqual, 0x6F),
     (Op::NewBuiltinError, 0x70),
     (Op::LoadBuiltinError, 0x71),
-    (Op::DateCall, 0x72),
-    (Op::BigIntCall, 0x73),
-    (Op::ArrayConstruct, 0x74),
-    (Op::ArrayFrom, 0x75),
-    (Op::ArrayOf, 0x76),
-    (Op::ObjectCall, 0x77),
-    (Op::ArrayBufferCall, 0x78),
-    (Op::DataViewCall, 0x79),
-    (Op::TypedArrayCall, 0x7A),
-    (Op::Yield, 0x7B),
-    (Op::SharedArrayBufferCall, 0x7C),
-    (Op::ProxyCall, 0x7D),
-    (Op::ReflectCall, 0x7E),
-    (Op::IteratorCall, 0x7F),
-    (Op::ToPrimitive, 0x80),
+    (Op::BigIntCall, 0x72),
+    (Op::ArrayConstruct, 0x73),
+    (Op::ArrayFrom, 0x74),
+    (Op::ArrayOf, 0x75),
+    (Op::ObjectCall, 0x76),
+    (Op::ArrayBufferCall, 0x77),
+    (Op::DataViewCall, 0x78),
+    (Op::TypedArrayCall, 0x79),
+    (Op::Yield, 0x7A),
+    (Op::SharedArrayBufferCall, 0x7B),
+    (Op::ProxyCall, 0x7C),
+    (Op::ReflectCall, 0x7D),
+    (Op::IteratorCall, 0x7E),
+    (Op::ToPrimitive, 0x7F),
 ];
 
 #[cfg(test)]
@@ -928,7 +927,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 129;
+        const EXPECTED_OPCODE_COUNT: usize = 128;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

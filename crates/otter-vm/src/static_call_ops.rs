@@ -23,29 +23,13 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, IteratorState, Value, VmError, VmPropertyKey,
-    abstract_ops, array, bigint, binary, collections, date, global_functions, math,
-    math_to_vm_error, native_function, object, object_statics,
+    abstract_ops, array, bigint, binary, collections, date, global_functions,
+    native_function, object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
     symbol_dispatch, symbol_to_vm_error, temporal, temporal_to_vm_error, write_register,
 };
-
-/// Object-shaped values that need §7.1.1 `ToPrimitive` coercion before
-/// numeric / string arithmetic. Mirrors the matches! variant list
-/// repeated through static-call arg preambles: every callable object
-/// shape plus `RegExp`.
-fn needs_to_primitive(v: &Value) -> bool {
-    v.is_object()
-        || v.is_array()
-        || v.is_function()
-        || v.is_closure()
-        || v.is_native_function()
-        || v.is_bound_function()
-        || v.is_class_constructor()
-        || v.is_proxy()
-        || v.is_regexp()
-}
 
 /// Full property-bearing object-like family used by Object.* and
 /// Reflect.* static dispatchers. Excludes Iterator / Generator /
@@ -82,22 +66,6 @@ impl Interpreter {
         operands: &[Operand],
     ) -> Result<(), VmError> {
         match op {
-            Op::MathCall => {
-                let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
-                let method =
-                    method_id::MathMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                // §21.3.2.{24,25} — `Math.max` / `Math.min` and every
-                // other unary / binary Math method call `ToNumber` on
-                // each arg, which runs `ToPrimitive(arg, "number")`
-                // for non-primitives. Pre-coerce here so the
-                // `coerce_all` table below sees primitives and the
-                // user-installed `@@toPrimitive` / `valueOf` /
-                // `toString` ladder fires per spec.
-                let coerced = self.math_coerce_args(context, args)?;
-                let result =
-                    math::call(method, &coerced, &self.gc_heap).map_err(math_to_vm_error)?;
-                finish_static_call(frame, dst, result, self.current_byte_len)
-            }
             Op::DateCall => unreachable!("DateCall requires stack-rooted dispatch"),
             Op::BigIntCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
@@ -210,34 +178,6 @@ impl Interpreter {
             self.coerce_to_primitive(context, first, abstract_ops::ToPrimitiveHint::String)?;
         *first = coerced;
         Ok(args)
-    }
-
-    /// Run `ToNumber` on each Math arg by routing non-primitives
-    /// through `evaluate_to_primitive(arg, Number)`. Primitives pass
-    /// through untouched so the spec's BigInt / Symbol error arms
-    /// surface from inside `coerce_all` rather than this prelude.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-math.max>
-    /// - <https://tc39.es/ecma262/#sec-math.min>
-    fn math_coerce_args(
-        &mut self,
-        context: &ExecutionContext,
-        args: SmallVec<[Value; 4]>,
-    ) -> Result<SmallVec<[Value; 4]>, VmError> {
-        let mut out: SmallVec<[Value; 4]> = SmallVec::with_capacity(args.len());
-        for arg in args {
-            if needs_to_primitive(&arg) {
-                out.push(self.evaluate_to_primitive(
-                    context,
-                    &arg,
-                    crate::abstract_ops::ToPrimitiveHint::Number,
-                )?);
-            } else {
-                out.push(arg);
-            }
-        }
-        Ok(out)
     }
 
     /// Stack-rooted dispatcher for `Op::DateCall`. Construct

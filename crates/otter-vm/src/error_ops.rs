@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ErrorKind, ExecutionContext, Frame, Interpreter, IntrinsicError, JsString, NativeError,
-    StackFrameSnapshot, Value, VmError, error_classes, math, object, read_register,
+    StackFrameSnapshot, Value, VmError, error_classes, object, read_register,
     symbol_dispatch, temporal, write_register,
 };
 
@@ -337,15 +337,6 @@ pub(crate) fn snapshot_frames(
             }
         })
         .collect()
-}
-
-pub(crate) fn math_to_vm_error(err: math::MathError) -> VmError {
-    match err {
-        math::MathError::UnknownMember(name) => VmError::UnknownIntrinsic {
-            name: format!("Math.{name}"),
-        },
-        math::MathError::BadArgument { .. } => VmError::TypeMismatch,
-    }
 }
 
 pub(crate) fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {

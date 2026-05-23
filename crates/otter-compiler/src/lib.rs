@@ -292,11 +292,18 @@ mod tests {
     }
 
     #[test]
-    fn math_namespace_lowers_to_dedicated_ops() {
+    fn math_namespace_inlines_constants_but_dispatches_methods_dynamically() {
+        // `Math.PI` keeps its dedicated [`Op::MathLoad`] inlining,
+        // while `Math.<method>(...)` calls now go through ordinary
+        // property-call dispatch so user shadows are observable.
         let module = compile_script_src("Math.PI; Math.abs(-1); Math.max(1, 2, 3);");
         let main = module.main();
         assert!(main.code.iter().any(|i| i.op == Op::MathLoad));
-        let calls = main.code.iter().filter(|i| i.op == Op::MathCall).count();
+        let calls = main
+            .code
+            .iter()
+            .filter(|i| i.op == Op::CallMethodValue)
+            .count();
         assert_eq!(calls, 2);
     }
 

@@ -270,11 +270,18 @@ pub fn call(
 }
 
 fn native_call(
+    ctx: &mut NativeCtx<'_>,
     method: otter_bytecode::method_id::MathMethod,
     args: &[Value],
-    heap: &otter_gc::GcHeap,
 ) -> Result<Value, NativeError> {
-    call(method, args, heap).map_err(|err| match err {
+    // §21.3.2.{24,25} — `Math.max` / `Math.min` and every other
+    // unary / binary Math method call `ToNumber` on each argument,
+    // which runs `ToPrimitive(arg, "number")` for non-primitives.
+    // Pre-coerce object operands here so `coerce_all` below sees
+    // primitives and the user-installed `@@toPrimitive` / `valueOf`
+    // / `toString` ladder fires per spec.
+    let coerced = coerce_math_args(ctx, args)?;
+    call(method, &coerced, ctx.heap()).map_err(|err| match err {
         MathError::UnknownMember(member) => NativeError::TypeError {
             name: method.name(),
             reason: format!("unknown Math member {member}"),
@@ -286,14 +293,46 @@ fn native_call(
     })
 }
 
+fn coerce_math_args(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
+    let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    for slot in out.iter_mut() {
+        if needs_to_primitive_for_math(slot) {
+            let (interp, exec) = ctx.interp_mut_and_context();
+            let exec = exec.ok_or(NativeError::TypeError {
+                name: "Math",
+                reason: "missing execution context".to_string(),
+            })?;
+            let primitive = interp
+                .evaluate_to_primitive(&exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
+                .map_err(|e| NativeError::TypeError {
+                    name: "Math",
+                    reason: e.to_string(),
+                })?;
+            *slot = primitive;
+        }
+    }
+    Ok(out)
+}
+
+fn needs_to_primitive_for_math(v: &Value) -> bool {
+    v.is_object()
+        || v.is_array()
+        || v.is_function()
+        || v.is_closure()
+        || v.is_native_function()
+        || v.is_bound_function()
+        || v.is_class_constructor()
+        || v.is_proxy()
+        || v.is_regexp()
+}
+
 macro_rules! native_math {
     ($fn_name:ident, $variant:ident) => {
         fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-            native_call(
-                otter_bytecode::method_id::MathMethod::$variant,
-                args,
-                ctx.heap(),
-            )
+            native_call(ctx, otter_bytecode::method_id::MathMethod::$variant, args)
         }
     };
 }

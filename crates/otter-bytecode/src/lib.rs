@@ -108,8 +108,8 @@ pub enum Op {
     PromiseNew,
     /// `r<dst> = Promise.<name>(args...)`. Operands:
     /// `dst, name_const, argc, args...`. Variadic, same shape as
-    /// [`Op::MathCall`]. Resolves `<name>` against the Promise
-    /// statics dispatcher; unknown names surface as
+    /// the other namespace-call shortcuts. Resolves `<name>` against
+    /// the Promise statics dispatcher; unknown names surface as
     /// `UnknownIntrinsic`.
     PromiseCall,
     /// `r<dst> = true`.
@@ -360,12 +360,6 @@ pub enum Op {
     /// when it sees `Math.PI` / `Math.E` / `Math.<known>` outside
     /// a call expression.
     MathLoad,
-    /// Variadic call against the `Math` namespace function table.
-    /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`. The runtime resolves `name` against the
-    /// `math` module's registry; unknown names raise
-    /// `UnknownIntrinsic`.
-    MathCall,
     /// `r<dst> = trailing-args-as-array`. Operand: `Register(dst)`.
     /// Reads the call's overflow argument list (the values past
     /// the declared `param_count`) that the dispatcher stashed on
@@ -488,7 +482,7 @@ pub enum Op {
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
     ///
-    /// Variadic, same shape as [`Self::MathCall`]. Routed by name
+    /// Variadic, same shape as the other namespace-call shortcuts. Routed by name
     /// against the runtime's global-function table.
     ///
     /// # See also
@@ -677,8 +671,8 @@ pub enum Op {
     /// Register(arg0), …`. When `name` is the empty-string sentinel
     /// the runtime executes the bare `Symbol(desc)` constructor;
     /// otherwise it dispatches `Symbol.for` / `Symbol.keyFor` /
-    /// other registered statics. Variadic, same shape as
-    /// [`Op::MathCall`].
+    /// other registered statics. Variadic, same shape as the
+    /// other namespace-call shortcuts.
     SymbolCall,
     /// `r<dst> = typeof r<src>`. Operands:
     /// `Register(dst), Register(src)`. Returns one of `"undefined"`,
@@ -838,7 +832,7 @@ pub enum Op {
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
     ///
-    /// Variadic, same shape as [`Self::MathCall`].
+    /// Variadic, same shape as the other namespace-call shortcuts.
     /// Routes Object-namespace static calls (`defineProperty`,
     /// `getOwnPropertyDescriptor`, `freeze`, `seal`,
     /// `preventExtensions`, the `is*` predicates) through one
@@ -1013,7 +1007,6 @@ impl Op {
             Op::MakeClass => "MAKE_CLASS",
             Op::CollectRest => "COLLECT_REST",
             Op::MathLoad => "MATH_LOAD",
-            Op::MathCall => "MATH_CALL",
             Op::Add => "ADD",
             Op::Sub => "SUB",
             Op::Mul => "MUL",
@@ -1222,7 +1215,6 @@ impl Op {
             // recv, key, src, scratch_dst for accessor setters.
             Op::StoreElement => 4,
             Op::CallMethodValue => 4, // dst, recv, name_const, argc
-            Op::MathCall => 3,        // dst, name_const, argc — args follow
             Op::SymbolCall => 3,      // dst, name_const, argc — args follow
             Op::ObjectCall => 3,      // dst, name_const, argc — args follow
             // dst, argc — args follow as `Register(arg0)…`.
@@ -1314,12 +1306,11 @@ impl Op {
             // [reg, recv, name_const, argc, args...]
             Op::CallMethodValue => pos == 2,
             // Variadic *Call shapes whose pos=1 is a method-id enum
-            // (`MathMethod::from_u32`, `JsonMethod::from_u32`, …),
-            // **not** a constant-pool reference. The linker must NOT
+            // (e.g. `PromiseMethod::from_u32`), **not** a
+            // constant-pool reference. The linker must NOT
             // offset these slots — doing so silently rebinds the
             // call to a different builtin method after merge.
-            Op::MathCall
-            | Op::PromiseCall
+            Op::PromiseCall
             | Op::SymbolCall
             | Op::ObjectCall
             | Op::GlobalCall

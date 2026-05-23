@@ -274,31 +274,10 @@ pub(crate) fn compile_method_call(
                 return Ok(dst);
             }
         }
-        // `Math.<name>(args)` — typed dispatch via [`MathMethod`] for
-        // the spec-defined static surface (`abs` / `max` / `sin` / …).
-        // Names outside that table (e.g. `Math.hasOwnProperty`
-        // inherited from `%Object.prototype%`) fall through to the
-        // generic method-call lowering below so `this` correctly
-        // resolves to the `Math` namespace object.
-        // <https://tc39.es/ecma262/#sec-math-object>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Math"
-            && cx.lookup_binding("Math").is_none()
-            && find_module_import_binding(cx, "Math").is_none()
-        {
-            let method_name = member.property.name.as_str();
-            if let Some(method_id) = otter_bytecode::method_id::MathMethod::from_str(method_name) {
-                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(method_id.as_u32()));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::MathCall, operands, span);
-                return Ok(dst);
-            }
-        }
+        // `Math.<name>(args)` flows through the real `NativeFunction`
+        // entries installed by the `Math` namespace bootstrap, so the
+        // dedicated `Op::MathCall` shortcut is no longer emitted.
+        // User shadowing of `Math.<method>` is therefore observable.
         // `JSON.<name>(args)` flows through the real `NativeFunction`
         // installed by the `JSON` namespace bootstrap, so the dedicated
         // `Op::JsonCall` shortcut is no longer emitted. User shadowing

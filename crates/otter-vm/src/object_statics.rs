@@ -689,9 +689,11 @@ fn native_get_own_property_descriptor_rooted(
             PropertyKey::String(key) => {
                 crate::object::get_own_descriptor(class.statics(ctx.heap()), ctx.heap(), key)
             }
-            PropertyKey::Symbol(sym) => {
-                crate::object::get_own_symbol_descriptor(class.statics(ctx.heap()), ctx.heap(), *sym)
-            }
+            PropertyKey::Symbol(sym) => crate::object::get_own_symbol_descriptor(
+                class.statics(ctx.heap()),
+                ctx.heap(),
+                *sym,
+            ),
         }
     } else if let Some(native) = first.as_native_function() {
         match &key {
@@ -1976,7 +1978,9 @@ fn explicit_to_string_tag_with_context(
             smallvec::SmallVec::new(),
         )?,
     };
-    Ok(value.as_string(ctx.heap()).map(|s| s.to_lossy_string(ctx.heap())))
+    Ok(value
+        .as_string(ctx.heap())
+        .map(|s| s.to_lossy_string(ctx.heap())))
 }
 
 fn native_function_has_own(
@@ -2414,8 +2418,7 @@ pub fn call(
                 }
             }
             for sym in symbols {
-                if let Some(desc) = crate::object::get_own_symbol_descriptor(target, gc_heap, sym)
-                {
+                if let Some(desc) = crate::object::get_own_symbol_descriptor(target, gc_heap, sym) {
                     let value = Value::object(descriptor_to_object_with_roots(
                         &desc,
                         gc_heap,

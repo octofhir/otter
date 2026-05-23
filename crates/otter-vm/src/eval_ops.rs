@@ -207,9 +207,11 @@ impl Interpreter {
             function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "name")?;
         let length_value =
             function_metadata::callable_intrinsic_property(&mut metadata_ctx, &value, "length")?;
-        let function_id_opt = value
-            .as_function()
-            .or_else(|| value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let function_id_opt = value.as_function().or_else(|| {
+            value
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         let prototype_value = if let Some(function_id) = function_id_opt {
             let mut roots = Vec::with_capacity(value_roots.len() + 1);
             roots.push(&value);

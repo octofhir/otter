@@ -148,5 +148,4 @@ impl ClassConstructor {
     pub fn from_gc(inner: otter_gc::Gc<ClassConstructorBody>) -> Self {
         Self { inner }
     }
-
 }

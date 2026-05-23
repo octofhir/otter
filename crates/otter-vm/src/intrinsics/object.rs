@@ -9,8 +9,7 @@
 //! - <https://tc39.es/ecma262/#sec-object-constructor>
 
 use crate::bootstrap::{
-    BootstrapFeatures, alloc_object_with_value_roots, define_global,
-    native_static_with_value_roots,
+    BootstrapFeatures, alloc_object_with_value_roots, define_global, native_static_with_value_roots,
 };
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{JsSurfaceError, ObjectBuilder};

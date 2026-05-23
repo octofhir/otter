@@ -621,14 +621,14 @@ mod tests {
             .receiver
             .as_string(args.gc_heap)
             .ok_or(IntrinsicError::BadReceiver { expected: "string" })?;
-        let arg0 =
-            args.args
-                .first()
-                .and_then(|v| v.as_string(args.gc_heap))
-                .ok_or(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "must be a string",
-                })?;
+        let arg0 = args
+            .args
+            .first()
+            .and_then(|v| v.as_string(args.gc_heap))
+            .ok_or(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "must be a string",
+            })?;
         let out = JsString::concat(recv, arg0, args.gc_heap)?;
         Ok(Value::string(out))
     }

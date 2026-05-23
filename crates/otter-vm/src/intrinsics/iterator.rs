@@ -9,13 +9,13 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-iterator-constructor>
 
+use crate::Value;
 use crate::bootstrap::{
-    BootstrapFeatures, alloc_object_with_value_roots,
-    native_constructor_static_with_value_roots, native_static_with_value_roots,
+    BootstrapFeatures, alloc_object_with_value_roots, native_constructor_static_with_value_roots,
+    native_static_with_value_roots,
 };
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
-use crate::Value;
 
 /// §27.1.1.1 `Iterator()` constructor — abstract base for the
 /// ES2025 iterator-helpers protocol. Direct calls / direct `new`
@@ -107,7 +107,12 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
                 true,
             ),
         );
-        crate::bootstrap::define_global_value(global, heap, Self::NAME, Value::native_function(ctor));
+        crate::bootstrap::define_global_value(
+            global,
+            heap,
+            Self::NAME,
+            Value::native_function(ctor),
+        );
         let iterator_ctor = ctor;
         let ctor_root = Value::native_function(iterator_ctor);
         let from_fn =
@@ -1138,4 +1143,3 @@ fn iterator_from_native(
         reason: "argument is not iterable".to_string(),
     })
 }
-

@@ -761,9 +761,11 @@ impl Interpreter {
         // Functions / closures inherit Object.prototype-style
         // methods. Foundation routes the call through the user-
         // properties bag attached to the compiled function.
-        let fn_id_for_proto = recv_value
-            .as_function()
-            .or_else(|| recv_value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fn_id_for_proto = recv_value.as_function().or_else(|| {
+            recv_value
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fn_id_for_proto
             && matches!(
                 name,
@@ -942,10 +944,11 @@ impl Interpreter {
                     }
                 }
             })
-        } else if let Some(fid) = recv_value
-            .as_function()
-            .or_else(|| recv_value.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(fid) = recv_value.as_function().or_else(|| {
+            recv_value
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             // §10.1.8 OrdinaryGet on a callable receiver — user
             // properties resolve via the function-properties side table.
             Some(self.function_property_get_stack_rooted(context, stack, fid, name)?)
@@ -1020,7 +1023,9 @@ impl Interpreter {
         replace_all: bool,
     ) -> Result<Value, VmError> {
         use crate::string::JsString;
-        let recv = receiver.as_string(&self.gc_heap).ok_or(VmError::TypeMismatch)?;
+        let recv = receiver
+            .as_string(&self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
         let needle = args
             .first()
             .and_then(|v| v.as_string(&self.gc_heap))

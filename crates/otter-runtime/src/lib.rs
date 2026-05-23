@@ -1909,7 +1909,12 @@ impl Runtime {
             smallvec::SmallVec::with_capacity(entry.extra_args.len());
         args.extend(entry.extra_args);
         self.interp
-            .run_callable_sync(&context, &entry.callback, otter_vm::Value::undefined(), args)
+            .run_callable_sync(
+                &context,
+                &entry.callback,
+                otter_vm::Value::undefined(),
+                args,
+            )
             .map_err(|error| {
                 map_vm_error(otter_vm::RunError {
                     error,
@@ -3047,9 +3052,7 @@ fn diagnostic_from_thrown_value(
     // `errors`: AggregateError. Each entry becomes an aggregated
     // diagnostic; recurse one level so nested causes inside each
     // error survive.
-    if let Some(errors) =
-        otter_vm::object::get(obj, heap, "errors").and_then(|v| v.as_array())
-    {
+    if let Some(errors) = otter_vm::object::get(obj, heap, "errors").and_then(|v| v.as_array()) {
         let entries: Vec<Diagnostic> = otter_vm::array::with_elements(errors, heap, |slice| {
             slice
                 .iter()

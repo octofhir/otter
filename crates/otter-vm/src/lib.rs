@@ -55,6 +55,8 @@ pub mod bootstrap_promise;
 pub mod bootstrap_regexp;
 pub mod bootstrap_typed_array;
 pub mod bootstrap_weak_refs;
+pub mod bound_function;
+pub mod class_constructor;
 pub mod dynamic_import;
 pub mod error_classes;
 mod error_ops;
@@ -76,6 +78,7 @@ mod intl_ops;
 pub mod intrinsic_install;
 pub mod intrinsics;
 mod iterator_ops;
+pub mod iterator_state;
 pub mod js_surface;
 pub mod json;
 pub mod math;
@@ -95,12 +98,12 @@ mod property_atom;
 mod property_dispatch;
 mod property_ic;
 pub mod proxy;
+pub mod realm_intrinsics;
 pub mod reflect;
 mod reflect_ops;
 pub mod regexp;
 pub mod regexp_prototype;
 pub mod run_control;
-pub mod realm_intrinsics;
 pub mod runtime_budget;
 pub mod runtime_cx;
 pub mod runtime_state;
@@ -113,9 +116,6 @@ pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
 pub mod timers;
-pub mod bound_function;
-pub mod class_constructor;
-pub mod iterator_state;
 pub mod upvalue;
 pub mod value;
 pub mod weak_refs;
@@ -677,13 +677,14 @@ impl Interpreter {
             && let Some(iter_proto) = iter_proto_value.as_object()
         {
             let shape_root = interp.shape_runtime.root();
-            let protos = crate::intrinsics::iterator::build_builtin_iterator_prototypes_post_bootstrap(
-                &mut interp.gc_heap,
-                shape_root,
-                iter_proto,
-                &interp.well_known_symbols,
-            )
-            .expect("per-kind iterator prototypes fit within any positive cap");
+            let protos =
+                crate::intrinsics::iterator::build_builtin_iterator_prototypes_post_bootstrap(
+                    &mut interp.gc_heap,
+                    shape_root,
+                    iter_proto,
+                    &interp.well_known_symbols,
+                )
+                .expect("per-kind iterator prototypes fit within any positive cap");
             interp.array_iterator_prototype = Some(protos.array);
             interp.map_iterator_prototype = Some(protos.map);
             interp.set_iterator_prototype = Some(protos.set);
@@ -2386,12 +2387,11 @@ impl Interpreter {
             upvalues,
             this_for_callee,
         );
-        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args).map_err(
-            |error| RunError {
+        self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)
+            .map_err(|error| RunError {
                 error,
                 frames: Vec::new(),
-            },
-        )?;
+            })?;
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(new_frame);
         match self.dispatch_loop(context, &mut stack) {
@@ -2758,13 +2758,7 @@ impl Interpreter {
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
-                    owner.park_after_yield(
-                        &mut self.gc_heap,
-                        popped,
-                        detached_cold,
-                        dst,
-                        yielded,
-                    );
+                    owner.park_after_yield(&mut self.gc_heap, popped, detached_cold, dst, yielded);
                     let pending_request = if owner.is_async(&self.gc_heap) {
                         owner.take_pending_request(&mut self.gc_heap)
                     } else {
@@ -2941,8 +2935,7 @@ impl Interpreter {
                     // descriptor-backed arguments object.
                     let dst = register_operand(context.exec_operand(instr, 0))?;
                     let (elements, kind, mapped_entries, callee) = {
-                        let function_id =
-                            stack.last().ok_or(VmError::InvalidOperand)?.function_id;
+                        let function_id = stack.last().ok_or(VmError::InvalidOperand)?.function_id;
                         let function = context
                             .exec_function(function_id)
                             .ok_or(VmError::InvalidOperand)?;
@@ -7522,11 +7515,14 @@ mod tests {
         let mut interp = Interpreter::new();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&main);
-        interp.frame_ensure_cold(&mut frame).handlers.push(TryHandler {
-            catch_pc: Some(42),
-            finally_pc: None,
-            exc_register: 1,
-        });
+        interp
+            .frame_ensure_cold(&mut frame)
+            .handlers
+            .push(TryHandler {
+                catch_pc: Some(42),
+                finally_pc: None,
+                exc_register: 1,
+            });
         stack.push(frame);
         interp
             .unwind_throw(&mut stack, Value::boolean(true))

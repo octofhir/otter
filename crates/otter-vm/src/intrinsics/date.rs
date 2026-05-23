@@ -6,14 +6,13 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-date-objects>
 
+use crate::Value;
 use crate::bootstrap::{
-    BootstrapFeatures, alloc_object_with_value_roots, define_global,
-    native_static_with_value_roots,
+    BootstrapFeatures, alloc_object_with_value_roots, define_global, native_static_with_value_roots,
 };
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
-use crate::Value;
 
 fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::js_surface::MethodSpec;

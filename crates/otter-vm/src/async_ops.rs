@@ -392,9 +392,7 @@ impl Interpreter {
                     .take()
                     .unwrap_or(VmError::Uncaught { value: display }));
             };
-            let popped_handler = self
-                .frame_cold_mut(frame)
-                .and_then(|c| c.handlers.pop());
+            let popped_handler = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
             // Re-borrow `frame` after the helper's `&mut self` borrow.
             let frame = stack.last_mut().expect("frame still present");
             let Some(handler) = popped_handler else {

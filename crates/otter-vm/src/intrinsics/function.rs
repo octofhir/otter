@@ -7,6 +7,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-function-objects>
 
+use crate::Value;
 use crate::bootstrap::{
     BootstrapFeatures, alloc_object_with_value_roots, define_global,
     native_constructor_static_with_value_roots, native_new_target_prototype,
@@ -16,7 +17,6 @@ use crate::function_prototype;
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{JsSurfaceError, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
-use crate::Value;
 
 fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::{NativeCtx, NativeError};
@@ -135,8 +135,6 @@ fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(),
 
 // `Math` installer migrated to [`crate::math::Intrinsic`].
 // `JSON` installer migrated to [`crate::json::Intrinsic`].
-
-
 
 /// `BuiltinIntrinsic` adapter for the global `Function` constructor.
 pub struct Intrinsic;

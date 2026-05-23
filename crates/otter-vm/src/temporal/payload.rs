@@ -225,5 +225,4 @@ impl JsTemporal {
     pub fn ptr_eq(self, other: Self) -> bool {
         self.inner == other.inner
     }
-
 }

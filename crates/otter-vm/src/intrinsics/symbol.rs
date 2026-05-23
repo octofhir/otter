@@ -10,6 +10,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-symbol-constructor>
 
+use crate::Value;
 use crate::bootstrap::{
     BootstrapFeatures, alloc_object_with_value_roots, define_global,
     install_iterator_well_knowns_post_bootstrap, native_static_with_value_roots,
@@ -17,7 +18,6 @@ use crate::bootstrap::{
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::object::{self, JsObject, PropertyDescriptor};
-use crate::Value;
 
 fn install_symbol(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
     use crate::symbol::WellKnown;
@@ -654,7 +654,6 @@ fn install_constructor_species_accessor(
     }
     Ok(())
 }
-
 
 /// `BuiltinIntrinsic` adapter for the global `Symbol` constructor.
 pub struct Intrinsic;

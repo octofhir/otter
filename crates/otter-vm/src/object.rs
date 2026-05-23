@@ -171,7 +171,6 @@ impl ObjectPrototype {
     }
 }
 
-
 // ---------- internal slot type --------------------------------------------
 
 /// Slot stored alongside each shape key. Mirrors the public

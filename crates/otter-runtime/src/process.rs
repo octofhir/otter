@@ -240,9 +240,8 @@ fn define_process_method(
 }
 
 pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
-    let Some(process) =
-        otter_vm::object::get(*interp.global_this(), interp.gc_heap(), "process")
-            .and_then(|v| v.as_object())
+    let Some(process) = otter_vm::object::get(*interp.global_this(), interp.gc_heap(), "process")
+        .and_then(|v| v.as_object())
     else {
         return 0;
     };
@@ -274,12 +273,13 @@ fn process_exit(
     _ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    let code = normalize_exit_code(args.first().unwrap_or(&Value::undefined())).ok_or_else(|| {
-        NativeError::TypeError {
-            name: "process.exit",
-            reason: "exit code must be a finite number between 0 and 255".to_string(),
-        }
-    })?;
+    let code =
+        normalize_exit_code(args.first().unwrap_or(&Value::undefined())).ok_or_else(|| {
+            NativeError::TypeError {
+                name: "process.exit",
+                reason: "exit code must be a finite number between 0 and 255".to_string(),
+            }
+        })?;
     Err(NativeError::Exit { code })
 }
 

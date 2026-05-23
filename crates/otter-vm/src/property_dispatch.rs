@@ -322,10 +322,11 @@ impl Interpreter {
             crate::object::delete(o, &mut self.gc_heap, name)
         } else if let Some(arr) = receiver.as_array() {
             crate::array::delete_named_property(arr, &mut self.gc_heap, name)
-        } else if let Some(function_id) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(function_id) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             self.ordinary_function_delete_own_property(function_id, name)
         } else if let Some(native) = receiver.as_native_function() {
             native.delete_own_property(&mut self.gc_heap, name)
@@ -424,10 +425,11 @@ impl Interpreter {
             } else {
                 true
             }
-        } else if let Some(function_id) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(function_id) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_lossy_string(&self.gc_heap);
                 self.ordinary_function_delete_own_property(function_id, &name)
@@ -676,10 +678,11 @@ impl Interpreter {
                 Some(value) => value,
                 None => self.load_from_constructor_prototype(context, "Array", v, name)?,
             }
-        } else if let Some(fid) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(fid) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             self.function_property_get_stack_rooted(context, stack, fid, name)?
         } else if let Some(native) = receiver.as_native_function() {
             match native.own_property_descriptor(&mut self.gc_heap, name)? {
@@ -953,10 +956,11 @@ impl Interpreter {
                 typed_array_set_expando(self, &t, name, value)?;
             }
             None
-        } else if let Some(fid) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(fid) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             let has_own = self
                 .ordinary_function_has_own_string_property_for_extensibility(context, fid, name)?;
             if matches!(name, "name" | "length") {
@@ -2193,10 +2197,11 @@ impl Interpreter {
             || receiver.is_native_function()
             || receiver.is_class_constructor()
         {
-            let own_present = if let Some(fid) = receiver
-                .as_function()
-                .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-            {
+            let own_present = if let Some(fid) = receiver.as_function().or_else(|| {
+                receiver
+                    .as_closure(&self.gc_heap)
+                    .map(|c| c.cached_function_id)
+            }) {
                 self.function_user_props
                     .get(&fid)
                     .copied()
@@ -2240,10 +2245,11 @@ impl Interpreter {
             o
         } else if let Some(c) = receiver.as_class_constructor() {
             c.statics(&self.gc_heap)
-        } else if let Some(fid) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(fid) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             match self.function_user_props.get(&fid).copied() {
                 Some(bag) => bag,
                 None => self.function_user_bag_with_stack_roots(stack, fid, &[&receiver])?,
@@ -2421,10 +2427,11 @@ impl Interpreter {
                 return Ok(true);
             }
             class.statics(&self.gc_heap)
-        } else if let Some(fid) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(fid) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             let Some(bag) = self.function_user_props.get(&fid).copied() else {
                 return Ok(false);
             };
@@ -2971,10 +2978,11 @@ impl Interpreter {
             obj
         } else if let Some(class) = receiver.as_class_constructor() {
             class.statics(&self.gc_heap)
-        } else if let Some(fid) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(fid) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             match &key {
                 ComputedPropertyKey::String(key) => {
                     if function_metadata::ordinary_function_metadata_key(key).is_some()
@@ -3321,10 +3329,11 @@ impl Interpreter {
             o
         } else if let Some(c) = receiver.as_class_constructor() {
             c.statics(&self.gc_heap)
-        } else if let Some(fid) = receiver
-            .as_function()
-            .or_else(|| receiver.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
-        {
+        } else if let Some(fid) = receiver.as_function().or_else(|| {
+            receiver
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
             if function_metadata::ordinary_function_metadata_key(name).is_some()
                 && let Some(desc) =
                     self.ordinary_function_own_property_descriptor(Some(context), fid, name)?

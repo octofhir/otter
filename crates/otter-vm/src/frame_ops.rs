@@ -148,9 +148,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
-        let popped = self
-            .frame_cold_mut(frame)
-            .and_then(|c| c.handlers.pop());
+        let popped = self.frame_cold_mut(frame).and_then(|c| c.handlers.pop());
         if popped.is_none() {
             return Err(VmError::InvalidOperand);
         }

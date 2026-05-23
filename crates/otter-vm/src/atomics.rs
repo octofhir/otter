@@ -359,7 +359,10 @@ const fn spec_name(method: &'static str) -> &'static str {
 // =====================================================================
 
 fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        false,
         "Atomics.load",
     )?;
     let idx = validate_atomic_access(
@@ -382,7 +385,10 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 }
 
 fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        false,
         "Atomics.store",
     )?;
     let idx = validate_atomic_access(
@@ -408,7 +414,10 @@ fn modify_op(
     op: fn(i64, i64) -> i64,
     op_big: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
 ) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        false,
         method_name,
     )?;
     let idx = validate_atomic_access(
@@ -493,7 +502,10 @@ fn native_xor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 }
 
 fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        false,
         "Atomics.exchange",
     )?;
     let idx = validate_atomic_access(
@@ -524,7 +536,10 @@ fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 }
 
 fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), false,
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        false,
         "Atomics.compareExchange",
     )?;
     let idx = validate_atomic_access(
@@ -643,8 +658,12 @@ fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Va
     } else {
         "Atomics.wait"
     };
-    let ta =
-        validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), true, method_name)?;
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        true,
+        method_name,
+    )?;
     // §25.4.3.13 Atomics.wait — buffer must be a SharedArrayBuffer.
     if !ta.buffer(ctx.heap()).is_shared() {
         return Err(type_err(
@@ -751,7 +770,10 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     // Allows Int32Array / BigInt64Array; no SharedArrayBuffer
     // requirement — the spec returns 0 for a non-shared buffer
     // because no thread can be waiting on a non-shared backing.
-    let ta = validate_integer_typed_array(args.first().unwrap_or(&Value::UNDEFINED), ctx.heap(), true,
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        true,
         "Atomics.notify",
     )?;
     let idx = validate_atomic_access(

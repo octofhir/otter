@@ -1053,9 +1053,11 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         callee: &Value,
     ) -> Result<Option<Value>, VmError> {
-        let function_id = callee
-            .as_function()
-            .or_else(|| callee.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let function_id = callee.as_function().or_else(|| {
+            callee
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = function_id {
             return match self.function_property_get_stack_rooted(
                 context,
@@ -1092,9 +1094,11 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Option<Value>, VmError> {
-        let function_id = callee
-            .as_function()
-            .or_else(|| callee.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let function_id = callee.as_function().or_else(|| {
+            callee
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = function_id {
             return match self.function_property_get_runtime_rooted(
                 context,

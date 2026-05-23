@@ -584,10 +584,18 @@ pub fn equals_string_bodies(heap: &GcHeap, a: JsStringHandle, b: JsStringHandle)
         return true;
     }
     let (a_len, a_hash, a_is_cons) = heap.read_payload(a, |body| {
-        (body.len, body.hash, matches!(body.repr, JsStringBodyRepr::Cons { .. }))
+        (
+            body.len,
+            body.hash,
+            matches!(body.repr, JsStringBodyRepr::Cons { .. }),
+        )
     });
     let (b_len, b_hash, b_is_cons) = heap.read_payload(b, |body| {
-        (body.len, body.hash, matches!(body.repr, JsStringBodyRepr::Cons { .. }))
+        (
+            body.len,
+            body.hash,
+            matches!(body.repr, JsStringBodyRepr::Cons { .. }),
+        )
     });
     if a_len != b_len {
         return false;

@@ -489,11 +489,7 @@ fn impl_starts_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicErro
     let recv = receiver_string(args)?;
     let needle = arg_to_string(args, 0)?;
     let from = arg_u32_or(args, 1, 0)?;
-    Ok(Value::boolean(recv.starts_with(
-        needle,
-        from,
-        args.gc_heap,
-    )))
+    Ok(Value::boolean(recv.starts_with(needle, from, args.gc_heap)))
 }
 
 fn impl_ends_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {

@@ -31,7 +31,7 @@
 //! [`op_to_byte`] / [`op_from_byte`] table covers the smoke-test
 //! opcode subset.
 
-use crate::{Instruction, Op, Operand, OperandList};
+use crate::{Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList};
 
 /// Current bytecode wire-format version.
 pub const BYTECODE_SCHEMA_VERSION: u16 = 2;
@@ -68,7 +68,10 @@ impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnexpectedEnd { offset } => {
-                write!(f, "unexpected end of bytecode stream at byte offset {offset}")
+                write!(
+                    f,
+                    "unexpected end of bytecode stream at byte offset {offset}"
+                )
             }
             Self::UnknownOpcode { offset, byte } => {
                 write!(f, "unknown opcode byte 0x{byte:02X} at offset {offset}")
@@ -162,17 +165,140 @@ pub struct EncodedFunction {
 /// Encode a whole function body (an [`Instruction`] slice in source
 /// order) into the v2 byte stream and return both the bytes and the
 /// per-instruction byte-offset map.
+///
+/// Jump-class opcodes (`Op::Jump`, `Op::JumpIfTrue`, `Op::JumpIfFalse`,
+/// `Op::JumpIfNullish`, `Op::EnterTry`) carry `Imm32` operands whose
+/// v1 semantics are *instruction-index* deltas relative to the
+/// instruction immediately following the jump. v2 wire format requires
+/// *byte-offset* deltas relative to `(jump_pc + 1)` (the byte after the
+/// opcode byte). Encoding is a two-pass walk:
+///
+/// 1. Write every instruction in order, capturing each jump operand's
+///    byte position and the source v1 delta.
+/// 2. Re-resolve each captured slot to a byte-offset delta computed
+///    against `instr_to_byte_pc`.
+///
+/// The `NO_HANDLER_OFFSET` sentinel (`i32::MIN`) is preserved as-is —
+/// the runtime treats it as "absent handler" for [`Op::EnterTry`].
 #[must_use]
 pub fn encode_function(instructions: &[Instruction]) -> EncodedFunction {
     let mut writer = BytecodeWriter::new();
     let mut instr_to_byte_pc: Vec<u32> = Vec::with_capacity(instructions.len());
-    for instr in instructions {
-        instr_to_byte_pc.push(writer.pc());
-        writer.write(instr);
+    let mut fixups: Vec<JumpFixup> = Vec::new();
+
+    for (idx, instr) in instructions.iter().enumerate() {
+        let byte_pc = writer.pc();
+        instr_to_byte_pc.push(byte_pc);
+        write_instruction_capturing_jumps(&mut writer, instr, idx, byte_pc, &mut fixups);
     }
+
+    let total_bytes = writer.pc();
+    for fixup in &fixups {
+        resolve_jump_fixup(
+            &mut writer.bytes,
+            fixup,
+            &instr_to_byte_pc,
+            total_bytes,
+            instructions.len(),
+        );
+    }
+
     EncodedFunction {
         code: writer.into_bytes(),
         instr_to_byte_pc: instr_to_byte_pc.into_boxed_slice(),
+    }
+}
+
+/// Slot bookkeeping for a single jump-class `Imm32` operand needing
+/// byte-offset patching after the whole function has been laid out.
+#[derive(Debug, Clone, Copy)]
+struct JumpFixup {
+    /// Source-order index of the jump instruction.
+    jump_idx: usize,
+    /// Byte offset of the jump opcode byte in the encoded stream.
+    jump_byte_pc: u32,
+    /// Byte offset of the `Imm32` payload bytes (the four bytes after
+    /// the operand kind tag) for this jump operand.
+    imm32_byte_offset: u32,
+}
+
+fn write_instruction_capturing_jumps(
+    writer: &mut BytecodeWriter,
+    instr: &Instruction,
+    jump_idx: usize,
+    jump_byte_pc: u32,
+    fixups: &mut Vec<JumpFixup>,
+) {
+    let opcode_byte = op_to_byte(instr.op)
+        .unwrap_or_else(|| panic!("opcode {:?} not registered in bytecode v2 table", instr.op));
+    writer.bytes.push(opcode_byte);
+    let operands = instr.operands.as_slice();
+    let count = u8::try_from(operands.len()).expect("instruction operand count exceeds u8::MAX");
+    writer.bytes.push(count);
+    let branch_slots = branch_imm32_operand_slots(instr.op);
+    for (op_idx, operand) in operands.iter().enumerate() {
+        let operand_start = writer.bytes.len() as u32;
+        writer.write_operand(operand);
+        if branch_slots.contains(&op_idx) {
+            assert!(
+                matches!(operand, Operand::Imm32(_)),
+                "branch operand at slot {op_idx} of {:?} must be Imm32, got {operand:?}",
+                instr.op
+            );
+            // `operand_start` points at the operand-kind tag byte; the
+            // four little-endian `Imm32` payload bytes follow it.
+            fixups.push(JumpFixup {
+                jump_idx,
+                jump_byte_pc,
+                imm32_byte_offset: operand_start + 1,
+            });
+        }
+    }
+}
+
+fn resolve_jump_fixup(
+    bytes: &mut [u8],
+    fixup: &JumpFixup,
+    instr_to_byte_pc: &[u32],
+    total_bytes: u32,
+    instruction_count: usize,
+) {
+    let start = fixup.imm32_byte_offset as usize;
+    let raw_bytes: [u8; 4] = bytes[start..start + 4]
+        .try_into()
+        .expect("imm32 payload occupies exactly 4 bytes");
+    let raw = i32::from_le_bytes(raw_bytes);
+    if raw == NO_HANDLER_OFFSET {
+        return;
+    }
+    let target_instr_idx = (fixup.jump_idx as i64) + 1 + (raw as i64);
+    assert!(
+        target_instr_idx >= 0,
+        "jump target instruction index underflow: jump_idx={} raw_delta={}",
+        fixup.jump_idx,
+        raw
+    );
+    let target_byte_pc = if target_instr_idx as usize == instruction_count {
+        // Jump past the last instruction lands at end-of-stream.
+        total_bytes
+    } else {
+        instr_to_byte_pc[target_instr_idx as usize]
+    };
+    let base = i64::from(fixup.jump_byte_pc) + 1;
+    let byte_delta = i64::from(target_byte_pc) - base;
+    let byte_delta_i32 =
+        i32::try_from(byte_delta).expect("jump byte-offset delta exceeds i32 range");
+    bytes[start..start + 4].copy_from_slice(&byte_delta_i32.to_le_bytes());
+}
+
+/// Operand slot positions whose `Imm32` value is a branch offset that
+/// the v2 encoder must rewrite from instruction-index delta to
+/// byte-offset delta. Non-branch opcodes return an empty slice.
+fn branch_imm32_operand_slots(op: Op) -> &'static [usize] {
+    match op {
+        Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => &[0],
+        Op::EnterTry => &[0, 1],
+        _ => &[],
     }
 }
 
@@ -193,7 +319,6 @@ pub fn decode_function(code: &[u8]) -> Result<Vec<Instruction>, DecodeError> {
     }
     Ok(out)
 }
-
 
 /// Decode the next instruction from `code` starting at byte offset
 /// `pc`. Returns the decoded instruction and the byte offset of the
@@ -452,10 +577,7 @@ mod tests {
 
     #[test]
     fn roundtrip_load_int32() {
-        let instr = make_instr(
-            Op::LoadInt32,
-            &[Operand::Register(0), Operand::Imm32(-42)],
-        );
+        let instr = make_instr(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(-42)]);
         assert_eq!(roundtrip(&instr), instr);
     }
 
@@ -570,10 +692,7 @@ mod tests {
         let instructions = vec![
             make_instr(Op::Nop, &[]),
             make_instr(Op::LoadUndefined, &[Operand::Register(0)]),
-            make_instr(
-                Op::LoadInt32,
-                &[Operand::Register(1), Operand::Imm32(42)],
-            ),
+            make_instr(Op::LoadInt32, &[Operand::Register(1), Operand::Imm32(42)]),
             make_instr(
                 Op::Add,
                 &[
@@ -609,6 +728,132 @@ mod tests {
                 "decoded pc must match the byte-offset map"
             );
         }
+    }
+
+    #[test]
+    fn forward_jump_is_rewritten_to_byte_offset_delta() {
+        // Layout: instr 0 = LoadInt32 (size 1 + 1 + 3 + 5 = 10 bytes),
+        // instr 1 = Jump +1 (target = instr 3) (size 1 + 1 + 5 = 7),
+        // instr 2 = LoadInt32 (10 bytes),
+        // instr 3 = Return (1 + 1 + 3 = 5 bytes).
+        let instructions = vec![
+            make_instr(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(7)]),
+            make_instr(Op::Jump, &[Operand::Imm32(1)]),
+            make_instr(Op::LoadInt32, &[Operand::Register(1), Operand::Imm32(8)]),
+            make_instr(Op::Return, &[Operand::Register(0)]),
+        ];
+        let encoded = encode_function(&instructions);
+        let jump_byte_pc = encoded.instr_to_byte_pc[1];
+        let target_byte_pc = encoded.instr_to_byte_pc[3];
+        // Re-decode the jump and confirm its Imm32 is the byte-offset
+        // delta from `(jump_pc + 1)` to the target.
+        let (decoded_jump, _) = decode_instruction(&encoded.code, jump_byte_pc as usize).unwrap();
+        let Operand::Imm32(byte_delta) = decoded_jump.operands.as_slice()[0] else {
+            panic!("jump operand must remain Imm32");
+        };
+        let resolved_target = (jump_byte_pc as i64) + 1 + (byte_delta as i64);
+        assert_eq!(resolved_target as u32, target_byte_pc);
+    }
+
+    #[test]
+    fn backward_jump_byte_delta_is_negative() {
+        // instr 0 = LoadInt32 (10),
+        // instr 1 = Return (5),
+        // instr 2 = Jump -2 (target = instr 1)
+        let instructions = vec![
+            make_instr(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(0)]),
+            make_instr(Op::Return, &[Operand::Register(0)]),
+            make_instr(Op::Jump, &[Operand::Imm32(-2)]),
+        ];
+        let encoded = encode_function(&instructions);
+        let jump_byte_pc = encoded.instr_to_byte_pc[2];
+        let target_byte_pc = encoded.instr_to_byte_pc[1];
+        let (decoded_jump, _) = decode_instruction(&encoded.code, jump_byte_pc as usize).unwrap();
+        let Operand::Imm32(byte_delta) = decoded_jump.operands.as_slice()[0] else {
+            panic!("jump operand must remain Imm32");
+        };
+        assert!(
+            byte_delta < 0,
+            "expected backward branch delta, got {byte_delta}"
+        );
+        let resolved_target = (jump_byte_pc as i64) + 1 + (byte_delta as i64);
+        assert_eq!(resolved_target as u32, target_byte_pc);
+    }
+
+    #[test]
+    fn enter_try_no_handler_sentinel_preserved() {
+        let instructions = vec![
+            make_instr(
+                Op::EnterTry,
+                &[
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Register(0),
+                ],
+            ),
+            make_instr(Op::LeaveTry, &[]),
+            make_instr(Op::Return, &[Operand::Register(0)]),
+        ];
+        let encoded = encode_function(&instructions);
+        let (decoded, _) = decode_instruction(&encoded.code, 0).unwrap();
+        let operands = decoded.operands.as_slice();
+        assert_eq!(operands[0], Operand::Imm32(NO_HANDLER_OFFSET));
+        assert_eq!(operands[1], Operand::Imm32(NO_HANDLER_OFFSET));
+        assert_eq!(operands[2], Operand::Register(0));
+    }
+
+    #[test]
+    fn enter_try_handler_offsets_rewritten_to_byte_pcs() {
+        // instr 0 = EnterTry catch=+1 finally=NO_HANDLER (size = 1+1+5+5+3 = 15)
+        // instr 1 = LoadInt32 (size 10)
+        // instr 2 = LeaveTry (size 1+1 = 2)        ← catch target
+        // instr 3 = Return (size 5)
+        let instructions = vec![
+            make_instr(
+                Op::EnterTry,
+                &[
+                    Operand::Imm32(1), // catch_offset (instr-index delta = +1 → target = idx 2)
+                    Operand::Imm32(NO_HANDLER_OFFSET),
+                    Operand::Register(7),
+                ],
+            ),
+            make_instr(Op::LoadInt32, &[Operand::Register(0), Operand::Imm32(0)]),
+            make_instr(Op::LeaveTry, &[]),
+            make_instr(Op::Return, &[Operand::Register(0)]),
+        ];
+        let encoded = encode_function(&instructions);
+        let try_byte_pc = encoded.instr_to_byte_pc[0];
+        let leave_byte_pc = encoded.instr_to_byte_pc[2];
+        let (decoded, _) = decode_instruction(&encoded.code, try_byte_pc as usize).unwrap();
+        let operands = decoded.operands.as_slice();
+        let Operand::Imm32(catch_byte_delta) = operands[0] else {
+            panic!("catch operand must remain Imm32");
+        };
+        assert_eq!(operands[1], Operand::Imm32(NO_HANDLER_OFFSET));
+        assert_eq!(operands[2], Operand::Register(7));
+        let resolved = (try_byte_pc as i64) + 1 + (catch_byte_delta as i64);
+        assert_eq!(resolved as u32, leave_byte_pc);
+    }
+
+    #[test]
+    fn jump_past_last_instruction_lands_at_stream_end() {
+        // Jump +0 from a last-position instruction equals "fall off"
+        // (target = instructions.len()). Encoder maps that to the end
+        // of the byte stream so unwind / source-map clients see a
+        // stable PC.
+        let instructions = vec![
+            make_instr(Op::Nop, &[]),
+            make_instr(Op::Jump, &[Operand::Imm32(0)]),
+        ];
+        let encoded = encode_function(&instructions);
+        let total_len = encoded.code.len() as u32;
+        let jump_byte_pc = encoded.instr_to_byte_pc[1];
+        let (decoded, _) = decode_instruction(&encoded.code, jump_byte_pc as usize).unwrap();
+        let Operand::Imm32(delta) = decoded.operands.as_slice()[0] else {
+            panic!("jump operand kind");
+        };
+        let resolved = (jump_byte_pc as i64) + 1 + (delta as i64);
+        assert_eq!(resolved as u32, total_len);
     }
 
     #[test]

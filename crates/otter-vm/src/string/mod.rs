@@ -211,11 +211,7 @@ impl JsString {
     ///
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
-    pub fn concat(
-        left: JsString,
-        right: JsString,
-        heap: &mut GcHeap,
-    ) -> Result<Self, OutOfMemory> {
+    pub fn concat(left: JsString, right: JsString, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
         if right.is_empty() {
             return Ok(left);
         }

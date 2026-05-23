@@ -413,7 +413,6 @@ fn build_global_this_impl(
     Ok(global)
 }
 
-
 /// Per-kind iterator prototypes built off `%IteratorPrototype%`.
 /// Returned from [`build_builtin_iterator_prototypes_post_bootstrap`]
 /// so the caller can stash them on the [`crate::Interpreter`] cache
@@ -635,4 +634,3 @@ mod tests {
         assert_eq!(abs.length(&heap), 1);
     }
 }
-

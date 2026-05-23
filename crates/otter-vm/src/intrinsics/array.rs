@@ -7,8 +7,7 @@
 //! - <https://tc39.es/ecma262/#sec-array-constructor>
 
 use crate::bootstrap::{
-    BootstrapFeatures, alloc_object_with_value_roots, define_global,
-    native_static_with_value_roots,
+    BootstrapFeatures, alloc_object_with_value_roots, define_global, native_static_with_value_roots,
 };
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{JsSurfaceError, ObjectBuilder};
@@ -166,7 +165,6 @@ fn install_array(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), Js
     define_global(global, heap, "Array", Value::object(array));
     Ok(())
 }
-
 
 /// `BuiltinIntrinsic` adapter for the global `Array` constructor.
 pub struct Intrinsic;

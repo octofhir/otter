@@ -1386,7 +1386,10 @@ impl Interpreter {
                 } else if own_property_names_uses_internal_methods(target) {
                     self.own_property_keys_value(context, target)?
                         .into_iter()
-                        .filter_map(|key| key.as_string(&self.gc_heap).map(|s| s.to_lossy_string(&self.gc_heap)))
+                        .filter_map(|key| {
+                            key.as_string(&self.gc_heap)
+                                .map(|s| s.to_lossy_string(&self.gc_heap))
+                        })
                         .collect()
                 } else {
                     return Err(VmError::TypeMismatch);

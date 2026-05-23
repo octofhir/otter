@@ -49,26 +49,24 @@ fn proxy_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     }
     let target = proxy_target_arg(args)?;
     let handler = proxy_handler_arg(args)?;
-    let proxy =
-        crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
-            NativeError::TypeError {
-                name: "Proxy",
-                reason: "out of memory while allocating proxy".to_string(),
-            }
-        })?;
+    let proxy = crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
+        NativeError::TypeError {
+            name: "Proxy",
+            reason: "out of memory while allocating proxy".to_string(),
+        }
+    })?;
     Ok(Value::proxy(proxy))
 }
 
 fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let target = proxy_target_arg(args)?;
     let handler = proxy_handler_arg(args)?;
-    let proxy =
-        crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
-            NativeError::TypeError {
-                name: "Proxy.revocable",
-                reason: "out of memory while allocating proxy".to_string(),
-            }
-        })?;
+    let proxy = crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
+        NativeError::TypeError {
+            name: "Proxy.revocable",
+            reason: "out of memory while allocating proxy".to_string(),
+        }
+    })?;
     let proxy_value = Value::proxy(proxy);
     let revoke = ctx
         .native_value_with_captures(

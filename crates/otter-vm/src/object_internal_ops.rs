@@ -643,9 +643,11 @@ impl Interpreter {
             }
             return Ok(None);
         }
-        let function_id = target
-            .as_function()
-            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let function_id = target.as_function().or_else(|| {
+            target
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = function_id {
             if let VmPropertyKey::Symbol(sym) = key {
                 let Some(bag) = self.function_user_props.get(&function_id).copied() else {
@@ -809,9 +811,11 @@ impl Interpreter {
         if let Some(arr) = value.as_array() {
             return Ok(array::is_extensible(arr, &self.gc_heap));
         }
-        let fid = value
-            .as_function()
-            .or_else(|| value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fid = value.as_function().or_else(|| {
+            value
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fid {
             return Ok(self.ordinary_function_is_extensible(function_id));
         }
@@ -993,9 +997,11 @@ impl Interpreter {
                 self.define_own_property_partial(statics, k, descriptor)?
             });
         }
-        let fid = target
-            .as_function()
-            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fid = target.as_function().or_else(|| {
+            target
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fid {
             if let VmPropertyKey::Symbol(sym) = key {
                 let bag = self.function_user_bag_runtime_rooted(function_id, &[], &[])?;
@@ -1956,9 +1962,11 @@ impl Interpreter {
             }
             return Ok(keys);
         }
-        let fid = target
-            .as_function()
-            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fid = target.as_function().or_else(|| {
+            target
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fid {
             let names = self.ordinary_function_own_property_keys(context, function_id);
             let mut keys: Vec<Value> = Vec::with_capacity(names.len());
@@ -2329,9 +2337,11 @@ impl Interpreter {
             array::prevent_extensions(arr, &mut self.gc_heap);
             return Ok(true);
         }
-        let fid = value
-            .as_function()
-            .or_else(|| value.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fid = value.as_function().or_else(|| {
+            value
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fid {
             self.ordinary_function_prevent_extensions(function_id);
             return Ok(true);
@@ -3474,9 +3484,11 @@ impl Interpreter {
             }
             return Ok(out);
         }
-        let fid = target
-            .as_function()
-            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fid = target.as_function().or_else(|| {
+            target
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fid {
             let keys = self.ordinary_function_own_property_keys(context, function_id);
             let mut out = Vec::with_capacity(keys.len());
@@ -3637,9 +3649,11 @@ impl Interpreter {
                 true
             });
         }
-        let fid = target
-            .as_function()
-            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fid = target.as_function().or_else(|| {
+            target
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fid {
             return Ok(if let Some(key) = key.string_name() {
                 self.ordinary_function_delete_own_property(function_id, key)
@@ -3786,9 +3800,11 @@ impl Interpreter {
                 _ => Ok(false),
             };
         }
-        let fid = target
-            .as_function()
-            .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+        let fid = target.as_function().or_else(|| {
+            target
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        });
         if let Some(function_id) = fid {
             return match key {
                 VmPropertyKey::Symbol(sym) => {

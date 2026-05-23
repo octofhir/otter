@@ -140,7 +140,6 @@ impl BigIntValue {
         Self { inner: handle }
     }
 
-
     /// Spec rendering: decimal digits **without** a trailing `n`.
     /// Computed on demand from the body's `BigInt` payload — V8 /
     /// JSC / SpiderMonkey all lazy-compute `toString` and the hot

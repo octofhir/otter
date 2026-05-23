@@ -17,7 +17,11 @@ use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value};
 
 fn proxy_target_is_object(value: &Value) -> bool {
-    value.is_object_like()
+    // §28.2.1 step 1 — `Type(target) is Object`. Spec `Object`
+    // includes callable / exotic objects (functions, arrays,
+    // proxies, …), not just ordinary objects. `is_object_like` only
+    // tests `TAG_PTR_OBJECT`, so use the wider `is_object_type`.
+    value.is_object_type()
 }
 
 fn proxy_target_arg(args: &[Value]) -> Result<Value, NativeError> {

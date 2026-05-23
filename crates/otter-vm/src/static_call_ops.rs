@@ -22,8 +22,8 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, Value, VmError, VmPropertyKey,
-    array, bigint, binary, object, object_statics,
+    ExecutionContext, Frame, Interpreter, Value, VmError, VmPropertyKey, array, bigint, binary,
+    object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
@@ -174,6 +174,112 @@ impl Interpreter {
             &mut external_visit,
         )?;
         finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
+    }
+
+    /// `Op::ForInKeys` — snapshot enumerable string-typed keys of an
+    /// object (own + prototype chain) into a fresh array. Backs the
+    /// compiler's `for-in` lowering; not user-observable as a method.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-enumerate-object-properties>
+    pub(crate) fn run_for_in_keys_operands(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        let (dst, target) = {
+            let frame = &stack[top_idx];
+            let dst = register_operand(operands.first())?;
+            let src = register_operand(operands.get(1))?;
+            let target = *read_register(frame, src)?;
+            (dst, target)
+        };
+        let keys = self.enumerable_for_in_string_keys_for_value(context, target)?;
+        let args_root = [target];
+        let mut names = Vec::with_capacity(keys.len());
+        for key in keys {
+            names.push(stack_static_string_value(&key, self)?);
+        }
+        let array = self.alloc_stack_rooted_array_from_values_with_root_slices(
+            stack,
+            names,
+            &[],
+            &[&args_root],
+        )?;
+        finish_static_call(
+            &mut stack[top_idx],
+            dst,
+            Value::array(array),
+            self.current_byte_len,
+        )
+    }
+
+    /// `Op::CopyDataProperties` — §7.3.31 CopyDataProperties applied
+    /// to `target` from `src`. No return value (compiler discards it).
+    /// Routes around any user shadow of `Object.assign`.
+    pub(crate) fn run_copy_data_properties_operands(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        let (target, src) = {
+            let frame = &stack[top_idx];
+            let target_reg = register_operand(operands.first())?;
+            let src_reg = register_operand(operands.get(1))?;
+            (
+                *read_register(frame, target_reg)?,
+                *read_register(frame, src_reg)?,
+            )
+        };
+        let args = [target, src];
+        let _ = self.do_object_assign(context, stack, &args)?;
+        let frame = &mut stack[top_idx];
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
+    }
+
+    /// `Op::DefineOwnProperty` — §10.1.6.1 OrdinaryDefineOwnProperty
+    /// on `target` using `key` and the property-descriptor object
+    /// `desc` (read through accessor-aware ToPropertyDescriptor).
+    /// Routes around any user shadow of `Object.defineProperty`.
+    pub(crate) fn run_define_own_property_operands(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        operands: &[Operand],
+    ) -> Result<(), VmError> {
+        let top_idx = stack.len() - 1;
+        let (target, key_value, desc_value) = {
+            let frame = &stack[top_idx];
+            let t = register_operand(operands.first())?;
+            let k = register_operand(operands.get(1))?;
+            let d = register_operand(operands.get(2))?;
+            (
+                *read_register(frame, t)?,
+                *read_register(frame, k)?,
+                *read_register(frame, d)?,
+            )
+        };
+        if !target.is_object_type() {
+            return Err(VmError::TypeError {
+                message: "DefineOwnProperty target must be an object".to_string(),
+            });
+        }
+        let key = self.evaluate_to_property_key(context, &key_value)?;
+        let descriptor = self.evaluate_to_property_descriptor(context, &desc_value)?;
+        let ok = self.define_own_property_value(context, &target, &key, descriptor)?;
+        if !ok {
+            return Err(VmError::TypeError {
+                message: "Cannot define property".to_string(),
+            });
+        }
+        let frame = &mut stack[top_idx];
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
     }
 
     pub(crate) fn run_object_static_call_operands(
@@ -1250,7 +1356,6 @@ impl Interpreter {
         self.set_property(result, "configurable", Value::boolean(desc.configurable()))?;
         Ok(result)
     }
-
 }
 
 /// §6.2.5.5 + §20.1.2.3 — enumerate the own enumerable property keys

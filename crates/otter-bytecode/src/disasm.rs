@@ -274,6 +274,9 @@ mod tests {
             Op::Yield,
             Op::SharedArrayBufferCall,
             Op::ToPrimitive,
+            Op::ForInKeys,
+            Op::CopyDataProperties,
+            Op::DefineOwnProperty,
         ]
     }
 
@@ -329,6 +332,8 @@ mod tests {
             | Op::LoadGlobalOrUndefined
             | Op::ImportMetaResolve
             | Op::ImportNamespaceDynamic
+            | Op::ForInKeys
+            | Op::CopyDataProperties
             | Op::Yield => vec![reg(0), reg(1)],
             Op::DefineGlobalVar => vec![konst(0), reg(1)],
             Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => vec![imm(2), reg(1)],
@@ -374,17 +379,15 @@ mod tests {
             | Op::LooseNotEqual
             | Op::NewBuiltinError
             | Op::ToPrimitive
-            | Op::PromiseCall => vec![reg(0), reg(1), reg(2)],
+            | Op::PromiseCall
+            | Op::DefineOwnProperty => vec![reg(0), reg(1), reg(2)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
-            Op::CallSpread
-            | Op::New
-            | Op::MakeClass
-            | Op::StoreProperty
-            | Op::StoreElement => vec![reg(0), reg(1), reg(2), reg(3)],
-            Op::CallMethodValue
-            | Op::CallWithThis
-            | Op::BindFunction
-            | Op::NewIntl => vec![reg(0), reg(1), reg(2), reg(3)],
+            Op::CallSpread | Op::New | Op::MakeClass | Op::StoreProperty | Op::StoreElement => {
+                vec![reg(0), reg(1), reg(2), reg(3)]
+            }
+            Op::CallMethodValue | Op::CallWithThis | Op::BindFunction | Op::NewIntl => {
+                vec![reg(0), reg(1), reg(2), reg(3)]
+            }
             Op::Call => vec![reg(0), reg(1), reg(2)],
             Op::QueueMicrotask => vec![reg(0), reg(1)],
             Op::PromiseNew => vec![reg(0), reg(1), reg(2)],
@@ -544,5 +547,8 @@ mod tests {
 000118 YIELD
 000119 SHARED_ARRAY_BUFFER_CALL
 000120 TO_PRIMITIVE
+000121 FOR_IN_KEYS
+000122 COPY_DATA_PROPERTIES
+000123 DEFINE_OWN_PROPERTY
 ";
 }

@@ -21,8 +21,8 @@ use smallvec::SmallVec;
 
 use crate::{
     ErrorKind, ExecutionContext, Frame, Interpreter, IntrinsicError, JsString, NativeError,
-    StackFrameSnapshot, Value, VmError, error_classes, object, read_register,
-    symbol_dispatch, temporal, write_register,
+    StackFrameSnapshot, Value, VmError, error_classes, object, read_register, symbol_dispatch,
+    temporal, write_register,
 };
 
 impl Interpreter {

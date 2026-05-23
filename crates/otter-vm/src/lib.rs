@@ -143,9 +143,8 @@ use arithmetic_dispatch::{
     bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
 };
 pub(crate) use error_ops::{
-    intrinsic_to_vm_error, native_to_vm_error,
-    render_thrown_value, snapshot_frames, symbol_to_vm_error, temporal_to_vm_error,
-    vm_err_to_value,
+    intrinsic_to_vm_error, native_to_vm_error, render_thrown_value, snapshot_frames,
+    symbol_to_vm_error, temporal_to_vm_error, vm_err_to_value,
 };
 use executable::ExecutableFunction;
 use operand_decode::{apply_branch, register_operand};
@@ -3985,6 +3984,21 @@ impl Interpreter {
                 Op::ObjectCall => {
                     let operands = context.exec_operands(instr);
                     self.run_object_static_call_operands(context, stack, operands)?;
+                    continue;
+                }
+                Op::ForInKeys => {
+                    let operands = context.exec_operands(instr);
+                    self.run_for_in_keys_operands(context, stack, operands)?;
+                    continue;
+                }
+                Op::CopyDataProperties => {
+                    let operands = context.exec_operands(instr);
+                    self.run_copy_data_properties_operands(context, stack, operands)?;
+                    continue;
+                }
+                Op::DefineOwnProperty => {
+                    let operands = context.exec_operands(instr);
+                    self.run_define_own_property_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::QueueMicrotask => {

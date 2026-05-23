@@ -799,6 +799,50 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
     ObjectCall,
+    /// `r<dst> = enumerable-string-keys(r<obj>)` — internal `for-in`
+    /// snapshot. Operands: `Register(dst), Register(obj)`.
+    ///
+    /// §14.7.5.6 EnumerateObjectProperties: collect the enumerable
+    /// own + inherited String-typed property keys of `obj` into a
+    /// fresh array, walking the prototype chain and de-duplicating.
+    /// The dispatcher uses the same helper that backs `for (k in o)`
+    /// — it is **not** an alias for `Object.keys`, which is own-only.
+    ///
+    /// Spec primitive: emitted only by the compiler for `for-in`
+    /// lowering. Not user-observable as a method name and therefore
+    /// not interceptable by shadowing `Object.<anything>`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-enumerate-object-properties>
+    /// - <https://tc39.es/ecma262/#sec-for-in-and-for-of-statements>
+    ForInKeys,
+    /// `r<target>` ←` enumerable own properties of r<src>`. Operands:
+    /// `Register(target), Register(src)`.
+    ///
+    /// §7.3.31 CopyDataProperties: copy each enumerable own string-
+    /// (and symbol-) keyed property of `src` onto `target` via
+    /// `[[Set]]`. Null / undefined sources are no-ops. Spec primitive
+    /// used by the compiler to lower `{ ...source }` object spread
+    /// and rest binding patterns. Routes around any user shadow of
+    /// `Object.assign`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-copydataproperties>
+    CopyDataProperties,
+    /// `r<target>.[[DefineOwnProperty]](r<key>, r<desc>)`. Operands:
+    /// `Register(target), Register(key), Register(desc)`.
+    ///
+    /// §10.1.6.1 OrdinaryDefineOwnProperty applied with the runtime
+    /// descriptor object referenced by `desc` (read through full
+    /// `[[Get]]` per §6.2.5.5 ToPropertyDescriptor). Spec primitive
+    /// emitted by the compiler for class method installation and
+    /// computed-key property definition; bypasses user shadows of
+    /// `Object.defineProperty`.
+    ///
+    /// # See also
+    /// - <https://tc39.es/ecma262/#sec-ordinarydefineownproperty>
+    /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
+    DefineOwnProperty,
     /// `r<dst> = ArrayBuffer(args...)` / `ArrayBuffer.<name>(args...)`.
     /// Operands: `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
@@ -983,6 +1027,9 @@ impl Op {
             Op::NewBuiltinError => "NEW_BUILTIN_ERROR",
             Op::LoadBuiltinError => "LOAD_BUILTIN_ERROR",
             Op::ObjectCall => "OBJECT_CALL",
+            Op::ForInKeys => "FOR_IN_KEYS",
+            Op::CopyDataProperties => "COPY_DATA_PROPERTIES",
+            Op::DefineOwnProperty => "DEFINE_OWN_PROPERTY",
             Op::ArrayConstruct => "ARRAY_CONSTRUCT",
             Op::ArrayFrom => "ARRAY_FROM",
             Op::ArrayOf => "ARRAY_OF",
@@ -1114,8 +1161,11 @@ impl Op {
             Op::LoadElement | Op::DeleteElement => 3,
             // recv, key, src, scratch_dst for accessor setters.
             Op::StoreElement => 4,
-            Op::CallMethodValue => 4, // dst, recv, name_const, argc
-            Op::ObjectCall => 3,      // dst, name_const, argc — args follow
+            Op::CallMethodValue => 4,    // dst, recv, name_const, argc
+            Op::ObjectCall => 3,         // dst, name_const, argc — args follow
+            Op::ForInKeys => 2,          // dst, obj
+            Op::CopyDataProperties => 2, // target, src
+            Op::DefineOwnProperty => 3,  // target, key, desc
             // dst, argc — args follow as `Register(arg0)…`.
             Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
             Op::BigIntCall => 3,      // dst, name_const, argc — args follow

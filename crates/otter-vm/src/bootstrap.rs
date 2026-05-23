@@ -27,7 +27,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::js_surface::{Attr, JsSurfaceError, NamespaceSpec, ObjectBuilder};
+use crate::js_surface::{Attr, JsSurfaceError, NamespaceSpec};
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{
     NativeCtx, NativeError, Value, VmGetOutcome, VmPropertyKey, array_prototype, atomics, console,
@@ -377,7 +377,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_bigint::Intrinsic),
     crate::bootstrap_entry!(crate::intrinsics::symbol::Intrinsic),
     crate::bootstrap_entry!(crate::math::Intrinsic),
-    crate::bootstrap_entry!(crate::bootstrap::DateIntrinsic),
+    crate::bootstrap_entry!(crate::intrinsics::date::Intrinsic),
     crate::bootstrap_entry!(crate::bootstrap_regexp::Intrinsic),
     crate::bootstrap_entry!(crate::bootstrap_collections::MapIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_collections::SetIntrinsic),
@@ -387,7 +387,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_promise::Intrinsic),
     crate::bootstrap_entry!(crate::intrinsics::proxy::Intrinsic),
     crate::bootstrap_entry!(crate::reflect::Intrinsic),
-    crate::bootstrap_entry!(crate::bootstrap::FunctionIntrinsic),
+    crate::bootstrap_entry!(crate::intrinsics::function::Intrinsic),
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::ArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::SharedArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_data_view::Intrinsic),
@@ -539,324 +539,6 @@ fn install_placeholder(
 // (configurable=false, writable=false, enumerable=false per
 // §20.4.2.*), plus `for` / `keyFor` methods and a `prototype` link.
 // <https://tc39.es/ecma262/#sec-symbol-constructor>
-
-fn install_function(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    use crate::{NativeCtx, NativeError};
-
-    fn function_prototype_call(
-        _ctx: &mut NativeCtx<'_>,
-        _args: &[Value],
-    ) -> Result<Value, NativeError> {
-        Ok(Value::undefined())
-    }
-
-    fn function_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let new_target_proto = native_new_target_prototype(ctx, "Function")?;
-        let (interp, context) = ctx.interp_mut_and_context();
-        let Some(context) = context else {
-            return Err(NativeError::TypeError {
-                name: "Function",
-                reason: "missing execution context for Function constructor".to_string(),
-            });
-        };
-        let result = interp
-            .build_function_constructor_with_roots(&context, args, None, &[], &[args])
-            .map_err(|err| {
-                let reason = format!("{err}");
-                match err {
-                    crate::VmError::SyntaxError { .. } => NativeError::SyntaxError {
-                        name: "Function",
-                        reason,
-                    },
-                    _ => NativeError::TypeError {
-                        name: "Function",
-                        reason,
-                    },
-                }
-            })?;
-        if let (Some(native), Some(proto)) = (result.as_native_function(), new_target_proto) {
-            native.set_prototype_override(interp.gc_heap_mut(), Some(proto));
-        }
-        Ok(result)
-    }
-
-    let global_root = Value::object(global);
-    let function = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let function_root = Value::object(function);
-    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &function_root])?;
-    let prototype_root = Value::object(prototype);
-    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
-        && let Some(object_proto) =
-            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
-    {
-        object::set_prototype(prototype, heap, Some(object_proto));
-    }
-    object::set_prototype(function, heap, Some(prototype));
-    let ctor_native = native_constructor_static_with_value_roots(
-        heap,
-        "Function",
-        1,
-        function_ctor_call,
-        &[&global_root, &function_root, &prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_native_root = Value::native_function(ctor_native);
-    object::set_constructor_native(function, heap, ctor_native_root);
-    let prototype_call = native_static_with_value_roots(
-        heap,
-        "",
-        0,
-        function_prototype_call,
-        &[
-            &global_root,
-            &function_root,
-            &prototype_root,
-            &ctor_native_root,
-        ],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_call_native(prototype, heap, Value::native_function(prototype_call));
-    let length = PropertyDescriptor::data(Value::number_i32(1), false, false, true);
-    let _ = object::define_own_property(function, heap, "length", length);
-    let name_value = Value::string(
-        crate::string::JsString::from_str("Function", heap)
-            .map_err(|_| JsSurfaceError::OutOfMemory)?,
-    );
-    let name = PropertyDescriptor::data(name_value, false, false, true);
-    let _ = object::define_own_property(function, heap, "name", name);
-    let prototype_descriptor =
-        PropertyDescriptor::data(Value::object(prototype), false, false, false);
-    let _ = object::define_own_property(function, heap, "prototype", prototype_descriptor);
-    let prototype_length = PropertyDescriptor::data(Value::number_i32(0), false, false, true);
-    let _ = object::define_own_property(prototype, heap, "length", prototype_length);
-    let prototype_name_value = Value::string(
-        crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
-    );
-    let prototype_name = PropertyDescriptor::data(prototype_name_value, false, false, true);
-    let _ = object::define_own_property(prototype, heap, "name", prototype_name);
-    {
-        let mut builder = ObjectBuilder::from_object_with_value_roots(
-            heap,
-            prototype,
-            vec![global_root, function_root],
-        );
-        for method in function_prototype::FUNCTION_PROTOTYPE_METHODS {
-            builder.method_from_spec(method)?;
-        }
-    }
-    function_prototype::install_restricted_accessors(
-        heap,
-        prototype,
-        &[&global_root, &function_root],
-    )?;
-    let constructor = PropertyDescriptor::data(Value::object(function), true, false, true);
-    let _ = object::define_own_property(prototype, heap, "constructor", constructor);
-    define_global(global, heap, "Function", Value::object(function));
-    Ok(())
-}
-
-// `Math` installer migrated to [`crate::math::Intrinsic`].
-// `JSON` installer migrated to [`crate::json::Intrinsic`].
-
-
-fn install_date(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    use crate::js_surface::MethodSpec;
-    use crate::native_function::NativeCall;
-    use crate::{JsString, NativeCtx, NativeError};
-
-    // §21.4.3 Date statics — trampolines that route to the typed
-    // dispatcher with no `this`. The constructor's
-    // `[[Construct]]` / `[[Call]]` slot still handles the
-    // `Date(...)` and `new Date(...)` shapes via `date_ctor_call`.
-    fn date_now_call(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call_static(
-            otter_bytecode::method_id::DateMethod::Now,
-            &[],
-            ctx.heap(),
-        )
-        .map_err(|err| NativeError::TypeError {
-            name: "Date.now",
-            reason: err.to_string(),
-        })
-    }
-    fn date_parse_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call_static(
-            otter_bytecode::method_id::DateMethod::Parse,
-            args,
-            ctx.heap(),
-        )
-        .map_err(|err| NativeError::TypeError {
-            name: "Date.parse",
-            reason: err.to_string(),
-        })
-    }
-    fn date_utc_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        crate::date::dispatch::call_static(
-            otter_bytecode::method_id::DateMethod::UTC,
-            args,
-            ctx.heap(),
-        )
-        .map_err(|err| NativeError::TypeError {
-            name: "Date.UTC",
-            reason: err.to_string(),
-        })
-    }
-
-    fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let time = {
-            let heap = ctx.heap_mut();
-            crate::date::dispatch::construct_time_value(args, heap)
-        };
-        if ctx.is_construct_call() {
-            // §21.4.2.1 — `new Date(...)`. The construct receiver
-            // is already a freshly allocated JsObject (via
-            // OrdinaryCreateFromConstructor on `Date`). Install
-            // the `[[DateValue]]` internal slot and return it.
-            if let Some(obj) = ctx.this_value().as_object() {
-                crate::object::set_date_data(obj, ctx.heap_mut(), time);
-                return Ok(Value::object(obj));
-            }
-            return Err(NativeError::TypeError {
-                name: "Date",
-                reason: "expected object receiver in `new Date(...)`".to_string(),
-            });
-        }
-        // §21.4.2.2 — `Date()` without `new` returns the current
-        // time rendered as an ISO string.
-        let text = crate::date::to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
-
-        let value =
-            JsString::from_str(&text, ctx.heap_mut()).map_err(|err| NativeError::TypeError {
-                name: "Date",
-                reason: err.to_string(),
-            })?;
-        Ok(Value::string(value))
-    }
-
-    let global_root = Value::object(global);
-    let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let constructor_root = Value::object(constructor);
-    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
-    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
-        && let Some(object_proto) =
-            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
-    {
-        object::set_prototype(constructor, heap, Some(object_proto));
-        object::set_prototype(prototype, heap, Some(object_proto));
-    }
-    let prototype_root = Value::object(prototype);
-    let ctor_native = native_static_with_value_roots(
-        heap,
-        "Date",
-        7,
-        date_ctor_call,
-        &[&global_root, &constructor_root, &prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_constructor_native(constructor, heap, Value::native_function(ctor_native));
-    let _ = object::define_own_property(
-        constructor,
-        heap,
-        "prototype",
-        PropertyDescriptor::data(Value::object(prototype), false, false, false),
-    );
-
-    // §21.4.4 Properties of the Date Prototype Object — install
-    // JS-visible prototype method specs so `(new Date()).getTime`
-    // resolves to a callable. The compile-time `CallDate` opcode
-    // keeps using the prototype intrinsic table directly.
-    {
-        let mut builder = ObjectBuilder::from_object_with_value_roots(
-            heap,
-            prototype,
-            vec![global_root, constructor_root],
-        );
-        for spec in crate::date::prototype::DATE_PROTOTYPE_METHODS
-            .iter()
-            .chain(crate::date::prototype::DATE_PROTOTYPE_EXTRA_METHODS)
-        {
-            builder.method_from_spec(spec)?;
-        }
-    }
-
-    // §21.4.3 statics — `Date.now()`, `Date.parse(str)`, `Date.UTC(...)`.
-    {
-        let mut builder = ObjectBuilder::from_object_with_value_roots(
-            heap,
-            constructor,
-            vec![global_root, prototype_root],
-        );
-        builder.method_from_spec(&MethodSpec {
-            name: "now",
-            length: 0,
-            attrs: Attr::builtin_function(),
-            call: NativeCall::Static(date_now_call),
-        })?;
-        builder.method_from_spec(&MethodSpec {
-            name: "parse",
-            length: 1,
-            attrs: Attr::builtin_function(),
-            call: NativeCall::Static(date_parse_call),
-        })?;
-        builder.method_from_spec(&MethodSpec {
-            name: "UTC",
-            length: 7,
-            attrs: Attr::builtin_function(),
-            call: NativeCall::Static(date_utc_call),
-        })?;
-    }
-
-    let date_value = Value::object(constructor);
-    let _ = object::define_own_property(
-        prototype,
-        heap,
-        "constructor",
-        PropertyDescriptor::data(date_value, true, false, true),
-    );
-    define_global(global, heap, "Date", date_value);
-    Ok(())
-}
-
-// `Atomics` installer migrated to [`crate::atomics::Intrinsic`].
-// `Reflect` installer migrated to [`crate::reflect::Intrinsic`].
-// `console` installer migrated to [`crate::console::Intrinsic`].
-// Timer globals migrated to [`crate::timers::Intrinsic`].
-
-pub(crate) fn define_global_value(
-    global: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    name: &'static str,
-    value: Value,
-) {
-    define_global(global, heap, name, value);
-}
-
-// `BuiltinIntrinsic` adapters for the remaining built-ins whose
-// installers still live inside `bootstrap.rs`. Each adapter is a
-// zero-sized marker type wired through the per-class private
-// `install_*` body. Migration target (Phase 3.1): move the bodies
-// into per-class modules under `crate::intrinsics::` and drop these
-// adapters.
-
-/// `BuiltinIntrinsic` adapter for the global `Date` constructor.
-pub struct DateIntrinsic;
-impl crate::intrinsic_install::BuiltinIntrinsic for DateIntrinsic {
-    const NAME: &'static str = "Date";
-    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_date(heap, global)
-    }
-}
-
-/// `BuiltinIntrinsic` adapter for the global `Function` constructor.
-pub struct FunctionIntrinsic;
-impl crate::intrinsic_install::BuiltinIntrinsic for FunctionIntrinsic {
-    const NAME: &'static str = "Function";
-    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_function(heap, global)
-    }
-}
 
 /// Placeholder `BuiltinIntrinsic` for `Intl` — empty object with a
 /// prototype slot. Real Intl integration ships separately.
@@ -2041,6 +1723,17 @@ pub(crate) fn define_global(
         Attr::global_binding().configurable,
     );
     let _ = object::define_own_property(global, heap, name, descriptor);
+}
+
+/// Convenience wrapper around [`define_global`] taking the global by
+/// receiver — kept for installer call sites that prefer the named form.
+pub(crate) fn define_global_value(
+    global: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    value: Value,
+) {
+    define_global(global, heap, name, value);
 }
 
 fn namespace_native_function_count(spec: &NamespaceSpec) -> usize {

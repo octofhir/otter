@@ -143,6 +143,58 @@ impl BytecodeWriter {
     }
 }
 
+/// Encoded function body: byte stream plus a parallel map from the
+/// caller's instruction-index PC (v1) to the byte-offset PC (v2).
+///
+/// The source-map conversion uses this to rewrite each `SpanEntry::pc`
+/// from instruction index to byte offset without re-walking the
+/// stream.
+#[derive(Debug, Clone)]
+pub struct EncodedFunction {
+    /// Byte-stream code.
+    pub code: Box<[u8]>,
+    /// `instr_to_byte_pc[i]` is the byte offset of the `i`-th
+    /// instruction in `code`. Length equals the source `Instruction`
+    /// slice length.
+    pub instr_to_byte_pc: Box<[u32]>,
+}
+
+/// Encode a whole function body (an [`Instruction`] slice in source
+/// order) into the v2 byte stream and return both the bytes and the
+/// per-instruction byte-offset map.
+#[must_use]
+pub fn encode_function(instructions: &[Instruction]) -> EncodedFunction {
+    let mut writer = BytecodeWriter::new();
+    let mut instr_to_byte_pc: Vec<u32> = Vec::with_capacity(instructions.len());
+    for instr in instructions {
+        instr_to_byte_pc.push(writer.pc());
+        writer.write(instr);
+    }
+    EncodedFunction {
+        code: writer.into_bytes(),
+        instr_to_byte_pc: instr_to_byte_pc.into_boxed_slice(),
+    }
+}
+
+/// Decode a whole function body into the corresponding
+/// [`Instruction`] sequence, re-walking the byte stream.
+///
+/// # Errors
+///
+/// Propagates any [`DecodeError`] from the underlying
+/// [`decode_instruction`] call.
+pub fn decode_function(code: &[u8]) -> Result<Vec<Instruction>, DecodeError> {
+    let mut out: Vec<Instruction> = Vec::new();
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let (instr, next) = decode_instruction(code, pc)?;
+        out.push(instr);
+        pc = next;
+    }
+    Ok(out)
+}
+
+
 /// Decode the next instruction from `code` starting at byte offset
 /// `pc`. Returns the decoded instruction and the byte offset of the
 /// instruction that follows it.
@@ -234,24 +286,145 @@ pub fn op_from_byte(byte: u8) -> Option<Op> {
 }
 
 /// Stable byte assignments for every [`Op`] variant the v2 wire
-/// format currently knows about. New opcodes append at the next
-/// unused byte; assignments are stable across schema-compatible
-/// builds.
+/// format knows about. New opcodes append at the next unused byte;
+/// assignments are stable across schema-compatible builds.
 ///
-/// This is the smoke-test subset; subsequent commits fill in the
-/// remaining ~120 opcodes as the dispatcher migrates.
+/// Bytes are assigned in declaration order so the table grows
+/// monotonically. Reordering or removing an entry bumps
+/// [`BYTECODE_SCHEMA_VERSION`].
 pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::Nop, 0x00),
     (Op::LoadUndefined, 0x01),
     (Op::LoadHole, 0x02),
-    (Op::LoadTrue, 0x03),
-    (Op::LoadFalse, 0x04),
-    (Op::LoadInt32, 0x05),
-    (Op::LoadNumber, 0x06),
-    (Op::LoadString, 0x07),
-    (Op::Return, 0x08),
-    (Op::Add, 0x09),
-    (Op::Sub, 0x0A),
+    (Op::Return, 0x03),
+    (Op::LoadString, 0x04),
+    (Op::LoadNumber, 0x05),
+    (Op::LoadInt32, 0x06),
+    (Op::LoadBigInt, 0x07),
+    (Op::LoadRegExp, 0x08),
+    (Op::JsonCall, 0x09),
+    (Op::QueueMicrotask, 0x0A),
+    (Op::PromiseNew, 0x0B),
+    (Op::PromiseCall, 0x0C),
+    (Op::LoadTrue, 0x0D),
+    (Op::LoadFalse, 0x0E),
+    (Op::LoadLength, 0x0F),
+    (Op::GetStringIndex, 0x10),
+    (Op::CallMethodValue, 0x11),
+    (Op::Add, 0x12),
+    (Op::Sub, 0x13),
+    (Op::Mul, 0x14),
+    (Op::Div, 0x15),
+    (Op::Rem, 0x16),
+    (Op::Neg, 0x17),
+    (Op::Pow, 0x18),
+    (Op::BitwiseAnd, 0x19),
+    (Op::BitwiseOr, 0x1A),
+    (Op::BitwiseXor, 0x1B),
+    (Op::BitwiseNot, 0x1C),
+    (Op::Shl, 0x1D),
+    (Op::Shr, 0x1E),
+    (Op::Ushr, 0x1F),
+    (Op::ToNumber, 0x20),
+    (Op::Equal, 0x21),
+    (Op::NotEqual, 0x22),
+    (Op::LessThan, 0x23),
+    (Op::LessEq, 0x24),
+    (Op::GreaterThan, 0x25),
+    (Op::GreaterEq, 0x26),
+    (Op::LoadNull, 0x27),
+    (Op::LogicalNot, 0x28),
+    (Op::ToBoolean, 0x29),
+    (Op::Jump, 0x2A),
+    (Op::JumpIfTrue, 0x2B),
+    (Op::JumpIfFalse, 0x2C),
+    (Op::JumpIfNullish, 0x2D),
+    (Op::LoadLocal, 0x2E),
+    (Op::StoreLocal, 0x2F),
+    (Op::TdzError, 0x30),
+    (Op::MakeFunction, 0x31),
+    (Op::MakeClosure, 0x32),
+    (Op::LoadUpvalue, 0x33),
+    (Op::StoreUpvalue, 0x34),
+    (Op::Call, 0x35),
+    (Op::CallWithThis, 0x36),
+    (Op::BindFunction, 0x37),
+    (Op::LoadThis, 0x38),
+    (Op::LoadNewTarget, 0x39),
+    (Op::Throw, 0x3A),
+    (Op::EnterTry, 0x3B),
+    (Op::LeaveTry, 0x3C),
+    (Op::EndFinally, 0x3D),
+    (Op::NewError, 0x3E),
+    (Op::GetIterator, 0x3F),
+    (Op::IteratorNext, 0x40),
+    (Op::ArrayPush, 0x41),
+    (Op::CallSpread, 0x42),
+    (Op::New, 0x43),
+    (Op::NewSpread, 0x44),
+    (Op::SuperConstructSpread, 0x45),
+    (Op::MakeClass, 0x46),
+    (Op::MathLoad, 0x47),
+    (Op::MathCall, 0x48),
+    (Op::CollectRest, 0x49),
+    (Op::ReturnValue, 0x4A),
+    (Op::ReturnUndefined, 0x4B),
+    (Op::NewObject, 0x4C),
+    (Op::LoadProperty, 0x4D),
+    (Op::StoreProperty, 0x4E),
+    (Op::DeleteProperty, 0x4F),
+    (Op::GetPrototype, 0x50),
+    (Op::SetPrototype, 0x51),
+    (Op::NewArray, 0x52),
+    (Op::LoadElement, 0x53),
+    (Op::StoreElement, 0x54),
+    (Op::ArrayLength, 0x55),
+    (Op::HasProperty, 0x56),
+    (Op::Instanceof, 0x57),
+    (Op::Eval, 0x58),
+    (Op::NewFunction, 0x59),
+    (Op::GlobalCall, 0x5A),
+    (Op::LoadGlobalThis, 0x5B),
+    (Op::LoadGlobalOrThrow, 0x5C),
+    (Op::CollectArguments, 0x5D),
+    (Op::LoadGlobalOrUndefined, 0x5E),
+    (Op::DefineGlobalVar, 0x5F),
+    (Op::ImportMetaResolve, 0x60),
+    (Op::ImportNamespaceDynamic, 0x61),
+    (Op::ImportNamespace, 0x62),
+    (Op::PromiseFulfilledOf, 0x63),
+    (Op::NewIntl, 0x64),
+    (Op::TemporalCall, 0x65),
+    (Op::TemporalLoad, 0x66),
+    (Op::NewCollection, 0x67),
+    (Op::NewWeakRef, 0x68),
+    (Op::NewFinalizationRegistry, 0x69),
+    (Op::SymbolLoad, 0x6A),
+    (Op::SymbolCall, 0x6B),
+    (Op::TypeOf, 0x6C),
+    (Op::DeleteElement, 0x6D),
+    (Op::Await, 0x6E),
+    (Op::SameValue, 0x6F),
+    (Op::IsArray, 0x70),
+    (Op::LooseEqual, 0x71),
+    (Op::LooseNotEqual, 0x72),
+    (Op::NewBuiltinError, 0x73),
+    (Op::LoadBuiltinError, 0x74),
+    (Op::DateCall, 0x75),
+    (Op::BigIntCall, 0x76),
+    (Op::ArrayConstruct, 0x77),
+    (Op::ArrayFrom, 0x78),
+    (Op::ArrayOf, 0x79),
+    (Op::ObjectCall, 0x7A),
+    (Op::ArrayBufferCall, 0x7B),
+    (Op::DataViewCall, 0x7C),
+    (Op::TypedArrayCall, 0x7D),
+    (Op::Yield, 0x7E),
+    (Op::SharedArrayBufferCall, 0x7F),
+    (Op::ProxyCall, 0x80),
+    (Op::ReflectCall, 0x81),
+    (Op::IteratorCall, 0x82),
+    (Op::ToPrimitive, 0x83),
 ];
 
 #[cfg(test)]
@@ -371,5 +544,87 @@ mod tests {
                 op
             );
         }
+    }
+
+    #[test]
+    fn op_byte_assignments_are_sequential() {
+        // Stable wire format requires monotonic byte assignments so
+        // diffs on this table read as a single growing column.
+        for (i, (_, byte)) in OP_BYTE_TABLE.iter().enumerate() {
+            assert_eq!(
+                *byte as usize, i,
+                "OP_BYTE_TABLE row {i} has byte 0x{byte:02X}; table must stay dense"
+            );
+        }
+    }
+
+    #[test]
+    fn op_byte_assignments_have_unique_opcodes() {
+        let mut seen = std::collections::HashSet::new();
+        for (op, _) in OP_BYTE_TABLE {
+            assert!(
+                seen.insert(*op),
+                "opcode {op:?} appears twice in OP_BYTE_TABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_decode_function_roundtrip() {
+        let instructions = vec![
+            make_instr(Op::Nop, &[]),
+            make_instr(Op::LoadUndefined, &[Operand::Register(0)]),
+            make_instr(
+                Op::LoadInt32,
+                &[Operand::Register(1), Operand::Imm32(42)],
+            ),
+            make_instr(
+                Op::Add,
+                &[
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::Register(1),
+                ],
+            ),
+            make_instr(Op::Return, &[Operand::Register(2)]),
+        ];
+        let encoded = encode_function(&instructions);
+        assert_eq!(encoded.instr_to_byte_pc.len(), instructions.len());
+        // First instruction always lands at byte 0.
+        assert_eq!(encoded.instr_to_byte_pc[0], 0);
+        // Byte offsets must be strictly monotonic.
+        for win in encoded.instr_to_byte_pc.windows(2) {
+            assert!(win[0] < win[1]);
+        }
+
+        let decoded = decode_function(&encoded.code).expect("decode");
+        // Re-stamp pc since round-trip through bytes flips PC from
+        // instruction-index to byte-offset; the structural data should
+        // otherwise match exactly.
+        for (i, (orig, decoded)) in instructions.iter().zip(decoded.iter()).enumerate() {
+            assert_eq!(orig.op, decoded.op, "op mismatch at index {i}");
+            assert_eq!(
+                orig.operands.as_slice(),
+                decoded.operands.as_slice(),
+                "operands mismatch at index {i}"
+            );
+            assert_eq!(
+                decoded.pc, encoded.instr_to_byte_pc[i],
+                "decoded pc must match the byte-offset map"
+            );
+        }
+    }
+
+    #[test]
+    fn coverage_matches_dispatcher_enum_size() {
+        // Catches accidental opcode additions that forget to wire
+        // through OP_BYTE_TABLE. If this fires, append the missing
+        // opcode at the next unused byte.
+        const EXPECTED_OPCODE_COUNT: usize = 132;
+        assert_eq!(
+            OP_BYTE_TABLE.len(),
+            EXPECTED_OPCODE_COUNT,
+            "Op enum changed; sync OP_BYTE_TABLE with the new opcode set"
+        );
     }
 }

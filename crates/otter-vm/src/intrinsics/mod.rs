@@ -19,6 +19,7 @@
 pub mod dispatch;
 
 // Bootstrap installer modules — one per intrinsic.
+pub mod object;
 pub mod proxy;
 pub mod symbol;
 

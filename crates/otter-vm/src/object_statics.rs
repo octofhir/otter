@@ -137,11 +137,99 @@ fn native_call(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
-    if let Some(result) = native_rooted_call(method, ctx, context.as_ref(), args)
-        .map_err(|err| object_native_error(method.name(), err))?
+
+    // Accessor-aware spec helpers route through the shared
+    // `do_object_*` paths whenever an ExecutionContext is available;
+    // the operands dispatcher uses the same helpers.
+    let coerced_args: Option<smallvec::SmallVec<[Value; 4]>> = if let Some(context) =
+        context.as_ref()
     {
-        return Ok(result);
-    }
+        use otter_bytecode::method_id::ObjectMethod as M;
+        match method {
+            M::Create => {
+                return ctx
+                    .cx
+                    .interp
+                    .do_object_create_with_descriptors(context, None, args)
+                    .map_err(|err| object_native_error(method.name(), err));
+            }
+            M::DefineProperties => {
+                return ctx
+                    .cx
+                    .interp
+                    .do_object_define_properties(context, None, args)
+                    .map_err(|err| object_native_error(method.name(), err));
+            }
+            M::Assign => {
+                return ctx
+                    .cx
+                    .interp
+                    .do_object_assign(context, None, args)
+                    .map_err(|err| object_native_error(method.name(), err));
+            }
+            M::GetOwnPropertyDescriptor | M::HasOwn => {
+                // §20.1.2.10 / §20.1.2.13 step 1 — ToObject(O) throws
+                // for null / undefined before any key coercion.
+                if args.first().is_none_or(|v| v.is_nullish()) {
+                    return Err(NativeError::TypeError {
+                        name: method.name(),
+                        reason: "Object static method called on null or undefined".to_string(),
+                    });
+                }
+                // §20.1.2.10 / §20.1.2.13 step 2 — accessor-aware
+                // ToPropertyKey(P) may invoke user `Symbol.toPrimitive`
+                // / `toString` / `valueOf`; route through the context-
+                // aware path only for non-trivially-coerced inputs so
+                // the spec error ordering matches the operands path.
+                let key_arg = args.get(1).cloned().unwrap_or(Value::undefined());
+                let needs_coercion = !(key_arg.is_string()
+                    || key_arg.is_number()
+                    || key_arg.is_boolean()
+                    || key_arg.is_null()
+                    || key_arg.is_undefined()
+                    || key_arg.is_symbol());
+                if needs_coercion {
+                    let coerced_key = ctx
+                        .cx
+                        .interp
+                        .evaluate_to_property_key(context, &key_arg)
+                        .map_err(|err| object_native_error(method.name(), err))?;
+                    let coerced_value = match &coerced_key {
+                        crate::VmPropertyKey::Symbol(sym) => Value::symbol(*sym),
+                        other => Value::string(
+                            crate::string::JsString::from_str(
+                                other
+                                    .string_name()
+                                    .expect("non-symbol key has string spelling"),
+                                ctx.heap_mut(),
+                            )
+                            .map_err(|_| NativeError::TypeError {
+                                name: method.name(),
+                                reason: "out of memory".to_string(),
+                            })?,
+                        ),
+                    };
+                    let mut rewritten: smallvec::SmallVec<[Value; 4]> =
+                        args.iter().cloned().collect();
+                    if rewritten.len() >= 2 {
+                        rewritten[1] = coerced_value;
+                    } else {
+                        rewritten.push(coerced_value);
+                    }
+                    Some(rewritten)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let args: &[Value] = coerced_args.as_deref().unwrap_or(args);
+
+    // Function / Proxy spec ladders go first so they observe the
+    // canonical descriptor / trap behaviour.
     if let Some(result) = ctx
         .cx
         .interp
@@ -160,447 +248,24 @@ fn native_call(
         return Ok(result);
     }
 
+    // Full spec-aware dispatch (primitive coercion, accessor
+    // enumeration, string-exotic indexed slots, …) lives in the
+    // operand-dispatcher helper. Reuse it with an empty frame stack
+    // so the alloc helpers fall back to runtime-rooted allocation
+    // and `args` survives via slice_roots.
+    if let Some(context) = context.as_ref()
+        && let Some(result) = ctx
+            .cx
+            .interp
+            .object_static_call_no_stack(context, method, args)
+            .map_err(|err| object_native_error(method.name(), err))?
+    {
+        return Ok(result);
+    }
+
     call(method, args, ctx.heap_mut()).map_err(|err| object_native_error(method.name(), err))
 }
 
-fn native_rooted_call(
-    method: otter_bytecode::method_id::ObjectMethod,
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Option<Value>, VmError> {
-    use otter_bytecode::method_id::ObjectMethod as M;
-    // Methods that need accessor-aware ToPropertyDescriptor / Get
-    // semantics route through the shared spec helpers whenever an
-    // ExecutionContext is available; the operands dispatcher already
-    // routes through the same helpers.
-    if let Some(context) = context {
-        match method {
-            M::Create => {
-                return ctx
-                    .cx
-                    .interp
-                    .do_object_create_with_descriptors(context, None, args)
-                    .map(Some);
-            }
-            M::DefineProperties => {
-                return ctx
-                    .cx
-                    .interp
-                    .do_object_define_properties(context, None, args)
-                    .map(Some);
-            }
-            M::Assign => {
-                return ctx
-                    .cx
-                    .interp
-                    .do_object_assign(context, None, args)
-                    .map(Some);
-            }
-            M::DefineProperty => {
-                // §20.1.2.4 — pre-Proxy spec block in
-                // `try_proxy_object_static_call` already runs the
-                // accessor-aware path for any Object-typed target.
-                // Defer to it via the layered fallback below.
-            }
-            _ => {}
-        }
-    }
-    match method {
-        M::Keys => native_keys_rooted(ctx, context, args).map(Some),
-        M::Values => native_values_rooted(ctx, args).map(Some),
-        M::Entries => native_entries_rooted(ctx, args).map(Some),
-        M::FromEntries => native_from_entries_rooted(ctx, context, args).map(Some),
-        M::GetOwnPropertyDescriptor => {
-            native_get_own_property_descriptor_rooted(ctx, context, args).map(Some)
-        }
-        M::GetOwnPropertyDescriptors => {
-            native_get_own_property_descriptors_rooted(ctx, context, args).map(Some)
-        }
-        M::GetOwnPropertyNames => {
-            native_get_own_property_names_rooted(ctx, context, args).map(Some)
-        }
-        M::GetOwnPropertySymbols => {
-            native_get_own_property_symbols_rooted(ctx, context, args).map(Some)
-        }
-        M::GroupBy => native_group_by_rooted(ctx, context, args).map(Some),
-        // Create reached only without context — fall back to the
-        // own-data variant for the rare case where natives are
-        // invoked outside a JS frame.
-        M::Create => native_create_rooted(ctx, args).map(Some),
-        _ => Ok(None),
-    }
-}
-
-/// §20.1.2.7 `Object.groupBy(items, callbackfn)` — groups iterable
-/// `items` into a null-prototype object keyed by the callback's
-/// return value. Each value is an Array of `items` in iteration
-/// order. The callback receives `(item, index)`.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-object.groupby>
-fn native_group_by_rooted(
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    let items = args.first().cloned().unwrap_or(Value::undefined());
-    let callback = args.get(1).cloned().unwrap_or(Value::undefined());
-    if items.is_nullish() {
-        return Err(VmError::TypeError {
-            message: "Object.groupBy: items must be iterable".to_string(),
-        });
-    }
-    if !ctx.cx.interp.is_callable_runtime(&callback) {
-        return Err(VmError::TypeError {
-            message: "Object.groupBy: callback must be a function".to_string(),
-        });
-    }
-    let exec_ctx = context.cloned().ok_or_else(|| VmError::TypeError {
-        message: "Object.groupBy: missing execution context".to_string(),
-    })?;
-    let items_snapshot = ctx.cx.interp.iterator_to_list_sync(&exec_ctx, &items)?;
-    let result = ctx.alloc_object_with_roots(&[&items, &callback], &[args])?;
-    crate::object::set_prototype(result, ctx.heap_mut(), None);
-
-    for (idx, item) in items_snapshot.iter().enumerate() {
-        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
-        cb_args.push(*item);
-        cb_args.push(Value::number(crate::number::NumberValue::from_f64(
-            idx as f64,
-        )));
-        let key =
-            ctx.cx
-                .interp
-                .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)?;
-        let key_pk = ctx.cx.interp.to_property_key_sync(&exec_ctx, key)?;
-        let key_str = match key_pk {
-            crate::VmPropertyKey::Symbol(_) => {
-                // Symbol keys go through `set_symbol`; reuse the
-                // existing arm.
-                continue;
-            }
-            crate::VmPropertyKey::Atom(a) => a.name().to_string(),
-            crate::VmPropertyKey::String(s) => s.to_string(),
-            crate::VmPropertyKey::OwnedString(s) => s,
-        };
-        let existing = crate::object::get(result, ctx.heap(), &key_str);
-        let group = match existing.and_then(|v| v.as_array()) {
-            Some(arr) => arr,
-            None => {
-                let arr = ctx.array_from_elements_with_roots(
-                    std::iter::empty(),
-                    &[&Value::object(result), item],
-                    &[args],
-                )?;
-                ctx.set_property(result, &key_str, Value::array(arr))?;
-                arr
-            }
-        };
-        let value_root = *item;
-        let arr_value = Value::array(group);
-        let roots = [&value_root, &arr_value, &Value::object(result)];
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for v in &roots {
-                v.trace_value_slots(visitor);
-            }
-        };
-        crate::array::push_with_roots(group, ctx.heap_mut(), *item, &mut external_visit)?;
-    }
-    Ok(Value::object(result))
-}
-
-fn native_create_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
-    let proto = args.first().cloned().unwrap_or(Value::undefined());
-    let proto_value = if proto.is_object() || proto.is_iterator() {
-        Some(proto)
-    } else if proto.is_null() {
-        None
-    } else {
-        return Err(VmError::TypeMismatch);
-    };
-    let obj = ctx.alloc_object_with_roots(&[&proto], &[args])?;
-    if !crate::object::set_prototype_value(obj, ctx.heap_mut(), proto_value) {
-        return Err(VmError::TypeMismatch);
-    }
-    if let Some(props_arg) = args.get(1)
-        && !props_arg.is_undefined()
-    {
-        let props = props_arg.as_object().ok_or(VmError::TypeMismatch)?;
-        let entries: Vec<(String, Value)> =
-            crate::object::with_properties(props, ctx.heap(), |p| {
-                p.enumerable_data_iter()
-                    .map(|(key, value)| (key.to_string(), value))
-                    .collect()
-            });
-        for (key, desc_value) in entries {
-            let desc_obj = desc_value.as_object().ok_or(VmError::TypeMismatch)?;
-            let descriptor = coerce_to_descriptor(&desc_obj, ctx.heap())?;
-            if !crate::object::define_own_property_partial(obj, ctx.heap_mut(), &key, descriptor) {
-                return Err(VmError::TypeMismatch);
-            }
-        }
-    }
-    Ok(Value::object(obj))
-}
-
-fn native_keys_rooted(
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
-    if target.is_proxy()
-        || target.is_array()
-        || target.is_regexp()
-        || target.is_function()
-        || target.is_closure()
-        || target.is_bound_function()
-        || target.is_native_function()
-    {
-        let Some(context) = context else {
-            return Err(VmError::InvalidOperand);
-        };
-        let values = if target.is_proxy() {
-            let trap_keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
-            let mut values = Vec::with_capacity(trap_keys.len());
-            for key in trap_keys {
-                if !key.is_string() {
-                    continue;
-                }
-                let vm_key = if let Some(s) = key.as_string(ctx.heap()) {
-                    crate::VmPropertyKey::OwnedString(s.to_lossy_string(ctx.heap()))
-                } else if let Some(sym) = key.as_symbol(ctx.heap()) {
-                    crate::VmPropertyKey::Symbol(sym)
-                } else {
-                    return Err(VmError::TypeMismatch);
-                };
-                let desc = ctx
-                    .cx
-                    .interp
-                    .ordinary_get_own_property_descriptor_value_runtime_rooted(
-                        context,
-                        target,
-                        &vm_key,
-                        0,
-                        &[&target],
-                        &[args],
-                    )?;
-                if desc.as_ref().is_some_and(PropertyDescriptor::enumerable) {
-                    values.push(key);
-                }
-            }
-            values
-        } else {
-            let keys = ctx
-                .cx
-                .interp
-                .enumerable_own_string_keys_for_value(context, target, 0)?;
-
-            let mut values = Vec::with_capacity(keys.len());
-            for key in keys {
-                values.push(string_value(&key, ctx.heap_mut())?);
-            }
-            values
-        };
-        let array = ctx.array_from_elements_with_roots(values, &[&target], &[args])?;
-        return Ok(Value::array(array));
-    }
-
-    let owned: Vec<String> = if let Some(target) = args.first().and_then(|v| v.as_object()) {
-        crate::object::with_properties(target, ctx.heap(), |p| {
-            p.enumerable_keys().map(|k| k.to_string()).collect()
-        })
-    } else if let Some(native) = args.first().and_then(|v| v.as_native_function()) {
-        native
-            .enumerable_own_property_keys(ctx.heap())
-            .into_iter()
-            .collect()
-    } else if let Some(bound) = args.first().and_then(|v| v.as_bound_function()) {
-        crate::function_metadata::bound_enumerable_own_property_keys(&bound, ctx.heap())
-            .into_iter()
-            .collect()
-    } else {
-        return Err(VmError::TypeMismatch);
-    };
-
-    let mut names = Vec::with_capacity(owned.len());
-    for key in owned {
-        names.push(string_value(&key, ctx.heap_mut())?);
-    }
-    Ok(Value::array(ctx.array_from_elements_with_roots(
-        names,
-        &[],
-        &[args],
-    )?))
-}
-
-fn native_values_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
-    let target = expect_object(args.first())?;
-    let values: Vec<Value> = crate::object::with_properties(target, ctx.heap(), |p| {
-        p.enumerable_data_iter().map(|(_, value)| value).collect()
-    });
-    let target_root = Value::object(target);
-    Ok(Value::array(ctx.array_from_elements_with_roots(
-        values,
-        &[&target_root],
-        &[args],
-    )?))
-}
-
-fn native_entries_rooted(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, VmError> {
-    let target = expect_object(args.first())?;
-    let raw: Vec<(String, Value)> = crate::object::with_properties(target, ctx.heap(), |p| {
-        p.enumerable_data_iter()
-            .map(|(key, value)| (key.to_string(), value))
-            .collect()
-    });
-
-    let target_root = Value::object(target);
-    let mut pairs = Vec::with_capacity(raw.len());
-    for (key, value) in raw {
-        let key_value = string_value(&key, ctx.heap_mut())?;
-        let pair = ctx.array_from_elements_with_roots(
-            [key_value, value],
-            &[&target_root],
-            &[args, pairs.as_slice()],
-        )?;
-        pairs.push(Value::array(pair));
-    }
-    Ok(Value::array(ctx.array_from_elements_with_roots(
-        pairs,
-        &[&target_root],
-        &[args],
-    )?))
-}
-
-/// §20.1.2.7 `Object.fromEntries(iterable)` — spec iterator protocol
-/// path with IteratorClose on abrupt completions per
-/// `AddEntriesFromIterable` (§24.1.1.2 conceptual analogue used in
-/// step 5).
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-object.fromentries>
-/// - <https://tc39.es/ecma262/#sec-add-entries-from-iterable>
-fn native_from_entries_rooted(
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    let iter = args.first().cloned().unwrap_or(Value::undefined());
-    // §7.1.4 RequireObjectCoercible — undefined / null reject before
-    // GetIterator.
-    if iter.is_nullish() {
-        return Err(VmError::TypeError {
-            message: "Object.fromEntries: iterable must not be null or undefined".to_string(),
-        });
-    }
-    let exec_ctx = context.cloned().ok_or_else(|| VmError::TypeError {
-        message: "Object.fromEntries: missing execution context".to_string(),
-    })?;
-    let result = ctx.alloc_object_with_roots(&[&iter], &[args])?;
-
-    let (iterator, next_method) = {
-        let interp = ctx.interp_mut();
-        interp.get_iterator_sync(&exec_ctx, &iter)?
-    };
-
-    loop {
-        let stepped = {
-            let interp = ctx.interp_mut();
-            interp.iterator_step_sync(&exec_ctx, &iterator, &next_method)
-        };
-        let entry = match stepped {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok(Value::object(result)),
-            // §7.4.6 step 1 — IteratorStep is itself a throw, do not
-            // call IteratorClose (the iterator is already in an error
-            // state per §7.4.8).
-            Err(err) => return Err(err),
-        };
-
-        // §20.1.2.7 step 5.b.i — nextItem must be an Object; on
-        // failure close the iterator and propagate a TypeError.
-        if !entry.is_object_type() {
-            let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
-            return Err(VmError::TypeError {
-                message: "Object.fromEntries: iterator value is not an entry object".to_string(),
-            });
-        }
-
-        let key = match read_entry_index(ctx, &exec_ctx, &entry, "0") {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
-                return Err(err);
-            }
-        };
-        let value = match read_entry_index(ctx, &exec_ctx, &entry, "1") {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
-                return Err(err);
-            }
-        };
-
-        // §20.1.2.7 step 5.b.iii — CreateDataPropertyOrThrow. Routes
-        // through the spec ToPropertyKey ladder so accessor-bearing
-        // key objects fire `toString` / `valueOf` here, not later.
-        let res = {
-            let interp = ctx.interp_mut();
-            interp.to_property_key_sync(&exec_ctx, key)
-        };
-        let key_pk = match res {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
-                return Err(err);
-            }
-        };
-        let set_result = match &key_pk {
-            crate::VmPropertyKey::Symbol(sym) => {
-                crate::object::set_symbol(result, ctx.heap_mut(), *sym, value);
-                Ok(())
-            }
-            _ => {
-                let k = key_pk
-                    .string_name()
-                    .expect("non-symbol key has string spelling")
-                    .to_owned();
-                ctx.set_property(result, &k, value)
-            }
-        };
-        if let Err(err) = set_result {
-            let _ = ctx.interp_mut().iterator_close_sync(&exec_ctx, &iterator);
-            return Err(err);
-        }
-    }
-}
-
-fn read_entry_index(
-    ctx: &mut NativeCtx<'_>,
-    context: &crate::ExecutionContext,
-    target: &Value,
-    name: &str,
-) -> Result<Value, VmError> {
-    let interp = ctx.interp_mut();
-    let outcome = interp.ordinary_get_value(
-        context,
-        *target,
-        *target,
-        &crate::VmPropertyKey::String(name),
-        0,
-    )?;
-    match outcome {
-        crate::VmGetOutcome::Value(v) => Ok(v),
-        crate::VmGetOutcome::InvokeGetter { getter } => {
-            interp.run_callable_sync(context, &getter, *target, smallvec::SmallVec::new())
-        }
-    }
-}
-
-/// Heap-only variant used by the context-less
-/// `object_statics::call` fallback path.
 fn set_from_entries_key_heap(
     target: crate::object::JsObject,
     key: &Value,
@@ -667,245 +332,6 @@ fn read_entry_pair_heap(
     Err(VmError::TypeMismatch)
 }
 
-fn native_get_own_property_descriptor_rooted(
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
-    let uses_internal_get_own_property_descriptor = target.is_proxy()
-        || target.is_array()
-        || target.is_regexp()
-        || target.is_function()
-        || target.is_closure()
-        || target.is_bound_function()
-        || target.is_native_function()
-        || target.is_string()
-        || target
-            .as_object()
-            .is_some_and(|obj| crate::object::string_data(obj, ctx.heap()).is_some());
-    if uses_internal_get_own_property_descriptor {
-        let Some(context) = context else {
-            return Err(VmError::InvalidOperand);
-        };
-        let desc =
-            ctx.cx
-                .interp
-                .get_own_property_descriptor_for_value(context, target, args.get(1))?;
-        return match desc {
-            Some(desc) => Ok(Value::object(native_descriptor_to_object_rooted(
-                ctx,
-                &desc,
-                &[&target],
-                args,
-            )?)),
-            None => Ok(Value::undefined()),
-        };
-    }
-
-    let key = expect_property_key(args.get(1), ctx.heap())?;
-    let Some(first) = args.first() else {
-        return Err(VmError::TypeError {
-            message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
-                .to_string(),
-        });
-    };
-    if first.is_nullish() {
-        return Err(VmError::TypeError {
-            message: "Object.getOwnPropertyDescriptor: cannot convert null/undefined to object"
-                .to_string(),
-        });
-    }
-    let desc = if let Some(target) = first.as_object() {
-        match &key {
-            PropertyKey::String(key) => crate::object::get_own_descriptor(target, ctx.heap(), key),
-            PropertyKey::Symbol(sym) => {
-                crate::object::get_own_symbol_descriptor(target, ctx.heap(), *sym)
-            }
-        }
-    } else if let Some(class) = first.as_class_constructor() {
-        match &key {
-            PropertyKey::String(key) => {
-                crate::object::get_own_descriptor(class.statics(ctx.heap()), ctx.heap(), key)
-            }
-            PropertyKey::Symbol(sym) => crate::object::get_own_symbol_descriptor(
-                class.statics(ctx.heap()),
-                ctx.heap(),
-                *sym,
-            ),
-        }
-    } else if let Some(native) = first.as_native_function() {
-        match &key {
-            PropertyKey::String(key) => native.own_property_descriptor(ctx.heap_mut(), key)?,
-            PropertyKey::Symbol(sym) => native.own_symbol_property_descriptor(ctx.heap(), *sym),
-        }
-    } else if let Some(target) = first.as_typed_array(ctx.heap()) {
-        // §10.4.5.1 IntegerIndexedExoticObject [[GetOwnProperty]].
-        match &key {
-            PropertyKey::String(k) => {
-                if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(k) {
-                    if target.buffer(ctx.heap()).is_detached(ctx.heap())
-                        || !n.is_finite()
-                        || n.fract() != 0.0
-                        || n < 0.0
-                        || (n as usize) >= target.length(ctx.heap())
-                    {
-                        None
-                    } else {
-                        Some(crate::object::PropertyDescriptor::data(
-                            target
-                                .get(ctx.heap_mut(), n as usize)
-                                .map_err(crate::oom_to_vm)?,
-                            true,
-                            true,
-                            true,
-                        ))
-                    }
-                } else if let Some(bag) = target.expando(ctx.heap()) {
-                    crate::object::get_own_descriptor(bag, ctx.heap(), k)
-                } else {
-                    None
-                }
-            }
-            PropertyKey::Symbol(sym) => target
-                .expando(ctx.heap())
-                .and_then(|bag| crate::object::get_own_symbol_descriptor(bag, ctx.heap(), *sym)),
-        }
-    } else if first.is_boolean()
-        || first.is_number()
-        || first.is_string()
-        || first.is_symbol()
-        || first.is_big_int()
-    {
-        // §20.1.2.7 — primitive operands carry no own data property.
-        None
-    } else {
-        return Err(VmError::TypeError {
-            message: "Object.getOwnPropertyDescriptor target must be an object".to_string(),
-        });
-    };
-    match desc {
-        Some(desc) => Ok(Value::object(native_descriptor_to_object_rooted(
-            ctx,
-            &desc,
-            &[],
-            args,
-        )?)),
-        None => Ok(Value::undefined()),
-    }
-}
-
-fn native_get_own_property_descriptors_rooted(
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    let target = args.first().cloned().ok_or(VmError::TypeMismatch)?;
-    if target.is_nullish() {
-        return Err(VmError::TypeError {
-            message: "Object.getOwnPropertyDescriptors called on null or undefined".to_string(),
-        });
-    }
-    // §20.1.2.9 step 2 — `obj = OrdinaryObjectCreate(%Object.prototype%)`.
-    let object_proto = ctx.cx.interp.constructor_prototype_value("Object").ok();
-    let result = ctx.alloc_object_with_roots(&[&target], &[args])?;
-    if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
-        crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
-    }
-    if !target.is_object_type() {
-        return Ok(Value::object(result));
-    }
-    let Some(context) = context else {
-        return Err(VmError::InvalidOperand);
-    };
-    let result_root = Value::object(result);
-
-    let keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
-    for key in keys {
-        let key_for_descriptor = if let Some(s) = key.as_string(ctx.heap()) {
-            Value::string(s)
-        } else if let Some(sym) = key.as_symbol(ctx.heap()) {
-            Value::symbol(sym)
-        } else {
-            continue;
-        };
-        let Some(desc) = ctx.cx.interp.get_own_property_descriptor_for_value(
-            context,
-            target,
-            Some(&key_for_descriptor),
-        )?
-        else {
-            continue;
-        };
-        let desc_obj =
-            native_descriptor_to_object_rooted(ctx, &desc, &[&target, &result_root], args)?;
-        if let Some(s) = key.as_string(ctx.heap()) {
-            ctx.set_property(
-                result,
-                &s.to_lossy_string(ctx.heap()),
-                Value::object(desc_obj),
-            )?;
-        } else if let Some(sym) = key.as_symbol(ctx.heap())
-            && !crate::object::set_symbol(result, ctx.heap_mut(), sym, Value::object(desc_obj))
-        {
-            return Err(VmError::TypeMismatch);
-        }
-    }
-    Ok(Value::object(result))
-}
-
-fn native_get_own_property_names_rooted(
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    let Some(first) = args.first() else {
-        return Err(VmError::TypeMismatch);
-    };
-    let values: Vec<Value> = if first.is_object()
-        || first.is_array()
-        || first.is_proxy()
-        || first.is_function()
-        || first.is_closure()
-        || first.is_native_function()
-        || first.is_bound_function()
-    {
-        let Some(context) = context else {
-            return Err(VmError::InvalidOperand);
-        };
-        let target = *first;
-        ctx.cx
-            .interp
-            .own_property_keys_value(context, &target)?
-            .into_iter()
-            .filter(|v| v.is_string())
-            .collect()
-    } else if let Some(class) = first.as_class_constructor() {
-        let keys = ctx
-            .cx
-            .interp
-            .class_constructor_own_property_keys(context, class)?;
-        keys.into_iter()
-            .map(|key| string_value(&key, ctx.heap_mut()))
-            .collect::<Result<Vec<_>, _>>()?
-    } else if first.is_boolean() || first.is_number() || first.is_symbol() {
-        Vec::new()
-    } else if let Some(s) = first.as_string(ctx.heap()) {
-        let mut keys: Vec<String> = (0..s.len()).map(|idx| idx.to_string()).collect();
-        keys.push("length".to_string());
-        keys.into_iter()
-            .map(|key| string_value(&key, ctx.heap_mut()))
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        return Err(VmError::TypeMismatch);
-    };
-    Ok(Value::array(ctx.array_from_elements_with_roots(
-        values,
-        &[],
-        &[args],
-    )?))
-}
-
 fn class_constructor_own_property_keys_without_context(
     class: &crate::ClassConstructor,
     gc_heap: &otter_gc::GcHeap,
@@ -935,80 +361,6 @@ fn class_constructor_own_property_keys_without_context(
     Ok(keys)
 }
 
-fn native_get_own_property_symbols_rooted(
-    ctx: &mut NativeCtx<'_>,
-    context: Option<&crate::ExecutionContext>,
-    args: &[Value],
-) -> Result<Value, VmError> {
-    if args.first().is_some_and(|v| v.is_proxy()) {
-        let Some(context) = context else {
-            return Err(VmError::InvalidOperand);
-        };
-        let target = *args.first().expect("guarded");
-
-        let trap_keys = ctx.cx.interp.own_property_keys_value(context, &target)?;
-        let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_symbol()).collect();
-        return Ok(Value::array(ctx.array_from_elements_with_roots(
-            values,
-            &[&target],
-            &[args],
-        )?));
-    }
-    let target = expect_object(args.first())?;
-    let syms: Vec<Value> = crate::object::with_properties(target, ctx.heap(), |p| {
-        p.symbol_keys().map(Value::symbol).collect()
-    });
-    let target_root = Value::object(target);
-    Ok(Value::array(ctx.array_from_elements_with_roots(
-        syms,
-        &[&target_root],
-        &[args],
-    )?))
-}
-
-fn native_descriptor_to_object_rooted(
-    ctx: &mut NativeCtx<'_>,
-    desc: &PropertyDescriptor,
-    value_roots: &[&Value],
-    args: &[Value],
-) -> Result<JsObject, VmError> {
-    let mut roots = Vec::with_capacity(value_roots.len() + 2);
-    roots.extend_from_slice(value_roots);
-    match &desc.kind {
-        DescriptorKind::Data { value } => roots.push(value),
-        DescriptorKind::Accessor { getter, setter } => {
-            if let Some(getter) = getter {
-                roots.push(getter);
-            }
-            if let Some(setter) = setter {
-                roots.push(setter);
-            }
-        }
-    }
-    // §6.2.5.4 FromPropertyDescriptor step 2 — descriptor objects
-    // inherit `%Object.prototype%`. Without setting the prototype,
-    // reflective tests (`desc instanceof Object`,
-    // `Object.getPrototypeOf(desc)`) observe a null-proto object.
-    let object_proto = ctx.cx.interp.constructor_prototype_value("Object").ok();
-    let result = ctx.alloc_object_with_roots(roots.as_slice(), &[args])?;
-    if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
-        crate::object::set_prototype(result, ctx.heap_mut(), Some(proto_obj));
-    }
-    match &desc.kind {
-        DescriptorKind::Data { value } => {
-            ctx.set_property(result, "value", *value)?;
-            ctx.set_property(result, "writable", Value::boolean(desc.writable()))?;
-        }
-        DescriptorKind::Accessor { getter, setter } => {
-            ctx.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
-            ctx.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
-        }
-    }
-    ctx.set_property(result, "enumerable", Value::boolean(desc.enumerable()))?;
-    ctx.set_property(result, "configurable", Value::boolean(desc.configurable()))?;
-    Ok(result)
-}
-
 fn object_native_error(name: &'static str, err: VmError) -> NativeError {
     match err {
         VmError::Uncaught { value } => NativeError::Thrown {
@@ -1016,6 +368,14 @@ fn object_native_error(name: &'static str, err: VmError) -> NativeError {
             message: value,
         },
         VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
+        VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
+        VmError::SyntaxError { message } => NativeError::SyntaxError {
             name,
             reason: message,
         },

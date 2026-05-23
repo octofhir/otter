@@ -640,7 +640,23 @@ impl Interpreter {
         Ok(target_value)
     }
 
-    fn object_static_call_stack_rooted(
+    /// No-stack entry point for callers without an active dispatcher
+    /// frame stack (typically natives invoked through ordinary
+    /// dynamic dispatch). Uses an empty frame stack — alloc helpers
+    /// then route through `collect_allocation_roots(empty)` which is
+    /// equivalent to runtime-rooted alloc, and args are always passed
+    /// via `slice_roots` so they remain reachable across allocations.
+    pub(crate) fn object_static_call_no_stack(
+        &mut self,
+        context: &ExecutionContext,
+        method: method_id::ObjectMethod,
+        args: &[Value],
+    ) -> Result<Option<Value>, VmError> {
+        let stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        self.object_static_call_stack_rooted(context, &stack, method, args)
+    }
+
+    pub(crate) fn object_static_call_stack_rooted(
         &mut self,
         context: &ExecutionContext,
         stack: &SmallVec<[Frame; 8]>,
@@ -1514,7 +1530,7 @@ fn finish_static_call(
     Ok(())
 }
 
-fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool {
+pub(crate) fn enumerable_own_names_uses_internal_methods(target: &Value) -> bool {
     is_property_bearing_object(target)
 }
 
@@ -1541,7 +1557,7 @@ fn own_property_descriptors_uses_internal_methods(target: &Value) -> bool {
         || target.is_regexp()
 }
 
-fn enumerable_own_string_entries(
+pub(crate) fn enumerable_own_string_entries(
     interp: &mut Interpreter,
     context: &ExecutionContext,
     target: &Value,

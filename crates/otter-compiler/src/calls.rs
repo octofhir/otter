@@ -132,18 +132,11 @@ pub(crate) fn compile_method_call(
         // flow through the real `NativeFunction` entries installed by
         // the per-TypedArray bootstrap, so the dedicated
         // `Op::TypedArrayCall` shortcut is no longer emitted.
-        // Foundation built-ins on the global `Object`: lower a few
-        // canonical forms directly to dedicated opcodes so the
-        // runtime does not need a host-callable bridge yet.
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Object"
-        {
-            let method = member.property.name.as_str();
-            if is_compiler_lowered_object_static(method) {
-                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                return compile_object_builtin(cx, method, &arg_regs, span);
-            }
-        }
+        // §20.1.2 `Object.<method>(args)` — every static flows
+        // through the real `NativeFunction` table installed by
+        // `OBJECT_SPEC`. User shadowing of `Object.<method>` is
+        // therefore observable per spec. No compile-time fast path:
+        // the runtime IC caches the resolved callee.
         // §23.1.2 Array static surface. `Array.isArray` keeps a
         // dedicated [`Op::IsArray`] for the §7.2.2 fast path;
         // `Array.from` / `Array.of` lower to dedicated

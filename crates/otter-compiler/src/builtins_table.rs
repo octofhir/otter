@@ -59,13 +59,6 @@ pub(crate) fn is_builtin_error_class_name(name: &str) -> bool {
     )
 }
 
-pub(crate) fn is_compiler_lowered_object_static(method: &str) -> bool {
-    matches!(
-        method,
-        "create" | "getPrototypeOf" | "setPrototypeOf" | "is"
-    ) || otter_bytecode::method_id::ObjectMethod::from_str(method).is_some()
-}
-
 /// §21.1.1 Number static constants. Returns the IEEE-754 value the
 /// compiler inlines via `Op::LoadNumber` when the user reads
 /// `Number.<CONST>` outside any local shadow.

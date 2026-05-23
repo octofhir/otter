@@ -263,26 +263,22 @@ fn take_n<const N: usize>(code: &[u8], pc: usize) -> Result<[u8; N], DecodeError
 }
 
 /// Stable opcode → byte mapping. Returning `None` means the opcode
-/// has not yet been registered in the v2 table; the writer panics
-/// in that case to keep the wire format closed.
+/// has not yet been registered in the v2 table.
 ///
-/// Each row in [`OP_BYTE_TABLE`] is a single source of truth for
-/// both directions. Adding a new opcode is one row added.
+/// O(1) via [`OP_BYTE_TABLE`]'s sequentiality invariant: rows are
+/// indexed by their byte value, so the byte == row index.
 #[must_use]
 pub fn op_to_byte(op: Op) -> Option<u8> {
     OP_BYTE_TABLE
         .iter()
-        .find(|(candidate, _)| *candidate == op)
-        .map(|(_, byte)| *byte)
+        .position(|(candidate, _)| *candidate == op)
+        .map(|index| index as u8)
 }
 
-/// Reverse of [`op_to_byte`].
+/// Reverse of [`op_to_byte`]. O(1) via direct table indexing.
 #[must_use]
 pub fn op_from_byte(byte: u8) -> Option<Op> {
-    OP_BYTE_TABLE
-        .iter()
-        .find(|(_, candidate)| *candidate == byte)
-        .map(|(op, _)| *op)
+    OP_BYTE_TABLE.get(byte as usize).map(|(op, _)| *op)
 }
 
 /// Stable byte assignments for every [`Op`] variant the v2 wire

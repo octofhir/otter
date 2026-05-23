@@ -17,6 +17,7 @@
 //! - `docs/architecture-refactor-plan-2026-05.md` Task 3.1
 
 pub mod dispatch;
+pub(crate) mod shared;
 
 // Bootstrap installer modules — one per intrinsic.
 pub mod array;

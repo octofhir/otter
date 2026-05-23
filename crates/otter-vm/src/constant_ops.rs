@@ -32,7 +32,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?
             .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::big_int(value))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 }

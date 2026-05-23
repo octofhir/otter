@@ -89,7 +89,7 @@ impl Interpreter {
         }
         // Advance past the Await before parking so resumption
         // continues at the next instruction.
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         let promise =
             if let Some(p) = awaited.as_promise() {
                 p
@@ -132,7 +132,7 @@ impl Interpreter {
         owner: crate::generator::JsGenerator,
     ) -> Result<(), VmError> {
         let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         let promise =
             if let Some(p) = awaited.as_promise() {
                 p

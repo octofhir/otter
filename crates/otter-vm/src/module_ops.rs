@@ -46,7 +46,7 @@ impl Interpreter {
                 name: format!("import \"{specifier}\""),
             })?;
         write_register(frame, dst, Value::object(namespace))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -69,7 +69,7 @@ impl Interpreter {
         let resolved_str =
             JsString::from_str(&resolved, &mut self.gc_heap).map_err(|_| VmError::TypeMismatch)?;
         write_register(frame, dst, Value::string(resolved_str))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -124,7 +124,7 @@ impl Interpreter {
                     .rejected_stack_rooted(self, stack, reason, &[], &[])?
             };
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         Ok(())
     }
 }

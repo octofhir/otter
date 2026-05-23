@@ -96,7 +96,7 @@ impl Interpreter {
                 let coerced = self.math_coerce_args(context, args)?;
                 let result =
                     math::call(method, &coerced, &self.gc_heap).map_err(math_to_vm_error)?;
-                finish_static_call(frame, dst, result)
+                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::JsonCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
@@ -137,7 +137,7 @@ impl Interpreter {
                 }
                 let result =
                     json::call(method, &coerced, &mut self.gc_heap).map_err(json_to_vm_error)?;
-                finish_static_call(frame, dst, result)
+                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::DateCall => unreachable!("DateCall requires stack-rooted dispatch"),
             Op::BigIntCall => {
@@ -174,7 +174,7 @@ impl Interpreter {
                     }
                 }
                 let result = bigint::dispatch::call(&mut self.gc_heap, method, &coerced)?;
-                finish_static_call(frame, dst, result)
+                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::ArrayBufferCall => unreachable!("ArrayBufferCall requires stack-rooted dispatch"),
             Op::DataViewCall => {
@@ -182,7 +182,7 @@ impl Interpreter {
                 let method = method_id::DataViewMethod::from_u32(method_idx)
                     .ok_or(VmError::InvalidOperand)?;
                 let result = binary::dispatch::data_view_call(method, &args, &mut self.gc_heap)?;
-                finish_static_call(frame, dst, result)
+                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::TypedArrayCall => unreachable!("TypedArrayCall requires stack-rooted dispatch"),
             Op::SharedArrayBufferCall => {
@@ -193,7 +193,7 @@ impl Interpreter {
                 let method =
                     method_id::GlobalMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
                 let result = global_functions::call(method, &args, &mut self.gc_heap)?;
-                finish_static_call(frame, dst, result)
+                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::SymbolCall => {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
@@ -213,7 +213,7 @@ impl Interpreter {
                 };
                 let result =
                     symbol_dispatch::call(self, method, &coerced).map_err(symbol_to_vm_error)?;
-                finish_static_call(frame, dst, result)
+                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::TemporalCall => {
                 let dst = register_operand(operands.first())?;
@@ -226,7 +226,7 @@ impl Interpreter {
                     .ok_or(VmError::InvalidOperand)?;
                 let result = temporal::call_static(&mut self.gc_heap, class, method, &args)
                     .map_err(temporal_to_vm_error)?;
-                finish_static_call(frame, dst, result)
+                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             _ => Err(VmError::InvalidOperand),
         }
@@ -344,7 +344,7 @@ impl Interpreter {
         };
         let result = json::call_with_roots(method, &args, &mut self.gc_heap, &mut external_visit)
             .map_err(json_to_vm_error)?;
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     /// Stack-rooted dispatcher for `Op::DateCall`. Construct
@@ -429,7 +429,7 @@ impl Interpreter {
             date_prototype,
             &mut external_visit,
         )?;
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     pub(crate) fn run_array_buffer_static_call_operands(
@@ -459,7 +459,7 @@ impl Interpreter {
             &mut self.gc_heap,
             &mut external_visit,
         )?;
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     pub(crate) fn run_typed_array_static_call_operands(
@@ -495,7 +495,7 @@ impl Interpreter {
             &mut self.gc_heap,
             &mut external_visit,
         )?;
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     pub(crate) fn run_shared_array_buffer_static_call_operands(
@@ -525,7 +525,7 @@ impl Interpreter {
             &mut self.gc_heap,
             &mut external_visit,
         )?;
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     pub(crate) fn run_object_static_call_operands(
@@ -552,15 +552,15 @@ impl Interpreter {
         match method {
             method_id::ObjectMethod::Create => {
                 let result = self.do_object_create_with_descriptors(context, stack, &args)?;
-                return finish_static_call(&mut stack[top_idx], dst, result);
+                return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
             }
             method_id::ObjectMethod::DefineProperties => {
                 let result = self.do_object_define_properties(context, stack, &args)?;
-                return finish_static_call(&mut stack[top_idx], dst, result);
+                return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
             }
             method_id::ObjectMethod::Assign => {
                 let result = self.do_object_assign(context, stack, &args)?;
-                return finish_static_call(&mut stack[top_idx], dst, result);
+                return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
             }
             method_id::ObjectMethod::GetOwnPropertyDescriptor | method_id::ObjectMethod::HasOwn => {
                 // §20.1.2.10 / §20.1.2.13 step 1: `obj = ? ToObject(O)`.
@@ -622,7 +622,12 @@ impl Interpreter {
                     } else {
                         object_statics::call(method, &rewritten, &mut self.gc_heap)?
                     };
-                    return finish_static_call(&mut stack[top_idx], dst, result);
+                    return finish_static_call(
+                        &mut stack[top_idx],
+                        dst,
+                        result,
+                        self.current_byte_len,
+                    );
                 }
             }
             _ => {}
@@ -642,7 +647,7 @@ impl Interpreter {
         } else {
             object_statics::call(method, &args, &mut self.gc_heap)?
         };
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     /// §20.1.2.2 Object.create(O, Properties).
@@ -1611,7 +1616,7 @@ impl Interpreter {
         let method =
             method_id::IteratorMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
         let result = self.iterator_static_call_stack_rooted(stack, method, &args)?;
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     pub(crate) fn run_proxy_static_call_operands(
@@ -1626,7 +1631,7 @@ impl Interpreter {
         };
         let method = method_id::ProxyMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
         let result = self.proxy_static_call_stack_rooted(stack, method, &args)?;
-        finish_static_call(&mut stack[top_idx], dst, result)
+        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     fn proxy_static_call_stack_rooted(
@@ -1904,9 +1909,14 @@ fn collect_call_args(
     Ok(args)
 }
 
-fn finish_static_call(frame: &mut Frame, dst: u16, result: Value) -> Result<(), VmError> {
+fn finish_static_call(
+    frame: &mut Frame,
+    dst: u16,
+    result: Value,
+    byte_len: u32,
+) -> Result<(), VmError> {
     write_register(frame, dst, result)?;
-    frame.advance_pc(1)?;
+    frame.advance_pc(byte_len)?;
     Ok(())
 }
 

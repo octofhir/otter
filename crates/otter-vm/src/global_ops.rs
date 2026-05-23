@@ -26,7 +26,7 @@ impl Interpreter {
         dst: u16,
     ) -> Result<(), VmError> {
         write_register(frame, dst, Value::object(self.global_this))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -42,7 +42,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         if let Some(value) = crate::object::get(self.global_this, &self.gc_heap, name) {
             write_register(frame, dst, value)?;
-            frame.advance_pc(1)?;
+            frame.advance_pc(self.current_byte_len)?;
             Ok(())
         } else {
             Err(VmError::UndefinedIdentifier {
@@ -64,7 +64,7 @@ impl Interpreter {
         let value =
             crate::object::get(self.global_this, &self.gc_heap, name).unwrap_or(Value::undefined());
         write_register(frame, dst, value)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -96,7 +96,7 @@ impl Interpreter {
                 message: format!("Cannot declare global var '{name}'"),
             });
         }
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 }

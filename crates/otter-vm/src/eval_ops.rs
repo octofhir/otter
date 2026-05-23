@@ -44,7 +44,7 @@ impl Interpreter {
         let result = self.run_eval(&value, force_strict)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -66,7 +66,7 @@ impl Interpreter {
         )?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 

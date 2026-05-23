@@ -50,7 +50,7 @@ impl Interpreter {
             .function_id_constant(idx)
             .ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, Value::function(function_id))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -93,7 +93,7 @@ impl Interpreter {
             crate::closure::alloc_closure(&mut self.gc_heap, function_id, upvalues, bound_this)
                 .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::closure(closure))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -149,7 +149,7 @@ impl Interpreter {
         );
         let frame = &mut stack[frame_idx];
         write_register(frame, dst, Value::class_constructor(class))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -325,7 +325,7 @@ impl Interpreter {
             cold.pending_bind_function = None;
         }
         write_register(&mut stack[top_idx], dst, Value::bound_function(bound))?;
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         Ok(())
     }
 

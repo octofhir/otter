@@ -39,7 +39,7 @@ impl Interpreter {
         let value = self.build_collection_with_stack_roots(kind, &seed, stack)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 

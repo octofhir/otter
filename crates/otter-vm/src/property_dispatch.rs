@@ -209,7 +209,7 @@ impl Interpreter {
             false
         };
         write_register(frame, dst, Value::boolean(result))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -304,7 +304,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         };
         write_register(frame, dst, Value::boolean(present))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -369,7 +369,7 @@ impl Interpreter {
             });
         }
         write_register(frame, dst, Value::boolean(removed))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -495,7 +495,7 @@ impl Interpreter {
             });
         }
         write_register(frame, dst, Value::boolean(removed))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -508,7 +508,7 @@ impl Interpreter {
         let value = *read_register(frame, src)?;
         let result = self.get_prototype_for_op(&value)?;
         write_register(frame, dst, result)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -571,7 +571,7 @@ impl Interpreter {
         } else {
             return Err(VmError::TypeMismatch);
         }
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -853,7 +853,7 @@ impl Interpreter {
         };
         let frame = &mut stack[top_idx];
         write_register(frame, dst, value)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -919,7 +919,7 @@ impl Interpreter {
                                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                                 args.push(value);
                                 self.run_callable_sync(context, &setter, Value::array(a), args)?;
-                                stack[top_idx].advance_pc(1)?;
+                                stack[top_idx].advance_pc(self.current_byte_len)?;
                                 return Ok(());
                             }
                             object::SetOutcome::Reject { .. } => {
@@ -927,7 +927,7 @@ impl Interpreter {
                                     strict,
                                     format!("Cannot assign to property '{name}'"),
                                 )?;
-                                stack[top_idx].advance_pc(1)?;
+                                stack[top_idx].advance_pc(self.current_byte_len)?;
                                 return Ok(());
                             }
                             object::SetOutcome::AssignData => {}
@@ -1103,7 +1103,7 @@ impl Interpreter {
         if let Some(target) = target {
             self.set_property(target, name, value)?;
         }
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -1503,7 +1503,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         };
         write_register(frame, dst, value)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -1581,7 +1581,7 @@ impl Interpreter {
                         strict,
                         "Cannot add symbol property to non-extensible function",
                     )?;
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     return Ok(());
                 }
                 let bag =
@@ -1708,7 +1708,7 @@ impl Interpreter {
                                         Value::array(arr),
                                         args,
                                     )?;
-                                    stack[top_idx].advance_pc(1)?;
+                                    stack[top_idx].advance_pc(self.current_byte_len)?;
                                     return Ok(());
                                 }
                                 object::SetOutcome::Reject { .. } => {
@@ -1716,7 +1716,7 @@ impl Interpreter {
                                         strict,
                                         format!("Cannot assign to property '{name}'"),
                                     )?;
-                                    stack[top_idx].advance_pc(1)?;
+                                    stack[top_idx].advance_pc(self.current_byte_len)?;
                                     return Ok(());
                                 }
                                 object::SetOutcome::AssignData => {}
@@ -1807,7 +1807,7 @@ impl Interpreter {
                         strict,
                         "Cannot add symbol property to non-extensible RegExp",
                     )?;
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     return Ok(());
                 }
                 let bag = regexp_ensure_expando(self, &r, &recv)?;
@@ -1859,7 +1859,7 @@ impl Interpreter {
             return Err(VmError::TypeMismatch);
         }
         let frame = &mut stack[top_idx];
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -2025,7 +2025,12 @@ impl Interpreter {
             if let Some(ic) = self.load_property_ics[site].cached() {
                 if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
                     self.property_ic_stats.record_hit(PropertyIcKind::Load);
-                    Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
+                    Self::finish_property_fast_path_value(
+                        &mut stack[top_idx],
+                        dst,
+                        value,
+                        self.current_byte_len,
+                    )?;
                     return Ok(true);
                 }
                 self.load_property_ics[site].record_guard_miss_with_stats(
@@ -2048,11 +2053,16 @@ impl Interpreter {
                     PropertyIcKind::Load,
                     ic,
                 );
-                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)?;
+                Self::finish_property_fast_path_value(
+                    &mut stack[top_idx],
+                    dst,
+                    value,
+                    self.current_byte_len,
+                )?;
                 return Ok(true);
             }
             let key = VmPropertyKey::atom(atomized_key);
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             match self.ordinary_get_value(
                 context,
                 Value::object(obj),
@@ -2096,7 +2106,7 @@ impl Interpreter {
             || receiver.is_data_view()
         {
             let key = VmPropertyKey::atom(atomized_key);
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -2118,7 +2128,7 @@ impl Interpreter {
         {
             let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])?;
             let key = VmPropertyKey::atom(atomized_key);
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             match self.ordinary_get_value(context, boxed, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -2140,7 +2150,7 @@ impl Interpreter {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
                 }) => {
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2160,7 +2170,7 @@ impl Interpreter {
                         &self.gc_heap,
                         name,
                     ) {
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2171,7 +2181,7 @@ impl Interpreter {
                         return Ok(true);
                     }
                     if is_restricted_function_property(name) {
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         let callee = self.restricted_throw_type_error()?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &callee, receiver, args, dst)?;
@@ -2222,7 +2232,7 @@ impl Interpreter {
                 if let object::PropertyLookup::Accessor { getter, .. } =
                     object::lookup(proto, &self.gc_heap, name)
                 {
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2252,7 +2262,7 @@ impl Interpreter {
         };
         match crate::object::lookup(obj, &self.gc_heap, name) {
             object::PropertyLookup::Accessor { getter, .. } => {
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2292,7 +2302,7 @@ impl Interpreter {
         let lhs = *read_register(&stack[top_idx], lhs_reg)?;
         let rhs = *read_register(&stack[top_idx], rhs_reg)?;
         let result = self.instanceof_operator_stack_rooted(context, stack, &lhs, &rhs)?;
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         write_register(&mut stack[top_idx], dst, Value::boolean(result))?;
         Ok(true)
     }
@@ -2337,7 +2347,7 @@ impl Interpreter {
             || receiver.is_array_buffer()
             || receiver.is_data_view();
         if prototype_routed {
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -2359,7 +2369,7 @@ impl Interpreter {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
                 }) => {
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2379,7 +2389,7 @@ impl Interpreter {
                         &self.gc_heap,
                         key,
                     ) {
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2390,7 +2400,7 @@ impl Interpreter {
                         return Ok(true);
                     }
                     if is_restricted_function_property(key) {
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         let callee = self.restricted_throw_type_error()?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &callee, receiver, args, dst)?;
@@ -2404,7 +2414,7 @@ impl Interpreter {
             o
         } else if let Some(class) = receiver.as_class_constructor() {
             if key.string_name().is_some_and(|key| key == "prototype") {
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 write_register(
                     &mut stack[top_idx],
                     dst,
@@ -2436,12 +2446,12 @@ impl Interpreter {
         };
         match lookup {
             object::PropertyLookup::Data { value, .. } => {
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 write_register(&mut stack[top_idx], dst, value)?;
                 Ok(true)
             }
             object::PropertyLookup::Accessor { getter, .. } => {
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2473,6 +2483,7 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
         context: &ExecutionContext,
         message: impl Into<String>,
+        byte_len: u32,
     ) -> Result<bool, VmError> {
         if Self::current_frame_is_strict(stack, context) {
             return Err(VmError::TypeError {
@@ -2480,7 +2491,7 @@ impl Interpreter {
             });
         }
         let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(byte_len)?;
         Ok(true)
     }
 
@@ -2494,18 +2505,17 @@ impl Interpreter {
         }
     }
 
-    fn advance_property_fast_path(frame: &mut Frame) -> Result<(), VmError> {
-        let pc = frame.pc;
-        frame.pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-        Ok(())
+    fn advance_property_fast_path(frame: &mut Frame, byte_len: u32) -> Result<(), VmError> {
+        frame.advance_pc(byte_len)
     }
 
     fn finish_property_fast_path_value(
         frame: &mut Frame,
         dst: u16,
         value: Value,
+        byte_len: u32,
     ) -> Result<(), VmError> {
-        Self::advance_property_fast_path(frame)?;
+        Self::advance_property_fast_path(frame, byte_len)?;
         write_register(frame, dst, value)
     }
 
@@ -2560,7 +2570,7 @@ impl Interpreter {
                                 )?;
                             }
                             let top_idx = stack.len() - 1;
-                            stack[top_idx].advance_pc(1)?;
+                            stack[top_idx].advance_pc(self.current_byte_len)?;
                             return Ok(true);
                         }
                         object::PropertyLookup::Accessor { setter, .. } => {
@@ -2576,7 +2586,7 @@ impl Interpreter {
                                 return Ok(true);
                             };
                             let top_idx = stack.len() - 1;
-                            stack[top_idx].advance_pc(1)?;
+                            stack[top_idx].advance_pc(self.current_byte_len)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                             args.push(value);
                             self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -2597,7 +2607,7 @@ impl Interpreter {
                         receiver
                     ];
                     let top_idx = stack.len() - 1;
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                         Some(_) => {}
                         None => {
@@ -2670,7 +2680,7 @@ impl Interpreter {
             strict,
             format!("Cannot assign to property '{name}' on primitive"),
         )?;
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         Ok(true)
     }
 
@@ -2719,7 +2729,7 @@ impl Interpreter {
                 value,
                 Value::proxy(proxy),
             ];
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(_) => {}
                 None => {
@@ -2805,7 +2815,7 @@ impl Interpreter {
                     if !abstract_ops::is_callable(&setter) {
                         return Err(VmError::TypeMismatch);
                     }
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
                     self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -2825,14 +2835,14 @@ impl Interpreter {
                         if !abstract_ops::is_callable(&setter) {
                             return Err(VmError::TypeMismatch);
                         }
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
                         self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                     if is_restricted_function_property(key) {
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         let callee = self.restricted_throw_type_error()?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
@@ -2853,6 +2863,7 @@ impl Interpreter {
                             stack,
                             context,
                             "Cannot assign to symbol property",
+                            self.current_byte_len,
                         );
                     }
                 }
@@ -2862,9 +2873,10 @@ impl Interpreter {
                             stack,
                             context,
                             "Cannot assign to accessor property without a setter",
+                            self.current_byte_len,
                         );
                     }
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
                     self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -2875,10 +2887,11 @@ impl Interpreter {
                         stack,
                         context,
                         "Cannot assign to symbol property",
+                        self.current_byte_len,
                     );
                 }
             }
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
         if receiver.is_boolean()
@@ -2911,6 +2924,7 @@ impl Interpreter {
                             stack,
                             context,
                             format!("Cannot add property '{key}' to non-extensible RegExp"),
+                            self.current_byte_len,
                         );
                     }
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
@@ -2919,6 +2933,7 @@ impl Interpreter {
                             stack,
                             context,
                             format!("Cannot assign to property '{key}'"),
+                            self.current_byte_len,
                         );
                     }
                 }
@@ -2931,6 +2946,7 @@ impl Interpreter {
                             stack,
                             context,
                             "Cannot add symbol property to non-extensible RegExp",
+                            self.current_byte_len,
                         );
                     }
                     let bag = regexp_ensure_expando(self, r, &receiver)?;
@@ -2939,11 +2955,12 @@ impl Interpreter {
                             stack,
                             context,
                             "Cannot assign to symbol property",
+                            self.current_byte_len,
                         );
                     }
                 }
             }
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
         let obj = if let Some(obj) = receiver.as_object() {
@@ -2966,6 +2983,7 @@ impl Interpreter {
                             stack,
                             context,
                             format!("Cannot assign to read-only property '{key}' of function"),
+                            self.current_byte_len,
                         );
                     }
                     let has_own = self
@@ -2977,6 +2995,7 @@ impl Interpreter {
                             stack,
                             context,
                             format!("Cannot add property '{key}' to non-extensible function"),
+                            self.current_byte_len,
                         );
                     }
                 }
@@ -2988,6 +3007,7 @@ impl Interpreter {
                             stack,
                             context,
                             "Cannot add symbol property to non-extensible function",
+                            self.current_byte_len,
                         );
                     }
                 }
@@ -3017,9 +3037,10 @@ impl Interpreter {
                         stack,
                         context,
                         "Cannot assign to read-only property",
+                        self.current_byte_len,
                     );
                 }
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 Ok(true)
             }
             object::SetOutcome::InvokeSetter { setter } => {
@@ -3028,17 +3049,21 @@ impl Interpreter {
                         stack,
                         context,
                         "Cannot assign to accessor property without a setter",
+                        self.current_byte_len,
                     );
                 }
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
                 self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                 Ok(true)
             }
-            object::SetOutcome::Reject { .. } => {
-                Self::finish_failed_set(stack, context, "Cannot assign to property")
-            }
+            object::SetOutcome::Reject { .. } => Self::finish_failed_set(
+                stack,
+                context,
+                "Cannot assign to property",
+                self.current_byte_len,
+            ),
         }
     }
 
@@ -3086,7 +3111,7 @@ impl Interpreter {
                     .is_some()
                 {
                     self.property_ic_stats.record_hit(PropertyIcKind::Store);
-                    Self::advance_property_fast_path(&mut stack[top_idx])?;
+                    Self::advance_property_fast_path(&mut stack[top_idx], self.current_byte_len)?;
                     return Ok(true);
                 }
                 self.store_property_ics[site].record_guard_miss_with_stats(
@@ -3116,7 +3141,7 @@ impl Interpreter {
                 value,
                 Value::proxy(proxy),
             ];
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
@@ -3239,7 +3264,7 @@ impl Interpreter {
                     if !abstract_ops::is_callable(&setter) {
                         return Err(VmError::TypeMismatch);
                     }
-                    stack[top_idx].advance_pc(1)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
                     self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -3259,14 +3284,14 @@ impl Interpreter {
                         if !abstract_ops::is_callable(&setter) {
                             return Err(VmError::TypeMismatch);
                         }
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
                         self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                     if is_restricted_function_property(name) {
-                        stack[top_idx].advance_pc(1)?;
+                        stack[top_idx].advance_pc(self.current_byte_len)?;
                         let callee = self.restricted_throw_type_error()?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
@@ -3309,6 +3334,7 @@ impl Interpreter {
                     stack,
                     context,
                     format!("Cannot assign to read-only property '{name}' of function"),
+                    self.current_byte_len,
                 );
             }
             match self.function_user_props.get(&fid).copied() {
@@ -3340,6 +3366,7 @@ impl Interpreter {
                         stack,
                         context,
                         format!("Cannot assign to property '{name}'"),
+                        self.current_byte_len,
                     );
                 }
                 if receiver.is_object() {
@@ -3370,7 +3397,7 @@ impl Interpreter {
                         }
                     }
                 }
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 Ok(true)
             }
             object::SetOutcome::InvokeSetter { setter } => {
@@ -3381,9 +3408,10 @@ impl Interpreter {
                         stack,
                         context,
                         format!("Cannot assign to accessor property '{name}' without a setter"),
+                        self.current_byte_len,
                     );
                 }
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
                 self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -3393,6 +3421,7 @@ impl Interpreter {
                 stack,
                 context,
                 format!("Cannot assign to property '{name}'"),
+                self.current_byte_len,
             ),
         }
     }
@@ -3427,6 +3456,7 @@ impl Interpreter {
                         &mut stack[top_idx],
                         dst,
                         Value::boolean(true),
+                        self.current_byte_len,
                     )?;
                     return Ok(true);
                 }
@@ -3451,6 +3481,7 @@ impl Interpreter {
                     &mut stack[top_idx],
                     dst,
                     Value::boolean(true),
+                    self.current_byte_len,
                 )?;
                 return Ok(true);
             }
@@ -3464,7 +3495,7 @@ impl Interpreter {
         } else {
             VmPropertyKey::OwnedString(lhs.display_string(&self.gc_heap))
         };
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         let present = self.ordinary_has_property_value(context, rhs, &key, 0)?;
         write_register(&mut stack[top_idx], dst, Value::boolean(present))?;
         Ok(true)
@@ -3489,7 +3520,7 @@ impl Interpreter {
         let Some(proxy) = receiver.as_proxy() else {
             return Ok(false);
         };
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         let removed = self.ordinary_delete_value(
             context,
             Value::proxy(proxy),
@@ -3518,7 +3549,7 @@ impl Interpreter {
         }
         let idx = *read_register(&stack[top_idx], idx_reg)?;
         let key = Self::coerce_vm_property_key(Some(&idx), &self.gc_heap)?;
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
@@ -3545,7 +3576,7 @@ impl Interpreter {
         if !value.is_proxy() {
             return Ok(false);
         };
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         let result = self.ordinary_get_prototype_value(context, value, 0)?;
         write_register(&mut stack[top_idx], dst, result)?;
         Ok(true)
@@ -3574,7 +3605,7 @@ impl Interpreter {
         } else {
             return Err(VmError::TypeMismatch);
         };
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         // §10.5.7 — dispatch through the value-level helper so
         // nested proxies fall through correctly and §10.5.7 invariants
         // apply on the trap result.

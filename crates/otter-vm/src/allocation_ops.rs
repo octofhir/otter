@@ -550,7 +550,7 @@ impl Interpreter {
         }
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::object(obj))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -573,7 +573,7 @@ impl Interpreter {
         let array = self.alloc_stack_rooted_array_from_elements(stack, elements)?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::array(array))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -594,7 +594,7 @@ impl Interpreter {
                 }
             })?;
         write_register(frame, dst, Value::regexp(regex))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -618,7 +618,7 @@ impl Interpreter {
         };
         crate::array::push_with_roots(array, &mut self.gc_heap, value, &mut external_visit)?;
         let frame = &mut stack[top_idx];
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -644,7 +644,7 @@ impl Interpreter {
         )?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::weak_ref(weak_ref))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -672,7 +672,7 @@ impl Interpreter {
         )?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::finalization_registry(registry))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 }

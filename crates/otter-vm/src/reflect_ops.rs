@@ -38,7 +38,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let args = collect_reflect_args(&stack[top_idx], operands)?;
 
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         let result = reflect::call(self, context, method, &args)?;
         let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
         write_register(frame, dst, result)

@@ -158,7 +158,7 @@ impl Interpreter {
             // Already-an-iterator should pass through unchanged.
             let frame = &mut stack[top_idx];
             write_register(frame, dst, Value::iterator(rc))?;
-            frame.advance_pc(1)?;
+            frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         } else {
             return Err(VmError::TypeMismatch);
@@ -166,7 +166,7 @@ impl Interpreter {
         let iter = self.alloc_stack_rooted_iterator_state(stack, state, &[&value], &[])?;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, Value::iterator(iter))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -183,7 +183,7 @@ impl Interpreter {
         let (value, done) = step_iterator(iter, &mut self.gc_heap)?;
         write_register(frame, value_dst, value)?;
         write_register(frame, done_dst, Value::boolean(done))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -723,7 +723,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let frame = &mut stack[top_idx];
         write_register(frame, dst, result)?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(true)
     }
 
@@ -1216,7 +1216,7 @@ impl Interpreter {
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                 cold.pending_get_iterator = None;
             }
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
 
@@ -1304,7 +1304,7 @@ impl Interpreter {
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                 cold.pending_iterator_next = None;
             }
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
 
@@ -1341,7 +1341,7 @@ impl Interpreter {
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
         // Helper-wrapper iterator states drive through the
@@ -1360,7 +1360,7 @@ impl Interpreter {
             let (value, done) = self.iterator_next_full(context, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(true);
         }
         // Snapshot the user iterator object out of the inner

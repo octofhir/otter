@@ -137,7 +137,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let value = to_number_primitive(read_register(frame, src)?, &self.gc_heap)?;
         write_register(frame, dst, Value::number(value))?;
-        frame.advance_pc(1)?;
+        frame.advance_pc(self.current_byte_len)?;
         Ok(())
     }
 
@@ -183,7 +183,7 @@ impl Interpreter {
         let hint = JsString::from_str("number", self.gc_heap_mut())?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
         args.push(Value::string(hint));
-        stack[top_idx].advance_pc(1)?;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
         self.invoke(stack, context, &callee, recv, args, dst)?;
         Ok(Some(()))
     }
@@ -251,7 +251,7 @@ impl Interpreter {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_to_primitive = None;
                 }
-                stack[top_idx].advance_pc(1)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
                 return Ok(false);
             }
             // Non-primitive — advance to the next stage.
@@ -269,7 +269,7 @@ impl Interpreter {
         let recv = *read_register(&stack[top_idx], src)?;
         if abstract_ops::is_primitive(&recv) {
             write_register(&mut stack[top_idx], dst, recv)?;
-            stack[top_idx].advance_pc(1)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
             return Ok(false);
         }
 
@@ -636,7 +636,7 @@ impl Interpreter {
                                 cold.pending_to_primitive = None;
                             }
                             write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].advance_pc(1)?;
+                            stack[top_idx].advance_pc(self.current_byte_len)?;
                             return Ok(false);
                         }
                     }
@@ -690,7 +690,7 @@ impl Interpreter {
                                 cold.pending_to_primitive = None;
                             }
                             write_register(&mut stack[top_idx], dst, v)?;
-                            stack[top_idx].advance_pc(1)?;
+                            stack[top_idx].advance_pc(self.current_byte_len)?;
                             return Ok(false);
                         }
                     }

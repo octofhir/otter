@@ -198,42 +198,12 @@ pub(crate) fn compile_method_call(
         // `NativeFunction` constructor, the call flows through
         // ordinary method dispatch so user-installed shadows on
         // `Promise.<name>` are observable.
-        // `Temporal.<Class>.<method>(args)` — typed dispatch via
-        // [`TemporalClassId`] + [`TemporalMethod`]. The callee is a
-        // nested static-member expression (`Temporal.<Class>` then
-        // `.<method>`), detected directly so the runtime needs no
-        // real `Temporal` global.
-        if let Expression::StaticMemberExpression(outer) = &member.object
-            && let Expression::Identifier(id) = &outer.object
-            && id.name.as_str() == "Temporal"
-        {
-            let class_name = outer.property.name.as_str();
-            let method_name = member.property.name.as_str();
-            let Some(class_id) = otter_bytecode::method_id::TemporalClassId::from_str(class_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Temporal.{class_name}"),
-                    span,
-                });
-            };
-            let Some(method_id) = otter_bytecode::method_id::TemporalMethod::from_str(method_name)
-            else {
-                return Err(CompileError::Unsupported {
-                    node: format!("Temporal.{class_name}.{method_name}"),
-                    span,
-                });
-            };
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(class_id.as_u32()));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::TemporalCall, operands, span);
-            return Ok(dst);
-        }
+        // `Temporal.<Class>.<method>(args)` previously routed through
+        // the dedicated `Op::TemporalCall` shortcut. The opcode is
+        // gone; the call now falls through to ordinary dynamic
+        // dispatch. The `Temporal` global bootstrap currently exposes
+        // no concrete class statics, so most `Temporal.*` calls will
+        // throw at runtime until that bootstrap is fleshed out.
         // `Symbol.<method>(args)` flows through the real `NativeFunction`
         // entries installed by the `Symbol` bootstrap, so the dedicated
         // `Op::SymbolCall` shortcut is no longer emitted. User shadowing

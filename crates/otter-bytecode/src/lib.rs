@@ -612,19 +612,8 @@ pub enum Op {
     /// `Value::Intl(JsIntl)` payload; subsequent method calls
     /// rebuild the underlying ICU formatter / collator on demand.
     NewIntl,
-    /// `r<dst> = Temporal.<Class>.<method>(args...)`. Operands:
-    /// `Register(dst), ConstIndex(class), ConstIndex(method),
-    /// ConstIndex(argc), Register(arg0), …`.
-    ///
-    /// Variadic. The runtime resolves `class` against the Temporal
-    /// type table (`Instant` / `Duration` / `PlainDate` / `PlainTime`
-    /// / `PlainDateTime` / `Now`) and routes `method` through the
-    /// per-class static dispatcher.
-    TemporalCall,
     /// `r<dst> = Temporal.<member>` (read accessor). Operand pair:
-    /// `Register(dst), ConstIndex(member)`. Reserved for future
-    /// calendar / unit constants — today every Temporal member is
-    /// reached through `TemporalCall`.
+    /// `Register(dst), ConstIndex(member)`.
     TemporalLoad,
     /// Build a fresh `Map` / `Set` / `WeakMap` / `WeakSet`. Operands:
     /// `Register(dst), ConstIndex(kind_const), Register(iterable)`.
@@ -984,7 +973,6 @@ impl Op {
             Op::NewCollection => "NEW_COLLECTION",
             Op::NewWeakRef => "NEW_WEAK_REF",
             Op::NewFinalizationRegistry => "NEW_FINALIZATION_REGISTRY",
-            Op::TemporalCall => "TEMPORAL_CALL",
             Op::TemporalLoad => "TEMPORAL_LOAD",
             Op::NewIntl => "NEW_INTL",
             Op::SameValue => "SAME_VALUE",
@@ -1136,7 +1124,6 @@ impl Op {
             Op::Yield => 2,           // dst, src
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
-            Op::TemporalCall => 4,    // dst, class_const, method_const, argc — args follow
             Op::NewIntl => 4,         // dst, class_const, locale_reg, options_reg
             Op::QueueMicrotask => 2,  // callee, argc — args follow
             Op::PromiseNew => 3,      // dst, executor_reg, scratch_dst
@@ -1221,8 +1208,6 @@ impl Op {
             | Op::ArrayBufferCall
             | Op::DataViewCall
             | Op::SharedArrayBufferCall => false,
-            // `dst, class_id, method_id, argc` — both raw.
-            Op::TemporalCall => false,
             // No constant-pool refs in any other operand position.
             _ => false,
         }

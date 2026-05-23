@@ -27,7 +27,7 @@ use crate::{
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
-    temporal, temporal_to_vm_error, write_register,
+    write_register,
 };
 
 /// Full property-bearing object-like family used by Object.* and
@@ -111,19 +111,6 @@ impl Interpreter {
             }
             Op::SharedArrayBufferCall => {
                 unreachable!("SharedArrayBufferCall requires stack-rooted dispatch")
-            }
-            Op::TemporalCall => {
-                let dst = register_operand(operands.first())?;
-                let class_idx = const_operand(operands.get(1))?;
-                let method_idx = const_operand(operands.get(2))?;
-                let args = collect_call_args(frame, operands, 3, 4)?;
-                let class = method_id::TemporalClassId::from_u32(class_idx)
-                    .ok_or(VmError::InvalidOperand)?;
-                let method = method_id::TemporalMethod::from_u32(method_idx)
-                    .ok_or(VmError::InvalidOperand)?;
-                let result = temporal::call_static(&mut self.gc_heap, class, method, &args)
-                    .map_err(temporal_to_vm_error)?;
-                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             _ => Err(VmError::InvalidOperand),
         }

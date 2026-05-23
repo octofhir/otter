@@ -344,8 +344,7 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Class identifiers carried as the leading operand of
-    /// [`Op::TemporalCall`](crate::Op::TemporalCall).
+    /// Class identifiers for the `Temporal` namespace.
     TemporalClassId {
         Instant = 0 => "Instant",
         Duration = 1 => "Duration",
@@ -357,9 +356,8 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Static methods reached through [`Op::TemporalCall`](crate::Op::TemporalCall).
-    /// Union of every per-class static surface; the runtime gates
-    /// each variant against the leading [`TemporalClassId`] operand.
+    /// Static methods for `Temporal.<Class>`. Union of every
+    /// per-class static surface.
     TemporalMethod {
         From = 0 => "from",
         Compare = 1 => "compare",

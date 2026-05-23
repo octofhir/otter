@@ -30,7 +30,7 @@ use std::num::NonZeroU32;
 use otter_gc::raw::SlotVisitor;
 
 use crate::frame_state::{
-    PendingBindFunction, PendingGetIterator, PendingIteratorNext, PendingToPrimitive,
+    PendingBindFunction, PendingGetIterator, PendingIteratorNext, PendingToPrimitive, TryHandler,
 };
 use crate::{JsObject, Value};
 use smallvec::SmallVec;
@@ -96,6 +96,10 @@ pub struct ColdFrame {
     /// only when the callee was compiled with `needs_arguments`;
     /// consumed by `Op::CollectArguments`.
     pub incoming_args: SmallVec<[Value; 4]>,
+    /// Active try-handler stack. Pushed by `Op::EnterTry`, popped by
+    /// `Op::LeaveTry` or by exception unwind landing on a matching
+    /// catch / finally. Innermost handler on top.
+    pub handlers: SmallVec<[TryHandler; 4]>,
 }
 
 impl ColdFrame {
@@ -112,6 +116,7 @@ impl ColdFrame {
             && self.new_target.is_none()
             && self.rest_args.is_empty()
             && self.incoming_args.is_empty()
+            && self.handlers.is_empty()
     }
 
     /// Trace GC slots reachable through cold protocol state.

@@ -7458,21 +7458,25 @@ mod tests {
                 span: (0, 0),
             }],
         };
+        let mut interp = Interpreter::new();
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&main);
-        frame.handlers.push(TryHandler {
+        interp.frame_ensure_cold(&mut frame).handlers.push(TryHandler {
             catch_pc: Some(42),
             finally_pc: None,
             exc_register: 1,
         });
         stack.push(frame);
-        let mut interp = Interpreter::new();
         interp
             .unwind_throw(&mut stack, Value::boolean(true))
             .unwrap();
         assert_eq!(stack[0].pc, 42);
         assert_eq!(stack[0].registers[1], Value::boolean(true));
-        assert!(stack[0].handlers.is_empty());
+        assert!(
+            interp
+                .frame_cold(&stack[0])
+                .is_none_or(|c| c.handlers.is_empty())
+        );
     }
 
     #[test]

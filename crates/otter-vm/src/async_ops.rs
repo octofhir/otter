@@ -167,6 +167,10 @@ impl Interpreter {
     /// `frame`. Mirrors [`Self::run_async_resume`] but settles the
     /// generator's `pending_request` on completion / unhandled
     /// throw rather than the frame's `async_state` promise.
+    // `Box<Frame>` is intentional: the parked frame travels heap-owned
+    // through the microtask queue. Inlining it would require copying
+    // the whole frame on every async-resume dispatch tick.
+    #[allow(clippy::boxed_local)]
     pub(crate) fn run_async_gen_resume(
         &mut self,
         context: &ExecutionContext,
@@ -273,6 +277,10 @@ impl Interpreter {
     ///   Async frames absorb their own throws via `async_state`,
     ///   so the only errors that escape are runtime-level (OOM,
     ///   stack overflow, interrupt).
+    // Box<Frame>: parked frame travels heap-owned through the
+    // microtask queue; inlining would copy the whole frame on every
+    // tick.
+    #[allow(clippy::boxed_local)]
     pub(crate) fn run_async_resume(
         &mut self,
         context: &ExecutionContext,
@@ -372,7 +380,12 @@ impl Interpreter {
                     .take()
                     .unwrap_or(VmError::Uncaught { value: display }));
             };
-            let Some(handler) = frame.handlers.pop() else {
+            let popped_handler = self
+                .frame_cold_mut(frame)
+                .and_then(|c| c.handlers.pop());
+            // Re-borrow `frame` after the helper's `&mut self` borrow.
+            let frame = stack.last_mut().expect("frame still present");
+            let Some(handler) = popped_handler else {
                 // No in-frame try-handler. Async frames absorb
                 // their own unhandled throws into the result
                 // promise as a rejection — synthesised in spec

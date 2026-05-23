@@ -56,10 +56,6 @@ pub struct Frame {
     /// provided value, and arrow closures override with their
     /// lexically-captured `this` regardless of the call site.
     pub this_value: Value,
-    /// Active try-handler stack. Pushed by [`Op::EnterTry`], popped
-    /// by [`Op::LeaveTry`] or by an exception unwind landing on a
-    /// matching catch / finally. Innermost handler is on top.
-    pub handlers: SmallVec<[TryHandler; 4]>,
     /// Async-call state: `Some` when this frame belongs to an
     /// `async` function. The result promise was created at call
     /// entry and written into the caller's destination register
@@ -386,7 +382,6 @@ impl Frame {
             return_register,
             upvalues,
             this_value,
-            handlers: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_str()),
             cold: None,
@@ -415,7 +410,6 @@ impl Frame {
             return_register,
             upvalues,
             this_value,
-            handlers: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_ref()),
             cold: None,

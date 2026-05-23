@@ -116,7 +116,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_enter_try_regs(
-        &self,
+        &mut self,
         frame: &mut Frame,
         catch_off: i32,
         finally_off: i32,
@@ -138,7 +138,7 @@ impl Interpreter {
         if catch_pc.is_none() && finally_pc.is_none() {
             return Err(VmError::InvalidOperand);
         }
-        frame.handlers.push(TryHandler {
+        self.frame_ensure_cold(frame).handlers.push(TryHandler {
             catch_pc,
             finally_pc,
             exc_register,
@@ -147,8 +147,11 @@ impl Interpreter {
         Ok(())
     }
 
-    pub(crate) fn run_leave_try(&self, frame: &mut Frame) -> Result<(), VmError> {
-        if frame.handlers.pop().is_none() {
+    pub(crate) fn run_leave_try(&mut self, frame: &mut Frame) -> Result<(), VmError> {
+        let popped = self
+            .frame_cold_mut(frame)
+            .and_then(|c| c.handlers.pop());
+        if popped.is_none() {
             return Err(VmError::InvalidOperand);
         }
         frame.pc += 1;

@@ -38,10 +38,6 @@ pub(crate) enum ObjectIntegrityLevel {
     Frozen,
 }
 
-/// Full object-shaped family used by §10 internal-method dispatchers
-/// (excluding the Object/Proxy ordinary fast paths the callers handle
-/// directly).
-
 /// Convert an already-primitive value to a [`VmPropertyKey`] per
 /// §7.1.19 step 2-3: Symbol values pass through unchanged; every
 /// other primitive coerces to a UTF-16 string spelling.

@@ -140,7 +140,7 @@ impl ExecutionContext {
     }
 
     /// Dense property IC site for a named property instruction at the
-    /// given v2 byte-offset PC.
+    /// given byte-offset PC.
     #[must_use]
     pub(crate) fn property_ic_site(&self, function_id: u32, pc: u32) -> Option<usize> {
         self.exec_function(function_id)?

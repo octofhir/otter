@@ -25,9 +25,9 @@
 //! # See also
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
-pub mod bytecode_v2;
 pub mod disasm;
 pub mod dump;
+pub mod encoding;
 pub mod method_id;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

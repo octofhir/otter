@@ -32,7 +32,7 @@
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, NO_HANDLER_OFFSET, Op,
     Operand, SpanEntry,
-    bytecode_v2::{EncodedFunction, encode_function, translate_spans_to_byte_pcs},
+    encoding::{EncodedFunction, encode_function, translate_spans_to_byte_pcs},
 };
 
 const NO_PROPERTY_IC_SITE: u32 = u32::MAX;

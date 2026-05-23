@@ -1,12 +1,13 @@
-//! Byte-stream bytecode encoding (v2 wire format).
+//! Bytecode wire format: byte-stream encoder, decoder, source-map
+//! and jump-offset helpers.
 //!
-//! Encodes the existing [`Instruction`] DTO stream into a single
-//! `Vec<u8>` byte buffer and decodes it back. The byte format is
-//! self-describing per operand (a tag byte precedes each operand so
-//! the decoder does not need a per-opcode schema yet). The next
-//! migration step replaces the per-operand tag with a schema-driven
-//! decode that lets the dispatcher read operands by fixed byte
-//! stride.
+//! Encodes the compiler's [`Instruction`] DTO stream into a single
+//! `Vec<u8>` byte buffer that the VM dispatch loop reads opcode-by-
+//! opcode. The format is self-describing per operand (a kind byte
+//! precedes each operand), so the decoder does not need a per-opcode
+//! schema. A schema-driven decoder is a future optimization; the wire
+//! format itself stays stable as long as
+//! [`BYTECODE_FORMAT_VERSION`] is unchanged.
 //!
 //! # Wire format (per instruction)
 //!
@@ -21,26 +22,19 @@
 //!     ConstIndex:  u32 little-endian
 //!     Imm32:       i32 little-endian
 //! ```
-//!
-//! # Scope
-//!
-//! This module ships the framework: writer, decoder, error variants,
-//! version constant, round-trip plumbing. Mapping every
-//! [`crate::Op`] variant to its stable byte and back is delivered in
-//! follow-up commits as opcodes migrate. The current
-//! [`op_to_byte`] / [`op_from_byte`] table covers the smoke-test
-//! opcode subset.
 
 use crate::{Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList, SpanEntry};
 
-/// Current bytecode wire-format version.
-pub const BYTECODE_SCHEMA_VERSION: u16 = 2;
+/// Current bytecode wire-format version. Bumped on any breaking change
+/// to the encoded layout (opcode reordering, operand-kind table edit,
+/// jump-offset semantics, header shape, etc.).
+pub const BYTECODE_FORMAT_VERSION: u16 = 2;
 
 const OPERAND_KIND_REGISTER: u8 = 0;
 const OPERAND_KIND_CONST_INDEX: u8 = 1;
 const OPERAND_KIND_IMM32: u8 = 2;
 
-/// Errors surfaced by the v2 decoder.
+/// Errors surfaced by the decoder.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// Stream ended mid-instruction.
@@ -85,7 +79,7 @@ impl std::fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// Append-only writer that builds a v2 byte stream from an
+/// Append-only writer that builds the byte stream from an
 /// [`Instruction`] sequence.
 #[derive(Debug, Default)]
 pub struct BytecodeWriter {
@@ -111,7 +105,7 @@ impl BytecodeWriter {
     /// opcode.
     pub fn write(&mut self, instr: &Instruction) {
         let opcode_byte = op_to_byte(instr.op)
-            .unwrap_or_else(|| panic!("opcode {:?} not registered in bytecode v2 table", instr.op));
+            .unwrap_or_else(|| panic!("opcode {:?} not registered in bytecode table", instr.op));
         self.bytes.push(opcode_byte);
         let operands = instr.operands.as_slice();
         let count =
@@ -146,11 +140,10 @@ impl BytecodeWriter {
     }
 }
 
-/// Encoded function body: byte stream plus a parallel map from the
-/// caller's instruction-index PC (v1) to the byte-offset PC (v2).
-///
-/// The source-map conversion uses this to rewrite each `SpanEntry::pc`
-/// from instruction index to byte offset without re-walking the
+/// Encoded function body: byte stream plus the per-instruction byte
+/// offsets. Source-map translation reuses the offsets to rewrite each
+/// `SpanEntry::pc` from instruction index (the compiler's coordinate
+/// system) to byte offset (the dispatcher's) without re-walking the
 /// stream.
 #[derive(Debug, Clone)]
 pub struct EncodedFunction {
@@ -163,18 +156,18 @@ pub struct EncodedFunction {
 }
 
 /// Encode a whole function body (an [`Instruction`] slice in source
-/// order) into the v2 byte stream and return both the bytes and the
+/// order) into the byte stream and return both the bytes and the
 /// per-instruction byte-offset map.
 ///
-/// Jump-class opcodes (`Op::Jump`, `Op::JumpIfTrue`, `Op::JumpIfFalse`,
-/// `Op::JumpIfNullish`, `Op::EnterTry`) carry `Imm32` operands whose
-/// v1 semantics are *instruction-index* deltas relative to the
-/// instruction immediately following the jump. v2 wire format requires
-/// *byte-offset* deltas relative to `(jump_pc + 1)` (the byte after the
-/// opcode byte). Encoding is a two-pass walk:
+/// The compiler emits branch operands (`Op::Jump`, `Op::JumpIfTrue`,
+/// `Op::JumpIfFalse`, `Op::JumpIfNullish`, `Op::EnterTry`) as
+/// *instruction-index* deltas relative to the instruction following the
+/// jump. The wire format wants *byte-offset* deltas relative to
+/// `(jump_pc + 1)` (the byte right after the opcode), so encoding is a
+/// two-pass walk:
 ///
 /// 1. Write every instruction in order, capturing each jump operand's
-///    byte position and the source v1 delta.
+///    byte position and the source instruction-index delta.
 /// 2. Re-resolve each captured slot to a byte-offset delta computed
 ///    against `instr_to_byte_pc`.
 ///
@@ -230,7 +223,7 @@ fn write_instruction_capturing_jumps(
     fixups: &mut Vec<JumpFixup>,
 ) {
     let opcode_byte = op_to_byte(instr.op)
-        .unwrap_or_else(|| panic!("opcode {:?} not registered in bytecode v2 table", instr.op));
+        .unwrap_or_else(|| panic!("opcode {:?} not registered in bytecode table", instr.op));
     writer.bytes.push(opcode_byte);
     let operands = instr.operands.as_slice();
     let count = u8::try_from(operands.len()).expect("instruction operand count exceeds u8::MAX");
@@ -292,8 +285,8 @@ fn resolve_jump_fixup(
 }
 
 /// Operand slot positions whose `Imm32` value is a branch offset that
-/// the v2 encoder must rewrite from instruction-index delta to
-/// byte-offset delta. Non-branch opcodes return an empty slice.
+/// the encoder must rewrite from instruction-index delta to byte-offset
+/// delta. Non-branch opcodes return an empty slice.
 fn branch_imm32_operand_slots(op: Op) -> &'static [usize] {
     match op {
         Op::Jump | Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfNullish => &[0],
@@ -302,12 +295,11 @@ fn branch_imm32_operand_slots(op: Op) -> &'static [usize] {
     }
 }
 
-/// Translate a v1 source-map (`pc` = instruction index) into the v2
-/// byte-offset form using the `instr_to_byte_pc` map produced by
-/// [`encode_function`]. Out-of-range entries fall back to the end of
-/// the byte stream (`total_bytes`), which matches the
-/// "jump past the last instruction" convention used by the encoder
-/// itself.
+/// Translate an instruction-index source-map into byte-offset form
+/// using the `instr_to_byte_pc` map produced by [`encode_function`].
+/// Out-of-range entries fall back to the end of the byte stream
+/// (`total_bytes`), matching the "jump past the last instruction"
+/// convention used by the encoder itself.
 ///
 /// Order is preserved; the caller may pass either a `Vec` or a slice
 /// borrowed from [`crate::Function::spans`].
@@ -418,10 +410,10 @@ fn take_n<const N: usize>(code: &[u8], pc: usize) -> Result<[u8; N], DecodeError
 }
 
 /// Stable opcode → byte mapping. Returning `None` means the opcode
-/// has not yet been registered in the v2 table.
+/// is not in [`OP_BYTE_TABLE`].
 ///
-/// O(1) via [`OP_BYTE_TABLE`]'s sequentiality invariant: rows are
-/// indexed by their byte value, so the byte == row index.
+/// O(1) via the table's sequentiality invariant: rows are indexed by
+/// their byte value, so the byte equals the row index.
 #[must_use]
 pub fn op_to_byte(op: Op) -> Option<u8> {
     OP_BYTE_TABLE
@@ -436,13 +428,13 @@ pub fn op_from_byte(byte: u8) -> Option<Op> {
     OP_BYTE_TABLE.get(byte as usize).map(|(op, _)| *op)
 }
 
-/// Stable byte assignments for every [`Op`] variant the v2 wire
-/// format knows about. New opcodes append at the next unused byte;
-/// assignments are stable across schema-compatible builds.
+/// Stable byte assignments for every [`Op`] variant. New opcodes
+/// append at the next unused byte; assignments are stable across
+/// format-compatible builds.
 ///
 /// Bytes are assigned in declaration order so the table grows
 /// monotonically. Reordering or removing an entry bumps
-/// [`BYTECODE_SCHEMA_VERSION`].
+/// [`BYTECODE_FORMAT_VERSION`].
 pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::Nop, 0x00),
     (Op::LoadUndefined, 0x01),

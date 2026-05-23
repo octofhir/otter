@@ -125,7 +125,12 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::ObjectCall`](crate::Op::ObjectCall).
+    /// Typed dispatch key for `Object.<method>(args...)` native
+    /// implementations. The compiler no longer emits a dedicated
+    /// opcode for these — calls flow through ordinary dynamic
+    /// dispatch — but the VM-side spec helpers still key off this
+    /// enum to keep one switch per method instead of one match-arm
+    /// per string name in hot paths.
     ObjectMethod {
         Assign = 0 => "assign",
         Create = 1 => "create",

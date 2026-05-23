@@ -783,22 +783,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-array.of>
     ArrayOf,
-    /// `r<dst> = Object.<name>(args...)`. Operands:
-    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
-    ///
-    /// Variadic, same shape as the other namespace-call shortcuts.
-    /// Routes Object-namespace static calls (`defineProperty`,
-    /// `getOwnPropertyDescriptor`, `freeze`, `seal`,
-    /// `preventExtensions`, the `is*` predicates) through one
-    /// dispatcher; unknown names raise `UnknownIntrinsic`. The
-    /// canonical lowerings `Object.create` / `Object.getPrototypeOf`
-    /// / `Object.setPrototypeOf` / `Object.is` keep their dedicated
-    /// opcodes for back-compat.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-properties-of-the-object-constructor>
-    ObjectCall,
     /// `r<dst> = enumerable-string-keys(r<obj>)` — internal `for-in`
     /// snapshot. Operands: `Register(dst), Register(obj)`.
     ///
@@ -1026,7 +1010,6 @@ impl Op {
             Op::LooseNotEqual => "LOOSE_NEQ",
             Op::NewBuiltinError => "NEW_BUILTIN_ERROR",
             Op::LoadBuiltinError => "LOAD_BUILTIN_ERROR",
-            Op::ObjectCall => "OBJECT_CALL",
             Op::ForInKeys => "FOR_IN_KEYS",
             Op::CopyDataProperties => "COPY_DATA_PROPERTIES",
             Op::DefineOwnProperty => "DEFINE_OWN_PROPERTY",
@@ -1162,7 +1145,6 @@ impl Op {
             // recv, key, src, scratch_dst for accessor setters.
             Op::StoreElement => 4,
             Op::CallMethodValue => 4,    // dst, recv, name_const, argc
-            Op::ObjectCall => 3,         // dst, name_const, argc — args follow
             Op::ForInKeys => 2,          // dst, obj
             Op::CopyDataProperties => 2, // target, src
             Op::DefineOwnProperty => 3,  // target, key, desc
@@ -1253,7 +1235,6 @@ impl Op {
             // offset these slots — doing so silently rebinds the
             // call to a different builtin method after merge.
             Op::PromiseCall
-            | Op::ObjectCall
             | Op::BigIntCall
             | Op::ArrayBufferCall
             | Op::DataViewCall

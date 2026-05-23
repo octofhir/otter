@@ -275,13 +275,11 @@ fn inherited_non_writable_data_store_loop(iterations: i32) -> ExecutionContext {
             Op::LoadString,
             [Operand::Register(10), Operand::ConstIndex(0)],
         ),
+        // §10.1.6.1 OrdinaryDefineOwnProperty(target=r9, key=r10, desc=r7).
         instr(
             7,
-            Op::ObjectCall,
+            Op::DefineOwnProperty,
             [
-                Operand::Register(11),
-                Operand::ConstIndex(2),
-                Operand::ConstIndex(3),
                 Operand::Register(9),
                 Operand::Register(10),
                 Operand::Register(7),

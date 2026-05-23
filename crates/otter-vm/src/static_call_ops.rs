@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError, VmPropertyKey, array, bigint, binary,
-    object, object_statics,
+    object,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
@@ -280,128 +280,6 @@ impl Interpreter {
         let frame = &mut stack[top_idx];
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
-    }
-
-    pub(crate) fn run_object_static_call_operands(
-        &mut self,
-        context: &ExecutionContext,
-        stack: &mut SmallVec<[Frame; 8]>,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        let (dst, method_idx, args) = {
-            let frame = &stack[top_idx];
-            decode_static_call(frame, operands, 1, 2, 3)?
-        };
-        let method =
-            method_id::ObjectMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-        // §20.1.2.2 Object.create / §20.1.2.3 Object.defineProperties
-        // run ToPropertyDescriptor (§6.2.5.5) on the descriptor
-        // source, which must invoke accessor getters and walk the
-        // prototype chain. Route them through context-aware helpers
-        // before the rooted/free fallbacks. Object.defineProperty is
-        // already handled in `try_proxy_object_static_call` (which is
-        // not actually Proxy-specific — it runs the full spec
-        // descriptor coercion for any Object-typed target).
-        match method {
-            method_id::ObjectMethod::Create => {
-                let result = self.do_object_create_with_descriptors(context, Some(stack), &args)?;
-                return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
-            }
-            method_id::ObjectMethod::DefineProperties => {
-                let result = self.do_object_define_properties(context, Some(stack), &args)?;
-                return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
-            }
-            method_id::ObjectMethod::Assign => {
-                let result = self.do_object_assign(context, Some(stack), &args)?;
-                return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
-            }
-            method_id::ObjectMethod::GetOwnPropertyDescriptor | method_id::ObjectMethod::HasOwn => {
-                // §20.1.2.10 / §20.1.2.13 step 1: `obj = ? ToObject(O)`.
-                // Preserve the observable ordering before the
-                // context-aware `ToPropertyKey(P)` path below: null /
-                // undefined receivers must throw before key coercion
-                // can invoke user code.
-                if args.first().is_none_or(|v| v.is_nullish()) {
-                    return Err(VmError::TypeError {
-                        message: "Object static method called on null or undefined".to_string(),
-                    });
-                }
-                // §20.1.2.10 / §20.1.2.13 step 2: `key = ? ToPropertyKey(P)`.
-                // The ToPrimitive ladder may invoke user
-                // `Symbol.toPrimitive` / `toString` / `valueOf`, so
-                // we route through the context-aware path *only*
-                // when the arg isn't already a String / Symbol /
-                // Number / Boolean / Null / Undefined primitive
-                // that the free coercion handles directly.
-                let key_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-                let needs_coercion = !(key_arg.is_string()
-                    || key_arg.is_number()
-                    || key_arg.is_boolean()
-                    || key_arg.is_null()
-                    || key_arg.is_undefined()
-                    || key_arg.is_symbol());
-                if needs_coercion {
-                    let coerced_key = self.evaluate_to_property_key(context, &key_arg)?;
-                    let coerced_value = match &coerced_key {
-                        crate::VmPropertyKey::Symbol(sym) => Value::symbol(*sym),
-                        other => Value::string(crate::string::JsString::from_str(
-                            other
-                                .string_name()
-                                .expect("non-symbol key has string spelling"),
-                            self.gc_heap_mut(),
-                        )?),
-                    };
-                    let mut rewritten: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-                    if rewritten.len() >= 2 {
-                        rewritten[1] = coerced_value;
-                    } else {
-                        rewritten.push(coerced_value);
-                    }
-                    let result = if let Some(result) = self.try_function_object_static_call(
-                        Some(context),
-                        Some(stack),
-                        method,
-                        &rewritten,
-                    )? {
-                        result
-                    } else if let Some(result) =
-                        self.try_proxy_object_static_call(context, Some(stack), method, &rewritten)?
-                    {
-                        result
-                    } else if let Some(result) =
-                        self.object_static_call_stack_rooted(context, stack, method, &rewritten)?
-                    {
-                        result
-                    } else {
-                        object_statics::call(method, &rewritten, &mut self.gc_heap)?
-                    };
-                    return finish_static_call(
-                        &mut stack[top_idx],
-                        dst,
-                        result,
-                        self.current_byte_len,
-                    );
-                }
-            }
-            _ => {}
-        }
-        let result = if let Some(result) =
-            self.try_function_object_static_call(Some(context), Some(stack), method, &args)?
-        {
-            result
-        } else if let Some(result) =
-            self.try_proxy_object_static_call(context, Some(stack), method, &args)?
-        {
-            result
-        } else if let Some(result) =
-            self.object_static_call_stack_rooted(context, stack, method, &args)?
-        {
-            result
-        } else {
-            object_statics::call(method, &args, &mut self.gc_heap)?
-        };
-        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
     }
 
     /// §20.1.2.2 Object.create(O, Properties).

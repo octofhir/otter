@@ -268,7 +268,6 @@ mod tests {
             Op::ArrayConstruct,
             Op::ArrayFrom,
             Op::ArrayOf,
-            Op::ObjectCall,
             Op::ArrayBufferCall,
             Op::DataViewCall,
             Op::Yield,
@@ -324,7 +323,6 @@ mod tests {
             | Op::ArrayConstruct
             | Op::ArrayFrom
             | Op::ArrayOf
-            | Op::ObjectCall
             | Op::ArrayBufferCall
             | Op::DataViewCall
             | Op::SharedArrayBufferCall
@@ -541,14 +539,13 @@ mod tests {
 000112 ARRAY_CONSTRUCT
 000113 ARRAY_FROM
 000114 ARRAY_OF
-000115 OBJECT_CALL
-000116 ARRAY_BUFFER_CALL
-000117 DATA_VIEW_CALL
-000118 YIELD
-000119 SHARED_ARRAY_BUFFER_CALL
-000120 TO_PRIMITIVE
-000121 FOR_IN_KEYS
-000122 COPY_DATA_PROPERTIES
-000123 DEFINE_OWN_PROPERTY
+000115 ARRAY_BUFFER_CALL
+000116 DATA_VIEW_CALL
+000117 YIELD
+000118 SHARED_ARRAY_BUFFER_CALL
+000119 TO_PRIMITIVE
+000120 FOR_IN_KEYS
+000121 COPY_DATA_PROPERTIES
+000122 DEFINE_OWN_PROPERTY
 ";
 }

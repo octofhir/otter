@@ -646,6 +646,81 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
     123 lib tests in compiler / bytecode / runtime; workspace clippy
     clean.
 
+  **Follow-up (DONE 2026-05-24):** `ObjectCall` removed from the ISA
+  entirely. Three new spec-primitive opcodes — `ForInKeys`,
+  `CopyDataProperties`, `DefineOwnProperty` — carry the compiler-
+  internal `for-in` snapshot, object/array spread + rest binding
+  CopyDataProperties, and class / computed-key OrdinaryDefineOwnProperty
+  paths. The user-facing `Object.<method>(...)` surface lowers to
+  ordinary dynamic dispatch against `OBJECT_SPEC` exclusively — every
+  shadow of `Object.<method>` (including the four formerly hand-
+  lowered `create` / `getPrototypeOf` / `setPrototypeOf` / `is` shapes)
+  is observable. `object_statics::native_call` chains the accessor-
+  aware `do_object_{create,defineProperties,assign}` helpers plus the
+  pre-`ToPropertyKey` coercion for `GetOwnPropertyDescriptor` /
+  `HasOwn`, then `try_function_object_static_call`,
+  `try_proxy_object_static_call`, and a new
+  `object_static_call_no_stack` wrapper that reuses the operands
+  dispatcher with an empty frame stack so allocation paths fall back
+  to runtime-rooted alloc (args remain rooted via slice_roots). The
+  `object_native_error` mapping now preserves `RangeError` and
+  `SyntaxError` kinds rather than collapsing every non-TypeError
+  completion to `TypeError`, recovering ~28 array-length /
+  defineProperty / defineProperties cases. OP_BYTE_TABLE renumbered
+  to stay dense after `Op::ObjectCall` removal (125 → 124 opcodes).
+
+  Temporal placeholder replaced with a real `NamespaceBuilder`-driven
+  installer (`crates/otter-vm/src/temporal/intrinsic.rs`) exposing
+  the existing `temporal::dispatch::call` engine through the global
+  `Temporal` object plus six sub-namespaces (`Instant`, `Duration`,
+  `PlainDate`, `PlainTime`, `PlainDateTime`, `Now`). The sub-
+  namespaces ship `from` / `compare` / `fromEpochMilliseconds` /
+  Now snapshot views as `NativeCall::Static` entries.
+  `Temporal.Now.instant()` / `Temporal.Instant.from(...)` / etc.
+  resolve through ordinary dynamic dispatch. Note: classes are
+  currently namespace objects, not callable constructors — full
+  `[[Construct]]` surface (`typeof Temporal.Instant === 'function'`,
+  `instanceof`) is follow-up work. Bootstrap GC allocation ratchet
+  bumped 1100 → 1130.
+
+  Proxy regression partially recovered: `proxy_target_arg` /
+  `proxy_handler_arg` switched from `Value::is_object_like()` (narrow
+  `TAG_PTR_OBJECT`) to `Value::is_object_type()` (spec
+  `Type(value) is Object`, includes callables / exotics). Recovers
+  the entire `Proxy/apply/*` and `Proxy/construct/*` family that was
+  rejecting `new Proxy(targetFunction, handler)` as "target must be
+  an object".
+
+  Test262 deltas (pre-2.3 baseline → 2.3 follow-up):
+  - Object 3396/3414 → 3384/3414 (−12) — remaining 22 failures are
+    pre-existing gaps in unrelated surfaces (async-function class
+    wrapping, Proxy-of-function `Object.prototype.toString`,
+    `nan-equivalence` redefine corners) that the deleted operands
+    path masked via its looser error mapping rather than via spec
+    correctness; tracked as separate follow-ups.
+  - Proxy 235/311 → 217/311 (−18) — the +26 recovered by the
+    `is_object_type` fix leaves an −18 residual that depends on
+    Reflect.apply / Function.prototype.apply compiler support
+    (FEATURE_NOT_IN_SLICE on the AST).
+  - Reflect 153/154 → 148/154 — all five new failures are compile-
+    side FEATURE_NOT_IN_SLICE errors on `Function.prototype.apply`
+    test bodies, not native-dispatch divergence.
+  - Math 306/327 → 305/327 (Math.hypot ToNumberErr edge), plus one
+    `Math.sqrt` crash on a 1000-element inline array fixture that
+    overflows the OperandList `u8` arity limit (compiler-side
+    follow-up, unrelated to the dispatch refactor).
+  - JSON 80/165 → 79/165, Symbol 77/98 → 76/98 — single pre-existing
+    edge per suite.
+
+  Files: `crates/otter-bytecode/src/{lib,encoding,disasm,method_id}.rs`,
+  `crates/otter-compiler/src/{for_loops,destructuring,assignment,
+  class/mod,builtins_call,builtins_table,calls,expr/object_array}.rs`,
+  `crates/otter-vm/src/{lib,static_call_ops,object_statics,
+  intrinsics/proxy,intrinsics/placeholders,temporal/mod,temporal/
+  intrinsic,bootstrap}.rs`, `crates/otter-vm/benches/property_gc.rs`.
+  529 / 22 / 60 / 123 lib tests in `otter-vm` / `otter-bytecode` /
+  `otter-compiler` / `otter-runtime`; workspace clippy clean.
+
 ### Task 2.4 — Polymorphic IC Slots
 
 - Goal: make ROADMAP P1 true and create JIT patch points.

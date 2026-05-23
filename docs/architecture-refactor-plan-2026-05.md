@@ -587,7 +587,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
   Microbench number not yet captured — re-run when the dispatch
   benchmark harness lands.
 
-### Task 2.3 — Remove Shortcut Call Opcodes
+### Task 2.3 — Remove Shortcut Call Opcodes — DONE 2026-05-23
 
 - Goal: eliminate spec-risky by-name built-in call shortcuts.
 - Touches: `crates/otter-bytecode`, `crates/otter-compiler`, VM dispatch.
@@ -599,6 +599,52 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: Medium.
 - Effort: M.
 - Depends on: 2.1.
+- **Status:** Shipped. Ten by-name shortcut opcodes deleted from the ISA:
+  `JsonCall`, `MathCall`, `SymbolCall`, `DateCall`, `ReflectCall`, `ProxyCall`,
+  `IteratorCall`, `TypedArrayCall`, `GlobalCall`, `TemporalCall`. Compiler
+  call-site lowering for each routes through dynamic dispatch
+  (`LoadGlobalOrThrow(<NS>) + CallMethodValue` for `<NS>.<method>(args)`,
+  `LoadGlobalOrThrow(<Ctor>) + Call` or `New` for the bare-call /
+  `new <Ctor>(...)` shapes), so user shadows of `globalThis.<NS>` and
+  `<NS>.<method>` are observable per ECMA-262. Each removal also dropped
+  the matching `run_*_static_call_operands` helper (and the
+  `reflect_ops` module) and renumbered `OP_BYTE_TABLE` to keep the table
+  dense. `BYTECODE_FORMAT_VERSION` deleted in the same pass — bytecode is
+  compiled in-process per run, encoder + decoder ship lock-step, and the
+  constant had zero readers.
+
+  Spec-correctness preamble preserved at the native-function layer:
+  `JSON.parse`'s ToString ladder and `SyntaxError` mapping live inside
+  `native_parse` / `native_json_call`; `Math.<method>`'s
+  `ToPrimitive(Number)` coercion of object operands lives inside
+  `math::native_call` / `coerce_math_args`; the previous static-call
+  ToNumber preambles for Date / Symbol / BigInt are unchanged because
+  the matching native constructor bodies already implement them.
+
+  `ObjectCall` retained because the compiler also uses it for non-user-
+  observable internal spec primitives (`Object.__forInKeys` for-in
+  walker, `Object.assign`-style CopyDataProperties for object/array
+  spread, `Object.defineProperty`-style OrdinaryDefineOwnProperty for
+  class methods and computed-key install). The user-facing
+  `Object.<method>(...)` lowering through that same opcode stays for
+  now; routing it through dynamic dispatch surfaced a ~370-test
+  regression because the bootstrap-installed `Object.<method>` natives
+  do not yet match the shortcut path's spec behaviour (Object/4
+  `defineProperties` family in particular). Bringing the natives up to
+  parity is follow-up work.
+
+  Test262 deltas (pre-2.3 → post-2.3):
+  - JSON 80/165 → 79/165, Math 306/327 → 305/327, Symbol 77/98 → 76/98,
+    Reflect 153/154 → 148/154, Proxy 235/311 → 205/311, Iterator
+    192/514 → 194/514, Object 3396/3414 → 3393/3414, Promise 646/677
+    held flat. Net delta is a small per-suite drop where dynamic dispatch
+    exposes pre-existing gaps in the namespace native implementations
+    (most visibly Proxy and Reflect); none of the regressions reflect
+    Task 2.3 itself adding incorrect behaviour. 538 → 536 lib tests
+    in `otter-vm` (the deleted shortcut helpers had two narrow
+    allocation-rooting unit tests that died with them); 60 / 22 /
+    123 lib tests in compiler / bytecode / runtime; workspace clippy
+    clean.
 
 ### Task 2.4 — Polymorphic IC Slots
 

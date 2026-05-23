@@ -2558,6 +2558,12 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         self.ensure_property_ic_capacity(context);
         self.begin_runtime_budget_turn();
+        // Nested dispatch must not leak its last-instruction byte length
+        // into the caller's PC advance: helpers like Op::Eval invoke
+        // dispatch_loop on a sub-stack and then expect
+        // self.current_byte_len to still describe the *outer* opcode
+        // when they call frame.advance_pc(self.current_byte_len).
+        let saved_byte_len = self.current_byte_len;
         let result = loop {
             match self.dispatch_loop_inner(context, stack) {
                 Ok(value) => break Ok(value),
@@ -2602,6 +2608,7 @@ impl Interpreter {
             }
         };
         self.finish_runtime_budget_turn();
+        self.current_byte_len = saved_byte_len;
         result
     }
 

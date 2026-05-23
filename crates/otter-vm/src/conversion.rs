@@ -243,15 +243,17 @@ impl Interpreter {
         // 1. Resume path — only when the parked state matches this
         //    instruction. Read the result the called function wrote
         //    to `dst`; if primitive, finish.
-        let resume = stack[top_idx]
-            .pending_to_primitive
-            .as_ref()
+        let resume = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|c| c.pending_to_primitive.as_ref())
             .filter(|s| s.pc == pc && s.dst == dst)
             .cloned();
         if let Some(state) = resume {
             let produced = *read_register(&stack[top_idx], dst)?;
             if abstract_ops::is_primitive(&produced) {
-                stack[top_idx].pending_to_primitive = None;
+                if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                    cold.pending_to_primitive = None;
+                }
                 stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
                 return Ok(false);
             }
@@ -633,7 +635,9 @@ impl Interpreter {
                         )? && abstract_ops::is_primitive(&v)
                         {
                             let top_idx = stack.len() - 1;
-                            stack[top_idx].pending_to_primitive = None;
+                            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                                cold.pending_to_primitive = None;
+                            }
                             write_register(&mut stack[top_idx], dst, v)?;
                             stack[top_idx].pc = stack[top_idx]
                                 .pc
@@ -688,7 +692,9 @@ impl Interpreter {
                         )? && abstract_ops::is_primitive(&v)
                         {
                             let top_idx = stack.len() - 1;
-                            stack[top_idx].pending_to_primitive = None;
+                            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                                cold.pending_to_primitive = None;
+                            }
                             write_register(&mut stack[top_idx], dst, v)?;
                             stack[top_idx].pc = stack[top_idx]
                                 .pc
@@ -704,7 +710,9 @@ impl Interpreter {
                     // upgrade `VmError::TypeMismatch` to a real
                     // `TypeError` Error object.
                     let top_idx = stack.len() - 1;
-                    stack[top_idx].pending_to_primitive = None;
+                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                        cold.pending_to_primitive = None;
+                    }
                     return Err(VmError::TypeMismatch);
                 }
             }
@@ -730,7 +738,8 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
-        stack[top_idx].pending_to_primitive = Some(PendingToPrimitive {
+        self.frame_ensure_cold(&mut stack[top_idx])
+            .pending_to_primitive = Some(PendingToPrimitive {
             pc,
             dst,
             obj,

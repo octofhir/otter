@@ -25,6 +25,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
     ExecutableFunction, JsObject, JsPromiseHandle, UpvalueCell, Value, abstract_ops, alloc_upvalue,
+    cold_frame::ColdFrameIdx,
 };
 
 /// One call frame. Compact and cache-conscious per foundation
@@ -111,42 +112,13 @@ pub struct Frame {
     /// `Op::ImportNamespace` itself never executes from a
     /// non-module frame in well-formed bytecode.
     pub module_url: std::rc::Rc<str>,
-    /// State machine for the in-flight ECMA-262 §7.1.1 `ToPrimitive`
-    /// ladder. `Some` while the dispatcher is mid-way through the
-    /// `[Symbol.toPrimitive]` / `valueOf` / `toString` chain on a
-    /// specific `Op::ToPrimitive` instruction; `None` otherwise.
-    /// Set by [`Interpreter::drive_to_primitive`] before pushing a
-    /// call frame, cleared once the ladder hands back a primitive
-    /// (or exhausts every stage and the dispatcher raises a
-    /// `TypeMismatch`).
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-toprimitive>
-    pub pending_to_primitive: Option<PendingToPrimitive>,
-    /// In-flight ECMA-262 §20.2.3.2
-    /// `Function.prototype.bind` metadata collection. `Some`
-    /// while `Op::BindFunction` is awaiting an accessor getter for
-    /// `target.name` or `target.length`.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-function.prototype.bind>
-    pub pending_bind_function: Option<PendingBindFunction>,
-    /// In-flight ECMA-262 §7.4.3 `GetIterator` over a user object.
-    /// `Some` while the dispatcher is awaiting the result of
-    /// `obj[@@iterator]()`; the resume step wraps that return
-    /// value as [`IteratorState::User`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-getiterator>
-    pub pending_get_iterator: Option<PendingGetIterator>,
-    /// In-flight ECMA-262 §7.4.5 `IteratorNext` over a user
-    /// iterator. `Some` while the dispatcher is awaiting the
-    /// result of `iter.next()`; the resume step extracts
-    /// `value` / `done` from the returned record.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-iteratornext>
-    pub pending_iterator_next: Option<PendingIteratorNext>,
+    /// Handle into the per-interpreter
+    /// [`crate::cold_frame::ColdFramePool`] when this frame has
+    /// acquired a cold side record (try handlers, async parking,
+    /// pending ToPrimitive/bind/iterator ladders, …). `None` until
+    /// the first opcode that needs cold state writes through
+    /// [`crate::Interpreter::frame_ensure_cold`].
+    pub cold: Option<ColdFrameIdx>,
     /// `Some(gen)` when this frame is the suspended body of an
     /// active generator object. [`otter_bytecode::Op::Yield`]
     /// inspects this slot: if set, the running frame is unspooled
@@ -452,10 +424,7 @@ impl Frame {
             incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_str()),
-            pending_to_primitive: None,
-            pending_bind_function: None,
-            pending_get_iterator: None,
-            pending_iterator_next: None,
+            cold: None,
             generator_owner: None,
         }
     }
@@ -489,10 +458,7 @@ impl Frame {
             incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_ref()),
-            pending_to_primitive: None,
-            pending_bind_function: None,
-            pending_get_iterator: None,
-            pending_iterator_next: None,
+            cold: None,
             generator_owner: None,
         }
     }
@@ -527,22 +493,10 @@ impl Frame {
         if let Some(async_state) = &self.async_state {
             async_state.result_promise.trace_value_slots(visitor);
         }
-        if let Some(pending) = &self.pending_to_primitive {
-            pending.obj.trace_value_slots(visitor);
-        }
-        if let Some(pending) = &self.pending_bind_function {
-            pending.target.trace_value_slots(visitor);
-            pending.bound_this.trace_value_slots(visitor);
-            for arg in &pending.bound_args {
-                arg.trace_value_slots(visitor);
-            }
-            if let Some(name) = &pending.target_name {
-                name.trace_value_slots(visitor);
-            }
-        }
-        if let Some(pending) = &self.pending_iterator_next {
-            pending.iterator.trace_value_slots(visitor);
-        }
+        // Cold-record GC slots (pending_to_primitive / pending_bind_function /
+        // pending_iterator_next) are traced separately by the caller through
+        // [`crate::cold_frame::ColdFrame::trace_cold_slots`] when
+        // `self.cold` is `Some`.
         if let Some(owner) = &self.generator_owner {
             owner.trace_value_slots(visitor);
         }

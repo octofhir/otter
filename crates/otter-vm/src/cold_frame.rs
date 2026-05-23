@@ -27,6 +27,12 @@
 
 use std::num::NonZeroU32;
 
+use otter_gc::raw::SlotVisitor;
+
+use crate::frame_state::{
+    PendingBindFunction, PendingGetIterator, PendingIteratorNext, PendingToPrimitive,
+};
+
 /// Niche-encoded handle into a [`ColdFramePool`]. Stored as
 /// `Option<ColdFrameIdx>` (4 bytes) on the hot frame; `None` means no
 /// cold record has been acquired yet.
@@ -53,21 +59,57 @@ impl ColdFrameIdx {
 /// Cold half of a call frame. Pool-allocated and shared via
 /// [`ColdFrameIdx`].
 ///
-/// Empty in this scaffolding commit; subsequent commits migrate the
-/// individual cold fields (`handlers`, `module_url`, `pending_*`,
-/// `async_state`, `generator_owner`, …) out of [`crate::Frame`] and
-/// into this struct.
+/// Subsequent commits migrate the remaining cold fields (`handlers`,
+/// `module_url`, `async_state`, `generator_owner`, …) into this
+/// struct.
 #[derive(Debug, Default, Clone)]
-pub struct ColdFrame {}
+pub struct ColdFrame {
+    /// State machine for the in-flight ECMA-262 §7.1.1 `ToPrimitive`
+    /// ladder. See [`crate::frame_state::PendingToPrimitive`].
+    pub pending_to_primitive: Option<PendingToPrimitive>,
+    /// In-flight ECMA-262 §20.2.3.2 `Function.prototype.bind` metadata
+    /// collection.
+    pub pending_bind_function: Option<PendingBindFunction>,
+    /// In-flight ECMA-262 §7.4.3 `GetIterator` over a user object.
+    pub pending_get_iterator: Option<PendingGetIterator>,
+    /// In-flight ECMA-262 §7.4.5 `IteratorNext` over a user iterator.
+    pub pending_iterator_next: Option<PendingIteratorNext>,
+}
 
 impl ColdFrame {
     /// Whether this slot is logically empty (no cold state worth
-    /// keeping). The pool consults this on `release` to assert that
-    /// callers cleared their state before handing the slot back.
+    /// keeping).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        // No fields yet; always empty.
-        true
+        self.pending_to_primitive.is_none()
+            && self.pending_bind_function.is_none()
+            && self.pending_get_iterator.is_none()
+            && self.pending_iterator_next.is_none()
+    }
+
+    /// Trace GC slots reachable through cold protocol state.
+    ///
+    /// `crate::Frame::trace_frame_slots` traces hot fields; the
+    /// caller must additionally trace this record for any frame whose
+    /// `cold` slot is `Some`.
+    pub fn trace_cold_slots(&self, visitor: &mut SlotVisitor<'_>) {
+        if let Some(p) = &self.pending_to_primitive {
+            p.obj.trace_value_slots(visitor);
+        }
+        if let Some(p) = &self.pending_bind_function {
+            p.target.trace_value_slots(visitor);
+            p.bound_this.trace_value_slots(visitor);
+            for arg in &p.bound_args {
+                arg.trace_value_slots(visitor);
+            }
+            if let Some(name) = &p.target_name {
+                name.trace_value_slots(visitor);
+            }
+        }
+        if let Some(p) = &self.pending_iterator_next {
+            p.iterator.trace_value_slots(visitor);
+        }
+        // `pending_get_iterator` carries only pc + dst, no values.
     }
 }
 

@@ -36,8 +36,12 @@ impl Interpreter {
     pub(crate) fn collect_allocation_roots(&self, stack: &SmallVec<[Frame; 8]>) -> Vec<*mut RawGc> {
         let mut roots = Vec::new();
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
+        let pool = self.cold_frames();
         for frame in stack {
             frame.trace_frame_slots(&mut |slot| roots.push(slot));
+            if let Some(idx) = frame.cold {
+                pool.get(idx).trace_cold_slots(&mut |slot| roots.push(slot));
+            }
         }
         roots
     }

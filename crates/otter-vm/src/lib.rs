@@ -468,11 +468,6 @@ pub struct Interpreter {
     /// Hot [`crate::Frame`] carries an `Option<ColdFrameIdx>` and
     /// acquires a slot the first time an opcode needs cold state.
     /// See [`crate::cold_frame`] for the contract.
-    ///
-    /// Currently unread because the cold-field migration lands across
-    /// subsequent commits in Task 1.3; the pool itself is wired here
-    /// first so the per-field migrations can be reviewed in isolation.
-    #[allow(dead_code)]
     cold_frames: cold_frame::ColdFramePool,
 }
 
@@ -1929,6 +1924,55 @@ impl Interpreter {
     /// `thrower` function CreateCatchFinally(C, onFinally) installs.
     pub(crate) fn set_pending_uncaught_throw(&mut self, value: Value) {
         self.pending_uncaught_throw = Some(value);
+    }
+
+    /// Borrow the cold record attached to `frame`, if any.
+    #[inline]
+    #[must_use]
+    pub(crate) fn frame_cold(&self, frame: &Frame) -> Option<&cold_frame::ColdFrame> {
+        frame.cold.map(|idx| self.cold_frames.get(idx))
+    }
+
+    /// Mutable borrow of the cold record attached to `frame`, if any.
+    #[inline]
+    #[must_use]
+    pub(crate) fn frame_cold_mut(
+        &mut self,
+        frame: &mut Frame,
+    ) -> Option<&mut cold_frame::ColdFrame> {
+        frame.cold.map(|idx| self.cold_frames.get_mut(idx))
+    }
+
+    /// Acquire a cold record for `frame` if it doesn't have one yet,
+    /// then return a mutable borrow.
+    #[inline]
+    pub(crate) fn frame_ensure_cold(&mut self, frame: &mut Frame) -> &mut cold_frame::ColdFrame {
+        let idx = match frame.cold {
+            Some(idx) => idx,
+            None => {
+                let idx = self.cold_frames.acquire();
+                frame.cold = Some(idx);
+                idx
+            }
+        };
+        self.cold_frames.get_mut(idx)
+    }
+
+    /// Release `frame`'s cold record back to the pool if it holds one.
+    /// Called when a frame is popped off the dispatcher stack.
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn frame_release_cold(&mut self, frame: &mut Frame) {
+        if let Some(idx) = frame.cold.take() {
+            self.cold_frames.release(idx);
+        }
+    }
+
+    /// Borrow the per-interpreter cold-frame pool.
+    #[inline]
+    #[must_use]
+    pub(crate) fn cold_frames(&self) -> &cold_frame::ColdFramePool {
+        &self.cold_frames
     }
 
     /// Borrow the per-isolate GC heap (read-only).
@@ -4910,7 +4954,6 @@ fn step_iterator(
     }
 }
 
-
 /// `true` when `value` is a `JsObject` whose internal native
 /// call slot carries a native function, i.e. it is
 /// callable even though it is not a plain function value.
@@ -5707,7 +5750,8 @@ mod tests {
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut frame = Frame::for_function(&module.functions[0]);
         frame.pc = 0;
-        frame.pending_get_iterator = Some(PendingGetIterator { pc: 0, dst: 1 });
+        interp.frame_ensure_cold(&mut frame).pending_get_iterator =
+            Some(PendingGetIterator { pc: 0, dst: 1 });
         frame.registers[1] = Value::object(iterator_obj);
         stack.push(frame);
         let context = ExecutionContext::from_module(module);
@@ -5726,7 +5770,11 @@ mod tests {
             "GetIterator resume should allocate user iterator state in young space"
         );
         assert!(stack[0].registers[1].is_iterator());
-        assert!(stack[0].pending_get_iterator.is_none());
+        assert!(
+            interp
+                .frame_cold(&stack[0])
+                .is_none_or(|c| c.pending_get_iterator.is_none())
+        );
         assert_eq!(stack[0].pc, 1);
     }
 

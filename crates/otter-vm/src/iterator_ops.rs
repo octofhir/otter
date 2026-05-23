@@ -31,10 +31,7 @@ use crate::{
     step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
 
-fn string_iterator_values(
-    s: JsString,
-    heap: &mut otter_gc::GcHeap,
-) -> Result<Vec<Value>, VmError> {
+fn string_iterator_values(s: JsString, heap: &mut otter_gc::GcHeap) -> Result<Vec<Value>, VmError> {
     let mut out = Vec::new();
     let mut index = 0;
     while let Some(unit) = s.char_code_at(index, heap) {
@@ -1194,9 +1191,9 @@ impl Interpreter {
         let pc = stack[top_idx].pc;
 
         // 1. Resume path.
-        let resume = stack[top_idx]
-            .pending_get_iterator
-            .as_ref()
+        let resume = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|c| c.pending_get_iterator.as_ref())
             .filter(|s| s.pc == pc && s.dst == dst)
             .cloned();
         if let Some(_state) = resume {
@@ -1204,14 +1201,18 @@ impl Interpreter {
             // §7.4.3 step 2 — `[@@iterator]()` must return an
             // Object. Anything else is a TypeError.
             if !produced.is_object() {
-                stack[top_idx].pending_get_iterator = None;
+                if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                    cold.pending_get_iterator = None;
+                }
                 return Err(VmError::TypeMismatch);
             }
             let iter_state = IteratorState::User { iterator: produced };
             let iter =
                 self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
             write_register(&mut stack[top_idx], dst, Value::iterator(iter))?;
-            stack[top_idx].pending_get_iterator = None;
+            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                cold.pending_get_iterator = None;
+            }
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
         }
@@ -1230,7 +1231,8 @@ impl Interpreter {
         if !is_callable(&callee) {
             return Err(VmError::TypeMismatch);
         }
-        stack[top_idx].pending_get_iterator = Some(PendingGetIterator { pc, dst });
+        self.frame_ensure_cold(&mut stack[top_idx])
+            .pending_get_iterator = Some(PendingGetIterator { pc, dst });
         let args: SmallVec<[Value; 8]> = SmallVec::new();
         // pc stays on Op::GetIterator; the called frame's result
         // lands in `dst` and the resume guard above wraps it.
@@ -1272,15 +1274,17 @@ impl Interpreter {
         let pc = stack[top_idx].pc;
 
         // 1. Resume path — read the parked record.
-        let resume = stack[top_idx]
-            .pending_iterator_next
-            .as_ref()
+        let resume = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|c| c.pending_iterator_next.as_ref())
             .filter(|s| s.pc == pc && s.value_dst == value_dst && s.done_dst == done_dst)
             .cloned();
         if let Some(state) = resume {
             let result = *read_register(&stack[top_idx], state.result_reg)?;
             let Some(obj) = result.as_object() else {
-                stack[top_idx].pending_iterator_next = None;
+                if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                    cold.pending_iterator_next = None;
+                }
                 return Err(VmError::TypeMismatch);
             };
             let value =
@@ -1294,7 +1298,9 @@ impl Interpreter {
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
-            stack[top_idx].pending_iterator_next = None;
+            if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                cold.pending_iterator_next = None;
+            }
             stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
             return Ok(true);
         }
@@ -1379,7 +1385,8 @@ impl Interpreter {
         // Park the state and push a call. `result_reg` reuses the
         // `value_dst` slot — the resume step overwrites it with
         // the unpacked value before the user code observes it.
-        stack[top_idx].pending_iterator_next = Some(PendingIteratorNext {
+        self.frame_ensure_cold(&mut stack[top_idx])
+            .pending_iterator_next = Some(PendingIteratorNext {
             pc,
             value_dst,
             done_dst,

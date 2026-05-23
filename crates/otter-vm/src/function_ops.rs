@@ -38,7 +38,6 @@ enum BindMetadataGet {
 
 // Mirrors the matches! variant list used by `OrdinaryHasInstance` and
 
-
 impl Interpreter {
     pub(crate) fn run_make_function_reg(
         &self,
@@ -163,9 +162,9 @@ impl Interpreter {
         let dst = register_operand(operands.first())?;
         let top_idx = stack.len() - 1;
         let pc = stack[top_idx].pc;
-        let pending = stack[top_idx]
-            .pending_bind_function
-            .as_ref()
+        let pending = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|c| c.pending_bind_function.as_ref())
             .filter(|state| state.pc == pc && state.dst == dst)
             .cloned();
         if let Some(state) = pending {
@@ -182,7 +181,9 @@ impl Interpreter {
                 ),
                 PendingBindStage::Length => {
                     let target_name = state.target_name.ok_or(VmError::InvalidOperand)?;
-                    stack[top_idx].pending_bind_function = None;
+                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                        cold.pending_bind_function = None;
+                    }
                     self.finish_bind_function(
                         stack,
                         dst,
@@ -223,7 +224,8 @@ impl Interpreter {
                 target_name,
             ),
             BindMetadataGet::Getter(getter) => {
-                stack[top_idx].pending_bind_function = Some(PendingBindFunction {
+                self.frame_ensure_cold(&mut stack[top_idx])
+                    .pending_bind_function = Some(PendingBindFunction {
                     pc,
                     dst,
                     target,
@@ -251,7 +253,9 @@ impl Interpreter {
         let pc = stack[top_idx].pc;
         match self.callable_bind_metadata_get(context, &target, "length")? {
             BindMetadataGet::Value(target_length) => {
-                stack[top_idx].pending_bind_function = None;
+                if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                    cold.pending_bind_function = None;
+                }
                 self.finish_bind_function(
                     stack,
                     dst,
@@ -263,7 +267,8 @@ impl Interpreter {
                 )
             }
             BindMetadataGet::Getter(getter) => {
-                stack[top_idx].pending_bind_function = Some(PendingBindFunction {
+                self.frame_ensure_cold(&mut stack[top_idx])
+                    .pending_bind_function = Some(PendingBindFunction {
                     pc,
                     dst,
                     target,
@@ -316,7 +321,9 @@ impl Interpreter {
             &mut external_visit,
         )?;
         let top_idx = stack.len() - 1;
-        stack[top_idx].pending_bind_function = None;
+        if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+            cold.pending_bind_function = None;
+        }
         write_register(&mut stack[top_idx], dst, Value::bound_function(bound))?;
         stack[top_idx].pc = stack[top_idx]
             .pc
@@ -1394,9 +1401,11 @@ impl Interpreter {
             // dispatcher. This mirrors §10.1.3/§10.1.4 for the
             // side-table-backed function shape.
             M::IsExtensible => {
-                let function_id = target
-                    .as_function()
-                    .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+                let function_id = target.as_function().or_else(|| {
+                    target
+                        .as_closure(&self.gc_heap)
+                        .map(|c| c.cached_function_id)
+                });
                 match function_id {
                     Some(function_id) => Ok(Some(Value::boolean(
                         self.ordinary_function_is_extensible(function_id),
@@ -1405,9 +1414,11 @@ impl Interpreter {
                 }
             }
             M::PreventExtensions => {
-                let function_id = target
-                    .as_function()
-                    .or_else(|| target.as_closure(&self.gc_heap).map(|c| c.cached_function_id));
+                let function_id = target.as_function().or_else(|| {
+                    target
+                        .as_closure(&self.gc_heap)
+                        .map(|c| c.cached_function_id)
+                });
                 match function_id {
                     Some(function_id) => {
                         self.ordinary_function_prevent_extensions(function_id);

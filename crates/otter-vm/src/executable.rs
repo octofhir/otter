@@ -2,24 +2,23 @@
 //!
 //! `otter-bytecode` owns the compiler/debug DTO shape. The VM owns this
 //! compact view so hot dispatch reads opcodes, operands, byte offsets,
-//! and named-property IC sites without following heap operand vectors
-//! for fixed-width instructions.
+//! and named-property IC sites directly off each instruction record.
 //!
 //! # Contents
 //! - [`ExecutableModuleBuilder`] — transient builder over compiler bytecode.
 //! - [`ExecutableModule`] — VM-owned frozen function table.
-//! - [`ExecutableFunction`] — one function body: hot instructions, byte-stream
-//!   length, byte-offset source-map spans.
-//! - [`ExecInstr`] — hot instruction record with inline operands, byte length,
-//!   and byte-offset PC.
+//! - [`ExecutableFunction`] — one function body: instruction stream,
+//!   byte-stream length, byte-offset source-map spans.
+//! - [`ExecInstr`] — single instruction record: opcode, owned operands,
+//!   byte length, byte-offset PC, optional IC site id.
 //!
 //! # Invariants
 //! - `frame.pc` is a byte offset into the function's encoded stream.
 //! - Each `ExecInstr` carries its own `byte_pc` and `byte_len` so the
 //!   dispatch loop advances by `byte_len` and resolves jump targets in the
 //!   same coordinate system as the source-map spans.
-//! - Instructions with three or fewer operands store them inline; variadic
-//!   instructions spill into a per-module side table addressed by `side_start`.
+//! - Operands live in a per-instruction `Box<[Operand]>`; there is no
+//!   shared side table. Variadic opcodes just hold a longer slice.
 //! - Branch-class `Imm32` operands hold byte-offset deltas relative to
 //!   `(byte_pc + 1)`. `NO_HANDLER_OFFSET` is preserved verbatim for absent
 //!   try-handler slots.

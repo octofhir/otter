@@ -123,6 +123,11 @@ pub enum MicrotaskKind {
         /// Frame the drain re-pushes. Boxed so the `Microtask`
         /// stays small in the common-case `Call` enqueue path.
         frame: Box<Frame>,
+        /// Detached cold record extracted from the interpreter pool
+        /// at suspend time. The drain re-attaches it before pushing
+        /// the frame back onto the stack. `None` when the parked
+        /// frame had no cold state.
+        cold: Option<Box<crate::cold_frame::ColdFrame>>,
         /// Register inside `frame` that receives the awaited
         /// value on the fulfilled path.
         await_dst: u16,
@@ -138,6 +143,8 @@ pub enum MicrotaskKind {
     AsyncGenResume {
         /// Frame the drain re-pushes.
         frame: Box<Frame>,
+        /// Detached cold record, see [`Self::AsyncResume::cold`].
+        cold: Option<Box<crate::cold_frame::ColdFrame>>,
         /// Register inside `frame` that receives the awaited
         /// value on the fulfilled path.
         await_dst: u16,
@@ -288,9 +295,19 @@ impl Microtask {
         }
         match &self.kind {
             MicrotaskKind::Call | MicrotaskKind::FinalizationCallback => {}
-            MicrotaskKind::AsyncResume { frame, .. } => frame.trace_frame_slots(visitor),
-            MicrotaskKind::AsyncGenResume { frame, owner, .. } => {
+            MicrotaskKind::AsyncResume { frame, cold, .. } => {
                 frame.trace_frame_slots(visitor);
+                if let Some(c) = cold {
+                    c.trace_cold_slots(visitor);
+                }
+            }
+            MicrotaskKind::AsyncGenResume {
+                frame, cold, owner, ..
+            } => {
+                frame.trace_frame_slots(visitor);
+                if let Some(c) = cold {
+                    c.trace_cold_slots(visitor);
+                }
                 owner.trace_value_slots(visitor);
             }
         }

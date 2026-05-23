@@ -1033,12 +1033,15 @@ impl Interpreter {
             return self.make_runtime_rooted_iter_result(Value::undefined(), true, &[], &[]);
         }
         // Pull the frame out of the gen body so we can mutate it.
-        let mut frame = match handle.take_frame(&mut self.gc_heap) {
-            Some(f) => f,
+        let (mut frame, cold) = match handle.take_frame(&mut self.gc_heap) {
+            Some(pair) => pair,
             None => {
                 return self.make_runtime_rooted_iter_result(Value::undefined(), true, &[], &[]);
             }
         };
+        if let Some(c) = cold {
+            self.frame_attach_cold(&mut frame, c);
+        }
         // Apply the resume operation to the frame before re-entering
         // dispatch.
         let mut throw_value: Option<Value> = None;

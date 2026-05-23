@@ -1967,6 +1967,31 @@ impl Interpreter {
         }
     }
 
+    /// Detach `frame`'s cold record out of the pool, returning it as
+    /// an owned [`Box`] so the caller can store it alongside the
+    /// parked frame (async await, generator yield). Returns `None`
+    /// when the frame had no cold state.
+    #[inline]
+    pub(crate) fn frame_detach_cold(
+        &mut self,
+        frame: &mut Frame,
+    ) -> Option<Box<cold_frame::ColdFrame>> {
+        let idx = frame.cold.take()?;
+        Some(Box::new(self.cold_frames.detach(idx)))
+    }
+
+    /// Re-attach an owned cold record into the pool and bind it to
+    /// `frame`. Matches [`Self::frame_detach_cold`] on the resume path.
+    #[inline]
+    pub(crate) fn frame_attach_cold(
+        &mut self,
+        frame: &mut Frame,
+        cold: Box<cold_frame::ColdFrame>,
+    ) {
+        let idx = self.cold_frames.attach(*cold);
+        frame.cold = Some(idx);
+    }
+
     /// Borrow the per-interpreter cold-frame pool.
     #[inline]
     #[must_use]
@@ -2162,22 +2187,25 @@ impl Interpreter {
         // so route them to `run_async_resume` directly.
         if let MicrotaskKind::AsyncResume {
             frame,
+            cold,
             await_dst,
             fulfilled,
         } = task.kind
         {
             let value = task.args.into_iter().next().unwrap_or(Value::undefined());
-            return self.run_async_resume(context, frame, await_dst, fulfilled, value);
+            return self.run_async_resume(context, frame, cold, await_dst, fulfilled, value);
         }
         if let MicrotaskKind::AsyncGenResume {
             frame,
+            cold,
             await_dst,
             fulfilled,
             owner,
         } = task.kind
         {
             let value = task.args.into_iter().next().unwrap_or(Value::undefined());
-            return self.run_async_gen_resume(context, frame, await_dst, fulfilled, value, owner);
+            return self
+                .run_async_gen_resume(context, frame, cold, await_dst, fulfilled, value, owner);
         }
         // Resolve callee → function_id + upvalues. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
@@ -2702,8 +2730,15 @@ impl Interpreter {
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
                     frame.pc = frame.pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
-                    let popped = stack.pop().expect("frame present");
-                    owner.park_after_yield(&mut self.gc_heap, popped, dst, yielded);
+                    let mut popped = stack.pop().expect("frame present");
+                    let detached_cold = self.frame_detach_cold(&mut popped);
+                    owner.park_after_yield(
+                        &mut self.gc_heap,
+                        popped,
+                        detached_cold,
+                        dst,
+                        yielded,
+                    );
                     let pending_request = if owner.is_async(&self.gc_heap) {
                         owner.take_pending_request(&mut self.gc_heap)
                     } else {

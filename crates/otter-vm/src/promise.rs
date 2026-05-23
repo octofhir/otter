@@ -953,7 +953,7 @@ fn reaction_to_microtask(
             await_dst,
             fulfilled,
         } => {
-            let frame = crate::generator::take_parked_frame(parked, heap)?;
+            let (frame, cold) = crate::generator::take_parked_frame(parked, heap)?;
             Some(Microtask {
                 callee: Value::undefined(),
                 this_value: Value::undefined(),
@@ -962,6 +962,7 @@ fn reaction_to_microtask(
                 result_capability: None,
                 kind: MicrotaskKind::AsyncResume {
                     frame,
+                    cold,
                     await_dst,
                     fulfilled,
                 },
@@ -973,7 +974,7 @@ fn reaction_to_microtask(
             owner,
             fulfilled,
         } => {
-            let frame = crate::generator::take_parked_frame(parked, heap)?;
+            let (frame, cold) = crate::generator::take_parked_frame(parked, heap)?;
             Some(Microtask {
                 callee: Value::undefined(),
                 this_value: Value::undefined(),
@@ -982,6 +983,7 @@ fn reaction_to_microtask(
                 result_capability: None,
                 kind: MicrotaskKind::AsyncGenResume {
                     frame,
+                    cold,
                     await_dst,
                     fulfilled,
                     owner,

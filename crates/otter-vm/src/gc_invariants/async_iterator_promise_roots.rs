@@ -192,7 +192,7 @@ fn generator_and_parked_frame_roots_register_values() {
         crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("object");
     parked_frame.registers[0] = Value::object(parked_object);
     let parked =
-        crate::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame).expect("park");
+        crate::generator::alloc_parked_frame(interp.gc_heap_mut(), parked_frame, None).expect("park");
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     let capability = crate::PromiseCapability {
         promise: Value::undefined(),

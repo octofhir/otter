@@ -437,7 +437,7 @@ fn parked_frame_keeps_alive() {
     frame.registers[0] = Value::object(object);
 
     let parked =
-        crate::generator::alloc_parked_frame(interp.gc_heap_mut(), frame).expect("parked frame");
+        crate::generator::alloc_parked_frame(interp.gc_heap_mut(), frame, None).expect("parked frame");
     let promise = crate::JsPromiseHandle::pending(interp.gc_heap_mut()).expect("promise");
     promise.perform_async_resume_then(
         interp.gc_heap_mut(),

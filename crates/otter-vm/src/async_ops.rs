@@ -103,8 +103,10 @@ impl Interpreter {
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
-        let parked = stack.pop().expect("top frame existed");
-        let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
+        let mut parked = stack.pop().expect("top frame existed");
+        let detached_cold = self.frame_detach_cold(&mut parked);
+        let parked =
+            crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold)?;
         let outcome = promise.perform_async_resume_then_with_context(
             &mut self.gc_heap,
             parked,
@@ -147,8 +149,10 @@ impl Interpreter {
         let promise_value = Value::promise(promise);
         let capability = promise_dispatch::PromiseBuilder::with_context(context.clone())
             .capability_stack_rooted(self, stack, &[&promise_value], &[])?;
-        let parked = stack.pop().expect("top frame existed");
-        let parked = crate::generator::alloc_parked_frame(&mut self.gc_heap, parked)?;
+        let mut parked = stack.pop().expect("top frame existed");
+        let detached_cold = self.frame_detach_cold(&mut parked);
+        let parked =
+            crate::generator::alloc_parked_frame(&mut self.gc_heap, parked, detached_cold)?;
         let outcome = promise.perform_async_resume_then_with_context(
             &mut self.gc_heap,
             parked,
@@ -175,11 +179,15 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         mut frame: Box<Frame>,
+        cold: Option<Box<crate::cold_frame::ColdFrame>>,
         await_dst: u16,
         fulfilled: bool,
         value: Value,
         owner: crate::generator::JsGenerator,
     ) -> Result<(), RunError> {
+        if let Some(c) = cold {
+            self.frame_attach_cold(&mut frame, c);
+        }
         if fulfilled {
             if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
                 *slot = value;
@@ -285,10 +293,14 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         mut frame: Box<Frame>,
+        cold: Option<Box<crate::cold_frame::ColdFrame>>,
         await_dst: u16,
         fulfilled: bool,
         value: Value,
     ) -> Result<(), RunError> {
+        if let Some(c) = cold {
+            self.frame_attach_cold(&mut frame, c);
+        }
         if fulfilled {
             if let Some(slot) = frame.registers.get_mut(await_dst as usize) {
                 *slot = value;

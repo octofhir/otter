@@ -51,6 +51,12 @@ pub struct GeneratorBody {
     /// `Some(frame)` when the generator can still resume; `None`
     /// once done or while an async-generator await owns the frame.
     pub frame: Option<Box<Frame>>,
+    /// Detached cold record for the suspended frame. Acquired by
+    /// the interpreter at yield time via
+    /// [`crate::Interpreter::frame_detach_cold`]; re-attached on
+    /// resume so try handlers, async parking, and other cold state
+    /// survive the suspension.
+    pub cold: Option<Box<crate::cold_frame::ColdFrame>>,
     /// Register slot that the most recent `Op::Yield` paused on.
     pub resume_dst: u16,
     /// `true` once the body has returned, thrown, or had `.return()`
@@ -75,6 +81,9 @@ impl otter_gc::SafeTraceable for GeneratorBody {
         if let Some(frame) = &self.frame {
             frame.trace_frame_slots(visitor);
         }
+        if let Some(cold) = &self.cold {
+            cold.trace_cold_slots(visitor);
+        }
         if let Some(value) = &self.yielded {
             value.trace_value_slots(visitor);
         }
@@ -90,9 +99,15 @@ impl otter_gc::SafeTraceable for GeneratorBody {
 }
 
 /// GC-managed async suspension payload.
+///
+/// `frame.cold` is `None` while parked — the cold record is detached
+/// out of the interpreter pool at suspend time and stored alongside
+/// the frame so pool slots can be reused while the parked frame
+/// sleeps. The matching attach happens on resume.
 #[derive(Debug)]
 pub struct ParkedFrameBody {
     frame: Option<Box<Frame>>,
+    cold: Option<Box<crate::cold_frame::ColdFrame>>,
 }
 
 impl otter_gc::SafeTraceable for ParkedFrameBody {
@@ -101,6 +116,9 @@ impl otter_gc::SafeTraceable for ParkedFrameBody {
     fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
         if let Some(frame) = &self.frame {
             frame.trace_frame_slots(visitor);
+        }
+        if let Some(cold) = &self.cold {
+            cold.trace_cold_slots(visitor);
         }
     }
 }
@@ -121,6 +139,7 @@ impl JsGenerator {
         Ok(Self {
             inner: heap.alloc_old(GeneratorBody {
                 frame: Some(Box::new(frame)),
+                cold: None,
                 resume_dst: 0,
                 done: false,
                 yielded: None,
@@ -199,22 +218,31 @@ impl JsGenerator {
         heap.read_payload(self.inner, |body| body.resume_dst)
     }
 
-    /// Take the saved frame.
-    pub fn take_frame(&self, heap: &mut otter_gc::GcHeap) -> Option<Box<Frame>> {
-        heap.with_payload(self.inner, |body| body.frame.take())
+    /// Take the saved frame along with its detached cold record.
+    pub fn take_frame(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+    ) -> Option<(Box<Frame>, Option<Box<crate::cold_frame::ColdFrame>>)> {
+        heap.with_payload(self.inner, |body| {
+            let frame = body.frame.take()?;
+            let cold = body.cold.take();
+            Some((frame, cold))
+        })
     }
 
-    /// Store a saved frame and resume metadata.
+    /// Store a saved frame, its detached cold record, and resume metadata.
     pub fn park_after_yield(
         &self,
         heap: &mut otter_gc::GcHeap,
         frame: Frame,
+        cold: Option<Box<crate::cold_frame::ColdFrame>>,
         resume_dst: u16,
         yielded: crate::Value,
     ) {
         let barrier_value = yielded;
         heap.with_payload(self.inner, |body| {
             body.frame = Some(Box::new(frame));
+            body.cold = cold;
             body.resume_dst = resume_dst;
             body.yielded = Some(yielded);
         });
@@ -293,18 +321,29 @@ impl PartialEq for JsGenerator {
     }
 }
 
-/// Allocate a parked async frame.
+/// Allocate a parked async frame. `cold` is the detached cold record
+/// pulled out of the interpreter's pool at suspend time (None if the
+/// frame had no cold state).
 pub fn alloc_parked_frame(
     heap: &mut otter_gc::GcHeap,
     frame: Frame,
+    cold: Option<Box<crate::cold_frame::ColdFrame>>,
 ) -> Result<ParkedFrame, otter_gc::OutOfMemory> {
     heap.alloc_old(ParkedFrameBody {
         frame: Some(Box::new(frame)),
+        cold,
     })
 }
 
-/// Take a parked frame. Returns `None` if the twin reaction already
-/// consumed it.
-pub fn take_parked_frame(parked: ParkedFrame, heap: &mut otter_gc::GcHeap) -> Option<Box<Frame>> {
-    heap.with_payload(parked, |body| body.frame.take())
+/// Take a parked frame along with its detached cold record. Returns
+/// `None` if the twin reaction already consumed it.
+pub fn take_parked_frame(
+    parked: ParkedFrame,
+    heap: &mut otter_gc::GcHeap,
+) -> Option<(Box<Frame>, Option<Box<crate::cold_frame::ColdFrame>>)> {
+    heap.with_payload(parked, |body| {
+        let frame = body.frame.take()?;
+        let cold = body.cold.take();
+        Some((frame, cold))
+    })
 }

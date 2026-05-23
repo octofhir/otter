@@ -5,9 +5,10 @@
 //! `Vec<u8>` byte buffer that the VM dispatch loop reads opcode-by-
 //! opcode. The format is self-describing per operand (a kind byte
 //! precedes each operand), so the decoder does not need a per-opcode
-//! schema. A schema-driven decoder is a future optimization; the wire
-//! format itself stays stable as long as
-//! [`BYTECODE_FORMAT_VERSION`] is unchanged.
+//! schema. A schema-driven decoder is a future optimization. The
+//! encoder and decoder ship in the same binary build — bytecode is
+//! never persisted across versions, so no wire-format version is
+//! carried in the stream.
 //!
 //! # Wire format (per instruction)
 //!
@@ -24,11 +25,6 @@
 //! ```
 
 use crate::{Instruction, NO_HANDLER_OFFSET, Op, Operand, OperandList, SpanEntry};
-
-/// Current bytecode wire-format version. Bumped on any breaking change
-/// to the encoded layout (opcode reordering, operand-kind table edit,
-/// jump-offset semantics, header shape, etc.).
-pub const BYTECODE_FORMAT_VERSION: u16 = 2;
 
 const OPERAND_KIND_REGISTER: u8 = 0;
 const OPERAND_KIND_CONST_INDEX: u8 = 1;
@@ -428,13 +424,9 @@ pub fn op_from_byte(byte: u8) -> Option<Op> {
     OP_BYTE_TABLE.get(byte as usize).map(|(op, _)| *op)
 }
 
-/// Stable byte assignments for every [`Op`] variant. New opcodes
-/// append at the next unused byte; assignments are stable across
-/// format-compatible builds.
-///
-/// Bytes are assigned in declaration order so the table grows
-/// monotonically. Reordering or removing an entry bumps
-/// [`BYTECODE_FORMAT_VERSION`].
+/// Byte assignments for every [`Op`] variant. The encoder and
+/// decoder ship in the same binary build, so the assignments only
+/// need to be dense (the table is indexed by byte) and unique.
 pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::Nop, 0x00),
     (Op::LoadUndefined, 0x01),

@@ -170,8 +170,43 @@ fn native_rooted_call(
     args: &[Value],
 ) -> Result<Option<Value>, VmError> {
     use otter_bytecode::method_id::ObjectMethod as M;
+    // Methods that need accessor-aware ToPropertyDescriptor / Get
+    // semantics route through the shared spec helpers whenever an
+    // ExecutionContext is available; the operands dispatcher already
+    // routes through the same helpers.
+    if let Some(context) = context {
+        match method {
+            M::Create => {
+                return ctx
+                    .cx
+                    .interp
+                    .do_object_create_with_descriptors(context, None, args)
+                    .map(Some);
+            }
+            M::DefineProperties => {
+                return ctx
+                    .cx
+                    .interp
+                    .do_object_define_properties(context, None, args)
+                    .map(Some);
+            }
+            M::Assign => {
+                return ctx
+                    .cx
+                    .interp
+                    .do_object_assign(context, None, args)
+                    .map(Some);
+            }
+            M::DefineProperty => {
+                // §20.1.2.4 — pre-Proxy spec block in
+                // `try_proxy_object_static_call` already runs the
+                // accessor-aware path for any Object-typed target.
+                // Defer to it via the layered fallback below.
+            }
+            _ => {}
+        }
+    }
     match method {
-        M::Create => native_create_rooted(ctx, args).map(Some),
         M::Keys => native_keys_rooted(ctx, context, args).map(Some),
         M::Values => native_values_rooted(ctx, args).map(Some),
         M::Entries => native_entries_rooted(ctx, args).map(Some),
@@ -189,6 +224,10 @@ fn native_rooted_call(
             native_get_own_property_symbols_rooted(ctx, context, args).map(Some)
         }
         M::GroupBy => native_group_by_rooted(ctx, context, args).map(Some),
+        // Create reached only without context — fall back to the
+        // own-data variant for the rare case where natives are
+        // invoked outside a JS frame.
+        M::Create => native_create_rooted(ctx, args).map(Some),
         _ => Ok(None),
     }
 }

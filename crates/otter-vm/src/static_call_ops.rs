@@ -236,7 +236,7 @@ impl Interpreter {
             )
         };
         let args = [target, src];
-        let _ = self.do_object_assign(context, stack, &args)?;
+        let _ = self.do_object_assign(context, Some(stack), &args)?;
         let frame = &mut stack[top_idx];
         frame.advance_pc(self.current_byte_len)?;
         Ok(())
@@ -305,15 +305,15 @@ impl Interpreter {
         // descriptor coercion for any Object-typed target).
         match method {
             method_id::ObjectMethod::Create => {
-                let result = self.do_object_create_with_descriptors(context, stack, &args)?;
+                let result = self.do_object_create_with_descriptors(context, Some(stack), &args)?;
                 return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
             }
             method_id::ObjectMethod::DefineProperties => {
-                let result = self.do_object_define_properties(context, stack, &args)?;
+                let result = self.do_object_define_properties(context, Some(stack), &args)?;
                 return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
             }
             method_id::ObjectMethod::Assign => {
-                let result = self.do_object_assign(context, stack, &args)?;
+                let result = self.do_object_assign(context, Some(stack), &args)?;
                 return finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len);
             }
             method_id::ObjectMethod::GetOwnPropertyDescriptor | method_id::ObjectMethod::HasOwn => {
@@ -421,10 +421,10 @@ impl Interpreter {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-object.create>
     /// - <https://tc39.es/ecma262/#sec-topropertydescriptor>
-    fn do_object_create_with_descriptors(
+    pub(crate) fn do_object_create_with_descriptors(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: Option<&SmallVec<[Frame; 8]>>,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::undefined());
@@ -435,7 +435,12 @@ impl Interpreter {
         } else {
             return Err(VmError::TypeMismatch);
         };
-        let obj = self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?;
+        let obj = match stack {
+            Some(stack) => {
+                self.alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)?
+            }
+            None => self.alloc_runtime_rooted_object_with_roots(&[&proto], &[args])?,
+        };
         if !object::set_prototype_value(obj, &mut self.gc_heap, proto_value) {
             return Err(VmError::TypeError {
                 message: "Object.create failed".to_string(),
@@ -490,10 +495,10 @@ impl Interpreter {
     ///
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-object.defineproperties>
-    fn do_object_define_properties(
+    pub(crate) fn do_object_define_properties(
         &mut self,
         context: &ExecutionContext,
-        _stack: &SmallVec<[Frame; 8]>,
+        _stack: Option<&SmallVec<[Frame; 8]>>,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let target_value = args.first().cloned().unwrap_or(Value::undefined());
@@ -564,10 +569,10 @@ impl Interpreter {
     /// Function, ClassConstructor, NativeFunction, etc.). Symbol
     /// sources are accepted but their symbol-keyed properties aren't
     /// copied yet — filed as a follow-up.
-    fn do_object_assign(
+    pub(crate) fn do_object_assign(
         &mut self,
         context: &ExecutionContext,
-        stack: &SmallVec<[Frame; 8]>,
+        stack: Option<&SmallVec<[Frame; 8]>>,
         args: &[Value],
     ) -> Result<Value, VmError> {
         let target_input = args.first().cloned().unwrap_or(Value::undefined());
@@ -583,7 +588,14 @@ impl Interpreter {
             });
         } else {
             let arg_slice = args;
-            self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[arg_slice])?
+            match stack {
+                Some(stack) => {
+                    self.box_sloppy_this_primitive_stack_rooted(stack, target_input, &[arg_slice])?
+                }
+                None => {
+                    self.box_sloppy_this_primitive_runtime_rooted(target_input, &[arg_slice])?
+                }
+            }
         };
         // Cache the object form when applicable so the existing
         // `ordinary_set_with_callable_setter` fast path keeps working

@@ -484,8 +484,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
   entirely — import opcodes now read the referrer from
   `ExecutableFunction::module_url` via `context.exec_function(...)`.
   Byte-offset PC stays deferred to Phase 2.1 (the layout-only split
-  doesn't depend on it). Design note:
-  [`docs/task-1.3-frame-split.md`](task-1.3-frame-split.md). All
+  doesn't depend on it). All
   tests green: `otter-vm --lib` 535/535, `otter-runtime --lib`
   123/123, workspace `cargo test --all --all-features` clean, clippy
   clean. Remaining `Frame` cold fields (`async_state`,

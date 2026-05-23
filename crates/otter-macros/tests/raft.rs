@@ -2,7 +2,7 @@
 
 use otter_macros::raft;
 use otter_vm::object;
-use otter_vm::{Interpreter, NamespaceBuilder, Value};
+use otter_vm::{Interpreter, NamespaceBuilder};
 
 mod raft_ns {
     use otter_vm::{NativeCtx, NativeError, Value};

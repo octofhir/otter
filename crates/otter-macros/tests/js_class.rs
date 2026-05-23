@@ -2,7 +2,7 @@
 
 use otter_macros::js_class;
 use otter_vm::object;
-use otter_vm::{ClassBuilder, Interpreter, Value};
+use otter_vm::{ClassBuilder, Interpreter};
 
 #[js_class(name = "MacroClass", spec = MACRO_CLASS_SPEC)]
 mod macro_class {

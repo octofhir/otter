@@ -127,6 +127,14 @@ pub unsafe fn scavenge(
     ephemeron_registry_slots: &[*mut RawGc],
     weak_registry_slots: &[*mut RawGc],
 ) -> ScavengeStats {
+    // Promotions can append survivors to old-space pages while processing
+    // roots. Snapshot pre-scavenge watermarks so Cheney scans those newly
+    // promoted payloads instead of starting at the post-promotion bump cursor.
+    let mut old_scan_cursors: smallvec::SmallVec<[usize; 16]> = old_space
+        .pages()
+        .iter()
+        .map(|p| p.header().bump_cursor)
+        .collect();
     let mut ctx = ScavCtx {
         // SAFETY: borrows are valid for the duration of this fn.
         new_space: unsafe { NonNull::new_unchecked(new_space as *mut _) },
@@ -156,12 +164,14 @@ pub unsafe fn scavenge(
     // 4) Cheney scan to-space (and freshly-promoted bytes in
     // old-space) until convergence.
     // SAFETY: STW + raw-pointer state.
-    unsafe { cheney_scan(&mut ctx) };
+    unsafe { cheney_scan(&mut ctx, &mut old_scan_cursors) };
 
     // 5) Run minor-GC ephemeron processing. This may evacuate values for
     // keys that were already kept alive by ordinary reachability.
     // SAFETY: registry slots are valid non-root slots supplied by the heap.
-    unsafe { process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots) };
+    unsafe {
+        process_ephemeron_fixpoint(&mut ctx, ephemeron_registry_slots, &mut old_scan_cursors)
+    };
 
     // 6) Rewrite non-root weak registry entries after all strong and
     // ephemeron reachability has been evacuated, but before from-space is
@@ -311,7 +321,11 @@ unsafe fn process_ephemeron_key_slot(ctx: &mut ScavCtx, slot: *mut RawGc) -> boo
 /// # Safety
 ///
 /// `ephemeron_registry_slots` must address valid non-root registry slots.
-unsafe fn process_ephemeron_fixpoint(ctx: &mut ScavCtx, ephemeron_registry_slots: &[*mut RawGc]) {
+unsafe fn process_ephemeron_fixpoint(
+    ctx: &mut ScavCtx,
+    ephemeron_registry_slots: &[*mut RawGc],
+    old_scan_cursors: &mut smallvec::SmallVec<[usize; 16]>,
+) {
     // SAFETY: caller guarantees slot validity under STW.
     unsafe {
         loop {
@@ -329,7 +343,7 @@ unsafe fn process_ephemeron_fixpoint(ctx: &mut ScavCtx, ephemeron_registry_slots
                 trace_ephemeron_table(ctx, header_ptr);
             }
 
-            cheney_scan(ctx);
+            cheney_scan(ctx, old_scan_cursors);
 
             if ctx.stats == before {
                 break;
@@ -478,19 +492,11 @@ unsafe fn scan_old_dirty_cards(ctx: &mut ScavCtx) {
 /// # Safety
 ///
 /// STW pause + valid pages.
-unsafe fn cheney_scan(ctx: &mut ScavCtx) {
+unsafe fn cheney_scan(ctx: &mut ScavCtx, old_cursors: &mut smallvec::SmallVec<[usize; 16]>) {
     // Per-page scan cursors.
     let to_count = ctx.new_space().to_pages().len();
     let mut to_cursors: smallvec::SmallVec<[usize; 16]> =
         std::iter::repeat_n(PAGE_HEADER_SIZE, to_count).collect();
-    let initial_old_count = ctx.old_space().page_count();
-    let mut old_cursors: smallvec::SmallVec<[usize; 16]> = ctx
-        .old_space()
-        .pages()
-        .iter()
-        .map(|p| p.header().bump_cursor)
-        .collect();
-
     // SAFETY: STW pause; raw page walk on owned spaces.
     unsafe {
         loop {
@@ -531,12 +537,7 @@ unsafe fn cheney_scan(ctx: &mut ScavCtx) {
                     let page = &ctx.old_space().pages()[idx];
                     (page.base_ptr(), page.header().bump_cursor)
                 };
-                // Both branches converge after our cursor-extend
-                // step above; idx < initial_old_count picked up
-                // its prior watermark, fresh pages start at
-                // PAGE_HEADER_SIZE.
                 let scan_from = old_cursors[idx];
-                let _ = initial_old_count;
                 if scan_from >= limit {
                     continue;
                 }

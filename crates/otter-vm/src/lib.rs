@@ -482,6 +482,12 @@ impl Drop for Interpreter {
     }
 }
 
+impl otter_gc::ExtraRootSource for Interpreter {
+    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        crate::runtime_state::RuntimeState::new(self).trace_roots(visitor);
+    }
+}
+
 /// Compile-time options for dynamic source text.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EvalCompileOptions {
@@ -643,6 +649,8 @@ impl Interpreter {
             regexp_string_iterator_prototype: None,
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
         };
+        let extra_roots = otter_gc::ExtraRoots::new(&interp);
+        let previous = interp.gc_heap.install_extra_roots(Some(extra_roots));
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind
         // iterator prototypes once `%Iterator.prototype%` is wired
         // into the global. The bootstrap helper owns the install
@@ -667,6 +675,7 @@ impl Interpreter {
             interp.regexp_string_iterator_prototype = Some(protos.regexp_string);
         }
         interp.install_function_kind_prototypes_post_bootstrap();
+        let _ = interp.gc_heap.install_extra_roots(previous);
         interp
     }
 
@@ -1936,27 +1945,17 @@ impl Interpreter {
         &mut self.gc_heap
     }
 
-    /// Force a full GC cycle. Pre-collects every root slot via
-    /// [`crate::runtime_state::RuntimeState::trace_roots`] before
-    /// handing them to [`otter_gc::GcHeap::collect_full`] — so
-    /// the same `&mut self` borrow can satisfy both the heap
-    /// (mutably) and the root walker (immutably) without
-    /// resorting to unsafe split-borrow tricks.
+    /// Force a full GC cycle. Runtime-owned roots are supplied through the
+    /// heap's [`otter_gc::ExtraRoots`] callback so explicit GC and
+    /// allocation-triggered GC use the same root walk.
     ///
     /// **Debug / test only** — production embedders let the GC
     /// trigger itself.
     pub fn force_gc(&mut self) {
-        let mut roots: Vec<*mut RawGc> = Vec::new();
-        {
-            let state = crate::runtime_state::RuntimeState::new(self);
-            state.trace_roots(&mut |slot| roots.push(slot));
-        }
-        let mut visit = |sv: &mut dyn FnMut(*mut RawGc)| {
-            for &p in &roots {
-                sv(p);
-            }
-        };
-        self.gc_heap.mark_phase(&mut visit);
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let previous = self.gc_heap.install_extra_roots(Some(extra_roots));
+        let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
+        self.gc_heap.mark_phase(&mut noop);
         crate::collections::run_ephemeron_fixpoint(&mut self.gc_heap);
         let finalization_jobs =
             crate::weak_refs::process_weak_refs_and_finalizers(&mut self.gc_heap);
@@ -1973,6 +1972,7 @@ impl Interpreter {
             });
         }
         self.gc_heap.sweep_phase();
+        let _ = self.gc_heap.install_extra_roots(previous);
     }
 
     /// Execute `<main>` of `module` and return its completion value.
@@ -1982,13 +1982,17 @@ impl Interpreter {
     /// snapshot) on bytecode malformation, type mismatch, OOM,
     /// interrupt, or stack overflow.
     pub fn run(&mut self, context: &ExecutionContext) -> Result<Value, RunError> {
+        let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
+        let previous = self.gc_heap.install_extra_roots(Some(extra_roots));
         self.pending_uncaught_throw = None;
         self.pending_uncaught_frames = None;
         self.ensure_property_ic_capacity(context);
-        match self.run_inner(context) {
+        let result = match self.run_inner(context) {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError { error, frames }),
-        }
+        };
+        let _ = self.gc_heap.install_extra_roots(previous);
+        result
     }
 
     /// Drain the microtask queue until empty (or

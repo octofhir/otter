@@ -39,6 +39,7 @@ use std::time::Instant;
 use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
+use crate::extra_roots::ExtraRoots;
 use crate::finalize::WeakFinalizationRegistry;
 use crate::handle::{GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
@@ -124,6 +125,7 @@ pub struct GcHeap {
     marking: MarkingState,
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
+    extra_roots: Option<ExtraRoots>,
     ephemerons: EphemeronRegistry,
     weak_finalization: WeakFinalizationRegistry,
     shared_external: Arc<SharedExternalState>,
@@ -174,6 +176,7 @@ impl GcHeap {
             marking: MarkingState::new(),
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
+            extra_roots: None,
             ephemerons: EphemeronRegistry::default(),
             weak_finalization: WeakFinalizationRegistry::default(),
             shared_external: Arc::new(SharedExternalState::default()),
@@ -533,6 +536,13 @@ impl GcHeap {
         &self.global_handles
     }
 
+    /// Install or clear the heap's extra runtime root source, returning the
+    /// previous registration so callers can restore nested scopes.
+    #[must_use]
+    pub fn install_extra_roots(&mut self, roots: Option<ExtraRoots>) -> Option<ExtraRoots> {
+        std::mem::replace(&mut self.extra_roots, roots)
+    }
+
     /// Reference to the marking state (Phase 2 / task 86 will
     /// drive it).
     pub fn marking(&self) -> &MarkingState {
@@ -859,6 +869,7 @@ impl GcHeap {
         // own handle-stack and global-handles walk.
         let handle_stack: *const HandleStack = &*self.handle_stack;
         let global_handles: *const GlobalHandleTable = &*self.global_handles;
+        let extra_roots = self.extra_roots;
         let mut combined = move |visitor: &mut dyn FnMut(*mut RawGc)| {
             // SAFETY: STW pause; raw pointers reconstituted to
             // shared references.
@@ -867,6 +878,9 @@ impl GcHeap {
                 (*global_handles).visit_slots(visitor);
             }
             external_visit(visitor);
+            if let Some(extra) = extra_roots {
+                extra.visit(visitor);
+            }
         };
         let ephemeron_registry_slots = self.ephemerons.handle_slots();
         let weak_registry_slots = self.weak_finalization.handle_slots();
@@ -1044,6 +1058,9 @@ impl GcHeap {
             (*global_handles).visit_slots(&mut shade);
         }
         external_visit(&mut shade);
+        if let Some(extra) = self.extra_roots {
+            extra.visit(&mut shade);
+        }
     }
 
     /// Mark additional raw objects during an active mark phase and

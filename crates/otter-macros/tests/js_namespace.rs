@@ -2,7 +2,7 @@
 
 use otter_macros::js_namespace;
 use otter_vm::object;
-use otter_vm::{Interpreter, NamespaceBuilder, Value};
+use otter_vm::{Interpreter, NamespaceBuilder};
 
 #[js_namespace(name = "MacroNs", spec = MACRO_NS_SPEC)]
 mod macro_ns {

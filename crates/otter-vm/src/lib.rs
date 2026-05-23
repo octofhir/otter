@@ -565,7 +565,7 @@ impl Interpreter {
         // Bootstrap allocates the ctor + prototype objects; this
         // hook attaches the per-realm singleton symbols once
         // `WellKnownSymbols` exists.
-        bootstrap::install_symbol_well_knowns_post_bootstrap(
+        crate::intrinsics::symbol::install_symbol_well_knowns_post_bootstrap(
             &mut gc_heap,
             global_this,
             &well_known_symbols,

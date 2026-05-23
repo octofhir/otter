@@ -20,6 +20,7 @@ pub mod dispatch;
 
 // Bootstrap installer modules — one per intrinsic.
 pub mod proxy;
+pub mod symbol;
 
 // Backward-compatible re-exports so existing `crate::intrinsics::Foo`
 // call sites continue to resolve.

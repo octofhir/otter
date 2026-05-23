@@ -386,7 +386,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_collections::WeakSetIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_weak_refs::WeakRefIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_promise::Intrinsic),
-    crate::bootstrap_entry!(crate::bootstrap::ProxyIntrinsic),
+    crate::bootstrap_entry!(crate::intrinsics::proxy::Intrinsic),
     crate::bootstrap_entry!(crate::reflect::Intrinsic),
     crate::bootstrap_entry!(crate::bootstrap::FunctionIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::ArrayBufferIntrinsic),
@@ -531,116 +531,6 @@ fn install_placeholder(
     let proto = alloc_object_with_value_roots(heap, &[&global_root, &placeholder_root])?;
     object::set(placeholder, heap, "prototype", Value::object(proto));
     define_global(global, heap, name, Value::object(placeholder));
-    Ok(())
-}
-
-fn install_proxy(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    use crate::{NativeCtx, NativeError};
-
-    fn proxy_target_is_object(value: &Value) -> bool {
-        value.is_object_like()
-    }
-
-    fn proxy_target_arg(args: &[Value]) -> Result<Value, NativeError> {
-        match args.first() {
-            Some(value) if proxy_target_is_object(value) => Ok(*value),
-            _ => Err(NativeError::TypeError {
-                name: "Proxy",
-                reason: "target must be an object".to_string(),
-            }),
-        }
-    }
-
-    fn proxy_handler_arg(args: &[Value]) -> Result<Value, NativeError> {
-        match args.get(1) {
-            Some(value) if proxy_target_is_object(value) => Ok(*value),
-            _ => Err(NativeError::TypeError {
-                name: "Proxy",
-                reason: "handler must be an object".to_string(),
-            }),
-        }
-    }
-
-    fn proxy_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        if !ctx.is_construct_call() {
-            return Err(NativeError::TypeError {
-                name: "Proxy",
-                reason: "constructor requires new".to_string(),
-            });
-        }
-        let target = proxy_target_arg(args)?;
-        let handler = proxy_handler_arg(args)?;
-        let proxy = crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
-            NativeError::TypeError {
-                name: "Proxy",
-                reason: "out of memory while allocating proxy".to_string(),
-            }
-        })?;
-        Ok(Value::proxy(proxy))
-    }
-
-    fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-        let target = proxy_target_arg(args)?;
-        let handler = proxy_handler_arg(args)?;
-        let proxy = crate::proxy::JsProxy::new(ctx.heap_mut(), target, handler).map_err(|_| {
-            NativeError::TypeError {
-                name: "Proxy.revocable",
-                reason: "out of memory while allocating proxy".to_string(),
-            }
-        })?;
-        let proxy_value = Value::proxy(proxy);
-        let revoke = ctx
-            .native_value_with_captures(
-                "revoke",
-                smallvec::smallvec![proxy_value],
-                &[],
-                &[args],
-                move |ctx, _, captures| {
-                    if let Some(proxy) = captures.first().and_then(|v| v.as_proxy()) {
-                        proxy.revoke(ctx.heap_mut());
-                    }
-                    Ok(Value::undefined())
-                },
-            )
-            .map_err(|_| NativeError::TypeError {
-                name: "Proxy.revocable",
-                reason: "out of memory while creating revoke function".to_string(),
-            })?;
-        let obj = ctx
-            .alloc_object_with_roots(&[&proxy_value, &revoke], &[args])
-            .map_err(|_| NativeError::TypeError {
-                name: "Proxy.revocable",
-                reason: "out of memory while creating result object".to_string(),
-            })?;
-        object::set(obj, ctx.heap_mut(), "proxy", proxy_value);
-        object::set(obj, ctx.heap_mut(), "revoke", revoke);
-        Ok(Value::object(obj))
-    }
-
-    let global_root = Value::object(global);
-    let proxy_ctor = native_constructor_static_with_value_roots(
-        heap,
-        "Proxy",
-        2,
-        proxy_ctor_call,
-        &[&global_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let proxy_ctor_root = Value::native_function(proxy_ctor);
-    let revocable = native_static_with_value_roots(
-        heap,
-        "revocable",
-        2,
-        proxy_revocable_call,
-        &[&global_root, &proxy_ctor_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let revocable_desc =
-        PropertyDescriptor::data(Value::native_function(revocable), true, false, true);
-    if !proxy_ctor.define_own_property(heap, "revocable", revocable_desc) {
-        return Err(JsSurfaceError::DefinePropertyFailed("revocable"));
-    }
-    define_global(global, heap, "Proxy", Value::native_function(proxy_ctor));
     Ok(())
 }
 
@@ -2463,16 +2353,6 @@ impl crate::intrinsic_install::BuiltinIntrinsic for DateIntrinsic {
     }
 }
 
-/// `BuiltinIntrinsic` adapter for the global `Proxy` constructor.
-pub struct ProxyIntrinsic;
-impl crate::intrinsic_install::BuiltinIntrinsic for ProxyIntrinsic {
-    const NAME: &'static str = "Proxy";
-    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_proxy(heap, global)
-    }
-}
-
 /// `BuiltinIntrinsic` adapter for the global `Function` constructor.
 pub struct FunctionIntrinsic;
 impl crate::intrinsic_install::BuiltinIntrinsic for FunctionIntrinsic {
@@ -3653,7 +3533,12 @@ fn iterator_from_native(
     })
 }
 
-fn define_global(global: JsObject, heap: &mut otter_gc::GcHeap, name: &'static str, value: Value) {
+pub(crate) fn define_global(
+    global: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    value: Value,
+) {
     let descriptor = PropertyDescriptor::data(
         value,
         Attr::global_binding().writable,

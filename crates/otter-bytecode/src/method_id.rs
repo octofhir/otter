@@ -152,7 +152,7 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::GlobalCall`](crate::Op::GlobalCall).
+    /// Methods dispatched by the §19.2 / §21.1.2 global function natives.
     /// Global host functions plus the `Number.<predicate>` static
     /// surface that aliases / strictifies them.
     GlobalMethod {

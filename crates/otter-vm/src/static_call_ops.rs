@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, Value, VmError, VmPropertyKey,
-    array, bigint, binary, global_functions, object, object_statics,
+    array, bigint, binary, object, object_statics,
     operand_decode::{const_operand, register_operand},
     read_register,
     string::JsString,
@@ -111,13 +111,6 @@ impl Interpreter {
             }
             Op::SharedArrayBufferCall => {
                 unreachable!("SharedArrayBufferCall requires stack-rooted dispatch")
-            }
-            Op::GlobalCall => {
-                let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
-                let method =
-                    method_id::GlobalMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-                let result = global_functions::call(method, &args, &mut self.gc_heap)?;
-                finish_static_call(frame, dst, result, self.current_byte_len)
             }
             Op::TemporalCall => {
                 let dst = register_operand(operands.first())?;

@@ -239,42 +239,11 @@ pub(crate) fn compile_method_call(
         // `Op::SymbolCall` shortcut is no longer emitted. User shadowing
         // of `Symbol.for` / `Symbol.keyFor` is therefore observable.
         // §21.1.2 Number static surface — `Number.parseInt` /
-        // `Number.parseFloat` are aliases of the global functions
-        // (§21.1.2.13 / §21.1.2.12); `Number.isNaN` /
-        // `Number.isFinite` / `Number.isInteger` /
-        // `Number.isSafeInteger` are the strict variants. All four
-        // shapes route through the same `Op::GlobalCall` entry —
-        // strict variants pass a distinguishing key so
-        // `global_functions::call` can branch.
-        // <https://tc39.es/ecma262/#sec-properties-of-the-number-constructor>
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "Number"
-            && cx.lookup_binding("Number").is_none()
-            && find_module_import_binding(cx, "Number").is_none()
-        {
-            use otter_bytecode::method_id::GlobalMethod;
-            let method = member.property.name.as_str();
-            let method_id = match method {
-                "parseInt" => Some(GlobalMethod::ParseInt),
-                "parseFloat" => Some(GlobalMethod::ParseFloat),
-                "isNaN" => Some(GlobalMethod::NumberIsNaN),
-                "isFinite" => Some(GlobalMethod::NumberIsFinite),
-                "isInteger" => Some(GlobalMethod::NumberIsInteger),
-                "isSafeInteger" => Some(GlobalMethod::NumberIsSafeInteger),
-                _ => None,
-            };
-            if let Some(method_id) = method_id {
-                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(method_id.as_u32()));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::GlobalCall, operands, span);
-                return Ok(dst);
-            }
-        }
+        // `Number.parseFloat` / `Number.isNaN` / `Number.isFinite`
+        // / `Number.isInteger` / `Number.isSafeInteger` flow through
+        // the real `NativeFunction` entries installed by the
+        // `Number` bootstrap, so the dedicated `Op::GlobalCall`
+        // shortcut is no longer emitted.
     }
     // Bare `Symbol(desc)` resolves against the `NativeFunction`
     // installed by the `Symbol` bootstrap, so the dedicated
@@ -440,31 +409,11 @@ pub(crate) fn compile_method_call(
         );
         return Ok(dst);
     }
-    // §19.2 global-function interceptions: route bare-identifier
-    // calls like `parseInt(...)` / `isNaN(x)` /
-    // `encodeURIComponent(s)` through a single `Op::GlobalCall`
-    // dispatcher. The user can shadow these names with a local
-    // binding; `lookup_binding` is consulted first so the shadow
-    // wins.
-    // <https://tc39.es/ecma262/#sec-function-properties-of-the-global-object>
-    if let Expression::Identifier(id) = callee {
-        let name = id.name.as_str();
-        if let Some(method_id) = otter_bytecode::method_id::GlobalMethod::from_str(name)
-            && !matches!(method_id.name(), n if n.starts_with("Number."))
-            && cx.lookup_binding(name).is_none()
-            && find_module_import_binding(cx, name).is_none()
-        {
-            let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-            let dst = cx.alloc_scratch();
-            let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-            operands.push(Operand::Register(dst));
-            operands.push(Operand::ConstIndex(method_id.as_u32()));
-            operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-            operands.extend(arg_regs.into_iter().map(Operand::Register));
-            cx.emit(Op::GlobalCall, operands, span);
-            return Ok(dst);
-        }
-    }
+    // §19.2 global function bare-identifier calls like
+    // `parseInt(...)` / `isNaN(x)` / `encodeURIComponent(s)` flow
+    // through the real `NativeFunction` entries installed on
+    // `globalThis`, so the dedicated `Op::GlobalCall` shortcut is
+    // no longer emitted.
     // Bare-identifier interceptions — `queueMicrotask(fn, ...args)`
     // is the only one today. Lives at the call-site layer (not
     // inside the StaticMember branch) because the syntax is a

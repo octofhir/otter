@@ -4003,12 +4003,6 @@ impl Interpreter {
                     self.run_promise_call_operands(context, stack, operands)?;
                     continue;
                 }
-                Op::GlobalCall => {
-                    let operands = context.exec_operands(instr);
-                    let frame = &mut stack[top_idx];
-                    self.run_static_call_operands(op, context, frame, operands)?;
-                    continue;
-                }
                 Op::ImportNamespaceDynamic => {
                     let operands = context.exec_operands(instr);
                     self.run_import_namespace_dynamic_operands(context, stack, top_idx, operands)?;

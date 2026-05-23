@@ -475,20 +475,6 @@ pub enum Op {
     /// - <https://tc39.es/ecma262/#sec-function-p1-p2-pn-body>
     NewFunction,
 
-    /// `r<dst> = <name>(args...)` for one of the §19.2 global
-    /// functions: `parseInt`, `parseFloat`, `isNaN`, `isFinite`,
-    /// `encodeURI`, `encodeURIComponent`, `decodeURI`,
-    /// `decodeURIComponent`. Operands:
-    /// `Register(dst), ConstIndex(name), ConstIndex(argc),
-    /// Register(arg0), …`.
-    ///
-    /// Variadic, same shape as the other namespace-call shortcuts. Routed by name
-    /// against the runtime's global-function table.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-function-properties-of-the-global-object>
-    GlobalCall,
-
     /// `r<dst> = globalThis`. Operand: `Register(dst)`. Returns the
     /// per-Interpreter shared `globalThis` JsObject. The foundation
     /// surface is intentionally minimal (the global functions are
@@ -1016,7 +1002,6 @@ impl Op {
             Op::HasProperty => "HAS_PROPERTY",
             Op::ImportNamespaceDynamic => "IMPORT_NAMESPACE_DYNAMIC",
             Op::ImportMetaResolve => "IMPORT_META_RESOLVE",
-            Op::GlobalCall => "GLOBAL_CALL",
             Op::LoadGlobalThis => "LOAD_GLOBAL_THIS",
             Op::LoadGlobalOrThrow => "LOAD_GLOBAL_OR_THROW",
             Op::LoadGlobalOrUndefined => "LOAD_GLOBAL_OR_UNDEFINED",
@@ -1146,7 +1131,6 @@ impl Op {
             // dst, argc — args follow as `Register(arg0)…`.
             Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => 2,
             Op::BigIntCall => 3,      // dst, name_const, argc — args follow
-            Op::GlobalCall => 3,      // dst, name_const, argc — args follow
             Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::DataViewCall => 3,    // dst, name_const, argc — args follow
             Op::Yield => 2,           // dst, src
@@ -1233,7 +1217,6 @@ impl Op {
             // call to a different builtin method after merge.
             Op::PromiseCall
             | Op::ObjectCall
-            | Op::GlobalCall
             | Op::BigIntCall
             | Op::ArrayBufferCall
             | Op::DataViewCall

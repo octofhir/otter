@@ -17,15 +17,11 @@ impl crate::intrinsic_install::BuiltinIntrinsic for IntlIntrinsic {
     }
 }
 
-/// Placeholder `BuiltinIntrinsic` for `Temporal`.
-pub struct TemporalIntrinsic;
-impl crate::intrinsic_install::BuiltinIntrinsic for TemporalIntrinsic {
-    const NAME: &'static str = "Temporal";
-    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_placeholder(Self::NAME, heap, global)
-    }
-}
+/// `Temporal` namespace is now installed by
+/// [`crate::temporal::intrinsic::Intrinsic`]. The placeholder type
+/// alias here delegates to it so the bootstrap registry continues
+/// to refer to `placeholders::TemporalIntrinsic`.
+pub use crate::temporal::intrinsic::Intrinsic as TemporalIntrinsic;
 
 /// Placeholder `BuiltinIntrinsic` for `AggregateError`.
 pub struct AggregateErrorIntrinsic;

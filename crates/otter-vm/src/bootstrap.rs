@@ -549,7 +549,11 @@ mod tests {
         // `Iterator.prototype.{next, return, throw}` installers.
         // Each ctor installs a `[[Construct]]` slot plus a prototype
         // with several native methods and (for some) accessors.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1100;
+        // Bumped from 1100 → 1130 when the `Temporal` placeholder
+        // was replaced with a real namespace carrying six sub-
+        // namespaces (`Instant`, `Duration`, `PlainDate`, `PlainTime`,
+        // `PlainDateTime`, `Now`) and their static methods.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1130;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 488 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

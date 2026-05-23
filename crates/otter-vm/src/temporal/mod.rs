@@ -31,6 +31,7 @@ pub mod dispatch;
 pub mod duration;
 pub mod helpers;
 pub mod instant;
+pub mod intrinsic;
 pub mod now;
 pub mod payload;
 pub mod plain_date;

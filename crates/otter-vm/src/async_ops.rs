@@ -403,7 +403,7 @@ impl Interpreter {
             }
             let finally_pc = handler.finally_pc.ok_or(VmError::InvalidOperand)?;
             frame.pc = finally_pc;
-            frame.pending_throw = Some(payload);
+            self.frame_ensure_cold(frame).pending_throw = Some(payload);
             return Ok(());
         }
     }

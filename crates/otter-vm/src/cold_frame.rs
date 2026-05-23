@@ -32,6 +32,7 @@ use otter_gc::raw::SlotVisitor;
 use crate::frame_state::{
     PendingBindFunction, PendingGetIterator, PendingIteratorNext, PendingToPrimitive,
 };
+use crate::{JsObject, Value};
 
 /// Niche-encoded handle into a [`ColdFramePool`]. Stored as
 /// `Option<ColdFrameIdx>` (4 bytes) on the hot frame; `None` means no
@@ -74,6 +75,18 @@ pub struct ColdFrame {
     pub pending_get_iterator: Option<PendingGetIterator>,
     /// In-flight ECMA-262 §7.4.5 `IteratorNext` over a user iterator.
     pub pending_iterator_next: Option<PendingIteratorNext>,
+    /// In-flight exception parked when a throw routed into a `finally`
+    /// block. [`otter_bytecode::Op::EndFinally`] consumes it: `Some`
+    /// re-throws, `None` falls through.
+    pub pending_throw: Option<Value>,
+    /// Newly-allocated receiver when this frame was entered via
+    /// `Op::New`. On return, the dispatcher substitutes this object
+    /// for any non-object return value so constructors that don't
+    /// `return` a replacement still hand the caller the fresh instance.
+    pub construct_target: Option<JsObject>,
+    /// `new.target` visible to the active function body. Set only for
+    /// frames entered through `[[Construct]]`.
+    pub new_target: Option<Value>,
 }
 
 impl ColdFrame {
@@ -85,6 +98,9 @@ impl ColdFrame {
             && self.pending_bind_function.is_none()
             && self.pending_get_iterator.is_none()
             && self.pending_iterator_next.is_none()
+            && self.pending_throw.is_none()
+            && self.construct_target.is_none()
+            && self.new_target.is_none()
     }
 
     /// Trace GC slots reachable through cold protocol state.
@@ -110,6 +126,16 @@ impl ColdFrame {
             p.iterator.trace_value_slots(visitor);
         }
         // `pending_get_iterator` carries only pc + dst, no values.
+        if let Some(v) = &self.pending_throw {
+            v.trace_value_slots(visitor);
+        }
+        if let Some(obj) = &self.construct_target {
+            let p = obj as *const JsObject as *mut otter_gc::raw::RawGc;
+            visitor(p);
+        }
+        if let Some(v) = &self.new_target {
+            v.trace_value_slots(visitor);
+        }
     }
 }
 

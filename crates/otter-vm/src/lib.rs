@@ -1961,7 +1961,6 @@ impl Interpreter {
     /// Release `frame`'s cold record back to the pool if it holds one.
     /// Called when a frame is popped off the dispatcher stack.
     #[inline]
-    #[allow(dead_code)]
     pub(crate) fn frame_release_cold(&mut self, frame: &mut Frame) {
         if let Some(idx) = frame.cold.take() {
             self.cold_frames.release(idx);
@@ -2659,7 +2658,10 @@ impl Interpreter {
                     continue;
                 }
                 Op::EndFinally => {
-                    if let Some(value) = stack[top_idx].pending_throw.take() {
+                    let pending = self
+                        .frame_cold_mut(&mut stack[top_idx])
+                        .and_then(|c| c.pending_throw.take());
+                    if let Some(value) = pending {
                         self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
                         let unwind = self.unwind_throw(stack, value);
                         if unwind.is_ok() {
@@ -4161,8 +4163,12 @@ impl Interpreter {
         stack: &mut SmallVec<[Frame; 8]>,
         value: Value,
     ) -> Result<Option<Value>, VmError> {
-        let popped = stack.pop().ok_or(VmError::InvalidOperand)?;
-        let resolved = match popped.construct_target {
+        let mut popped = stack.pop().ok_or(VmError::InvalidOperand)?;
+        let construct_target = self.frame_cold(&popped).and_then(|c| c.construct_target);
+        // Release the cold slot now so the pool can reuse it; the
+        // remaining cold-record reads above already happened.
+        self.frame_release_cold(&mut popped);
+        let resolved = match construct_target {
             Some(_) if value.is_object_type() => value,
             Some(target) => Value::object(target),
             None => value,

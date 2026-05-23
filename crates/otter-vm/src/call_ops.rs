@@ -121,8 +121,11 @@ impl Interpreter {
             upvalues,
             Value::object(receiver),
         );
-        frame.construct_target = Some(receiver);
-        frame.new_target = Some(new_target);
+        {
+            let cold = self.frame_ensure_cold(&mut frame);
+            cold.construct_target = Some(receiver);
+            cold.new_target = Some(new_target);
+        }
         Self::bind_bytecode_call_arguments(function, &mut frame, args)?;
         Ok(frame)
     }
@@ -149,8 +152,11 @@ impl Interpreter {
             upvalues,
             Value::object(receiver),
         );
-        frame.construct_target = Some(receiver);
-        frame.new_target = Some(new_target);
+        {
+            let cold = self.frame_ensure_cold(&mut frame);
+            cold.construct_target = Some(receiver);
+            cold.new_target = Some(new_target);
+        }
         args.bind_into(function, &mut frame)?;
         Ok(frame)
     }
@@ -803,7 +809,10 @@ impl Interpreter {
         if !is_constructor_runtime(&callee, context, &self.gc_heap) {
             return Err(VmError::NotCallable);
         }
-        let new_target = stack[top_idx].new_target.unwrap_or(callee);
+        let new_target = self
+            .frame_cold(&stack[top_idx])
+            .and_then(|c| c.new_target)
+            .unwrap_or(callee);
         let args_value = *read_register(&stack[top_idx], args_reg)?;
         let Some(arr) = args_value.as_array() else {
             return Err(VmError::TypeMismatch);
@@ -1007,8 +1016,9 @@ impl Interpreter {
         // The pushed frame is now on top; mark it so `pop_frame`
         // can substitute the receiver for any non-object return.
         if let Some(top) = stack.last_mut() {
-            top.construct_target = Some(receiver);
-            top.new_target = Some(new_target);
+            let cold = self.frame_ensure_cold(top);
+            cold.construct_target = Some(receiver);
+            cold.new_target = Some(new_target);
         }
         Ok(())
     }

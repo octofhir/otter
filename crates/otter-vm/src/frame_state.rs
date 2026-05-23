@@ -24,7 +24,7 @@ use otter_bytecode::Function;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::{
-    ExecutableFunction, JsObject, JsPromiseHandle, UpvalueCell, Value, abstract_ops, alloc_upvalue,
+    ExecutableFunction, JsPromiseHandle, UpvalueCell, Value, abstract_ops, alloc_upvalue,
     cold_frame::ColdFrameIdx,
 };
 
@@ -60,18 +60,6 @@ pub struct Frame {
     /// by [`Op::LeaveTry`] or by an exception unwind landing on a
     /// matching catch / finally. Innermost handler is on top.
     pub handlers: SmallVec<[TryHandler; 4]>,
-    /// In-flight exception parked when a throw routed into a
-    /// `finally` block. [`Op::EndFinally`] consumes it: `Some` →
-    /// re-throw, `None` → fall through. The compiler always emits
-    /// `EndFinally` at the close of every finally body, so the
-    /// re-throw protocol stays bytecode-visible.
-    pub pending_throw: Option<Value>,
-    /// Newly-allocated receiver when this frame was entered via
-    /// [`Op::New`] (`new C(args)`). On return, [`Interpreter::pop_frame`]
-    /// substitutes this object for any non-object return value, so
-    /// constructors that don't `return` a replacement still hand the
-    /// caller the freshly-built instance.
-    pub construct_target: Option<JsObject>,
     /// Trailing arguments past the declared `param_count`. Populated
     /// by the call dispatcher only when the callee declares a rest
     /// parameter (`function f(...rest) { … }`); consumed by
@@ -79,10 +67,6 @@ pub struct Frame {
     /// fresh `JsArray`. Always empty for non-rest callees so the
     /// allocation cost is paid only when needed.
     pub rest_args: SmallVec<[Value; 4]>,
-    /// `new.target` visible to the active function body. Set only
-    /// for frames entered through `[[Construct]]`; ordinary calls
-    /// and top-level code observe `undefined`.
-    pub new_target: Option<Value>,
     /// Full incoming-argument list captured at call entry. Used by
     /// [`otter_bytecode::Op::CollectArguments`] to materialise an
     /// `arguments`-style array containing every value the caller
@@ -417,10 +401,7 @@ impl Frame {
             upvalues,
             this_value,
             handlers: SmallVec::new(),
-            pending_throw: None,
-            construct_target: None,
             rest_args: SmallVec::new(),
-            new_target: None,
             incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_str()),
@@ -451,10 +432,7 @@ impl Frame {
             upvalues,
             this_value,
             handlers: SmallVec::new(),
-            pending_throw: None,
-            construct_target: None,
             rest_args: SmallVec::new(),
-            new_target: None,
             incoming_args: SmallVec::new(),
             async_state: None,
             module_url: std::rc::Rc::from(function.module_url.as_ref()),
@@ -477,18 +455,8 @@ impl Frame {
         for value in &self.rest_args {
             value.trace_value_slots(visitor);
         }
-        if let Some(value) = &self.new_target {
-            value.trace_value_slots(visitor);
-        }
         for value in &self.incoming_args {
             value.trace_value_slots(visitor);
-        }
-        if let Some(value) = &self.pending_throw {
-            value.trace_value_slots(visitor);
-        }
-        if let Some(obj) = &self.construct_target {
-            let p = obj as *const JsObject as *mut RawGc;
-            visitor(p);
         }
         if let Some(async_state) = &self.async_state {
             async_state.result_promise.trace_value_slots(visitor);

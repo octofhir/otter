@@ -22,8 +22,10 @@ pub mod dispatch;
 pub mod array;
 pub mod date;
 pub mod function;
+pub mod iterator;
 pub mod number;
 pub mod object;
+pub mod placeholders;
 pub mod proxy;
 pub mod symbol;
 

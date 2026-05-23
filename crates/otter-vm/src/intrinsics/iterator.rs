@@ -1,0 +1,1141 @@
+//! `%Iterator%` constructor + post-bootstrap well-known wiring.
+//!
+//! Implements ECMA-262 §27.1 The Iterator Constructor (ES2025
+//! iterator-helpers): the `Iterator()` abstract constructor and the
+//! `%Iterator.prototype%` chain. The post-bootstrap hook attaches
+//! `@@iterator` and `@@toStringTag` once the well-known symbol table
+//! is materialised.
+//!
+//! # See also
+//! - <https://tc39.es/ecma262/#sec-iterator-constructor>
+
+use crate::bootstrap::{
+    BootstrapFeatures, alloc_object_with_value_roots,
+    native_constructor_static_with_value_roots, native_static_with_value_roots,
+};
+use crate::js_surface::JsSurfaceError;
+use crate::object::{self, JsObject};
+use crate::Value;
+
+/// §27.1.1.1 `Iterator()` constructor — abstract base for the
+/// ES2025 iterator-helpers protocol. Direct calls / direct `new`
+/// throw `TypeError`; subclass `super()` calls allocate an
+/// ordinary object inheriting from the new-target's `.prototype`.
+fn iterator_ctor_call(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let new_target = ctx.new_target().cloned();
+    let Some(new_target) = new_target else {
+        return Err(crate::NativeError::TypeError {
+            name: "Iterator",
+            reason: "constructor Iterator requires 'new'".to_string(),
+        });
+    };
+    // §27.1.1.1 step 2 — OrdinaryCreateFromConstructor(new.target,
+    // "%Iterator.prototype%"). Resolve the prototype off the
+    // new-target so subclass `class T extends Iterator { … }` /
+    // `new T()` inherits from `T.prototype`.
+    let new_target_root = new_target;
+    let obj = ctx
+        .alloc_object_with_roots(&[&new_target_root], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator",
+            reason: "out of memory".to_string(),
+        })?;
+    let proto = if let Some(nf) = new_target.as_native_function() {
+        let heap = ctx.heap_mut();
+        nf.own_property_descriptor(heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|d| match d.kind {
+                crate::object::DescriptorKind::Data { value } => Some(value),
+                _ => None,
+            })
+    } else if let Some(target_obj) = new_target.as_object() {
+        crate::object::get(target_obj, ctx.heap(), "prototype")
+    } else if let Some(c) = new_target.as_class_constructor() {
+        crate::object::get(c.statics(ctx.heap()), ctx.heap(), "prototype")
+    } else {
+        None
+    };
+    if let Some(proto_obj) = proto.and_then(|v| v.as_object()) {
+        crate::object::set_prototype(obj, ctx.heap_mut(), Some(proto_obj));
+    }
+    Ok(Value::object(obj))
+}
+
+/// `BuiltinIntrinsic` for the ES2025 `Iterator` constructor — the
+/// abstract base of the iterator-helpers protocol.
+pub struct IteratorIntrinsic;
+impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
+    const NAME: &'static str = "Iterator";
+    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
+    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
+        let global_root = Value::object(global);
+        // Build the spec-compliant Iterator constructor (callable as
+        // `new Iterator()` via subclass `super()`, throws when
+        // invoked directly).
+        let ctor = native_constructor_static_with_value_roots(
+            heap,
+            "Iterator",
+            0,
+            iterator_ctor_call,
+            &[&global_root],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        // Wire %Iterator.prototype% — a fresh object chained later
+        // to %Object.prototype% and decorated with the iterator
+        // helpers below.
+        let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
+        let proto_value = Value::object(proto);
+        let prototype_desc =
+            crate::object::PropertyDescriptor::data(proto_value, false, false, false);
+        if !ctor.define_own_property(heap, "prototype", prototype_desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
+        }
+        // §27.1.2 — `Iterator.prototype.constructor = %Iterator%`,
+        // writable / non-enumerable / configurable.
+        crate::object::define_own_property(
+            proto,
+            heap,
+            "constructor",
+            crate::object::PropertyDescriptor::data(
+                Value::native_function(ctor),
+                true,
+                false,
+                true,
+            ),
+        );
+        crate::bootstrap::define_global_value(global, heap, Self::NAME, Value::native_function(ctor));
+        let iterator_ctor = ctor;
+        let ctor_root = Value::native_function(iterator_ctor);
+        let from_fn =
+            native_static_with_value_roots(heap, "from", 1, iterator_from_native, &[&ctor_root])
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let from_desc = crate::object::PropertyDescriptor::data(
+            Value::native_function(from_fn),
+            true,
+            false,
+            true,
+        );
+        let _ = iterator_ctor.define_own_property(heap, "from", from_desc);
+        let prototype = proto;
+        // §27.1.2 %IteratorPrototype% — install the iterator-helpers
+        // proposal methods on the prototype carried by the
+        // `Iterator` constructor. The handlers re-enter the
+        // runtime via existing `IteratorState` wrappers so the
+        // call-method fast path and reflective property access
+        // share behaviour.
+        let proto_root = Value::object(prototype);
+        // §27.1.2: `%IteratorPrototype%.[[Prototype]]` is
+        // `%Object.prototype%` so reflective walks
+        // (`Object.getPrototypeOf(Iterator.prototype) === Object.prototype`)
+        // terminate at the realm-wide Object root.
+        if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
+            && let Some(object_proto) =
+                object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
+        {
+            object::set_prototype(prototype, heap, Some(object_proto));
+        }
+        let install_proto = |heap: &mut otter_gc::GcHeap,
+                             name: &'static str,
+                             length: u8,
+                             call: crate::native_function::NativeFastFn|
+         -> Result<(), JsSurfaceError> {
+            let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
+                .map_err(|_| JsSurfaceError::OutOfMemory)?;
+            object::set(prototype, heap, name, Value::native_function(f));
+            Ok(())
+        };
+        install_proto(heap, "map", 1, iterator_proto_map)?;
+        install_proto(heap, "filter", 1, iterator_proto_filter)?;
+        install_proto(heap, "take", 1, iterator_proto_take)?;
+        install_proto(heap, "drop", 1, iterator_proto_drop)?;
+        install_proto(heap, "flatMap", 1, iterator_proto_flat_map)?;
+        install_proto(heap, "toArray", 0, iterator_proto_to_array)?;
+        install_proto(heap, "forEach", 1, iterator_proto_for_each)?;
+        install_proto(heap, "reduce", 1, iterator_proto_reduce)?;
+        install_proto(heap, "some", 1, iterator_proto_some)?;
+        install_proto(heap, "every", 1, iterator_proto_every)?;
+        install_proto(heap, "find", 1, iterator_proto_find)?;
+        // §27.1.5.1 / §22.1.5.1 / §23.1.5.1 / §24.1.5.1 / §24.2.5.1 —
+        // Otter exposes a single `%IteratorPrototype%` that carries
+        // `next`, `return`, and `throw`; the per-kind iterator
+        // sub-prototypes (Map, Set, String, Array) inherit from it.
+        // Each method routes back through `iterator_next_full` /
+        // `iterator_helper_dispatch` so the spec result record is
+        // identical whether the call comes from `Op::IteratorNext`
+        // or reflective `proto.next.call(it)`.
+        install_proto(heap, "next", 0, iterator_proto_next)?;
+        install_proto(heap, "return", 1, iterator_proto_return)?;
+        install_proto(heap, "throw", 1, iterator_proto_throw)?;
+        Ok(())
+    }
+}
+
+/// §27.1.2.1 `Iterator.prototype[@@iterator]` — returns the
+/// receiver unchanged so any iterator value is itself iterable.
+///
+/// <https://tc39.es/ecma262/#sec-iteratorprototype-%symbol.iterator%>
+fn iterator_proto_symbol_iterator(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    Ok(*ctx.this_value())
+}
+
+/// Post-bootstrap pass that installs the symbol-keyed members of
+/// `%Iterator.prototype%`: `@@iterator` (returns `this`) and
+/// `@@toStringTag = "Iterator"`. Runs after the well-known symbol
+/// table is materialised in the same phase that installs
+/// `@@toStringTag` on TypedArray prototypes.
+pub fn install_iterator_well_knowns_post_bootstrap(
+    heap: &mut otter_gc::GcHeap,
+    global: JsObject,
+    well_known: &crate::symbol::WellKnownSymbols,
+) -> Result<(), JsSurfaceError> {
+    use crate::symbol::WellKnown;
+    let iter_value = object::get(global, heap, "Iterator");
+    let prototype = if let Some(ctor) = iter_value.as_ref().and_then(|v| v.as_native_function()) {
+        ctor.own_property_descriptor(heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|d| match d.kind {
+                crate::object::DescriptorKind::Data { value } => value.as_object(),
+                _ => None,
+            })
+    } else if let Some(iterator_ctor) = iter_value.and_then(|v| v.as_object()) {
+        object::get(iterator_ctor, heap, "prototype").and_then(|v| v.as_object())
+    } else {
+        None
+    };
+    let Some(prototype) = prototype else {
+        return Ok(());
+    };
+    let proto_root = Value::object(prototype);
+    let symbol_iter_fn = native_static_with_value_roots(
+        heap,
+        "[Symbol.iterator]",
+        0,
+        iterator_proto_symbol_iterator,
+        &[&proto_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let iter_sym = well_known.get(WellKnown::Iterator);
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        iter_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::native_function(symbol_iter_fn)),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    let tag_sym = well_known.get(WellKnown::ToStringTag);
+    let tag = crate::string::JsString::from_str("Iterator", heap)
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        tag_sym,
+        crate::object::PartialPropertyDescriptor {
+            value: Some(Value::string(tag)),
+            writable: Some(false),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    Ok(())
+}
+
+/// Build the per-kind iterator prototypes
+/// (`%ArrayIteratorPrototype%`, `%MapIteratorPrototype%`,
+/// `%SetIteratorPrototype%`, `%StringIteratorPrototype%`,
+/// `%RegExpStringIteratorPrototype%`) chained off `parent`
+/// (`%IteratorPrototype%`). Called post-bootstrap once
+/// `%IteratorPrototype%` is reachable.
+pub fn build_builtin_iterator_prototypes_post_bootstrap(
+    heap: &mut otter_gc::GcHeap,
+    shape_root: object::ShapeHandle,
+    parent: JsObject,
+    well_known: &crate::symbol::WellKnownSymbols,
+) -> Result<crate::bootstrap::BuiltinIteratorPrototypes, JsSurfaceError> {
+    use crate::symbol::WellKnown;
+    let parent_value = Value::object(parent);
+    let tag_sym = well_known.get(WellKnown::ToStringTag);
+    let mut make = |tag: &'static str| -> Result<JsObject, JsSurfaceError> {
+        let proto = {
+            let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                parent_value.trace_value_slots(visitor);
+            };
+            object::alloc_object_with_shape_roots(heap, shape_root, &mut visit)
+                .map_err(|_| JsSurfaceError::OutOfMemory)?
+        };
+        object::set_prototype(proto, heap, Some(parent));
+        let tag_string = crate::string::JsString::from_str(tag, heap)
+            .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        object::define_own_symbol_property_partial(
+            proto,
+            heap,
+            tag_sym,
+            object::PartialPropertyDescriptor {
+                value: Some(Value::string(tag_string)),
+                writable: Some(false),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+        Ok(proto)
+    };
+    let array = make("Array Iterator")?;
+    let map = make("Map Iterator")?;
+    let set = make("Set Iterator")?;
+    let string = make("String Iterator")?;
+    let regexp_string = make("RegExp String Iterator")?;
+    let next_fn = native_static_with_value_roots(
+        heap,
+        "next",
+        0,
+        regexp_string_iterator_proto_next,
+        &[&parent_value],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    if !object::define_own_property(
+        regexp_string,
+        heap,
+        "next",
+        object::PropertyDescriptor::data(Value::native_function(next_fn), true, false, true),
+    ) {
+        return Err(JsSurfaceError::DefinePropertyFailed(
+            "RegExpStringIteratorPrototype.next",
+        ));
+    }
+    Ok(crate::bootstrap::BuiltinIteratorPrototypes {
+        array,
+        map,
+        set,
+        string,
+        regexp_string,
+    })
+}
+
+fn iterator_receiver(
+    ctx: &mut crate::NativeCtx<'_>,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    if let Some(h) = this_value.as_iterator() {
+        return Ok(h);
+    }
+    if let Some(g) = this_value.as_generator() {
+        let gen_value = Value::generator(g);
+        let state = crate::IteratorState::Generator { handle: g };
+        return ctx
+            .alloc_iterator_state(state, &[&gen_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "iterator allocation failed".to_string(),
+            });
+    }
+    // §27.1.4.1.1 GetIteratorDirect — the `Iterator.prototype.X`
+    // helpers accept any receiver that implements the iterator
+    // protocol via a callable `next` method; they do NOT walk
+    // `@@iterator`. Probe `next` directly and wrap as `IteratorState::User`.
+    if this_value.is_object()
+        || this_value.is_map()
+        || this_value.is_set()
+        || this_value.is_array()
+        || this_value.is_string()
+    {
+        let (interp, exec_ctx) = ctx.interp_mut_and_context();
+        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        let next_key = crate::VmPropertyKey::String("next");
+        let outcome = interp
+            .ordinary_get_value(&exec_ctx, this_value, this_value, &next_key, 0)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?;
+        let next_method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp
+                    .run_callable_sync(&exec_ctx, &getter, this_value, args)
+                    .map_err(|e| crate::NativeError::TypeError {
+                        name,
+                        reason: e.to_string(),
+                    })?
+            }
+        };
+        if !interp.is_callable_runtime(&next_method) {
+            return Err(crate::NativeError::TypeError {
+                name,
+                reason: "this is not an iterator".to_string(),
+            });
+        }
+        let this_root = this_value;
+        let state = crate::IteratorState::User {
+            iterator: this_value,
+        };
+        return ctx
+            .alloc_iterator_state(state, &[&this_root], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "iterator allocation failed".to_string(),
+            });
+    }
+    Err(crate::NativeError::TypeError {
+        name,
+        reason: "this is not an iterator".to_string(),
+    })
+}
+
+/// Strict iterator receiver used by `%IteratorPrototype%.next/return/throw`.
+/// Only accepts built-in iterator-shaped values (`Value::Iterator`,
+/// `Value::Generator`); non-iterator receivers throw `TypeError` per
+/// §27.1.5.1.2 step 2. The looser [`iterator_receiver`] used by the
+/// helper terminals (map/filter/drop/take/forEach/…) would re-wrap an
+/// ordinary object as `IteratorState::User`, which causes infinite
+/// re-entry when the wrapped object's `next` resolves back to this
+/// same native through the prototype chain.
+fn iterator_receiver_builtin(
+    ctx: &mut crate::NativeCtx<'_>,
+    name: &'static str,
+) -> Result<crate::IteratorHandle, crate::NativeError> {
+    let this_value = *ctx.this_value();
+    if let Some(h) = this_value.as_iterator() {
+        return Ok(h);
+    }
+    if let Some(g) = this_value.as_generator() {
+        let gen_value = Value::generator(g);
+        let state = crate::IteratorState::Generator { handle: g };
+        return ctx
+            .alloc_iterator_state(state, &[&gen_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name,
+                reason: "iterator allocation failed".to_string(),
+            });
+    }
+    Err(crate::NativeError::TypeError {
+        name,
+        reason: "this is not a built-in iterator".to_string(),
+    })
+}
+
+fn require_callable_arg(
+    ctx: &crate::NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+    index: usize,
+) -> Result<Value, crate::NativeError> {
+    let v = args.get(index).cloned().unwrap_or(Value::undefined());
+    if ctx.cx.interp.is_callable_runtime(&v) {
+        Ok(v)
+    } else {
+        Err(crate::NativeError::TypeError {
+            name,
+            reason: "argument must be callable".to_string(),
+        })
+    }
+}
+
+fn iterator_proto_map(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.map")?;
+    let mapper = require_callable_arg(ctx, args, "Iterator.prototype.map", 0)?;
+    let source_value = Value::iterator(source);
+    let state = crate::IteratorState::Map { source, mapper };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &mapper], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.map",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
+fn iterator_proto_filter(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.filter")?;
+    let predicate = require_callable_arg(ctx, args, "Iterator.prototype.filter", 0)?;
+    let source_value = Value::iterator(source);
+    let state = crate::IteratorState::Filter { source, predicate };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &predicate], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.filter",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
+fn iterator_proto_take(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.take")?;
+    let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.take")?;
+    let source_value = Value::iterator(source);
+    let state = crate::IteratorState::Take {
+        source,
+        remaining: n,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.take",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
+fn iterator_proto_drop(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
+    let n = iterator_arg_count_native(ctx, args, "Iterator.prototype.drop")?;
+    let source_value = Value::iterator(source);
+    let state = crate::IteratorState::Drop { source, to_drop: n };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.drop",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
+fn iterator_proto_flat_map(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let source = iterator_receiver(ctx, "Iterator.prototype.flatMap")?;
+    let mapper = require_callable_arg(ctx, args, "Iterator.prototype.flatMap", 0)?;
+    let source_value = Value::iterator(source);
+    let state = crate::IteratorState::FlatMap {
+        source,
+        mapper,
+        inner: None,
+    };
+    let handle = ctx
+        .alloc_iterator_state(state, &[&source_value, &mapper], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.flatMap",
+            reason: "iterator allocation failed".to_string(),
+        })?;
+    Ok(Value::iterator(handle))
+}
+
+fn iterator_arg_count_native(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<u64, crate::NativeError> {
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    // §27.5.1.2 step 3 — `numLimit = ? ToNumber(limit)`. Non-
+    // primitive operands route through `ToPrimitive(hint: number)`
+    // so `valueOf` / `toString` / `Symbol.toPrimitive` hooks fire.
+    let primitive = if crate::abstract_ops::is_primitive(&arg) {
+        arg
+    } else {
+        let (interp, exec) = ctx.interp_mut_and_context();
+        let exec = exec.ok_or_else(|| crate::NativeError::TypeError {
+            name,
+            reason: "missing execution context".to_string(),
+        })?;
+        interp
+            .evaluate_to_primitive(&exec, &arg, crate::abstract_ops::ToPrimitiveHint::Number)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?
+    };
+    let n = crate::number::to_number_value(&primitive, ctx.heap());
+    if n.is_nan() {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "argument must be a non-negative integer".to_string(),
+        });
+    }
+    let trunc = n.trunc();
+    if trunc < 0.0 {
+        return Err(crate::NativeError::RangeError {
+            name,
+            reason: "argument must be a non-negative integer".to_string(),
+        });
+    }
+    if n.is_infinite() {
+        return Ok(u64::MAX);
+    }
+    Ok(trunc as u64)
+}
+
+fn iterator_proto_to_array(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.toArray")?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.toArray",
+                reason: "missing execution context".to_string(),
+            })?;
+    let mut collected: Vec<Value> = Vec::new();
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.toArray",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        collected.push(v);
+    }
+    let iter_value = Value::iterator(handle);
+    let arr = ctx
+        .array_from_elements_with_roots(
+            collected.iter().cloned(),
+            &[&iter_value],
+            &[collected.as_slice()],
+        )
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.toArray",
+            reason: "array allocation failed".to_string(),
+        })?;
+    Ok(Value::array(arr))
+}
+
+fn iterator_proto_for_each(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.forEach")?;
+    let callback = require_callable_arg(ctx, args, "Iterator.prototype.forEach", 0)?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.forEach",
+                reason: "missing execution context".to_string(),
+            })?;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.forEach",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(v);
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
+        ctx.cx
+            .interp
+            .run_callable_sync(&exec_ctx, &callback, Value::undefined(), cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.forEach",
+                reason: e.to_string(),
+            })?;
+        idx += 1.0;
+    }
+    Ok(Value::undefined())
+}
+
+fn iterator_proto_reduce(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.reduce")?;
+    let reducer = require_callable_arg(ctx, args, "Iterator.prototype.reduce", 0)?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.reduce",
+                reason: "missing execution context".to_string(),
+            })?;
+    let has_initial = args.len() >= 2;
+    let mut acc = if has_initial {
+        args[1]
+    } else {
+        Value::undefined()
+    };
+    // `has_acc` flips to true once `acc` holds a real value — either
+    // the caller-supplied initial value or the first yielded element
+    // when no initial was passed.
+    let mut has_acc = has_initial;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.reduce",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        if !has_acc {
+            acc = v;
+            has_acc = true;
+            idx += 1.0;
+            continue;
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(acc);
+        cb_args.push(v);
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
+        acc = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &reducer, Value::undefined(), cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.reduce",
+                reason: e.to_string(),
+            })?;
+        idx += 1.0;
+    }
+    if !has_acc {
+        return Err(crate::NativeError::TypeError {
+            name: "Iterator.prototype.reduce",
+            reason: "reduce of empty iterator with no initial value".to_string(),
+        });
+    }
+    Ok(acc)
+}
+
+fn iterator_proto_some(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    iterator_predicate_drain(ctx, args, "Iterator.prototype.some", true, false)
+}
+
+fn iterator_proto_every(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    iterator_predicate_drain(ctx, args, "Iterator.prototype.every", false, true)
+}
+
+fn iterator_proto_find(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, "Iterator.prototype.find")?;
+    let predicate = require_callable_arg(ctx, args, "Iterator.prototype.find", 0)?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.find",
+                reason: "missing execution context".to_string(),
+            })?;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.find",
+                reason: e.to_string(),
+            })?;
+        if done {
+            break;
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(v);
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
+        let kept = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.prototype.find",
+                reason: e.to_string(),
+            })?;
+        if kept.to_boolean(ctx.heap()) {
+            return Ok(v);
+        }
+        idx += 1.0;
+    }
+    Ok(Value::undefined())
+}
+
+/// §27.1.5.1.2 `%IteratorPrototype%.next()` — drive one step on the
+/// receiver iterator and wrap the (value, done) pair in the spec's
+/// result record.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.next>
+fn iterator_proto_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.next")?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name: "Iterator.prototype.next",
+                reason: "missing execution context".to_string(),
+            })?;
+    let iter_value = Value::iterator(handle);
+    let (value, done) = ctx
+        .cx
+        .interp
+        .iterator_next_full(&exec_ctx, &handle)
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: e.to_string(),
+        })?;
+    let obj = ctx
+        .alloc_object_with_roots(&[&iter_value, &value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: "result allocation failed".to_string(),
+        })?;
+    ctx.set_property(obj, "value", value)
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: e.to_string(),
+        })?;
+    ctx.set_property(obj, "done", Value::boolean(done))
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.next",
+            reason: e.to_string(),
+        })?;
+    Ok(Value::object(obj))
+}
+
+/// §22.2.7.2 `%RegExpStringIteratorPrototype%.next`.
+///
+/// Unlike the generic `%IteratorPrototype%.next` helper, this own
+/// method requires the receiver to carry RegExp String Iterator
+/// internal state.
+fn regexp_string_iterator_proto_next(
+    ctx: &mut crate::NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let name = "RegExpStringIteratorPrototype.next";
+    let this_value = *ctx.this_value();
+    let Some(handle) = this_value.as_iterator() else {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "this is not a RegExp String Iterator".to_string(),
+        });
+    };
+    let is_regexp_string = ctx
+        .cx
+        .interp
+        .gc_heap_for_cx()
+        .read_payload(handle, |state| {
+            matches!(state, crate::IteratorState::RegExpString { .. })
+        });
+    if !is_regexp_string {
+        return Err(crate::NativeError::TypeError {
+            name,
+            reason: "this is not a RegExp String Iterator".to_string(),
+        });
+    }
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+    let iter_value = Value::iterator(handle);
+    let (value, done) = ctx
+        .cx
+        .interp
+        .iterator_next_full(&exec_ctx, &handle)
+        .map_err(|e| crate::NativeError::TypeError {
+            name,
+            reason: e.to_string(),
+        })?;
+    let obj = ctx
+        .alloc_object_with_roots(&[&iter_value, &value], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name,
+            reason: "result allocation failed".to_string(),
+        })?;
+    ctx.set_property(obj, "value", value)
+        .map_err(|e| crate::NativeError::TypeError {
+            name,
+            reason: e.to_string(),
+        })?;
+    ctx.set_property(obj, "done", Value::boolean(done))
+        .map_err(|e| crate::NativeError::TypeError {
+            name,
+            reason: e.to_string(),
+        })?;
+    Ok(Value::object(obj))
+}
+
+/// §27.1.5.1.3 `%IteratorPrototype%.return(value)` — mark the
+/// receiver iterator exhausted and return the spec result record
+/// `{ value, done: true }`. Generator-backed iterators delegate
+/// to the generator's `return` handler through `iterator_helper_dispatch`.
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.return>
+fn iterator_proto_return(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.return")?;
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    let iter_value = Value::iterator(handle);
+    ctx.cx
+        .interp
+        .gc_heap_for_cx_mut()
+        .with_payload(handle, |state| {
+            *state = crate::IteratorState::Exhausted;
+        });
+    let obj = ctx
+        .alloc_object_with_roots(&[&iter_value, &arg], &[])
+        .map_err(|_| crate::NativeError::TypeError {
+            name: "Iterator.prototype.return",
+            reason: "result allocation failed".to_string(),
+        })?;
+    ctx.set_property(obj, "value", arg)
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.return",
+            reason: e.to_string(),
+        })?;
+    ctx.set_property(obj, "done", Value::boolean(true))
+        .map_err(|e| crate::NativeError::TypeError {
+            name: "Iterator.prototype.return",
+            reason: e.to_string(),
+        })?;
+    Ok(Value::object(obj))
+}
+
+/// §27.1.5.1.4 `%IteratorPrototype%.throw(value)` — propagate the
+/// argument as a thrown completion. Built-in (non-generator)
+/// iterators have no `[[Throw]]` handler, so the abstract algorithm
+/// degrades to "throw value".
+///
+/// # See also
+/// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.throw>
+fn iterator_proto_throw(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let _handle = iterator_receiver_builtin(ctx, "Iterator.prototype.throw")?;
+    let arg = args.first().cloned().unwrap_or(Value::undefined());
+    Err(crate::NativeError::Thrown {
+        name: "Iterator.prototype.throw",
+        message: arg.display_string(ctx.heap()),
+    })
+}
+
+fn iterator_predicate_drain(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+    short_on_truthy: bool,
+    initial: bool,
+) -> Result<Value, crate::NativeError> {
+    let handle = iterator_receiver(ctx, name)?;
+    let predicate = require_callable_arg(ctx, args, name, 0)?;
+    let exec_ctx =
+        ctx.execution_context()
+            .cloned()
+            .ok_or_else(|| crate::NativeError::TypeError {
+                name,
+                reason: "missing execution context".to_string(),
+            })?;
+    let mut idx: f64 = 0.0;
+    loop {
+        let (v, done) = ctx
+            .cx
+            .interp
+            .iterator_next_full(&exec_ctx, &handle)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?;
+        if done {
+            return Ok(Value::boolean(initial));
+        }
+        let mut cb_args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+        cb_args.push(v);
+        cb_args.push(Value::number(crate::number::NumberValue::from_f64(idx)));
+        let kept = ctx
+            .cx
+            .interp
+            .run_callable_sync(&exec_ctx, &predicate, Value::undefined(), cb_args)
+            .map_err(|e| crate::NativeError::TypeError {
+                name,
+                reason: e.to_string(),
+            })?;
+        if kept.to_boolean(ctx.heap()) == short_on_truthy {
+            return Ok(Value::boolean(short_on_truthy));
+        }
+        idx += 1.0;
+    }
+}
+
+/// §27.1.4.1 `Iterator.from(iterable)` — wraps the operand into a
+/// foundation iterator. Already-iterator inputs pass through;
+/// iterable objects route through `GetIterator` so `[Symbol.iterator]()`
+/// fires and the resulting user iterator is wrapped in
+/// `IteratorState::User`. Plain Array / Set / Map / String operands
+/// route through their respective `IteratorState` shapes via the
+/// existing `make_*_iterator_factory` helpers. Primitive inputs that
+/// aren't iterable raise TypeError per spec step 4.
+fn iterator_from_native(
+    ctx: &mut crate::NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, crate::NativeError> {
+    let input = args.first().cloned().unwrap_or(Value::undefined());
+    if input.is_iterator() {
+        return Ok(input);
+    }
+    if let Some(arr) = input.as_array() {
+        let arr_value = Value::array(arr);
+        let state = crate::IteratorState::Array {
+            array: arr,
+            index: 0,
+            origin: crate::BuiltinIteratorOrigin::Array,
+        };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&arr_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        return Ok(Value::iterator(handle));
+    }
+    if let Some(g) = input.as_generator() {
+        let state = crate::IteratorState::Generator { handle: g };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&input], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        return Ok(Value::iterator(handle));
+    }
+    if let Some(s) = input.as_string(ctx.heap()) {
+        let state = crate::IteratorState::String {
+            string: s,
+            index: 0,
+        };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&input], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        return Ok(Value::iterator(handle));
+    }
+    // §27.1.4.1 step 1 — `iterable` may also be an Object with
+    // `@@iterator`; look up the method, call it, and wrap the
+    // resulting iterator object in `IteratorState::User`.
+    if input.is_object()
+        || input.is_set()
+        || input.is_map()
+        || input.is_function()
+        || input.is_closure()
+        || input.is_native_function()
+        || input.is_bound_function()
+        || input.is_class_constructor()
+        || input.is_proxy()
+    {
+        let iterator_sym = ctx
+            .cx
+            .interp
+            .well_known_symbols()
+            .get(crate::symbol::WellKnown::Iterator);
+        let (interp, exec_ctx) = ctx.interp_mut_and_context();
+        let exec_ctx = exec_ctx.ok_or_else(|| crate::NativeError::TypeError {
+            name: "Iterator.from",
+            reason: "missing execution context".to_string(),
+        })?;
+        let key = crate::VmPropertyKey::Symbol(iterator_sym);
+        let outcome = interp
+            .ordinary_get_value(&exec_ctx, input, input, &key, 0)
+            .map_err(|e| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: e.to_string(),
+            })?;
+        let iter_method = match outcome {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+                interp
+                    .run_callable_sync(&exec_ctx, &getter, input, args)
+                    .map_err(|e| crate::NativeError::TypeError {
+                        name: "Iterator.from",
+                        reason: e.to_string(),
+                    })?
+            }
+        };
+        let iter_value = if iter_method.is_nullish() {
+            input
+        } else if interp.is_callable_runtime(&iter_method) {
+            let args: smallvec::SmallVec<[Value; 8]> = smallvec::SmallVec::new();
+            interp
+                .run_callable_sync(&exec_ctx, &iter_method, input, args)
+                .map_err(|e| crate::NativeError::TypeError {
+                    name: "Iterator.from",
+                    reason: e.to_string(),
+                })?
+        } else {
+            return Err(crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "argument is not iterable".to_string(),
+            });
+        };
+        if iter_value.is_iterator() {
+            return Ok(iter_value);
+        }
+        let state = crate::IteratorState::User {
+            iterator: iter_value,
+        };
+        let handle = ctx
+            .alloc_iterator_state(state, &[&iter_value], &[])
+            .map_err(|_| crate::NativeError::TypeError {
+                name: "Iterator.from",
+                reason: "iterator allocation failed".to_string(),
+            })?;
+        return Ok(Value::iterator(handle));
+    }
+    Err(crate::NativeError::TypeError {
+        name: "Iterator.from",
+        reason: "argument is not iterable".to_string(),
+    })
+}
+

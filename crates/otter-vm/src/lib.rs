@@ -669,7 +669,7 @@ impl Interpreter {
             && let Some(iter_proto) = iter_proto_value.as_object()
         {
             let shape_root = interp.shape_runtime.root();
-            let protos = bootstrap::build_builtin_iterator_prototypes_post_bootstrap(
+            let protos = crate::intrinsics::iterator::build_builtin_iterator_prototypes_post_bootstrap(
                 &mut interp.gc_heap,
                 shape_root,
                 iter_proto,

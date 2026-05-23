@@ -558,7 +558,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
   workspace clippy clean. Test262 baselines hold (try 156/44/2,
   generators 165/101/0, await 18/4/0).
 
-### Task 2.2 — Collapse Dispatch To One Loop
+### Task 2.2 — Collapse Dispatch To One Loop — DONE 2026-05-23
 
 - Goal: remove three-match dispatch shape.
 - Touches: `Interpreter::dispatch_loop_inner`.
@@ -568,6 +568,24 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: Medium.
 - Effort: M.
 - Depends on: 2.1.
+- **Status:** Shipped. `dispatch_loop_inner` walks one fetch + one
+  exhaustive `match op` over all 132 opcodes (the leftover nested
+  match handling the equality opcode family lives inside its own
+  arm). Variadic call / closure arms (`MakeClosure`, `JsonCall`,
+  `ArrayBufferCall`, …, `TemporalCall`) grab `let operands = ...` /
+  `let frame = &mut stack[top_idx];` locally so the merge stays
+  borrow-safe. Previously-duplicated arms (`ToNumber`,
+  `DeleteProperty`, `DeleteElement`, `GetPrototype`, `SetPrototype`,
+  `LoadProperty`, `StoreProperty`, `LoadElement`, `StoreElement`,
+  `GetIterator`, `IteratorNext`, `Instanceof`, `HasProperty`,
+  `CollectArguments`) merged into a single body each (proxy/ladder
+  check first, fast path inlined). Dead `run_collect_arguments_reg`
+  helper deleted. Trailing `_ => {}` dropped because the match is
+  now exhaustive. Test262 baselines hold: try 156p/44f/2crash,
+  generators 165p/101f/0crash, await 18p/4f/0crash. 539/539 `otter-vm
+  --lib`, 123/123 `otter-runtime --lib`, workspace clippy clean.
+  Microbench number not yet captured — re-run when the dispatch
+  benchmark harness lands.
 
 ### Task 2.3 — Remove Shortcut Call Opcodes
 

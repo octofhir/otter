@@ -1216,7 +1216,7 @@ impl Interpreter {
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                 cold.pending_get_iterator = None;
             }
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return Ok(true);
         }
 
@@ -1304,7 +1304,7 @@ impl Interpreter {
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                 cold.pending_iterator_next = None;
             }
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return Ok(true);
         }
 
@@ -1341,7 +1341,7 @@ impl Interpreter {
             }
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return Ok(true);
         }
         // Helper-wrapper iterator states drive through the
@@ -1360,7 +1360,7 @@ impl Interpreter {
             let (value, done) = self.iterator_next_full(context, iter_rc)?;
             write_register(&mut stack[top_idx], value_dst, value)?;
             write_register(&mut stack[top_idx], done_dst, Value::boolean(done))?;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return Ok(true);
         }
         // Snapshot the user iterator object out of the inner

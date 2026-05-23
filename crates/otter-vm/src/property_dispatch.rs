@@ -2052,8 +2052,7 @@ impl Interpreter {
                 return Ok(true);
             }
             let key = VmPropertyKey::atom(atomized_key);
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             match self.ordinary_get_value(
                 context,
                 Value::object(obj),
@@ -2097,8 +2096,7 @@ impl Interpreter {
             || receiver.is_data_view()
         {
             let key = VmPropertyKey::atom(atomized_key);
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -2120,8 +2118,7 @@ impl Interpreter {
         {
             let boxed = self.box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])?;
             let key = VmPropertyKey::atom(atomized_key);
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             match self.ordinary_get_value(context, boxed, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -2143,8 +2140,7 @@ impl Interpreter {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
                 }) => {
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].advance_pc(1)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2164,8 +2160,7 @@ impl Interpreter {
                         &self.gc_heap,
                         name,
                     ) {
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2176,8 +2171,7 @@ impl Interpreter {
                         return Ok(true);
                     }
                     if is_restricted_function_property(name) {
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         let callee = self.restricted_throw_type_error()?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &callee, receiver, args, dst)?;
@@ -2228,8 +2222,7 @@ impl Interpreter {
                 if let object::PropertyLookup::Accessor { getter, .. } =
                     object::lookup(proto, &self.gc_heap, name)
                 {
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].advance_pc(1)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2259,8 +2252,7 @@ impl Interpreter {
         };
         match crate::object::lookup(obj, &self.gc_heap, name) {
             object::PropertyLookup::Accessor { getter, .. } => {
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2300,8 +2292,7 @@ impl Interpreter {
         let lhs = *read_register(&stack[top_idx], lhs_reg)?;
         let rhs = *read_register(&stack[top_idx], rhs_reg)?;
         let result = self.instanceof_operator_stack_rooted(context, stack, &lhs, &rhs)?;
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         write_register(&mut stack[top_idx], dst, Value::boolean(result))?;
         Ok(true)
     }
@@ -2346,8 +2337,7 @@ impl Interpreter {
             || receiver.is_array_buffer()
             || receiver.is_data_view();
         if prototype_routed {
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
                 VmGetOutcome::Value(value) => write_register(&mut stack[top_idx], dst, value)?,
                 VmGetOutcome::InvokeGetter { getter } => {
@@ -2369,8 +2359,7 @@ impl Interpreter {
                     kind: object::DescriptorKind::Accessor { getter, .. },
                     ..
                 }) => {
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].advance_pc(1)?;
                     match getter {
                         Some(callee) if abstract_ops::is_callable(&callee) => {
                             let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2390,8 +2379,7 @@ impl Interpreter {
                         &self.gc_heap,
                         key,
                     ) {
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         match getter {
                             Some(callee) if abstract_ops::is_callable(&callee) => {
                                 let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2402,8 +2390,7 @@ impl Interpreter {
                         return Ok(true);
                     }
                     if is_restricted_function_property(key) {
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         let callee = self.restricted_throw_type_error()?;
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
                         self.invoke(stack, context, &callee, receiver, args, dst)?;
@@ -2417,8 +2404,7 @@ impl Interpreter {
             o
         } else if let Some(class) = receiver.as_class_constructor() {
             if key.string_name().is_some_and(|key| key == "prototype") {
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 write_register(
                     &mut stack[top_idx],
                     dst,
@@ -2450,14 +2436,12 @@ impl Interpreter {
         };
         match lookup {
             object::PropertyLookup::Data { value, .. } => {
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 write_register(&mut stack[top_idx], dst, value)?;
                 Ok(true)
             }
             object::PropertyLookup::Accessor { getter, .. } => {
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 match getter {
                     Some(callee) if abstract_ops::is_callable(&callee) => {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
@@ -2496,8 +2480,7 @@ impl Interpreter {
             });
         }
         let top_idx = stack.len() - 1;
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         Ok(true)
     }
 
@@ -2577,8 +2560,7 @@ impl Interpreter {
                                 )?;
                             }
                             let top_idx = stack.len() - 1;
-                            let pc = stack[top_idx].pc;
-                            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                            stack[top_idx].advance_pc(1)?;
                             return Ok(true);
                         }
                         object::PropertyLookup::Accessor { setter, .. } => {
@@ -2594,8 +2576,7 @@ impl Interpreter {
                                 return Ok(true);
                             };
                             let top_idx = stack.len() - 1;
-                            let pc = stack[top_idx].pc;
-                            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                            stack[top_idx].advance_pc(1)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                             args.push(value);
                             self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -2616,8 +2597,7 @@ impl Interpreter {
                         receiver
                     ];
                     let top_idx = stack.len() - 1;
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].advance_pc(1)?;
                     match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                         Some(_) => {}
                         None => {
@@ -2690,8 +2670,7 @@ impl Interpreter {
             strict,
             format!("Cannot assign to property '{name}' on primitive"),
         )?;
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         Ok(true)
     }
 
@@ -2740,8 +2719,7 @@ impl Interpreter {
                 value,
                 Value::proxy(proxy),
             ];
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(_) => {}
                 None => {
@@ -2827,8 +2805,7 @@ impl Interpreter {
                     if !abstract_ops::is_callable(&setter) {
                         return Err(VmError::TypeMismatch);
                     }
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].advance_pc(1)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
                     self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -2848,16 +2825,14 @@ impl Interpreter {
                         if !abstract_ops::is_callable(&setter) {
                             return Err(VmError::TypeMismatch);
                         }
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
                         self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                     if is_restricted_function_property(key) {
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         let callee = self.restricted_throw_type_error()?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
@@ -2889,8 +2864,7 @@ impl Interpreter {
                             "Cannot assign to accessor property without a setter",
                         );
                     }
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].advance_pc(1)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
                     self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -2904,8 +2878,7 @@ impl Interpreter {
                     );
                 }
             }
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return Ok(true);
         }
         if receiver.is_boolean()
@@ -2970,8 +2943,7 @@ impl Interpreter {
                     }
                 }
             }
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return Ok(true);
         }
         let obj = if let Some(obj) = receiver.as_object() {
@@ -3047,8 +3019,7 @@ impl Interpreter {
                         "Cannot assign to read-only property",
                     );
                 }
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 Ok(true)
             }
             object::SetOutcome::InvokeSetter { setter } => {
@@ -3059,8 +3030,7 @@ impl Interpreter {
                         "Cannot assign to accessor property without a setter",
                     );
                 }
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
                 self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -3146,8 +3116,7 @@ impl Interpreter {
                 value,
                 Value::proxy(proxy),
             ];
-            let pc = stack[top_idx].pc;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             match self.invoke_proxy_trap(context, &proxy, "set", trap_args)? {
                 Some(result) => {
                     let ok = result.to_boolean(&self.gc_heap);
@@ -3270,8 +3239,7 @@ impl Interpreter {
                     if !abstract_ops::is_callable(&setter) {
                         return Err(VmError::TypeMismatch);
                     }
-                    let pc = stack[top_idx].pc;
-                    stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                    stack[top_idx].advance_pc(1)?;
                     let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                     args.push(value);
                     self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -3291,16 +3259,14 @@ impl Interpreter {
                         if !abstract_ops::is_callable(&setter) {
                             return Err(VmError::TypeMismatch);
                         }
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
                         self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
                         return Ok(true);
                     }
                     if is_restricted_function_property(name) {
-                        let pc = stack[top_idx].pc;
-                        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                        stack[top_idx].advance_pc(1)?;
                         let callee = self.restricted_throw_type_error()?;
                         let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                         args.push(value);
@@ -3404,8 +3370,7 @@ impl Interpreter {
                         }
                     }
                 }
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 Ok(true)
             }
             object::SetOutcome::InvokeSetter { setter } => {
@@ -3418,8 +3383,7 @@ impl Interpreter {
                         format!("Cannot assign to accessor property '{name}' without a setter"),
                     );
                 }
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                 args.push(value);
                 self.invoke(stack, context, &setter, receiver, args, scratch_reg)?;
@@ -3500,8 +3464,7 @@ impl Interpreter {
         } else {
             VmPropertyKey::OwnedString(lhs.display_string(&self.gc_heap))
         };
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         let present = self.ordinary_has_property_value(context, rhs, &key, 0)?;
         write_register(&mut stack[top_idx], dst, Value::boolean(present))?;
         Ok(true)
@@ -3526,8 +3489,7 @@ impl Interpreter {
         let Some(proxy) = receiver.as_proxy() else {
             return Ok(false);
         };
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         let removed = self.ordinary_delete_value(
             context,
             Value::proxy(proxy),
@@ -3556,8 +3518,7 @@ impl Interpreter {
         }
         let idx = *read_register(&stack[top_idx], idx_reg)?;
         let key = Self::coerce_vm_property_key(Some(&idx), &self.gc_heap)?;
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         let removed = self.ordinary_delete_value(context, receiver, &key, 0)?;
         let strict = context.function_is_strict(stack[top_idx].function_id);
         if !removed && strict {
@@ -3584,8 +3545,7 @@ impl Interpreter {
         if !value.is_proxy() {
             return Ok(false);
         };
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         let result = self.ordinary_get_prototype_value(context, value, 0)?;
         write_register(&mut stack[top_idx], dst, result)?;
         Ok(true)
@@ -3614,8 +3574,7 @@ impl Interpreter {
         } else {
             return Err(VmError::TypeMismatch);
         };
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         // §10.5.7 — dispatch through the value-level helper so
         // nested proxies fall through correctly and §10.5.7 invariants
         // apply on the trap result.

@@ -102,8 +102,7 @@ impl Interpreter {
                 && self.is_callable_runtime(&method)
             {
                 let top_idx = stack.len() - 1;
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
             let result = promise_dispatch::prototype_call(
@@ -283,8 +282,7 @@ impl Interpreter {
                 && let Some(method) = crate::object::get(proto, &self.gc_heap, name)
                 && self.is_callable_runtime(&method)
             {
-                let pc = stack[top_idx].pc;
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 self.invoke(stack, context, &method, recv_value, arg_values, dst)?;
                 return Ok(());
             }

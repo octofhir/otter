@@ -37,8 +37,7 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let args = collect_array_args(&stack[top_idx], operands)?;
 
-        let pc = stack[top_idx].pc;
-        stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+        stack[top_idx].advance_pc(1)?;
         let result = match op {
             Op::ArrayConstruct => self.array_construct_stack_rooted(stack, &args)?,
             Op::ArrayFrom => self.array_from_sync(context, &args)?,

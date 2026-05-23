@@ -251,7 +251,7 @@ impl Interpreter {
                 if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                     cold.pending_to_primitive = None;
                 }
-                stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+                stack[top_idx].advance_pc(1)?;
                 return Ok(false);
             }
             // Non-primitive — advance to the next stage.
@@ -269,7 +269,7 @@ impl Interpreter {
         let recv = *read_register(&stack[top_idx], src)?;
         if abstract_ops::is_primitive(&recv) {
             write_register(&mut stack[top_idx], dst, recv)?;
-            stack[top_idx].pc = pc.checked_add(1).ok_or(VmError::InvalidOperand)?;
+            stack[top_idx].advance_pc(1)?;
             return Ok(false);
         }
 

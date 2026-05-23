@@ -37,6 +37,7 @@ pub mod boolean;
 mod call_ops;
 pub mod closure;
 mod coerce;
+pub mod cold_frame;
 mod collection_ops;
 pub mod collections;
 pub mod collections_prototype;
@@ -462,6 +463,17 @@ pub struct Interpreter {
     string_iterator_prototype: Option<JsObject>,
     regexp_string_iterator_prototype: Option<JsObject>,
     function_kind_prototypes: function_kind::FunctionKindPrototypes,
+    /// Pool of cold-frame side records (try handlers, async parking,
+    /// in-flight ToPrimitive/bind/iterator ladders, module URL, …).
+    /// Hot [`crate::Frame`] carries an `Option<ColdFrameIdx>` and
+    /// acquires a slot the first time an opcode needs cold state.
+    /// See [`crate::cold_frame`] for the contract.
+    ///
+    /// Currently unread because the cold-field migration lands across
+    /// subsequent commits in Task 1.3; the pool itself is wired here
+    /// first so the per-field migrations can be reviewed in isolation.
+    #[allow(dead_code)]
+    cold_frames: cold_frame::ColdFramePool,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -648,6 +660,7 @@ impl Interpreter {
             string_iterator_prototype: None,
             regexp_string_iterator_prototype: None,
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
+            cold_frames: cold_frame::ColdFramePool::new(),
         };
         let extra_roots = otter_gc::ExtraRoots::new(&interp);
         let previous = interp.gc_heap.install_extra_roots(Some(extra_roots));

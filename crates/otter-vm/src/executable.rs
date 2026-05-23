@@ -24,7 +24,8 @@
 //! - [`otter_bytecode::Instruction`]
 
 use otter_bytecode::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, Op, Operand,
+    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Function, Op, Operand, SpanEntry,
+    bytecode_v2::{EncodedFunction, encode_function, translate_spans_to_byte_pcs},
 };
 
 const INLINE_OPERANDS: usize = 3;
@@ -137,6 +138,36 @@ impl ExecutableModule {
     }
 }
 
+#[allow(dead_code)]
+impl ExecutableFunction {
+    /// Byte-offset source-map entries, sorted by `pc`. Empty when the
+    /// underlying [`Function::spans`] is empty.
+    #[must_use]
+    pub(crate) fn byte_spans(&self) -> &[SpanEntry] {
+        &self.byte_spans
+    }
+
+    /// Total length in bytes of this function's canonical v2
+    /// byte-stream encoding.
+    #[must_use]
+    pub(crate) const fn code_byte_len(&self) -> u32 {
+        self.code_byte_len
+    }
+
+    /// Resolve a v2 byte-offset PC to its corresponding [`ExecInstr`]
+    /// in `code`. Returns `None` if `byte_pc` does not fall on a known
+    /// instruction boundary. Used while the dispatch loop flips from
+    /// instruction-index to byte-offset PC semantics.
+    #[must_use]
+    pub(crate) fn instr_at_byte_pc(&self, byte_pc: u32) -> Option<&ExecInstr> {
+        let idx = self
+            .code
+            .binary_search_by_key(&byte_pc, |instr| instr.byte_pc())
+            .ok()?;
+        self.code.get(idx)
+    }
+}
+
 /// One executable function body.
 #[derive(Debug, Clone)]
 pub(crate) struct ExecutableFunction {
@@ -170,8 +201,22 @@ pub(crate) struct ExecutableFunction {
     pub(crate) is_module: bool,
     /// Source module URL carried by frames for module resolution.
     pub(crate) module_url: Box<str>,
-    /// Compact instruction stream. The index is the program counter.
+    /// Compact instruction stream. The index is the v1 instruction-index
+    /// program counter; each [`ExecInstr`] also carries its v2 byte-offset
+    /// (`byte_pc`) and `byte_len` so the dispatch loop can flip from
+    /// instruction-index to byte-offset PC without changing storage shape.
     pub(crate) code: Box<[ExecInstr]>,
+    /// Source-map entries with `pc` already remapped to byte offsets
+    /// via [`translate_spans_to_byte_pcs`]. Empty when the underlying
+    /// [`Function::spans`] is empty. Wired in once
+    /// [`crate::error_ops::snapshot_frames`] flips to byte-offset PC.
+    #[allow(dead_code)]
+    pub(crate) byte_spans: Box<[SpanEntry]>,
+    /// Total length in bytes of the canonical v2 byte-stream encoding
+    /// of this function body. Stored so source-map lookups and end-of-
+    /// stream jumps key off the same upper bound the encoder produced.
+    #[allow(dead_code)]
+    pub(crate) code_byte_len: u32,
 }
 
 impl ExecutableFunction {
@@ -184,10 +229,17 @@ impl ExecutableFunction {
             .param_count
             .saturating_add(function.locals)
             .saturating_add(function.scratch);
+        let EncodedFunction {
+            code: code_bytes,
+            instr_to_byte_pc,
+        } = encode_function(&function.code);
+        let code_byte_len =
+            u32::try_from(code_bytes.len()).expect("function byte stream exceeds u32 range");
         let code = function
             .code
             .iter()
-            .map(|instr| {
+            .enumerate()
+            .map(|(idx, instr)| {
                 let property_ic_site = match instr.op {
                     Op::LoadProperty | Op::StoreProperty | Op::HasProperty => {
                         let site = *next_property_ic_site;
@@ -198,11 +250,20 @@ impl ExecutableFunction {
                     }
                     _ => NO_PROPERTY_IC_SITE,
                 };
+                let byte_pc = instr_to_byte_pc[idx];
+                let next_byte_pc = instr_to_byte_pc
+                    .get(idx + 1)
+                    .copied()
+                    .unwrap_or(code_byte_len);
+                let byte_len = u8::try_from(next_byte_pc - byte_pc)
+                    .expect("single instruction exceeds 255-byte v2 encoding");
                 ExecInstr::from_operands(
                     instr.op,
                     instr.operands.as_slice(),
                     side_operands,
                     property_ic_site,
+                    byte_pc,
+                    byte_len,
                 )
             })
             .collect::<Vec<_>>()
@@ -215,6 +276,9 @@ impl ExecutableFunction {
                 storage: binding.storage,
             })
             .collect();
+        let byte_spans =
+            translate_spans_to_byte_pcs(&function.spans, &instr_to_byte_pc, code_byte_len)
+                .into_boxed_slice();
         Self {
             id: function.id,
             param_count: function.param_count,
@@ -232,6 +296,8 @@ impl ExecutableFunction {
             is_module: function.is_module,
             module_url: function.module_url.clone().into_boxed_str(),
             code,
+            byte_spans,
+            code_byte_len,
         }
     }
 }
@@ -252,12 +318,19 @@ pub(crate) struct ExecInstr {
     op: Op,
     /// Operand count. Values greater than three read from the side table.
     operand_len: u8,
+    /// Byte length of this instruction in the canonical v2 wire encoding
+    /// (`opcode` + `operand_count` header + tagged operand bytes).
+    byte_len: u8,
     /// Inline operand slots for common fixed-width instructions.
     inline_operands: [Operand; INLINE_OPERANDS],
     /// Start index in [`ExecutableModule::side_operands`] for variadic ops.
     side_start: u32,
     /// Dense module-local property IC site id for named property ops.
     property_ic_site: u32,
+    /// Byte-offset PC of this instruction in the v2 byte stream. Kept
+    /// in lock-step with the v1 instruction-index PC so the dispatch
+    /// loop can flip to byte-offset semantics opcode-by-opcode.
+    byte_pc: u32,
 }
 
 impl ExecInstr {
@@ -266,6 +339,8 @@ impl ExecInstr {
         operands: &[Operand],
         side_operands: &mut Vec<Operand>,
         property_ic_site: u32,
+        byte_pc: u32,
+        byte_len: u8,
     ) -> Self {
         let operand_len =
             u8::try_from(operands.len()).expect("instruction operand count exceeds u8");
@@ -275,9 +350,11 @@ impl ExecInstr {
             Self {
                 op,
                 operand_len,
+                byte_len,
                 inline_operands,
                 side_start: 0,
                 property_ic_site,
+                byte_pc,
             }
         } else {
             let side_start = u32::try_from(side_operands.len())
@@ -286,9 +363,11 @@ impl ExecInstr {
             Self {
                 op,
                 operand_len,
+                byte_len,
                 inline_operands: [EMPTY_OPERAND; INLINE_OPERANDS],
                 side_start,
                 property_ic_site,
+                byte_pc,
             }
         }
     }
@@ -297,6 +376,19 @@ impl ExecInstr {
     #[must_use]
     pub(crate) const fn op(&self) -> Op {
         self.op
+    }
+
+    /// Byte length of this instruction in the v2 wire encoding.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn byte_len(&self) -> u32 {
+        self.byte_len as u32
+    }
+
+    /// Byte-offset PC of this instruction in the v2 byte stream.
+    #[must_use]
+    pub(crate) const fn byte_pc(&self) -> u32 {
+        self.byte_pc
     }
 
     /// Dense property IC site index for named property opcodes.

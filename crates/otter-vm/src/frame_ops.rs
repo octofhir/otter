@@ -105,16 +105,6 @@ impl Interpreter {
         Ok(())
     }
 
-    pub(crate) fn run_collect_arguments_reg(
-        &self,
-        frame: &mut Frame,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        write_register(frame, dst, Value::undefined())?;
-        frame.advance_pc(self.current_byte_len)?;
-        Ok(())
-    }
-
     pub(crate) fn run_enter_try_regs(
         &mut self,
         frame: &mut Frame,

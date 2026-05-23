@@ -2808,6 +2808,15 @@ impl Interpreter {
                     if let Some(()) = self.try_to_primitive_dispatch(stack, context, operands)? {
                         continue;
                     }
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_to_number_regs(frame, dst, src)?;
+                    continue;
                 }
                 // §7.1.1 `ToPrimitive` ladder. Each invocation of
                 // the dispatch loop either advances pc with a
@@ -2832,6 +2841,14 @@ impl Interpreter {
                     if self.drive_get_iterator(stack, context, operands)? {
                         continue;
                     }
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    self.run_get_iterator_regs(&mut *stack, top_idx, dst, src)?;
+                    continue;
                 }
                 // §7.4.5 `IteratorNext`. Built-in iterators step
                 // synchronously; user iterators push a call to
@@ -2843,6 +2860,18 @@ impl Interpreter {
                     if self.drive_iterator_next(stack, context, operands)? {
                         continue;
                     }
+                    let value_dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let done_dst = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let iter_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)?;
+                    continue;
                 }
                 // §10.1.8 [[Get]] — when the resolved property is an
                 // accessor descriptor at any depth in the prototype
@@ -2856,12 +2885,32 @@ impl Interpreter {
                     if self.drive_load_property(stack, context, operands)? {
                         continue;
                     }
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let obj_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let key = context
+                        .property_atom(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    self.run_load_property_reg(context, &mut *stack, top_idx, dst, obj_reg, key)?;
+                    continue;
                 }
                 Op::LoadElement => {
                     let operands = context.exec_operands(instr);
                     if self.drive_load_element(stack, context, operands)? {
                         continue;
                     }
+                    let (dst, recv_reg, idx_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg)?;
+                    continue;
                 }
                 // §10.1.9 [[Set]] — accessor setter dispatch follows
                 // the same pattern as `LoadProperty`. Non-writable
@@ -2872,18 +2921,56 @@ impl Interpreter {
                     if self.drive_store_property(stack, context, operands)? {
                         continue;
                     }
+                    let obj_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let key = context
+                        .property_atom(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    self.run_store_property_reg(context, &mut *stack, top_idx, obj_reg, key, src)?;
+                    continue;
                 }
                 Op::StoreElement => {
                     let operands = context.exec_operands(instr);
                     if self.drive_store_element(stack, context, operands)? {
                         continue;
                     }
+                    let recv_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let idx_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src_reg = context
+                        .exec_register(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    self.run_store_element_regs(
+                        context,
+                        &mut *stack,
+                        top_idx,
+                        recv_reg,
+                        idx_reg,
+                        src_reg,
+                    )?;
+                    continue;
                 }
                 Op::Instanceof => {
                     let operands = context.exec_operands(instr);
                     if self.drive_instanceof(stack, context, operands)? {
                         continue;
                     }
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_instanceof_legacy_regs(frame, dst, lhs, rhs)?;
+                    continue;
                 }
                 // §28.2.4.7 / .10 Proxy.[[HasProperty]] /
                 // [[Delete]] — invoke `has` / `deleteProperty`
@@ -2893,18 +2980,47 @@ impl Interpreter {
                     if self.drive_has_property_proxy(stack, context, operands)? {
                         continue;
                     }
+                    let (dst, lhs, rhs) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_has_property_regs(frame, context, dst, lhs, rhs)?;
+                    continue;
                 }
                 Op::DeleteProperty => {
                     let operands = context.exec_operands(instr);
                     if self.drive_delete_property_proxy(stack, context, operands)? {
                         continue;
                     }
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let obj_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let name_idx = context
+                        .exec_const_index(instr, 2)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let key = context
+                        .property_atom(name_idx)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let strict = context.function_is_strict(stack[top_idx].function_id);
+                    let frame = &mut stack[top_idx];
+                    self.run_delete_property_reg(frame, dst, obj_reg, key, strict)?;
+                    continue;
                 }
                 Op::DeleteElement => {
                     let operands = context.exec_operands(instr);
                     if self.drive_delete_element_proxy(stack, context, operands)? {
                         continue;
                     }
+                    let (dst, obj_reg, idx_reg) = context
+                        .exec_register3(instr)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let strict = context.function_is_strict(stack[top_idx].function_id);
+                    let frame = &mut stack[top_idx];
+                    self.run_delete_element_regs(frame, dst, obj_reg, idx_reg, strict)?;
+                    continue;
                 }
                 // §28.2.4.1 / .2 Proxy.[[GetPrototypeOf]] /
                 // [[SetPrototypeOf]] — invoke `getPrototypeOf` /
@@ -2915,12 +3031,30 @@ impl Interpreter {
                     if self.drive_get_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_get_prototype_regs(frame, dst, src)?;
+                    continue;
                 }
                 Op::SetPrototype => {
                     let operands = context.exec_operands(instr);
                     if self.drive_set_prototype_proxy(stack, context, operands)? {
                         continue;
                     }
+                    let obj_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let proto_reg = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let frame = &mut stack[top_idx];
+                    self.run_set_prototype_regs(context, frame, obj_reg, proto_reg)?;
+                    continue;
                 }
                 // §19.4.1 indirect eval — recursively dispatches a
                 // freshly compiled module on a sub-stack, then
@@ -3027,10 +3161,6 @@ impl Interpreter {
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
-                _ => {}
-            }
-
-            match op {
                 Op::Nop => {
                     stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;
@@ -3166,17 +3296,6 @@ impl Interpreter {
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
-                Op::ToNumber => {
-                    let dst = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_to_number_regs(frame, dst, src)?;
-                    continue;
-                }
                 Op::GetStringIndex => {
                     let (dst, recv, idx) = context
                         .exec_register3(instr)
@@ -3210,55 +3329,6 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let frame = &mut stack[top_idx];
                     self.run_load_new_target_reg(frame, dst)?;
-                    continue;
-                }
-                Op::DeleteProperty => {
-                    let dst = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let obj_reg = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let name_idx = context
-                        .exec_const_index(instr, 2)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let key = context
-                        .property_atom(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let strict = context.function_is_strict(stack[top_idx].function_id);
-                    let frame = &mut stack[top_idx];
-                    self.run_delete_property_reg(frame, dst, obj_reg, key, strict)?;
-                    continue;
-                }
-                Op::DeleteElement => {
-                    let (dst, obj_reg, idx_reg) = context
-                        .exec_register3(instr)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let strict = context.function_is_strict(stack[top_idx].function_id);
-                    let frame = &mut stack[top_idx];
-                    self.run_delete_element_regs(frame, dst, obj_reg, idx_reg, strict)?;
-                    continue;
-                }
-                Op::GetPrototype => {
-                    let dst = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_get_prototype_regs(frame, dst, src)?;
-                    continue;
-                }
-                Op::SetPrototype => {
-                    let obj_reg = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let proto_reg = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_set_prototype_regs(context, frame, obj_reg, proto_reg)?;
                     continue;
                 }
                 Op::NewObject => {
@@ -3322,98 +3392,6 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     self.run_collect_rest_reg(&mut *stack, top_idx, dst)?;
-                    continue;
-                }
-                Op::CollectArguments => {
-                    let dst = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_collect_arguments_reg(frame, dst)?;
-                    continue;
-                }
-                Op::LoadProperty => {
-                    let dst = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let obj_reg = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let name_idx = context
-                        .exec_const_index(instr, 2)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let key = context
-                        .property_atom(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    self.run_load_property_reg(context, &mut *stack, top_idx, dst, obj_reg, key)?;
-                    continue;
-                }
-                Op::StoreProperty => {
-                    let obj_reg = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let name_idx = context
-                        .exec_const_index(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 2)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let key = context
-                        .property_atom(name_idx)
-                        .ok_or(VmError::InvalidOperand)?;
-                    self.run_store_property_reg(context, &mut *stack, top_idx, obj_reg, key, src)?;
-                    continue;
-                }
-                Op::LoadElement => {
-                    let (dst, recv_reg, idx_reg) = context
-                        .exec_register3(instr)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_load_element_regs(context, frame, dst, recv_reg, idx_reg)?;
-                    continue;
-                }
-                Op::StoreElement => {
-                    let recv_reg = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let idx_reg = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let src_reg = context
-                        .exec_register(instr, 2)
-                        .ok_or(VmError::InvalidOperand)?;
-                    self.run_store_element_regs(
-                        context,
-                        &mut *stack,
-                        top_idx,
-                        recv_reg,
-                        idx_reg,
-                        src_reg,
-                    )?;
-                    continue;
-                }
-                Op::GetIterator => {
-                    let dst = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let src = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    self.run_get_iterator_regs(&mut *stack, top_idx, dst, src)?;
-                    continue;
-                }
-                Op::IteratorNext => {
-                    let value_dst = context
-                        .exec_register(instr, 0)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let done_dst = context
-                        .exec_register(instr, 1)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let iter_reg = context
-                        .exec_register(instr, 2)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)?;
                     continue;
                 }
                 Op::MakeFunction => {
@@ -3978,112 +3956,112 @@ impl Interpreter {
                     frame.advance_pc(self.current_byte_len)?;
                     continue;
                 }
-                Op::Instanceof => {
-                    let (dst, lhs, rhs) = context
-                        .exec_register3(instr)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_instanceof_legacy_regs(frame, dst, lhs, rhs)?;
-                    continue;
-                }
-                Op::HasProperty => {
-                    let (dst, lhs, rhs) = context
-                        .exec_register3(instr)
-                        .ok_or(VmError::InvalidOperand)?;
-                    let frame = &mut stack[top_idx];
-                    self.run_has_property_regs(frame, context, dst, lhs, rhs)?;
-                    continue;
-                }
-                _ => {}
-            }
-
-            let operands = context.exec_operands(instr);
-            let frame = &mut stack[top_idx];
-            match op {
                 Op::MakeClosure => {
+                    let operands = context.exec_operands(instr);
+                    let frame = &mut stack[top_idx];
                     self.run_make_closure_operands(context, frame, operands)?;
+                    continue;
                 }
                 Op::JsonCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_json_static_call_operands(Some(context), stack, operands)?;
                     continue;
                 }
                 Op::ArrayBufferCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_array_buffer_static_call_operands(stack, operands)?;
                     continue;
                 }
                 Op::TypedArrayCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_typed_array_static_call_operands(stack, operands)?;
                     continue;
                 }
                 Op::SharedArrayBufferCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_shared_array_buffer_static_call_operands(stack, operands)?;
                     continue;
                 }
                 Op::DateCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_date_static_call_operands(stack, context, operands)?;
                     continue;
                 }
                 Op::MathCall | Op::BigIntCall | Op::DataViewCall => {
+                    let operands = context.exec_operands(instr);
+                    let frame = &mut stack[top_idx];
                     self.run_static_call_operands(op, context, frame, operands)?;
+                    continue;
                 }
                 Op::ProxyCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_proxy_static_call_operands(stack, operands)?;
                     continue;
                 }
                 Op::IteratorCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_iterator_static_call_operands(stack, operands)?;
                     continue;
                 }
-                // §28.1 Reflect static surface — single dispatcher
-                // covering every spec method.
-                // <https://tc39.es/ecma262/#sec-reflect-object>
                 Op::ReflectCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_reflect_call_operands(context, stack, operands)?;
                     continue;
                 }
-                // §23.1.1 / §23.1.2 — typed Array static dispatch.
-                // No string indirection: each shape has its own
-                // opcode with `dst, argc, args...` operands.
                 Op::ArrayConstruct | Op::ArrayFrom | Op::ArrayOf => {
+                    let operands = context.exec_operands(instr);
                     self.run_array_static_operands(op, context, stack, operands)?;
                     continue;
                 }
                 Op::ObjectCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_object_static_call_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::QueueMicrotask => {
+                    let operands = context.exec_operands(instr);
+                    let frame = &mut stack[top_idx];
                     self.run_queue_microtask_operands(context, frame, operands)?;
+                    continue;
                 }
                 Op::PromiseNew => {
+                    let operands = context.exec_operands(instr);
                     self.run_promise_new_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::PromiseCall => {
+                    let operands = context.exec_operands(instr);
                     self.run_promise_call_operands(context, stack, operands)?;
                     continue;
                 }
                 Op::GlobalCall => {
+                    let operands = context.exec_operands(instr);
+                    let frame = &mut stack[top_idx];
                     self.run_static_call_operands(op, context, frame, operands)?;
+                    continue;
                 }
                 Op::ImportNamespaceDynamic => {
+                    let operands = context.exec_operands(instr);
                     self.run_import_namespace_dynamic_operands(context, stack, top_idx, operands)?;
                     continue;
                 }
                 Op::BindFunction => {
+                    let operands = context.exec_operands(instr);
                     self.drive_bind_function(stack, context, operands)?;
                     continue;
                 }
                 Op::SymbolCall => {
+                    let operands = context.exec_operands(instr);
+                    let frame = &mut stack[top_idx];
                     self.run_static_call_operands(op, context, frame, operands)?;
+                    continue;
                 }
                 Op::TemporalCall => {
+                    let operands = context.exec_operands(instr);
+                    let frame = &mut stack[top_idx];
                     self.run_static_call_operands(op, context, frame, operands)?;
+                    continue;
                 }
-                _ => unreachable!(
-                    "opcode {:?} should not reach the trailing static-call match",
-                    op
-                ),
             }
         }
     }

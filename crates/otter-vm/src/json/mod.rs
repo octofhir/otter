@@ -9,7 +9,8 @@
 //!
 //! # Contents
 //! - [`JSON_SPEC`] — static namespace spec used by bootstrap.
-//! - [`call`] — namespace-call dispatcher (used by `Op::JsonCall`).
+//! - [`call`] — internal dispatcher shared by the `JSON.parse` and
+//!   `JSON.stringify` native function entry points.
 //! - [`stringify`] / [`parse`] — public entry points.
 //! - [`stringify_with_options`] — programmable `space` + `replacer`.
 //! - [`JsonError`] — failure mode the dispatcher converts to
@@ -290,9 +291,19 @@ fn native_json_call(
         );
     };
     call_with_roots(method, args, ctx.heap_mut(), &mut external_visit).map_err(|err| {
-        NativeError::TypeError {
-            name: method.name(),
-            reason: err.to_string(),
+        // §25.5.1 step 5 — `JSON.parse` reports malformed input as
+        // `SyntaxError`. Every other failure (cycles, BigInt,
+        // depth overflow, bad arguments, OOM) flows through
+        // `TypeError` per spec.
+        match err {
+            JsonError::ParseFailed { message, position } => NativeError::SyntaxError {
+                name: method.name(),
+                reason: format!("JSON Parse error: {message} at byte {position}"),
+            },
+            other => NativeError::TypeError {
+                name: method.name(),
+                reason: other.to_string(),
+            },
         }
     })
 }

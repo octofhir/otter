@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 
 use crate::{
     ErrorKind, ExecutionContext, Frame, Interpreter, IntrinsicError, JsString, NativeError,
-    StackFrameSnapshot, Value, VmError, error_classes, json, math, object, read_register,
+    StackFrameSnapshot, Value, VmError, error_classes, math, object, read_register,
     symbol_dispatch, temporal, write_register,
 };
 
@@ -409,49 +409,6 @@ pub(crate) fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Val
             crate::JsString::from_str("", heap).expect("empty string allocates")
         }),
     )
-}
-
-pub(crate) fn json_to_vm_error(err: json::JsonError) -> VmError {
-    // Diagnostic strings stay short and spec-faithful (no cycle
-    // path-walk) to match the identity-pointer visit set. Parse
-    // errors additionally carry the byte position so users can
-    // locate the offending token.
-    match err {
-        json::JsonError::UnknownMember(name) => VmError::UnknownIntrinsic {
-            name: format!("JSON.{name}"),
-        },
-        json::JsonError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => VmError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        json::JsonError::Cyclic => VmError::JsonError {
-            code: "JSON_CYCLIC",
-            message: "JSON.stringify cannot serialize cyclic structures.".to_string(),
-        },
-        json::JsonError::BigInt => VmError::JsonError {
-            code: "JSON_BIGINT",
-            message: "JSON.stringify cannot serialize BigInt values.".to_string(),
-        },
-        json::JsonError::TooDeep { limit } => VmError::JsonError {
-            code: "JSON_DEPTH",
-            message: format!("JSON nesting exceeded {limit} levels."),
-        },
-        json::JsonError::ParseFailed { message, position } => VmError::JsonError {
-            code: "JSON_PARSE",
-            message: format!("JSON Parse error: {message} at byte {position}"),
-        },
-        json::JsonError::BadArgument {
-            name,
-            index,
-            reason,
-        } => VmError::JsonError {
-            code: "JSON_BAD_ARG",
-            message: format!("JSON.{name} argument {index} {reason}"),
-        },
-    }
 }
 
 pub(crate) fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {

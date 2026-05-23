@@ -84,14 +84,6 @@ pub enum Op {
     /// load time; subsequent loads of the same constant share the
     /// compiled engine via the constant pool slot.
     LoadRegExp,
-    /// `r<dst> = JSON.<name>(args...)`. Operands:
-    /// `dst, name_const, argc, args...`.
-    ///
-    /// Variadic, same shape as [`Op::MathCall`]. The compiler
-    /// intercepts the literal `JSON.<name>(...)` call shape so the
-    /// runtime does not need a real global object yet. Unknown
-    /// `<name>` surfaces as `UnknownIntrinsic`.
-    JsonCall,
     /// Enqueue a microtask: `queueMicrotask(callee, args...)`.
     /// Operands: `callee_reg, argc, args...`. There is no
     /// destination register — the global returns `undefined`
@@ -116,7 +108,7 @@ pub enum Op {
     PromiseNew,
     /// `r<dst> = Promise.<name>(args...)`. Operands:
     /// `dst, name_const, argc, args...`. Variadic, same shape as
-    /// [`Op::JsonCall`]. Resolves `<name>` against the Promise
+    /// [`Op::MathCall`]. Resolves `<name>` against the Promise
     /// statics dispatcher; unknown names surface as
     /// `UnknownIntrinsic`.
     PromiseCall,
@@ -846,7 +838,7 @@ pub enum Op {
     /// `Register(dst), ConstIndex(name), ConstIndex(argc),
     /// Register(arg0), …`.
     ///
-    /// Variadic, same shape as [`Self::MathCall`] / [`Self::JsonCall`].
+    /// Variadic, same shape as [`Self::MathCall`].
     /// Routes Object-namespace static calls (`defineProperty`,
     /// `getOwnPropertyDescriptor`, `freeze`, `seal`,
     /// `preventExtensions`, the `is*` predicates) through one
@@ -994,7 +986,6 @@ impl Op {
             Op::LoadInt32 => "LOAD_INT32",
             Op::LoadBigInt => "LOAD_BIGINT",
             Op::LoadRegExp => "LOAD_REGEXP",
-            Op::JsonCall => "JSON_CALL",
             Op::QueueMicrotask => "QUEUE_MICROTASK",
             Op::PromiseNew => "PROMISE_NEW",
             Op::PromiseCall => "PROMISE_CALL",
@@ -1232,7 +1223,6 @@ impl Op {
             Op::StoreElement => 4,
             Op::CallMethodValue => 4, // dst, recv, name_const, argc
             Op::MathCall => 3,        // dst, name_const, argc — args follow
-            Op::JsonCall => 3,        // dst, name_const, argc — args follow
             Op::SymbolCall => 3,      // dst, name_const, argc — args follow
             Op::ObjectCall => 3,      // dst, name_const, argc — args follow
             // dst, argc — args follow as `Register(arg0)…`.
@@ -1329,7 +1319,6 @@ impl Op {
             // offset these slots — doing so silently rebinds the
             // call to a different builtin method after merge.
             Op::MathCall
-            | Op::JsonCall
             | Op::PromiseCall
             | Op::SymbolCall
             | Op::ObjectCall

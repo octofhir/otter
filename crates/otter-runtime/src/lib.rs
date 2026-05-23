@@ -3950,17 +3950,21 @@ mod tests {
     }
 
     #[test]
-    fn json_cyclic_surfaces_jsc_style_diagnostic() {
+    fn json_cyclic_throws_type_error() {
         let otter = Otter::new();
         let err = otter
             .blocking_run_typescript("const a = {}; a.self = a; JSON.stringify(a);")
             .unwrap_err();
         match err {
             OtterError::Runtime { diagnostic } => {
-                assert_eq!(diagnostic.code, "JSON_CYCLIC");
-                assert_eq!(
+                assert_eq!(diagnostic.code, "UNCAUGHT");
+                assert!(
+                    diagnostic.message.contains("TypeError")
+                        && diagnostic
+                            .message
+                            .contains("JSON.stringify cannot serialize cyclic structures."),
+                    "unexpected diagnostic: {}",
                     diagnostic.message,
-                    "JSON.stringify cannot serialize cyclic structures."
                 );
             }
             other => panic!("expected Runtime, got {other:?}"),
@@ -3968,37 +3972,42 @@ mod tests {
     }
 
     #[test]
-    fn json_parse_error_carries_byte_position() {
+    fn json_parse_error_throws_syntax_error_with_byte_position() {
         let otter = Otter::new();
         let err = otter
             .blocking_run_typescript("JSON.parse(\"[1, 2,]\");")
             .unwrap_err();
         match err {
             OtterError::Runtime { diagnostic } => {
-                assert_eq!(diagnostic.code, "JSON_PARSE");
+                assert_eq!(diagnostic.code, "UNCAUGHT");
                 assert!(
-                    diagnostic
-                        .message
-                        .starts_with("JSON Parse error: trailing comma")
+                    diagnostic.message.contains("SyntaxError")
+                        && diagnostic.message.contains("trailing comma")
+                        && diagnostic.message.contains("at byte 6"),
+                    "unexpected diagnostic: {}",
+                    diagnostic.message,
                 );
-                assert!(diagnostic.message.contains("at byte 6"));
             }
             other => panic!("expected Runtime, got {other:?}"),
         }
     }
 
     #[test]
-    fn json_bigint_emits_jsc_style_message() {
+    fn json_bigint_throws_type_error() {
         let otter = Otter::new();
         let err = otter
             .blocking_run_typescript("JSON.stringify({ n: 1n });")
             .unwrap_err();
         match err {
             OtterError::Runtime { diagnostic } => {
-                assert_eq!(diagnostic.code, "JSON_BIGINT");
-                assert_eq!(
+                assert_eq!(diagnostic.code, "UNCAUGHT");
+                assert!(
+                    diagnostic.message.contains("TypeError")
+                        && diagnostic
+                            .message
+                            .contains("JSON.stringify cannot serialize BigInt values."),
+                    "unexpected diagnostic: {}",
                     diagnostic.message,
-                    "JSON.stringify cannot serialize BigInt values."
                 );
             }
             other => panic!("expected Runtime, got {other:?}"),

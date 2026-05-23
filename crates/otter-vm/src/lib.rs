@@ -144,7 +144,7 @@ use arithmetic_dispatch::{
     bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
 };
 pub(crate) use error_ops::{
-    intrinsic_to_vm_error, json_to_vm_error, math_to_vm_error, native_to_vm_error,
+    intrinsic_to_vm_error, math_to_vm_error, native_to_vm_error,
     render_thrown_value, snapshot_frames, symbol_to_vm_error, temporal_to_vm_error,
     vm_err_to_value,
 };
@@ -3962,11 +3962,6 @@ impl Interpreter {
                     self.run_make_closure_operands(context, frame, operands)?;
                     continue;
                 }
-                Op::JsonCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_json_static_call_operands(Some(context), stack, operands)?;
-                    continue;
-                }
                 Op::ArrayBufferCall => {
                     let operands = context.exec_operands(instr);
                     self.run_array_buffer_static_call_operands(stack, operands)?;
@@ -6241,47 +6236,6 @@ mod tests {
             "host-rooted object and array helpers should allocate in young space"
         );
         assert!(object::get(host, interp.gc_heap(), "items").is_some_and(|v| v.is_array()));
-    }
-
-    #[test]
-    fn json_parse_uses_stack_rooted_container_allocation() {
-        let module = module_with(Vec::new(), 3);
-        let mut interp = Interpreter::new();
-        let input = Value::string(
-            JsString::from_str("{\"items\":[1,{\"nested\":2}]}", interp.gc_heap_mut()).unwrap(),
-        );
-        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
-        let mut frame = Frame::for_function(&module.functions[0]);
-        frame.registers[0] = input;
-        stack.push(frame);
-        let operands = vec![
-            Operand::Register(1),
-            Operand::ConstIndex(0),
-            Operand::ConstIndex(1),
-            Operand::Register(0),
-        ];
-        let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-
-        interp
-            .run_json_static_call_operands(None, &mut stack, operands.as_slice())
-            .expect("JSON.parse");
-
-        let after = interp.gc_heap_mut().stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "JSON.parse should allocate result containers through stack roots"
-        );
-        let Some(obj) = (stack[0].registers[1]).as_object() else {
-            panic!("JSON.parse should return an object");
-        };
-        let Some(items) = object::get(obj, interp.gc_heap(), "items").and_then(|v| v.as_array())
-        else {
-            panic!("parsed object should contain items array");
-        };
-        assert_eq!(
-            array::get(items, interp.gc_heap(), 0),
-            Value::number(NumberValue::from_i32(1))
-        );
     }
 
     #[test]

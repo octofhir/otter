@@ -74,7 +74,7 @@ macro_rules! method_id_enum {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::JsonCall`](crate::Op::JsonCall).
+    /// Methods dispatched by the `JSON` namespace native functions.
     JsonMethod {
         Parse = 0 => "parse",
         Stringify = 1 => "stringify",

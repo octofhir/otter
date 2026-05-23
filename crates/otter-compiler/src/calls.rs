@@ -299,23 +299,10 @@ pub(crate) fn compile_method_call(
                 return Ok(dst);
             }
         }
-        // `JSON.<name>(args)` — typed dispatch via [`JsonMethod`].
-        if let Expression::Identifier(id) = &member.object
-            && id.name.as_str() == "JSON"
-        {
-            let method_name = member.property.name.as_str();
-            if let Some(method_id) = otter_bytecode::method_id::JsonMethod::from_str(method_name) {
-                let arg_regs = compile_call_args(cx, &call.arguments, span)?;
-                let dst = cx.alloc_scratch();
-                let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-                operands.push(Operand::Register(dst));
-                operands.push(Operand::ConstIndex(method_id.as_u32()));
-                operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-                operands.extend(arg_regs.into_iter().map(Operand::Register));
-                cx.emit(Op::JsonCall, operands, span);
-                return Ok(dst);
-            };
-        }
+        // `JSON.<name>(args)` flows through the real `NativeFunction`
+        // installed by the `JSON` namespace bootstrap, so the dedicated
+        // `Op::JsonCall` shortcut is no longer emitted. User shadowing
+        // of `JSON.parse` / `JSON.stringify` is therefore observable.
         // `Promise.<name>(args)` previously routed through
         // `Op::PromiseCall` for the typed dispatcher. With the
         // bootstrap installer placing real statics on the

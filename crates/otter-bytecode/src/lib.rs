@@ -848,20 +848,6 @@ pub enum Op {
     /// # See also
     /// - <https://tc39.es/ecma262/#sec-dataview-constructor>
     DataViewCall,
-    /// `r<dst> = new <T>(args...)` / `<T>.<method>(args...)` for one
-    /// of the eleven concrete TypedArray classes. Operands:
-    /// `Register(dst), ConstIndex(kind), ConstIndex(name),
-    /// ConstIndex(argc), Register(arg0), …`.
-    ///
-    /// `kind` is a string constant naming the concrete class
-    /// (`"Uint8Array"`, `"Int32Array"`, …). Empty `name` selects the
-    /// constructor (§23.2.5); otherwise the runtime dispatches
-    /// `from` / `of` against
-    /// [`crate::binary::dispatch::typed_array_call`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-typedarray-constructors>
-    TypedArrayCall,
     /// `yield r<src>` inside a generator body — pause the running
     /// frame and surface `r<src>` to the caller's `.next()` /
     /// iteration step. Operands: `Register(dst), Register(src)`.
@@ -1040,7 +1026,6 @@ impl Op {
             Op::NewFunction => "NEW_FUNCTION",
             Op::ArrayBufferCall => "ARRAY_BUFFER_CALL",
             Op::DataViewCall => "DATA_VIEW_CALL",
-            Op::TypedArrayCall => "TYPED_ARRAY_CALL",
             Op::Yield => "YIELD",
             Op::SharedArrayBufferCall => "SHARED_ARRAY_BUFFER_CALL",
         }
@@ -1164,7 +1149,6 @@ impl Op {
             Op::GlobalCall => 3,      // dst, name_const, argc — args follow
             Op::ArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::DataViewCall => 3,    // dst, name_const, argc — args follow
-            Op::TypedArrayCall => 4,  // dst, kind_const, name_const, argc — args follow
             Op::Yield => 2,           // dst, src
             Op::SharedArrayBufferCall => 3, // dst, name_const, argc — args follow
             Op::NewFunction => 2,     // dst, argc — args follow
@@ -1254,9 +1238,6 @@ impl Op {
             | Op::ArrayBufferCall
             | Op::DataViewCall
             | Op::SharedArrayBufferCall => false,
-            // `dst, kind_id, method_id, argc` — both kind_id and
-            // method_id are raw enum values, not pool refs.
-            Op::TypedArrayCall => false,
             // `dst, class_id, method_id, argc` — both raw.
             Op::TemporalCall => false,
             // No constant-pool refs in any other operand position.

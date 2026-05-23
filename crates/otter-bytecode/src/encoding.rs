@@ -557,10 +557,9 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::ObjectCall, 0x76),
     (Op::ArrayBufferCall, 0x77),
     (Op::DataViewCall, 0x78),
-    (Op::TypedArrayCall, 0x79),
-    (Op::Yield, 0x7A),
-    (Op::SharedArrayBufferCall, 0x7B),
-    (Op::ToPrimitive, 0x7C),
+    (Op::Yield, 0x79),
+    (Op::SharedArrayBufferCall, 0x7A),
+    (Op::ToPrimitive, 0x7B),
 ];
 
 #[cfg(test)]
@@ -924,7 +923,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 125;
+        const EXPECTED_OPCODE_COUNT: usize = 124;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

@@ -312,7 +312,7 @@ method_id_enum! {
 }
 
 method_id_enum! {
-    /// Methods reached through [`Op::TypedArrayCall`](crate::Op::TypedArrayCall).
+    /// Methods dispatched by the typed-array namespace native functions.
     /// The leading operand carries the kind discriminant; this enum
     /// covers the trailing static surface (`Construct` / `from` /
     /// `of`).

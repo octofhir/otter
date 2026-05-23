@@ -109,7 +109,6 @@ impl Interpreter {
                 let result = binary::dispatch::data_view_call(method, &args, &mut self.gc_heap)?;
                 finish_static_call(frame, dst, result, self.current_byte_len)
             }
-            Op::TypedArrayCall => unreachable!("TypedArrayCall requires stack-rooted dispatch"),
             Op::SharedArrayBufferCall => {
                 unreachable!("SharedArrayBufferCall requires stack-rooted dispatch")
             }
@@ -159,42 +158,6 @@ impl Interpreter {
             }
         };
         let result = binary::dispatch::array_buffer_call_with_roots(
-            method,
-            &args,
-            &mut self.gc_heap,
-            &mut external_visit,
-        )?;
-        finish_static_call(&mut stack[top_idx], dst, result, self.current_byte_len)
-    }
-
-    pub(crate) fn run_typed_array_static_call_operands(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        operands: &[Operand],
-    ) -> Result<(), VmError> {
-        let top_idx = stack.len() - 1;
-        let (dst, kind_idx, method_idx, args) = {
-            let frame = &stack[top_idx];
-            let dst = register_operand(operands.first())?;
-            let kind_idx = const_operand(operands.get(1))?;
-            let method_idx = const_operand(operands.get(2))?;
-            let args = collect_call_args(frame, operands, 3, 4)?;
-            (dst, kind_idx, method_idx, args)
-        };
-        let kind = binary::TypedArrayKind::from_u32(kind_idx).ok_or(VmError::InvalidOperand)?;
-        let method =
-            method_id::TypedArrayMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            for arg in &args {
-                arg.trace_value_slots(visitor);
-            }
-        };
-        let result = binary::dispatch::typed_array_call_with_roots(
-            kind,
             method,
             &args,
             &mut self.gc_heap,

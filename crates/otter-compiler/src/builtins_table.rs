@@ -15,8 +15,7 @@
 /// imported alias matching `name`. Returns the binding info
 /// Whether `name` is one of the eleven canonical TypedArray
 /// constructor names per ECMA-262 Table 71. Used by the compiler to
-/// intercept `new <T>(...)` / `<T>.from(...)` / `<T>.of(...)` and
-/// route through `Op::TypedArrayCall`.
+/// inline `<T>.BYTES_PER_ELEMENT` reads.
 pub(crate) fn is_typed_array_name(name: &str) -> bool {
     matches!(
         name,

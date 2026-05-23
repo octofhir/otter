@@ -3966,11 +3966,6 @@ impl Interpreter {
                     self.run_array_buffer_static_call_operands(stack, operands)?;
                     continue;
                 }
-                Op::TypedArrayCall => {
-                    let operands = context.exec_operands(instr);
-                    self.run_typed_array_static_call_operands(stack, operands)?;
-                    continue;
-                }
                 Op::SharedArrayBufferCall => {
                     let operands = context.exec_operands(instr);
                     self.run_shared_array_buffer_static_call_operands(stack, operands)?;

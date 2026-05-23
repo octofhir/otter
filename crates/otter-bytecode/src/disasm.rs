@@ -273,7 +273,6 @@ mod tests {
             Op::ObjectCall,
             Op::ArrayBufferCall,
             Op::DataViewCall,
-            Op::TypedArrayCall,
             Op::Yield,
             Op::SharedArrayBufferCall,
             Op::ToPrimitive,
@@ -384,8 +383,7 @@ mod tests {
             | Op::New
             | Op::MakeClass
             | Op::StoreProperty
-            | Op::StoreElement
-            | Op::TypedArrayCall => vec![reg(0), reg(1), reg(2), reg(3)],
+            | Op::StoreElement => vec![reg(0), reg(1), reg(2), reg(3)],
             Op::CallMethodValue
             | Op::CallWithThis
             | Op::BindFunction
@@ -549,9 +547,8 @@ mod tests {
 000117 OBJECT_CALL
 000118 ARRAY_BUFFER_CALL
 000119 DATA_VIEW_CALL
-000120 TYPED_ARRAY_CALL
-000121 YIELD
-000122 SHARED_ARRAY_BUFFER_CALL
-000123 TO_PRIMITIVE
+000120 YIELD
+000121 SHARED_ARRAY_BUFFER_CALL
+000122 TO_PRIMITIVE
 ";
 }

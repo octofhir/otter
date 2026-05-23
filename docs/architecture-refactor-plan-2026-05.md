@@ -579,7 +579,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Effort: M/L.
 - Depends on: 2.1.
 
-### Task 2.5 — Freeze Native Call ABI
+### Task 2.5 — Freeze Native Call ABI — DONE 2026-05-23
 
 - Goal: make macros and future JIT generate into one call convention.
 - Touches: `native_function.rs`, `NativeCtx`, macro-generated specs, docs.
@@ -590,6 +590,26 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: Medium.
 - Effort: M.
 - Depends on: 1.1.
+- **Status:** Shipped. Authoritative ABI spec at
+  [`docs/native-call-abi.md`](native-call-abi.md): entry signature
+  (`NativeFastFn`), receiver/`new.target` accessors, argument and
+  return protocol, throw-routing table for every `NativeError`
+  variant, allocation/rooting rules naming every sanctioned
+  `NativeCtx` helper, forbidden patterns, versioning policy. ABI is
+  v1; non-`#[non_exhaustive]` variant additions require version
+  bump + coordinated migration. `NativeFastFn`, `NativeError`, and
+  `NativeCtx` carry inline pointers to the spec doc. Existing
+  compile-fail fixtures under
+  [`crates/otter-vm/tests/compile_fail/`](../crates/otter-vm/tests/compile_fail/)
+  cover the forbidden patterns (raw `Gc<T>` / `Local` / `Value` /
+  `Frame` in `Send + 'static`, `NativeCtx` across `.await`,
+  cross-isolate handles, branded-session leaks, raw write barriers,
+  raw `RawGc` import). `NativeCtx::heap_mut` remains `pub` as a
+  documented escape hatch — ~150 in-tree callers still depend on
+  it; the aspirational `native_ctx_heap_mut_rejected` fixture is
+  removed in this commit (kept as a follow-up under "migrate raw
+  `heap_mut` to high-level helpers"). 539/539 `otter-vm --lib`,
+  123/123 `otter-runtime --lib`, all compile-fail tests green.
 
 ## Phase 3 — Bootstrap & IntrinsicRegistry
 

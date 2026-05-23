@@ -113,11 +113,6 @@ pub mod symbol_dispatch;
 pub mod symbol_prototype;
 pub mod temporal;
 pub mod timers;
-// New 8-byte tagged `Value` foundation (Phase 1.1).
-// Lives alongside the legacy enum during cut-over; once every call site
-// migrates to the accessor surface in [`value::Value`], the enum below
-// disappears and `pub use value::Value as Value` becomes the canonical
-// export. See `docs/architecture-refactor-plan-2026-05.md` §Phase 1.
 pub mod bound_function;
 pub mod class_constructor;
 pub mod iterator_state;
@@ -665,9 +660,8 @@ impl Interpreter {
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
         };
         // Cache typed handles for the well-known constructors and
-        // prototypes that bootstrap just installed (Phase 3.2).
-        // Subsequent runtime lookups go through the slots and avoid
-        // the global → ctor → prototype string walk.
+        // prototypes. Subsequent runtime lookups read the slots and
+        // skip the global → ctor → prototype string walk.
         interp
             .realm_intrinsics
             .populate(&interp.gc_heap, global_this);

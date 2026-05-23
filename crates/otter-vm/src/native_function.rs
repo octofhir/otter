@@ -107,9 +107,9 @@ impl NativeFunctionMetadata {
 
 /// Function-pointer signature for static builtin callables.
 ///
-/// This is the production fast path for spec-declared builtins and
-/// future macro-generated surfaces: invoking it requires no closure
-/// allocation, capture clone, or dynamic dispatch.
+/// Production fast path for spec-declared builtins and macro-generated
+/// surfaces: no closure allocation, no capture clone, no dynamic
+/// dispatch.
 pub type NativeFastFn = for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>;
 
 /// VM-owned intrinsic callable.

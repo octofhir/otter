@@ -145,11 +145,6 @@ impl NativeCallInfo {
 /// `NativeCtx<'rt>` is `!Send + !Sync` and never crosses `.await`.
 /// The lifetime `'rt` is the mutator turn — the same constraint
 /// that applies to [`RuntimeCx<'rt>`].
-///
-/// # Migration
-///
-/// Native bindings under `crates/otter-modules` and active product
-/// crates use this instead of ad-hoc runtime handles.
 pub struct NativeCtx<'rt> {
     pub(crate) cx: RuntimeCx<'rt>,
     call_info: NativeCallInfo,

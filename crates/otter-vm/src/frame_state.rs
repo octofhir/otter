@@ -28,10 +28,9 @@ use crate::{
     cold_frame::ColdFrameIdx,
 };
 
-// JIT-readiness target (Task 1.3): hot frame fits in two 64 B cache
-// lines. The cold half of the frame's data (try handlers, async
-// parking, pending ToPrimitive/bind/iterator ladders, rest/incoming
-// args, …) lives in [`crate::cold_frame::ColdFramePool`] and is
+// Hot frame fits in two 64 B cache lines. Cold protocol state (try
+// handlers, async parking, pending ToPrimitive/bind/iterator ladders,
+// rest/incoming args, …) lives in `cold_frame::ColdFramePool` and is
 // reached lazily through `frame.cold`.
 const _: () = assert!(
     std::mem::size_of::<Frame>() <= 128,

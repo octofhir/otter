@@ -37,6 +37,7 @@ pub mod payload;
 pub mod plain_date;
 pub mod plain_date_time;
 pub mod plain_time;
+pub mod plain_year_month;
 
 pub use dispatch::{TemporalError, call as call_static, load_static};
 pub use payload::{
@@ -68,6 +69,7 @@ pub fn lookup_prototype(
         TemporalKind::PlainDate => plain_date::lookup(name),
         TemporalKind::PlainTime => plain_time::lookup(name),
         TemporalKind::PlainDateTime => plain_date_time::lookup(name),
+        TemporalKind::PlainYearMonth => plain_year_month::lookup(name),
     }
 }
 
@@ -83,5 +85,6 @@ pub fn load_property(temporal: JsTemporal, gc_heap: &mut otter_gc::GcHeap, name:
         TemporalKind::PlainDate => plain_date::load_property(temporal, gc_heap, name),
         TemporalKind::PlainTime => plain_time::load_property(temporal, gc_heap, name),
         TemporalKind::PlainDateTime => plain_date_time::load_property(temporal, gc_heap, name),
+        TemporalKind::PlainYearMonth => plain_year_month::load_property(temporal, gc_heap, name),
     }
 }

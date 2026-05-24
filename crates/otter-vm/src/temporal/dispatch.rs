@@ -24,7 +24,9 @@
 
 use crate::Value;
 use crate::temporal::now;
-use crate::temporal::{duration, instant, plain_date, plain_date_time, plain_time};
+use crate::temporal::{
+    duration, instant, plain_date, plain_date_time, plain_time, plain_year_month,
+};
 
 /// Failure modes returned by [`call`] / [`load_static`].
 #[derive(Debug, Clone, thiserror::Error)]
@@ -125,6 +127,7 @@ pub fn call(
         C::PlainDate => plain_date::dispatch_static(gc_heap, method, args),
         C::PlainTime => plain_time::dispatch_static(gc_heap, method, args),
         C::PlainDateTime => plain_date_time::dispatch_static(gc_heap, method, args),
+        C::PlainYearMonth => plain_year_month::dispatch_static(gc_heap, method, args),
     }
 }
 

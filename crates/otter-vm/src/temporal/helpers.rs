@@ -201,6 +201,24 @@ pub fn require_plain_time(
     }
 }
 
+/// Extract a [`temporal_rs::PlainYearMonth`] from the receiver.
+pub fn require_plain_year_month(
+    args: &IntrinsicArgs<'_>,
+) -> Result<temporal_rs::PlainYearMonth, IntrinsicError> {
+    if let Some(t) = args.receiver.as_temporal(args.gc_heap) {
+        match t.payload_clone(args.gc_heap) {
+            TemporalPayload::PlainYearMonth(v) => Ok(v),
+            _ => Err(IntrinsicError::BadReceiver {
+                expected: "Temporal.PlainYearMonth",
+            }),
+        }
+    } else {
+        Err(IntrinsicError::BadReceiver {
+            expected: "Temporal.PlainYearMonth",
+        })
+    }
+}
+
 /// Extract a [`temporal_rs::PlainDateTime`] from the receiver.
 pub fn require_plain_date_time(
     args: &IntrinsicArgs<'_>,
@@ -634,6 +652,33 @@ pub fn parse_calendar_fields(
     }
     if let Some(v) = read_partial_integer(obj, "day", heap)? {
         f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    Ok(f)
+}
+
+/// Parse a `{ year, month, monthCode }` partial-record into
+/// [`temporal_rs::fields::YearMonthCalendarFields`]. ISO foundation
+/// slice ignores `era` / `eraYear` (non-ISO calendars filed as a
+/// follow-up).
+pub fn parse_year_month_fields(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::fields::YearMonthCalendarFields, IntrinsicError> {
+    let mut f = temporal_rs::fields::YearMonthCalendarFields::default();
+    if let Some(v) = read_partial_integer(obj, "year", heap)? {
+        f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
+    if let Some(v) = read_partial_integer(obj, "month", heap)? {
+        f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(s) = read_string_field(obj, "monthCode", heap) {
+        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index: 0,
+                reason: "invalid monthCode",
+            }
+        })?;
+        f.month_code = Some(code);
     }
     Ok(f)
 }

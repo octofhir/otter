@@ -29,7 +29,9 @@ use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, Name
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
 use crate::temporal::dispatch::{TemporalError, call as call_static};
-use crate::temporal::{duration, instant, plain_date, plain_date_time, plain_time};
+use crate::temporal::{
+    duration, instant, plain_date, plain_date_time, plain_time, plain_year_month,
+};
 use crate::{NativeCtx, NativeError, Value};
 
 // ---------------------------------------------------------------
@@ -108,6 +110,18 @@ otter_macros::couch! {
     install_on = temporal_host,
 }
 
+otter_macros::couch! {
+    name = "PlainYearMonth",
+    feature = CORE,
+    intrinsic = PlainYearMonthIntrinsic,
+    constructor = (length = 2, call = plain_year_month::construct),
+    statics = {
+        "from"    / 1 => native_plain_year_month_from,
+        "compare" / 2 => native_plain_year_month_compare,
+    },
+    install_on = temporal_host,
+}
+
 // ---------------------------------------------------------------
 // `Temporal` namespace + `Temporal.Now` sub-namespace.
 // ---------------------------------------------------------------
@@ -135,6 +149,7 @@ impl BuiltinIntrinsic for Intrinsic {
         PlainDateIntrinsic::install(heap, global)?;
         PlainTimeIntrinsic::install(heap, global)?;
         PlainDateTimeIntrinsic::install(heap, global)?;
+        PlainYearMonthIntrinsic::install(heap, global)?;
 
         // `Temporal.Now` is a namespace object per spec, not a
         // constructor — keep it as a plain object with method specs.
@@ -270,6 +285,8 @@ temporal_native!(native_plain_time_from, PlainTime, From);
 temporal_native!(native_plain_time_compare, PlainTime, Compare);
 temporal_native!(native_plain_date_time_from, PlainDateTime, From);
 temporal_native!(native_plain_date_time_compare, PlainDateTime, Compare);
+temporal_native!(native_plain_year_month_from, PlainYearMonth, From);
+temporal_native!(native_plain_year_month_compare, PlainYearMonth, Compare);
 temporal_native!(native_now_instant, Now, NowInstant);
 temporal_native!(native_now_plain_date_time_iso, Now, NowPlainDateTimeISO);
 temporal_native!(native_now_plain_date_iso, Now, NowPlainDateISO);

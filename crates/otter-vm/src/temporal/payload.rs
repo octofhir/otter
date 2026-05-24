@@ -39,6 +39,8 @@ pub enum TemporalPayload {
     PlainTime(temporal_rs::PlainTime),
     /// `Temporal.PlainDateTime` — combined wall-clock date + time.
     PlainDateTime(temporal_rs::PlainDateTime),
+    /// `Temporal.PlainYearMonth` — `YYYY-MM` calendar year+month.
+    PlainYearMonth(temporal_rs::PlainYearMonth),
 }
 
 impl TemporalPayload {
@@ -51,6 +53,7 @@ impl TemporalPayload {
             TemporalPayload::PlainDate(_) => TemporalKind::PlainDate,
             TemporalPayload::PlainTime(_) => TemporalKind::PlainTime,
             TemporalPayload::PlainDateTime(_) => TemporalKind::PlainDateTime,
+            TemporalPayload::PlainYearMonth(_) => TemporalKind::PlainYearMonth,
         }
     }
 }
@@ -71,6 +74,8 @@ pub enum TemporalKind {
     PlainTime,
     /// `Temporal.PlainDateTime` instance.
     PlainDateTime,
+    /// `Temporal.PlainYearMonth` instance.
+    PlainYearMonth,
 }
 
 impl TemporalKind {
@@ -83,6 +88,7 @@ impl TemporalKind {
             TemporalKind::PlainDate => "PlainDate",
             TemporalKind::PlainTime => "PlainTime",
             TemporalKind::PlainDateTime => "PlainDateTime",
+            TemporalKind::PlainYearMonth => "PlainYearMonth",
         }
     }
 
@@ -95,6 +101,7 @@ impl TemporalKind {
             "PlainDate" => TemporalKind::PlainDate,
             "PlainTime" => TemporalKind::PlainTime,
             "PlainDateTime" => TemporalKind::PlainDateTime,
+            "PlainYearMonth" => TemporalKind::PlainYearMonth,
             _ => return None,
         })
     }

@@ -357,6 +357,7 @@ method_id_enum! {
         PlainTime = 3 => "PlainTime",
         PlainDateTime = 4 => "PlainDateTime",
         Now = 5 => "Now",
+        PlainYearMonth = 6 => "PlainYearMonth",
     }
 }
 

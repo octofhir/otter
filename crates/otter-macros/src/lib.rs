@@ -158,6 +158,51 @@ use syn::{
     bracketed, parenthesized, parse_macro_input,
 };
 
+mod holt;
+
+/// Generate a `NamespaceSpec` + `BuiltinIntrinsic` adapter for a
+/// non-constructible namespace intrinsic (`Math`, `JSON`, `Reflect`,
+/// `Atomics`, `Console`, `Symbol` namespace surface, `Temporal`
+/// top-level, `Intl`).
+///
+/// See the crate-level docs for the naming theme and full surface,
+/// and [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+/// for the design rationale.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// holt! {
+///     name = "Math",
+///     feature = CORE,
+///     methods = {
+///         "abs"  / 1 => native_abs,
+///         "ceil" / 1 => native_ceil,
+///         "pow"  / 2 => native_pow,
+///     },
+/// }
+/// ```
+///
+/// `feature` is the bare variant name from
+/// `::otter_vm::BootstrapFeatures`. Optional fields `spec =
+/// MATH_SPEC,` and `intrinsic = MathIntrinsic,` override the
+/// derived ident names (default: `<NAME>_SPEC` and `Intrinsic`).
+///
+/// # Generated symbols
+///
+/// - `pub static <SPEC>: ::otter_vm::NamespaceSpec`
+/// - `pub struct <INTRINSIC>;`
+/// - `impl ::otter_vm::BuiltinIntrinsic for <INTRINSIC>` with
+///   `NAME`, `FEATURE`, and `install`.
+///
+/// Bootstrap registration stays explicit — add
+/// `crate::bootstrap_entry!(<INTRINSIC>)` to `BOOTSTRAP_ENTRIES`
+/// in `crates/otter-vm/src/bootstrap.rs`.
+#[proc_macro]
+pub fn holt(input: TokenStream) -> TokenStream {
+    holt::expand(input)
+}
+
 /// Generate a static `NamespaceSpec` from a Rust module.
 ///
 /// The module must declare an explicit JavaScript name and spec

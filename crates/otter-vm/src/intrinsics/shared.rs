@@ -162,7 +162,12 @@ pub(crate) fn define_global(
 }
 
 /// Convenience wrapper around [`define_global`] for installer call sites.
-pub(crate) fn define_global_value(
+///
+/// `pub` because the `holt!` / `couch!` / `lodge!` macros expand
+/// their generated `install` bodies to call this helper from outside
+/// `otter-vm`. Hand-written installers inside the crate keep using
+/// it through the `bootstrap::` re-export.
+pub fn define_global_value(
     global: JsObject,
     heap: &mut otter_gc::GcHeap,
     name: &'static str,

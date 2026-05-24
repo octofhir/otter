@@ -24,16 +24,24 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 
 ## Macro implementation checklist (4.1a)
 
-| Macro                | File                                  | Tests             | State       |
-| -------------------- | ------------------------------------- | ----------------- | ----------- |
-| `holt!`              | `crates/otter-macros/src/holt.rs`     | `tests/holt_*.rs` | Pending     |
-| `couch!`             | `crates/otter-macros/src/couch.rs`    | `tests/couch_*.rs`| Pending     |
-| `raft!` (extend)     | `crates/otter-macros/src/raft.rs`     | `tests/raft.rs`   | Existing    |
-| `#[dive]` attr       | `crates/otter-macros/src/dive.rs`     | `tests/dive_*.rs` | Pending     |
-| `burrow!`            | `crates/otter-macros/src/burrow.rs`   | `tests/burrow_*.rs` | Deferred (Q3) |
-| `lodge!`             | `crates/otter-macros/src/lodge.rs`    | `tests/lodge_*.rs`| Pending (4.3 gate) |
-| `Pelt` derive        | `crates/otter-macros/src/derive_pelt.rs`  | `tests/derive_pelt.rs`  | Pending |
-| `Groom` derive       | `crates/otter-macros/src/derive_groom.rs` | `tests/derive_groom.rs` | Pending |
+| Macro            | File                                        | Tests                   | State            |
+| ---------------- | ------------------------------------------- | ----------------------- | ---------------- |
+| `holt!`          | `crates/otter-macros/src/holt.rs`           | `tests/holt.rs`         | Skeleton shipped |
+| `couch!`         | `crates/otter-macros/src/couch.rs`          | `tests/couch_*.rs`      | Pending          |
+| `raft!` (extend) | `crates/otter-macros/src/raft.rs`           | `tests/raft.rs`         | Existing         |
+| `#[dive]` attr   | `crates/otter-macros/src/dive.rs`           | `tests/dive_*.rs`       | Pending          |
+| `burrow!`        | `crates/otter-macros/src/burrow.rs`         | `tests/burrow_*.rs`     | Deferred (Q3)    |
+| `lodge!`         | `crates/otter-macros/src/lodge.rs`          | `tests/lodge_*.rs`      | Pending (4.3)    |
+| `Pelt` derive    | `crates/otter-macros/src/derive_pelt.rs`    | `tests/derive_pelt.rs`  | Pending          |
+| `Groom` derive   | `crates/otter-macros/src/derive_groom.rs`   | `tests/derive_groom.rs` | Pending          |
+
+Per-macro notes (referenced from the table above):
+
+- `holt!` skeleton shipped 2026-05-24 — covers `name` / `feature` /
+  `methods` fields plus derived `<NAME>_SPEC` + `Intrinsic` ident
+  defaults. Still pending: `constants = [...]` and `accessors = [...]`
+  field support, trybuild matrix (duplicate name, missing name,
+  unknown field), `attrs` per-row override inside the methods block.
 
 ## Production consumer inventory
 
@@ -93,7 +101,7 @@ callsite and Test262 deltas land in the port commit message.
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
 
-### 2026-05-24 — design + tracker only
+### 2026-05-24 — `holt!` skeleton + docs + tracker
 
 - `docs/otter-macros-design.md` written, naming theme approved by
   owner (holt / couch / Pelt / Groom + keep raft / burrow / lodge /
@@ -101,10 +109,24 @@ per entry. New entries go at the top.
   in 4.1). Q2 hard-cutover sequencing approved (a / b / c separate
   PRs).
 - This tracker added at `docs/otter-macros-refactor-tracker.md`.
-- Next: 4.1a — rewrite `crates/otter-macros/src/lib.rs` module
-  docstring with naming theme + per-macro examples, then ship
-  `holt!` as the first new macro with trybuild coverage. JSON
-  picked as 4.2a pathfinder afterward.
+- `crates/otter-macros/src/lib.rs` module docstring rewritten with
+  the full naming-theme table + per-macro examples.
+- `docs/book/src/macros/overview.md` rewritten with the same theme
+  plus expanded per-macro narrative.
+- `crates/otter-macros/src/holt.rs` shipped: parses `name` /
+  `feature` / `methods` (plus optional `spec` / `intrinsic` ident
+  overrides); emits `<NAME>_SPEC: NamespaceSpec`, `pub struct
+  Intrinsic;`, and the matching `BuiltinIntrinsic` impl with an
+  `install` body that calls `NamespaceBuilder::from_spec_with_value_roots`
+  plus `bootstrap::define_global_value`. Promoted
+  `bootstrap::define_global_value` from `pub(crate)` → `pub` so
+  macro consumers reach it through the documented re-export path.
+  Integration test at `crates/otter-macros/tests/holt.rs` checks
+  the generated spec + `BuiltinIntrinsic` metadata.
+- Next: extend `holt!` with `constants` and `accessors` fields,
+  add trybuild compile-fail matrix (duplicate / missing / unknown
+  field), then start `couch!` (class intrinsic). JSON picked as
+  4.2a pathfinder afterward.
 
 ## Acceptance ratchet
 

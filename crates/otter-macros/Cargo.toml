@@ -19,6 +19,7 @@ syn = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+otter-gc = { workspace = true }
 otter-vm = { workspace = true }
 
 [[bench]]

@@ -6,20 +6,21 @@ still open.
 
 ## Status — 2026-05-24
 
-Phases 0, 1, 2.1–2.5, 3.1–3.3 shipped. Active tracked work is:
+Phases 0, 1, 2.1–2.5, 3.1–3.3, and 4.1–4.3 shipped. Active tracked
+work is:
 
 | Phase | Task                                       | Status                |
 | ----- | ------------------------------------------ | --------------------- |
 | 3.3   | Snapshot checkpoint decision (docs only)   | DONE 2026-05-24       |
-| 4.1   | Replace macro API with `otter_*`           | Open                  |
-| 4.2   | Port first intrinsics through new macros   | Open, blocked on 4.1  |
-| 4.3   | Module install macro                       | Open, blocked on 4.1  |
+| 4.1   | Replace macro API with `otter_*`           | DONE 2026-05-24       |
+| 4.2   | Port first intrinsics through new macros   | DONE 2026-05-24       |
+| 4.3   | Module install macro + Web API ports       | DONE 2026-05-24       |
 | 5.1   | Step trace                                 | Open                  |
 | 5.2   | IC / shape / frame snapshots               | Open                  |
 | 5.3   | GC snapshot bridge                         | Open, blocked on 5.1  |
 | 6.1   | Object internal-method vtable evaluation   | Open                  |
 | 6.2   | Tighten Promise capability / job records   | Open                  |
-| 6.3   | Derive Trace / Finalize for new GC bodies  | Open, blocked on 4.1  |
+| 6.3   | Derive Trace / Finalize for new GC bodies  | Open (4.1 unblocked)  |
 
 Open carry-over tech debt from Phase 2.3 / 2.4 (not yet promoted to
 their own task numbers):
@@ -175,45 +176,41 @@ referenced below. This section is the index.
   stay read-only diagnostic surfaces. Future RFC-4 picks up the
   design once acceptance triggers all green.
 
-### Task 4.1 — Replace Current Macro API With `otter_*`
+### Task 4.1 — Replace Current Macro API With `otter_*` — DONE 2026-05-24
 
-- Goal: make macros the standard contributor path.
-- Touches: `crates/otter-macros`, `docs/book/src/macros/`, VM
-  surface builders.
-- Change: delete `js_namespace`, `js_class`, `raft`; introduce
-  `otter_intrinsic`, `otter_class`, `otter_module`, `dive`, and
-  trace/finalize derive.
-- Acceptance: trybuild tests for valid/invalid macro input; useful
-  diagnostics with correct spans.
-- Risk: Medium.
-- Effort: M.
-- Depends on: 2.5 ✓, 3.2 ✓ (unblocked).
+Shipped surface: `holt!` (namespace), `couch!` (class), `lodge!`
+(hosted module), `raft!` (method table), `#[dive]` (single binding).
+Legacy `js_namespace` / `js_class` / `js_fn` / `js_constructor` proc
+macros deleted (commit 480a46c0). Detail in
+[`docs/otter-macros-refactor-tracker.md`](otter-macros-refactor-tracker.md).
 
-### Task 4.2 — Port First Intrinsics
+Tests + clippy clean across `otter-macros`, `otter-vm`, `otter-runtime`,
+`otter-web`, `otter-modules`. Doctest matrix on each macro.
 
-- Goal: prove macros on real builtins.
-- Touches: Math, JSON, Reflect, BigInt / String if first pass
-  succeeds.
-- Change: generated specs feed the same `BuiltinIntrinsic` registry
-  and native ABI, not a parallel runtime path.
-- Acceptance: byte-for-byte same descriptors where spec requires;
-  focused Test262 subsets no regression.
-- Risk: Medium.
-- Effort: M.
-- Depends on: 4.1.
+### Task 4.2 — Port First Intrinsics — DONE 2026-05-24
 
-### Task 4.3 — Module Install Macro
+Every class intrinsic moved onto `couch!`: WeakRef,
+FinalizationRegistry, BigInt, Map/Set/WeakMap/WeakSet, ArrayBuffer /
+SharedArrayBuffer, DataView, RegExp, Boolean, Number, Symbol, String,
+Array, Object, Function, Date, Proxy, Promise, Iterator, the five
+Temporal classes, and the 11 TypedArrays + abstract `%TypedArray%`.
+Namespaces (Math, JSON, Reflect, Atomics, Console) on `holt!`. Error
+classes intentionally excluded — they live in a per-interpreter
+`ErrorClassRegistry`, not `BOOTSTRAP_ENTRIES`.
 
-- Goal: support third-party `otter:`, `node:`, and custom-prefix
-  modules.
-- Touches: module loader, runtime builder API, macro crate.
-- Change: generated module descriptor with prefix/name, ESM export
-  table, capability metadata, loader registration.
-- Acceptance: sample `myapp:` module works without editing loader
-  internals; capability denial tests pass.
-- Risk: Medium.
-- Effort: M.
-- Depends on: 4.1.
+### Task 4.3 — Module Install Macro — DONE 2026-05-24
+
+`lodge!` ships at `crates/otter-macros/src/lodge.rs` — generates
+hosted-module installers (capability-aware closures or static fn
+exports). Consumers: `otter:kv`, `otter:sql`, `otter:ffi` (commit
+d569c060).
+
+Web APIs (URL / Headers / Blob / Request / Response) folded into
+`couch!` rather than a separate `web!` macro — they ARE just global
+classes, only the install backend differs. `GlobalClass` reshaped to
+wrap either a `RuntimeClassSpec` (legacy) or a
+`BuiltinIntrinsic::install` fn pointer (couch!-generated). `feature
+= WEB` flag added (commit 745f1ccf).
 
 ### Task 5.1 — Step Trace
 
@@ -294,37 +291,33 @@ referenced below. This section is the index.
 
 ## Migration Order (remaining)
 
-Strict order for open work:
+Phase 4 fully shipped. Remaining work in strict order:
 
-1. **4.1** macro API rewrite — unblocks 4.2 / 4.3 / 6.3 and is the
-   long pole on the snapshot prerequisites (P1).
-2. **4.2** and **4.3** in parallel after 4.1.
-3. **5.1** step trace — unblocks 5.3.
-4. **5.2** PIC introspection — independent of 5.1.
-5. **5.3** GC snapshot — after 5.1.
-6. **6.1** vtable measurement — independent; can run alongside any
+1. **5.1** step trace — unblocks 5.3.
+2. **5.2** PIC introspection — independent of 5.1.
+3. **5.3** GC snapshot — after 5.1.
+4. **6.1** vtable measurement — independent; can run alongside any
    of the above once a baseline microbench exists.
-7. **6.2** Promise records — independent; gated only on test262
+5. **6.2** Promise records — independent; gated only on test262
    Promise stability.
-8. **6.3** trace derive — after 4.1.
+6. **6.3** trace derive — 4.1 unblocked, ready to start.
 
-Parallelizable: 4.x / 5.x / 6.x do not contend for the same files.
-Macro work and Promise work can land on independent branches.
+Parallelizable: 5.x / 6.x do not contend for the same files. Promise
+work (6.2) can land on an independent branch.
 
-Blocked: JIT remains blocked on Phase 4 (need macro-generated native
-descriptors as JIT input) plus a PIC-aware tiering RFC. Object
-vtable decision (6.1) is unblocked; needs measurement before commit.
+Blocked: JIT remains blocked on a PIC-aware tiering RFC (RFC-5).
+Object vtable decision (6.1) is unblocked; needs measurement before
+commit.
 
 ## Estimated Remaining Effort
 
 | Phase                     | Effort        | Risk       |
 | ------------------------- | ------------- | ---------- |
-| Phase 4 (4.1 + 4.2 + 4.3) | L, 1-2 months | Medium     |
 | Phase 5 (5.1 + 5.2 + 5.3) | M, 2-4 weeks  | Low/Medium |
 | Phase 6 (6.1 + 6.2 + 6.3) | M, 2-4 weeks  | Medium     |
 
-Serial total: ~2-4 months for one engineer if Phase 4 is the long
-pole. Phases 5 + 6 parallelize cleanly across two engineers.
+Serial total: ~1-2 months for one engineer. Phases 5 + 6 parallelize
+cleanly across two engineers.
 
 ## Open RFCs (remaining)
 

@@ -1872,7 +1872,10 @@ pub fn call(
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_frozen(o, gc_heap)
             } else {
-                !arg.is_object_like()
+                // §20.1.2.15 step 2 — non-Object returns true. Spec
+                // Object covers callables/exotics (`is_object_type`),
+                // not just `TAG_PTR_OBJECT`.
+                !arg.is_object_type()
             };
             Ok(Value::boolean(result))
         }
@@ -1891,7 +1894,9 @@ pub fn call(
             let result = if let Some(o) = arg.as_object() {
                 crate::object::is_sealed(o, gc_heap)
             } else {
-                !arg.is_object_like()
+                // §20.1.2.16 step 2 — non-Object returns true. Same
+                // spec-Object widening as `isFrozen` above.
+                !arg.is_object_type()
             };
             Ok(Value::boolean(result))
         }
@@ -1910,7 +1915,12 @@ pub fn call(
             } else if let Some(r) = arg.as_regexp() {
                 r.is_extensible(gc_heap)
             } else {
-                arg.is_object_like()
+                // §20.1.2.14 step 2 — non-Object returns false; every
+                // spec-Object kind reaches here only when none of the
+                // dedicated wrappers above matched, in which case
+                // `is_object_type` widens to callable / exotic
+                // payloads that default to extensible.
+                arg.is_object_type()
             };
             Ok(Value::boolean(result))
         }

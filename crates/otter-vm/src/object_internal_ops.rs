@@ -768,7 +768,12 @@ impl Interpreter {
     }
 
     fn proxy_get_prototype_result_is_object_or_null(value: &Value) -> bool {
-        value.is_null() || value.is_object_like()
+        // §10.5.1 step 6: `If handlerProto is not Object and not Null,
+        // throw TypeError`. Spec `Object` includes callable / exotic
+        // targets, so `is_object_type` is the correct predicate
+        // (`is_object_like` only matches `TAG_PTR_OBJECT` and rejects
+        // a Function returned by the `getPrototypeOf` trap).
+        value.is_null() || value.is_object_type()
     }
 
     /// §10.5.3 / §10.1.3 — value-level `[[IsExtensible]]`.

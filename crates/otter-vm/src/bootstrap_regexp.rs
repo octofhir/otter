@@ -749,7 +749,10 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 /// multiline, dotAll, unicode, unicodeSets, sticky).
 fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
-    if !receiver.is_object_like() {
+    // §22.2.6.4 step 1: `If R is not an Object, throw a TypeError`.
+    // Spec `Object` includes callables/exotics so use `is_object_type`
+    // rather than the narrower `is_object_like`.
+    if !receiver.is_object_type() {
         return Err(NativeError::TypeError {
             name: "get RegExp.prototype.flags",
             reason: "this value must be an Object".to_string(),

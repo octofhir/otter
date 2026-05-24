@@ -331,7 +331,12 @@ fn receiver_finalization_registry(
 }
 
 fn target_can_be_weak(v: &Value) -> bool {
-    v.is_object_like() || v.is_symbol()
+    // ECMA-262 §6.1.7.4 CanBeHeldWeakly — `Object` includes any
+    // heap-backed reference (callable / array / proxy / exotic), not
+    // just `TAG_PTR_OBJECT`. `Value::is_object_like` is narrower
+    // than the spec definition and rejects functions, breaking
+    // `new WeakRef(function () {})`.
+    v.is_object_type() || v.is_symbol()
 }
 
 fn oom(name: &'static str) -> NativeError {

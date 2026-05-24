@@ -1982,7 +1982,11 @@ fn normalize_set_key(value: Value) -> Value {
 }
 
 fn value_is_object_like(v: &Value) -> bool {
-    v.is_object_like()
+    // ECMA-262 §6.1.7 `Type(value) is Object` per §24.1.1.2 step 8.c
+    // (Map / Set entry iteration), §24.2.5 / §24.3.5 set-like
+    // operations. Spec `Object` covers callable / exotic targets, not
+    // just `TAG_PTR_OBJECT`.
+    v.is_object_type()
 }
 
 fn oom(name: &'static str) -> NativeError {

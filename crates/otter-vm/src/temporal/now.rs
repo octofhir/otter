@@ -41,6 +41,7 @@ fn instant(gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
             class: "Now",
             method: "instant",
             message: e.to_string(),
+            kind: e.kind(),
         })?;
     alloc_temporal_value(gc_heap, TemporalPayload::Instant(inst))
 }
@@ -52,6 +53,7 @@ fn plain_date_time_iso(gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Temporal
             class: "Now",
             method: "plainDateTimeISO",
             message: e.to_string(),
+            kind: e.kind(),
         })?;
     alloc_temporal_value(gc_heap, TemporalPayload::PlainDateTime(pdt))
 }
@@ -63,6 +65,7 @@ fn plain_date_iso(gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError
             class: "Now",
             method: "plainDateISO",
             message: e.to_string(),
+            kind: e.kind(),
         })?;
     alloc_temporal_value(gc_heap, TemporalPayload::PlainDate(pd))
 }
@@ -74,6 +77,7 @@ fn plain_time_iso(gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError
             class: "Now",
             method: "plainTimeISO",
             message: e.to_string(),
+            kind: e.kind(),
         })?;
     alloc_temporal_value(gc_heap, TemporalPayload::PlainTime(pt))
 }

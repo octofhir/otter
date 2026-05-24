@@ -100,6 +100,7 @@ fn parse_arg(
                 class: "PlainDate",
                 method,
                 message: e.to_string(),
+            kind: e.kind(),
             }
         })
     } else {

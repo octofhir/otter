@@ -127,6 +127,7 @@ fn from_epoch_milliseconds(
             class: "Instant",
             method: "fromEpochMilliseconds",
             message: e.to_string(),
+            kind: e.kind(),
         })?;
     alloc_temporal_value(gc_heap, TemporalPayload::Instant(inst))
 }
@@ -167,6 +168,7 @@ fn parse_instant_arg(
                 class: "Instant",
                 method,
                 message: e.to_string(),
+            kind: e.kind(),
             }
         })
     } else {

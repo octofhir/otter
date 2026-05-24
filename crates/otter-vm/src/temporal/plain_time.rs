@@ -104,6 +104,7 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
                 class: "PlainTime",
                 method: "from",
                 message: e.to_string(),
+            kind: e.kind(),
             }
         })?
     } else {

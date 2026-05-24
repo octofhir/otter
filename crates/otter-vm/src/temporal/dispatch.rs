@@ -52,7 +52,8 @@ pub enum TemporalError {
     },
     /// Pass-through for `temporal_rs` engine errors. The engine
     /// reports a structured error; the foundation surfaces the
-    /// stringified form so user code can match on it.
+    /// stringified form plus the spec error class so the surface
+    /// layer raises the right `RangeError` / `TypeError`.
     #[error("Temporal.{class}.{method}: {message}")]
     Engine {
         /// JS-visible class name.
@@ -61,6 +62,8 @@ pub enum TemporalError {
         method: &'static str,
         /// Error message.
         message: String,
+        /// Spec-mandated error class from `temporal_rs::TemporalError::kind()`.
+        kind: temporal_rs::error::ErrorKind,
     },
     /// String allocation failed.
     #[error("out of memory: requested {requested_bytes} bytes, heap limit {heap_limit_bytes}")]
@@ -70,6 +73,25 @@ pub enum TemporalError {
         /// Heap cap (`0` = unlimited).
         heap_limit_bytes: u64,
     },
+}
+
+impl TemporalError {
+    /// Build a [`TemporalError::Engine`] payload from a
+    /// `temporal_rs::TemporalError`, preserving both the rendered
+    /// message and the spec-mandated error class.
+    pub fn from_engine(
+        class: &'static str,
+        method: &'static str,
+        err: temporal_rs::TemporalError,
+    ) -> Self {
+        let kind = err.kind();
+        Self::Engine {
+            class,
+            method,
+            message: err.to_string(),
+            kind,
+        }
+    }
 }
 
 impl From<otter_gc::OutOfMemory> for TemporalError {

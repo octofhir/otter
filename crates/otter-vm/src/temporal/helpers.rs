@@ -221,23 +221,19 @@ pub fn require_plain_date_time(
 
 /// Convert a `temporal_rs` error into the foundation
 /// [`IntrinsicError`] hierarchy, honouring the spec error class:
-/// `RangeError` → [`IntrinsicError::OutOfRange`], `TypeError` /
-/// generic → [`IntrinsicError::BadArgument`]. `temporal_rs` does
-/// not expose its `ErrorKind` getter, so the routing is driven by
-/// the `Display` prefix it produces (`"RangeError: …"` /
-/// `"TypeError: …"`).
+/// `Range` → [`IntrinsicError::OutOfRange`], `Type` / `Generic` /
+/// `Syntax` / `Assert` → [`IntrinsicError::BadArgument`].
 pub fn temporal_err(err: temporal_rs::TemporalError) -> IntrinsicError {
-    let text = err.to_string();
-    if text.starts_with("RangeError") {
-        IntrinsicError::OutOfRange {
+    use temporal_rs::error::ErrorKind;
+    match err.kind() {
+        ErrorKind::Range => IntrinsicError::OutOfRange {
             index: 0,
             reason: "Temporal operation produced an out-of-range value",
-        }
-    } else {
-        IntrinsicError::BadArgument {
+        },
+        _ => IntrinsicError::BadArgument {
             index: 0,
             reason: "Temporal operation failed",
-        }
+        },
     }
 }
 

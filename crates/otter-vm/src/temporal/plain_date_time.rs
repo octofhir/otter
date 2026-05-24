@@ -144,6 +144,7 @@ fn parse_arg(
                 class: "PlainDateTime",
                 method,
                 message: e.to_string(),
+            kind: e.kind(),
             }
         })
     } else {

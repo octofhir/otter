@@ -88,6 +88,7 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
                 class: "Duration",
                 method: "from",
                 message: e.to_string(),
+            kind: e.kind(),
             }
         })?
     } else if let Some(obj) = first.and_then(|v| v.as_object()) {
@@ -95,6 +96,7 @@ fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, Tempora
             class: "Duration",
             method: "from",
             message: e.to_string(),
+            kind: e.kind(),
         })?
     } else if let Some(t) = first.and_then(|v| v.as_temporal(gc_heap)) {
         match t.payload_clone(gc_heap) {
@@ -129,6 +131,7 @@ fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, Temporal
         class: "Duration",
         method: "compare",
         message: e.to_string(),
+            kind: e.kind(),
     })?;
     let n = match cmp {
         std::cmp::Ordering::Less => -1,
@@ -160,6 +163,7 @@ fn expect_duration(
                 class: "Duration",
                 method: "compare",
                 message: e.to_string(),
+            kind: e.kind(),
             }
         })
     } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
@@ -167,6 +171,7 @@ fn expect_duration(
             class: "Duration",
             method: "compare",
             message: e.to_string(),
+            kind: e.kind(),
         })
     } else {
         Err(TemporalError::BadArgument {

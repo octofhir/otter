@@ -709,7 +709,6 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         quote! { ::otter_vm::bootstrap::native_constructor_static_with_value_roots }
     };
 
-    let prototype_has_method_specs = !prototype.method_specs.is_empty();
     let static_method_spec_iters = static_method_specs.iter().map(|path| {
         quote! {
             for method_spec in #path.iter() {
@@ -751,13 +750,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             }
         }
     });
-    // Macro-time flag for whether the prototype block contributes
-    // anything; controls the wrapping `if` in the install body.
-    let prototype_block_needed = !prototype.methods.is_empty()
-        || !prototype.accessors.is_empty()
-        || prototype_has_method_specs
-        || !prototype_constants.is_empty()
-        || prototype.parent.is_some();
+    // Every builtin constructor exposes a `.prototype` data property
+    // per ECMA-262 §19.4; even a content-empty prototype must exist so
+    // `instanceof` lookups and `<Class>.prototype.constructor`
+    // round-trip succeed.
+    let prototype_block_needed = true;
 
     let post_install_call = match post_install {
         Some(path) => quote! {

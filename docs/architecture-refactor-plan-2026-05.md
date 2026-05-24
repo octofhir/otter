@@ -6,11 +6,11 @@ still open.
 
 ## Status — 2026-05-24
 
-Phases 0, 1, 2.1–2.5, 3.1–3.2 shipped. Active tracked work is:
+Phases 0, 1, 2.1–2.5, 3.1–3.3 shipped. Active tracked work is:
 
 | Phase | Task                                       | Status                |
 | ----- | ------------------------------------------ | --------------------- |
-| 3.3   | Snapshot checkpoint decision (docs only)   | Open                  |
+| 3.3   | Snapshot checkpoint decision (docs only)   | DONE 2026-05-24       |
 | 4.1   | Replace macro API with `otter_*`           | Open                  |
 | 4.2   | Port first intrinsics through new macros   | Open, blocked on 4.1  |
 | 4.3   | Module install macro                       | Open, blocked on 4.1  |
@@ -153,16 +153,27 @@ referenced below. This section is the index.
 
 ## Open Tasks
 
-### Task 3.3 — Decide Snapshot Checkpoint
+### Task 3.3 — Decide Snapshot Checkpoint — DONE 2026-05-24
 
 - Goal: avoid premature snapshot work while preserving future path.
-- Touches: docs only in this phase.
+- Touches: docs only.
 - Change: write snapshot prerequisites and explicit defer decision.
 - Acceptance: owner sign-off — defer until after Phases 4 and 5
   (bytecode v2 + bootstrap split shipped; macros next).
 - Risk: Low.
 - Effort: S.
 - Depends on: nothing remaining.
+- **Status:** Shipped. Decision lives at
+  [`docs/snapshot-checkpoint-decision.md`](snapshot-checkpoint-decision.md):
+  defer until P1 (`otter_*` macros load-bearing) + P2 (GC body
+  schema frozen, Symbol/Temporal payloads migrated, `SafeTraceable`
+  derive shipped) + P3 (realm intrinsic slot table closed or growth
+  policy documented) + P4 (bytecode wire format ratchet test) + P5
+  (cold-start regression budget defined). Scope excludes the
+  already-shipped `HeapSnapshot` (Rust-side retained-size walker)
+  and `devtools_snapshot` (Chrome `.heapsnapshot` exporter); both
+  stay read-only diagnostic surfaces. Future RFC-4 picks up the
+  design once acceptance triggers all green.
 
 ### Task 4.1 — Replace Current Macro API With `otter_*`
 
@@ -285,17 +296,17 @@ referenced below. This section is the index.
 
 Strict order for open work:
 
-1. **3.3** snapshot decision (docs only, gates Phase 5 sequencing).
-2. **4.1** macro API rewrite — unblocks 4.2 / 4.3 / 6.3.
-3. **4.2** and **4.3** in parallel after 4.1.
-4. **5.1** step trace — unblocks 5.3.
-5. **5.2** PIC introspection — independent of 5.1.
-6. **5.3** GC snapshot — after 5.1.
-7. **6.1** vtable measurement — independent; can run alongside any
+1. **4.1** macro API rewrite — unblocks 4.2 / 4.3 / 6.3 and is the
+   long pole on the snapshot prerequisites (P1).
+2. **4.2** and **4.3** in parallel after 4.1.
+3. **5.1** step trace — unblocks 5.3.
+4. **5.2** PIC introspection — independent of 5.1.
+5. **5.3** GC snapshot — after 5.1.
+6. **6.1** vtable measurement — independent; can run alongside any
    of the above once a baseline microbench exists.
-8. **6.2** Promise records — independent; gated only on test262
+7. **6.2** Promise records — independent; gated only on test262
    Promise stability.
-9. **6.3** trace derive — after 4.1.
+8. **6.3** trace derive — after 4.1.
 
 Parallelizable: 4.x / 5.x / 6.x do not contend for the same files.
 Macro work and Promise work can land on independent branches.
@@ -308,7 +319,6 @@ vtable decision (6.1) is unblocked; needs measurement before commit.
 
 | Phase                     | Effort        | Risk       |
 | ------------------------- | ------------- | ---------- |
-| Phase 3.3                 | S, <1 day     | Low        |
 | Phase 4 (4.1 + 4.2 + 4.3) | L, 1-2 months | Medium     |
 | Phase 5 (5.1 + 5.2 + 5.3) | M, 2-4 weeks  | Low/Medium |
 | Phase 6 (6.1 + 6.2 + 6.3) | M, 2-4 weeks  | Medium     |
@@ -318,8 +328,11 @@ pole. Phases 5 + 6 parallelize cleanly across two engineers.
 
 ## Open RFCs (remaining)
 
-- **RFC-4: Snapshot pipeline.** Decision deferred; 3.3 promotes
-  this to a written defer doc with prerequisites enumerated.
+- **RFC-4: Snapshot pipeline.** Deferred; defer doc with
+  prerequisites lives at
+  [`docs/snapshot-checkpoint-decision.md`](snapshot-checkpoint-decision.md).
+  Resume when P1–P5 in that doc all green plus a concrete embedder
+  cold-start budget surfaces.
 - **RFC-5: JIT backend.** Cranelift recommended for first baseline
   JIT after Phase 4 ships and the macro-generated descriptor surface
   is stable. No backend commit yet.

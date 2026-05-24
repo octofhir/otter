@@ -1,17 +1,18 @@
 //! `Temporal` namespace bootstrap.
 //!
 //! Installs the global `Temporal` object together with its
-//! sub-namespaces — `Instant`, `Duration`, `PlainDate`, `PlainTime`,
-//! `PlainDateTime`, and `Now` — as ordinary JS objects holding the
-//! static methods (`from`, `compare`, `fromEpochMilliseconds`, the
-//! `Now.<view>()` snapshots) backed by the existing
-//! `temporal::dispatch::call` engine.
+//! sub-classes — `Instant`, `Duration`, `PlainDate`, `PlainTime`,
+//! `PlainDateTime` — as real `NativeFunction` constructors (each
+//! `typeof === "function"`) plus the `Now` namespace object. Each
+//! constructor carries its static methods (`from`, `compare`,
+//! `fromEpochMilliseconds`) as own data properties backed by the
+//! existing `temporal::dispatch::call` engine.
 //!
-//! The classes are currently exposed as namespace objects rather
-//! than callable constructors: `typeof Temporal.Instant === "object"`
-//! and `new Temporal.Instant(...)` is not yet supported. The static
-//! methods (`Temporal.Instant.from`, `Temporal.Now.instant`, …)
-//! match the spec.
+//! Direct construction (`new Temporal.Instant(...)`) throws a
+//! `TypeError` for now — the foundation does not yet thread the
+//! `epochNanoseconds` / partial-record argument shapes through the
+//! `[[Construct]]` path. Spec-recommended factories (`from`,
+//! `Now.instant()`, ...) work end-to-end.
 //!
 //! # Contents
 //! - [`Intrinsic`] — `BuiltinIntrinsic` adapter installed by
@@ -20,11 +21,14 @@
 //! # See also
 //! - <https://tc39.es/proposal-temporal/>
 
-use crate::bootstrap::{BootstrapFeatures, define_global_value};
+use crate::bootstrap::{
+    BootstrapFeatures, define_global_value, native_constructor_static_with_value_roots,
+    native_static_with_value_roots,
+};
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec};
 use crate::native_function::NativeCall;
-use crate::object::JsObject;
+use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::temporal::dispatch::{TemporalError, call as call_static};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -45,21 +49,142 @@ impl BuiltinIntrinsic for Intrinsic {
                 .build()?;
         let temporal_value = Value::object(temporal);
 
-        // Sub-namespaces: each class hangs off `Temporal` as an
-        // ordinary own data property.
-        for sub in TEMPORAL_SUBNAMESPACES {
-            let ns = NamespaceBuilder::from_spec_with_value_roots(
-                heap,
-                sub,
-                vec![global_root, temporal_value],
-            )?
-            .build()?;
-            crate::object::set(temporal, heap, sub.name, Value::object(ns));
+        for spec in TEMPORAL_CLASSES {
+            install_class(heap, global_root, temporal, temporal_value, spec)?;
         }
+
+        // `Temporal.Now` is a namespace object per spec, not a
+        // constructor — keep it as a plain object with method specs.
+        let now = NamespaceBuilder::from_spec_with_value_roots(
+            heap,
+            &NOW_SPEC,
+            vec![global_root, temporal_value],
+        )?
+        .build()?;
+        object::set(temporal, heap, NOW_SPEC.name, Value::object(now));
 
         define_global_value(global, heap, Self::NAME, temporal_value);
         Ok(())
     }
+}
+
+/// Per-class installer descriptor: the JS-visible class name plus
+/// the static methods exposed on the constructor function.
+struct TemporalClassSpec {
+    name: &'static str,
+    methods: &'static [TemporalStatic],
+}
+
+struct TemporalStatic {
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeFastFn,
+}
+
+const fn temporal_static(
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeFastFn,
+) -> TemporalStatic {
+    TemporalStatic { name, length, call }
+}
+
+const TEMPORAL_CLASSES: &[TemporalClassSpec] = &[
+    TemporalClassSpec {
+        name: "Instant",
+        methods: &[
+            temporal_static("from", 1, native_instant_from),
+            temporal_static("fromEpochMilliseconds", 1, native_instant_from_epoch_ms),
+            temporal_static("compare", 2, native_instant_compare),
+        ],
+    },
+    TemporalClassSpec {
+        name: "Duration",
+        methods: &[
+            temporal_static("from", 1, native_duration_from),
+            temporal_static("compare", 2, native_duration_compare),
+        ],
+    },
+    TemporalClassSpec {
+        name: "PlainDate",
+        methods: &[
+            temporal_static("from", 1, native_plain_date_from),
+            temporal_static("compare", 2, native_plain_date_compare),
+        ],
+    },
+    TemporalClassSpec {
+        name: "PlainTime",
+        methods: &[
+            temporal_static("from", 1, native_plain_time_from),
+            temporal_static("compare", 2, native_plain_time_compare),
+        ],
+    },
+    TemporalClassSpec {
+        name: "PlainDateTime",
+        methods: &[
+            temporal_static("from", 1, native_plain_date_time_from),
+            temporal_static("compare", 2, native_plain_date_time_compare),
+        ],
+    },
+];
+
+fn install_class(
+    heap: &mut otter_gc::GcHeap,
+    global_root: Value,
+    temporal: JsObject,
+    temporal_value: Value,
+    spec: &TemporalClassSpec,
+) -> Result<(), JsSurfaceError> {
+    // Constructor itself — direct `new Temporal.X(...)` throws a
+    // `TypeError` until the foundation wires the spec partial-record
+    // / epochNanoseconds argument shapes through `[[Construct]]`.
+    let ctor = native_constructor_static_with_value_roots(
+        heap,
+        spec.name,
+        0,
+        temporal_class_direct_construct,
+        &[&global_root, &temporal_value],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let ctor_value = Value::native_function(ctor);
+
+    // Install each spec-listed static method as an own data property
+    // on the constructor. Length / attrs match the namespace methods
+    // installed by the prior namespace-object form.
+    for method in spec.methods {
+        let fn_obj = native_static_with_value_roots(
+            heap,
+            method.name,
+            method.length,
+            method.call,
+            &[&global_root, &temporal_value, &ctor_value],
+        )
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+        let desc = PropertyDescriptor::data(Value::native_function(fn_obj), true, false, true);
+        if !ctor.define_own_property(heap, method.name, desc) {
+            return Err(JsSurfaceError::DefinePropertyFailed(method.name));
+        }
+    }
+
+    object::set(temporal, heap, spec.name, ctor_value);
+    Ok(())
+}
+
+fn temporal_class_direct_construct(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let name = if ctx.is_construct_call() {
+        "Temporal class constructor"
+    } else {
+        "Temporal class call"
+    };
+    Err(NativeError::TypeError {
+        name,
+        reason: "direct construction not implemented; use the class's spec-defined factory \
+                 (e.g. `Temporal.Instant.from`, `Temporal.Now.instant`)"
+            .to_string(),
+    })
 }
 
 const TEMPORAL_SPEC: NamespaceSpec = NamespaceSpec {
@@ -69,15 +194,6 @@ const TEMPORAL_SPEC: NamespaceSpec = NamespaceSpec {
     constants: &[],
     attrs: Attr::global_binding(),
 };
-
-const TEMPORAL_SUBNAMESPACES: &[&NamespaceSpec] = &[
-    &INSTANT_SPEC,
-    &DURATION_SPEC,
-    &PLAIN_DATE_SPEC,
-    &PLAIN_TIME_SPEC,
-    &PLAIN_DATE_TIME_SPEC,
-    &NOW_SPEC,
-];
 
 const fn method(
     name: &'static str,
@@ -91,64 +207,6 @@ const fn method(
         call: NativeCall::Static(call),
     }
 }
-
-// ----- per-class specs -----
-
-const INSTANT_SPEC: NamespaceSpec = NamespaceSpec {
-    name: "Instant",
-    methods: &[
-        method("from", 1, native_instant_from),
-        method("fromEpochMilliseconds", 1, native_instant_from_epoch_ms),
-        method("compare", 2, native_instant_compare),
-    ],
-    accessors: &[],
-    constants: &[],
-    attrs: Attr::builtin_function(),
-};
-
-const DURATION_SPEC: NamespaceSpec = NamespaceSpec {
-    name: "Duration",
-    methods: &[
-        method("from", 1, native_duration_from),
-        method("compare", 2, native_duration_compare),
-    ],
-    accessors: &[],
-    constants: &[],
-    attrs: Attr::builtin_function(),
-};
-
-const PLAIN_DATE_SPEC: NamespaceSpec = NamespaceSpec {
-    name: "PlainDate",
-    methods: &[
-        method("from", 1, native_plain_date_from),
-        method("compare", 2, native_plain_date_compare),
-    ],
-    accessors: &[],
-    constants: &[],
-    attrs: Attr::builtin_function(),
-};
-
-const PLAIN_TIME_SPEC: NamespaceSpec = NamespaceSpec {
-    name: "PlainTime",
-    methods: &[
-        method("from", 1, native_plain_time_from),
-        method("compare", 2, native_plain_time_compare),
-    ],
-    accessors: &[],
-    constants: &[],
-    attrs: Attr::builtin_function(),
-};
-
-const PLAIN_DATE_TIME_SPEC: NamespaceSpec = NamespaceSpec {
-    name: "PlainDateTime",
-    methods: &[
-        method("from", 1, native_plain_date_time_from),
-        method("compare", 2, native_plain_date_time_compare),
-    ],
-    accessors: &[],
-    constants: &[],
-    attrs: Attr::builtin_function(),
-};
 
 const NOW_SPEC: NamespaceSpec = NamespaceSpec {
     name: "Now",

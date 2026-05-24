@@ -66,7 +66,10 @@ pub static OBJECT_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::global_binding(),
 };
 
-const OBJECT_STATIC_METHODS: &[MethodSpec] = &[
+/// §20.1.2 — the JS-visible `Object` constructor static methods.
+/// Consumed by the `couch!` install body (via the
+/// `static_method_specs` field) and by `OBJECT_SPEC`.
+pub static OBJECT_STATIC_METHODS: &[MethodSpec] = &[
     method("is", 2, native_is),
     method("getPrototypeOf", 1, native_get_prototype_of),
     method("setPrototypeOf", 2, native_set_prototype_of),

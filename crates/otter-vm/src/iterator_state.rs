@@ -23,8 +23,6 @@
 //! - <https://tc39.es/ecma262/#sec-iterator-objects>
 //! - <https://tc39.es/proposal-iterator-helpers/>
 
-use otter_gc::raw::{RawGc, SlotVisitor};
-
 use crate::Value;
 use crate::array::JsArray;
 use crate::collections::{JsMap, JsSet};
@@ -98,7 +96,8 @@ pub enum BuiltinIteratorOrigin {
 /// Runtime state for iterator handles driven via `Op::IteratorNext`.
 /// Covers both built-in array / string iterators and the lazy
 /// iterator-helpers wrappers per the proposal.
-#[derive(Debug)]
+#[derive(Debug, otter_macros::Pelt)]
+#[pelt(tag = ITERATOR_STATE_TYPE_TAG)]
 pub enum IteratorState {
     /// Walks `array`'s dense storage in insertion order.
     Array {
@@ -108,11 +107,13 @@ pub enum IteratorState {
         /// Next element index to read. Compared against the array's
         /// `len()` at every step so resizing the array during
         /// iteration is observed correctly.
+        #[pelt(skip)]
         index: usize,
         /// Per-kind iterator origin. Map / Set / String iterators
         /// reuse the dense-array snapshot shape but inherit from
         /// distinct realm prototypes (§23.1.5 / §24.1.5 / §24.2.5 /
         /// §22.1.5) carrying their kind-specific `@@toStringTag`.
+        #[pelt(skip)]
         origin: BuiltinIteratorOrigin,
     },
     /// Walks `array` yielding only its numeric indices —
@@ -121,6 +122,7 @@ pub enum IteratorState {
         /// Backing array.
         array: JsArray,
         /// Next index to yield.
+        #[pelt(skip)]
         index: usize,
     },
     /// Walks `array` yielding `[index, value]` pairs per §23.1.3.7
@@ -129,14 +131,17 @@ pub enum IteratorState {
         /// Backing array.
         array: JsArray,
         /// Next index to yield.
+        #[pelt(skip)]
         index: usize,
     },
     /// Walks `string`'s WTF-16 code units while yielding full
     /// code-point strings; surrogate pairs advance as one item.
     String {
         /// Backing string.
+        #[pelt(skip)]
         string: JsString,
         /// Next code-unit index.
+        #[pelt(skip)]
         index: u32,
     },
     /// Lazy RegExp String Iterator created by
@@ -145,12 +150,16 @@ pub enum IteratorState {
         /// The cloned matcher object used for iteration.
         matcher: Value,
         /// Input string being matched.
+        #[pelt(skip)]
         input: JsString,
         /// Whether the matcher has the `g` flag.
+        #[pelt(skip)]
         global: bool,
         /// Whether `AdvanceStringIndex` uses Unicode mode (`u`/`v`).
+        #[pelt(skip)]
         full_unicode: bool,
         /// Sticky exhaustion flag for repeated `done` results.
+        #[pelt(skip)]
         done: bool,
     },
     /// Walks a live `Map` in insertion order.
@@ -158,8 +167,10 @@ pub enum IteratorState {
         /// Backing map.
         map: JsMap,
         /// Next live entry index.
+        #[pelt(skip)]
         index: usize,
         /// Yield shape.
+        #[pelt(skip)]
         kind: MapIteratorKind,
     },
     /// Walks a live `Set` in insertion order.
@@ -167,8 +178,10 @@ pub enum IteratorState {
         /// Backing set.
         set: JsSet,
         /// Next live entry index.
+        #[pelt(skip)]
         index: usize,
         /// Yield shape.
+        #[pelt(skip)]
         kind: SetIteratorKind,
     },
     /// User-defined iterable: the result of calling `obj[@@iterator]()`.
@@ -197,6 +210,7 @@ pub enum IteratorState {
         /// Underlying iterator handle.
         source: IteratorHandle,
         /// Steps still allowed before the wrapper reports `done`.
+        #[pelt(skip)]
         remaining: u64,
     },
     /// Lazy `Iterator.prototype.drop(n)` wrapper.
@@ -204,11 +218,13 @@ pub enum IteratorState {
         /// Underlying iterator handle.
         source: IteratorHandle,
         /// Elements still to discard before forwarding kicks in.
+        #[pelt(skip)]
         to_drop: u64,
     },
     /// `Value::Generator` driven through the iterator protocol.
     Generator {
         /// Underlying generator handle.
+        #[pelt(via = crate::generator::JsGenerator::trace_value_slots)]
         handle: crate::generator::JsGenerator,
     },
     /// Lazy `Iterator.prototype.flatMap(mapper)` wrapper.
@@ -244,56 +260,3 @@ impl IteratorState {
     }
 }
 
-impl otter_gc::SafeTraceable for IteratorState {
-    const TYPE_TAG: u8 = ITERATOR_STATE_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        match self {
-            IteratorState::Array { array, .. }
-            | IteratorState::ArrayKey { array, .. }
-            | IteratorState::ArrayEntry { array, .. } => {
-                let p = array as *const JsArray as *mut RawGc;
-                visitor(p);
-            }
-            IteratorState::String { .. } | IteratorState::Exhausted => {}
-            IteratorState::RegExpString { matcher, .. } => matcher.trace_value_slots(visitor),
-            IteratorState::MapCollection { map, .. } => {
-                let p = map as *const JsMap as *mut RawGc;
-                visitor(p);
-            }
-            IteratorState::SetCollection { set, .. } => {
-                let p = set as *const JsSet as *mut RawGc;
-                visitor(p);
-            }
-            IteratorState::User { iterator } => iterator.trace_value_slots(visitor),
-            IteratorState::Map { source, mapper } => {
-                let p = source as *const IteratorHandle as *mut RawGc;
-                visitor(p);
-                mapper.trace_value_slots(visitor);
-            }
-            IteratorState::Filter { source, predicate } => {
-                let p = source as *const IteratorHandle as *mut RawGc;
-                visitor(p);
-                predicate.trace_value_slots(visitor);
-            }
-            IteratorState::Take { source, .. } | IteratorState::Drop { source, .. } => {
-                let p = source as *const IteratorHandle as *mut RawGc;
-                visitor(p);
-            }
-            IteratorState::Generator { handle } => handle.trace_value_slots(visitor),
-            IteratorState::FlatMap {
-                source,
-                mapper,
-                inner,
-            } => {
-                let p = source as *const IteratorHandle as *mut RawGc;
-                visitor(p);
-                mapper.trace_value_slots(visitor);
-                if let Some(inner) = inner {
-                    let p = inner as *const IteratorHandle as *mut RawGc;
-                    visitor(p);
-                }
-            }
-        }
-    }
-}

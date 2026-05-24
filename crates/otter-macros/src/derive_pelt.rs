@@ -16,9 +16,9 @@
 //!
 //! # Invariants
 //!
-//! - The derive only supports `struct` items (named or tuple). Enums
-//!   require a hand-written trace and are rejected with a clear
-//!   message.
+//! - The derive supports `struct` items (named or tuple) and `enum`
+//!   items (mixed unit / tuple / named variants). Unions are
+//!   rejected.
 //! - The `#[pelt(tag = CONST)]` attribute is required. Reusing the
 //!   already-existing per-body `_TYPE_TAG` const keeps tag
 //!   coordination centralised in the body's own module.
@@ -60,29 +60,31 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         }
     };
 
-    let DataStruct { fields, .. } = match derive_input.data {
-        Data::Struct(s) => s,
-        Data::Enum(_) | Data::Union(_) => {
+    let body_ident = derive_input.ident;
+    let trace_body = match derive_input.data {
+        Data::Struct(DataStruct { fields, .. }) => {
+            let trace_calls = match field_calls(&fields) {
+                Ok(calls) => calls,
+                Err(err) => return err.to_compile_error().into(),
+            };
+            if trace_calls.is_empty() {
+                quote! { let _ = visitor; }
+            } else {
+                quote! { #(#trace_calls)* }
+            }
+        }
+        Data::Enum(data_enum) => match enum_trace_body(&data_enum) {
+            Ok(body) => body,
+            Err(err) => return err.to_compile_error().into(),
+        },
+        Data::Union(_) => {
             return syn::Error::new(
                 Span::call_site(),
-                "#[derive(Pelt)] only supports structs; enums and unions need hand-written \
-                 SafeTraceable impls",
+                "#[derive(Pelt)] does not support unions",
             )
             .to_compile_error()
             .into();
         }
-    };
-
-    let body_ident = derive_input.ident;
-    let trace_calls = match field_calls(&fields) {
-        Ok(calls) => calls,
-        Err(err) => return err.to_compile_error().into(),
-    };
-
-    let trace_body = if trace_calls.is_empty() {
-        quote! { let _ = visitor; }
-    } else {
-        quote! { #(#trace_calls)* }
     };
 
     let ephemeron_fn = args.ephemeron_via.as_ref().map(|path| {
@@ -154,6 +156,93 @@ fn parse_top_attrs(attrs: &[Attribute]) -> Result<Args> {
 struct Args {
     tag: Option<Expr>,
     ephemeron_via: Option<Path>,
+}
+
+/// Build the body of `trace_slots_safe` for an `enum` body. The
+/// expansion is a single `match self { … }` whose arms bind each
+/// non-skip field by value-borrow and dispatch through
+/// `PeltField::pelt_trace` (or the per-field `via` path).
+fn enum_trace_body(data: &syn::DataEnum) -> Result<proc_macro2::TokenStream> {
+    if data.variants.is_empty() {
+        return Ok(quote! { let _ = visitor; });
+    }
+    let mut arms: Vec<proc_macro2::TokenStream> = Vec::with_capacity(data.variants.len());
+    let mut any_traced_field = false;
+    for variant in &data.variants {
+        let var_ident = &variant.ident;
+        match &variant.fields {
+            Fields::Named(named) => {
+                let mut binders: Vec<proc_macro2::TokenStream> = Vec::new();
+                let mut calls: Vec<proc_macro2::TokenStream> = Vec::new();
+                let mut any_traced = false;
+                for f in &named.named {
+                    let attrs = parse_field_attrs(&f.attrs)?;
+                    let name = f.ident.as_ref().expect("named field has ident");
+                    if attrs.skip {
+                        binders.push(quote! { #name: _ });
+                    } else {
+                        binders.push(quote! { #name });
+                        let access = quote! { #name };
+                        calls.push(emit_field_call(&access, attrs.via.as_ref()));
+                        any_traced = true;
+                    }
+                }
+                if any_traced {
+                    any_traced_field = true;
+                    arms.push(quote! {
+                        Self::#var_ident { #( #binders ),* } => { #( #calls )* }
+                    });
+                } else {
+                    arms.push(quote! {
+                        Self::#var_ident { .. } => {}
+                    });
+                }
+            }
+            Fields::Unnamed(unnamed) => {
+                let mut binders: Vec<proc_macro2::TokenStream> = Vec::new();
+                let mut calls: Vec<proc_macro2::TokenStream> = Vec::new();
+                let mut any_traced = false;
+                for (i, f) in unnamed.unnamed.iter().enumerate() {
+                    let attrs = parse_field_attrs(&f.attrs)?;
+                    let bind_ident = Ident::new(&format!("__pelt_{i}"), Span::call_site());
+                    if attrs.skip {
+                        binders.push(quote! { _ });
+                    } else {
+                        let access = quote! { #bind_ident };
+                        calls.push(emit_field_call(&access, attrs.via.as_ref()));
+                        binders.push(quote! { #bind_ident });
+                        any_traced = true;
+                    }
+                }
+                if any_traced {
+                    any_traced_field = true;
+                    arms.push(quote! {
+                        Self::#var_ident(#( #binders ),*) => { #( #calls )* }
+                    });
+                } else {
+                    arms.push(quote! {
+                        Self::#var_ident(..) => {}
+                    });
+                }
+            }
+            Fields::Unit => {
+                arms.push(quote! {
+                    Self::#var_ident => {}
+                });
+            }
+        }
+    }
+    let prefix = if any_traced_field {
+        quote! {}
+    } else {
+        quote! { let _ = visitor; }
+    };
+    Ok(quote! {
+        #prefix
+        match self {
+            #( #arms ),*
+        }
+    })
 }
 
 fn field_calls(fields: &Fields) -> Result<Vec<proc_macro2::TokenStream>> {

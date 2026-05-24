@@ -273,8 +273,11 @@ impl PromiseSlots {
     }
 }
 
-/// Boa-style helper for constructing promises and capabilities with
-/// an explicit VM execution context.
+/// Root-aware helper for constructing ECMA-262 §27.2.1.5
+/// `NewPromiseCapability` records with an explicit VM execution
+/// context. Each method routes through the appropriate root walker
+/// (runtime / stack / native) so heap allocations remain visible to
+/// GC during the construction sequence.
 #[derive(Debug, Clone, Default)]
 pub struct PromiseBuilder {
     context: Option<ExecutionContext>,

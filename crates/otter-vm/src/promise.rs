@@ -70,16 +70,33 @@ impl crate::pelt::PeltField for PromiseState {
     }
 }
 
-/// One reaction registered via `.then` / `.catch` / `.finally`.
+/// ECMA-262 §27.2.1.6 `PromiseReaction` record.
+///
+/// Field layout follows the spec record one-for-one:
+///
+/// | Spec field | Rust field | Notes |
+/// | --- | --- | --- |
+/// | `[[Capability]]` | [`Self::capability`] | Downstream capability the reaction settles. `undefined` in the spec maps to a [`PromiseCapability`] whose `promise` slot is [`Value::undefined`] — Otter never installs an actual record with no capability today. |
+/// | `[[Type]]` | [`Self::kind`] | `Fulfill` / `Reject` per [`ReactionKind`]. |
+/// | `[[Handler]]` | [`Self::handler`] | JS callable (`Call(Some)`), spec identity / re-throw (`Call(None)`), or async-resume payload. |
+///
+/// Otter adds [`Self::context`] so an execution context can travel with the
+/// reaction into the microtask queue; the spec leaves that implicit in
+/// the surrounding agent. The async-resume handler variant carries
+/// additional state that the spec models through `AsyncFunctionStart` /
+/// `AsyncGeneratorStart` internals.
 #[derive(Debug, Clone)]
 pub struct PromiseReaction {
-    /// Downstream capability this reaction settles into.
+    /// `[[Capability]]` — downstream capability this reaction settles into.
     pub capability: PromiseCapability,
-    /// Work to perform when this reaction runs.
+    /// `[[Handler]]` — work to perform when this reaction runs.
     pub handler: PromiseReactionHandler,
-    /// Which side of `then` this reaction handles.
+    /// `[[Type]]` — which side of `then` this reaction handles.
     pub kind: ReactionKind,
-    /// Execution context that registered this reaction.
+    /// Otter-specific: execution context that registered this reaction.
+    /// Mirrors the agent's running execution context at registration
+    /// time so host-driven settlement (e.g. cross-thread promise
+    /// resolution) can resume on the right module.
     pub context: Option<ExecutionContext>,
 }
 
@@ -182,17 +199,34 @@ pub enum ReactionKind {
     Reject,
 }
 
-/// `{ promise, resolve, reject }` — the triple created by
-/// `NewPromiseCapability` (spec §27.2.1.5).
+/// ECMA-262 §27.2.1.1 `PromiseCapability` record.
+///
+/// Field layout follows the spec record one-for-one:
+///
+/// | Spec field | Rust field |
+/// | --- | --- |
+/// | `[[Promise]]` | [`Self::promise`] |
+/// | `[[Resolve]]` | [`Self::resolve`] |
+/// | `[[Reject]]` | [`Self::reject`] |
+///
+/// Built by `NewPromiseCapability(C)` (§27.2.1.5); see
+/// [`crate::promise_dispatch::PromiseBuilder`] for the root-aware
+/// constructors that pair the promise with its `{resolve, reject}`
+/// closures.
+///
+/// Otter adds [`Self::context`] so the capability remembers which
+/// execution context owned it at creation time — needed when
+/// settlement work runs in a later mutator turn (e.g. host-driven
+/// cross-thread resolution).
 #[derive(Debug, Clone)]
 pub struct PromiseCapability {
-    /// The promise this capability settles.
+    /// `[[Promise]]` — the promise this capability settles.
     pub promise: Value,
-    /// Native function: `resolve(v)` settles `promise` as fulfilled.
+    /// `[[Resolve]]` — native function: `resolve(v)` settles `promise` as fulfilled.
     pub resolve: Value,
-    /// Native function: `reject(reason)` settles `promise` as rejected.
+    /// `[[Reject]]` — native function: `reject(reason)` settles `promise` as rejected.
     pub reject: Value,
-    /// VM context captured when the capability was created.
+    /// Otter-specific: VM context captured when the capability was created.
     pub context: Option<ExecutionContext>,
 }
 
@@ -557,7 +591,7 @@ impl PurePromise {
         PromiseThenOutcome {
             immediate_job: outcome
                 .immediate_reaction
-                .and_then(|(reaction, value)| reaction_to_microtask(heap, reaction, value)),
+                .and_then(|(reaction, value)| new_promise_reaction_job(heap, reaction, value)),
         }
     }
 }
@@ -582,7 +616,7 @@ impl JsPromise for PurePromise {
         PromiseSettleJobs {
             jobs: reactions
                 .into_iter()
-                .filter_map(|r| reaction_to_microtask(heap, r, value))
+                .filter_map(|r| new_promise_reaction_job(heap, r, value))
                 .collect(),
         }
     }
@@ -602,7 +636,7 @@ impl JsPromise for PurePromise {
         PromiseSettleJobs {
             jobs: reactions
                 .into_iter()
-                .filter_map(|r| reaction_to_microtask(heap, r, reason))
+                .filter_map(|r| new_promise_reaction_job(heap, r, reason))
                 .collect(),
         }
     }
@@ -899,7 +933,23 @@ impl JsPromise for JsPromiseHandle {
     }
 }
 
-fn reaction_to_microtask(
+/// ECMA-262 §27.2.2.1 `NewPromiseReactionJob(reaction, argument)`.
+///
+/// Turns a queued [`PromiseReaction`] record into a [`Microtask`] the
+/// drain can run. Spec returns a `{ [[Job]], [[Realm]] }` record;
+/// Otter inlines `[[Realm]]` into the microtask's execution context
+/// and returns the job directly.
+///
+/// The async-resume reaction variants are Otter extensions that
+/// settle a parked frame instead of invoking a JS callable. They
+/// follow the same enqueue-to-microtask contract so the host
+/// observes them in FIFO order alongside ordinary reactions.
+///
+/// Returns `None` when the reaction's parked frame has already been
+/// consumed (e.g. a duplicate settlement raced the drain); the
+/// caller skips the empty job.
+#[must_use]
+pub fn new_promise_reaction_job(
     heap: &mut otter_gc::GcHeap,
     reaction: PromiseReaction,
     value: Value,
@@ -1084,6 +1134,42 @@ mod tests {
         p.perform_then(&mut heap, None, None, cap);
         let jobs = p.fulfill(&mut heap, n(11));
         assert_eq!(jobs.jobs.len(), 2);
+    }
+
+    /// FIFO order on a fulfill drain. ECMA-262 §27.2.1.4 step 5.b
+    /// requires reactions to enqueue in registration order; this
+    /// pins the invariant at the [`PurePromise`] level so a future
+    /// reactions-storage change cannot silently reorder them.
+    #[test]
+    fn fulfill_jobs_preserve_reaction_registration_order() {
+        let mut heap = otter_gc::GcHeap::new().expect("heap");
+        let p = PurePromise::pending(&mut heap).expect("promise");
+        let mut caps = Vec::new();
+        for tag in 0..4 {
+            let mut cap = cap_for(&mut heap);
+            // Use the (otherwise undefined) resolve slot as a tag so
+            // we can assert per-job identity after the drain.
+            cap.resolve = n(tag);
+            caps.push(cap.clone());
+            p.perform_then(&mut heap, None, None, cap);
+        }
+        let jobs = p.fulfill(&mut heap, n(99));
+        assert_eq!(jobs.jobs.len(), caps.len());
+        // The fulfill-side reaction with handler `None` resolves the
+        // downstream capability by invoking its `resolve` callable —
+        // exactly the slot we tagged above. The microtask's
+        // `callee` is that resolve value.
+        let observed_tags: Vec<i32> = jobs
+            .jobs
+            .iter()
+            .map(|job| {
+                job.callee
+                    .as_number()
+                    .and_then(|n| n.as_smi())
+                    .expect("tagged resolve")
+            })
+            .collect();
+        assert_eq!(observed_tags, vec![0, 1, 2, 3]);
     }
 
     #[test]

@@ -19,7 +19,7 @@ work is:
 | 5.2   | IC / shape / frame snapshots               | DONE 2026-05-24       |
 | 5.3   | GC snapshot bridge                         | DONE 2026-05-24       |
 | 6.1   | Object internal-method vtable evaluation   | DEFERRED 2026-05-24   |
-| 6.2   | Tighten Promise capability / job records   | Open                  |
+| 6.2   | Tighten Promise capability / job records   | DONE 2026-05-24       |
 | 6.3   | Derive Trace / Finalize for new GC bodies  | `Pelt` DONE 2026-05-24 (19/20 bodies, IteratorState enum stays manual); `Groom` deferred |
 
 Open carry-over tech debt from Phase 2.3 / 2.4 (not yet promoted to
@@ -273,7 +273,7 @@ wrap either a `RuntimeClassSpec` (legacy) or a
   IC hit rate below 80 %, average chain depth above 4, or a
   measurable Proxy-heavy regression.
 
-### Task 6.2 — Tighten Promise Capability / Job Records
+### Task 6.2 — Tighten Promise Capability / Job Records — DONE 2026-05-24
 
 - Goal: make Promise implementation read like ECMA-262 records.
 - Touches: `promise.rs`, `promise_dispatch.rs`, `microtask.rs`,
@@ -286,6 +286,24 @@ wrap either a `RuntimeClassSpec` (legacy) or a
 - Risk: Medium/High.
 - Effort: M.
 - Depends on: 1.1 ✓ (unblocked).
+- **Status:** Shipped. The Promise records were already largely
+  spec-shaped from Phase 1; this task ratchets that into the public
+  API: [`PromiseCapability`] now carries explicit §27.2.1.1 field
+  annotations (`[[Promise]]` / `[[Resolve]]` / `[[Reject]]`),
+  [`PromiseReaction`] documents the §27.2.1.6 record shape
+  (`[[Capability]]` / `[[Type]]` / `[[Handler]]`), and the
+  reaction→job converter is renamed
+  [`new_promise_reaction_job`] to match
+  §27.2.2.1 `NewPromiseReactionJob`. FIFO acceptance lives in
+  [`crates/otter-runtime/tests/microtask_ordering.rs`]
+  (`promise_reaction_chain_drains_in_spec_fifo_order`,
+  `queue_microtask_and_promise_then_share_a_single_fifo`,
+  `promise_then_handler_throw_routes_value_into_catch_and_unblocks_siblings`)
+  plus a new VM-level unit test
+  `fulfill_jobs_preserve_reaction_registration_order` that pins
+  registration-order draining at the [`PurePromise`] layer. The
+  isolate-local microtask queue + Tokio token boundary are
+  unchanged.
 
 ### Task 6.3 — Derive Trace / Finalize For New GC Bodies
 

@@ -1,0 +1,7 @@
+error: missing required `#[pelt(tag = <CONST>)]` attribute on the body
+ --> tests/compile_fail/pelt_missing_tag.rs:9:10
+  |
+9 | #[derive(Pelt)]
+  |          ^^^^
+  |
+  = note: this error originates in the derive macro `Pelt` (in Nightly builds, run with -Z macro-backtrace for more info)

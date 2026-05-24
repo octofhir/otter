@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
-use crate::object::{DescriptorKind, JsObject, PropertyDescriptor};
+use crate::object::{JsObject, PropertyDescriptor};
 use crate::string::JsString;
 use crate::{NativeCtx, Value};
 use otter_gc::heap::RootSlotVisitor;
@@ -76,6 +76,14 @@ enum NativeOwnProperty {
     Builtin,
     Deleted,
     Overridden(PropertyDescriptor),
+}
+
+impl crate::pelt::PeltField for NativeOwnProperty {
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+        if let Self::Overridden(desc) = self {
+            <PropertyDescriptor as crate::pelt::PeltField>::pelt_trace(desc, visitor);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,25 +191,34 @@ impl std::fmt::Debug for NativeCall {
 pub type NativeTraceFn = dyn Fn(&mut SlotVisitor<'_>);
 
 /// Heap payload for [`Value::NativeFunction`].
+#[derive(otter_macros::Pelt)]
+#[pelt(tag = NATIVE_FUNCTION_BODY_TYPE_TAG)]
 pub struct NativeFunctionBody {
     /// Display name (used in stack traces and `Function.prototype.
     /// toString` once that lands).
+    #[pelt(skip)]
     name: &'static str,
     /// ECMAScript `.length` metadata.
+    #[pelt(skip)]
     length: u8,
     /// Static function pointer or dynamic closure payload.
+    #[pelt(skip)]
     call: NativeCallStorage,
     /// JS values owned by the native payload and therefore traced
     /// strongly while this function is reachable.
     captures: SmallVec<[Value; 4]>,
     /// Optional trace hook for native-owned state such as shared
-    /// Promise combinator slots.
+    /// Promise combinator slots. The trace closure walks the
+    /// payload's GC slots itself; the derive dispatches to a
+    /// per-field helper rather than the generic `PeltField` path.
+    #[pelt(via = trace_native_trace_hook)]
     trace: Option<Rc<NativeTraceFn>>,
     /// Own property state for the built-in `name` property.
     name_property: NativeOwnProperty,
     /// Own property state for the built-in `length` property.
     length_property: NativeOwnProperty,
     /// Attribute policy for built-in metadata descriptors.
+    #[pelt(skip)]
     metadata: NativeFunctionMetadata,
     /// Ordinary own properties installed on native callables, such
     /// as `%Proxy%.revocable`.
@@ -215,40 +232,12 @@ pub struct NativeFunctionBody {
     prototype_override: Option<Value>,
 }
 
-impl otter_gc::SafeTraceable for NativeFunctionBody {
-    const TYPE_TAG: u8 = NATIVE_FUNCTION_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        for value in &self.captures {
-            value.trace_value_slots(visitor);
-        }
-        if let Some(trace) = &self.trace {
-            trace(visitor);
-        }
-        trace_native_own_property(&self.name_property, visitor);
-        trace_native_own_property(&self.length_property, visitor);
-        let p = &self.own_properties as *const JsObject as *mut RawGc;
-        visitor(p);
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
-}
-
-fn trace_native_own_property(property: &NativeOwnProperty, visitor: &mut SlotVisitor<'_>) {
-    let NativeOwnProperty::Overridden(desc) = property else {
-        return;
-    };
-    match &desc.kind {
-        DescriptorKind::Data { value } => value.trace_value_slots(visitor),
-        DescriptorKind::Accessor { getter, setter } => {
-            if let Some(getter) = getter {
-                getter.trace_value_slots(visitor);
-            }
-            if let Some(setter) = setter {
-                setter.trace_value_slots(visitor);
-            }
-        }
+fn trace_native_trace_hook(
+    trace: &Option<Rc<NativeTraceFn>>,
+    visitor: &mut SlotVisitor<'_>,
+) {
+    if let Some(t) = trace {
+        t(visitor);
     }
 }
 

@@ -195,7 +195,8 @@ impl From<otter_gc::OutOfMemory> for CollectionError {
 /// deletes, clears, and later additions correctly.
 pub type JsMap = otter_gc::Gc<MapBody>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, otter_macros::Pelt)]
+#[pelt(tag = MAP_BODY_TYPE_TAG)]
 /// GC-allocated storage backing every [`JsMap`] handle.
 pub struct MapBody {
     entries: Vec<MapEntry>,
@@ -207,6 +208,20 @@ struct MapEntry {
     key_hash: Option<MapKey>,
     key: Option<Value>,
     value: Option<Value>,
+}
+
+impl crate::pelt::PeltField for MapEntry {
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+        if let Some(key_hash) = &self.key_hash {
+            <MapKey as crate::pelt::PeltField>::pelt_trace(key_hash, visitor);
+        }
+        if let Some(key) = &self.key {
+            key.trace_value_slots(visitor);
+        }
+        if let Some(value) = &self.value {
+            value.trace_value_slots(visitor);
+        }
+    }
 }
 
 impl MapEntry {
@@ -237,26 +252,6 @@ impl MapEntry {
     }
 }
 
-impl otter_gc::SafeTraceable for MapBody {
-    const TYPE_TAG: u8 = MAP_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        for entry in &self.entries {
-            if let Some(key_hash) = &entry.key_hash {
-                trace_map_key(key_hash, visitor);
-            }
-            if let Some(key) = &entry.key {
-                key.trace_value_slots(visitor);
-            }
-            if let Some(value) = &entry.value {
-                value.trace_value_slots(visitor);
-            }
-        }
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
-}
 
 /// Allocate a fresh empty `Map`.
 pub fn alloc_map(heap: &mut otter_gc::GcHeap) -> Result<JsMap, otter_gc::OutOfMemory> {
@@ -479,7 +474,8 @@ pub fn map_ptr_eq(a: JsMap, b: JsMap) -> bool {
 /// JS `Set` — ordered unique-element store.
 pub type JsSet = otter_gc::Gc<SetBody>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, otter_macros::Pelt)]
+#[pelt(tag = SET_BODY_TYPE_TAG)]
 /// GC-allocated storage backing every [`JsSet`] handle.
 pub struct SetBody {
     /// Insertion-ordered `[[SetData]]` list. Deleted entries become
@@ -493,6 +489,17 @@ pub struct SetBody {
 struct SetEntry {
     key_hash: Option<MapKey>,
     value: Option<Value>,
+}
+
+impl crate::pelt::PeltField for SetEntry {
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+        if let Some(key_hash) = &self.key_hash {
+            <MapKey as crate::pelt::PeltField>::pelt_trace(key_hash, visitor);
+        }
+        if let Some(value) = &self.value {
+            value.trace_value_slots(visitor);
+        }
+    }
 }
 
 impl SetEntry {
@@ -517,23 +524,6 @@ impl SetEntry {
     }
 }
 
-impl otter_gc::SafeTraceable for SetBody {
-    const TYPE_TAG: u8 = SET_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        for entry in &self.entries {
-            if let Some(key_hash) = &entry.key_hash {
-                trace_map_key(key_hash, visitor);
-            }
-            if let Some(value) = &entry.value {
-                value.trace_value_slots(visitor);
-            }
-        }
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
-}
 
 /// Allocate a fresh empty `Set`.
 pub fn alloc_set(heap: &mut otter_gc::GcHeap) -> Result<JsSet, otter_gc::OutOfMemory> {
@@ -727,32 +717,31 @@ impl WeakCollectionKey {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, otter_macros::Pelt)]
+#[pelt(tag = WEAK_MAP_BODY_TYPE_TAG, ephemeron_via = weak_map_ephemeron_walk)]
 /// GC-allocated storage backing every [`JsWeakMap`] handle.
+///
+/// Ephemeron entries are not ordinary strong edges; the derive
+/// emits an empty trace for [`entries`](Self::entries) and the
+/// `ephemeron_via` hook walks the key / value pairs through the
+/// `EphemeronVisitor` so the VM fixpoint marks values only after the
+/// key is already live.
 pub struct WeakMapBody {
+    #[pelt(skip)]
     entries: Vec<(WeakCollectionKey, Value)>,
     prototype_override: Option<Value>,
 }
 
-impl otter_gc::SafeTraceable for WeakMapBody {
-    const TYPE_TAG: u8 = WEAK_MAP_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        // Ephemeron entries are not ordinary strong edges. The VM
-        // fixpoint marks values only after the key is already live.
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
-
-    fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
-        for (key, value) in &mut self.entries {
-            if let WeakCollectionKey::Object(raw) = key {
-                let key_slot = raw as *mut RawGc;
-                let mut visit_value_slots =
-                    |slot_visitor: &mut SlotVisitor<'_>| value.trace_value_slots(slot_visitor);
-                visitor(key_slot, &mut visit_value_slots);
-            }
+fn weak_map_ephemeron_walk(
+    body: &mut WeakMapBody,
+    visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,
+) {
+    for (key, value) in &mut body.entries {
+        if let WeakCollectionKey::Object(raw) = key {
+            let key_slot = raw as *mut RawGc;
+            let mut visit_value_slots =
+                |slot_visitor: &mut SlotVisitor<'_>| value.trace_value_slots(slot_visitor);
+            visitor(key_slot, &mut visit_value_slots);
         }
     }
 }
@@ -943,30 +932,28 @@ pub fn weak_map_delete(
 /// JS `WeakSet` — weakly-held object / unregistered-symbol set.
 pub type JsWeakSet = otter_gc::Gc<WeakSetBody>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, otter_macros::Pelt)]
+#[pelt(tag = WEAK_SET_BODY_TYPE_TAG, ephemeron_via = weak_set_ephemeron_walk)]
 /// GC-allocated storage backing every [`JsWeakSet`] handle.
+///
+/// WeakSet keys are weak and never traced as strong edges; the
+/// derive skips [`entries`](Self::entries) and the `ephemeron_via`
+/// hook walks the keys through the `EphemeronVisitor`.
 pub struct WeakSetBody {
+    #[pelt(skip)]
     entries: Vec<WeakCollectionKey>,
     prototype_override: Option<Value>,
 }
 
-impl otter_gc::SafeTraceable for WeakSetBody {
-    const TYPE_TAG: u8 = WEAK_SET_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        // WeakSet keys are weak and never traced as strong edges.
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
-
-    fn trace_ephemeron_slots_safe(&mut self, visitor: &mut otter_gc::trace::EphemeronVisitor<'_>) {
-        for key in &mut self.entries {
-            if let WeakCollectionKey::Object(raw) = key {
-                let key_slot = raw as *mut RawGc;
-                let mut visit_value_slots = |_slot_visitor: &mut SlotVisitor<'_>| {};
-                visitor(key_slot, &mut visit_value_slots);
-            }
+fn weak_set_ephemeron_walk(
+    body: &mut WeakSetBody,
+    visitor: &mut otter_gc::trace::EphemeronVisitor<'_>,
+) {
+    for key in &mut body.entries {
+        if let WeakCollectionKey::Object(raw) = key {
+            let key_slot = raw as *mut RawGc;
+            let mut visit_value_slots = |_slot_visitor: &mut SlotVisitor<'_>| {};
+            visitor(key_slot, &mut visit_value_slots);
         }
     }
 }
@@ -1219,9 +1206,11 @@ fn weak_collection_key(
     Err(CollectionError::NonObjectKey)
 }
 
-fn trace_map_key(key: &MapKey, visitor: &mut SlotVisitor<'_>) {
-    if let MapKey::ObjectValue(value) = key {
-        value.trace_value_slots(visitor);
+impl crate::pelt::PeltField for MapKey {
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+        if let MapKey::ObjectValue(value) = self {
+            value.trace_value_slots(visitor);
+        }
     }
 }
 

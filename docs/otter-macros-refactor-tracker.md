@@ -31,8 +31,8 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 | `#[dive]` attr   | `crates/otter-macros/src/dive.rs`           | `tests/dive_*.rs`       | Pending                        |
 | `burrow!`        | `crates/otter-macros/src/burrow.rs`         | `tests/burrow_*.rs`     | Deferred (Q3)                  |
 | `lodge!`         | `crates/otter-macros/src/lodge.rs`          | (smoke via consumer ports) | **DONE 2026-05-24** (shipped with prefix/name/capabilities/exports surface; trybuild matrix pending) |
-| `Pelt` derive    | `crates/otter-macros/src/derive_pelt.rs`    | `tests/derive_pelt.rs`  | Pending                        |
-| `Groom` derive   | `crates/otter-macros/src/derive_groom.rs`   | `tests/derive_groom.rs` | Pending                        |
+| `Pelt` derive    | `crates/otter-macros/src/derive_pelt.rs`    | `tests/derive_pelt.rs` + `crates/otter-vm/tests/compile_fail/pelt_*.rs` | **DONE 2026-05-24** (Phase 6.3 first cut: `tag`, `skip`, struct-only; six bodies migrated; trybuild matrix on missing-tag / untraceable-field / enum) |
+| `Groom` derive   | `crates/otter-macros/src/derive_groom.rs`   | `tests/derive_groom.rs` | Deferred — no `Finalize` trait in `otter-gc` yet; resume once sweep wiring + finalize hook RFC lands |
 
 Per-macro notes (referenced from the table above):
 
@@ -110,6 +110,256 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — Pelt third batch: derive feature-complete
+
+Pushed the derive to cover every remaining hand-written
+`SafeTraceable` impl except `IteratorState` (enum body — derive
+rejects enums up-front so per-variant slot tracing stays explicit).
+
+New macro surface:
+
+- **`#[pelt(via = path)]`** — per-field override that emits
+  `path(&self.field, visitor)` instead of the generic `PeltField`
+  dispatch. Lets bodies thread the visitor through bespoke walkers
+  (native trace closures, frame / cold-frame slot walks, promise
+  capability triples, weakly-held entry vectors) without dropping
+  the derive. `#[pelt(skip)]` and `#[pelt(via = ...)]` are
+  mutually exclusive on the same field.
+- **`#[pelt(ephemeron_via = path)]`** — top-level attribute on the
+  struct. Adds a `trace_ephemeron_slots_safe` override calling
+  `path(&mut self, visitor: &mut EphemeronVisitor<'_>)` alongside
+  the derived `trace_slots_safe`. Used by `WeakMapBody` /
+  `WeakSetBody` so the WeakMap / WeakSet ephemeron fixpoint stays
+  on the derive instead of forking a hand-written impl.
+
+`PeltField` blanket impls added:
+
+- `std::collections::HashMap<K, V: PeltField, S>` — walks values.
+- `indexmap::IndexMap<K, V: PeltField, S>` — same.
+- Tuple `(A: PeltField, B: PeltField)` and `(A, B, C)`.
+- `std::sync::Arc<T: ?Sized>` / `std::rc::Rc<T: ?Sized>` — no-op
+  for foreign-payload Arc / Rc (JSON source bytes, libloading
+  handles, dyn closure objects); bodies that wrap a GC-bearing
+  payload inside Arc / Rc still need a hand-written impl.
+
+Bodies migrated this round (8 total):
+
+- **`NativeFunctionBody`** — `#[pelt(via)]` on the
+  `Option<Rc<NativeTraceFn>>` field invokes the native trace
+  closure when present; everything else (`captures` SmallVec,
+  `name_property` / `length_property` `NativeOwnProperty`,
+  `own_properties` `JsObject`, `prototype_override`) flows through
+  the derive. `NativeOwnProperty` gets a `PeltField` impl that
+  reuses the existing `DescriptorKind` walker.
+- **`BoundFunctionBody`** — derive driven by `PeltField` impls on
+  `DescriptorKind`, `PropertyDescriptor`, and
+  `BoundFunctionMetadataProperty` (the last lives in the body's
+  own module). `builtin_length: NumberValue` rides
+  `#[pelt(skip)]` (no GC slot).
+- **`ArrayBody`** — all HashMap value-walks flow through the new
+  `HashMap<K, V>` blanket. The `(JsSymbol, Value)` symbol property
+  vector uses `#[pelt(via)]` because the spec-mandated identity-
+  based `JsSymbol` half does not contribute a slot.
+- **`MapBody`** + **`SetBody`** — derive plus per-entry
+  `PeltField` impls on `MapEntry` / `SetEntry` and a `PeltField`
+  for the `MapKey` enum (only `ObjectValue` carries a slot).
+- **`WeakMapBody`** + **`WeakSetBody`** — derive with
+  `ephemeron_via` and `#[pelt(skip)]` on the weak entry vector;
+  the ephemeron walker stays in the body's own module.
+- **`GeneratorBody`** + **`ParkedFrameBody`** — three per-field
+  `via` helpers cover `Option<Box<Frame>>`,
+  `Option<Box<ColdFrame>>`, and
+  `Option<PromiseCapability>` without dragging `Frame` /
+  `ColdFrame` `PeltField` impls into scope (their walkers already
+  exist as `trace_frame_slots` / `trace_cold_slots`).
+
+Hand-written impl left:
+
+- **`IteratorState`** — enum body, intentionally outside the
+  derive. The per-variant slot walks pattern-match against many
+  one-off shapes; expressing them through `via` would just move
+  the same code into a helper without compression.
+
+Total migration count: **19 of 20** hand-written `SafeTraceable`
+impls now ride the derive (≈95%); the lone hold-out is the
+`IteratorState` enum body.
+
+Tests / clippy:
+
+- `cargo test -p otter-vm --lib` 534/534, no regressions.
+- `cargo test -p otter-vm --test compile_fail compile_fail_pelt_derive_invariants`
+  3/3 (re-blessed `pelt_untraceable_field.stderr` after the new
+  blanket impls / per-body `PeltField` entries showed up in
+  rustc's trait-suggestion list).
+- `cargo test -p otter-runtime --all-features` only failure is
+  the pre-existing `dependency_graph::active_product_crates_do_not_depend_on_otter_vm_directly`
+  (introduced by Phase 4.3 commit 745f1ccf; unrelated to this
+  work).
+- `cargo clippy -p otter-vm -p otter-macros --all-targets
+  --all-features -- -D warnings` clean.
+
+Next: `#[derive(Groom)]` still blocked on the `Finalize` trait +
+sweep dispatch RFC. Enum-body support for `Pelt` would close the
+last 5% (`IteratorState`) but the variant walk already reads
+cleanly enough as a hand-written `match`.
+
+### 2026-05-24 — Pelt second batch: regexp / weak-refs / promise
+
+Migrated four more hand-written `SafeTraceable` impls to
+`#[derive(Pelt)]`:
+
+- **`JsRegExpBody`** — `Regex`, `RegExpFlags`, and the
+  `last_index_writable` / `extensible` bools land behind
+  `#[pelt(skip)]`; `RefCell<Value>`, `Option<JsObject>`,
+  `Option<Value>`, `Vec<u16>`, and `String` flow through the
+  existing blanket impls. The hand-written impl wrapped
+  `Option<JsObject>` in `Value::object(*expando)` before tracing
+  — the derived form visits the same compressed-offset slot
+  through `<Gc<ObjectBody> as PeltField>::pelt_trace`, byte-for-
+  byte equivalent in observable behaviour.
+- **`WeakRefBody`** — `target: RawGc` carries `#[pelt(skip)]` per
+  §27.7.3 (weak by spec); the `prototype_override: Option<Value>`
+  slot flows through the derive.
+- **`FinalizationRegistryBody`** — `cleanup_callback: Value`,
+  `cells: Vec<FinalizerCell>`, and `prototype_override:
+  Option<Value>` go through the derive;
+  `Option<ExecutionContext>` is skipped (no GC slot). The inner
+  `FinalizerCell` is **not** registered as its own GC body; it
+  keeps a hand-written `impl PeltField` so the derive's
+  `Vec<FinalizerCell>` blanket can recurse without dragging a
+  fake `Traceable::TYPE_TAG` into the table.
+- **`PurePromiseBody`** — added `impl PeltField for PromiseState`
+  and `impl PeltField for PromiseReaction` (delegating to the
+  existing private `trace_value_slots` bodies), then derived the
+  body; `is_handled: bool` is the only `#[pelt(skip)]` field.
+
+Net migration count after this round: 12 of 19 hand-written
+`SafeTraceable` impls now ride the derive (≈63%).
+
+Remaining hand-rolled, blocked on type-shape work:
+
+- `ArrayBody` / `MapBody` / `SetBody` / `WeakMapBody` /
+  `WeakSetBody` — `IndexMap` / `FxHashMap` value walks; need a
+  `PeltField` impl for the map shapes or a per-body manual impl
+  kept by hand.
+- `BoundFunctionBody` / `NativeFunctionBody` — both reach into
+  `BoundFunctionMetadataProperty` / `DescriptorKind` field
+  walkers; needs `PeltField` impls for the descriptor types.
+- `GeneratorBody` / `ParkedFrameBody` — need `PeltField` for
+  `Frame` / `ColdFrame` / `PromiseCapability`.
+- `IteratorState` — enum body, intentionally outside the derive
+  (the macro rejects enums up-front so per-variant slot tracing
+  stays explicit).
+
+Tests / clippy:
+
+- `cargo test -p otter-vm --lib` 534 passing (+0; the migrations
+  are behaviour-preserving).
+- `cargo test -p otter-vm --test compile_fail compile_fail_pelt_derive_invariants`
+  3/3 passing; the `pelt_untraceable_field.stderr` snapshot was
+  re-blessed (`TRYBUILD=overwrite`) after the new
+  `FinalizerCell` / `PromiseReaction` / `PromiseState` impls
+  appeared in the rustc trait-suggestion list. Every new
+  `PeltField` impl regresses this snapshot — acceptable while the
+  set is still growing.
+- `cargo clippy -p otter-vm -p otter-macros --all-targets
+  --all-features -- -D warnings` clean.
+
+Next: cluster the descriptor-shaped helper impls
+(`BoundFunctionMetadataProperty`, `DescriptorKind`) into one
+follow-up so `BoundFunctionBody` + `NativeFunctionBody` can both
+land on the derive in a single commit. Frame / ColdFrame
+`PeltField` is a larger surface and probably wants its own PR.
+
+### 2026-05-24 — `#[derive(Pelt)]` shipped (Phase 6.3 first cut)
+
+First cut of `#[derive(Pelt)]` lands at
+`crates/otter-macros/src/derive_pelt.rs`. The derive expands to one
+`impl ::otter_gc::SafeTraceable` block whose `trace_slots_safe` body
+calls `<FieldTy as ::otter_vm::pelt::PeltField>::pelt_trace(&self.field,
+visitor)` on every non-`#[pelt(skip)]` field. Missing `PeltField`
+impls surface at the field's span as ordinary trait-bound errors,
+satisfying the Phase 6.3 acceptance gate.
+
+Surface:
+
+- `#[pelt(tag = <CONST>)]` (required, on the struct). Reuses the
+  per-body `<NAME>_TYPE_TAG` const each hand-written impl already
+  declares — no new tag coordination.
+- `#[pelt(skip)]` (per field). Suppresses the call entirely; used
+  for `bool` / `u64` / `String` / `BigInt` / `TemporalPayload` /
+  `IntlPayload` / non-cage `JsString` fields.
+- Struct-only. Enums + unions are rejected with a clear message so
+  per-variant slot tracing keeps its hand-written form.
+
+Helper trait lives at `crates/otter-vm/src/pelt.rs`:
+
+- `PeltField::pelt_trace(&self, &mut SlotVisitor<'_>)`.
+- Blanket impls for `Value`, `Gc<T>` (with `is_null()` guard
+  matching the hand-rolled call sites), `Option<T>`, `Vec<T>`,
+  `[T; N]`, `Box<T>`, `RefCell<T>`.
+- No-op impls for `bool` / `char` / every integer / `f32` / `f64`
+  / `String` / `()` so the derive can call uniformly without
+  per-field AST carve-outs.
+- Intentionally **no** `Cell<Value>` impl: `Cell::get()` would
+  visit a value copy, not the cell slot, breaking relocation.
+  Fields with that shape stay on a hand-written `SafeTraceable`
+  impl.
+
+`Value::trace_value_slots` promoted from `pub(crate)` to `pub`
+because the helper trait lives in `otter-vm` and forwards through
+it from the derive expansion.
+
+Bodies migrated to the derive in this commit:
+
+- `UpvalueCellBody` — one `Value` field.
+- `ProxyBodyGc` — two `Value`s + skipped `bool`.
+- `JsClosureBody` — `Vec<UpvalueCell>` + `Option<Value>` + skipped
+  `function_id: u32`.
+- `ClassConstructorBody` — `Value` + two `JsObject` handles. The
+  pre-derive impl guarded each `JsObject` with `is_null()`; the
+  guard is now hoisted into the `Gc<T>` blanket impl on
+  `PeltField`, so the derived `trace_slots_safe` is byte-identical
+  in observable behaviour.
+- `SymbolBody` — all three fields `#[pelt(skip)]` for now (the
+  `JsString` description and `WellKnown` enum aren't `PeltField`
+  yet); the derive replaces an empty `trace_slots_safe` body and
+  the `JsString`-on-GC migration will drop the skip on
+  `description`.
+- `BigIntBody` / `IntlBody` / `TemporalBody` — leaf payloads with
+  no GC slots; the derive replaces the empty hand-written body.
+
+`#[derive(Groom)]` is deferred. `otter-gc` does not have a
+`Finalize` trait yet (the existing `crates/otter-gc/src/finalize.rs`
+module owns weak/registry bookkeeping, not a per-body finalize
+hook), and the sweep path has no place to dispatch one. Resume
+after the finalize-hook RFC + sweep wiring lands.
+
+Tests:
+
+- `crates/otter-macros/tests/derive_pelt.rs` — three integration
+  tests covering `Value` / `Option` / `RefCell` field shapes,
+  skipped primitives, and a struct whose every field is skipped.
+- `crates/otter-vm/tests/compile_fail/pelt_missing_tag.rs` +
+  `pelt_untraceable_field.rs` + `pelt_enum_rejected.rs` — trybuild
+  matrix wired into `tests/compile_fail.rs::compile_fail_pelt_derive_invariants`.
+- `cargo test -p otter-vm --lib` 530 → **534** (four new `pelt`
+  unit tests; no regressions).
+- `cargo clippy -p otter-vm -p otter-macros --all-targets
+  --all-features -- -D warnings` green.
+
+Workspace-wide `cargo test --all --all-features` has one
+pre-existing failure (`otter-runtime::dependency_graph::active_product_crates_do_not_depend_on_otter_vm_directly`,
+introduced by 745f1ccf — `otter-web` directly depends on
+`otter-vm` since the Phase 4.3 port). Unrelated to this work.
+
+Next: continue migrating the remaining `SafeTraceable` impls that
+fit the derive (`JsRegExpBody` is a good candidate — it already
+uses only `RefCell<Value>` plus `Option<JsObject>` plus
+`Option<Value>` plus skipped `bool`). Add a `Cell<Value>`-safe
+escape hatch once a GC body actually needs it. Pick up
+`#[derive(Groom)]` after the finalize-hook RFC.
 
 ### 2026-05-24 — otter-web ported to couch! (4.3 wrap)
 

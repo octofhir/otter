@@ -19,7 +19,8 @@
 //! - <https://tc39.es/ecma262/#sec-class-definitions>
 //! - <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
 
-use otter_gc::raw::{RawGc, SlotVisitor};
+use otter_gc::raw::RawGc;
+use otter_macros::Pelt;
 
 use crate::Value;
 use crate::object::JsObject;
@@ -30,7 +31,8 @@ pub const CLASS_CONSTRUCTOR_BODY_TYPE_TAG: u8 = 0x1f;
 /// GC-allocated payload backing every [`Value::ClassConstructor`].
 /// Holds the callable, the instance prototype, and the static-side
 /// object the class exposes.
-#[derive(Debug)]
+#[derive(Debug, Pelt)]
+#[pelt(tag = CLASS_CONSTRUCTOR_BODY_TYPE_TAG)]
 pub struct ClassConstructorBody {
     /// The actual callable (`Value::Function` / `Value::Closure` /
     /// `Value::NativeFunction`) the runtime invokes for `new C(...)`
@@ -45,22 +47,6 @@ pub struct ClassConstructorBody {
     /// to `C`'s static object so static inheritance just falls out of
     /// the existing prototype walker.
     pub statics: JsObject,
-}
-
-impl otter_gc::SafeTraceable for ClassConstructorBody {
-    const TYPE_TAG: u8 = CLASS_CONSTRUCTOR_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        self.ctor.trace_value_slots(visitor);
-        if !self.prototype.is_null() {
-            let p = &self.prototype as *const JsObject as *mut RawGc;
-            visitor(p);
-        }
-        if !self.statics.is_null() {
-            let p = &self.statics as *const JsObject as *mut RawGc;
-            visitor(p);
-        }
-    }
 }
 
 /// Cheap-to-clone class-constructor handle. Wraps a

@@ -100,6 +100,7 @@ pub mod object;
 mod object_internal_ops;
 pub mod object_statics;
 mod operand_decode;
+pub mod pelt;
 pub mod promise;
 pub mod promise_dispatch;
 mod promise_ops;

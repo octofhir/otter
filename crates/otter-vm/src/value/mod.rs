@@ -1900,7 +1900,7 @@ impl Value {
     /// Immediate variants (`undefined`, `null`, `hole`, booleans,
     /// numbers, function ids) hold no GC slot and are skipped.
     #[allow(dead_code)] // Wired up at Phase-1 swap; ~150 call sites flip over from legacy::Value.
-    pub(crate) fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    pub fn trace_value_slots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         let tag = top_tag(self.0);
         if (TAG_PTR_OBJECT..=TAG_PTR_OTHER).contains(&tag) {
             let slot = &self.0 as *const u64 as *mut otter_gc::raw::RawGc;

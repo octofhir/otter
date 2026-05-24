@@ -42,7 +42,8 @@ pub const ARRAY_BODY_TYPE_TAG: u8 = 0x12;
 pub type JsArray = otter_gc::Gc<ArrayBody>;
 
 /// GC-allocated storage backing every [`JsArray`] handle.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, otter_macros::Pelt)]
+#[pelt(tag = ARRAY_BODY_TYPE_TAG)]
 pub struct ArrayBody {
     /// Dense element storage. Crate-internal callers must go through
     /// this module's helpers so growth is heap-accounted.
@@ -50,6 +51,7 @@ pub struct ArrayBody {
     /// Logical `length` property. This may be larger than dense
     /// storage when `length` is assigned directly or when sparse
     /// elements are written.
+    #[pelt(skip)]
     pub(crate) length: usize,
     /// Sparse array-indexed own elements.
     ///
@@ -71,12 +73,14 @@ pub struct ArrayBody {
     /// Descriptor flags for properties installed through
     /// `Object.defineProperty`. Missing entries use the ordinary
     /// array defaults for data properties.
+    #[pelt(skip)]
     pub(crate) property_flags: Option<HashMap<String, PropertyFlags>>,
     /// Symbol-keyed own properties. Stored as a vector of
     /// `(JsSymbol, Value)` pairs (mirroring `JsObject::symbol_props`)
     /// because `JsSymbol` is identity-based — `ptr_eq` is the
     /// authoritative comparator. Typical arrays have zero entries,
     /// so the `Option` keeps the inline footprint at one word.
+    #[pelt(via = trace_array_symbol_properties)]
     pub(crate) symbol_properties: Option<Vec<(crate::symbol::JsSymbol, Value)>>,
     /// Verbatim slice of input text captured by `JSON.parse` for the
     /// lazy stringify memcpy fast-path. `Some` only when the array
@@ -84,21 +88,39 @@ pub struct ArrayBody {
     /// brackets `[…]` exactly.
     ///
     /// Spec: <https://tc39.es/ecma262/#sec-json.stringify> §25.5.2
+    #[pelt(skip)]
     pub(crate) source_bytes: Option<Arc<[u8]>>,
     /// `true` once the array has been mutated since `source_bytes`
     /// was captured. Always `false` while `source_bytes` is `None`
     /// (no fast path is in play to invalidate).
+    #[pelt(skip)]
     pub(crate) dirty: bool,
     /// `[[Extensible]]` internal slot per §10.1.3. Starts `true`
     /// (`Default::default()`); flipped to `false` by
     /// `Object.preventExtensions` / `seal` / `freeze` on the array
     /// exotic. New string-keyed writes against a non-extensible
     /// array are rejected by the foundation OrdinarySet path.
+    #[pelt(skip)]
     pub(crate) extensible: ExtensibleFlag,
     /// Per-instance `[[Prototype]]` override for Array exotic
     /// objects constructed through subclassing. Plain arrays leave
     /// this unset and resolve to the realm `%Array.prototype%`.
     pub(crate) prototype_override: Option<Value>,
+}
+
+/// Trace helper for symbol-keyed own properties: only `Value` parts
+/// of each `(JsSymbol, Value)` pair carry GC slots — the `JsSymbol`
+/// wrapper itself flows through ordinary roots / well-known
+/// installation, not through array body trace.
+fn trace_array_symbol_properties(
+    field: &Option<Vec<(crate::symbol::JsSymbol, Value)>>,
+    visitor: &mut SlotVisitor<'_>,
+) {
+    if let Some(entries) = field {
+        for (_sym, value) in entries {
+            value.trace_value_slots(visitor);
+        }
+    }
 }
 
 /// One-byte `[[Extensible]]` slot. Wrapper around `bool` with a
@@ -113,43 +135,6 @@ impl Default for ExtensibleFlag {
     }
 }
 
-impl otter_gc::SafeTraceable for ArrayBody {
-    const TYPE_TAG: u8 = ARRAY_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        for element in &self.elements {
-            element.trace_value_slots(visitor);
-        }
-        if let Some(sparse) = &self.sparse_elements {
-            for value in sparse.values() {
-                value.trace_value_slots(visitor);
-            }
-        }
-        if let Some(named) = &self.named_properties {
-            for value in named.values() {
-                value.trace_value_slots(visitor);
-            }
-        }
-        if let Some(accessors) = &self.accessors {
-            for (get, set) in accessors.values() {
-                if let Some(g) = get {
-                    g.trace_value_slots(visitor);
-                }
-                if let Some(s) = set {
-                    s.trace_value_slots(visitor);
-                }
-            }
-        }
-        if let Some(sym_props) = &self.symbol_properties {
-            for (_sym, value) in sym_props {
-                value.trace_value_slots(visitor);
-            }
-        }
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
-}
 
 /// Read the Array exotic's per-instance `[[Prototype]]` override.
 pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {

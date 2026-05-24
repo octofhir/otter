@@ -1,0 +1,7 @@
+error: #[derive(Pelt)] only supports structs; enums and unions need hand-written SafeTraceable impls
+  --> tests/compile_fail/pelt_enum_rejected.rs:10:10
+   |
+10 | #[derive(Pelt)]
+   |          ^^^^
+   |
+   = note: this error originates in the derive macro `Pelt` (in Nightly builds, run with -Z macro-backtrace for more info)

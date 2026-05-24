@@ -1,0 +1,22 @@
+error[E0277]: the trait bound `ForeignType: PeltField` is not satisfied
+  --> tests/compile_fail/pelt_untraceable_field.rs:11:10
+   |
+11 | #[derive(Pelt)]
+   |          ^^^^ unsatisfied trait bound
+   |
+help: the trait `PeltField` is not implemented for `ForeignType`
+  --> tests/compile_fail/pelt_untraceable_field.rs:7:1
+   |
+ 7 | struct ForeignType;
+   | ^^^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `PeltField`:
+             ()
+             (A, B)
+             (A, B, C)
+             Arc<T>
+             Box<T>
+             DescriptorKind
+             FinalizerCell
+             Gc<T>
+           and $N others
+   = note: this error originates in the derive macro `Pelt` (in Nightly builds, run with -Z macro-backtrace for more info)

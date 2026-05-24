@@ -44,6 +44,7 @@
 use std::cell::RefCell;
 
 use otter_gc::raw::SlotVisitor;
+use otter_macros::Pelt;
 
 use crate::string::JsString;
 
@@ -76,12 +77,18 @@ pub fn alloc_symbol(
 /// per-symbol descriptor fields. Allocation is always through
 /// [`alloc_symbol`]; cloning a [`JsSymbol`] copies the handle but
 /// keeps the same body, so `ptr_eq` is the truth-bearer for `===`.
-#[derive(Debug)]
+#[derive(Debug, Pelt)]
+#[pelt(tag = SYMBOL_BODY_TYPE_TAG)]
 pub struct SymbolBody {
     /// Optional human-readable description, exposed through
     /// [`Symbol.prototype.description`] and the `toString` form
     /// `Symbol(<desc>)`. `None` means "no description" — distinct
     /// from a description that is the empty string.
+    //
+    // `JsString` lives outside the cage today (`Arc<StringRepr>`); once
+    // it migrates to a GC body the `#[pelt(skip)]` here drops and the
+    // derive will emit the handle visit automatically.
+    #[pelt(skip)]
     pub description: Option<JsString>,
     /// Stable tag identifying which well-known slot this symbol
     /// belongs to. `None` for ordinary `Symbol(...)` calls and
@@ -90,22 +97,13 @@ pub struct SymbolBody {
     /// identity is still handle equality — but it lets the runtime
     /// fast-path well-known checks (e.g. `Symbol.iterator`,
     /// `Symbol.toPrimitive`) without walking a comparison table.
+    #[pelt(skip)]
     pub well_known: Option<WellKnown>,
     /// `true` for symbols created by `Symbol.for`. Registered
     /// symbols are shared through the global registry and cannot be
     /// used as WeakMap / WeakSet keys.
+    #[pelt(skip)]
     pub registered: bool,
-}
-
-impl otter_gc::SafeTraceable for SymbolBody {
-    const TYPE_TAG: u8 = SYMBOL_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
-        // `description` is `JsString` — an `Arc<StringRepr>` outside
-        // the cage today; no GC slot to follow. Once `JsString`
-        // migrates to a GC body the description handle slot is
-        // emitted here.
-    }
 }
 
 /// Heap handle for [`Value::Symbol`].

@@ -41,10 +41,19 @@ pub(crate) enum BoundFunctionMetadataProperty {
     Overridden(object::PropertyDescriptor),
 }
 
+impl crate::pelt::PeltField for BoundFunctionMetadataProperty {
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+        if let Self::Overridden(desc) = self {
+            desc.pelt_trace(visitor);
+        }
+    }
+}
+
 /// GC-allocated storage for `Value::BoundFunction`. Constructed by
 /// the `Op::BindFunction` opcode and consumed by every call dispatch
 /// path (`Op::Call`, `Op::CallWithThis`, `Op::CallMethodValue`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, otter_macros::Pelt)]
+#[pelt(tag = BOUND_FUNCTION_BODY_TYPE_TAG)]
 pub struct BoundFunctionBody {
     /// Underlying callable. Foundation slice keeps this as a `Value`;
     /// chained `bind` flattens by re-wrapping at call time without
@@ -60,6 +69,7 @@ pub struct BoundFunctionBody {
     /// Bound function builtin `name`, computed once by `bind`.
     pub(crate) builtin_name: String,
     /// Bound function builtin `length`, computed once by `bind`.
+    #[pelt(skip)]
     pub(crate) builtin_length: NumberValue,
     /// Own `name` metadata property state.
     pub(crate) name_property: BoundFunctionMetadataProperty,
@@ -67,42 +77,6 @@ pub struct BoundFunctionBody {
     pub(crate) length_property: BoundFunctionMetadataProperty,
     /// Ordinary own properties added after bind creation.
     pub(crate) own_properties: JsObject,
-}
-
-impl otter_gc::SafeTraceable for BoundFunctionBody {
-    const TYPE_TAG: u8 = BOUND_FUNCTION_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        self.target.trace_value_slots(visitor);
-        self.bound_this.trace_value_slots(visitor);
-        for arg in &self.bound_args {
-            arg.trace_value_slots(visitor);
-        }
-        trace_bound_metadata_property(&self.name_property, visitor);
-        trace_bound_metadata_property(&self.length_property, visitor);
-        let p = &self.own_properties as *const JsObject as *mut RawGc;
-        visitor(p);
-    }
-}
-
-fn trace_bound_metadata_property(
-    property: &BoundFunctionMetadataProperty,
-    visitor: &mut SlotVisitor<'_>,
-) {
-    let BoundFunctionMetadataProperty::Overridden(desc) = property else {
-        return;
-    };
-    match &desc.kind {
-        object::DescriptorKind::Data { value } => value.trace_value_slots(visitor),
-        object::DescriptorKind::Accessor { getter, setter } => {
-            if let Some(getter) = getter {
-                getter.trace_value_slots(visitor);
-            }
-            if let Some(setter) = setter {
-                setter.trace_value_slots(visitor);
-            }
-        }
-    }
 }
 
 fn no_extra_roots(_: &mut dyn FnMut(*mut RawGc)) {}

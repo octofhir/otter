@@ -33,7 +33,7 @@ names exactly one macro role:
 | Host-owned object surface                      | `burrow!`            | a private stash the embedder owns       |
 | Hosted module loader (`otter:fs`, `node:url`)  | `lodge!`             | the family residence — module home      |
 | `SafeTraceable` derive                         | `#[derive(Pelt)]`    | the coat that keeps roots alive         |
-| `Finalize` derive                              | `#[derive(Groom)]`   | the cleanup ritual                      |
+| `Finalize` derive (deferred)                   | `#[derive(Groom)]`   | the cleanup ritual                      |
 
 The theme is in macro identifiers only. Generated diagnostics stay
 spec-leaning — no "your raft is sinking" error messages.
@@ -292,45 +292,70 @@ contract.
 
 ## `#[derive(Pelt)]` — GC Body Tracing
 
-`Pelt` derives `SafeTraceable` for GC body structs. The derive walks
-fields:
+`Pelt` derives `otter_gc::SafeTraceable` for GC body structs. Each
+non-`#[pelt(skip)]` field is funneled through
+`otter_vm::pelt::PeltField::pelt_trace`, which has blanket impls for
+the leaf shapes every body actually uses:
 
-- `Gc<T>` / `Value` → emits `slot.trace_value_slots(visitor)`
-- `Option<Gc<T>>` → emits the conditional trace
-- `[Gc<T>; N]` / `SmallVec<[Gc<T>; _]>` → emits per-element trace
-- Plain `Copy` primitives / non-GC fields → skipped
-- Foreign / unrecognised types → require `#[pelt(skip)]` or the
-  derive fails at compile time with the field span underlined
+- `Value` → calls `Value::trace_value_slots`.
+- `Gc<T>` (and aliases such as `JsObject = Gc<ObjectBody>`,
+  `UpvalueCell = Gc<UpvalueCellBody>`) → visitor receives the inline
+  field address as `*mut RawGc`; `Gc::null()` is skipped so the
+  derived body matches the hand-written `if !handle.is_null() { … }`
+  guards byte-for-byte.
+- `Option<T>` / `Vec<T>` / `[T; N]` / `Box<T>` / `RefCell<T>` →
+  derive recurses into the inner `T` (each must implement
+  `PeltField`).
+- `bool` / `char` / `String` / every integer / `f32` / `f64` / `()`
+  → no-op impls so the derive can call uniformly; tag these with
+  `#[pelt(skip)]` only when you want to document intent.
+
+Fields whose type does **not** implement `PeltField` (foreign
+records, ICU formatter state, `BigInt`, `JsString` until it lands
+on a GC body, custom enums) must carry `#[pelt(skip)]` — otherwise
+the derive fails at compile time with the field span underlined.
+This is the load-bearing safety property: silent omissions become
+loud trait-bound errors.
+
+`Cell<Value>` is intentionally **not** covered by a blanket impl:
+visiting through `Cell::get()` would walk a value *copy*, not the
+live cell slot, breaking relocation. Bodies with that shape stay
+on a hand-written `SafeTraceable` impl until a safe escape hatch
+(e.g. `#[pelt(via = path)]`) ships.
 
 ```rust,ignore
 use otter_macros::Pelt;
+use otter_vm::Value;
 
-#[derive(Pelt)]
-struct PromiseBody {
-    fulfilled: Option<otter_gc::Gc<otter_vm::JsObject>>,
-    rejected:  Option<otter_gc::Gc<otter_vm::JsObject>>,
+pub const PROXY_BODY_TYPE_TAG: u8 = 0x29;
+
+#[derive(Debug, Pelt)]
+#[pelt(tag = PROXY_BODY_TYPE_TAG)]
+pub struct ProxyBodyGc {
+    pub target:  Value,
+    pub handler: Value,
     #[pelt(skip)] // primitive — no GC slot
-    state: PromiseState,
+    pub revoked: bool,
 }
 ```
 
-## `#[derive(Groom)]` — Finalize Hook
+The `#[pelt(tag = <CONST>)]` attribute on the struct is required —
+the macro never invents a tag. Reuse the per-body `<NAME>_TYPE_TAG`
+const each hand-written installer already declares so tag
+coordination stays centralised.
 
-`Groom` derives `Finalize` and walks the same field set. Fields
-explicitly marked `#[groom(skip)]` are excluded from the finalize
-walk. Use it on bodies that wrap external resources (file handles,
-foreign-library handles, locked OS primitives) where Drop alone is
-insufficient because finalization runs on a GC thread.
+## `#[derive(Groom)]` — Finalize Hook (deferred)
 
-```rust,ignore
-use otter_macros::{Pelt, Groom};
-
-#[derive(Pelt, Groom)]
-struct LibraryHandle {
-    #[pelt(skip)] #[groom(skip)] // managed by libloading::Library Drop
-    lib: std::sync::Arc<libloading::Library>,
-}
-```
+`#[derive(Groom)]` is **not yet shipped**. `otter-gc` does not have a
+per-body `Finalize` trait, and the sweep path has no place to
+dispatch one — the existing
+[`crates/otter-gc/src/finalize.rs`](https://github.com/octofhir/otter/blob/main/crates/otter-gc/src/finalize.rs)
+module owns weak / `FinalizationRegistry` bookkeeping, not a
+generic drop-time hook. Once the finalize-hook RFC lands and the
+sweeper wiring is in place, `#[derive(Groom)]` will mirror `Pelt`'s
+field-walk shape with a `#[groom(skip)]` opt-out for fields managed
+by their own `Drop` impl. Tracker entry:
+[`docs/otter-macros-refactor-tracker.md`](https://github.com/octofhir/otter/blob/main/docs/otter-macros-refactor-tracker.md).
 
 ## How the Macros Plug into Bootstrap
 

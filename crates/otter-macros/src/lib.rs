@@ -157,6 +157,7 @@ use syn::{
 };
 
 mod couch;
+mod derive_pelt;
 mod holt;
 mod lodge;
 
@@ -273,6 +274,51 @@ pub fn couch(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn lodge(input: TokenStream) -> TokenStream {
     lodge::expand(input)
+}
+
+/// Derive `otter_gc::SafeTraceable` for a GC body struct.
+///
+/// One field-level call per non-`#[pelt(skip)]` field; missing
+/// `PeltField` impls surface at the field's span. The struct must
+/// carry a `#[pelt(tag = <CONST>)]` attribute that names the
+/// `Traceable::TYPE_TAG` constant — by convention the same
+/// per-body `<NAME>_TYPE_TAG` const the hand-written installers
+/// already declare.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// use otter_macros::Pelt;
+///
+/// #[derive(Pelt)]
+/// #[pelt(tag = PROXY_BODY_TYPE_TAG)]
+/// pub struct ProxyBodyGc {
+///     pub target: otter_vm::Value,
+///     pub handler: otter_vm::Value,
+///     #[pelt(skip)] // primitive — not a GC slot
+///     pub revoked: bool,
+/// }
+/// ```
+///
+/// # Generated impl
+///
+/// ```rust,ignore
+/// impl otter_gc::SafeTraceable for ProxyBodyGc {
+///     const TYPE_TAG: u8 = PROXY_BODY_TYPE_TAG;
+///     fn trace_slots_safe(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+///         otter_vm::pelt::PeltField::pelt_trace(&self.target, visitor);
+///         otter_vm::pelt::PeltField::pelt_trace(&self.handler, visitor);
+///     }
+/// }
+/// ```
+///
+/// Per-field tracers that need custom logic (Cell-shaped interior
+/// mutability, ephemeron entries, etc.) keep their hand-written
+/// `SafeTraceable` impl. See [`docs/otter-macros-design.md`] for the
+/// full surface and the planned `#[pelt(via = path)]` extension.
+#[proc_macro_derive(Pelt, attributes(pelt))]
+pub fn pelt_derive(input: TokenStream) -> TokenStream {
+    derive_pelt::expand(input)
 }
 
 

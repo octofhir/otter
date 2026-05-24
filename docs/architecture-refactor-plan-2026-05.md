@@ -20,7 +20,7 @@ work is:
 | 5.3   | GC snapshot bridge                         | Open, blocked on 5.1  |
 | 6.1   | Object internal-method vtable evaluation   | Open                  |
 | 6.2   | Tighten Promise capability / job records   | Open                  |
-| 6.3   | Derive Trace / Finalize for new GC bodies  | Open (4.1 unblocked)  |
+| 6.3   | Derive Trace / Finalize for new GC bodies  | `Pelt` DONE 2026-05-24 (19/20 bodies, IteratorState enum stays manual); `Groom` deferred |
 
 Open carry-over tech debt from Phase 2.3 / 2.4 (not yet promoted to
 their own task numbers):
@@ -288,6 +288,28 @@ wrap either a `RuntimeClassSpec` (legacy) or a
 - Risk: Medium.
 - Effort: M.
 - Depends on: 4.1.
+- **Status:** First cut shipped 2026-05-24. `#[derive(Pelt)]` at
+  `crates/otter-macros/src/derive_pelt.rs`; helper trait
+  `otter_vm::pelt::PeltField` with blanket impls for `Value`,
+  `Gc<T>` (with `is_null()` guard), `Option<T>`, `Vec<T>`,
+  `[T; N]`, `Box<T>`, `RefCell<T>`, plus no-op impls for every
+  primitive leaf. Bodies migrated:
+  `UpvalueCellBody` / `ProxyBodyGc` / `JsClosureBody` /
+  `ClassConstructorBody` / `SymbolBody` / `BigIntBody` /
+  `IntlBody` / `TemporalBody`. Trybuild matrix at
+  `crates/otter-vm/tests/compile_fail/pelt_*.rs` covers missing
+  `#[pelt(tag = …)]`, untraceable field, and enum body. Full
+  detail in
+  [`docs/otter-macros-refactor-tracker.md`](otter-macros-refactor-tracker.md).
+  **`#[derive(Groom)]` deferred** until `otter-gc` grows a per-body
+  `Finalize` trait + sweep dispatch (the existing
+  `crates/otter-gc/src/finalize.rs` module owns weak / registry
+  bookkeeping, not a generic drop-time hook). Migration of the
+  remaining hand-written `SafeTraceable` impls (`JsRegExpBody`,
+  `BoundFunctionBody`, `NativeFunctionBody`, `ArrayBody`, the two
+  generator bodies, the four collection bodies, the weak-ref
+  bodies, `PurePromiseBody`, the four iterator-state bodies) is
+  per-body work tracked in the macros tracker.
 
 ## Migration Order (remaining)
 
@@ -300,7 +322,8 @@ Phase 4 fully shipped. Remaining work in strict order:
    of the above once a baseline microbench exists.
 5. **6.2** Promise records — independent; gated only on test262
    Promise stability.
-6. **6.3** trace derive — 4.1 unblocked, ready to start.
+6. **6.3** trace derive — `Pelt` shipped 2026-05-24; `Groom`
+   resumes after the finalize-hook RFC.
 
 Parallelizable: 5.x / 6.x do not contend for the same files. Promise
 work (6.2) can land on an independent branch.

@@ -24,23 +24,21 @@ use num_bigint::BigInt;
 
 use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
-use otter_gc::raw::SlotVisitor;
+use otter_macros::Pelt;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`BigIntBody`].
 pub const BIG_INT_BODY_TYPE_TAG: u8 = 0x25;
 
 /// GC-allocated payload backing every `Value::BigInt`.
-#[derive(Debug, Clone)]
+///
+/// No outgoing GC slots — `BigInt` is plain numeric data; the
+/// derive emits an empty `trace_slots_safe` body.
+#[derive(Debug, Clone, Pelt)]
+#[pelt(tag = BIG_INT_BODY_TYPE_TAG)]
 pub struct BigIntBody {
     /// Underlying arbitrary-precision integer.
+    #[pelt(skip)]
     pub inner: BigInt,
-}
-
-impl otter_gc::SafeTraceable for BigIntBody {
-    const TYPE_TAG: u8 = BIG_INT_BODY_TYPE_TAG;
-
-    /// No outgoing GC slots — `BigInt` is plain numeric data.
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {}
 }
 
 /// 4-byte compressed handle to a [`BigIntBody`]. `Copy`.

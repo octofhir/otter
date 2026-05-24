@@ -163,6 +163,28 @@ pub enum DescriptorKind {
     },
 }
 
+impl crate::pelt::PeltField for DescriptorKind {
+    fn pelt_trace(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        match self {
+            Self::Data { value } => value.trace_value_slots(visitor),
+            Self::Accessor { getter, setter } => {
+                if let Some(g) = getter {
+                    g.trace_value_slots(visitor);
+                }
+                if let Some(s) = setter {
+                    s.trace_value_slots(visitor);
+                }
+            }
+        }
+    }
+}
+
+impl crate::pelt::PeltField for PropertyDescriptor {
+    fn pelt_trace(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        self.kind.pelt_trace(visitor);
+    }
+}
+
 impl PropertyDescriptor {
     /// Build a data descriptor.
     #[must_use]

@@ -22,7 +22,7 @@
 //! - <https://tc39.es/ecma262/#sec-newdeclarativeenvironment>
 //! - <https://tc39.es/ecma262/#sec-function-environment-records>
 
-use otter_gc::raw::SlotVisitor;
+use otter_macros::Pelt;
 
 use crate::Value;
 
@@ -49,19 +49,13 @@ pub const UPVALUE_CELL_TYPE_TAG: u8 = 0x10;
 /// (CreateMutableBinding) + §9.1.1.1.5 (InitializeBinding); the
 /// closure spine that holds these cells is built by `Op::MakeClosure`
 /// per §15.2.5 (FunctionDeclarationInstantiation).
+#[derive(Pelt)]
+#[pelt(tag = UPVALUE_CELL_TYPE_TAG)]
 pub struct UpvalueCellBody {
     /// Captured `Value`. Stores fire the generational write barrier
     /// through [`store_upvalue`] for every RHS that carries a GC
     /// handle.
     pub value: Value,
-}
-
-impl otter_gc::SafeTraceable for UpvalueCellBody {
-    const TYPE_TAG: u8 = UPVALUE_CELL_TYPE_TAG;
-
-    fn trace_slots_safe(&self, v: &mut SlotVisitor<'_>) {
-        self.value.trace_value_slots(v);
-    }
 }
 
 /// Compressed handle to an [`UpvalueCellBody`]. `Copy + Eq + Hash`

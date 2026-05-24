@@ -59,8 +59,10 @@ impl PromiseState {
     pub fn is_settled(&self) -> bool {
         !matches!(self, Self::Pending)
     }
+}
 
-    fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+impl crate::pelt::PeltField for PromiseState {
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
         match self {
             Self::Fulfilled(value) | Self::Rejected(value) => value.trace_value_slots(visitor),
             Self::Pending => {}
@@ -81,8 +83,8 @@ pub struct PromiseReaction {
     pub context: Option<ExecutionContext>,
 }
 
-impl PromiseReaction {
-    fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
+impl crate::pelt::PeltField for PromiseReaction {
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
         self.capability.promise.trace_value_slots(visitor);
         self.capability.resolve.trace_value_slots(visitor);
         self.capability.reject.trace_value_slots(visitor);
@@ -271,11 +273,13 @@ pub struct PurePromise {
 }
 
 /// GC-allocated pure promise body.
-#[derive(Debug)]
+#[derive(Debug, otter_macros::Pelt)]
+#[pelt(tag = PURE_PROMISE_BODY_TYPE_TAG)]
 pub struct PurePromiseBody {
     state: PromiseState,
     fulfill_reactions: Vec<PromiseReaction>,
     reject_reactions: Vec<PromiseReaction>,
+    #[pelt(skip)]
     is_handled: bool,
     /// Lazy expando bag for non-spec own properties such as
     /// user-installed `then` / `constructor` overrides per the
@@ -284,27 +288,6 @@ pub struct PurePromiseBody {
     /// Per-instance `[[Prototype]]` override for Promise subclass
     /// construction.
     prototype_override: Option<Value>,
-}
-
-impl otter_gc::SafeTraceable for PurePromiseBody {
-    const TYPE_TAG: u8 = PURE_PROMISE_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        self.state.trace_value_slots(visitor);
-        for reaction in self
-            .fulfill_reactions
-            .iter()
-            .chain(self.reject_reactions.iter())
-        {
-            reaction.trace_value_slots(visitor);
-        }
-        if let Some(expando) = &self.expando {
-            Value::object(*expando).trace_value_slots(visitor);
-        }
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
 }
 
 impl PurePromise {

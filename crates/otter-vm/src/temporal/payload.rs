@@ -19,7 +19,6 @@
 //! # See also
 //! - <https://tc39.es/proposal-temporal/>
 
-use otter_gc::raw::SlotVisitor;
 
 /// One Temporal value, parameterised over the [`temporal_rs`] type.
 ///
@@ -105,18 +104,15 @@ impl TemporalKind {
 pub const TEMPORAL_BODY_TYPE_TAG: u8 = 0x27;
 
 /// GC body holding a Temporal value's [`TemporalPayload`].
-#[derive(Debug, Clone)]
+///
+/// `temporal_rs::*` records hold no GC references; the derive emits
+/// an empty `trace_slots_safe` body.
+#[derive(Debug, Clone, otter_macros::Pelt)]
+#[pelt(tag = TEMPORAL_BODY_TYPE_TAG)]
 pub struct TemporalBody {
     /// Variant-typed Temporal payload.
+    #[pelt(skip)]
     pub payload: TemporalPayload,
-}
-
-impl otter_gc::SafeTraceable for TemporalBody {
-    const TYPE_TAG: u8 = TEMPORAL_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, _visitor: &mut SlotVisitor<'_>) {
-        // `temporal_rs::*` records hold no GC references.
-    }
 }
 
 /// 4-byte compressed GC handle to a [`TemporalBody`]. `Copy`. Packs

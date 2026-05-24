@@ -186,10 +186,12 @@ impl RegExpFlags {
 }
 
 /// Inner state shared by every clone of a [`JsRegExp`].
-#[derive(Debug)]
+#[derive(Debug, otter_macros::Pelt)]
+#[pelt(tag = REGEXP_BODY_TYPE_TAG)]
 pub struct JsRegExpBody {
     /// Compiled `regress` engine. Always present after construction —
     /// errors surface during [`compile`] before the body is built.
+    #[pelt(skip)]
     pub regex: Regex,
     /// Pattern source code-units (the body between the slashes).
     pub pattern_utf16: Vec<u16>,
@@ -197,6 +199,7 @@ pub struct JsRegExpBody {
     /// by the `.source` JS getter.
     pub source: String,
     /// Parsed flag bits.
+    #[pelt(skip)]
     pub flags: RegExpFlags,
     /// `RegExp.prototype.lastIndex` — a writable own data property.
     /// RegExp execution coerces it numerically, but ordinary JS
@@ -204,6 +207,7 @@ pub struct JsRegExpBody {
     pub last_index: RefCell<Value>,
     /// Writable bit for the `lastIndex` own data property. Its
     /// enumerable/configurable bits are spec-fixed at `false`.
+    #[pelt(skip)]
     pub last_index_writable: bool,
     /// Lazy expando bag for non-spec own properties — user
     /// installations such as `re.global = false` /
@@ -214,24 +218,11 @@ pub struct JsRegExpBody {
     /// Per-instance `[[Extensible]]` slot for RegExp exotic objects.
     /// `Object.preventExtensions` flips this flag while existing
     /// own slots such as `lastIndex` remain writable.
+    #[pelt(skip)]
     pub extensible: bool,
     /// Per-instance `[[Prototype]]` override for RegExp subclass
     /// construction.
     pub prototype_override: Option<Value>,
-}
-
-impl otter_gc::SafeTraceable for JsRegExpBody {
-    const TYPE_TAG: u8 = REGEXP_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        self.last_index.borrow().trace_value_slots(visitor);
-        if let Some(expando) = &self.expando {
-            Value::object(*expando).trace_value_slots(visitor);
-        }
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
 }
 
 /// Cheap-to-clone JS regex handle.

@@ -25,6 +25,7 @@
 
 use crate::Value;
 use otter_gc::raw::SlotVisitor;
+use otter_macros::Pelt;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`ProxyBodyGc`].
 pub const PROXY_BODY_TYPE_TAG: u8 = 0x29;
@@ -33,7 +34,8 @@ pub const PROXY_BODY_TYPE_TAG: u8 = 0x29;
 ///
 /// Mutators flip `revoked` through [`otter_gc::GcHeap::with_payload`]
 /// (no interior mutability in GC bodies).
-#[derive(Debug)]
+#[derive(Debug, Pelt)]
+#[pelt(tag = PROXY_BODY_TYPE_TAG)]
 pub struct ProxyBodyGc {
     /// Target value trap-less operations fall through to. ECMA-262
     /// §28.2 accepts any object, including callables.
@@ -41,16 +43,8 @@ pub struct ProxyBodyGc {
     /// Handler object — trap properties live here.
     pub handler: Value,
     /// `true` once `Proxy.revocable().revoke()` has fired.
+    #[pelt(skip)]
     pub revoked: bool,
-}
-
-impl otter_gc::SafeTraceable for ProxyBodyGc {
-    const TYPE_TAG: u8 = PROXY_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        self.target.trace_value_slots(visitor);
-        self.handler.trace_value_slots(visitor);
-    }
 }
 
 /// 4-byte compressed GC handle to a [`ProxyBodyGc`]. `Copy`.

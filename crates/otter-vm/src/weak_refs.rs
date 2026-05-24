@@ -58,25 +58,27 @@ pub type JsWeakRef = otter_gc::Gc<WeakRefBody>;
 pub type JsFinalizationRegistry = otter_gc::Gc<FinalizationRegistryBody>;
 
 /// GC-allocated payload backing every [`JsWeakRef`].
-#[derive(Debug, Clone)]
+///
+/// The target is weak by spec and is cleared by
+/// [`process_weak_refs_and_finalizers`] after marking, so the derive
+/// skips it deliberately.
+#[derive(Debug, Clone, otter_macros::Pelt)]
+#[pelt(tag = WEAK_REF_BODY_TYPE_TAG)]
 pub struct WeakRefBody {
+    #[pelt(skip)]
     target: RawGc,
     prototype_override: Option<Value>,
 }
 
-impl otter_gc::SafeTraceable for WeakRefBody {
-    const TYPE_TAG: u8 = WEAK_REF_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        // The target is weak by spec and is cleared by
-        // `process_weak_refs_and_finalizers` after marking.
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
-}
-
 /// One registered finalization cell.
+///
+/// `target` and `unregister_token` are weak — the GC never marks
+/// through them; `held_value` is the strongly-traced cleanup argument
+/// (§27.7.4 step 7). `FinalizerCell` is never registered as its own
+/// GC body — it lives inline inside `FinalizationRegistryBody.cells`
+/// — so it stays a plain Rust struct with a hand-written
+/// `PeltField` impl that the surrounding `Vec<FinalizerCell>`
+/// dispatches through.
 #[derive(Debug, Clone)]
 pub struct FinalizerCell {
     target: RawGc,
@@ -84,27 +86,25 @@ pub struct FinalizerCell {
     unregister_token: Option<RawGc>,
 }
 
+impl crate::pelt::PeltField for FinalizerCell {
+    #[inline]
+    fn pelt_trace(&self, visitor: &mut SlotVisitor<'_>) {
+        // `target` + `unregister_token` are weak per §27.7.4.
+        let _ = self.target;
+        let _ = self.unregister_token;
+        self.held_value.trace_value_slots(visitor);
+    }
+}
+
 /// GC-allocated payload backing every [`JsFinalizationRegistry`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, otter_macros::Pelt)]
+#[pelt(tag = FINALIZATION_REGISTRY_BODY_TYPE_TAG)]
 pub struct FinalizationRegistryBody {
     cleanup_callback: Value,
+    #[pelt(skip)]
     cleanup_context: Option<ExecutionContext>,
     cells: Vec<FinalizerCell>,
     prototype_override: Option<Value>,
-}
-
-impl otter_gc::SafeTraceable for FinalizationRegistryBody {
-    const TYPE_TAG: u8 = FINALIZATION_REGISTRY_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        self.cleanup_callback.trace_value_slots(visitor);
-        for cell in &self.cells {
-            cell.held_value.trace_value_slots(visitor);
-        }
-        if let Some(proto) = &self.prototype_override {
-            proto.trace_value_slots(visitor);
-        }
-    }
 }
 
 /// Cleanup work prepared during post-mark weak processing.

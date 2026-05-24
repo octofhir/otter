@@ -38,6 +38,7 @@ use otter_gc::GcHeap;
 use otter_gc::OutOfMemory;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
+use otter_macros::Pelt;
 
 use crate::{UpvalueCell, Value};
 
@@ -45,9 +46,11 @@ use crate::{UpvalueCell, Value};
 pub const JS_CLOSURE_BODY_TYPE_TAG: u8 = 0x23;
 
 /// GC body backing every closure value.
-#[derive(Debug)]
+#[derive(Debug, Pelt)]
+#[pelt(tag = JS_CLOSURE_BODY_TYPE_TAG)]
 pub struct JsClosureBody {
     /// Index into [`otter_bytecode::BytecodeModule::functions`].
+    #[pelt(skip)]
     pub function_id: u32,
     /// Captured upvalue spine in declaration order. Per-cell mutation
     /// flows through [`crate::store_upvalue`] /
@@ -56,20 +59,6 @@ pub struct JsClosureBody {
     /// Arrow closures: `Some(this)` overrides the caller's receiver.
     /// Non-arrow closures: `None` (take `this` from the call site).
     pub bound_this: Option<Value>,
-}
-
-impl otter_gc::SafeTraceable for JsClosureBody {
-    const TYPE_TAG: u8 = JS_CLOSURE_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        for cell in self.upvalues.iter() {
-            let p = cell as *const UpvalueCell as *mut RawGc;
-            visitor(p);
-        }
-        if let Some(value) = &self.bound_this {
-            value.trace_value_slots(visitor);
-        }
-    }
 }
 
 /// 4-byte compressed `Gc<JsClosureBody>` handle to the underlying

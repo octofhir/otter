@@ -244,18 +244,15 @@ impl IntlKind {
 pub const INTL_BODY_TYPE_TAG: u8 = 0x28;
 
 /// GC body holding an Intl value's [`IntlPayload`].
-#[derive(Debug)]
+///
+/// ICU formatter / collator state holds no GC references; the derive
+/// emits an empty `trace_slots_safe` body.
+#[derive(Debug, otter_macros::Pelt)]
+#[pelt(tag = INTL_BODY_TYPE_TAG)]
 pub struct IntlBody {
     /// Variant-typed Intl payload.
+    #[pelt(skip)]
     pub payload: IntlPayload,
-}
-
-impl otter_gc::SafeTraceable for IntlBody {
-    const TYPE_TAG: u8 = INTL_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        // ICU formatter / collator state holds no GC references.
-    }
 }
 
 /// 4-byte compressed GC handle to an [`IntlBody`]. `Copy`. Packs

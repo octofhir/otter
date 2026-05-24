@@ -46,55 +46,64 @@ pub struct JsGenerator {
 pub type ParkedFrame = otter_gc::Gc<ParkedFrameBody>;
 
 /// Internal generator storage.
-#[derive(Debug)]
+#[derive(Debug, otter_macros::Pelt)]
+#[pelt(tag = GENERATOR_BODY_TYPE_TAG)]
 pub struct GeneratorBody {
     /// `Some(frame)` when the generator can still resume; `None`
     /// once done or while an async-generator await owns the frame.
+    #[pelt(via = trace_generator_frame)]
     pub frame: Option<Box<Frame>>,
     /// Detached cold record for the suspended frame. Acquired by
     /// the interpreter at yield time via
     /// [`crate::Interpreter::frame_detach_cold`]; re-attached on
     /// resume so try handlers, async parking, and other cold state
     /// survive the suspension.
+    #[pelt(via = trace_generator_cold)]
     pub cold: Option<Box<crate::cold_frame::ColdFrame>>,
     /// Register slot that the most recent `Op::Yield` paused on.
+    #[pelt(skip)]
     pub resume_dst: u16,
     /// `true` once the body has returned, thrown, or had `.return()`
     /// invoked.
+    #[pelt(skip)]
     pub done: bool,
     /// Most recent value yielded by the body.
     pub yielded: Option<crate::Value>,
     /// `true` for `async function*` generators.
+    #[pelt(skip)]
     pub is_async: bool,
     /// `[[Prototype]]` captured from the generator function's own
     /// `prototype` property at call time.
     pub prototype_override: Option<crate::Value>,
     /// Pending Promise capability for an in-flight async-generator
     /// request.
+    #[pelt(via = trace_promise_capability)]
     pub pending_request: Option<crate::promise::PromiseCapability>,
 }
 
-impl otter_gc::SafeTraceable for GeneratorBody {
-    const TYPE_TAG: u8 = GENERATOR_BODY_TYPE_TAG;
+fn trace_generator_frame(field: &Option<Box<Frame>>, visitor: &mut SlotVisitor<'_>) {
+    if let Some(frame) = field {
+        frame.trace_frame_slots(visitor);
+    }
+}
 
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        if let Some(frame) = &self.frame {
-            frame.trace_frame_slots(visitor);
-        }
-        if let Some(cold) = &self.cold {
-            cold.trace_cold_slots(visitor);
-        }
-        if let Some(value) = &self.yielded {
-            value.trace_value_slots(visitor);
-        }
-        if let Some(value) = &self.prototype_override {
-            value.trace_value_slots(visitor);
-        }
-        if let Some(capability) = &self.pending_request {
-            capability.promise.trace_value_slots(visitor);
-            capability.resolve.trace_value_slots(visitor);
-            capability.reject.trace_value_slots(visitor);
-        }
+fn trace_generator_cold(
+    field: &Option<Box<crate::cold_frame::ColdFrame>>,
+    visitor: &mut SlotVisitor<'_>,
+) {
+    if let Some(cold) = field {
+        cold.trace_cold_slots(visitor);
+    }
+}
+
+fn trace_promise_capability(
+    field: &Option<crate::promise::PromiseCapability>,
+    visitor: &mut SlotVisitor<'_>,
+) {
+    if let Some(capability) = field {
+        capability.promise.trace_value_slots(visitor);
+        capability.resolve.trace_value_slots(visitor);
+        capability.reject.trace_value_slots(visitor);
     }
 }
 
@@ -104,23 +113,13 @@ impl otter_gc::SafeTraceable for GeneratorBody {
 /// out of the interpreter pool at suspend time and stored alongside
 /// the frame so pool slots can be reused while the parked frame
 /// sleeps. The matching attach happens on resume.
-#[derive(Debug)]
+#[derive(Debug, otter_macros::Pelt)]
+#[pelt(tag = PARKED_FRAME_BODY_TYPE_TAG)]
 pub struct ParkedFrameBody {
+    #[pelt(via = trace_generator_frame)]
     frame: Option<Box<Frame>>,
+    #[pelt(via = trace_generator_cold)]
     cold: Option<Box<crate::cold_frame::ColdFrame>>,
-}
-
-impl otter_gc::SafeTraceable for ParkedFrameBody {
-    const TYPE_TAG: u8 = PARKED_FRAME_BODY_TYPE_TAG;
-
-    fn trace_slots_safe(&self, visitor: &mut SlotVisitor<'_>) {
-        if let Some(frame) = &self.frame {
-            frame.trace_frame_slots(visitor);
-        }
-        if let Some(cold) = &self.cold {
-            cold.trace_cold_slots(visitor);
-        }
-    }
 }
 
 impl JsGenerator {

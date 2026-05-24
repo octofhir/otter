@@ -220,13 +220,24 @@ pub fn require_plain_date_time(
 }
 
 /// Convert a `temporal_rs` error into the foundation
-/// [`IntrinsicError::BadArgument`]. The error message is preserved
-/// in the diagnostic.
+/// [`IntrinsicError`] hierarchy, honouring the spec error class:
+/// `RangeError` → [`IntrinsicError::OutOfRange`], `TypeError` /
+/// generic → [`IntrinsicError::BadArgument`]. `temporal_rs` does
+/// not expose its `ErrorKind` getter, so the routing is driven by
+/// the `Display` prefix it produces (`"RangeError: …"` /
+/// `"TypeError: …"`).
 pub fn temporal_err(err: temporal_rs::TemporalError) -> IntrinsicError {
-    let _ = err; // The foundation surfaces the error class via reason.
-    IntrinsicError::BadArgument {
-        index: 0,
-        reason: "Temporal operation failed",
+    let text = err.to_string();
+    if text.starts_with("RangeError") {
+        IntrinsicError::OutOfRange {
+            index: 0,
+            reason: "Temporal operation produced an out-of-range value",
+        }
+    } else {
+        IntrinsicError::BadArgument {
+            index: 0,
+            reason: "Temporal operation failed",
+        }
     }
 }
 
@@ -425,7 +436,7 @@ pub fn parse_difference_settings(
         && !name.eq_ignore_ascii_case("auto")
     {
         let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            IntrinsicError::BadArgument {
+            IntrinsicError::OutOfRange {
                 index,
                 reason: "invalid `largestUnit`",
             }
@@ -434,7 +445,7 @@ pub fn parse_difference_settings(
     }
     if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
         let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            IntrinsicError::BadArgument {
+            IntrinsicError::OutOfRange {
                 index,
                 reason: "invalid `smallestUnit`",
             }
@@ -443,7 +454,7 @@ pub fn parse_difference_settings(
     }
     if let Some(name) = read_string_field(obj, "roundingMode", heap) {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
-            IntrinsicError::BadArgument {
+            IntrinsicError::OutOfRange {
                 index,
                 reason: "invalid `roundingMode`",
             }
@@ -459,7 +470,7 @@ pub fn parse_difference_settings(
             if let Ok(incr) = temporal_rs::options::RoundingIncrement::try_from(raw.trunc()) {
                 settings.increment = Some(incr);
             } else {
-                return Err(IntrinsicError::BadArgument {
+                return Err(IntrinsicError::OutOfRange {
                     index,
                     reason: "invalid `roundingIncrement`",
                 });
@@ -483,7 +494,7 @@ pub fn parse_rounding_options(
         // `round("hour")` is shorthand for `round({ smallestUnit: "hour" })`.
         let name = s.to_lossy_string(args.gc_heap);
         let unit =
-            temporal_rs::options::Unit::from_str(&name).map_err(|_| IntrinsicError::BadArgument {
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| IntrinsicError::OutOfRange {
                 index,
                 reason: "invalid smallest-unit shorthand",
             })?;
@@ -502,7 +513,7 @@ pub fn parse_rounding_options(
     let heap = &*args.gc_heap;
     if let Some(name) = read_string_field(obj, "largestUnit", heap) {
         let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            IntrinsicError::BadArgument {
+            IntrinsicError::OutOfRange {
                 index,
                 reason: "invalid `largestUnit`",
             }
@@ -511,7 +522,7 @@ pub fn parse_rounding_options(
     }
     if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
         let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            IntrinsicError::BadArgument {
+            IntrinsicError::OutOfRange {
                 index,
                 reason: "invalid `smallestUnit`",
             }
@@ -520,7 +531,7 @@ pub fn parse_rounding_options(
     }
     if let Some(name) = read_string_field(obj, "roundingMode", heap) {
         let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
-            IntrinsicError::BadArgument {
+            IntrinsicError::OutOfRange {
                 index,
                 reason: "invalid `roundingMode`",
             }
@@ -536,7 +547,7 @@ pub fn parse_rounding_options(
             if let Ok(incr) = temporal_rs::options::RoundingIncrement::try_from(raw.trunc()) {
                 options.increment = Some(incr);
             } else {
-                return Err(IntrinsicError::BadArgument {
+                return Err(IntrinsicError::OutOfRange {
                     index,
                     reason: "invalid `roundingIncrement`",
                 });

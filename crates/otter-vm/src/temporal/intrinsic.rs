@@ -212,10 +212,26 @@ fn temporal_native_error(err: TemporalError) -> NativeError {
             class,
             method,
             message,
-        } => NativeError::RangeError {
-            name: "Temporal",
-            reason: format!("Temporal.{class}.{method}: {message}"),
-        },
+        } => {
+            // `temporal_rs::TemporalError::Display` prefixes the
+            // message with the spec error class ("RangeError: …",
+            // "TypeError: …", …). Route TypeError-class engine
+            // errors to `NativeError::TypeError` so spec assertions
+            // that expect `TypeError` aren't surfaced as
+            // `RangeError`.
+            let reason = format!("Temporal.{class}.{method}: {message}");
+            if message.starts_with("TypeError") {
+                NativeError::TypeError {
+                    name: "Temporal",
+                    reason,
+                }
+            } else {
+                NativeError::RangeError {
+                    name: "Temporal",
+                    reason,
+                }
+            }
+        }
         TemporalError::UnknownMember { class, method } => NativeError::TypeError {
             name: "Temporal",
             reason: format!("Temporal.{class}.{method} is not defined"),

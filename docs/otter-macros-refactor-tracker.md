@@ -86,8 +86,8 @@ callsite and Test262 deltas land in the port commit message.
 | WeakRef / FinalizationRegistry | `crates/otter-vm/src/bootstrap_weak_refs.rs`     | `couch!` (×2)      | **DONE 2026-05-24** |
 | ArrayBuffer / SharedArrayBuffer | `crates/otter-vm/src/bootstrap_array_buffer.rs` | `couch!` (×2)      | **DONE 2026-05-24** |
 | DataView            | `crates/otter-vm/src/bootstrap_data_view.rs`               | `couch!`           | **DONE 2026-05-24** |
-| TypedArray family   | `crates/otter-vm/src/bootstrap_typed_array.rs`             | `couch!` (×N + `%TypedArray%`) | Pending (shared abstract proto — needs design) |
-| Temporal classes    | `crates/otter-vm/src/temporal/intrinsic.rs`                | `couch!` (×5) + `holt!` (Now) | Pending |
+| TypedArray family   | `crates/otter-vm/src/bootstrap_typed_array.rs`             | bespoke (already decl-macro driven via `typed_array_intrinsic!` + const tables) | **Parked** — see note below |
+| Temporal classes    | `crates/otter-vm/src/temporal/intrinsic.rs`                | `couch!` (×5) + `holt!` (Now) | **DONE 2026-05-24** |
 | Timers              | `crates/otter-vm/src/timers.rs`                            | `holt!` (or `#[dive]` on globalThis) | Pending |
 
 ### Otter-specific modules → `lodge!`
@@ -111,6 +111,61 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — TypedArrays parking note
+
+- **Parking TypedArrays.** Per-kind ctors (Int8Array .. BigUint64Array)
+  share an abstract `%TypedArray%.prototype` allocated lazily, plus a
+  per-kind prototype chain to that abstract proto, plus a `BYTES_PER_ELEMENT`
+  data property on both ctor and prototype, plus a ctor `[[Prototype]]`
+  override to the abstract `%TypedArray%` ctor. couch!'s "one ctor with
+  optional prototype, parent prototype defaults to %Object.prototype%"
+  shape doesn't capture this without three new design extensions
+  (`prototype_parent = path`, `ctor_parent = path`, `extra_data_props =
+  [...]`).
+- The existing `typed_array_intrinsic!` decl-macro + `TYPED_ARRAY_CTORS`
+  / `TYPED_ARRAY_METHODS` / `TYPED_ARRAY_STATICS` const tables already
+  give a declarative surface for the family. The macro emits 11
+  `BuiltinIntrinsic` adapters that all delegate to a shared
+  `install_typed_array_entry`. The contribution surface for adding a
+  new TypedArray kind is one row in `TYPED_ARRAY_CTORS` + one row in
+  `TYPED_ARRAY_STATICS` + one row in the per-kind ctor dispatch table —
+  no install body to write.
+- Bringing TypedArrays under couch! would mean adding the three couch!
+  design extensions above, then writing 11 near-identical couch!
+  invocations. Net contributor experience would be worse.
+- **Outcome:** TypedArrays stay on `typed_array_intrinsic!`. The macros
+  chapter and tracker note this as the canonical exception.
+
+### 2026-05-24 — Temporal classes ported (4.2d continued)
+
+- **couch! gains `install_on = path`.** When set, the install body
+  binds the ctor on a host object returned by `path(global, heap)`
+  instead of on `globalThis`. Used for nested ctors (Temporal.Instant,
+  Temporal.Duration, …).
+- **Temporal classes ported** — 5 couch! invocations (Instant /
+  Duration / PlainDate / PlainTime / PlainDateTime), each with
+  `install_on = temporal_host`. Per-class adapters are private (not
+  in `BOOTSTRAP_ENTRIES`); `TemporalIntrinsic` still drives the
+  install order so the Temporal namespace exists before each class
+  binds. `Temporal.Now` stays on the hand-rolled `NamespaceBuilder`
+  path (it's a namespace, not a class).
+- **Function ported** — couch! with `prototype.method_specs = [FUNCTION_PROTOTYPE_METHODS]`
+  + `post_install` for the §20.2.3 `[[Call]]` slot on the prototype
+  (so `Function.prototype()` returns undefined), the `length=0` /
+  `name=""` overrides, and the AddRestrictedFunctionProperties
+  caller/arguments accessor pair routed to `%ThrowTypeError%`.
+- **Object ported** — couch! with `static_method_specs = [OBJECT_STATIC_METHODS]`
+  + `prototype.method_specs = [OBJECT_PROTOTYPE_METHODS]` + post_install
+  for the §B.2.2.1 `__proto__` accessor pair. The wrap_primitive
+  helper collapses five inline ToObject branches into one
+  closure-driven path.
+- **RealmIntrinsics generalised** — populate() now delegates to a
+  shared `resolve_prototype` helper that accepts both plain-JsObject
+  constructors (legacy: Function only) and NativeFunction
+  constructors (couch!: everyone else). Stripped vestigial
+  `object_constructor` / `array_constructor` slots that were never
+  read.
 
 ### 2026-05-24 — bulk 4.2d batch (WeakRef..String/Array) + couch! surface fills
 

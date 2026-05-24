@@ -40,193 +40,11 @@ use smallvec::SmallVec;
 
 use crate::binary::typed_array::TypedArrayKind;
 use crate::binary::{dispatch, typed_array_prototype};
-use crate::bootstrap::{alloc_object_with_value_roots, native_constructor_static_with_value_roots};
 use crate::intrinsics::IntrinsicArgs;
-use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::native_function::NativeCall;
-use crate::number::NumberValue;
+use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
 
-const TYPED_ARRAY_METHODS: &[(&str, u8, crate::native_function::NativeFastFn)] = &[
-    ("at", 1, ta_at),
-    ("subarray", 2, ta_subarray),
-    ("slice", 2, ta_slice),
-    ("fill", 3, ta_fill),
-    ("copyWithin", 3, ta_copy_within),
-    ("reverse", 0, ta_reverse),
-    ("indexOf", 2, ta_index_of),
-    ("lastIndexOf", 2, ta_last_index_of),
-    ("includes", 2, ta_includes),
-    ("join", 1, ta_join),
-    ("toString", 0, ta_to_string),
-    ("toLocaleString", 0, ta_to_locale_string),
-    ("set", 2, ta_set),
-    ("toReversed", 0, ta_to_reversed),
-    ("toSorted", 1, ta_to_sorted),
-    ("sort", 1, ta_sort),
-    ("with", 2, ta_with),
-    ("keys", 0, ta_keys),
-    ("values", 0, ta_values),
-    ("entries", 0, ta_entries),
-];
-
-/// Per-kind `<TA>.from` / `<TA>.of` static-method routing table.
-/// Installed on each concrete TypedArray constructor after its
-/// prototype is wired so the §23.2.6 inherited statics resolve via
-/// ordinary property lookup (and not only the call-method
-/// intrinsic dispatch path).
-const TYPED_ARRAY_STATICS: &[(
-    &str,
-    crate::native_function::NativeFastFn,
-    crate::native_function::NativeFastFn,
-)] = &[
-    ("Int8Array", from_int8, of_int8),
-    ("Uint8Array", from_uint8, of_uint8),
-    ("Uint8ClampedArray", from_uint8_clamped, of_uint8_clamped),
-    ("Int16Array", from_int16, of_int16),
-    ("Uint16Array", from_uint16, of_uint16),
-    ("Int32Array", from_int32, of_int32),
-    ("Uint32Array", from_uint32, of_uint32),
-    ("Float32Array", from_float32, of_float32),
-    ("Float64Array", from_float64, of_float64),
-    ("BigInt64Array", from_bigint64, of_bigint64),
-    ("BigUint64Array", from_biguint64, of_biguint64),
-];
-
-/// 11 concrete kinds × (name, length, ctor fn pointer).
-const TYPED_ARRAY_CTORS: &[(&str, TypedArrayKind, crate::native_function::NativeFastFn)] = &[
-    ("Int8Array", TypedArrayKind::Int8, ctor_int8),
-    ("Uint8Array", TypedArrayKind::Uint8, ctor_uint8),
-    (
-        "Uint8ClampedArray",
-        TypedArrayKind::Uint8Clamped,
-        ctor_uint8_clamped,
-    ),
-    ("Int16Array", TypedArrayKind::Int16, ctor_int16),
-    ("Uint16Array", TypedArrayKind::Uint16, ctor_uint16),
-    ("Int32Array", TypedArrayKind::Int32, ctor_int32),
-    ("Uint32Array", TypedArrayKind::Uint32, ctor_uint32),
-    ("Float32Array", TypedArrayKind::Float32, ctor_float32),
-    ("Float64Array", TypedArrayKind::Float64, ctor_float64),
-    ("BigInt64Array", TypedArrayKind::BigInt64, ctor_bigint64),
-    ("BigUint64Array", TypedArrayKind::BigUint64, ctor_biguint64),
-];
-
-/// Entry point invoked by the per-kind `BuiltinIntrinsic` adapter.
-/// Looks up the per-kind ctor for `name` from the static table and
-/// routes to the shared install path.
-pub(crate) fn install_typed_array_entry(
-    name: &'static str,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<(), JsSurfaceError> {
-    let global_root = Value::object(global);
-    // Look up this entry's kind + ctor fn from the static table.
-    let (_, kind, ctor_call) = TYPED_ARRAY_CTORS
-        .iter()
-        .find(|(entry_name, _, _)| *entry_name == name)
-        .copied()
-        .expect("name must match TYPED_ARRAY_CTORS");
-
-    // Ensure %TypedArray%.prototype exists on the realm (allocated
-    // lazily the first time we install a concrete TypedArray).
-    let abstract_proto = ensure_abstract_typed_array_prototype(heap, global)?;
-    let abstract_proto_root = Value::object(abstract_proto);
-
-    // Per-kind prototype linked to the abstract.
-    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &abstract_proto_root])?;
-    let prototype_root = Value::object(prototype);
-    object::set_prototype(prototype, heap, Some(abstract_proto));
-
-    // BYTES_PER_ELEMENT (read-only) on the per-kind prototype.
-    let bpe = kind.bytes_per_element() as i32;
-    object::define_own_property(
-        prototype,
-        heap,
-        "BYTES_PER_ELEMENT",
-        PropertyDescriptor::data(
-            Value::number(NumberValue::from_i32(bpe)),
-            false,
-            false,
-            false,
-        ),
-    );
-
-    let ctor = native_constructor_static_with_value_roots(
-        heap,
-        name,
-        3,
-        ctor_call,
-        &[&global_root, &abstract_proto_root, &prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_root = Value::native_function(ctor);
-    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, "prototype", proto_desc) {
-        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
-    }
-    // §23.2.6.1: each concrete TypedArray constructor inherits from
-    // %TypedArray%. The override is consulted by
-    // `Object.getPrototypeOf` / `__proto__` walks.
-    let abstract_ctor = ensure_abstract_typed_array_constructor(heap, global)?;
-    ctor.set_prototype_override(heap, Some(Value::native_function(abstract_ctor)));
-    // Also expose BYTES_PER_ELEMENT on the constructor (§23.2.6.1).
-    let bpe_desc = PropertyDescriptor::data(
-        Value::number(NumberValue::from_i32(bpe)),
-        false,
-        false,
-        false,
-    );
-    let _ = ctor.define_own_property(heap, "BYTES_PER_ELEMENT", bpe_desc);
-
-    // §23.2.2.1 / §23.2.2.2 — per-kind `from` / `of` static methods.
-    // Installed as own properties so reflective access
-    // (`Int8Array.from`, `Int8Array.of`) returns a callable.
-    if let Some((_, from_fn, of_fn)) = TYPED_ARRAY_STATICS
-        .iter()
-        .copied()
-        .find(|(n, _, _)| *n == name)
-    {
-        let abstract_ctor_value = Value::native_function(abstract_ctor);
-        let from_native = crate::bootstrap::native_static_with_value_roots(
-            heap,
-            "from",
-            1,
-            from_fn,
-            &[&ctor_root, &abstract_ctor_value],
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let _ = ctor.define_own_property(
-            heap,
-            "from",
-            PropertyDescriptor::data(Value::native_function(from_native), true, false, true),
-        );
-        let of_native = crate::bootstrap::native_static_with_value_roots(
-            heap,
-            "of",
-            0,
-            of_fn,
-            &[&ctor_root, &abstract_ctor_value],
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let _ = ctor.define_own_property(
-            heap,
-            "of",
-            PropertyDescriptor::data(Value::native_function(of_native), true, false, true),
-        );
-    }
-
-    object::define_own_property(
-        prototype,
-        heap,
-        "constructor",
-        PropertyDescriptor::data(ctor_root, true, false, true),
-    );
-
-    crate::bootstrap::define_global_value(global, heap, name, ctor_root);
-    Ok(())
-}
 
 /// Install `@@toStringTag` on each per-kind prototype after the
 /// well-known symbol table exists. Also installs `@@iterator =
@@ -906,121 +724,6 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
     ))
 }
 
-// ---------------------------------------------------------------
-// Abstract %TypedArray%.prototype lifecycle
-// ---------------------------------------------------------------
-
-/// Sentinel-named property on `globalThis` that holds
-/// `%TypedArray%.prototype`. Hidden by a leading symbol-style
-/// `@@` prefix to avoid colliding with any user-visible global.
-const ABSTRACT_PROTO_SLOT: &str = "@@%TypedArrayPrototype%";
-
-/// Sentinel slot that holds the abstract `%TypedArray%` constructor
-/// function. Spec §23.2.1: this constructor is the [[Prototype]] of
-/// every concrete TypedArray constructor (Int8Array, Uint8Array …).
-const ABSTRACT_CTOR_SLOT: &str = "@@%TypedArray%";
-
-/// §23.2.1.1 — calling `%TypedArray%` directly always throws a
-/// `TypeError`. The abstract constructor is never observably
-/// instantiated.
-fn abstract_typed_array_call(
-    _ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
-    Err(NativeError::TypeError {
-        name: "TypedArray",
-        reason: "Abstract class TypedArray not directly constructable".to_string(),
-    })
-}
-
-fn ensure_abstract_typed_array_constructor(
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<crate::native_function::NativeFunction, JsSurfaceError> {
-    if let Some(nf) =
-        object::get(global, heap, ABSTRACT_CTOR_SLOT).and_then(|v| v.as_native_function())
-    {
-        return Ok(nf);
-    }
-    let abstract_proto = ensure_abstract_typed_array_prototype(heap, global)?;
-    let global_root = Value::object(global);
-    let abstract_proto_root = Value::object(abstract_proto);
-    let ctor = native_constructor_static_with_value_roots(
-        heap,
-        "TypedArray",
-        0,
-        abstract_typed_array_call,
-        &[&global_root, &abstract_proto_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    // §23.2.2.3 %TypedArray%.prototype is non-writable,
-    // non-enumerable, non-configurable.
-    let proto_desc = PropertyDescriptor::data(Value::object(abstract_proto), false, false, false);
-    if !ctor.define_own_property(heap, "prototype", proto_desc) {
-        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
-    }
-    // §23.2.3.2 %TypedArray%.prototype.constructor — writable,
-    // non-enumerable, configurable.
-    object::define_own_property(
-        abstract_proto,
-        heap,
-        "constructor",
-        PropertyDescriptor::data(Value::native_function(ctor), true, false, true),
-    );
-    // Hide the abstract ctor under a non-enumerable global slot.
-    object::define_own_property(
-        global,
-        heap,
-        ABSTRACT_CTOR_SLOT,
-        PropertyDescriptor::data(Value::native_function(ctor), false, false, false),
-    );
-    Ok(ctor)
-}
-
-fn ensure_abstract_typed_array_prototype(
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-) -> Result<JsObject, JsSurfaceError> {
-    if let Some(obj) = object::get(global, heap, ABSTRACT_PROTO_SLOT).and_then(|v| v.as_object()) {
-        return Ok(obj);
-    }
-    let global_root = Value::object(global);
-    let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
-    // Chain to %Object.prototype% per §23.2.3.
-    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
-        && let Some(object_proto) =
-            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
-    {
-        object::set_prototype(proto, heap, Some(object_proto));
-    }
-    {
-        let mut builder =
-            ObjectBuilder::from_object_with_value_roots(heap, proto, vec![global_root]);
-        for (name, length, call) in TYPED_ARRAY_METHODS {
-            builder.method(
-                name,
-                *length,
-                NativeCall::Static(*call),
-                Attr::builtin_function(),
-            )?;
-        }
-    }
-    // Hide the slot itself from enumeration.
-    object::define_own_property(
-        global,
-        heap,
-        ABSTRACT_PROTO_SLOT,
-        PropertyDescriptor::data(Value::object(proto), false, false, false),
-    );
-    Ok(proto)
-}
-
-fn get_abstract_typed_array_prototype(
-    global: JsObject,
-    heap: &otter_gc::GcHeap,
-) -> Option<JsObject> {
-    object::get(global, heap, ABSTRACT_PROTO_SLOT).and_then(|v| v.as_object())
-}
 
 // ---------------------------------------------------------------
 // Per-kind constructor wrappers
@@ -1362,44 +1065,149 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     }
 }
 
+
 // ---------------------------------------------------------------
-// BuiltinIntrinsic adapters — one zero-sized struct per TypedArray
-// variant.
+// Abstract %TypedArray% + per-kind couch!-driven installers.
 // ---------------------------------------------------------------
 
-/// Generate per-kind `BuiltinIntrinsic` adapter types. Each ZST
-/// pins its JS name and dispatches through
-/// [`install_typed_array_entry`].
-macro_rules! typed_array_intrinsic {
-    ($($ty:ident => $name:literal),* $(,)?) => {
-        $(
-            #[doc = concat!("`BuiltinIntrinsic` adapter for the `", $name, "` constructor.")]
-            pub struct $ty;
-            impl crate::intrinsic_install::BuiltinIntrinsic for $ty {
-                const NAME: &'static str = $name;
-                const FEATURE: crate::bootstrap::BootstrapFeatures =
-                    crate::bootstrap::BootstrapFeatures::CORE;
-                fn install(
-                    heap: &mut otter_gc::GcHeap,
-                    global: JsObject,
-                ) -> Result<(), JsSurfaceError> {
-                    install_typed_array_entry(Self::NAME, heap, global)
-                }
-            }
-        )*
+/// Sentinel-named property on `globalThis` that holds the abstract
+/// `%TypedArray%` constructor. Hidden by a leading `@@` prefix to
+/// avoid colliding with any user-visible global. The matching
+/// abstract `%TypedArray%.prototype` is reached through
+/// `<abstract>.prototype` (couch! emits the standard prototype data
+/// property when the prototype block is non-empty).
+const ABSTRACT_CTOR_SLOT: &str = "@@%TypedArray%";
+
+/// §23.2.1.1 — calling `%TypedArray%` directly always throws a
+/// `TypeError`. The abstract constructor is never observably
+/// instantiated.
+fn abstract_typed_array_call(
+    _ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    Err(NativeError::TypeError {
+        name: "TypedArray",
+        reason: "Abstract class TypedArray not directly constructable".to_string(),
+    })
+}
+
+otter_macros::couch! {
+    name = "@@%TypedArray%",
+    feature = CORE,
+    intrinsic = AbstractTypedArrayIntrinsic,
+    constructor = (length = 0, call = abstract_typed_array_call),
+    prototype = {
+        methods = {
+            "at"             / 1 => ta_at,
+            "subarray"       / 2 => ta_subarray,
+            "slice"          / 2 => ta_slice,
+            "fill"           / 3 => ta_fill,
+            "copyWithin"     / 3 => ta_copy_within,
+            "reverse"        / 0 => ta_reverse,
+            "indexOf"        / 2 => ta_index_of,
+            "lastIndexOf"    / 2 => ta_last_index_of,
+            "includes"       / 2 => ta_includes,
+            "join"           / 1 => ta_join,
+            "toString"       / 0 => ta_to_string,
+            "toLocaleString" / 0 => ta_to_locale_string,
+            "set"            / 2 => ta_set,
+            "toReversed"     / 0 => ta_to_reversed,
+            "toSorted"       / 1 => ta_to_sorted,
+            "sort"           / 1 => ta_sort,
+            "with"           / 2 => ta_with,
+            "keys"           / 0 => ta_keys,
+            "values"         / 0 => ta_values,
+            "entries"        / 0 => ta_entries,
+        },
+    },
+}
+
+/// Safe `Option` variant of [`abstract_typed_array_proto_lookup`]
+/// for callers that run before the abstract ctor is guaranteed to
+/// exist (e.g. post-bootstrap well-known fixups that walk every
+/// per-kind prototype regardless of installation order).
+fn get_abstract_typed_array_prototype(
+    global: JsObject,
+    heap: &mut otter_gc::GcHeap,
+) -> Option<JsObject> {
+    let ctor = object::get(global, heap, ABSTRACT_CTOR_SLOT)?.as_native_function()?;
+    let desc = ctor
+        .own_property_descriptor(heap, "prototype")
+        .ok()
+        .flatten()?;
+    match desc.kind {
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
+        _ => None,
+    }
+}
+
+/// Resolve `%TypedArray%.prototype` for per-kind couch! invocations
+/// via `prototype.parent`. Panics if `AbstractTypedArrayIntrinsic`
+/// has not yet run — bootstrap enforces declaration order, so this
+/// is unreachable under the supported install path.
+fn abstract_typed_array_proto_lookup(global: JsObject, heap: &mut otter_gc::GcHeap) -> JsObject {
+    let ctor = object::get(global, heap, ABSTRACT_CTOR_SLOT)
+        .and_then(|v| v.as_native_function())
+        .expect("abstract %TypedArray% ctor must be installed before per-kind installers");
+    let desc = ctor
+        .own_property_descriptor(heap, "prototype")
+        .ok()
+        .flatten()
+        .expect("abstract %TypedArray%.prototype must exist");
+    match desc.kind {
+        crate::object::DescriptorKind::Data { value } => value
+            .as_object()
+            .expect("abstract %TypedArray%.prototype must be an object"),
+        _ => panic!("abstract %TypedArray%.prototype must be a data descriptor"),
+    }
+}
+
+/// Resolve `%TypedArray%` as a `Value` for per-kind couch! ctors via
+/// `ctor_parent`. Per §23.2.6.1 each concrete TypedArray constructor
+/// inherits from `%TypedArray%`.
+fn abstract_typed_array_ctor_lookup(global: JsObject, heap: &mut otter_gc::GcHeap) -> Value {
+    object::get(global, heap, ABSTRACT_CTOR_SLOT)
+        .expect("abstract %TypedArray% ctor must be installed before per-kind installers")
+}
+
+/// Declarative wrapper that emits one `couch!` invocation for a
+/// concrete TypedArray kind. Each kind pins its `BYTES_PER_ELEMENT`
+/// on both ctor and prototype, chains the prototype to
+/// `%TypedArray%.prototype`, and overrides the ctor's `[[Prototype]]`
+/// to `%TypedArray%`.
+macro_rules! typed_array_kind {
+    ($name:literal, $intrinsic:ident, $bpe:expr, $ctor:ident, $from:ident, $of:ident) => {
+        otter_macros::couch! {
+            name = $name,
+            feature = CORE,
+            intrinsic = $intrinsic,
+            constructor = (length = 3, call = $ctor),
+            statics = {
+                "from" / 1 => $from,
+                "of"   / 0 => $of,
+            },
+            static_constants = [
+                ("BYTES_PER_ELEMENT", Number($bpe)),
+            ],
+            prototype = {
+                parent = abstract_typed_array_proto_lookup,
+            },
+            prototype_constants = [
+                ("BYTES_PER_ELEMENT", Number($bpe)),
+            ],
+            ctor_parent = abstract_typed_array_ctor_lookup,
+        }
     };
 }
 
-typed_array_intrinsic!(
-    Int8ArrayIntrinsic         => "Int8Array",
-    Uint8ArrayIntrinsic        => "Uint8Array",
-    Uint8ClampedArrayIntrinsic => "Uint8ClampedArray",
-    Int16ArrayIntrinsic        => "Int16Array",
-    Uint16ArrayIntrinsic       => "Uint16Array",
-    Int32ArrayIntrinsic        => "Int32Array",
-    Uint32ArrayIntrinsic       => "Uint32Array",
-    Float32ArrayIntrinsic      => "Float32Array",
-    Float64ArrayIntrinsic      => "Float64Array",
-    BigInt64ArrayIntrinsic     => "BigInt64Array",
-    BigUint64ArrayIntrinsic    => "BigUint64Array",
-);
+typed_array_kind!("Int8Array",         Int8ArrayIntrinsic,         1.0, ctor_int8,          from_int8,          of_int8);
+typed_array_kind!("Uint8Array",        Uint8ArrayIntrinsic,        1.0, ctor_uint8,         from_uint8,         of_uint8);
+typed_array_kind!("Uint8ClampedArray", Uint8ClampedArrayIntrinsic, 1.0, ctor_uint8_clamped, from_uint8_clamped, of_uint8_clamped);
+typed_array_kind!("Int16Array",        Int16ArrayIntrinsic,        2.0, ctor_int16,         from_int16,         of_int16);
+typed_array_kind!("Uint16Array",       Uint16ArrayIntrinsic,       2.0, ctor_uint16,        from_uint16,        of_uint16);
+typed_array_kind!("Int32Array",        Int32ArrayIntrinsic,        4.0, ctor_int32,         from_int32,         of_int32);
+typed_array_kind!("Uint32Array",       Uint32ArrayIntrinsic,       4.0, ctor_uint32,        from_uint32,        of_uint32);
+typed_array_kind!("Float32Array",      Float32ArrayIntrinsic,      4.0, ctor_float32,       from_float32,       of_float32);
+typed_array_kind!("Float64Array",      Float64ArrayIntrinsic,      8.0, ctor_float64,       from_float64,       of_float64);
+typed_array_kind!("BigInt64Array",     BigInt64ArrayIntrinsic,     8.0, ctor_bigint64,      from_bigint64,      of_bigint64);
+typed_array_kind!("BigUint64Array",    BigUint64ArrayIntrinsic,    8.0, ctor_biguint64,     from_biguint64,     of_biguint64);

@@ -290,6 +290,10 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::ArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_array_buffer::SharedArrayBufferIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_data_view::Intrinsic),
+    // Abstract `%TypedArray%` must install before any per-kind ctor —
+    // the per-kind couch! invocations resolve the abstract proto +
+    // ctor via lookup, which would panic otherwise.
+    crate::bootstrap_entry!(crate::bootstrap_typed_array::AbstractTypedArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Int8ArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint8ArrayIntrinsic),
     crate::bootstrap_entry!(crate::bootstrap_typed_array::Uint8ClampedArrayIntrinsic),

@@ -603,7 +603,7 @@ impl NativeFunction {
     /// Return an own property descriptor for native function object
     /// metadata. Built-in `name` / `length` are non-writable,
     /// non-enumerable, configurable data properties.
-    pub(crate) fn own_property_descriptor(
+    pub fn own_property_descriptor(
         &self,
         heap: &mut otter_gc::GcHeap,
         key: &str,

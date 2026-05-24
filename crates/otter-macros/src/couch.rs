@@ -206,6 +206,12 @@ pub(crate) struct PrototypeBlock {
     pub(crate) methods: Vec<MethodEntry>,
     pub(crate) accessors: Vec<AccessorEntry>,
     pub(crate) method_specs: Vec<Path>,
+    /// Optional `parent = path` override. When set, the install body
+    /// resolves the prototype's `[[Prototype]]` via
+    /// `path(global, heap)` instead of linking to `%Object.prototype%`.
+    /// Used by TypedArray per-kind prototypes that chain to
+    /// `%TypedArray%.prototype` per §23.2.6.
+    pub(crate) parent: Option<Path>,
 }
 
 impl Parse for PrototypeBlock {
@@ -215,10 +221,14 @@ impl Parse for PrototypeBlock {
         let mut methods: Vec<MethodEntry> = Vec::new();
         let mut accessors: Vec<AccessorEntry> = Vec::new();
         let mut method_specs: Vec<Path> = Vec::new();
+        let mut parent: Option<Path> = None;
         while !body.is_empty() {
             let key: Ident = body.parse()?;
             body.parse::<Token![=]>()?;
             match key.to_string().as_str() {
+                "parent" => {
+                    parent = Some(body.parse()?);
+                }
                 "methods" => {
                     let methods_body;
                     braced!(methods_body in body);
@@ -254,7 +264,7 @@ impl Parse for PrototypeBlock {
                         key.span(),
                         format!(
                             "couch! prototype: unknown field `{other}` — expected \
-                             `methods`, `accessors`, or `method_specs`"
+                             `methods`, `accessors`, `method_specs`, or `parent`"
                         ),
                     ));
                 }
@@ -267,6 +277,7 @@ impl Parse for PrototypeBlock {
             methods,
             accessors,
             method_specs,
+            parent,
         })
     }
 }
@@ -291,6 +302,15 @@ pub(crate) struct CouchInput {
     /// the `holt!` constant grammar.
     pub(crate) static_constants: Vec<ConstantEntry>,
     pub(crate) prototype: PrototypeBlock,
+    /// Mirrors [`Self::static_constants`] but pins the constants on
+    /// the **prototype** instead of the constructor. Used for
+    /// `TypedArray.prototype.BYTES_PER_ELEMENT` per §23.2.6.1.
+    pub(crate) prototype_constants: Vec<ConstantEntry>,
+    /// Optional `ctor_parent = path` override. When set, the install
+    /// body resolves the constructor's `[[Prototype]]` override via
+    /// `path(global, heap) -> Value`. Used for concrete TypedArray
+    /// constructors that inherit from `%TypedArray%` per §23.2.6.1.
+    pub(crate) ctor_parent: Option<Path>,
     /// Optional `install_on = path` parent override. When set, the
     /// generated install body looks up the parent host object via
     /// `path(global, heap)` and binds the constructor there instead
@@ -317,7 +337,9 @@ impl Parse for CouchInput {
         let mut statics: Vec<MethodEntry> = Vec::new();
         let mut static_method_specs: Vec<Path> = Vec::new();
         let mut static_constants: Vec<ConstantEntry> = Vec::new();
+        let mut prototype_constants: Vec<ConstantEntry> = Vec::new();
         let mut prototype: PrototypeBlock = PrototypeBlock::default();
+        let mut ctor_parent: Option<Path> = None;
         let mut install_on: Option<Path> = None;
         let mut post_install: Option<Path> = None;
 
@@ -360,8 +382,21 @@ impl Parse for CouchInput {
                         }
                     }
                 }
+                "prototype_constants" => {
+                    let body;
+                    bracketed!(body in input);
+                    while !body.is_empty() {
+                        prototype_constants.push(body.parse()?);
+                        if body.peek(Token![,]) {
+                            body.parse::<Token![,]>()?;
+                        }
+                    }
+                }
                 "prototype" => {
                     prototype = input.parse()?;
+                }
+                "ctor_parent" => {
+                    ctor_parent = Some(input.parse()?);
                 }
                 "install_on" => {
                     install_on = Some(input.parse()?);
@@ -375,7 +410,8 @@ impl Parse for CouchInput {
                         format!(
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
                              `spec`, `intrinsic`, `constructor`, `statics`, `static_method_specs`, \
-                             `static_constants`, `prototype`, `install_on`, or `post_install`"
+                             `static_constants`, `prototype`, `ctor_parent`, `install_on`, or \
+                             `post_install`"
                         ),
                     ));
                 }
@@ -421,7 +457,9 @@ impl Parse for CouchInput {
             statics,
             static_method_specs,
             static_constants,
+            prototype_constants,
             prototype,
+            ctor_parent,
             install_on,
             post_install,
         })
@@ -439,7 +477,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         statics,
         static_method_specs,
         static_constants,
+        prototype_constants,
         prototype,
+        ctor_parent,
         install_on,
         post_install,
     } = input;
@@ -483,6 +523,8 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
 
     let statics_ident = format_ident!("__OTTER_{}_STATICS", spec_ident);
     let static_constants_ident = format_ident!("__OTTER_{}_STATIC_CONSTANTS", spec_ident);
+    let prototype_constants_ident =
+        format_ident!("__OTTER_{}_PROTOTYPE_CONSTANTS", spec_ident);
     let prototype_methods_ident = format_ident!("__OTTER_{}_PROTOTYPE_METHODS", spec_ident);
     let prototype_accessors_ident = format_ident!("__OTTER_{}_PROTOTYPE_ACCESSORS", spec_ident);
     let static_entries = statics.iter().map(|m| {
@@ -513,6 +555,54 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             }
         }
     });
+    let prototype_constant_entries = prototype_constants.iter().map(|c| {
+        let js_name = &c.js_name;
+        let attrs_path = crate::holt::attrs_factory_path(c.attrs.as_ref(), "read_only");
+        let value_tokens = match (c.kind.to_string().as_str(), c.value.as_ref()) {
+            ("Undefined", None) => quote! { ::otter_vm::ConstValue::Undefined },
+            ("Null", None) => quote! { ::otter_vm::ConstValue::Null },
+            ("Boolean", Some(expr)) => quote! { ::otter_vm::ConstValue::Boolean(#expr) },
+            ("Number", Some(expr)) => quote! { ::otter_vm::ConstValue::Number(#expr) },
+            ("Undefined" | "Null", Some(_)) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "couch!: `{}` prototype constant takes no value — drop the `(expr)` suffix",
+                        c.kind
+                    ),
+                )
+                .to_compile_error();
+            }
+            ("Boolean" | "Number", None) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "couch!: `{}` prototype constant requires a `(expr)` value",
+                        c.kind
+                    ),
+                )
+                .to_compile_error();
+            }
+            (other, _) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "couch!: unknown prototype constant kind `{other}` — expected one of \
+                         `Undefined`, `Null`, `Boolean`, `Number`"
+                    ),
+                )
+                .to_compile_error();
+            }
+        };
+        quote! {
+            ::otter_vm::ConstSpec {
+                name: #js_name,
+                value: #value_tokens,
+                attrs: #attrs_path,
+            }
+        }
+    });
+
     let static_constant_entries = static_constants.iter().map(|c| {
         let js_name = &c.js_name;
         let attrs_path = crate::holt::attrs_factory_path(c.attrs.as_ref(), "read_only");
@@ -650,11 +740,68 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // anything; controls the wrapping `if` in the install body.
     let prototype_block_needed = !prototype.methods.is_empty()
         || !prototype.accessors.is_empty()
-        || prototype_has_method_specs;
+        || prototype_has_method_specs
+        || !prototype_constants.is_empty()
+        || prototype.parent.is_some();
 
     let post_install_call = match post_install {
         Some(path) => quote! {
             #path(heap, global, ctor)?;
+        },
+        None => quote! {},
+    };
+
+    let prototype_parent_link = match &prototype.parent {
+        Some(path) => quote! {
+            // Custom prototype parent — caller provides a resolver
+            // that returns the JsObject to link `[[Prototype]]` to.
+            let parent_proto = #path(global, heap);
+            ::otter_vm::object::set_prototype(
+                prototype,
+                heap,
+                ::core::option::Option::Some(parent_proto),
+            );
+        },
+        None => quote! {
+            // Default — link to `%Object.prototype%` per §19.4 when
+            // Object is already installed.
+            if let ::core::option::Option::Some(object_ctor) =
+                ::otter_vm::object::get(global, heap, "Object")
+                    .and_then(|v| v.as_object())
+                && let ::core::option::Option::Some(object_proto) =
+                    ::otter_vm::object::get(object_ctor, heap, "prototype")
+                        .and_then(|v| v.as_object())
+            {
+                ::otter_vm::object::set_prototype(
+                    prototype,
+                    heap,
+                    ::core::option::Option::Some(object_proto),
+                );
+            } else if let ::core::option::Option::Some(object_ctor_value) =
+                ::otter_vm::object::get(global, heap, "Object")
+                && let ::core::option::Option::Some(object_ctor_native) =
+                    object_ctor_value.as_native_function()
+                && let ::core::result::Result::Ok(::core::option::Option::Some(desc)) =
+                    object_ctor_native.own_property_descriptor(heap, "prototype")
+                && let ::otter_vm::object::DescriptorKind::Data { value } = desc.kind
+                && let ::core::option::Option::Some(object_proto) = value.as_object()
+            {
+                ::otter_vm::object::set_prototype(
+                    prototype,
+                    heap,
+                    ::core::option::Option::Some(object_proto),
+                );
+            }
+        },
+    };
+
+    let ctor_parent_link = match ctor_parent {
+        Some(path) => quote! {
+            // Custom constructor `[[Prototype]]` override — used by
+            // concrete TypedArray ctors that inherit from
+            // `%TypedArray%` per §23.2.6.1.
+            let parent_ctor = #path(global, heap);
+            ctor.set_prototype_override(heap, ::core::option::Option::Some(parent_ctor));
         },
         None => quote! {},
     };
@@ -705,6 +852,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         static #static_constants_ident: &[::otter_vm::ConstSpec] = &[
             #(#static_constant_entries),*
+        ];
+
+        #[allow(non_upper_case_globals)]
+        static #prototype_constants_ident: &[::otter_vm::ConstSpec] = &[
+            #(#prototype_constant_entries),*
         ];
 
         #[allow(non_upper_case_globals)]
@@ -765,6 +917,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 )
                 .map_err(::otter_vm::JsSurfaceError::from)?;
                 let ctor_value = ::otter_vm::Value::native_function(ctor);
+                #ctor_parent_link
 
                 for method_spec in #spec_ident.static_methods.iter() {
                     let call_target = match method_spec.call {
@@ -844,19 +997,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         &[&global_root, &ctor_value],
                     )
                     .map_err(::otter_vm::JsSurfaceError::from)?;
-                    if let ::core::option::Option::Some(object_ctor) =
-                        ::otter_vm::object::get(global, heap, "Object")
-                            .and_then(|v| v.as_object())
-                        && let ::core::option::Option::Some(object_proto) =
-                            ::otter_vm::object::get(object_ctor, heap, "prototype")
-                                .and_then(|v| v.as_object())
-                    {
-                        ::otter_vm::object::set_prototype(
-                            prototype,
-                            heap,
-                            ::core::option::Option::Some(object_proto),
-                        );
-                    }
+                    #prototype_parent_link
                     let prototype_value = ::otter_vm::Value::object(prototype);
                     {
                         let mut builder =
@@ -879,6 +1020,32 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         // declarative macro that produces a static
                         // slice.
                         #(#extra_method_spec_iters)*
+                    }
+                    // Prototype constants (e.g. per-kind
+                    // `TypedArray.prototype.BYTES_PER_ELEMENT`).
+                    for const_spec in #prototype_constants_ident.iter() {
+                        let value = match const_spec.value {
+                            ::otter_vm::ConstValue::Undefined => ::otter_vm::Value::undefined(),
+                            ::otter_vm::ConstValue::Null => ::otter_vm::Value::null(),
+                            ::otter_vm::ConstValue::Boolean(b) => ::otter_vm::Value::boolean(b),
+                            ::otter_vm::ConstValue::Number(n) => ::otter_vm::Value::number_f64(n),
+                        };
+                        let desc = ::otter_vm::object::PropertyDescriptor::data(
+                            value,
+                            const_spec.attrs.writable,
+                            const_spec.attrs.enumerable,
+                            const_spec.attrs.configurable,
+                        );
+                        if !::otter_vm::object::define_own_property(
+                            prototype,
+                            heap,
+                            const_spec.name,
+                            desc,
+                        ) {
+                            return ::core::result::Result::Err(
+                                ::otter_vm::JsSurfaceError::DefinePropertyFailed(const_spec.name),
+                            );
+                        }
                     }
                     let proto_desc = ::otter_vm::object::PropertyDescriptor::data(
                         prototype_value,

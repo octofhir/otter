@@ -1,7 +1,7 @@
 //! `couch!` proc macro — class intrinsic generator.
 //!
 //! See the crate-level docs and
-//! [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+//! [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md)
 //! for the naming theme and the full surface. This module owns the
 //! parsing + expansion for the `couch!` invocation only.
 //!

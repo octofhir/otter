@@ -7,7 +7,7 @@
 //! at startup. No new runtime path, no dynamic registration — the
 //! macros are pure code generation over the spec types in
 //! [`otter_vm`] and the native ABI v1 documented at
-//! [`docs/native-call-abi.md`](../../../docs/native-call-abi.md).
+//! [`docs/book/src/engine/native-call-abi.md`](../../../docs/book/src/engine/native-call-abi.md).
 //!
 //! # Naming theme
 //!
@@ -129,22 +129,12 @@
 //!
 //! # See also
 //!
-//! - [Design note](../../../docs/otter-macros-design.md) — full
+//! - [Design note](../../../docs/book/src/macros/design.md) — full
 //!   surface, naming rationale, migration sequence.
-//! - [Refactor tracker](../../../docs/otter-macros-refactor-tracker.md)
-//!   — per-consumer port state.
-//! - [Native call ABI](../../../docs/native-call-abi.md) — the
-//!   signature every generated method targets.
+//! - [Native call ABI](../../../docs/book/src/engine/native-call-abi.md)
+//!   — the signature every generated method targets.
 //! - [Macro overview (mdbook)](../../../docs/book/src/macros/overview.md)
 //!   — narrative chapter with per-macro examples.
-//!
-//! # Status
-//!
-//! Phase 4.1 of the architecture refactor — see
-//! `docs/architecture-refactor-plan-2026-05.md` Task 4.1. Sub-phase
-//! 4.1b deleted the legacy `#[js_namespace]` / `#[js_class]` /
-//! `#[js_fn]` / `#[js_constructor]` attribute macros; only the
-//! otter-themed surface (`holt!`, `couch!`, `raft!`) remains.
 
 use std::collections::BTreeSet;
 
@@ -168,7 +158,7 @@ mod lodge;
 /// top-level, `Intl`).
 ///
 /// See the crate-level docs for the naming theme and full surface,
-/// and [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+/// and [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md)
 /// for the design rationale.
 ///
 /// # Syntax
@@ -247,7 +237,7 @@ pub fn couch(input: TokenStream) -> TokenStream {
 /// `otter:*` / `node:*` module surface.
 ///
 /// See the crate-level docs and
-/// [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+/// [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md)
 /// for the naming theme. The macro emits:
 ///
 /// - `pub fn install_<name>_module(&mut HostedModuleCtx) -> Result<(), String>`
@@ -315,7 +305,7 @@ pub fn lodge(input: TokenStream) -> TokenStream {
 ///
 /// Per-field tracers that need custom logic (Cell-shaped interior
 /// mutability, ephemeron entries, etc.) keep their hand-written
-/// `SafeTraceable` impl. See [`docs/otter-macros-design.md`] for the
+/// `SafeTraceable` impl. See [`docs/book/src/macros/design.md`] for the
 /// full surface and the planned `#[pelt(via = path)]` extension.
 #[proc_macro_derive(Pelt, attributes(pelt))]
 pub fn pelt_derive(input: TokenStream) -> TokenStream {
@@ -336,7 +326,7 @@ pub fn pelt_derive(input: TokenStream) -> TokenStream {
 /// heap.register_finalize::<MyBody>();
 /// ```
 ///
-/// See [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+/// See [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md)
 /// for the full Pelt / Groom surface.
 #[proc_macro_derive(Groom, attributes(groom))]
 pub fn groom_derive(input: TokenStream) -> TokenStream {

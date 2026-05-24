@@ -42,8 +42,8 @@
 //! # See also
 //!
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types>
-//! - `docs/architecture-refactor-plan-2026-05.md` Phase 1.1
-//! - `docs/architecture-audit-2026-05.md` §1 (value model audit)
+//! - [`docs/book/src/engine/architecture.md`](../../../../docs/book/src/engine/architecture.md)
+//!   — the value-model section.
 
 pub mod tag;
 

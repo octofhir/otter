@@ -1,7 +1,7 @@
 //! `holt!` proc macro — namespace intrinsic generator.
 //!
 //! See the crate-level docs and
-//! [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+//! [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md)
 //! for the naming theme and the full surface. This module owns the
 //! parsing + expansion for the `holt!` invocation only.
 //!
@@ -29,7 +29,7 @@
 //! # See also
 //! - [`crate::raft`](super::raft) — grouped method spec used as the
 //!   table form of a `holt!` body.
-//! - [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+//! - [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md)
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;

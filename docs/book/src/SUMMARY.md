@@ -15,6 +15,7 @@
 - [Event Loop](engine/event-loop.md)
 - [Frontend And Compilation](engine/frontend.md)
 - [GC API](engine/gc-api.md)
+- [Native Call ABI](engine/native-call-abi.md)
 - [Step Trace](engine/step-trace.md)
 
 # Package Manager
@@ -44,3 +45,4 @@
 # Macros
 
 - [Overview](macros/overview.md)
+- [Design Note](macros/design.md)

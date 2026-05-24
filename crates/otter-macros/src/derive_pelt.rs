@@ -29,7 +29,7 @@
 //! # See also
 //!
 //! - [`otter_vm::pelt`] — `PeltField` trait + blanket impls.
-//! - [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md).
+//! - [`docs/book/src/macros/design.md`](../../../docs/book/src/macros/design.md).
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;

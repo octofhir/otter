@@ -1,21 +1,18 @@
-# Otter Macros — Design Note for Task 4.1
+# Otter Macros — Design Note
 
-Status: **Draft**, owner review pending.
+This is the design note behind the otter-themed macro surface
+(`holt!` / `couch!` / `raft!` / `burrow!` / `lodge!` / `#[dive]` /
+`#[derive(Pelt)]` / `#[derive(Groom)]`). It captures the naming
+rationale, the migration story away from the legacy
+`#[js_namespace]` / `#[js_class]` macros, and the open questions
+that remain.
 
-This is the design note for Task 4.1 (Replace Current Macro API
-With `otter_*`) from
-[`docs/architecture-refactor-plan-2026-05.md`](architecture-refactor-plan-2026-05.md).
-Final naming + macro surface is settled here before any code lands;
-the macro crate rewrite + first intrinsic ports are gated on owner
-sign-off of this note.
-
-The brief from the plan was generic `otter_intrinsic`,
-`otter_class`, `otter_module`, `dive`, plus trace/finalize derives.
-This note replaces the generic naming with the otter-themed surface
-already in use in stub/aspirational form (`raft!` / `burrow!` /
-`lodge!` / `#[dive]`) and extends it to cover the remaining roles.
-The point is keeping Otter recognisable as Otter, not as
-"yet-another-engine".
+The brief was generic `otter_intrinsic`, `otter_class`,
+`otter_module`, `dive`, plus trace/finalize derives. This note
+replaces the generic naming with the otter-themed surface
+(`raft!` / `burrow!` / `lodge!` / `#[dive]`) and extends it to
+cover the remaining roles. The point is keeping Otter recognisable
+as Otter, not as "yet-another-engine".
 
 ## Goals
 
@@ -198,7 +195,7 @@ Methods receive `&mut NativeCtx<'_>` plus the burrow handle
 unpacked from `this`.
 
 Burrow is the only macro that touches the embedder root contract;
-deserves its own runbook section in `docs/native-call-abi.md` when
+deserves its own runbook section in `docs/book/src/engine/native-call-abi.md` when
 the macro lands.
 
 ### `lodge!` — module install
@@ -356,7 +353,7 @@ depends on (see `crates/otter-runtime/tests/compile_fail/`).
    assertions pin the expected `^^^^^` underline range.
 2. **ABI drift.** Generated code embeds the v1 ABI signature; an
    ABI v2 (if and when it ships) breaks every macro expansion at
-   once. Document this in `docs/native-call-abi.md` as a hard
+   once. Document this in `docs/book/src/engine/native-call-abi.md` as a hard
    versioning rule: macros target the current ABI verbatim, no
    shim layer.
 3. **`forbid(unsafe_code)`.** None of the planned expansions need
@@ -420,15 +417,10 @@ Task 4.1 is DONE when:
 
 ## Cross-references
 
-- [`docs/architecture-refactor-plan-2026-05.md`](architecture-refactor-plan-2026-05.md)
-  — Task 4.1 / 4.2 / 4.3 / 6.3.
-- [`docs/native-call-abi.md`](native-call-abi.md) — ABI v1 the
+- [Native Call ABI](../engine/native-call-abi.md) — ABI v1 the
   generated code targets.
-- [`docs/snapshot-checkpoint-decision.md`](snapshot-checkpoint-decision.md)
-  — P1 prerequisite: this work is the load-bearing input for the
-  startup snapshot pipeline.
 - [`crates/otter-macros/src/lib.rs`](../crates/otter-macros/src/lib.rs)
-  — current proc-macro implementations to be replaced.
+  — current proc-macro implementations.
 - [`crates/otter-vm/src/intrinsics/`](../crates/otter-vm/src/intrinsics/)
   — current hand-written installers; each becomes a macro callsite
   during Phase 4.2.

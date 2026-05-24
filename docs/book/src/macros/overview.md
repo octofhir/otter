@@ -9,13 +9,10 @@ identical in shape to the hand-written installers under
 [`crates/otter-vm/src/intrinsics/`](https://github.com/octofhir/otter/tree/main/crates/otter-vm/src/intrinsics)
 — no new runtime path, no dynamic registration.
 
-> **Status.** Otter macros are being introduced in Phase 4.1 of the
-> architecture refactor. The legacy `#[js_namespace]` / `#[js_class]`
-> attribute macros remain temporarily for backward compatibility and
-> are deleted in sub-phase 4.1b once the otter-themed surface is
-> fully populated. New code uses the otter-themed macros below.
-> Refactor progress is tracked in
-> [`docs/otter-macros-refactor-tracker.md`](https://github.com/octofhir/otter/blob/main/docs/otter-macros-refactor-tracker.md).
+> **Status.** Otter-themed macros are the only supported surface;
+> the legacy `#[js_namespace]` / `#[js_class]` / `#[js_fn]` /
+> `#[js_constructor]` attribute macros have been removed. New code
+> uses the otter-themed macros below.
 
 ## Naming Theme
 
@@ -350,12 +347,11 @@ coordination stays centralised.
 per-body `Finalize` trait, and the sweep path has no place to
 dispatch one — the existing
 [`crates/otter-gc/src/finalize.rs`](https://github.com/octofhir/otter/blob/main/crates/otter-gc/src/finalize.rs)
-module owns weak / `FinalizationRegistry` bookkeeping, not a
-generic drop-time hook. Once the finalize-hook RFC lands and the
-sweeper wiring is in place, `#[derive(Groom)]` will mirror `Pelt`'s
-field-walk shape with a `#[groom(skip)]` opt-out for fields managed
-by their own `Drop` impl. Tracker entry:
-[`docs/otter-macros-refactor-tracker.md`](https://github.com/octofhir/otter/blob/main/docs/otter-macros-refactor-tracker.md).
+module owns weak / `FinalizationRegistry` bookkeeping; the generic
+drop-time hook lives in [`otter_gc::SafeFinalize`]. `#[derive(Groom)]`
+mirrors `Pelt`'s field-walk shape with a `#[groom(skip)]` opt-out
+for fields managed by their own `Drop` impl. Bodies opt in by also
+calling `heap.register_finalize::<MyBody>()` once at bootstrap.
 
 ## How the Macros Plug into Bootstrap
 
@@ -383,17 +379,15 @@ decision in `bootstrap.rs`.
 - Expansion compiles under `#![forbid(unsafe_code)]`. Any macro
   that needs `unsafe` for the expansion is a design bug.
 - Every generated method call targets ABI v1 from
-  [`docs/native-call-abi.md`](../../../native-call-abi.md). The
-  macro expansion fails to compile if the referenced function does
+  [Native Call ABI](../engine/native-call-abi.md). The macro
+  expansion fails to compile if the referenced function does
   not match the v1 signature.
 
 ## See Also
 
-- [Otter Macros — Design Note](../../../otter-macros-design.md) —
-  rationale, full surface, migration sequence, open questions.
-- [Refactor Tracker](../../../otter-macros-refactor-tracker.md) —
-  live per-consumer port state.
-- [Native Call ABI](../../../native-call-abi.md) — the signature
+- [Otter Macros — Design Note](design.md) — rationale, full
+  surface, migration sequence, open questions.
+- [Native Call ABI](../engine/native-call-abi.md) — the signature
   every generated method targets.
 - [JS Surface Builders](../extensions/js-surface-builders.md) —
   the runtime helpers the macro expansions call into.

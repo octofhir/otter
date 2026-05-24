@@ -35,8 +35,8 @@
 use smallvec::SmallVec;
 
 use crate::collections::{self, CollectionError};
-use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
-use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
+use crate::js_surface::JsSurfaceError;
+use crate::object::{self, JsObject, PartialPropertyDescriptor};
 use crate::{
     NativeCtx, NativeError, Value, VmError, VmGetOutcome, VmPropertyKey, descriptor_value,
 };
@@ -45,49 +45,99 @@ use crate::{
 // Public bootstrap install entry points
 // ---------------------------------------------------------------
 
-/// `BuiltinIntrinsic` adapter for `Map`. Routes through the shared
-/// `install_collection` helper with `CollectionKind::Map`.
-pub struct MapIntrinsic;
+// Four collection intrinsics — Map / Set / WeakMap / WeakSet. Each
+// gets its own `couch!` invocation. Shared `install_collection`
+// helper deleted along with the per-kind `match` in
+// `install_prototype_methods`; the macro emits the right install
+// body inline per call.
+//
+// `size` accessors on Map / Set declared inline via the `accessors`
+// field; `Map.groupBy` static spec'd here; `entries → @@iterator`
+// and `keys → values` alias fixups (identity-preserving) stay in
+// `install_collection_well_knowns_post_bootstrap`.
 
-impl crate::intrinsic_install::BuiltinIntrinsic for MapIntrinsic {
-    const NAME: &'static str = "Map";
-    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_collection(Self::NAME, heap, global, CollectionKind::Map)
-    }
+otter_macros::couch! {
+    name = "Map",
+    feature = CORE,
+    intrinsic = MapIntrinsic,
+    constructor = (length = 0, call = map_ctor_call),
+    statics = {
+        "groupBy" / 2 => map_group_by_native,
+    },
+    prototype = {
+        methods = {
+            "get"     / 1 => map_proto_get,
+            "set"     / 2 => map_proto_set,
+            "has"     / 1 => map_proto_has,
+            "delete"  / 1 => map_proto_delete,
+            "clear"   / 0 => map_proto_clear,
+            "keys"    / 0 => map_proto_keys,
+            "values"  / 0 => map_proto_values,
+            "entries" / 0 => map_proto_entries,
+            "forEach" / 1 => map_proto_for_each,
+        },
+        accessors = [
+            ("size", get = map_size_get),
+        ],
+    },
 }
 
-/// `BuiltinIntrinsic` adapter for `Set`.
-pub struct SetIntrinsic;
-
-impl crate::intrinsic_install::BuiltinIntrinsic for SetIntrinsic {
-    const NAME: &'static str = "Set";
-    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_collection(Self::NAME, heap, global, CollectionKind::Set)
-    }
+otter_macros::couch! {
+    name = "Set",
+    feature = CORE,
+    intrinsic = SetIntrinsic,
+    constructor = (length = 0, call = set_ctor_call),
+    prototype = {
+        methods = {
+            "add"                 / 1 => set_proto_add,
+            "has"                 / 1 => set_proto_has,
+            "delete"              / 1 => set_proto_delete,
+            "clear"               / 0 => set_proto_clear,
+            "keys"                / 0 => set_proto_keys,
+            "values"              / 0 => set_proto_values,
+            "entries"             / 0 => set_proto_entries,
+            "forEach"             / 1 => set_proto_for_each,
+            "union"               / 1 => set_proto_union,
+            "intersection"        / 1 => set_proto_intersection,
+            "difference"          / 1 => set_proto_difference,
+            "symmetricDifference" / 1 => set_proto_symmetric_difference,
+            "isSubsetOf"          / 1 => set_proto_is_subset_of,
+            "isSupersetOf"        / 1 => set_proto_is_superset_of,
+            "isDisjointFrom"      / 1 => set_proto_is_disjoint_from,
+        },
+        accessors = [
+            ("size", get = set_size_get),
+        ],
+    },
 }
 
-/// `BuiltinIntrinsic` adapter for `WeakMap`.
-pub struct WeakMapIntrinsic;
-
-impl crate::intrinsic_install::BuiltinIntrinsic for WeakMapIntrinsic {
-    const NAME: &'static str = "WeakMap";
-    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_collection(Self::NAME, heap, global, CollectionKind::WeakMap)
-    }
+otter_macros::couch! {
+    name = "WeakMap",
+    feature = CORE,
+    intrinsic = WeakMapIntrinsic,
+    constructor = (length = 0, call = weak_map_ctor_call),
+    prototype = {
+        methods = {
+            "get"    / 1 => weak_map_proto_get,
+            "set"    / 2 => weak_map_proto_set,
+            "has"    / 1 => weak_map_proto_has,
+            "delete" / 1 => weak_map_proto_delete,
+        },
+    },
 }
 
-/// `BuiltinIntrinsic` adapter for `WeakSet`.
-pub struct WeakSetIntrinsic;
-
-impl crate::intrinsic_install::BuiltinIntrinsic for WeakSetIntrinsic {
-    const NAME: &'static str = "WeakSet";
-    const FEATURE: crate::bootstrap::BootstrapFeatures = crate::bootstrap::BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install_collection(Self::NAME, heap, global, CollectionKind::WeakSet)
-    }
+otter_macros::couch! {
+    name = "WeakSet",
+    feature = CORE,
+    intrinsic = WeakSetIntrinsic,
+    constructor = (length = 0, call = weak_set_ctor_call),
+    prototype = {
+        methods = {
+            "add"    / 1 => weak_set_proto_add,
+            "has"    / 1 => weak_set_proto_has,
+            "delete" / 1 => weak_set_proto_delete,
+        },
+    },
 }
 
 /// Post-bootstrap fixup: install `@@toStringTag` on each
@@ -230,80 +280,6 @@ fn ctor_prototype(
     }
 }
 
-fn install_collection(
-    name: &'static str,
-    heap: &mut otter_gc::GcHeap,
-    global: JsObject,
-    kind: CollectionKind,
-) -> Result<(), JsSurfaceError> {
-    // §24.*.2 Properties of the *Map* / *Set* / *WeakMap* / *WeakSet*
-    // Prototype Object — ordinary object linked to %Object.prototype%.
-    let global_root = Value::object(global);
-    let prototype = crate::bootstrap::alloc_object_with_value_roots(heap, &[&global_root])?;
-    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
-        && let Some(object_proto) =
-            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
-    {
-        object::set_prototype(prototype, heap, Some(object_proto));
-    }
-
-    install_prototype_methods(heap, prototype, kind, vec![global_root])?;
-
-    // §24.1.1 / §24.2.1 / §24.3.1 / §24.4.1 — constructor proper.
-    let ctor_name = kind.name();
-    let ctor_call: crate::native_function::NativeFastFn = match kind {
-        CollectionKind::Map => map_ctor_call,
-        CollectionKind::Set => set_ctor_call,
-        CollectionKind::WeakMap => weak_map_ctor_call,
-        CollectionKind::WeakSet => weak_set_ctor_call,
-    };
-    let prototype_root = Value::object(prototype);
-    let ctor = crate::bootstrap::native_constructor_static_with_value_roots(
-        heap,
-        ctor_name,
-        0,
-        ctor_call,
-        &[&global_root, &prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-
-    // §24.1.2.1 / §24.2.2.1 — `prototype` own data property:
-    // non-writable, non-enumerable, non-configurable.
-    let proto_desc = PropertyDescriptor::data(Value::object(prototype), false, false, false);
-    if !ctor.define_own_property(heap, "prototype", proto_desc) {
-        return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
-    }
-
-    // Prototype `constructor` back pointer (§24.1.3.1 / §24.2.3.1).
-    object::define_own_property(
-        prototype,
-        heap,
-        "constructor",
-        PropertyDescriptor::data(Value::native_function(ctor), true, false, true),
-    );
-
-    // §24.1.2.1 `Map.groupBy(items, callback)` static.
-    // §24.2.2.1 `Set.groupBy` was rejected by TC39; only Map has
-    // it. Object.groupBy already handled elsewhere.
-    if matches!(kind, CollectionKind::Map) {
-        let ctor_root = Value::native_function(ctor);
-        let group_by_fn = crate::bootstrap::native_static_with_value_roots(
-            heap,
-            "groupBy",
-            2,
-            map_group_by_native,
-            &[&global_root, &ctor_root],
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc = PropertyDescriptor::data(Value::native_function(group_by_fn), true, false, true);
-        if !ctor.define_own_property(heap, "groupBy", desc) {
-            return Err(JsSurfaceError::DefinePropertyFailed("groupBy"));
-        }
-    }
-
-    crate::bootstrap::define_global_value(global, heap, name, Value::native_function(ctor));
-    Ok(())
-}
 
 /// §24.1.2.1 `Map.groupBy(items, callbackfn)` — drain `items`
 /// into groups keyed by callback return value, store result in
@@ -407,247 +383,6 @@ fn map_group_by_vm_error(err: crate::VmError) -> NativeError {
     }
 }
 
-fn install_prototype_methods(
-    heap: &mut otter_gc::GcHeap,
-    prototype: JsObject,
-    kind: CollectionKind,
-    value_roots: Vec<Value>,
-) -> Result<(), JsSurfaceError> {
-    use crate::native_function::NativeCall;
-
-    let extra_roots = value_roots.clone();
-    let mut builder = ObjectBuilder::from_object_with_value_roots(heap, prototype, value_roots);
-    match kind {
-        CollectionKind::Map => {
-            builder.method(
-                "get",
-                1,
-                NativeCall::Static(map_proto_get),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "set",
-                2,
-                NativeCall::Static(map_proto_set),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "has",
-                1,
-                NativeCall::Static(map_proto_has),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "delete",
-                1,
-                NativeCall::Static(map_proto_delete),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "clear",
-                0,
-                NativeCall::Static(map_proto_clear),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "keys",
-                0,
-                NativeCall::Static(map_proto_keys),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "values",
-                0,
-                NativeCall::Static(map_proto_values),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "entries",
-                0,
-                NativeCall::Static(map_proto_entries),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "forEach",
-                1,
-                NativeCall::Static(map_proto_for_each),
-                Attr::builtin_function(),
-            )?;
-        }
-        CollectionKind::Set => {
-            builder.method(
-                "add",
-                1,
-                NativeCall::Static(set_proto_add),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "has",
-                1,
-                NativeCall::Static(set_proto_has),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "delete",
-                1,
-                NativeCall::Static(set_proto_delete),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "clear",
-                0,
-                NativeCall::Static(set_proto_clear),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "keys",
-                0,
-                NativeCall::Static(set_proto_keys),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "values",
-                0,
-                NativeCall::Static(set_proto_values),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "entries",
-                0,
-                NativeCall::Static(set_proto_entries),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "forEach",
-                1,
-                NativeCall::Static(set_proto_for_each),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "union",
-                1,
-                NativeCall::Static(set_proto_union),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "intersection",
-                1,
-                NativeCall::Static(set_proto_intersection),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "difference",
-                1,
-                NativeCall::Static(set_proto_difference),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "symmetricDifference",
-                1,
-                NativeCall::Static(set_proto_symmetric_difference),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "isSubsetOf",
-                1,
-                NativeCall::Static(set_proto_is_subset_of),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "isSupersetOf",
-                1,
-                NativeCall::Static(set_proto_is_superset_of),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "isDisjointFrom",
-                1,
-                NativeCall::Static(set_proto_is_disjoint_from),
-                Attr::builtin_function(),
-            )?;
-        }
-        CollectionKind::WeakMap => {
-            builder.method(
-                "get",
-                1,
-                NativeCall::Static(weak_map_proto_get),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "set",
-                2,
-                NativeCall::Static(weak_map_proto_set),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "has",
-                1,
-                NativeCall::Static(weak_map_proto_has),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "delete",
-                1,
-                NativeCall::Static(weak_map_proto_delete),
-                Attr::builtin_function(),
-            )?;
-        }
-        CollectionKind::WeakSet => {
-            builder.method(
-                "add",
-                1,
-                NativeCall::Static(weak_set_proto_add),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "has",
-                1,
-                NativeCall::Static(weak_set_proto_has),
-                Attr::builtin_function(),
-            )?;
-            builder.method(
-                "delete",
-                1,
-                NativeCall::Static(weak_set_proto_delete),
-                Attr::builtin_function(),
-            )?;
-        }
-    }
-    // §24.1.3.11 / §24.2.3.11 — `size` accessor on Map/Set
-    // prototypes. WeakMap/WeakSet deliberately omit `size`.
-    match kind {
-        CollectionKind::Map | CollectionKind::Set => {
-            let getter_call: crate::native_function::NativeFastFn = match kind {
-                CollectionKind::Map => map_size_get,
-                CollectionKind::Set => set_size_get,
-                _ => unreachable!(),
-            };
-            let prototype_root = Value::object(prototype);
-            let mut roots = Vec::with_capacity(extra_roots.len() + 1);
-            roots.push(&prototype_root);
-            roots.extend(extra_roots.iter());
-            let getter = crate::bootstrap::native_static_with_value_roots(
-                heap,
-                "get size",
-                0,
-                getter_call,
-                roots.as_slice(),
-            )
-            .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            let desc = PropertyDescriptor::accessor(
-                Some(Value::native_function(getter)),
-                None,
-                false,
-                true,
-            );
-            if !object::define_own_property(prototype, heap, "size", desc) {
-                return Err(JsSurfaceError::DefinePropertyFailed("size"));
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------
 // Constructor bodies

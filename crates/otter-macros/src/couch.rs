@@ -67,12 +67,21 @@ use syn::{
 
 use crate::holt::{AccessorEntry, MethodEntry};
 
-/// Parsed `constructor = (length = N, call = path [, abstract = true])`
-/// tuple.
+/// Parsed `constructor = (length = N, call = path
+/// [, is_abstract = true] [, callable_only = true])` tuple.
 pub(crate) struct ConstructorSpecArgs {
     pub(crate) length: u8,
     pub(crate) call: Path,
     pub(crate) is_abstract: bool,
+    /// When `true`, the ctor lacks a `[[Construct]]` slot — the
+    /// install body allocates the function through
+    /// `bootstrap::native_static_with_value_roots` instead of
+    /// `bootstrap::native_constructor_static_with_value_roots`.
+    /// Matches the §21.1.1 (`Number`) / §21.2.1 (`BigInt`) /
+    /// §22.1.1 (`String`) / §20.4.1 (`Symbol`) / §20.3.1
+    /// (`Boolean`) shape where `new Foo(x)` throws "is not a
+    /// constructor" via §10.1.10.
+    pub(crate) callable_only: bool,
 }
 
 impl Parse for ConstructorSpecArgs {
@@ -82,6 +91,7 @@ impl Parse for ConstructorSpecArgs {
         let mut length: Option<u8> = None;
         let mut call: Option<Path> = None;
         let mut is_abstract = false;
+        let mut callable_only = false;
         while !body.is_empty() {
             let key: Ident = body.parse()?;
             body.parse::<Token![=]>()?;
@@ -97,13 +107,17 @@ impl Parse for ConstructorSpecArgs {
                     let lit: LitBool = body.parse()?;
                     is_abstract = lit.value;
                 }
+                "callable_only" => {
+                    let lit: LitBool = body.parse()?;
+                    callable_only = lit.value;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "couch!: unknown constructor field `{other}` — expected \
-                             `length`, `call`, or `is_abstract` (Rust reserves the \
-                             bare `abstract` keyword)"
+                             `length`, `call`, `is_abstract`, or `callable_only` \
+                             (Rust reserves the bare `abstract` keyword)"
                         ),
                     ));
                 }
@@ -126,6 +140,7 @@ impl Parse for ConstructorSpecArgs {
                 )
             })?,
             is_abstract,
+            callable_only,
         })
     }
 }
@@ -420,6 +435,13 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // synthesise a default throw stub when `abstract = true` and no
     // `call` is supplied.
     let _ = constructor.is_abstract;
+    // Callable-only ctors lose their [[Construct]] slot, so `new
+    // BigInt(x)` throws via §10.1.10 instead of via the body.
+    let ctor_alloc_path = if constructor.callable_only {
+        quote! { ::otter_vm::bootstrap::native_static_with_value_roots }
+    } else {
+        quote! { ::otter_vm::bootstrap::native_constructor_static_with_value_roots }
+    };
 
     let prototype_has_method_specs = !prototype.method_specs.is_empty();
     let extra_method_spec_iters = prototype.method_specs.iter().map(|path| {
@@ -490,7 +512,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         );
                     }
                 };
-                let ctor = ::otter_vm::bootstrap::native_constructor_static_with_value_roots(
+                let ctor = #ctor_alloc_path(
                     heap,
                     #spec_ident.name,
                     #spec_ident.length,

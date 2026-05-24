@@ -2021,23 +2021,31 @@ impl Interpreter {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
-            let mut site_disabled = self.load_property_ics[site].is_disabled();
-            if let Some(ic) = self.load_property_ics[site].cached() {
+            let mut site_disabled = self.load_property_ics[site].is_megamorphic();
+            let entries = self.load_property_ics[site].entries();
+            let mut hit_value: Option<Value> = None;
+            for ic in entries {
                 if let Some(value) = ic.load(obj, &self.gc_heap, atomized_key) {
-                    self.property_ic_stats.record_hit(PropertyIcKind::Load);
-                    Self::finish_property_fast_path_value(
-                        &mut stack[top_idx],
-                        dst,
-                        value,
-                        self.current_byte_len,
-                    )?;
-                    return Ok(true);
+                    hit_value = Some(value);
+                    break;
                 }
+            }
+            if let Some(value) = hit_value {
+                self.property_ic_stats.record_hit(PropertyIcKind::Load);
+                Self::finish_property_fast_path_value(
+                    &mut stack[top_idx],
+                    dst,
+                    value,
+                    self.current_byte_len,
+                )?;
+                return Ok(true);
+            }
+            if self.load_property_ics[site].entry_count() > 0 {
                 self.load_property_ics[site].record_guard_miss_with_stats(
                     &mut self.property_ic_stats,
                     PropertyIcKind::Load,
                 );
-                site_disabled = self.load_property_ics[site].is_disabled();
+                site_disabled = self.load_property_ics[site].is_megamorphic();
             } else {
                 self.load_property_ics[site].record_uncached_miss_with_stats(
                     &mut self.property_ic_stats,
@@ -3105,15 +3113,27 @@ impl Interpreter {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
-            if let Some(ic) = self.store_property_ics[site].cached_ref() {
+            let entries_len = self.store_property_ics[site].entry_count();
+            let mut store_hit = false;
+            for idx in 0..entries_len {
+                // Reborrow each iteration: `store` needs `&mut self.gc_heap`
+                // which conflicts with holding a long-lived borrow on the
+                // entries slice.
+                let ic = self.store_property_ics[site].entries()[idx].clone();
                 if ic
                     .store(obj, &mut self.gc_heap, atomized_key, &value)
                     .is_some()
                 {
-                    self.property_ic_stats.record_hit(PropertyIcKind::Store);
-                    Self::advance_property_fast_path(&mut stack[top_idx], self.current_byte_len)?;
-                    return Ok(true);
+                    store_hit = true;
+                    break;
                 }
+            }
+            if store_hit {
+                self.property_ic_stats.record_hit(PropertyIcKind::Store);
+                Self::advance_property_fast_path(&mut stack[top_idx], self.current_byte_len)?;
+                return Ok(true);
+            }
+            if entries_len > 0 {
                 self.store_property_ics[site].record_guard_miss_with_stats(
                     &mut self.property_ic_stats,
                     PropertyIcKind::Store,
@@ -3373,7 +3393,7 @@ impl Interpreter {
                     let site = context
                         .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                         .ok_or(VmError::InvalidOperand)?;
-                    if !self.store_property_ics[site].is_disabled()
+                    if !self.store_property_ics[site].is_megamorphic()
                         && object::supports_fast_property_ic(obj, &self.gc_heap)
                     {
                         if let Some(transition) = transition {
@@ -3448,21 +3468,30 @@ impl Interpreter {
             let site = context
                 .property_ic_site(stack[top_idx].function_id, stack[top_idx].pc)
                 .ok_or(VmError::InvalidOperand)?;
-            let mut site_disabled = self.has_property_ics[site].is_disabled();
-            if let Some(ic) = self.has_property_ics[site].cached_ref() {
+            let mut site_disabled = self.has_property_ics[site].is_megamorphic();
+            let entries_len = self.has_property_ics[site].entry_count();
+            let mut probe_hit = false;
+            for idx in 0..entries_len {
+                let ic = self.has_property_ics[site].entries()[idx].clone();
                 if ic.probe(obj, &self.gc_heap, key_string).is_some() {
-                    self.property_ic_stats.record_hit(PropertyIcKind::Has);
-                    Self::finish_property_fast_path_value(
-                        &mut stack[top_idx],
-                        dst,
-                        Value::boolean(true),
-                        self.current_byte_len,
-                    )?;
-                    return Ok(true);
+                    probe_hit = true;
+                    break;
                 }
+            }
+            if probe_hit {
+                self.property_ic_stats.record_hit(PropertyIcKind::Has);
+                Self::finish_property_fast_path_value(
+                    &mut stack[top_idx],
+                    dst,
+                    Value::boolean(true),
+                    self.current_byte_len,
+                )?;
+                return Ok(true);
+            }
+            if entries_len > 0 {
                 self.has_property_ics[site]
                     .record_guard_miss_with_stats(&mut self.property_ic_stats, PropertyIcKind::Has);
-                site_disabled = self.has_property_ics[site].is_disabled();
+                site_disabled = self.has_property_ics[site].is_megamorphic();
             } else {
                 self.has_property_ics[site].record_uncached_miss_with_stats(
                     &mut self.property_ic_stats,

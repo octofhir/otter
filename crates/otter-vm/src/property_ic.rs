@@ -1,14 +1,16 @@
 //! Interpreter inline-cache records for property bytecodes.
 //!
 //! This module keeps IC state out of the bytecode format. Caches are
-//! interpreter-local, keyed by compiled function id plus bytecode pc, and only
-//! guard ordinary object data slots for now.
+//! interpreter-local, keyed by compiled function id plus bytecode pc.
+//! Each site holds up to four polymorphic entries (a fixed PIC) plus
+//! a megamorphic terminal state for sites whose receiver shape churn
+//! exceeds the PIC capacity.
 //!
 //! # Contents
-//! - [`LoadPropertyIc`] — monomorphic own/direct-prototype data-slot load cache.
-//! - [`StorePropertyIc`] — monomorphic existing-own-slot and guarded
-//!   store-transition cache.
-//! - [`HasPropertyIc`] — monomorphic own/direct-prototype presence cache.
+//! - [`LoadPropertyIc`] — own/direct-prototype data-slot load cache.
+//! - [`StorePropertyIc`] — existing-own-slot and guarded store-
+//!   transition cache.
+//! - [`HasPropertyIc`] — own/direct-prototype presence cache.
 //! - [`PropertyIcEntry`] — per-site cache state and miss policy.
 //! - [`PropertyIcStats`] — aggregate IC counters for diagnostics/tests.
 //!
@@ -18,6 +20,12 @@
 //! - Proxies, accessors, symbols, computed keys, dictionary-compatible
 //!   objects, and deep prototype hits are not cached.
 //! - Cache guards include both shape identity and atom id.
+//! - PIC capacity is fixed at [`MAX_PIC_ENTRIES`]; a probe through all
+//!   entries that still misses contributes to the shared `misses`
+//!   counter on the site. Once `misses` reaches
+//!   [`PIC_GUARD_MISS_THRESHOLD`] **and** the PIC is full, the site
+//!   transitions to [`PropertyIcEntry::Megamorphic`] and is never
+//!   re-populated for the interpreter lifetime.
 //! - Store transition guard semantics live in [`crate::object`]'s
 //!   shape-transition layer; this module stores only the frozen IC record.
 //!
@@ -32,8 +40,18 @@ use crate::object::{
 use crate::property_atom::AtomizedPropertyKey;
 use crate::{JsObject, JsString, Value};
 use otter_gc::raw::SlotVisitor;
+use smallvec::SmallVec;
 
-const MONOMORPHIC_MISS_DISABLE_THRESHOLD: u8 = 4;
+/// Maximum polymorphic entries stored per site before the site
+/// transitions to [`PropertyIcEntry::Megamorphic`]. Four matches the
+/// shape mix in real-world JS object factories (V8 Ignition, Boa,
+/// JSC) without ballooning per-site memory.
+pub(crate) const MAX_PIC_ENTRIES: usize = 4;
+
+/// Miss budget across all PIC entries before a full PIC transitions
+/// to megamorphic. Aligns with the pre-PIC monomorphic disable
+/// threshold so single-shape micro-benchmarks behave identically.
+const PIC_GUARD_MISS_THRESHOLD: u8 = 4;
 
 /// Aggregate inline-cache counters for named property bytecodes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -113,59 +131,101 @@ impl PropertyIcStats {
     }
 }
 
-/// Per-site monomorphic IC state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Per-site polymorphic inline cache state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) enum PropertyIcEntry<T> {
-    /// Site has not installed an IC yet.
+    /// Site has not installed any IC yet.
     #[default]
     Empty,
-    /// Site guards one receiver shape/key pair and tracks guard misses.
-    Monomorphic {
-        /// Cached IC record.
-        ic: T,
-        /// Guard misses since install.
+    /// Site holds 1..=[`MAX_PIC_ENTRIES`] guarded IC records. Probe
+    /// walks them in install order. `misses` counts probes whose
+    /// receiver shape did not match any entry; when it reaches the
+    /// threshold and the PIC is full, the site transitions to
+    /// [`Self::Megamorphic`].
+    Polymorphic {
+        /// Cached IC records, in install order. Capped at
+        /// [`MAX_PIC_ENTRIES`].
+        entries: SmallVec<[T; MAX_PIC_ENTRIES]>,
+        /// Guard misses since install across all entries.
         misses: u8,
     },
-    /// Site was too unstable for a monomorphic IC.
-    Disabled,
+    /// Site saw more shape diversity than the PIC could absorb and is
+    /// permanently bypassed for the interpreter lifetime.
+    Megamorphic,
 }
 
 impl<T> PropertyIcEntry<T> {
-    /// `true` when this site currently has a monomorphic cache.
+    /// `true` when this site currently holds at least one PIC entry.
     #[must_use]
     #[cfg(test)]
-    pub(crate) const fn is_monomorphic(&self) -> bool {
-        matches!(self, Self::Monomorphic { .. })
+    pub(crate) fn is_polymorphic(&self) -> bool {
+        matches!(self, Self::Polymorphic { .. })
     }
 
-    /// `true` when this site should not reinstall a monomorphic IC.
+    /// `true` when this site should not install any further IC entries.
     #[must_use]
-    pub(crate) const fn is_disabled(&self) -> bool {
-        matches!(self, Self::Disabled)
+    pub(crate) const fn is_megamorphic(&self) -> bool {
+        matches!(self, Self::Megamorphic)
     }
 
-    /// Install or replace the monomorphic record, resetting miss count.
-    pub(crate) fn install(&mut self, ic: T) {
-        if !self.is_disabled() {
-            *self = Self::Monomorphic { ic, misses: 0 };
+    /// Number of installed PIC entries (0 for `Empty` / `Megamorphic`).
+    #[must_use]
+    pub(crate) fn entry_count(&self) -> usize {
+        match self {
+            Self::Polymorphic { entries, .. } => entries.len(),
+            Self::Empty | Self::Megamorphic => 0,
         }
     }
 
-    /// Permanently disable this site for the interpreter lifetime.
-    pub(crate) fn disable(&mut self) {
-        *self = Self::Disabled;
+    /// Borrow the cached PIC entries in install order. Empty slice for
+    /// `Empty` / `Megamorphic` sites.
+    #[must_use]
+    pub(crate) fn entries(&self) -> &[T] {
+        match self {
+            Self::Polymorphic { entries, .. } => entries.as_slice(),
+            Self::Empty | Self::Megamorphic => &[],
+        }
     }
 
-    /// Record one guard miss. Returns `true` when this miss disabled the site.
+    /// Install a new IC entry. No-op when the site is megamorphic.
+    /// Appends to the PIC when capacity remains; on overflow the site
+    /// transitions to `Megamorphic` instead of evicting.
+    pub(crate) fn install(&mut self, ic: T) {
+        match self {
+            Self::Megamorphic => {}
+            Self::Empty => {
+                let mut entries = SmallVec::new();
+                entries.push(ic);
+                *self = Self::Polymorphic { entries, misses: 0 };
+            }
+            Self::Polymorphic { entries, misses } => {
+                if entries.len() < MAX_PIC_ENTRIES {
+                    entries.push(ic);
+                    *misses = 0;
+                } else {
+                    *self = Self::Megamorphic;
+                }
+            }
+        }
+    }
+
+    /// Permanently bypass this site for the interpreter lifetime.
+    pub(crate) fn disable(&mut self) {
+        *self = Self::Megamorphic;
+    }
+
+    /// Record one guard miss. Returns `true` when this miss promoted
+    /// the site to `Megamorphic` (PIC was full and miss budget tipped
+    /// over).
     pub(crate) fn record_guard_miss(&mut self) -> bool {
-        let Self::Monomorphic { misses, .. } = self else {
+        let Self::Polymorphic { entries, misses } = self else {
             return false;
         };
         *misses = misses.saturating_add(1);
-        if *misses < MONOMORPHIC_MISS_DISABLE_THRESHOLD {
+        if *misses < PIC_GUARD_MISS_THRESHOLD || entries.len() < MAX_PIC_ENTRIES {
             return false;
         }
-        *self = Self::Disabled;
+        *self = Self::Megamorphic;
         true
     }
 
@@ -181,65 +241,55 @@ impl<T> PropertyIcEntry<T> {
         }
     }
 
-    /// Record a miss when the site has no active monomorphic entry yet.
+    /// Record a miss when the site has no PIC entries yet (Empty).
+    /// Megamorphic sites do not contribute further miss counts since
+    /// they no longer try the IC fast path.
     pub(crate) fn record_uncached_miss_with_stats(
         &self,
         stats: &mut PropertyIcStats,
         kind: PropertyIcKind,
     ) {
-        if !self.is_disabled() {
+        if !self.is_megamorphic() {
             stats.record_miss(kind);
         }
     }
 
-    /// Install or replace this site's monomorphic entry and update counters.
+    /// Append a new entry to the site's PIC and update counters. No-op
+    /// when the site is already megamorphic.
     pub(crate) fn install_with_stats(
         &mut self,
         stats: &mut PropertyIcStats,
         kind: PropertyIcKind,
         ic: T,
     ) {
-        if !self.is_disabled() {
-            self.install(ic);
+        if self.is_megamorphic() {
+            return;
+        }
+        let became_megamorphic = matches!(self, Self::Polymorphic { entries, .. }
+            if entries.len() >= MAX_PIC_ENTRIES);
+        self.install(ic);
+        if became_megamorphic {
+            stats.record_disable(kind);
+        } else {
             stats.record_install(kind);
         }
     }
 
-    /// Disable this site and update counters if it was not already disabled.
+    /// Disable this site and update counters if it was not already megamorphic.
     pub(crate) fn disable_with_stats(&mut self, stats: &mut PropertyIcStats, kind: PropertyIcKind) {
-        if !self.is_disabled() {
+        if !self.is_megamorphic() {
             self.disable();
             stats.record_disable(kind);
         }
     }
 }
 
-impl<T: Clone> PropertyIcEntry<T> {
-    /// Cached monomorphic record, if the site is active.
-    #[must_use]
-    pub(crate) fn cached(&self) -> Option<T> {
-        match self {
-            Self::Monomorphic { ic, .. } => Some(ic.clone()),
-            Self::Empty | Self::Disabled => None,
-        }
-    }
-}
-
-impl<T> PropertyIcEntry<T> {
-    /// Borrow the cached monomorphic record without cloning it.
-    #[must_use]
-    pub(crate) fn cached_ref(&self) -> Option<&T> {
-        match self {
-            Self::Monomorphic { ic, .. } => Some(ic),
-            Self::Empty | Self::Disabled => None,
-        }
-    }
-}
-
 impl PropertyIcEntry<StorePropertyIc> {
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
-        if let Self::Monomorphic { ic, .. } = self {
-            ic.trace_roots(visitor);
+        if let Self::Polymorphic { entries, .. } = self {
+            for ic in entries {
+                ic.trace_roots(visitor);
+            }
         }
     }
 }
@@ -648,23 +698,45 @@ mod tests {
     }
 
     #[test]
-    fn monomorphic_entry_disables_after_repeated_guard_misses() {
+    fn pic_grows_until_capacity_then_transitions_to_megamorphic() {
         let mut entry = PropertyIcEntry::Empty;
-        entry.install(7_u8);
+        // Install MAX_PIC_ENTRIES distinct entries without ever
+        // missing — the PIC fills but the site stays polymorphic.
+        for i in 0..super::MAX_PIC_ENTRIES as u8 {
+            entry.install(i);
+        }
+        assert!(entry.is_polymorphic());
+        assert_eq!(entry.entry_count(), super::MAX_PIC_ENTRIES);
+        assert_eq!(entry.entries(), &[0_u8, 1, 2, 3]);
 
-        assert_eq!(entry.cached(), Some(7));
-        assert!(!entry.is_disabled());
+        // The PIC is full but only a fresh guard miss budgets toward
+        // promotion. The first three misses leave the site
+        // polymorphic.
         assert!(!entry.record_guard_miss());
         assert!(!entry.record_guard_miss());
         assert!(!entry.record_guard_miss());
 
+        // Fourth miss tips the budget once the PIC is full → Megamorphic.
         assert!(entry.record_guard_miss());
-        assert!(entry.is_disabled());
-        assert_eq!(entry.cached(), None);
+        assert!(entry.is_megamorphic());
+        assert_eq!(entry.entries(), &[] as &[u8]);
 
-        entry.install(8);
-        assert!(entry.is_disabled());
-        assert_eq!(entry.cached(), None);
+        // Megamorphic is sticky: install is a no-op.
+        entry.install(99);
+        assert!(entry.is_megamorphic());
+        assert_eq!(entry.entries(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn install_into_full_pic_transitions_to_megamorphic() {
+        let mut entry = PropertyIcEntry::Empty;
+        for i in 0..super::MAX_PIC_ENTRIES as u8 {
+            entry.install(i);
+        }
+        // Direct install past capacity (no preceding miss) still
+        // promotes — the PIC simply has no room.
+        entry.install(99);
+        assert!(entry.is_megamorphic());
     }
 
     #[test]
@@ -680,21 +752,40 @@ mod tests {
         stats.record_hit(PropertyIcKind::Load);
         assert_eq!(stats.load_hits, 1);
 
+        // Single PIC entry — three misses in a row don't yet promote
+        // because the PIC isn't full.
         entry.record_guard_miss_with_stats(&mut stats, PropertyIcKind::Load);
         entry.record_guard_miss_with_stats(&mut stats, PropertyIcKind::Load);
         entry.record_guard_miss_with_stats(&mut stats, PropertyIcKind::Load);
         assert_eq!(stats.load_misses, 4);
         assert_eq!(stats.load_disables, 0);
+        assert!(entry.is_polymorphic());
 
-        entry.record_guard_miss_with_stats(&mut stats, PropertyIcKind::Load);
-        assert!(entry.is_disabled());
-        assert_eq!(stats.load_misses, 5);
-        assert_eq!(stats.load_disables, 1);
-
+        // Fill the PIC. Each install bumps `load_installs` but does
+        // not affect `load_disables`.
         entry.install_with_stats(&mut stats, PropertyIcKind::Load, 8_u8);
-        entry.disable_with_stats(&mut stats, PropertyIcKind::Load);
-        assert_eq!(stats.load_installs, 1);
+        entry.install_with_stats(&mut stats, PropertyIcKind::Load, 9_u8);
+        entry.install_with_stats(&mut stats, PropertyIcKind::Load, 10_u8);
+        assert_eq!(stats.load_installs, 4);
+        assert_eq!(stats.load_disables, 0);
+        assert_eq!(entry.entry_count(), super::MAX_PIC_ENTRIES);
+
+        // Now PIC is full — guard misses accumulate until threshold,
+        // then the site flips to Megamorphic.
+        for _ in 0..super::PIC_GUARD_MISS_THRESHOLD {
+            entry.record_guard_miss_with_stats(&mut stats, PropertyIcKind::Load);
+        }
+        assert!(entry.is_megamorphic());
         assert_eq!(stats.load_disables, 1);
+
+        // Install past Megamorphic stays a no-op and does not update
+        // install / disable counters.
+        let installs_before = stats.load_installs;
+        let disables_before = stats.load_disables;
+        entry.install_with_stats(&mut stats, PropertyIcKind::Load, 11_u8);
+        entry.disable_with_stats(&mut stats, PropertyIcKind::Load);
+        assert_eq!(stats.load_installs, installs_before);
+        assert_eq!(stats.load_disables, disables_before);
     }
 
     #[test]

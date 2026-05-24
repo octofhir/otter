@@ -720,7 +720,7 @@ impl Interpreter {
     pub(crate) fn load_property_ic_count(&self) -> usize {
         self.load_property_ics
             .iter()
-            .filter(|entry| entry.is_monomorphic())
+            .filter(|entry| entry.is_polymorphic())
             .count()
     }
 
@@ -728,7 +728,7 @@ impl Interpreter {
     pub(crate) fn store_property_ic_count(&self) -> usize {
         self.store_property_ics
             .iter()
-            .filter(|entry| entry.is_monomorphic())
+            .filter(|entry| entry.is_polymorphic())
             .count()
     }
 

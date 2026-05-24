@@ -1,33 +1,152 @@
-//! Zero-cost JavaScript surface macros for Otter.
+//! Zero-cost JavaScript / module surface macros for Otter.
 //!
-//! These macros generate static specs and ordinary Rust
-//! functions. They do not register globals, allocate at runtime, or
-//! create dynamic dispatch paths for static builtins.
+//! Otter intrinsics, classes, and hosted modules are declared with a
+//! family of otter-themed macros. Each macro corresponds to one role
+//! in the JS / module surface; expansion produces ordinary Rust code
+//! plus a `BuiltinIntrinsic`-shaped installer that bootstrap walks
+//! at startup. No new runtime path, no dynamic registration — the
+//! macros are pure code generation over the spec types in
+//! [`otter_vm`] and the native ABI v1 documented at
+//! [`docs/native-call-abi.md`](../../../docs/native-call-abi.md).
 //!
-//! # Contents
-//! - [`js_namespace`] — attribute macro for namespace objects.
-//! - [`js_class`] — attribute macro for constructor/prototype class
-//!   specs.
-//! - [`raft`] — grouped static namespace spec declaration macro.
-//! - `#[js_fn(...)]` — helper attribute consumed inside
-//!   [`js_namespace`].
-//! - `#[js_constructor(...)]`, `#[js_method(...)]`,
-//!   `#[js_static_method(...)]`, `#[js_getter(...)]`, and
-//!   `#[js_setter(...)]` — helper attributes consumed inside
-//!   [`js_class`].
+//! # Naming theme
+//!
+//! Otters live in **holts** (single-otter dens), gather on land in
+//! **couches**, float together in **rafts**, dig **burrows** for
+//! private stashes, raise families in **lodges**, **dive** to forage,
+//! grow a **pelt** for protection, and **groom** their fur to keep it
+//! waterproof. Each term names exactly one macro role:
+//!
+//! | Role                                           | Macro       | Mnemonic                                |
+//! |------------------------------------------------|-------------|-----------------------------------------|
+//! | Namespace intrinsic (non-constructible)        | [`holt!`]   | a den that holds methods + constants    |
+//! | Class intrinsic (callable ctor + proto)        | [`couch!`]  | a couch of otters — ctor + instances    |
+//! | Grouped method spec (table form)               | [`raft!`]   | a raft of methods floating together     |
+//! | Single binding (annotates one Rust fn)         | `#[dive]`   | one focused act                         |
+//! | Host-owned object surface                      | [`burrow!`] | a private stash the embedder owns       |
+//! | Hosted module loader (`otter:fs`, `node:url`)  | [`lodge!`]  | the family residence — module home      |
+//! | `SafeTraceable` derive (GC body fields)        | `#[derive(Pelt)]` | the coat that keeps roots alive   |
+//! | `Finalize` derive (drop-time cleanup)          | `#[derive(Groom)]` | the cleanup ritual              |
+//!
+//! The theme is in the macro identifiers only. Generated diagnostics
+//! stay neutral / spec-leaning — no "your raft is sinking" error
+//! messages.
+//!
+//! # Examples
+//!
+//! Namespace intrinsic — `Math` in the abstract:
+//!
+//! ```rust,ignore
+//! use otter_macros::holt;
+//! use otter_vm::{NativeCtx, NativeError, Value};
+//!
+//! holt! {
+//!     name = "Math",
+//!     feature = CORE,
+//!     constants = [
+//!         ("PI", f64, std::f64::consts::PI, read_only),
+//!         ("E",  f64, std::f64::consts::E,  read_only),
+//!     ],
+//!     methods = raft! {
+//!         "abs"  / 1 => native_abs,
+//!         "ceil" / 1 => native_ceil,
+//!         "pow"  / 2 => native_pow,
+//!     },
+//! }
+//!
+//! fn native_abs(_ctx: &mut NativeCtx<'_>, args: &[Value])
+//!     -> Result<Value, NativeError> { /* … */ Ok(Value::undefined()) }
+//! # fn native_ceil(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> { Ok(Value::undefined()) }
+//! # fn native_pow(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> { Ok(Value::undefined()) }
+//! ```
+//!
+//! Class intrinsic — `Proxy` in the abstract:
+//!
+//! ```rust,ignore
+//! use otter_macros::{couch, raft};
+//!
+//! couch! {
+//!     name = "Proxy",
+//!     feature = CORE,
+//!     constructor = (length = 2, call = proxy_ctor_call),
+//!     statics = raft! {
+//!         "revocable" / 2 => proxy_revocable_call,
+//!     },
+//! }
+//! ```
+//!
+//! Single-method binding — fold one Rust function into the enclosing
+//! `holt!` / `couch!` without listing it in the `raft!` table:
+//!
+//! ```rust,ignore
+//! #[dive(name = "fromEpochMilliseconds", length = 1)]
+//! pub fn from_epoch_ms(ctx: &mut NativeCtx<'_>, args: &[Value])
+//!     -> Result<Value, NativeError> { /* … */ }
+//! ```
+//!
+//! Hosted module — `otter:kv` in the abstract:
+//!
+//! ```rust,ignore
+//! use otter_macros::lodge;
+//!
+//! lodge! {
+//!     prefix = "otter",
+//!     name   = "kv",
+//!     capabilities = [Net("kv.example.com")],
+//!     exports = raft! {
+//!         "get"  / 1 => kv_get,
+//!         "set"  / 2 => kv_set,
+//!         "open" / 1 => kv_open,
+//!     },
+//! }
+//! ```
+//!
+//! GC body derives — `Pelt` for tracing, `Groom` for finalize:
+//!
+//! ```rust,ignore
+//! use otter_macros::{Pelt, Groom};
+//!
+//! #[derive(Pelt, Groom)]
+//! struct MyBody {
+//!     target:  otter_gc::Gc<otter_vm::JsObject>,
+//!     #[pelt(skip)] // not a GC slot
+//!     cached_hash: u64,
+//! }
+//! ```
 //!
 //! # Invariants
+//!
 //! - Exported JavaScript names and arity are explicit in macro
-//!   metadata.
+//!   metadata; the macro never infers them from Rust identifiers.
 //! - Expansion emits `NamespaceSpec`, `ClassSpec`, `ConstructorSpec`,
 //!   and `MethodSpec` static data with `NativeCall::Static` function
-//!   pointers.
+//!   pointers — same shape as the hand-written installers in
+//!   [`otter_vm::intrinsics`](../../../crates/otter-vm/src/intrinsics/).
 //! - Bootstrap remains explicit; generated specs are installed by
 //!   JS surface builders or the centralized bootstrap registry.
+//! - Generated code compiles under `#![forbid(unsafe_code)]`; any
+//!   macro that needs `unsafe` for its expansion is a design bug.
 //!
 //! # See also
-//! - [Macro overview](../../../docs/book/src/macros/overview.md)
-//! - [JS surface builders](../../../docs/book/src/extensions/js-surface-builders.md)
+//!
+//! - [Design note](../../../docs/otter-macros-design.md) — full
+//!   surface, naming rationale, migration sequence.
+//! - [Refactor tracker](../../../docs/otter-macros-refactor-tracker.md)
+//!   — per-consumer port state.
+//! - [Native call ABI](../../../docs/native-call-abi.md) — the
+//!   signature every generated method targets.
+//! - [Macro overview (mdbook)](../../../docs/book/src/macros/overview.md)
+//!   — narrative chapter with per-macro examples.
+//!
+//! # Status
+//!
+//! Phase 4.1 of the architecture refactor — see
+//! `docs/architecture-refactor-plan-2026-05.md` Task 4.1. The legacy
+//! [`js_namespace`] / [`js_class`] / `js_fn` / `js_constructor`
+//! attribute macros are kept temporarily for backward compatibility
+//! during the cutover; they are deleted in sub-phase 4.1b once the
+//! otter-themed surface is fully populated. Do not use them in new
+//! code.
 
 use std::collections::{BTreeMap, BTreeSet};
 

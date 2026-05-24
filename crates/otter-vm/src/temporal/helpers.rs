@@ -546,6 +546,103 @@ pub fn parse_rounding_options(
     Ok(options)
 }
 
+/// Read an `Option<integer>` field from a `PartialTime` /
+/// `CalendarFields` / `DateTimeFields` partial-record object.
+/// Returns `Ok(None)` when the property is missing or `undefined`.
+/// Non-numeric values surface as `IntrinsicError::BadArgument`.
+fn read_partial_integer(
+    obj: JsObject,
+    name: &str,
+    heap: &otter_gc::GcHeap,
+) -> Result<Option<i64>, IntrinsicError> {
+    let Some(v) = crate::object::get(obj, heap, name) else {
+        return Ok(None);
+    };
+    if v.is_undefined() {
+        return Ok(None);
+    }
+    let Some(n) = v.as_number() else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "partial-record fields must be numbers",
+        });
+    };
+    let raw = n.as_f64();
+    if !raw.is_finite() {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "partial-record field must be finite",
+        });
+    }
+    if (raw - raw.trunc()).abs() > 0.0 {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "partial-record field must be an integer",
+        });
+    }
+    Ok(Some(raw.trunc() as i64))
+}
+
+/// Parse a `{ hour, minute, second, millisecond, microsecond,
+/// nanosecond }` partial-record into [`temporal_rs::PartialTime`].
+pub fn parse_partial_time(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::partial::PartialTime, IntrinsicError> {
+    let mut t = temporal_rs::partial::PartialTime::default();
+    if let Some(v) = read_partial_integer(obj, "hour", heap)? {
+        t.hour = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(obj, "minute", heap)? {
+        t.minute = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(obj, "second", heap)? {
+        t.second = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(obj, "millisecond", heap)? {
+        t.millisecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(obj, "microsecond", heap)? {
+        t.microsecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    if let Some(v) = read_partial_integer(obj, "nanosecond", heap)? {
+        t.nanosecond = Some(v.clamp(0, u16::MAX as i64) as u16);
+    }
+    Ok(t)
+}
+
+/// Parse a `{ year, month, day }` partial-record into
+/// [`temporal_rs::fields::CalendarFields`]. Bare-bones —
+/// covers the foundation slice (no era / month_code surface yet).
+pub fn parse_calendar_fields(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::fields::CalendarFields, IntrinsicError> {
+    let mut f = temporal_rs::fields::CalendarFields::default();
+    if let Some(v) = read_partial_integer(obj, "year", heap)? {
+        f.year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
+    if let Some(v) = read_partial_integer(obj, "month", heap)? {
+        f.month = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    if let Some(v) = read_partial_integer(obj, "day", heap)? {
+        f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
+    }
+    Ok(f)
+}
+
+/// Parse a `{ year, month, day, hour, minute, second, ms, us, ns }`
+/// partial-record into [`temporal_rs::fields::DateTimeFields`].
+pub fn parse_date_time_fields(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::fields::DateTimeFields, IntrinsicError> {
+    Ok(temporal_rs::fields::DateTimeFields {
+        calendar_fields: parse_calendar_fields(obj, heap)?,
+        time: parse_partial_time(obj, heap)?,
+    })
+}
+
 /// Convert the dispatch-level `TemporalError` into a `NativeError`
 /// — used by `[[Construct]]` bodies to surface OOM and any
 /// future pass-through cases via the native-fn boundary.

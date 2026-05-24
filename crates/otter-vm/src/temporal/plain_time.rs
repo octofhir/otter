@@ -10,8 +10,9 @@ use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     alloc_temporal_value, clamp_to_u16, clamp_to_u8, js_string_value, make_temporal,
-    opt_integer_with_truncation, parse_difference_settings, parse_rounding_options,
-    require_construct, require_plain_time, temporal_dispatch_err, temporal_err,
+    opt_integer_with_truncation, parse_difference_settings, parse_partial_time,
+    parse_rounding_options, require_construct, require_plain_time, temporal_dispatch_err,
+    temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -241,6 +242,19 @@ fn arg_as_plain_time(
     }
 }
 
+fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pt = crate::temporal::helpers::require_plain_time(args)?;
+    let Some(obj) = args.args.first().and_then(|v| v.as_object()) else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "first argument must be an object",
+        });
+    };
+    let partial = parse_partial_time(obj, args.gc_heap)?;
+    let result = pt.with(partial, None).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::PlainTime(result))
+}
+
 /// `Temporal.PlainTime.prototype` table.
 pub static PLAIN_TIME_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
     crate::intrinsics!(
@@ -254,6 +268,7 @@ pub static PLAIN_TIME_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(
         "until"    / 1 => impl_until,
         "since"    / 1 => impl_since,
         "round"    / 1 => impl_round,
+        "with"     / 1 => impl_with,
     )
 });
 

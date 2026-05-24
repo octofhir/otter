@@ -14,8 +14,8 @@ use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     alloc_temporal_value, arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value,
-    make_temporal, parse_difference_settings, require_construct, require_plain_date,
-    temporal_dispatch_err, temporal_err, to_integer_with_truncation,
+    make_temporal, parse_calendar_fields, parse_difference_settings, require_construct,
+    require_plain_date, temporal_dispatch_err, temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -257,18 +257,86 @@ fn arg_as_plain_date(
     }
 }
 
+fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pd = require_plain_date(args)?;
+    let Some(obj) = args.args.first().and_then(|v| v.as_object()) else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "first argument must be an object",
+        });
+    };
+    let fields = parse_calendar_fields(obj, args.gc_heap)?;
+    let result = pd.with(fields, None).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::PlainDate(result))
+}
+
+fn impl_with_calendar(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pd = require_plain_date(args)?;
+    let cal_value = args.args.first().copied().unwrap_or_default();
+    let Some(js) = cal_value.as_string(args.gc_heap) else {
+        return Err(IntrinsicError::BadArgument {
+            index: 0,
+            reason: "calendar identifier must be a string",
+        });
+    };
+    let s = js.to_lossy_string(args.gc_heap);
+    let calendar = temporal_rs::Calendar::try_from_utf8(s.as_bytes()).map_err(temporal_err)?;
+    let result = pd.with_calendar(calendar);
+    make_temporal(args, TemporalPayload::PlainDate(result))
+}
+
+fn impl_to_plain_date_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pd = require_plain_date(args)?;
+    let time = if let Some(v) = args.args.first().copied()
+        && !v.is_undefined()
+    {
+        let Some(obj) = v.as_object() else {
+            return Err(IntrinsicError::BadArgument {
+                index: 0,
+                reason: "first argument must be an object or undefined",
+            });
+        };
+        // Accept either a Temporal.PlainTime body or a partial-time
+        // object.
+        if let Some(t) = v.as_temporal(args.gc_heap) {
+            match t.payload_clone(args.gc_heap) {
+                TemporalPayload::PlainTime(pt) => Some(pt),
+                _ => {
+                    return Err(IntrinsicError::BadArgument {
+                        index: 0,
+                        reason: "must be a Temporal.PlainTime or partial-time object",
+                    });
+                }
+            }
+        } else {
+            let partial = crate::temporal::helpers::parse_partial_time(obj, args.gc_heap)?;
+            let pt = temporal_rs::PlainTime::default()
+                .with(partial, None)
+                .map_err(temporal_err)?;
+            Some(pt)
+        }
+    } else {
+        None
+    };
+    let pdt = pd.to_plain_date_time(time).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::PlainDateTime(pdt))
+}
+
 /// `Temporal.PlainDate.prototype` table.
 pub static PLAIN_DATE_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
     crate::intrinsics!(
         Temporal,
-        "toString" / 0 => impl_to_string,
-        "toJSON"   / 0 => impl_to_json,
-        "valueOf"  / 0 => impl_value_of,
-        "add"      / 1 => impl_add,
-        "subtract" / 1 => impl_subtract,
-        "equals"   / 1 => impl_equals,
-        "until"    / 1 => impl_until,
-        "since"    / 1 => impl_since,
+        "toString"          / 0 => impl_to_string,
+        "toJSON"            / 0 => impl_to_json,
+        "valueOf"           / 0 => impl_value_of,
+        "add"               / 1 => impl_add,
+        "subtract"          / 1 => impl_subtract,
+        "equals"            / 1 => impl_equals,
+        "until"             / 1 => impl_until,
+        "since"             / 1 => impl_since,
+        "with"              / 1 => impl_with,
+        "withCalendar"      / 1 => impl_with_calendar,
+        "toPlainDateTime"   / 0 => impl_to_plain_date_time,
     )
 });
 

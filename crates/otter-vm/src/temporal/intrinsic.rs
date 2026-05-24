@@ -214,9 +214,6 @@ fn temporal_native_error(err: TemporalError) -> NativeError {
             message,
             kind,
         } => {
-            // Honour the spec error class carried by
-            // `temporal_rs::TemporalError::kind()` rather than
-            // pattern-matching on the rendered text.
             let reason = format!("Temporal.{class}.{method}: {message}");
             use temporal_rs::error::ErrorKind;
             match kind {

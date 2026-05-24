@@ -84,6 +84,7 @@ pub mod global_functions;
 mod global_ops;
 pub mod intl;
 mod intl_ops;
+pub mod groom;
 pub mod inspect;
 pub mod intrinsic_install;
 pub mod intrinsics;

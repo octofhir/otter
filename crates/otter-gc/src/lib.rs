@@ -98,7 +98,7 @@ pub use page::{CARD_SIZE, PAGE_SIZE, Page, SpaceKind};
 pub use snapshot::{HeapSnapshot, SnapshotObject};
 pub use stats::{GcStats, TYPE_TAG_COUNT, TypeStats};
 pub use store::{GcEdge, GcStore};
-pub use trace::{SafeTraceable, Traceable};
+pub use trace::{SafeFinalize, SafeTraceable, Traceable};
 
 /// Raw collector backend types used by audited VM adapter layers.
 ///

@@ -157,6 +157,7 @@ use syn::{
 };
 
 mod couch;
+mod derive_groom;
 mod derive_pelt;
 mod holt;
 mod lodge;
@@ -319,6 +320,27 @@ pub fn lodge(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(Pelt, attributes(pelt))]
 pub fn pelt_derive(input: TokenStream) -> TokenStream {
     derive_pelt::expand(input)
+}
+
+/// Derive `::otter_gc::SafeFinalize` for a GC body.
+///
+/// Mirrors [`Pelt`] for the sweep-time finalize hook: every field
+/// that is not annotated with `#[groom(skip)]` is funneled through
+/// `::otter_vm::groom::GroomField::groom`, in declaration order.
+///
+/// Bodies that opt into `Groom` must also implement
+/// `::otter_gc::SafeTraceable` (typically via `#[derive(Pelt)]`) and
+/// register the finalize wrapper once with the host heap:
+///
+/// ```rust,ignore
+/// heap.register_finalize::<MyBody>();
+/// ```
+///
+/// See [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+/// for the full Pelt / Groom surface.
+#[proc_macro_derive(Groom, attributes(groom))]
+pub fn groom_derive(input: TokenStream) -> TokenStream {
+    derive_groom::expand(input)
 }
 
 

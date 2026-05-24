@@ -108,6 +108,36 @@ pub trait Traceable: 'static {
     unsafe fn trace_ephemeron_slots(_this: *mut Self, _visitor: &mut EphemeronVisitor<'_>) {}
 }
 
+/// Sweep-time finalizer hook for GC bodies.
+///
+/// The collector invokes [`Self::finalize_safe`] once on every
+/// dead body during the full-GC sweep, **before** the body's
+/// `Drop` impl runs and before its storage is reclaimed.
+///
+/// Most heap-allocated bodies do not need a finalizer — Rust's
+/// `Drop` is enough to release per-field resources. Bodies impl
+/// `SafeFinalize` only when they own GC-ordered cleanup work that
+/// must observe the post-mark live set (host registry pruning,
+/// external counter decrements, fast-flag teardown, …).
+///
+/// Bodies typically derive `SafeFinalize` through
+/// `#[derive(Groom)]` in `otter-macros`; the derive emits a
+/// finalizer that walks each non-skipped field through
+/// `GroomField::groom`.
+///
+/// Bodies that opt in must register themselves with the heap via
+/// [`crate::heap::GcHeap::register_finalize`] (typically through
+/// the helper emitted alongside the derive). Unregistered bodies
+/// skip the finalize step entirely — the sweep dispatch only fires
+/// when the type-tag slot is populated.
+pub trait SafeFinalize: SafeTraceable {
+    /// Called by the sweeper on a dead body before
+    /// `core::ptr::drop_in_place` runs. Must not allocate inside
+    /// the GC heap, must not run user JavaScript, and must not
+    /// re-enter the same heap.
+    fn finalize_safe(&mut self);
+}
+
 /// Safe-only counterpart of [`Traceable`] — the trait downstream
 /// crates that keep `forbid(unsafe_code)` (e.g. `otter-vm`) impl
 /// to register a GC-managed type.
@@ -168,6 +198,9 @@ pub struct TraceTable {
     /// on dead objects (so e.g. boxed strings get their backing
     /// freed). `None` for plain-old-data types.
     drop_table: [Option<unsafe fn(*mut GcHeader)>; 256],
+    /// Sweep-time finalizers for bodies that impl [`SafeFinalize`].
+    /// `None` for every other tag. Fires *before* `drop_table`.
+    finalize_table: [Option<unsafe fn(*mut GcHeader)>; 256],
 }
 
 impl Default for TraceTable {
@@ -183,6 +216,7 @@ impl TraceTable {
             table: [None; 256],
             ephemeron_table: [None; 256],
             drop_table: [None; 256],
+            finalize_table: [None; 256],
         }
     }
 
@@ -251,6 +285,37 @@ impl TraceTable {
     #[inline]
     pub fn get_drop(&self, tag: u8) -> Option<unsafe fn(*mut GcHeader)> {
         self.drop_table[tag as usize]
+    }
+
+    /// Look up the finalize function for a given type tag.
+    /// `None` when the tag has no [`SafeFinalize`] registration.
+    #[inline]
+    pub fn get_finalize(&self, tag: u8) -> Option<unsafe fn(*mut GcHeader)> {
+        self.finalize_table[tag as usize]
+    }
+
+    /// Register the finalize wrapper for a type that opts into
+    /// [`SafeFinalize`]. Must be paired with an earlier
+    /// [`Self::register`] call for the same type tag.
+    pub fn register_finalize<T: Traceable + SafeFinalize>(&mut self) {
+        unsafe fn finalize_wrapper<T: Traceable + SafeFinalize>(header: *mut GcHeader) {
+            // SAFETY: by the [`Traceable`] safety contract,
+            // `header` precedes a valid `T` payload.
+            unsafe {
+                let payload = (header as *mut u8)
+                    .add(std::mem::size_of::<GcHeader>())
+                    .cast::<T>();
+                (*payload).finalize_safe();
+            }
+        }
+        let tag = <T as Traceable>::TYPE_TAG as usize;
+        if let Some(existing) = self.finalize_table[tag] {
+            debug_assert!(
+                existing as *const () == finalize_wrapper::<T> as *const (),
+                "finalize tag {tag} already registered with a different fn",
+            );
+        }
+        self.finalize_table[tag] = Some(finalize_wrapper::<T>);
     }
 
     /// Invoke the trace function for `header`, if registered.

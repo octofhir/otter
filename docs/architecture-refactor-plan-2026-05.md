@@ -20,7 +20,7 @@ work is:
 | 5.3   | GC snapshot bridge                         | DONE 2026-05-24       |
 | 6.1   | Object internal-method vtable evaluation   | DEFERRED 2026-05-24   |
 | 6.2   | Tighten Promise capability / job records   | DONE 2026-05-24       |
-| 6.3   | Derive Trace / Finalize for new GC bodies  | `Pelt` DONE 2026-05-24 (19/20 bodies, IteratorState enum stays manual); `Groom` deferred |
+| 6.3   | Derive Trace / Finalize for new GC bodies  | DONE 2026-05-24 (`Pelt` 19/20 bodies + `Groom`)                                          |
 
 Open carry-over tech debt from Phase 2.3 / 2.4 (not yet promoted to
 their own task numbers):
@@ -305,39 +305,49 @@ wrap either a `RuntimeClassSpec` (legacy) or a
   isolate-local microtask queue + Tokio token boundary are
   unchanged.
 
-### Task 6.3 — Derive Trace / Finalize For New GC Bodies
+### Task 6.3 — Derive Trace / Finalize For New GC Bodies — DONE 2026-05-24
 
 - Goal: reduce manual tracing omissions.
 - Touches: `otter-macros`, GC body types introduced in Phase 1.
-- Change: derive macro mirrors Boa's `Trace`/`Finalize` safety
-  pattern but emits Otter `SafeTraceable` / slot-visitor code.
+- Change: derive macros emit `SafeTraceable` / slot-visitor code
+  and an opt-in `SafeFinalize` sweep-time hook.
 - Acceptance: compile-fail tests for untraceable fields; migrated
   bodies use the derive unless they need custom weak semantics.
 - Risk: Medium.
 - Effort: M.
 - Depends on: 4.1.
-- **Status:** First cut shipped 2026-05-24. `#[derive(Pelt)]` at
-  `crates/otter-macros/src/derive_pelt.rs`; helper trait
-  `otter_vm::pelt::PeltField` with blanket impls for `Value`,
-  `Gc<T>` (with `is_null()` guard), `Option<T>`, `Vec<T>`,
-  `[T; N]`, `Box<T>`, `RefCell<T>`, plus no-op impls for every
-  primitive leaf. Bodies migrated:
-  `UpvalueCellBody` / `ProxyBodyGc` / `JsClosureBody` /
-  `ClassConstructorBody` / `SymbolBody` / `BigIntBody` /
-  `IntlBody` / `TemporalBody`. Trybuild matrix at
-  `crates/otter-vm/tests/compile_fail/pelt_*.rs` covers missing
-  `#[pelt(tag = …)]`, untraceable field, and enum body. Full
-  detail in
-  [`docs/otter-macros-refactor-tracker.md`](otter-macros-refactor-tracker.md).
-  **`#[derive(Groom)]` deferred** until `otter-gc` grows a per-body
-  `Finalize` trait + sweep dispatch (the existing
-  `crates/otter-gc/src/finalize.rs` module owns weak / registry
-  bookkeeping, not a generic drop-time hook). Migration of the
-  remaining hand-written `SafeTraceable` impls (`JsRegExpBody`,
-  `BoundFunctionBody`, `NativeFunctionBody`, `ArrayBody`, the two
-  generator bodies, the four collection bodies, the weak-ref
-  bodies, `PurePromiseBody`, the four iterator-state bodies) is
-  per-body work tracked in the macros tracker.
+- **Status:** Both halves shipped.
+  - `#[derive(Pelt)]` at
+    `crates/otter-macros/src/derive_pelt.rs`; helper trait
+    `otter_vm::pelt::PeltField` with blanket impls for `Value`,
+    `Gc<T>` (with `is_null()` guard), `Option<T>`, `Vec<T>`,
+    `[T; N]`, `Box<T>`, `RefCell<T>`, plus no-op impls for every
+    primitive leaf. Bodies migrated:
+    `UpvalueCellBody` / `ProxyBodyGc` / `JsClosureBody` /
+    `ClassConstructorBody` / `SymbolBody` / `BigIntBody` /
+    `IntlBody` / `TemporalBody`. Trybuild matrix at
+    `crates/otter-vm/tests/compile_fail/pelt_*.rs` covers missing
+    `#[pelt(tag = …)]`, untraceable field, and enum body. Full
+    detail in
+    [`docs/otter-macros-refactor-tracker.md`](otter-macros-refactor-tracker.md).
+  - `#[derive(Groom)]` at
+    `crates/otter-macros/src/derive_groom.rs`; helper trait
+    `otter_vm::groom::GroomField` mirrors `PeltField` with `&mut
+    self` access for `Option<T>`, `Vec<T>`, `[T; N]`, `Box<T>`,
+    `RefCell<T>`, `SmallVec<…>`, tuples + no-op leaves on every
+    primitive. New trait `otter_gc::SafeFinalize` + `finalize_table`
+    on `TraceTable`; sweep dispatch fires `finalize_safe` ahead of
+    `Drop` only for tags explicitly registered via
+    `GcHeap::register_finalize::<T>()`. Smoke coverage at
+    `crates/otter-macros/tests/derive_groom.rs` (expansion shape)
+    and `crates/otter-gc/tests/sweep_finalize.rs` (sweep wiring).
+- **Carry-over:** Migration of the remaining hand-written
+  `SafeTraceable` impls (`JsRegExpBody`, `BoundFunctionBody`,
+  `NativeFunctionBody`, `ArrayBody`, the two generator bodies, the
+  four collection bodies, the weak-ref bodies, `PurePromiseBody`,
+  the four iterator-state bodies) remains per-body work tracked in
+  the macros tracker — most bodies need `Drop` only; `Groom` is
+  available for the ones that need sweep-time host bookkeeping.
 
 ## Migration Order (remaining)
 

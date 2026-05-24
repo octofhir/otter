@@ -439,6 +439,15 @@ impl GcHeap {
         self.trace_table.register::<T>();
     }
 
+    /// Register a [`SafeFinalize`] body so the sweeper calls
+    /// `finalize_safe` on dead instances before their storage is
+    /// reclaimed. Idempotent; must be paired with an earlier
+    /// `register_traceable::<T>()` (the lazy `alloc_*` path
+    /// handles the trace registration for you).
+    pub fn register_finalize<T: Traceable + crate::trace::SafeFinalize>(&mut self) {
+        self.trace_table.register_finalize::<T>();
+    }
+
     /// Register a GC-managed weak collection table for ephemeron
     /// fixpoint work between full-GC marking and sweeping.
     pub fn register_ephemeron_table<T: ?Sized>(&mut self, table: Gc<T>) {
@@ -1185,7 +1194,11 @@ impl GcHeap {
                     let tag = (*h).type_tag() as usize;
                     let size = (*h).size_bytes() as usize;
                     if !(*h).is_marked() {
-                        if let Some(drop_fn) = self.trace_table.get_drop((*h).type_tag()) {
+                        let tag_u8 = (*h).type_tag();
+                        if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
+                            finalize_fn(h);
+                        }
+                        if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
                             drop_fn(h);
                         }
                         reclaimed += size;
@@ -1200,7 +1213,11 @@ impl GcHeap {
                     let tag = (*h).type_tag() as usize;
                     let size = (*h).size_bytes() as usize;
                     if !(*h).is_marked() {
-                        if let Some(drop_fn) = self.trace_table.get_drop((*h).type_tag()) {
+                        let tag_u8 = (*h).type_tag();
+                        if let Some(finalize_fn) = self.trace_table.get_finalize(tag_u8) {
+                            finalize_fn(h);
+                        }
+                        if let Some(drop_fn) = self.trace_table.get_drop(tag_u8) {
                             drop_fn(h);
                         }
                         reclaimed += size;

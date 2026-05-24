@@ -1383,6 +1383,57 @@ impl Interpreter {
         self.tracer.is_some()
     }
 
+    /// Install (or clear) the shape-transition observer. The
+    /// observer fires on every hidden-class transition the VM
+    /// takes — both fresh allocations and cached lookups. See
+    /// [`inspect::ShapeTransitionEvent`].
+    pub fn set_shape_transition_observer(
+        &mut self,
+        observer: Option<Box<dyn inspect::ShapeTransitionObserver>>,
+    ) {
+        self.shape_runtime.set_observer(observer);
+    }
+
+    /// Snapshot every property inline-cache site in dense site-id
+    /// order. The snapshot is built without disturbing the live IC
+    /// state and can be called from anywhere with a `&self`
+    /// borrow.
+    #[must_use]
+    pub fn ic_snapshot(&self) -> Vec<inspect::IcSiteSnapshot> {
+        let mut out =
+            Vec::with_capacity(self.load_property_ics.len() + self.store_property_ics.len() + self.has_property_ics.len());
+        for (index, entry) in self.load_property_ics.iter().enumerate() {
+            out.push(inspect::IcSiteSnapshot {
+                site_index: index as u32,
+                kind: inspect::IcSiteKind::Load,
+                state: inspect::snapshot_load_state(entry),
+            });
+        }
+        for (index, entry) in self.store_property_ics.iter().enumerate() {
+            out.push(inspect::IcSiteSnapshot {
+                site_index: index as u32,
+                kind: inspect::IcSiteKind::Store,
+                state: inspect::snapshot_store_state(entry),
+            });
+        }
+        for (index, entry) in self.has_property_ics.iter().enumerate() {
+            out.push(inspect::IcSiteSnapshot {
+                site_index: index as u32,
+                kind: inspect::IcSiteKind::Has,
+                state: inspect::snapshot_has_state(entry),
+            });
+        }
+        out
+    }
+
+    /// Snapshot the active hidden-class transition tree. Nodes
+    /// appear in deterministic order: root first, then transitions
+    /// sorted by `(parent_shape_id, transition_key)`.
+    #[must_use]
+    pub fn shape_transition_snapshot(&self) -> inspect::ShapeTransitionSnapshot {
+        inspect::build_shape_transition_snapshot(&self.shape_runtime, &self.gc_heap)
+    }
+
     /// Cloneable handle for cooperative cancellation.
     #[must_use]
     pub fn interrupt_handle(&self) -> InterruptFlag {
@@ -2691,6 +2742,7 @@ impl Interpreter {
                     .map(|f| f.name.as_str())
                     .unwrap_or("<unknown>");
                 let operands = context.exec_operands(instr);
+                let register_window = stack[top_idx].registers.as_slice();
                 let event = inspect::StepEvent {
                     frame_depth: stack.len(),
                     function_id,
@@ -2698,6 +2750,7 @@ impl Interpreter {
                     byte_pc: pc,
                     op,
                     operands,
+                    register_window,
                 };
                 if let Some(tracer) = self.tracer.as_deref_mut() {
                     tracer.on_step(&event);

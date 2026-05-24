@@ -86,6 +86,34 @@ buffer to avoid per-line allocation; embedders that need to skip
 the formatting cost can implement `StepTracer` directly and treat
 the event payload as structured input.
 
+## Inspector Snapshots
+
+The same `inspect` module exposes point-in-time DTOs that complement
+the streaming trace:
+
+- `Runtime::ic_snapshot()` returns one `IcSiteSnapshot` per
+  property inline-cache site. Each site reports `Empty`,
+  `Polymorphic { entries, misses }`, or `Megamorphic`. Polymorphic
+  entries carry the receiver shape id, the matched slot offset, and
+  the IC variant (`OwnData`, `DirectPrototypeData`,
+  `OwnAddTransition`, …).
+- `Runtime::shape_transition_snapshot()` returns the live
+  hidden-class transition tree as a flat node list ordered by
+  `(parent_shape_id, transition_key)`.
+- `Runtime::set_shape_transition_observer(Some(obs))` installs a
+  `ShapeTransitionObserver` that fires on every hidden-class
+  transition the VM takes. The event carries the from / to shape ids,
+  the key, and a `reused` flag that distinguishes fresh allocations
+  from cached lookups — the right primitive for shape-transition
+  breakpoints and shape-thrash audits.
+- `FrameSnapshot::from_step_event(event, include_undefined)`
+  builds a per-frame snapshot from inside a step tracer's
+  `on_step`. Each `RegisterSnapshot` carries the register index and
+  a compact debug repr of the live `Value`.
+
+The snapshot DTOs are plain owned structs (no GC handles). They are
+safe to keep across mutator turns, log, or compare in tests.
+
 ## Schema Stability
 
 The trace format is wedged to the bytecode wire format by the

@@ -2086,6 +2086,36 @@ impl Runtime {
         self.interp.reset_runtime_budget_stats();
     }
 
+    /// Snapshot every property inline-cache site. See
+    /// [`inspect::IcSiteSnapshot`].
+    #[must_use]
+    pub fn ic_snapshot(&self) -> Vec<inspect::IcSiteSnapshot> {
+        self.interp.ic_snapshot()
+    }
+
+    /// Snapshot the active hidden-class transition tree. See
+    /// [`inspect::ShapeTransitionSnapshot`].
+    #[must_use]
+    pub fn shape_transition_snapshot(&self) -> inspect::ShapeTransitionSnapshot {
+        self.interp.shape_transition_snapshot()
+    }
+
+    /// Install (or clear) the shape-transition observer used by
+    /// shape-transition breakpoints. See
+    /// [`inspect::ShapeTransitionObserver`].
+    pub fn set_shape_transition_observer(
+        &mut self,
+        observer: Option<Box<dyn inspect::ShapeTransitionObserver>>,
+    ) {
+        self.interp.set_shape_transition_observer(observer);
+    }
+
+    /// Install (or clear) the per-instruction step tracer. See
+    /// [`inspect::StepTracer`].
+    pub fn set_tracer(&mut self, tracer: Option<Box<dyn inspect::StepTracer>>) {
+        self.interp.set_tracer(tracer);
+    }
+
     /// Force a full GC cycle (scavenge + old-gen mark-sweep).
     ///
     /// **Debug / test only.** Production code must never call

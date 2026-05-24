@@ -30,6 +30,7 @@ use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
+use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
 use crate::string::{JsStringBody, JsStringHandle, JsStringId, alloc_flat_string_body_with_roots};
 
 use super::ShapeId;
@@ -45,13 +46,26 @@ struct TransitionKey {
 }
 
 /// Mutable side tables for GC-managed hidden classes.
-#[derive(Debug)]
 pub(crate) struct ShapeRuntime {
     root: ShapeHandle,
     next_string_id: u32,
     interned_keys: HashMap<String, JsStringHandle>,
     transitions: HashMap<TransitionKey, ShapeHandle>,
     offset_cache: HashMap<ShapeId, HashMap<JsStringId, u32>>,
+    observer: Option<Box<dyn ShapeTransitionObserver>>,
+}
+
+impl std::fmt::Debug for ShapeRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShapeRuntime")
+            .field("root", &self.root)
+            .field("next_string_id", &self.next_string_id)
+            .field("interned_keys", &self.interned_keys.len())
+            .field("transitions", &self.transitions.len())
+            .field("offset_cache", &self.offset_cache.len())
+            .field("observer_installed", &self.observer.is_some())
+            .finish()
+    }
 }
 
 impl ShapeRuntime {
@@ -65,7 +79,31 @@ impl ShapeRuntime {
             interned_keys: HashMap::new(),
             transitions: HashMap::new(),
             offset_cache: HashMap::new(),
+            observer: None,
         })
+    }
+
+    /// Install or clear the shape-transition observer. The
+    /// observer fires on every transition take —
+    /// [`ShapeTransitionEvent::reused`] distinguishes cached lookups
+    /// from fresh shape allocations.
+    pub(crate) fn set_observer(
+        &mut self,
+        observer: Option<Box<dyn ShapeTransitionObserver>>,
+    ) {
+        self.observer = observer;
+    }
+
+    /// Read-only access to the live transition table for the
+    /// snapshot builder. Each entry yields the parent shape id and
+    /// the child shape handle; callers read the child's stored
+    /// transition key from the heap as needed.
+    pub(crate) fn transitions_for_snapshot(
+        &self,
+    ) -> impl Iterator<Item = (ShapeId, ShapeHandle)> + '_ {
+        self.transitions
+            .iter()
+            .map(|(key, child)| (key.parent, *child))
     }
 
     /// Empty hidden-class root.
@@ -132,12 +170,35 @@ impl ShapeRuntime {
             key: key_id,
         };
         if let Some(existing) = self.transitions.get(&transition_key) {
-            return Ok(*existing);
+            let child = *existing;
+            self.notify_observer(heap, parent_id, child, key, true);
+            return Ok(child);
         }
 
         let child = alloc_child_shape_body_with_roots(heap, parent, key_handle, external_visit)?;
         self.transitions.insert(transition_key, child);
+        self.notify_observer(heap, parent_id, child, key, false);
         Ok(child)
+    }
+
+    fn notify_observer(
+        &mut self,
+        heap: &GcHeap,
+        parent_id: ShapeId,
+        child: ShapeHandle,
+        key: &str,
+        reused: bool,
+    ) {
+        let Some(observer) = self.observer.as_deref_mut() else {
+            return;
+        };
+        let child_id = heap.read_payload(child, ShapeBody::id);
+        observer.on_transition(&ShapeTransitionEvent {
+            from_shape_id: parent_id.raw(),
+            to_shape_id: child_id.raw(),
+            key: key.to_string(),
+            reused,
+        });
     }
 
     /// Lookup `key` in a shape, using the flattened cache when available.

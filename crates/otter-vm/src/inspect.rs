@@ -27,11 +27,29 @@
 //! - `crate::Interpreter::set_tracer`
 //! - [`otter_bytecode::disasm`]
 //! - `docs/book/src/engine/step-trace.md`
+//!
+//! # Snapshots
+//! On top of the per-instruction trace, this module exposes
+//! point-in-time DTOs that surface the interpreter's hot-path
+//! state without leaking internal types:
+//!
+//! - [`IcSiteSnapshot`] / [`IcSiteState`] / [`IcEntrySnapshot`] —
+//!   one entry per property inline-cache site.
+//! - [`ShapeTransitionSnapshot`] / [`ShapeNodeSnapshot`] — flat
+//!   walk of the hidden-class transition tree.
+//! - [`ShapeTransitionObserver`] — install once on the
+//!   interpreter to break on every fresh hidden-class transition
+//!   (the cache-miss path; cached transition lookups never
+//!   re-fire the observer).
+//! - [`FrameSnapshot`] / [`RegisterSnapshot`] — frame and
+//!   register window inspection from inside a step-tracer hook.
 
 use std::fmt::Write as _;
 use std::io::Write;
 
 use otter_bytecode::{Op, Operand};
+
+use crate::Value;
 
 /// Canonical version banner. Bump on any format change that breaks
 /// existing golden traces.
@@ -58,6 +76,11 @@ pub struct StepEvent<'a> {
     pub op: Op,
     /// Operands in declaration order.
     pub operands: &'a [Operand],
+    /// Register window of the active frame. Embedders that want
+    /// frame/register inspection from inside a tracer hook should
+    /// read this slice directly — it is the same backing storage the
+    /// dispatch loop sees.
+    pub register_window: &'a [Value],
 }
 
 /// VM dispatch observer.
@@ -166,6 +189,417 @@ fn format_operand(out: &mut String, operand: &Operand) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// IC, shape, and frame snapshots — point-in-time dumps for inspector tooling.
+// ---------------------------------------------------------------------------
+
+/// Family of named-property bytecodes a polymorphic inline cache
+/// belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcSiteKind {
+    /// `LoadProperty` site.
+    Load,
+    /// `StoreProperty` site.
+    Store,
+    /// `HasProperty` site.
+    Has,
+}
+
+/// Lifecycle state of one inline-cache site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IcSiteState {
+    /// No cache record has been installed yet.
+    Empty,
+    /// One or more guarded entries are installed. `misses` is the
+    /// running probe-miss budget; reaching the disable threshold
+    /// while the entry list is full transitions the site to
+    /// [`Self::Megamorphic`].
+    Polymorphic {
+        /// Installed entries in install order.
+        entries: Vec<IcEntrySnapshot>,
+        /// Probe misses observed since the most recent install.
+        misses: u32,
+    },
+    /// Site exceeded the polymorphic cache budget and falls through
+    /// to the slow path on every dispatch.
+    Megamorphic,
+}
+
+/// One entry inside a polymorphic IC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcEntrySnapshot {
+    /// Whether the cache record fires on an own slot, a direct
+    /// prototype slot, or a hidden-class transition.
+    pub variant: IcEntryVariant,
+    /// Guarded receiver shape id rendered as `u64`. Distinct between
+    /// any two shape histories.
+    pub receiver_shape_id: u64,
+    /// Guarded property key when known. Resolved through the cached
+    /// constant pool / shape key table; rendered as UTF-8.
+    pub key: Option<String>,
+    /// Property slot offset on the matched shape.
+    pub slot: Option<u16>,
+    /// For transition entries: the destination shape id.
+    pub to_shape_id: Option<u64>,
+}
+
+/// Inline-cache record family inside a [`IcEntrySnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcEntryVariant {
+    /// Receiver owns the matched data slot.
+    OwnData,
+    /// Receiver's direct prototype owns the matched data slot.
+    DirectPrototypeData,
+    /// Append transition that adds a slot on store.
+    OwnAddTransition,
+    /// Store transition guarded by a direct-prototype miss.
+    DirectPrototypeMissingTransition,
+    /// Store transition guarded by a direct-prototype writable
+    /// data slot.
+    DirectPrototypeWritableDataTransition,
+}
+
+/// One inline-cache site dump. The `site_index` matches the dense
+/// VM-local id assigned at executable build time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcSiteSnapshot {
+    /// Dense VM-local site id.
+    pub site_index: u32,
+    /// Opcode family the site belongs to.
+    pub kind: IcSiteKind,
+    /// Lifecycle state and entry list.
+    pub state: IcSiteState,
+}
+
+/// One node in a hidden-class transition tree dump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeNodeSnapshot {
+    /// VM-local shape id.
+    pub shape_id: u64,
+    /// Parent shape id, or `None` for the root.
+    pub parent_shape_id: Option<u64>,
+    /// Key added by this transition, or `None` for the root.
+    pub transition_key: Option<String>,
+    /// Number of string-keyed slots represented by this shape.
+    pub property_count: u32,
+}
+
+/// Flat dump of the active hidden-class transition tree. Nodes
+/// appear in deterministic order: root first, then transitions
+/// sorted by `(parent_shape_id, transition_key)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeTransitionSnapshot {
+    /// VM-local id of the root shape.
+    pub root_shape_id: u64,
+    /// Every shape reachable from the runtime transition table.
+    pub nodes: Vec<ShapeNodeSnapshot>,
+}
+
+/// One transition event delivered to a
+/// [`ShapeTransitionObserver`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeTransitionEvent {
+    /// Parent shape id the transition starts from.
+    pub from_shape_id: u64,
+    /// Child shape id reached by the transition.
+    pub to_shape_id: u64,
+    /// Property key added by the transition.
+    pub key: String,
+    /// `true` when the transition table already had a cached entry
+    /// for this `(parent, key)` pair — the observer fires every
+    /// time the transition is taken, regardless of cache state.
+    /// `false` means this dispatch allocated a fresh shape node.
+    pub reused: bool,
+}
+
+/// Observer fired on every hidden-class transition. Useful for
+/// shape-transition breakpoints and shape-thrash audits.
+///
+/// The observer runs inside the same mutator turn as the
+/// allocating opcode; do not park, await, or call back into the
+/// interpreter from inside `on_transition`.
+pub trait ShapeTransitionObserver {
+    /// Fired once per transition take. See
+    /// [`ShapeTransitionEvent::reused`] for the cache-hit
+    /// signal.
+    fn on_transition(&mut self, event: &ShapeTransitionEvent);
+}
+
+/// One snapshot row inside a [`FrameSnapshot::registers`] list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterSnapshot {
+    /// Register index inside the frame's window.
+    pub index: u16,
+    /// Compact debug repr of the value (`int32:42`, `bool:true`,
+    /// `undefined`, …).
+    pub debug: String,
+}
+
+/// One frame's state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameSnapshot {
+    /// 1-based call depth (matches [`StepEvent::frame_depth`]).
+    pub depth: usize,
+    /// VM-local function id.
+    pub function_id: u32,
+    /// Source-declared function name.
+    pub function_name: String,
+    /// Byte-offset PC inside the function's encoded stream.
+    pub byte_pc: u32,
+    /// Total number of registers in this frame's window.
+    pub register_count: usize,
+    /// Registers in window order. Embedders that want every slot
+    /// regardless of contents can pass `include_undefined = true`
+    /// to the snapshot helper; the default drops `undefined` slots
+    /// so the dump stays short for wide frames.
+    pub registers: Vec<RegisterSnapshot>,
+}
+
+impl FrameSnapshot {
+    /// Build a snapshot from the active dispatch frame visible
+    /// through a [`StepEvent`]. `include_undefined` controls whether
+    /// `undefined` register slots appear in the output.
+    #[must_use]
+    pub fn from_step_event(event: &StepEvent<'_>, include_undefined: bool) -> Self {
+        let mut registers = Vec::with_capacity(event.register_window.len());
+        for (idx, value) in event.register_window.iter().enumerate() {
+            if !include_undefined && value.is_undefined() {
+                continue;
+            }
+            let index = u16::try_from(idx).unwrap_or(u16::MAX);
+            registers.push(RegisterSnapshot {
+                index,
+                debug: format_value_debug(*value),
+            });
+        }
+        Self {
+            depth: event.frame_depth,
+            function_id: event.function_id,
+            function_name: event.function_name.to_string(),
+            byte_pc: event.byte_pc,
+            register_count: event.register_window.len(),
+            registers,
+        }
+    }
+}
+
+/// Build the [`IcSiteState`] DTO from one stored
+/// [`crate::property_ic::PropertyIcEntry`] holding a
+/// [`crate::property_ic::LoadPropertyIc`].
+#[must_use]
+pub(crate) fn snapshot_load_state(
+    entry: &crate::property_ic::PropertyIcEntry<crate::property_ic::LoadPropertyIc>,
+) -> IcSiteState {
+    use crate::property_ic::{LoadPropertyIc, PropertyIcEntry};
+    match entry {
+        PropertyIcEntry::Empty => IcSiteState::Empty,
+        PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
+        PropertyIcEntry::Polymorphic { entries, misses } => {
+            let mapped = entries
+                .iter()
+                .map(|ic| match ic {
+                    LoadPropertyIc::OwnData { hit } => IcEntrySnapshot {
+                        variant: IcEntryVariant::OwnData,
+                        receiver_shape_id: hit.shape_id.raw(),
+                        key: None,
+                        slot: Some(hit.slot),
+                        to_shape_id: None,
+                    },
+                    LoadPropertyIc::DirectPrototypeData {
+                        receiver_shape_id,
+                        hit,
+                    } => IcEntrySnapshot {
+                        variant: IcEntryVariant::DirectPrototypeData,
+                        receiver_shape_id: receiver_shape_id.raw(),
+                        key: None,
+                        slot: Some(hit.slot),
+                        to_shape_id: None,
+                    },
+                })
+                .collect();
+            IcSiteState::Polymorphic {
+                entries: mapped,
+                misses: u32::from(*misses),
+            }
+        }
+    }
+}
+
+/// Build the [`IcSiteState`] DTO from one
+/// [`crate::property_ic::PropertyIcEntry`] holding a
+/// [`crate::property_ic::StorePropertyIc`].
+#[must_use]
+pub(crate) fn snapshot_store_state(
+    entry: &crate::property_ic::PropertyIcEntry<crate::property_ic::StorePropertyIc>,
+) -> IcSiteState {
+    use crate::property_ic::{PropertyIcEntry, StorePropertyIc};
+    match entry {
+        PropertyIcEntry::Empty => IcSiteState::Empty,
+        PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
+        PropertyIcEntry::Polymorphic { entries, misses } => {
+            let mapped = entries
+                .iter()
+                .map(|ic| match ic {
+                    StorePropertyIc::ExistingOwnDataStore { hit } => IcEntrySnapshot {
+                        variant: IcEntryVariant::OwnData,
+                        receiver_shape_id: hit.shape_id.raw(),
+                        key: None,
+                        slot: Some(hit.slot),
+                        to_shape_id: None,
+                    },
+                    StorePropertyIc::OwnAddTransition { transition } => IcEntrySnapshot {
+                        variant: IcEntryVariant::OwnAddTransition,
+                        receiver_shape_id: transition.from_shape_id.raw(),
+                        key: None,
+                        slot: None,
+                        to_shape_id: Some(transition.to_shape_id.raw()),
+                    },
+                    StorePropertyIc::DirectPrototypeMissingTransition { transition } => {
+                        IcEntrySnapshot {
+                            variant: IcEntryVariant::DirectPrototypeMissingTransition,
+                            receiver_shape_id: transition.from_shape_id.raw(),
+                            key: None,
+                            slot: None,
+                            to_shape_id: Some(transition.to_shape_id.raw()),
+                        }
+                    }
+                    StorePropertyIc::DirectPrototypeWritableDataTransition { transition } => {
+                        IcEntrySnapshot {
+                            variant: IcEntryVariant::DirectPrototypeWritableDataTransition,
+                            receiver_shape_id: transition.from_shape_id.raw(),
+                            key: None,
+                            slot: None,
+                            to_shape_id: Some(transition.to_shape_id.raw()),
+                        }
+                    }
+                })
+                .collect();
+            IcSiteState::Polymorphic {
+                entries: mapped,
+                misses: u32::from(*misses),
+            }
+        }
+    }
+}
+
+/// Build the [`IcSiteState`] DTO from one
+/// [`crate::property_ic::PropertyIcEntry`] holding a
+/// [`crate::property_ic::HasPropertyIc`].
+#[must_use]
+pub(crate) fn snapshot_has_state(
+    entry: &crate::property_ic::PropertyIcEntry<crate::property_ic::HasPropertyIc>,
+) -> IcSiteState {
+    use crate::property_ic::{HasPropertyIc, PropertyIcEntry};
+    match entry {
+        PropertyIcEntry::Empty => IcSiteState::Empty,
+        PropertyIcEntry::Megamorphic => IcSiteState::Megamorphic,
+        PropertyIcEntry::Polymorphic { entries, misses } => {
+            let mapped = entries
+                .iter()
+                .map(|ic| match ic {
+                    HasPropertyIc::OwnData { key: _, hit } => IcEntrySnapshot {
+                        variant: IcEntryVariant::OwnData,
+                        receiver_shape_id: hit.shape_id.raw(),
+                        key: None,
+                        slot: Some(hit.slot),
+                        to_shape_id: None,
+                    },
+                    HasPropertyIc::DirectPrototypeData {
+                        receiver_shape_id,
+                        key: _,
+                        hit,
+                    } => IcEntrySnapshot {
+                        variant: IcEntryVariant::DirectPrototypeData,
+                        receiver_shape_id: receiver_shape_id.raw(),
+                        key: None,
+                        slot: Some(hit.slot),
+                        to_shape_id: None,
+                    },
+                })
+                .collect();
+            IcSiteState::Polymorphic {
+                entries: mapped,
+                misses: u32::from(*misses),
+            }
+        }
+    }
+}
+
+/// Build a [`ShapeTransitionSnapshot`] from the live shape runtime.
+#[must_use]
+pub(crate) fn build_shape_transition_snapshot(
+    shape_runtime: &crate::object::ShapeRuntime,
+    heap: &otter_gc::GcHeap,
+) -> ShapeTransitionSnapshot {
+    use crate::object::ShapeBody;
+    use crate::string::to_utf16_vec;
+
+    let root_handle = shape_runtime.root();
+    let root_shape_id = heap.read_payload(root_handle, ShapeBody::id).raw();
+
+    let mut nodes = Vec::new();
+    nodes.push(ShapeNodeSnapshot {
+        shape_id: root_shape_id,
+        parent_shape_id: None,
+        transition_key: None,
+        property_count: 0,
+    });
+
+    let mut raw: Vec<(u64, u64, String, u32)> = Vec::new();
+    for (parent_id, child) in shape_runtime.transitions_for_snapshot() {
+        let (child_id, transition_key_handle, property_count, _own_offset) = heap
+            .read_payload(child, |body| {
+                (
+                    body.id(),
+                    body.transition_key(),
+                    body.property_count(),
+                    body.own_offset(),
+                )
+            });
+        let key = if transition_key_handle.is_null() {
+            String::new()
+        } else {
+            let units = to_utf16_vec(heap, transition_key_handle);
+            String::from_utf16_lossy(&units)
+        };
+        raw.push((parent_id.raw(), child_id.raw(), key, property_count));
+    }
+    raw.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+    for (parent_shape_id, shape_id, transition_key, property_count) in raw {
+        nodes.push(ShapeNodeSnapshot {
+            shape_id,
+            parent_shape_id: Some(parent_shape_id),
+            transition_key: Some(transition_key),
+            property_count,
+        });
+    }
+
+    ShapeTransitionSnapshot {
+        root_shape_id,
+        nodes,
+    }
+}
+
+/// Compact debug repr for a [`Value`]. Mirrors the kinds the
+/// step trace surfaces in operand listings.
+#[must_use]
+pub fn format_value_debug(value: Value) -> String {
+    if value.is_undefined() {
+        "undefined".to_string()
+    } else if value.is_null() {
+        "null".to_string()
+    } else if let Some(b) = value.as_boolean() {
+        format!("bool:{b}")
+    } else if let Some(n) = value.as_number() {
+        format!("number:{}", n.as_f64())
+    } else {
+        // Fall back to the raw NaN-boxed bit pattern when the value
+        // is heap-shaped — the dump should remain stable across
+        // heap layouts.
+        format!("bits:{:#018x}", value.to_bits())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +614,7 @@ mod tests {
     #[test]
     fn single_event_renders_canonical_line() {
         let operands = [Operand::Register(2), Operand::Register(0), Operand::Register(1)];
+        let registers: [Value; 0] = [];
         let event = StepEvent {
             frame_depth: 1,
             function_id: 0,
@@ -187,6 +622,7 @@ mod tests {
             byte_pc: 12,
             op: Op::Add,
             operands: &operands,
+            register_window: &registers,
         };
         let mut out = String::new();
         format_event(&mut out, &event);
@@ -199,6 +635,7 @@ mod tests {
         {
             let mut tracer = WriterTracer::new(&mut buf);
             let operands = [Operand::Register(0), Operand::Imm32(7)];
+            let registers: [Value; 0] = [];
             let event = StepEvent {
                 frame_depth: 1,
                 function_id: 0,
@@ -206,6 +643,7 @@ mod tests {
                 byte_pc: 0,
                 op: Op::LoadInt32,
                 operands: &operands,
+                register_window: &registers,
             };
             tracer.on_step(&event);
             tracer.on_step(&event);

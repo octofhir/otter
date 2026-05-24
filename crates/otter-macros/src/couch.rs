@@ -65,7 +65,7 @@ use syn::{
     parse_macro_input,
 };
 
-use crate::holt::{AccessorEntry, MethodEntry};
+use crate::holt::{AccessorEntry, ConstantEntry, MethodEntry};
 
 /// Parsed `constructor = (length = N, call = path
 /// [, is_abstract = true] [, callable_only = true])` tuple.
@@ -231,6 +231,11 @@ pub(crate) struct CouchInput {
     pub(crate) intrinsic_ident: Ident,
     pub(crate) constructor: ConstructorSpecArgs,
     pub(crate) statics: Vec<MethodEntry>,
+    /// Numeric / boolean / nullish constants pinned as own data
+    /// properties on the constructor itself (e.g. `Number.MAX_VALUE`,
+    /// `Math.PI` — though Math is a namespace, not a class). Shares
+    /// the `holt!` constant grammar.
+    pub(crate) static_constants: Vec<ConstantEntry>,
     pub(crate) prototype: PrototypeBlock,
     /// Optional `post_install = path` escape hatch. When set, the
     /// generated install body calls
@@ -249,6 +254,7 @@ impl Parse for CouchInput {
         let mut intrinsic_override: Option<Ident> = None;
         let mut constructor: Option<ConstructorSpecArgs> = None;
         let mut statics: Vec<MethodEntry> = Vec::new();
+        let mut static_constants: Vec<ConstantEntry> = Vec::new();
         let mut prototype: PrototypeBlock = PrototypeBlock::default();
         let mut post_install: Option<Path> = None;
 
@@ -271,6 +277,16 @@ impl Parse for CouchInput {
                         }
                     }
                 }
+                "static_constants" => {
+                    let body;
+                    bracketed!(body in input);
+                    while !body.is_empty() {
+                        static_constants.push(body.parse()?);
+                        if body.peek(Token![,]) {
+                            body.parse::<Token![,]>()?;
+                        }
+                    }
+                }
                 "prototype" => {
                     prototype = input.parse()?;
                 }
@@ -282,8 +298,8 @@ impl Parse for CouchInput {
                         key.span(),
                         format!(
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
-                             `spec`, `intrinsic`, `constructor`, `statics`, `prototype`, \
-                             or `post_install`"
+                             `spec`, `intrinsic`, `constructor`, `statics`, `static_constants`, \
+                             `prototype`, or `post_install`"
                         ),
                     ));
                 }
@@ -327,6 +343,7 @@ impl Parse for CouchInput {
             intrinsic_ident,
             constructor,
             statics,
+            static_constants,
             prototype,
             post_install,
         })
@@ -342,6 +359,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         intrinsic_ident,
         constructor,
         statics,
+        static_constants,
         prototype,
         post_install,
     } = input;
@@ -384,6 +402,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     }
 
     let statics_ident = format_ident!("__OTTER_{}_STATICS", spec_ident);
+    let static_constants_ident = format_ident!("__OTTER_{}_STATIC_CONSTANTS", spec_ident);
     let prototype_methods_ident = format_ident!("__OTTER_{}_PROTOTYPE_METHODS", spec_ident);
     let prototype_accessors_ident = format_ident!("__OTTER_{}_PROTOTYPE_ACCESSORS", spec_ident);
     let static_entries = statics.iter().map(|m| {
@@ -414,6 +433,54 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             }
         }
     });
+    let static_constant_entries = static_constants.iter().map(|c| {
+        let js_name = &c.js_name;
+        let attrs_path = crate::holt::attrs_factory_path(c.attrs.as_ref(), "read_only");
+        let value_tokens = match (c.kind.to_string().as_str(), c.value.as_ref()) {
+            ("Undefined", None) => quote! { ::otter_vm::ConstValue::Undefined },
+            ("Null", None) => quote! { ::otter_vm::ConstValue::Null },
+            ("Boolean", Some(expr)) => quote! { ::otter_vm::ConstValue::Boolean(#expr) },
+            ("Number", Some(expr)) => quote! { ::otter_vm::ConstValue::Number(#expr) },
+            ("Undefined" | "Null", Some(_)) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "couch!: `{}` static constant takes no value — drop the `(expr)` suffix",
+                        c.kind
+                    ),
+                )
+                .to_compile_error();
+            }
+            ("Boolean" | "Number", None) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "couch!: `{}` static constant requires a `(expr)` value",
+                        c.kind
+                    ),
+                )
+                .to_compile_error();
+            }
+            (other, _) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "couch!: unknown static constant kind `{other}` — expected one of \
+                         `Undefined`, `Null`, `Boolean`, `Number`"
+                    ),
+                )
+                .to_compile_error();
+            }
+        };
+        quote! {
+            ::otter_vm::ConstSpec {
+                name: #js_name,
+                value: #value_tokens,
+                attrs: #attrs_path,
+            }
+        }
+    });
+
     let prototype_accessor_entries = prototype.accessors.iter().map(|a| {
         let js_name = &a.js_name;
         let get_tokens = match &a.get {
@@ -482,6 +549,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         static #statics_ident: &[::otter_vm::MethodSpec] = &[
             #(#static_entries),*
+        ];
+
+        #[allow(non_upper_case_globals)]
+        static #static_constants_ident: &[::otter_vm::ConstSpec] = &[
+            #(#static_constant_entries),*
         ];
 
         #[allow(non_upper_case_globals)]
@@ -570,6 +642,31 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     if !ctor.define_own_property(heap, method_spec.name, desc) {
                         return ::core::result::Result::Err(
                             ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
+                        );
+                    }
+                }
+
+                // Static constants (e.g. `Number.NaN`, `Number.MAX_VALUE`).
+                // Pinned as own data properties on the constructor
+                // using the attrs supplied per row (defaults to
+                // `Attr::read_only()` — non-writable / non-enumerable
+                // / non-configurable, matching §21.1.2 etc.).
+                for const_spec in #static_constants_ident.iter() {
+                    let value = match const_spec.value {
+                        ::otter_vm::ConstValue::Undefined => ::otter_vm::Value::undefined(),
+                        ::otter_vm::ConstValue::Null => ::otter_vm::Value::null(),
+                        ::otter_vm::ConstValue::Boolean(b) => ::otter_vm::Value::boolean(b),
+                        ::otter_vm::ConstValue::Number(n) => ::otter_vm::Value::number_f64(n),
+                    };
+                    let desc = ::otter_vm::object::PropertyDescriptor::data(
+                        value,
+                        const_spec.attrs.writable,
+                        const_spec.attrs.enumerable,
+                        const_spec.attrs.configurable,
+                    );
+                    if !ctor.define_own_property(heap, const_spec.name, desc) {
+                        return ::core::result::Result::Err(
+                            ::otter_vm::JsSurfaceError::DefinePropertyFailed(const_spec.name),
                         );
                     }
                 }

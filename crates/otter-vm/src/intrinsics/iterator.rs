@@ -10,10 +10,7 @@
 //! - <https://tc39.es/ecma262/#sec-iterator-constructor>
 
 use crate::Value;
-use crate::bootstrap::{
-    BootstrapFeatures, alloc_object_with_value_roots, native_constructor_static_with_value_roots,
-    native_static_with_value_roots,
-};
+use crate::bootstrap::native_static_with_value_roots;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
 
@@ -65,118 +62,48 @@ fn iterator_ctor_call(
     Ok(Value::object(obj))
 }
 
-/// `BuiltinIntrinsic` for the ES2025 `Iterator` constructor — the
-/// abstract base of the iterator-helpers protocol.
-pub struct IteratorIntrinsic;
-impl crate::intrinsic_install::BuiltinIntrinsic for IteratorIntrinsic {
-    const NAME: &'static str = "Iterator";
-    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        let global_root = Value::object(global);
-        // Build the spec-compliant Iterator constructor (callable as
-        // `new Iterator()` via subclass `super()`, throws when
-        // invoked directly).
-        let ctor = native_constructor_static_with_value_roots(
-            heap,
-            "Iterator",
-            0,
-            iterator_ctor_call,
-            &[&global_root],
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        // Wire %Iterator.prototype% — a fresh object chained later
-        // to %Object.prototype% and decorated with the iterator
-        // helpers below.
-        let proto = alloc_object_with_value_roots(heap, &[&global_root])?;
-        let proto_value = Value::object(proto);
-        let prototype_desc =
-            crate::object::PropertyDescriptor::data(proto_value, false, false, false);
-        if !ctor.define_own_property(heap, "prototype", prototype_desc) {
-            return Err(JsSurfaceError::DefinePropertyFailed("prototype"));
-        }
-        // §27.1.2 — `Iterator.prototype.constructor = %Iterator%`,
-        // writable / non-enumerable / configurable.
-        crate::object::define_own_property(
-            proto,
-            heap,
-            "constructor",
-            crate::object::PropertyDescriptor::data(
-                Value::native_function(ctor),
-                true,
-                false,
-                true,
-            ),
-        );
-        crate::bootstrap::define_global_value(
-            global,
-            heap,
-            Self::NAME,
-            Value::native_function(ctor),
-        );
-        let iterator_ctor = ctor;
-        let ctor_root = Value::native_function(iterator_ctor);
-        let from_fn =
-            native_static_with_value_roots(heap, "from", 1, iterator_from_native, &[&ctor_root])
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let from_desc = crate::object::PropertyDescriptor::data(
-            Value::native_function(from_fn),
-            true,
-            false,
-            true,
-        );
-        let _ = iterator_ctor.define_own_property(heap, "from", from_desc);
-        let prototype = proto;
-        // §27.1.2 %IteratorPrototype% — install the iterator-helpers
-        // proposal methods on the prototype carried by the
-        // `Iterator` constructor. The handlers re-enter the
-        // runtime via existing `IteratorState` wrappers so the
-        // call-method fast path and reflective property access
-        // share behaviour.
-        let proto_root = Value::object(prototype);
-        // §27.1.2: `%IteratorPrototype%.[[Prototype]]` is
-        // `%Object.prototype%` so reflective walks
-        // (`Object.getPrototypeOf(Iterator.prototype) === Object.prototype`)
-        // terminate at the realm-wide Object root.
-        if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
-            && let Some(object_proto) =
-                object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
-        {
-            object::set_prototype(prototype, heap, Some(object_proto));
-        }
-        let install_proto = |heap: &mut otter_gc::GcHeap,
-                             name: &'static str,
-                             length: u8,
-                             call: crate::native_function::NativeFastFn|
-         -> Result<(), JsSurfaceError> {
-            let f = native_static_with_value_roots(heap, name, length, call, &[&proto_root])
-                .map_err(|_| JsSurfaceError::OutOfMemory)?;
-            object::set(prototype, heap, name, Value::native_function(f));
-            Ok(())
-        };
-        install_proto(heap, "map", 1, iterator_proto_map)?;
-        install_proto(heap, "filter", 1, iterator_proto_filter)?;
-        install_proto(heap, "take", 1, iterator_proto_take)?;
-        install_proto(heap, "drop", 1, iterator_proto_drop)?;
-        install_proto(heap, "flatMap", 1, iterator_proto_flat_map)?;
-        install_proto(heap, "toArray", 0, iterator_proto_to_array)?;
-        install_proto(heap, "forEach", 1, iterator_proto_for_each)?;
-        install_proto(heap, "reduce", 1, iterator_proto_reduce)?;
-        install_proto(heap, "some", 1, iterator_proto_some)?;
-        install_proto(heap, "every", 1, iterator_proto_every)?;
-        install_proto(heap, "find", 1, iterator_proto_find)?;
-        // §27.1.5.1 / §22.1.5.1 / §23.1.5.1 / §24.1.5.1 / §24.2.5.1 —
-        // Otter exposes a single `%IteratorPrototype%` that carries
-        // `next`, `return`, and `throw`; the per-kind iterator
-        // sub-prototypes (Map, Set, String, Array) inherit from it.
-        // Each method routes back through `iterator_next_full` /
-        // `iterator_helper_dispatch` so the spec result record is
-        // identical whether the call comes from `Op::IteratorNext`
-        // or reflective `proto.next.call(it)`.
-        install_proto(heap, "next", 0, iterator_proto_next)?;
-        install_proto(heap, "return", 1, iterator_proto_return)?;
-        install_proto(heap, "throw", 1, iterator_proto_throw)?;
-        Ok(())
-    }
+// `ITERATOR_SPEC` + `IteratorIntrinsic` generated by `couch!`.
+// §27.1 — ES2025 Iterator constructor (abstract base for the
+// iterator-helpers protocol; calls / direct `new` throw, subclass
+// `super()` allocates via OrdinaryCreateFromConstructor). The
+// `couch!` install body links the prototype to `%Object.prototype%`
+// per §27.1.2 + auto-installs the `constructor` back-pointer. The
+// symbol-keyed members (`@@iterator`, `@@toStringTag`) land
+// post-bootstrap in [`install_iterator_well_knowns_post_bootstrap`].
+otter_macros::couch! {
+    name = "Iterator",
+    feature = CORE,
+    intrinsic = IteratorIntrinsic,
+    constructor = (length = 0, call = iterator_ctor_call),
+    statics = {
+        "from" / 1 => iterator_from_native,
+    },
+    prototype = {
+        methods = {
+            "map"     / 1 => iterator_proto_map,
+            "filter"  / 1 => iterator_proto_filter,
+            "take"    / 1 => iterator_proto_take,
+            "drop"    / 1 => iterator_proto_drop,
+            "flatMap" / 1 => iterator_proto_flat_map,
+            "toArray" / 0 => iterator_proto_to_array,
+            "forEach" / 1 => iterator_proto_for_each,
+            "reduce"  / 1 => iterator_proto_reduce,
+            "some"    / 1 => iterator_proto_some,
+            "every"   / 1 => iterator_proto_every,
+            "find"    / 1 => iterator_proto_find,
+            // §27.1.5.1 / §22.1.5.1 / §23.1.5.1 / §24.1.5.1 /
+            // §24.2.5.1 — Otter exposes one `%IteratorPrototype%`
+            // carrying `next` / `return` / `throw`; the per-kind
+            // iterator sub-prototypes inherit from it. Each method
+            // routes back through `iterator_next_full` /
+            // `iterator_helper_dispatch` so the spec result record
+            // is identical whether the call comes from
+            // `Op::IteratorNext` or reflective `proto.next.call(it)`.
+            "next"    / 0 => iterator_proto_next,
+            "return"  / 1 => iterator_proto_return,
+            "throw"   / 1 => iterator_proto_throw,
+        },
+    },
 }
 
 /// §27.1.2.1 `Iterator.prototype[@@iterator]` — returns the

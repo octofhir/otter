@@ -21,7 +21,14 @@ pub(crate) fn compile_array_literal(
         .elements
         .iter()
         .any(|el| matches!(el, oxc_ast::ast::ArrayExpressionElement::SpreadElement(_)));
-    if !has_spread {
+    // Dense `NewArray` encodes `(dst, count, elem0, …, elemN-1)` as
+    // a flat operand list; the bytecode wire format caps operand
+    // count at `u8::MAX` (255), so very large literals fall back to
+    // the per-element `ArrayPush` loop used by the spread path. The
+    // threshold leaves headroom for the leading `(dst, count)` slots
+    // plus a safety margin against future format changes.
+    const DENSE_NEW_ARRAY_MAX_ELEMENTS: usize = 240;
+    if !has_spread && arr.elements.len() <= DENSE_NEW_ARRAY_MAX_ELEMENTS {
         let mut element_regs: Vec<u16> = Vec::with_capacity(arr.elements.len());
         for el in &arr.elements {
             match el {

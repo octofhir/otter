@@ -92,7 +92,15 @@ fn install_proto_proto_accessor(
 ///
 /// <https://tc39.es/ecma262/#sec-object-value>
 fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    if ctx.is_construct_call() && !ctx.new_target().is_some_and(|v| v.is_object()) {
+    // §20.1.1.1 step 1 — when `NewTarget` is neither undefined nor
+    // the active `Object` function (i.e. `class C extends Object {};
+    // new C(...)`), the dispatcher has already produced `this` via
+    // `OrdinaryCreateFromConstructor(NewTarget, "%Object.prototype%")`
+    // and we hand it back unchanged. Self-construction (`new
+    // Object(value)`) falls through to steps 2–3 so primitive
+    // arguments get wrapped in their `%X.prototype%` body instead of
+    // being silently dropped.
+    if ctx.is_construct_call() && !new_target_is_self(ctx) {
         return Ok(*ctx.this_value());
     }
     let first_is_nullish = args.first().is_none_or(|v| v.is_nullish());
@@ -144,6 +152,22 @@ fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         });
     }
     Ok(v)
+}
+
+/// `true` when this constructor call's `new.target` is the active
+/// `Object` function itself (per §20.1.1.1 step 1's "active function
+/// object" check). The comparison goes through `globalThis.Object`,
+/// which is the same `NativeFunction` value `couch!` installed at
+/// bootstrap.
+fn new_target_is_self(ctx: &mut NativeCtx<'_>) -> bool {
+    let Some(new_target) = ctx.new_target().copied() else {
+        return false;
+    };
+    let interp = ctx.interp_mut();
+    let Some(self_ctor) = crate::object::get(interp.global_this, &interp.gc_heap, "Object") else {
+        return false;
+    };
+    new_target == self_ctor
 }
 
 fn wrap_primitive<F>(

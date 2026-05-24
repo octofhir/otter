@@ -60,14 +60,19 @@ use proc_macro2::Span;
 use quote::{format_ident, quote};
 use std::collections::BTreeSet;
 use syn::parse::{Parse, ParseStream};
-use syn::{Ident, LitInt, LitStr, Path, Result, Token, braced, parenthesized, parse_macro_input};
+use syn::{
+    Ident, LitBool, LitInt, LitStr, Path, Result, Token, braced, bracketed, parenthesized,
+    parse_macro_input,
+};
 
-use crate::holt::MethodEntry;
+use crate::holt::{AccessorEntry, MethodEntry};
 
-/// Parsed `constructor = (length = N, call = path)` tuple.
+/// Parsed `constructor = (length = N, call = path [, abstract = true])`
+/// tuple.
 pub(crate) struct ConstructorSpecArgs {
     pub(crate) length: u8,
     pub(crate) call: Path,
+    pub(crate) is_abstract: bool,
 }
 
 impl Parse for ConstructorSpecArgs {
@@ -76,6 +81,7 @@ impl Parse for ConstructorSpecArgs {
         parenthesized!(body in input);
         let mut length: Option<u8> = None;
         let mut call: Option<Path> = None;
+        let mut is_abstract = false;
         while !body.is_empty() {
             let key: Ident = body.parse()?;
             body.parse::<Token![=]>()?;
@@ -87,12 +93,17 @@ impl Parse for ConstructorSpecArgs {
                 "call" => {
                     call = Some(body.parse()?);
                 }
+                "is_abstract" => {
+                    let lit: LitBool = body.parse()?;
+                    is_abstract = lit.value;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "couch!: unknown constructor field `{other}` — expected \
-                             `length` or `call`"
+                             `length`, `call`, or `is_abstract` (Rust reserves the \
+                             bare `abstract` keyword)"
                         ),
                     ));
                 }
@@ -114,7 +125,64 @@ impl Parse for ConstructorSpecArgs {
                     "couch!: constructor block missing `call = path::to::fn`",
                 )
             })?,
+            is_abstract,
         })
+    }
+}
+
+/// Parsed `prototype = { methods = { ... }, accessors = [...] }`
+/// block.
+#[derive(Default)]
+pub(crate) struct PrototypeBlock {
+    pub(crate) methods: Vec<MethodEntry>,
+    pub(crate) accessors: Vec<AccessorEntry>,
+}
+
+impl Parse for PrototypeBlock {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let body;
+        braced!(body in input);
+        let mut methods: Vec<MethodEntry> = Vec::new();
+        let mut accessors: Vec<AccessorEntry> = Vec::new();
+        while !body.is_empty() {
+            let key: Ident = body.parse()?;
+            body.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "methods" => {
+                    let methods_body;
+                    braced!(methods_body in body);
+                    while !methods_body.is_empty() {
+                        methods.push(methods_body.parse()?);
+                        if methods_body.peek(Token![,]) {
+                            methods_body.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                "accessors" => {
+                    let accessors_body;
+                    bracketed!(accessors_body in body);
+                    while !accessors_body.is_empty() {
+                        accessors.push(accessors_body.parse()?);
+                        if accessors_body.peek(Token![,]) {
+                            accessors_body.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "couch! prototype: unknown field `{other}` — expected \
+                             `methods` or `accessors`"
+                        ),
+                    ));
+                }
+            }
+            if body.peek(Token![,]) {
+                body.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self { methods, accessors })
     }
 }
 
@@ -126,6 +194,7 @@ pub(crate) struct CouchInput {
     pub(crate) intrinsic_ident: Ident,
     pub(crate) constructor: ConstructorSpecArgs,
     pub(crate) statics: Vec<MethodEntry>,
+    pub(crate) prototype: PrototypeBlock,
 }
 
 impl Parse for CouchInput {
@@ -136,6 +205,7 @@ impl Parse for CouchInput {
         let mut intrinsic_override: Option<Ident> = None;
         let mut constructor: Option<ConstructorSpecArgs> = None;
         let mut statics: Vec<MethodEntry> = Vec::new();
+        let mut prototype: PrototypeBlock = PrototypeBlock::default();
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -156,12 +226,15 @@ impl Parse for CouchInput {
                         }
                     }
                 }
+                "prototype" => {
+                    prototype = input.parse()?;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
-                             `spec`, `intrinsic`, `constructor`, or `statics`"
+                             `spec`, `intrinsic`, `constructor`, `statics`, or `prototype`"
                         ),
                     ));
                 }
@@ -205,6 +278,7 @@ impl Parse for CouchInput {
             intrinsic_ident,
             constructor,
             statics,
+            prototype,
         })
     }
 }
@@ -218,6 +292,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         intrinsic_ident,
         constructor,
         statics,
+        prototype,
     } = input;
 
     let mut seen = BTreeSet::new();
@@ -231,18 +306,84 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             .into();
         }
     }
+    let mut seen_proto_m = BTreeSet::new();
+    for m in &prototype.methods {
+        if !seen_proto_m.insert(m.js_name.value()) {
+            return syn::Error::new_spanned(
+                &m.js_name,
+                format!("couch!: duplicate prototype method `{}`", m.js_name.value()),
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
+    let mut seen_proto_a = BTreeSet::new();
+    for a in &prototype.accessors {
+        if !seen_proto_a.insert(a.js_name.value()) {
+            return syn::Error::new_spanned(
+                &a.js_name,
+                format!(
+                    "couch!: duplicate prototype accessor `{}`",
+                    a.js_name.value()
+                ),
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
 
     let statics_ident = format_ident!("__OTTER_{}_STATICS", spec_ident);
+    let prototype_methods_ident = format_ident!("__OTTER_{}_PROTOTYPE_METHODS", spec_ident);
+    let prototype_accessors_ident = format_ident!("__OTTER_{}_PROTOTYPE_ACCESSORS", spec_ident);
     let static_entries = statics.iter().map(|m| {
         let js_name = &m.js_name;
         let length = m.length;
         let call = &m.call;
+        let attrs_path = crate::holt::attrs_factory_path(m.attrs.as_ref(), "builtin_function");
         quote! {
             ::otter_vm::MethodSpec {
                 name: #js_name,
                 length: #length,
-                attrs: ::otter_vm::Attr::builtin_function(),
+                attrs: #attrs_path,
                 call: ::otter_vm::NativeCall::Static(#call),
+            }
+        }
+    });
+    let prototype_method_entries = prototype.methods.iter().map(|m| {
+        let js_name = &m.js_name;
+        let length = m.length;
+        let call = &m.call;
+        let attrs_path = crate::holt::attrs_factory_path(m.attrs.as_ref(), "builtin_function");
+        quote! {
+            ::otter_vm::MethodSpec {
+                name: #js_name,
+                length: #length,
+                attrs: #attrs_path,
+                call: ::otter_vm::NativeCall::Static(#call),
+            }
+        }
+    });
+    let prototype_accessor_entries = prototype.accessors.iter().map(|a| {
+        let js_name = &a.js_name;
+        let get_tokens = match &a.get {
+            Some(path) => quote! {
+                ::core::option::Option::Some(::otter_vm::NativeCall::Static(#path))
+            },
+            None => quote! { ::core::option::Option::None },
+        };
+        let set_tokens = match &a.set {
+            Some(path) => quote! {
+                ::core::option::Option::Some(::otter_vm::NativeCall::Static(#path))
+            },
+            None => quote! { ::core::option::Option::None },
+        };
+        let attrs_path = crate::holt::attrs_factory_path(a.attrs.as_ref(), "builtin_function");
+        quote! {
+            ::otter_vm::AccessorSpec {
+                name: #js_name,
+                get: #get_tokens,
+                set: #set_tokens,
+                attrs: #attrs_path,
             }
         }
     });
@@ -250,11 +391,28 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let ctor_length = constructor.length;
     let ctor_call = &constructor.call;
     let feature_path = quote! { ::otter_vm::bootstrap::BootstrapFeatures::#feature };
+    // Abstract ctors still wire their `call` field (for diagnostics
+    // + name resolution), but the macro emits the same install
+    // path; the user's call body is expected to throw a TypeError.
+    // The flag mostly documents intent today; future expansions may
+    // synthesise a default throw stub when `abstract = true` and no
+    // `call` is supplied.
+    let _ = constructor.is_abstract;
 
     quote! {
         #[allow(non_upper_case_globals)]
         static #statics_ident: &[::otter_vm::MethodSpec] = &[
             #(#static_entries),*
+        ];
+
+        #[allow(non_upper_case_globals)]
+        static #prototype_methods_ident: &[::otter_vm::MethodSpec] = &[
+            #(#prototype_method_entries),*
+        ];
+
+        #[allow(non_upper_case_globals)]
+        static #prototype_accessors_ident: &[::otter_vm::AccessorSpec] = &[
+            #(#prototype_accessor_entries),*
         ];
 
         #[doc = "Generated constructor spec (see `couch!`)."]
@@ -264,7 +422,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             length: #ctor_length,
             call: ::otter_vm::NativeCall::Static(#ctor_call),
             static_methods: #statics_ident,
-            prototype_methods: &[],
+            prototype_methods: #prototype_methods_ident,
             attrs: ::otter_vm::Attr::global_binding(),
         };
 
@@ -280,6 +438,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 global: ::otter_vm::JsObject,
             ) -> ::core::result::Result<(), ::otter_vm::JsSurfaceError> {
                 let global_root = ::otter_vm::Value::object(global);
+
                 // Generated specs only ever carry `NativeCall::Static`;
                 // every other variant is unreachable inside macro
                 // expansion. Pattern out explicitly to keep
@@ -332,6 +491,63 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     if !ctor.define_own_property(heap, method_spec.name, desc) {
                         return ::core::result::Result::Err(
                             ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
+                        );
+                    }
+                }
+
+                // §19.4 prototype object (only when the spec lists
+                // prototype methods or accessors). Alloc empty
+                // prototype + link to %Object.prototype% + pin each
+                // entry via ObjectBuilder, then attach the prototype
+                // back on the constructor as a non-writable /
+                // non-enumerable / non-configurable own data
+                // property (matches the canonical builtin prototype
+                // descriptor).
+                if !#spec_ident.prototype_methods.is_empty()
+                    || !#prototype_accessors_ident.is_empty()
+                {
+                    let prototype = ::otter_vm::bootstrap::alloc_object_with_value_roots_pub(
+                        heap,
+                        &[&global_root, &ctor_value],
+                    )
+                    .map_err(::otter_vm::JsSurfaceError::from)?;
+                    if let ::core::option::Option::Some(object_ctor) =
+                        ::otter_vm::object::get(global, heap, "Object")
+                            .and_then(|v| v.as_object())
+                        && let ::core::option::Option::Some(object_proto) =
+                            ::otter_vm::object::get(object_ctor, heap, "prototype")
+                                .and_then(|v| v.as_object())
+                    {
+                        ::otter_vm::object::set_prototype(
+                            prototype,
+                            heap,
+                            ::core::option::Option::Some(object_proto),
+                        );
+                    }
+                    let prototype_value = ::otter_vm::Value::object(prototype);
+                    {
+                        let mut builder =
+                            ::otter_vm::ObjectBuilder::from_object_with_value_roots(
+                                heap,
+                                prototype,
+                                ::std::vec![global_root, ctor_value, prototype_value],
+                            );
+                        for method_spec in #spec_ident.prototype_methods.iter() {
+                            builder.method_from_spec(method_spec)?;
+                        }
+                        for accessor_spec in #prototype_accessors_ident.iter() {
+                            builder.accessor_from_spec(accessor_spec)?;
+                        }
+                    }
+                    let proto_desc = ::otter_vm::object::PropertyDescriptor::data(
+                        prototype_value,
+                        false,
+                        false,
+                        false,
+                    );
+                    if !ctor.define_own_property(heap, "prototype", proto_desc) {
+                        return ::core::result::Result::Err(
+                            ::otter_vm::JsSurfaceError::DefinePropertyFailed("prototype"),
                         );
                     }
                 }

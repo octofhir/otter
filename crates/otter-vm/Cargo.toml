@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 otter-bytecode = { workspace = true }
 otter-gc = { workspace = true }
+otter-macros = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
 indexmap = { workspace = true }

@@ -19,6 +19,15 @@
 //! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 //! - [Frontend and bytecode dumps](../../../docs/book/src/engine/frontend.md)
 
+// The otter-themed macros (`holt!`, `couch!`, `lodge!`) emit code
+// against the absolute `::otter_vm::*` path so consumers outside
+// this crate can call them without remembering to import every
+// type. Inside `otter-vm` itself, that path normally fails to
+// resolve; this self-alias makes `::otter_vm::Foo` mean the same
+// thing as `crate::Foo` so the macro-generated install bodies
+// compile in both contexts.
+extern crate self as otter_vm;
+
 pub mod abstract_ops;
 mod allocation_ops;
 mod argument_window;

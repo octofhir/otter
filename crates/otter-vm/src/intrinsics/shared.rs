@@ -12,6 +12,18 @@ use crate::js_surface::{Attr, JsSurfaceError};
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmGetOutcome, VmPropertyKey, descriptor_value};
 
+/// `pub` re-export of [`alloc_object_with_value_roots`] for use by
+/// the macro-generated `install` bodies in `crates/otter-macros`
+/// (the `couch!` macro allocates an empty prototype object before
+/// pinning methods on it). Hand-written installers continue to use
+/// the `pub(crate)` form directly.
+pub fn alloc_object_with_value_roots_pub(
+    heap: &mut otter_gc::GcHeap,
+    value_roots: &[&Value],
+) -> Result<JsObject, otter_gc::OutOfMemory> {
+    alloc_object_with_value_roots(heap, value_roots)
+}
+
 /// Allocate an empty object while keeping the supplied `value_roots`
 /// alive across the allocation.
 pub(crate) fn alloc_object_with_value_roots(

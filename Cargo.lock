@@ -2035,6 +2035,7 @@ dependencies = [
  "num-traits",
  "otter-bytecode",
  "otter-gc",
+ "otter-macros",
  "regress",
  "serde",
  "smallvec",

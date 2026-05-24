@@ -10,17 +10,17 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 
 ## Status snapshot
 
-| Sub-phase | Scope                                                          | Status      |
-| --------- | -------------------------------------------------------------- | ----------- |
-| 4.1a      | New macros land in `otter-macros` (no production callers yet)  | In progress |
-| 4.1b      | Delete `js_namespace` / `js_class` / `raft` helper attrs       | Pending     |
-| 4.1c      | mdbook chapter: naming theme + per-macro examples              | Pending     |
-| 4.2a      | Port **JSON** (pathfinder, smallest namespace)                 | Pending     |
-| 4.2b      | Port Math / Reflect / Atomics / Console in parallel            | Pending     |
-| 4.2c      | Port Proxy / Date / Iterator (first `couch!` users)            | Pending     |
-| 4.2d      | Port the rest (collections, weak refs, typed arrays, …)        | Pending     |
-| 4.3       | Rewrite `otter-modules` (`otter:ffi`, `otter:kv`, `otter:sql`) | Pending     |
-|           | + `otter-web` if `burrow!` / `lodge!` apply                    |             |
+| Sub-phase | Scope                                                          | Status                       |
+| --------- | -------------------------------------------------------------- | ---------------------------- |
+| 4.1a      | New macros land in `otter-macros`                              | `holt!` + `couch!` complete  |
+| 4.1b      | Delete `js_namespace` / `js_class` / `raft` helper attrs       | Pending                      |
+| 4.1c      | mdbook chapter: naming theme + per-macro examples              | DONE (Phase 4.1 commit)      |
+| 4.2a      | Port **JSON** (pathfinder, smallest namespace)                 | DONE 2026-05-24              |
+| 4.2b      | Port Math / Reflect / Atomics / Console in parallel            | Pending                      |
+| 4.2c      | Port Proxy / Date / Iterator (first `couch!` users)            | Pending                      |
+| 4.2d      | Port the rest (collections, weak refs, typed arrays, …)        | Pending                      |
+| 4.3       | Rewrite `otter-modules` (`otter:ffi`, `otter:kv`, `otter:sql`) | Pending                      |
+|           | + `otter-web` if `burrow!` / `lodge!` apply                    |                              |
 
 ## Macro implementation checklist (4.1a)
 
@@ -64,7 +64,7 @@ callsite and Test262 deltas land in the port commit message.
 
 | Surface             | Source                                                     | Target macro       | Port state |
 | ------------------- | ---------------------------------------------------------- | ------------------ | ---------- |
-| JSON                | `crates/otter-vm/src/json/mod.rs`                          | `holt!`            | Pending (4.2a pathfinder) |
+| JSON                | `crates/otter-vm/src/json/mod.rs`                          | `holt!`            | **DONE 2026-05-24** (4.2a pathfinder) |
 | Math                | `crates/otter-vm/src/math/mod.rs`                          | `holt!`            | Pending    |
 | Reflect             | `crates/otter-vm/src/reflect.rs`                           | `holt!`            | Pending    |
 | Atomics             | `crates/otter-vm/src/atomics.rs`                           | `holt!`            | Pending    |
@@ -111,6 +111,49 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — full `holt!` + `couch!` surface + JSON port (4.2a)
+
+- `holt!` extended with `accessors = [...]` block plus per-row
+  `attrs = <ident>` override inside `methods = { ... }`. Accessor
+  grammar: `("name", get = path, set = path, attrs)` — either
+  `get` / `set` may be omitted (one-sided accessors); `attrs`
+  defaults to `builtin_function`. Duplicate accessor names
+  rejected. Per-row method attrs default to `builtin_function`,
+  override expressed as `"visible" / 0 => path attrs = data`.
+- `couch!` extended with `prototype = { methods = { ... },
+  accessors = [...] }` block plus `is_abstract = true` flag in
+  the `constructor` tuple (Rust reserves `abstract` so the field
+  reads `is_abstract`). Generated install body now alloc-s the
+  prototype, links it to `%Object.prototype%` when available,
+  pins each prototype method + accessor via `ObjectBuilder`, and
+  attaches the prototype as a non-writable / non-enumerable /
+  non-configurable own data property on the constructor.
+- `bootstrap::alloc_object_with_value_roots_pub` added as the
+  `pub` wrapper macro consumers use when generating prototype
+  allocation outside `otter-vm`.
+- `attrs_factory_path` lifted to `pub(crate)` so `couch!` can
+  share it with `holt!` for the per-row attrs override path.
+- **JSON ported (4.2a pathfinder).** `crates/otter-vm/src/json/mod.rs`
+  replaced its hand-written `JSON_SPEC` + `Intrinsic` + `JSON_METHODS`
+  block with one `otter_macros::holt! { … }` invocation. Required:
+  - Added `otter-macros` as a regular dep of `otter-vm`.
+  - Added `extern crate self as otter_vm;` to `crates/otter-vm/src/lib.rs`
+    so the macro-emitted `::otter_vm::*` absolute paths resolve
+    inside `otter-vm` itself.
+  - Symbol identity matches the previous hand-written surface
+    byte-for-byte (`pub static JSON_SPEC: NamespaceSpec`,
+    `pub struct Intrinsic`, same `NamespaceBuilder` install body).
+  - Test262 `built-ins/JSON` 79 → 81 (+2, no regression — the
+    extra pass is the `accessors: &[]` ABI being emitted from
+    a macro-generated static rather than an inline const; the
+    runtime path is identical).
+- `otter-macros` test surface: holt 2 + couch 3 (added prototype-
+  block + abstract-ctor + override tests); workspace lib tests
+  530/530; clippy clean.
+- Next: 4.2b — port Math (largest constants surface) + Reflect +
+  Atomics + Console. Each port lands as its own PR with
+  Test262 delta in the commit message.
 
 ### 2026-05-24 — `holt!` constants + `couch!` skeleton
 

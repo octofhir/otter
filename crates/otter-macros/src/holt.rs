@@ -41,11 +41,13 @@ use syn::{
     parse_macro_input,
 };
 
-/// Single `"name" / length => path` row of a `holt!` method table.
+/// Single `"name" / length => path [attrs = <ident>]` row of a
+/// `holt!` / `couch!` method table.
 pub(crate) struct MethodEntry {
     pub(crate) js_name: LitStr,
     pub(crate) length: u8,
     pub(crate) call: Path,
+    pub(crate) attrs: Option<Ident>,
 }
 
 impl Parse for MethodEntry {
@@ -55,10 +57,91 @@ impl Parse for MethodEntry {
         let length_lit: LitInt = input.parse()?;
         input.parse::<Token![=>]>()?;
         let call: Path = input.parse()?;
+        let attrs = if input.peek(syn::Ident) {
+            // Optional `attrs = <factory_ident>` suffix.
+            let key: Ident = input.parse()?;
+            if key != "attrs" {
+                return Err(syn::Error::new(
+                    key.span(),
+                    format!(
+                        "expected `attrs = <Attr factory ident>` or a comma after the method \
+                         entry; got `{key}`"
+                    ),
+                ));
+            }
+            input.parse::<Token![=]>()?;
+            Some(input.parse()?)
+        } else {
+            None
+        };
         Ok(Self {
             js_name,
             length: length_lit.base10_parse()?,
             call,
+            attrs,
+        })
+    }
+}
+
+/// Single `("name", get = getter, set = setter, attrs)` row of a
+/// `holt!` / `couch!` accessor table. Either `get` or `set` may be
+/// omitted (one-sided accessor); `attrs` defaults to
+/// `builtin_function`.
+pub(crate) struct AccessorEntry {
+    pub(crate) js_name: LitStr,
+    pub(crate) get: Option<Path>,
+    pub(crate) set: Option<Path>,
+    pub(crate) attrs: Option<Ident>,
+}
+
+impl Parse for AccessorEntry {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let inner;
+        parenthesized!(inner in input);
+        let js_name: LitStr = inner.parse()?;
+        let mut get: Option<Path> = None;
+        let mut set: Option<Path> = None;
+        let mut attrs: Option<Ident> = None;
+        while !inner.is_empty() {
+            inner.parse::<Token![,]>()?;
+            if inner.is_empty() {
+                break;
+            }
+            let key: Ident = inner.parse()?;
+            if key == "attrs" {
+                // Plain `attrs = <ident>` form (default factory).
+                inner.parse::<Token![=]>()?;
+                attrs = Some(inner.parse()?);
+                continue;
+            }
+            inner.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "get" => get = Some(inner.parse()?),
+                "set" => set = Some(inner.parse()?),
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!(
+                            "unknown accessor field `{other}` — expected `get`, `set`, or `attrs`"
+                        ),
+                    ));
+                }
+            }
+        }
+        if get.is_none() && set.is_none() {
+            return Err(syn::Error::new_spanned(
+                &js_name,
+                format!(
+                    "accessor `{}` declares neither `get =` nor `set =`",
+                    js_name.value()
+                ),
+            ));
+        }
+        Ok(Self {
+            js_name,
+            get,
+            set,
+            attrs,
         })
     }
 }
@@ -116,6 +199,7 @@ pub(crate) struct HoltInput {
     pub(crate) intrinsic_ident: Ident,
     pub(crate) methods: Vec<MethodEntry>,
     pub(crate) constants: Vec<ConstantEntry>,
+    pub(crate) accessors: Vec<AccessorEntry>,
 }
 
 impl Parse for HoltInput {
@@ -126,6 +210,7 @@ impl Parse for HoltInput {
         let mut intrinsic_override: Option<Ident> = None;
         let mut methods: Vec<MethodEntry> = Vec::new();
         let mut constants: Vec<ConstantEntry> = Vec::new();
+        let mut accessors: Vec<AccessorEntry> = Vec::new();
         let mut methods_seen = false;
 
         while !input.is_empty() {
@@ -157,12 +242,22 @@ impl Parse for HoltInput {
                         }
                     }
                 }
+                "accessors" => {
+                    let body;
+                    bracketed!(body in input);
+                    while !body.is_empty() {
+                        accessors.push(body.parse()?);
+                        if body.peek(Token![,]) {
+                            body.parse::<Token![,]>()?;
+                        }
+                    }
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `holt!` field `{other}` — expected `name`, `feature`, \
-                             `spec`, `intrinsic`, `methods`, or `constants`"
+                             `spec`, `intrinsic`, `methods`, `constants`, or `accessors`"
                         ),
                     ));
                 }
@@ -207,6 +302,7 @@ impl Parse for HoltInput {
             intrinsic_ident,
             methods,
             constants,
+            accessors,
         })
     }
 }
@@ -216,7 +312,13 @@ impl Parse for HoltInput {
 /// silently — the syn::Error path is awkward inside the closure
 /// chain so we defer to the rust type checker (`Attr::<unknown>`
 /// compile error) for diagnostics if the ident is malformed.
-fn attrs_factory_path(attrs: Option<&Ident>, default_factory: &str) -> proc_macro2::TokenStream {
+///
+/// `pub(crate)` so the [`crate::couch`] module can reuse the same
+/// resolution for prototype methods + accessors.
+pub(crate) fn attrs_factory_path(
+    attrs: Option<&Ident>,
+    default_factory: &str,
+) -> proc_macro2::TokenStream {
     let factory = attrs
         .map(|ident| ident.to_string())
         .unwrap_or_else(|| default_factory.to_string());
@@ -233,6 +335,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         intrinsic_ident,
         methods,
         constants,
+        accessors,
     } = input;
 
     // Duplicate-name guards.
@@ -258,19 +361,57 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             .into();
         }
     }
+    let mut seen_accessor = BTreeSet::new();
+    for a in &accessors {
+        if !seen_accessor.insert(a.js_name.value()) {
+            return syn::Error::new_spanned(
+                &a.js_name,
+                format!("holt!: duplicate accessor name `{}`", a.js_name.value()),
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
 
     let methods_ident = format_ident!("__OTTER_{}_METHODS", spec_ident);
     let constants_ident = format_ident!("__OTTER_{}_CONSTANTS", spec_ident);
+    let accessors_ident = format_ident!("__OTTER_{}_ACCESSORS", spec_ident);
     let method_entries = methods.iter().map(|m| {
         let js_name = &m.js_name;
         let length = m.length;
         let call = &m.call;
+        let attrs_path = attrs_factory_path(m.attrs.as_ref(), "builtin_function");
         quote! {
             ::otter_vm::MethodSpec {
                 name: #js_name,
                 length: #length,
-                attrs: ::otter_vm::Attr::builtin_function(),
+                attrs: #attrs_path,
                 call: ::otter_vm::NativeCall::Static(#call),
+            }
+        }
+    });
+
+    let accessor_entries = accessors.iter().map(|a| {
+        let js_name = &a.js_name;
+        let get_tokens = match &a.get {
+            Some(path) => quote! {
+                ::core::option::Option::Some(::otter_vm::NativeCall::Static(#path))
+            },
+            None => quote! { ::core::option::Option::None },
+        };
+        let set_tokens = match &a.set {
+            Some(path) => quote! {
+                ::core::option::Option::Some(::otter_vm::NativeCall::Static(#path))
+            },
+            None => quote! { ::core::option::Option::None },
+        };
+        let attrs_path = attrs_factory_path(a.attrs.as_ref(), "builtin_function");
+        quote! {
+            ::otter_vm::AccessorSpec {
+                name: #js_name,
+                get: #get_tokens,
+                set: #set_tokens,
+                attrs: #attrs_path,
             }
         }
     });
@@ -338,12 +479,17 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             #(#constant_entries),*
         ];
 
+        #[allow(non_upper_case_globals)]
+        static #accessors_ident: &[::otter_vm::AccessorSpec] = &[
+            #(#accessor_entries),*
+        ];
+
         #[doc = "Generated namespace spec (see `holt!`)."]
         #[allow(non_upper_case_globals)]
         pub static #spec_ident: ::otter_vm::NamespaceSpec = ::otter_vm::NamespaceSpec {
             name: #name,
             methods: #methods_ident,
-            accessors: &[],
+            accessors: #accessors_ident,
             constants: #constants_ident,
             attrs: ::otter_vm::Attr::global_binding(),
         };

@@ -609,20 +609,23 @@ pub(crate) fn try_compile_function_method(
             Ok(Some(dst))
         }
         "apply" => {
-            // `apply(thisArg, argsArray)` — second argument must
-            // be statically an array literal for foundation
-            // lowering. The receiver is still evaluated even when
-            // we fall back to the universal dispatch path so that
-            // observable side-effects keep their position.
+            // `apply(thisArg, argsArray)` — accepts exactly two
+            // observable arguments per §20.2.3.1. Extra trailing
+            // arguments are evaluated but ignored by the spec, so
+            // they must remain side-effect-observable. Bail to the
+            // universal `CallMethodValue` dispatch path so the
+            // receiver isn't compiled twice and every arg gets
+            // evaluated in source order.
+            if arguments.len() > 2 {
+                return Ok(None);
+            }
+            // Spread at the top-level argument list (e.g.
+            // `fn.apply(...args)`) is dispatched via `compile_spread_call`
+            // before reaching here, so we never see `SpreadElement`
+            // as a direct argument.
             let callee_reg = compile_expr(cx, receiver, span)?;
             let mut args_iter = arguments.iter();
             let this_reg = match args_iter.next() {
-                Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
-                    return Err(CompileError::Unsupported {
-                        node: "Function.prototype.apply: spread thisArg".to_string(),
-                        span: (s.span.start, s.span.end),
-                    });
-                }
                 Some(other) => compile_expr(cx, other.to_expression(), span)?,
                 None => {
                     let r = cx.alloc_scratch();
@@ -632,55 +635,44 @@ pub(crate) fn try_compile_function_method(
             };
             let mut forwarded: Vec<u16> = Vec::new();
             let mut dynamic_args: Option<u16> = None;
-            match args_iter.next() {
-                None => {}
-                Some(oxc_ast::ast::Argument::SpreadElement(s)) => {
-                    return Err(CompileError::Unsupported {
-                        node: "Function.prototype.apply: spread arg list".to_string(),
-                        span: (s.span.start, s.span.end),
-                    });
-                }
-                Some(other) => {
-                    let expr = unwrap_ts_expr(other.to_expression());
-                    match expr {
-                        Expression::ArrayExpression(arr) => {
-                            for el in &arr.elements {
-                                match el {
-                                    oxc_ast::ast::ArrayExpressionElement::SpreadElement(s) => {
-                                        return Err(CompileError::Unsupported {
-                                            node: "Function.prototype.apply: spread element"
-                                                .to_string(),
-                                            span: (s.span.start, s.span.end),
-                                        });
-                                    }
-                                    oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
-                                        let r = cx.alloc_scratch();
-                                        cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
-                                        forwarded.push(r);
-                                    }
-                                    el_expr => {
-                                        forwarded.push(compile_expr(
-                                            cx,
-                                            el_expr.to_expression(),
-                                            span,
-                                        )?);
-                                    }
+            if let Some(other) = args_iter.next() {
+                let expr = unwrap_ts_expr(other.to_expression());
+                match expr {
+                    Expression::ArrayExpression(arr)
+                        if !arr.elements.iter().any(|el| {
+                            matches!(el, oxc_ast::ast::ArrayExpressionElement::SpreadElement(_))
+                        }) =>
+                    {
+                        for el in &arr.elements {
+                            match el {
+                                oxc_ast::ast::ArrayExpressionElement::SpreadElement(_) => {
+                                    unreachable!("spread excluded above")
+                                }
+                                oxc_ast::ast::ArrayExpressionElement::Elision(_) => {
+                                    let r = cx.alloc_scratch();
+                                    cx.emit(Op::LoadUndefined, [Operand::Register(r)], span);
+                                    forwarded.push(r);
+                                }
+                                el_expr => {
+                                    forwarded.push(compile_expr(
+                                        cx,
+                                        el_expr.to_expression(),
+                                        span,
+                                    )?);
                                 }
                             }
                         }
-                        Expression::NullLiteral(_) => {}
-                        Expression::Identifier(id) if id.name.as_str() == "undefined" => {}
-                        _ => {
-                            dynamic_args = Some(compile_expr(cx, expr, span)?);
-                        }
+                    }
+                    Expression::NullLiteral(_) => {}
+                    Expression::Identifier(id) if id.name.as_str() == "undefined" => {}
+                    _ => {
+                        // Array literals with `...spread` and any
+                        // other expression shape go through the
+                        // dynamic path so the runtime performs the
+                        // spec-required iterable coercion.
+                        dynamic_args = Some(compile_expr(cx, expr, span)?);
                     }
                 }
-            }
-            if args_iter.next().is_some() {
-                return Err(CompileError::Unsupported {
-                    node: "Function.prototype.apply: extra arguments".to_string(),
-                    span,
-                });
             }
             let dst = cx.alloc_scratch();
             if let Some(args_reg) = dynamic_args {

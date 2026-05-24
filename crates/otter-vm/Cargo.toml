@@ -14,6 +14,7 @@ otter-bytecode = { workspace = true }
 otter-gc = { workspace = true }
 otter-macros = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 smallvec = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }

@@ -206,6 +206,83 @@ impl StepTracer for CapturingTracer {
 }
 
 #[test]
+fn heap_snapshot_summary_reports_live_buckets() {
+    let mut runtime = build_runtime();
+    let source = r#"
+        const xs = [];
+        for (let i = 0; i < 32; i++) xs.push({ idx: i, label: "node" + i });
+        xs.length;
+    "#;
+    run(&mut runtime, source);
+
+    let summary = runtime.heap_snapshot_summary();
+    assert!(
+        summary.object_count > 0,
+        "expected live objects after script ran"
+    );
+    assert!(
+        summary.total_bytes > 0,
+        "expected non-zero heap usage after script ran"
+    );
+    assert!(
+        !summary.buckets.is_empty(),
+        "expected per-type heap buckets after script ran"
+    );
+    // Buckets sort by descending bytes — the first row should
+    // hold the largest live tag.
+    let first = &summary.buckets[0];
+    assert!(
+        first.bytes >= summary.buckets.last().unwrap().bytes,
+        "buckets must be sorted by descending bytes"
+    );
+
+    let rendered = summary.render_text();
+    assert!(rendered.starts_with("; otter heap snapshot summary v1"));
+    assert!(rendered.contains("type_tag"));
+}
+
+#[test]
+fn chrome_heap_snapshot_emits_documented_schema() {
+    let mut runtime = build_runtime();
+    run(&mut runtime, "const o = { a: 1, b: 2 }; o.a + o.b;");
+    let mut buf: Vec<u8> = Vec::new();
+    runtime
+        .write_chrome_heap_snapshot(&mut buf)
+        .expect("write chrome heap snapshot");
+    let json: serde_json::Value =
+        serde_json::from_slice(&buf).expect("snapshot must be valid JSON");
+    let meta = json
+        .pointer("/snapshot/meta")
+        .expect("`snapshot.meta` present");
+    let node_fields = meta
+        .pointer("/node_fields")
+        .and_then(|v| v.as_array())
+        .expect("`node_fields` array");
+    assert!(
+        node_fields.iter().any(|f| f == "self_size"),
+        "node_fields should include `self_size`"
+    );
+    let nodes = json
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .expect("`nodes` array");
+    assert!(!nodes.is_empty(), "snapshot should describe at least the synthetic root");
+    let edges = json
+        .get("edges")
+        .and_then(|v| v.as_array())
+        .expect("`edges` array");
+    let strings = json
+        .get("strings")
+        .and_then(|v| v.as_array())
+        .expect("`strings` array");
+    let _ = edges;
+    assert!(
+        strings.iter().any(|s| s == "(GC roots)"),
+        "string table should contain the synthetic root label"
+    );
+}
+
+#[test]
 fn frame_snapshot_carries_register_window_for_main_frame() {
     let events: Arc<Mutex<Vec<FrameSnapshot>>> = Arc::new(Mutex::new(Vec::new()));
     let mut runtime = build_runtime();

@@ -2116,6 +2116,26 @@ impl Runtime {
         self.interp.set_tracer(tracer);
     }
 
+    /// Type-count summary of every live GC body. See
+    /// [`inspect::HeapSnapshotSummary`].
+    #[must_use]
+    pub fn heap_snapshot_summary(&self) -> inspect::HeapSnapshotSummary {
+        self.interp.heap_snapshot_summary()
+    }
+
+    /// Write a Chrome DevTools `.heapsnapshot` for the current heap
+    /// state. The output is JSON; the DevTools "Memory" panel
+    /// accepts it as-is.
+    ///
+    /// # Errors
+    /// Propagates I/O errors from `writer`.
+    pub fn write_chrome_heap_snapshot<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        self.interp.write_chrome_heap_snapshot(writer)
+    }
+
     /// Force a full GC cycle (scavenge + old-gen mark-sweep).
     ///
     /// **Debug / test only.** Production code must never call

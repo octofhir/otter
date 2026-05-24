@@ -580,6 +580,91 @@ pub(crate) fn build_shape_transition_snapshot(
     }
 }
 
+/// One bucket of the heap snapshot type-count summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapTypeBucket {
+    /// `Traceable::TYPE_TAG` value. Bytecode bodies define their
+    /// own constants — see the `*_BODY_TYPE_TAG` table in the VM
+    /// crate.
+    pub type_tag: u8,
+    /// Number of live objects with this tag.
+    pub object_count: u32,
+    /// Sum of `self_size` (header + payload) over those objects.
+    pub bytes: u64,
+}
+
+/// Type-count summary of every live GC body. Stable across runs
+/// for the same JS workload; one row per non-empty type tag,
+/// sorted by descending `bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapSnapshotSummary {
+    /// Total live object count across all type tags.
+    pub object_count: u64,
+    /// Total live bytes across all type tags (header + payload).
+    pub total_bytes: u64,
+    /// Per-tag totals. Empty tags are not represented.
+    pub buckets: Vec<HeapTypeBucket>,
+}
+
+impl HeapSnapshotSummary {
+    /// Build a summary from a raw [`otter_gc::HeapSnapshot`].
+    #[must_use]
+    pub fn from_snapshot(snapshot: &otter_gc::HeapSnapshot) -> Self {
+        let totals = snapshot.group_by_type();
+        let mut counts = [0u32; 256];
+        let mut object_count: u64 = 0;
+        for obj in &snapshot.objects {
+            counts[obj.type_tag as usize] = counts[obj.type_tag as usize].saturating_add(1);
+            object_count += 1;
+        }
+        let mut buckets: Vec<HeapTypeBucket> = (0..256u16)
+            .filter_map(|tag| {
+                let bytes = totals[tag as usize] as u64;
+                let object_count = counts[tag as usize];
+                if bytes == 0 && object_count == 0 {
+                    return None;
+                }
+                Some(HeapTypeBucket {
+                    type_tag: tag as u8,
+                    object_count,
+                    bytes,
+                })
+            })
+            .collect();
+        buckets.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.type_tag.cmp(&b.type_tag)));
+        let total_bytes = buckets.iter().map(|b| b.bytes).sum();
+        Self {
+            object_count,
+            total_bytes,
+            buckets,
+        }
+    }
+
+    /// Render the summary as a deterministic text table — one line
+    /// per bucket, columns: `type_tag`, `object_count`, `bytes`.
+    /// Caller can pipe straight to stderr / a file from inspector
+    /// commands.
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(64 + self.buckets.len() * 32);
+        let _ = writeln!(
+            out,
+            "; otter heap snapshot summary v1 — objects={} total_bytes={}",
+            self.object_count, self.total_bytes,
+        );
+        let _ = writeln!(out, "  type_tag  object_count  bytes");
+        for bucket in &self.buckets {
+            let _ = writeln!(
+                out,
+                "  {:#04x}      {:>12}  {:>10}",
+                bucket.type_tag, bucket.object_count, bucket.bytes,
+            );
+        }
+        out
+    }
+}
+
 /// Compact debug repr for a [`Value`]. Mirrors the kinds the
 /// step trace surfaces in operand listings.
 #[must_use]

@@ -51,6 +51,21 @@ use crate::heap::GcHeap;
 #[derive(Debug)]
 pub struct HeapSnapshotJson(pub Value);
 
+/// Safe wrapper over [`write_heap_snapshot`]. The single-mutator
+/// VM model already gives the required STW property whenever the
+/// caller holds `&GcHeap` and is not on an allocator path —
+/// matching the contract documented on
+/// [`crate::heap::GcHeap::snapshot`]. Inspector callers should
+/// prefer this entry point so the workspace-wide
+/// `forbid(unsafe_code)` lint stays clean.
+#[must_use]
+pub fn chrome_heap_snapshot(heap: &GcHeap) -> HeapSnapshotJson {
+    // SAFETY: see the doc-comment above — `&GcHeap` over a
+    // non-allocating call is the documented STW-equivalent
+    // contract for single-mutator hosts.
+    unsafe { write_heap_snapshot(heap) }
+}
+
 /// Walk the heap and emit a Chrome-compatible `.heapsnapshot`.
 ///
 /// # Safety

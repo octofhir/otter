@@ -17,7 +17,7 @@ work is:
 | 4.3   | Module install macro + Web API ports       | DONE 2026-05-24       |
 | 5.1   | Step trace                                 | DONE 2026-05-24       |
 | 5.2   | IC / shape / frame snapshots               | DONE 2026-05-24       |
-| 5.3   | GC snapshot bridge                         | Open (5.1 shipped)    |
+| 5.3   | GC snapshot bridge                         | DONE 2026-05-24       |
 | 6.1   | Object internal-method vtable evaluation   | Open                  |
 | 6.2   | Tighten Promise capability / job records   | Open                  |
 | 6.3   | Derive Trace / Finalize for new GC bodies  | `Pelt` DONE 2026-05-24 (19/20 bodies, IteratorState enum stays manual); `Groom` deferred |

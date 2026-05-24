@@ -110,6 +110,14 @@ the streaming trace:
   builds a per-frame snapshot from inside a step tracer's
   `on_step`. Each `RegisterSnapshot` carries the register index and
   a compact debug repr of the live `Value`.
+- `Runtime::heap_snapshot_summary()` returns a
+  `HeapSnapshotSummary` — total live objects, total bytes, and one
+  bucket per non-empty `Traceable::TYPE_TAG`. `render_text()` emits
+  a deterministic table for diagnostic dumps.
+- `Runtime::write_chrome_heap_snapshot(&mut writer)` streams a
+  Chrome DevTools `.heapsnapshot` JSON document. The output loads
+  directly into DevTools' "Memory" panel — no post-processing
+  required.
 
 The snapshot DTOs are plain owned structs (no GC handles). They are
 safe to keep across mutator turns, log, or compare in tests.

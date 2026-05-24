@@ -2038,6 +2038,7 @@ dependencies = [
  "otter-macros",
  "regress",
  "serde",
+ "serde_json",
  "smallvec",
  "static_assertions",
  "temporal_rs",

@@ -18,6 +18,11 @@ fn macro_holt_id(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 holt! {
     name = "MacroHolt",
     feature = CORE,
+    constants = [
+        ("PI",     Number(std::f64::consts::PI), read_only),
+        ("FLAG",   Boolean(true)),
+        ("NOTHING", Undefined),
+    ],
     methods = {
         "abs" / 1 => macro_holt_abs,
         "id"  / 1 => macro_holt_id,
@@ -32,7 +37,10 @@ fn holt_emits_namespace_spec_with_listed_methods() {
     assert_eq!(spec.methods[0].name, "abs");
     assert_eq!(spec.methods[0].length, 1);
     assert_eq!(spec.methods[1].name, "id");
-    assert_eq!(spec.constants.len(), 0);
+    assert_eq!(spec.constants.len(), 3);
+    assert_eq!(spec.constants[0].name, "PI");
+    assert_eq!(spec.constants[1].name, "FLAG");
+    assert_eq!(spec.constants[2].name, "NOTHING");
     assert_eq!(spec.accessors.len(), 0);
 }
 

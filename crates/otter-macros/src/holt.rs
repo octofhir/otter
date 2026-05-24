@@ -36,7 +36,10 @@ use proc_macro2::Span;
 use quote::{format_ident, quote};
 use std::collections::BTreeSet;
 use syn::parse::{Parse, ParseStream};
-use syn::{Ident, LitInt, LitStr, Path, Result, Token, braced, parse_macro_input};
+use syn::{
+    Expr, Ident, LitInt, LitStr, Path, Result, Token, braced, bracketed, parenthesized,
+    parse_macro_input,
+};
 
 /// Single `"name" / length => path` row of a `holt!` method table.
 pub(crate) struct MethodEntry {
@@ -60,6 +63,51 @@ impl Parse for MethodEntry {
     }
 }
 
+/// Single constant entry inside `constants = [...]`.
+///
+/// Syntax: `("NAME", Kind(expr), attrs)` where `Kind` is one of
+/// `Undefined`, `Null`, `Boolean`, `Number`. `attrs` is one of the
+/// `Attr` factory shortcuts: `read_only`, `data`, `builtin_function`,
+/// `global_binding`, defaulting to `read_only` when omitted.
+pub(crate) struct ConstantEntry {
+    pub(crate) js_name: LitStr,
+    pub(crate) kind: Ident,
+    pub(crate) value: Option<Expr>,
+    pub(crate) attrs: Option<Ident>,
+}
+
+impl Parse for ConstantEntry {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let inner;
+        parenthesized!(inner in input);
+        let js_name: LitStr = inner.parse()?;
+        inner.parse::<Token![,]>()?;
+        // `Kind(expr)` or `Kind` for nullary variants (Undefined / Null).
+        let kind: Ident = inner.parse()?;
+        let value = if inner.peek(syn::token::Paren) {
+            let value_body;
+            parenthesized!(value_body in inner);
+            let expr: Expr = value_body.parse()?;
+            Some(expr)
+        } else {
+            None
+        };
+        let attrs = if inner.peek(Token![,]) {
+            inner.parse::<Token![,]>()?;
+            let attr_ident: Ident = inner.parse()?;
+            Some(attr_ident)
+        } else {
+            None
+        };
+        Ok(Self {
+            js_name,
+            kind,
+            value,
+            attrs,
+        })
+    }
+}
+
 /// Parsed body of a `holt!` invocation.
 pub(crate) struct HoltInput {
     pub(crate) name: LitStr,
@@ -67,6 +115,7 @@ pub(crate) struct HoltInput {
     pub(crate) spec_ident: Ident,
     pub(crate) intrinsic_ident: Ident,
     pub(crate) methods: Vec<MethodEntry>,
+    pub(crate) constants: Vec<ConstantEntry>,
 }
 
 impl Parse for HoltInput {
@@ -76,6 +125,7 @@ impl Parse for HoltInput {
         let mut spec_override: Option<Ident> = None;
         let mut intrinsic_override: Option<Ident> = None;
         let mut methods: Vec<MethodEntry> = Vec::new();
+        let mut constants: Vec<ConstantEntry> = Vec::new();
         let mut methods_seen = false;
 
         while !input.is_empty() {
@@ -97,12 +147,22 @@ impl Parse for HoltInput {
                         }
                     }
                 }
+                "constants" => {
+                    let body;
+                    bracketed!(body in input);
+                    while !body.is_empty() {
+                        constants.push(body.parse()?);
+                        if body.peek(Token![,]) {
+                            body.parse::<Token![,]>()?;
+                        }
+                    }
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `holt!` field `{other}` — expected `name`, `feature`, \
-                             `spec`, `intrinsic`, or `methods`"
+                             `spec`, `intrinsic`, `methods`, or `constants`"
                         ),
                     ));
                 }
@@ -146,8 +206,22 @@ impl Parse for HoltInput {
             spec_ident,
             intrinsic_ident,
             methods,
+            constants,
         })
     }
+}
+
+/// Map an `attrs = <ident>` shortcut to the matching `Attr::*()`
+/// factory path. Unknown idents fall back to `default_factory`
+/// silently — the syn::Error path is awkward inside the closure
+/// chain so we defer to the rust type checker (`Attr::<unknown>`
+/// compile error) for diagnostics if the ident is malformed.
+fn attrs_factory_path(attrs: Option<&Ident>, default_factory: &str) -> proc_macro2::TokenStream {
+    let factory = attrs
+        .map(|ident| ident.to_string())
+        .unwrap_or_else(|| default_factory.to_string());
+    let factory_ident = Ident::new(&factory, Span::call_site());
+    quote! { ::otter_vm::Attr::#factory_ident() }
 }
 
 pub(crate) fn expand(input: TokenStream) -> TokenStream {
@@ -158,9 +232,10 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         spec_ident,
         intrinsic_ident,
         methods,
+        constants,
     } = input;
 
-    // Duplicate-name guard.
+    // Duplicate-name guards.
     let mut seen = BTreeSet::new();
     for method in &methods {
         if !seen.insert(method.js_name.value()) {
@@ -172,8 +247,20 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             .into();
         }
     }
+    let mut seen_const = BTreeSet::new();
+    for c in &constants {
+        if !seen_const.insert(c.js_name.value()) {
+            return syn::Error::new_spanned(
+                &c.js_name,
+                format!("holt!: duplicate constant name `{}`", c.js_name.value()),
+            )
+            .to_compile_error()
+            .into();
+        }
+    }
 
     let methods_ident = format_ident!("__OTTER_{}_METHODS", spec_ident);
+    let constants_ident = format_ident!("__OTTER_{}_CONSTANTS", spec_ident);
     let method_entries = methods.iter().map(|m| {
         let js_name = &m.js_name;
         let length = m.length;
@@ -184,6 +271,51 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 length: #length,
                 attrs: ::otter_vm::Attr::builtin_function(),
                 call: ::otter_vm::NativeCall::Static(#call),
+            }
+        }
+    });
+
+    let constant_entries = constants.iter().map(|c| {
+        let js_name = &c.js_name;
+        let attrs_path = attrs_factory_path(c.attrs.as_ref(), "read_only");
+        let value_tokens = match (c.kind.to_string().as_str(), c.value.as_ref()) {
+            ("Undefined", None) => quote! { ::otter_vm::ConstValue::Undefined },
+            ("Null", None) => quote! { ::otter_vm::ConstValue::Null },
+            ("Boolean", Some(expr)) => quote! { ::otter_vm::ConstValue::Boolean(#expr) },
+            ("Number", Some(expr)) => quote! { ::otter_vm::ConstValue::Number(#expr) },
+            ("Undefined" | "Null", Some(_)) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "holt!: `{}` constant takes no value — drop the `(expr)` suffix",
+                        c.kind
+                    ),
+                )
+                .to_compile_error();
+            }
+            ("Boolean" | "Number", None) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!("holt!: `{}` constant requires a `(expr)` value", c.kind),
+                )
+                .to_compile_error();
+            }
+            (other, _) => {
+                return syn::Error::new_spanned(
+                    &c.kind,
+                    format!(
+                        "holt!: unknown constant kind `{other}` — expected one of \
+                         `Undefined`, `Null`, `Boolean`, `Number`"
+                    ),
+                )
+                .to_compile_error();
+            }
+        };
+        quote! {
+            ::otter_vm::ConstSpec {
+                name: #js_name,
+                value: #value_tokens,
+                attrs: #attrs_path,
             }
         }
     });
@@ -201,13 +333,18 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             #(#method_entries),*
         ];
 
+        #[allow(non_upper_case_globals)]
+        static #constants_ident: &[::otter_vm::ConstSpec] = &[
+            #(#constant_entries),*
+        ];
+
         #[doc = "Generated namespace spec (see `holt!`)."]
         #[allow(non_upper_case_globals)]
         pub static #spec_ident: ::otter_vm::NamespaceSpec = ::otter_vm::NamespaceSpec {
             name: #name,
             methods: #methods_ident,
             accessors: &[],
-            constants: &[],
+            constants: #constants_ident,
             attrs: ::otter_vm::Attr::global_binding(),
         };
 

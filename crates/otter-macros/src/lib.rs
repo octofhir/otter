@@ -158,6 +158,7 @@ use syn::{
     bracketed, parenthesized, parse_macro_input,
 };
 
+mod couch;
 mod holt;
 
 /// Generate a `NamespaceSpec` + `BuiltinIntrinsic` adapter for a
@@ -201,6 +202,44 @@ mod holt;
 #[proc_macro]
 pub fn holt(input: TokenStream) -> TokenStream {
     holt::expand(input)
+}
+
+/// Generate a `ConstructorSpec` + `BuiltinIntrinsic` adapter for a
+/// class intrinsic — callable constructor with its own static
+/// methods plus a prototype slot.
+///
+/// Used for `Proxy`, `Date`, `Map`, `Set`, `Promise`, `RegExp`, the
+/// Temporal classes, every error class, every TypedArray.
+///
+/// # Syntax
+///
+/// ```rust,ignore
+/// couch! {
+///     name = "Proxy",
+///     feature = CORE,
+///     constructor = (length = 2, call = proxy_ctor_call),
+///     statics = {
+///         "revocable" / 2 => proxy_revocable_call,
+///     },
+/// }
+/// ```
+///
+/// Optional fields `spec = MY_SPEC,` and `intrinsic = MyIntrinsic,`
+/// override the derived ident names. Prototype methods + accessors
+/// are not yet supported by this skeleton — see the design note
+/// for the planned grammar.
+///
+/// # Generated symbols
+///
+/// - `pub static <SPEC>: ::otter_vm::ConstructorSpec`
+/// - `pub struct <INTRINSIC>;`
+/// - `impl ::otter_vm::intrinsic_install::BuiltinIntrinsic for
+///   <INTRINSIC>` whose `install` body allocates the
+///   `NativeFunction` constructor and pins each static as an own
+///   data property before binding the constructor on `globalThis`.
+#[proc_macro]
+pub fn couch(input: TokenStream) -> TokenStream {
+    couch::expand(input)
 }
 
 /// Generate a static `NamespaceSpec` from a Rust module.

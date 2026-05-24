@@ -27,7 +27,12 @@ pub(crate) fn alloc_object_with_value_roots(
 }
 
 /// Allocate a static native constructor with `value_roots` kept live.
-pub(crate) fn native_constructor_static_with_value_roots(
+///
+/// `pub` because the `couch!` macro expands generated `install`
+/// bodies to call this helper from outside `otter-vm`. Hand-written
+/// installers inside the crate continue to use the
+/// `bootstrap::native_constructor_static_with_value_roots` re-export.
+pub fn native_constructor_static_with_value_roots(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     length: u8,
@@ -49,7 +54,11 @@ pub(crate) fn native_constructor_static_with_value_roots(
 }
 
 /// Allocate a static native non-constructor with `value_roots` kept live.
-pub(crate) fn native_static_with_value_roots(
+///
+/// `pub` for the same reason as
+/// [`native_constructor_static_with_value_roots`]: the `couch!` /
+/// `lodge!` macros call it from their generated `install` bodies.
+pub fn native_static_with_value_roots(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,
     length: u8,

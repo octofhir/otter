@@ -718,7 +718,12 @@ impl NativeFunction {
     /// metadata properties. This slice supports `name` / `length`;
     /// arbitrary expando properties still belong to the broader
     /// function-object property-bag work.
-    pub(crate) fn define_own_property(
+    ///
+    /// `pub` because the `couch!` macro expands generated `install`
+    /// bodies to pin static methods on the constructor through this
+    /// method. Hand-written installers call it through the same
+    /// path.
+    pub fn define_own_property(
         &self,
         heap: &mut otter_gc::GcHeap,
         key: &str,

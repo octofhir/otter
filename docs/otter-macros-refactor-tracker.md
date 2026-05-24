@@ -24,24 +24,35 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 
 ## Macro implementation checklist (4.1a)
 
-| Macro            | File                                        | Tests                   | State            |
-| ---------------- | ------------------------------------------- | ----------------------- | ---------------- |
-| `holt!`          | `crates/otter-macros/src/holt.rs`           | `tests/holt.rs`         | Skeleton shipped |
-| `couch!`         | `crates/otter-macros/src/couch.rs`          | `tests/couch_*.rs`      | Pending          |
-| `raft!` (extend) | `crates/otter-macros/src/raft.rs`           | `tests/raft.rs`         | Existing         |
-| `#[dive]` attr   | `crates/otter-macros/src/dive.rs`           | `tests/dive_*.rs`       | Pending          |
-| `burrow!`        | `crates/otter-macros/src/burrow.rs`         | `tests/burrow_*.rs`     | Deferred (Q3)    |
-| `lodge!`         | `crates/otter-macros/src/lodge.rs`          | `tests/lodge_*.rs`      | Pending (4.3)    |
-| `Pelt` derive    | `crates/otter-macros/src/derive_pelt.rs`    | `tests/derive_pelt.rs`  | Pending          |
-| `Groom` derive   | `crates/otter-macros/src/derive_groom.rs`   | `tests/derive_groom.rs` | Pending          |
+| Macro            | File                                        | Tests                   | State                          |
+| ---------------- | ------------------------------------------- | ----------------------- | ------------------------------ |
+| `holt!`          | `crates/otter-macros/src/holt.rs`           | `tests/holt.rs`         | Skeleton + constants shipped   |
+| `couch!`         | `crates/otter-macros/src/couch.rs`          | `tests/couch.rs`        | Skeleton shipped               |
+| `raft!` (extend) | `crates/otter-macros/src/raft.rs`           | `tests/raft.rs`         | Existing                       |
+| `#[dive]` attr   | `crates/otter-macros/src/dive.rs`           | `tests/dive_*.rs`       | Pending                        |
+| `burrow!`        | `crates/otter-macros/src/burrow.rs`         | `tests/burrow_*.rs`     | Deferred (Q3)                  |
+| `lodge!`         | `crates/otter-macros/src/lodge.rs`          | `tests/lodge_*.rs`      | Pending (4.3)                  |
+| `Pelt` derive    | `crates/otter-macros/src/derive_pelt.rs`    | `tests/derive_pelt.rs`  | Pending                        |
+| `Groom` derive   | `crates/otter-macros/src/derive_groom.rs`   | `tests/derive_groom.rs` | Pending                        |
 
 Per-macro notes (referenced from the table above):
 
-- `holt!` skeleton shipped 2026-05-24 — covers `name` / `feature` /
-  `methods` fields plus derived `<NAME>_SPEC` + `Intrinsic` ident
-  defaults. Still pending: `constants = [...]` and `accessors = [...]`
-  field support, trybuild matrix (duplicate name, missing name,
-  unknown field), `attrs` per-row override inside the methods block.
+- `holt!` shipped 2026-05-24: `name` / `feature` / `methods` /
+  `constants` fields plus derived `<NAME>_SPEC` + `Intrinsic` ident
+  defaults. Constants grammar: `("NAME", Kind(expr), attrs)` where
+  `Kind` ∈ `Undefined`/`Null`/`Boolean`/`Number`, `attrs` ∈ Attr
+  factory ident (default `read_only`). Still pending: `accessors =
+  [...]` field, `attrs` per-row override inside the methods block,
+  trybuild matrix.
+- `couch!` shipped 2026-05-24: `name` / `feature` / `constructor =
+  (length = N, call = path)` (required) + optional `statics` /
+  `spec` / `intrinsic` overrides. Generates `<NAME>_SPEC:
+  ConstructorSpec` with empty `prototype_methods` and the matching
+  `Intrinsic` adapter whose `install` allocates the NativeFunction
+  ctor + pins each static as own data property before binding on
+  `globalThis`. Still pending: `prototype = { methods, accessors
+  }` block, `abstract = true` flag for `%TypedArray%`-style
+  abstract ctors, trybuild matrix.
 
 ## Production consumer inventory
 
@@ -100,6 +111,38 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — `holt!` constants + `couch!` skeleton
+
+- `holt!` extended with `constants = [...]` block. Grammar:
+  `("NAME", Kind(expr), attrs)` where `Kind` ∈ `Undefined` / `Null`
+  / `Boolean` / `Number`, `attrs` ∈ Attr factory ident (default
+  `read_only`). Duplicate constant names rejected with spanned
+  diagnostic. Integration test exercises Number / Boolean /
+  Undefined entries.
+- `couch!` skeleton shipped at `crates/otter-macros/src/couch.rs`.
+  Grammar: `name` / `feature` / `constructor = (length = N, call =
+  path)` (required) + optional `statics = { ... }` / `spec` /
+  `intrinsic` overrides. Generates `<NAME>_SPEC: ConstructorSpec`
+  with empty `prototype_methods` (prototype methods + accessors
+  fields deferred — gated on first real consumer). `install` body
+  allocates the NativeFunction ctor via
+  `bootstrap::native_constructor_static_with_value_roots`, pins each
+  static as own data property on the ctor through
+  `NativeFunction::define_own_property`, then binds on
+  `globalThis`. Non-`Static` `NativeCall` variants are
+  pattern-rejected (macro-generated specs only carry `Static`;
+  defensive only).
+- Promoted three more helpers to `pub` so the `couch!` expansion
+  can call them from outside `otter-vm`:
+  `bootstrap::native_constructor_static_with_value_roots`,
+  `bootstrap::native_static_with_value_roots`,
+  `NativeFunction::define_own_property`. Hand-written installers
+  reach them through the same paths.
+- Next: extend `holt!` with `accessors = [...]` + per-row `attrs`
+  override in methods block; add trybuild compile-fail matrix;
+  then start `couch!` prototype block (methods + accessors); then
+  4.2a — port **JSON** as the first production consumer.
 
 ### 2026-05-24 — `holt!` skeleton + docs + tracker
 

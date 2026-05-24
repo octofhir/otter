@@ -4,8 +4,8 @@
 //! and built-in helpers; it bundles the borrow set every algorithm
 //! needs (`&mut RuntimeState`, `&mut GcHeap`, intrinsics) so callers
 //! never reach for thread-local heap lookup. [`NativeCtx<'rt>`] is
-//! the public-to-native binding view used by `#[dive]` /
-//! `#[js_namespace]` style entry points.
+//! the public-to-native binding view used by `holt!` / `couch!` /
+//! `#[dive]` style entry points.
 //!
 //! Both types are `!Send + !Sync` (enforced by static assertions in
 //! [`crate::lib`]) and never cross `.await` — the lifetime parameter
@@ -137,10 +137,10 @@ impl NativeCallInfo {
     }
 }
 
-/// Public-to-native binding context. Handed to `#[dive]` /
-/// `#[js_namespace]` entry points so native code allocates and
-/// mutates against the right isolate without reaching for
-/// thread-local state.
+/// Public-to-native binding context. Handed to `holt!` / `couch!` /
+/// `#[dive]` entry points so native code allocates and mutates
+/// against the right isolate without reaching for thread-local
+/// state.
 ///
 /// `NativeCtx<'rt>` is `!Send + !Sync` and never crosses `.await`.
 /// The lifetime `'rt` is the mutator turn — the same constraint

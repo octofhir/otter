@@ -18,10 +18,5 @@ quote = { workspace = true }
 syn = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
 otter-gc = { workspace = true }
 otter-vm = { workspace = true }
-
-[[bench]]
-name = "js_surface_macros"
-harness = false

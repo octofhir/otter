@@ -1875,7 +1875,6 @@ dependencies = [
 name = "otter-macros"
 version = "0.1.0"
 dependencies = [
- "criterion",
  "otter-gc",
  "otter-vm",
  "proc-macro2",

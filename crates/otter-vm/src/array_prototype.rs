@@ -784,7 +784,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             // `arr.length = 2**31`) does not index out of bounds.
             // Trailing slots beyond `elements.len()` are holes that
             // can never `===` the needle.
-            let mut i = (from as usize).min(elements.len() - 1) as i64;
+            let mut i = from.min(elements.len() - 1) as i64;
             while i >= 0 {
                 if elements[i as usize] == needle {
                     return Some(i as i32);

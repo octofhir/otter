@@ -13,7 +13,7 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 | Sub-phase | Scope                                                          | Status                       |
 | --------- | -------------------------------------------------------------- | ---------------------------- |
 | 4.1a      | New macros land in `otter-macros`                              | `holt!` + `couch!` complete  |
-| 4.1b      | Delete `js_namespace` / `js_class` / `raft` helper attrs       | Pending                      |
+| 4.1b      | Delete `js_namespace` / `js_class` legacy attribute macros     | **DONE 2026-05-24**          |
 | 4.1c      | mdbook chapter: naming theme + per-macro examples              | DONE (Phase 4.1 commit)      |
 | 4.2a      | Port **JSON** (pathfinder, smallest namespace)                 | DONE 2026-05-24              |
 | 4.2b      | Port Math / Reflect / Atomics / Console in parallel            | DONE 2026-05-24              |
@@ -111,6 +111,36 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — Legacy `js_namespace` / `js_class` deleted (4.1b)
+
+Every production consumer was already on `holt!` / `couch!` (4.2a-d).
+Removed the legacy proc-macro surface:
+
+- `js_namespace`, `js_class`, `js_fn`, `js_constructor`, `js_method`,
+  `js_static_method`, `js_getter`, `js_setter` proc-macros from
+  `crates/otter-macros/src/lib.rs` (~530 lines including
+  `NamespaceArgs` / `ClassArgs` / `FnArgs` / `LengthArgs` /
+  `NameArgs` / `MethodBinding` / `ConstructorBinding` /
+  `AccessorBinding` and the `take_*_attr` helpers).
+- `crates/otter-macros/tests/js_namespace.rs` +
+  `crates/otter-macros/tests/js_class.rs` integration tests.
+- `crates/otter-macros/benches/js_surface_macros.rs` parity bench
+  (compared js_namespace / js_class against handwritten — both
+  sides used the deleted macros, so the comparison is moot).
+- `criterion` dev-dep dropped (no benches left).
+- `runtime_cx.rs` doc references updated to point at the new
+  macros.
+- crate-level status block updated.
+
+Final macro surface: `holt!`, `couch!`, `raft!`, `#[dive]` (raft +
+dive remain alongside holt/couch as documented in the mdbook
+chapter).
+
+Tests: otter-vm 530/530, otter-macros 0/0 (doctests only), clippy
+clean. Picked up one drive-by clippy fix in
+`array_prototype::impl_last_index_of` (unnecessary `as usize`
+cast).
 
 ### 2026-05-24 — TypedArrays ported to couch! (4.2d wrap)
 

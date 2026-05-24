@@ -721,7 +721,7 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
   529 / 22 / 60 / 123 lib tests in `otter-vm` / `otter-bytecode` /
   `otter-compiler` / `otter-runtime`; workspace clippy clean.
 
-### Task 2.4 — Polymorphic IC Slots
+### Task 2.4 — Polymorphic IC Slots — DONE 2026-05-24
 
 - Goal: make ROADMAP P1 true and create JIT patch points.
 - Touches: `property_ic.rs`, `property_dispatch.rs`, executable metadata.
@@ -732,6 +732,54 @@ Test262 `built-ins/Promise` and `language/expressions/await` subsets.
 - Risk: High.
 - Effort: M/L.
 - Depends on: 2.1.
+- **Status:** Shipped. `PropertyIcEntry` rewritten from
+  `Empty / Monomorphic { ic, misses } / Disabled` to
+  `Empty / Polymorphic { entries: SmallVec<[T; 4]>, misses } /
+  Megamorphic`. Each site walks installed entries linearly on probe;
+  misses while the PIC has capacity append a fresh candidate, misses
+  on a full PIC accumulate against the (preserved-at-4)
+  `PIC_GUARD_MISS_THRESHOLD` and tip the site to `Megamorphic` on
+  overflow. `Megamorphic` is sticky for the interpreter lifetime —
+  no re-population, no further `install`/`disable` accounting.
+
+  Dispatcher (`LoadProperty` / `StoreProperty` / `HasProperty` arms
+  in `property_dispatch.rs`) replaces the `cached()` /
+  `cached_ref()` single-record API with an `entries()` slice walk;
+  the borrow-conflict against `&mut gc_heap` on `StoreProperty` is
+  resolved by reborrowing each entry by clone inside the loop. The
+  `is_disabled()` predicate is renamed `is_megamorphic()` and
+  `is_monomorphic()` (test-only) is renamed `is_polymorphic()`;
+  `PropertyIcStats` counter field names are kept verbatim
+  (`load_disables` now counts Megamorphic promotions) so the
+  external introspection surface is stable.
+
+  Storage: `SmallVec<[T; MAX_PIC_ENTRIES]>` keeps the PIC entirely
+  stack-resident (cap enforced — no heap spill); per-site cost is
+  `4*sizeof(T) + len + cap_tag` ≈ 144 bytes for the largest
+  `StorePropertyIc`. Trace through `StorePropertyTransition` walks
+  every entry under
+  `impl PropertyIcEntry<StorePropertyIc>::trace_roots`.
+
+  Tests: `property_ic::tests::pic_grows_until_capacity_then_transitions_to_megamorphic`
+  asserts the PIC fill / promotion path, plus
+  `install_into_full_pic_transitions_to_megamorphic` for direct
+  install overflow. The existing dictionary-prototype rejection and
+  writability tests stay unchanged. `entry_lifecycle_updates_opcode_family_stats`
+  reframed for the PIC counter semantics. 530/530 `otter-vm --lib`
+  (one new test), 22 / 60 / 123 lib tests in bytecode / compiler /
+  runtime; workspace clippy clean.
+
+  Test262 deltas: `built-ins/Object` 3384 → 3387 (+3, polymorphic
+  sites that previously fell through now stay cached);
+  `built-ins/Promise` 646/677 flat; `built-ins/Array` 1859/3331
+  unchanged. No regression observed.
+
+  Follow-up: dedicated polymorphic-shape micro-benchmark (existing
+  `benches/property_ic.rs` loops are single-shape and exercise the
+  unchanged monomorphic path); when added it will document the
+  qualitative win — pre-PIC a 2-shape site disabled after 4 misses
+  and ran ordinary `[[Get]]` for the rest of the interpreter
+  lifetime; the PIC holds both shapes indefinitely.
 
 ### Task 2.5 — Freeze Native Call ABI — DONE 2026-05-23
 

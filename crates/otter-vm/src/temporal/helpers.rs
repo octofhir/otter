@@ -398,6 +398,154 @@ pub fn clamp_to_u16(n: f64, class: &'static str, field: &str) -> Result<u16, Nat
     Ok(n as u16)
 }
 
+/// Parse a `{ largestUnit, smallestUnit, roundingMode,
+/// roundingIncrement }` options bag into [`DifferenceSettings`].
+/// Returns the default when the argument is missing or `undefined`.
+/// Any unrecognised unit / rounding mode surfaces as
+/// `IntrinsicError::BadArgument`.
+pub fn parse_difference_settings(
+    args: &IntrinsicArgs<'_>,
+    index: u16,
+) -> Result<temporal_rs::options::DifferenceSettings, IntrinsicError> {
+    use core::str::FromStr;
+    let mut settings = temporal_rs::options::DifferenceSettings::default();
+    let v = args.args.get(index as usize).copied().unwrap_or_default();
+    if v.is_undefined() {
+        return Ok(settings);
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(IntrinsicError::BadArgument {
+            index,
+            reason: "options must be an object",
+        });
+    };
+    let heap = &*args.gc_heap;
+    if let Some(name) = read_string_field(obj, "largestUnit", heap)
+        && !name.is_empty()
+        && !name.eq_ignore_ascii_case("auto")
+    {
+        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index,
+                reason: "invalid `largestUnit`",
+            }
+        })?;
+        settings.largest_unit = Some(unit);
+    }
+    if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
+        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index,
+                reason: "invalid `smallestUnit`",
+            }
+        })?;
+        settings.smallest_unit = Some(unit);
+    }
+    if let Some(name) = read_string_field(obj, "roundingMode", heap) {
+        let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index,
+                reason: "invalid `roundingMode`",
+            }
+        })?;
+        settings.rounding_mode = Some(mode);
+    }
+    if let Some(n) = crate::object::get(obj, heap, "roundingIncrement")
+        && !n.is_undefined()
+        && let Some(num) = n.as_number()
+    {
+        let raw = num.as_f64();
+        if raw.is_finite() && raw >= 1.0 {
+            if let Ok(incr) = temporal_rs::options::RoundingIncrement::try_from(raw.trunc()) {
+                settings.increment = Some(incr);
+            } else {
+                return Err(IntrinsicError::BadArgument {
+                    index,
+                    reason: "invalid `roundingIncrement`",
+                });
+            }
+        }
+    }
+    Ok(settings)
+}
+
+/// Parse a `{ largestUnit, smallestUnit, roundingMode,
+/// roundingIncrement }` options bag into [`RoundingOptions`]. Mirror
+/// of [`parse_difference_settings`] for `prototype.round`.
+pub fn parse_rounding_options(
+    args: &IntrinsicArgs<'_>,
+    index: u16,
+) -> Result<temporal_rs::options::RoundingOptions, IntrinsicError> {
+    use core::str::FromStr;
+    let mut options = temporal_rs::options::RoundingOptions::default();
+    let v = args.args.get(index as usize).copied().unwrap_or_default();
+    if let Some(s) = v.as_string(args.gc_heap) {
+        // `round("hour")` is shorthand for `round({ smallestUnit: "hour" })`.
+        let name = s.to_lossy_string(args.gc_heap);
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| IntrinsicError::BadArgument {
+                index,
+                reason: "invalid smallest-unit shorthand",
+            })?;
+        options.smallest_unit = Some(unit);
+        return Ok(options);
+    }
+    if v.is_undefined() {
+        return Ok(options);
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(IntrinsicError::BadArgument {
+            index,
+            reason: "round() requires an options object or smallest-unit string",
+        });
+    };
+    let heap = &*args.gc_heap;
+    if let Some(name) = read_string_field(obj, "largestUnit", heap) {
+        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index,
+                reason: "invalid `largestUnit`",
+            }
+        })?;
+        options.largest_unit = Some(unit);
+    }
+    if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
+        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index,
+                reason: "invalid `smallestUnit`",
+            }
+        })?;
+        options.smallest_unit = Some(unit);
+    }
+    if let Some(name) = read_string_field(obj, "roundingMode", heap) {
+        let mode = temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
+            IntrinsicError::BadArgument {
+                index,
+                reason: "invalid `roundingMode`",
+            }
+        })?;
+        options.rounding_mode = Some(mode);
+    }
+    if let Some(n) = crate::object::get(obj, heap, "roundingIncrement")
+        && !n.is_undefined()
+        && let Some(num) = n.as_number()
+    {
+        let raw = num.as_f64();
+        if raw.is_finite() && raw >= 1.0 {
+            if let Ok(incr) = temporal_rs::options::RoundingIncrement::try_from(raw.trunc()) {
+                options.increment = Some(incr);
+            } else {
+                return Err(IntrinsicError::BadArgument {
+                    index,
+                    reason: "invalid `roundingIncrement`",
+                });
+            }
+        }
+    }
+    Ok(options)
+}
+
 /// Convert the dispatch-level `TemporalError` into a `NativeError`
 /// — used by `[[Construct]]` bodies to surface OOM and any
 /// future pass-through cases via the native-fn boundary.

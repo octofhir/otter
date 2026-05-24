@@ -20,8 +20,9 @@ use std::sync::LazyLock;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{
-    alloc_temporal_value, arg_or_undef, js_string_value, make_temporal, require_construct,
-    require_instant, temporal_dispatch_err, temporal_err,
+    alloc_temporal_value, arg_or_undef, js_string_value, make_temporal,
+    parse_difference_settings, parse_rounding_options, require_construct, require_instant,
+    temporal_dispatch_err, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -285,14 +286,81 @@ fn arg_as_duration(
     }
 }
 
+fn impl_until(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let inst = require_instant(args)?;
+    let other = arg_as_instant(args, 0)?;
+    let settings = parse_difference_settings(args, 1)?;
+    let result = inst.until(&other, settings).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::Duration(result))
+}
+
+fn impl_since(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let inst = require_instant(args)?;
+    let other = arg_as_instant(args, 0)?;
+    let settings = parse_difference_settings(args, 1)?;
+    let result = inst.since(&other, settings).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::Duration(result))
+}
+
+fn impl_round(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let inst = require_instant(args)?;
+    let options = parse_rounding_options(args, 0)?;
+    let result = inst.round(options).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::Instant(result))
+}
+
+/// `toJSON` returns the same ISO string as `toString` per
+/// §8.3.10 — used by `JSON.stringify`.
+fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    impl_to_string(args)
+}
+
+/// `valueOf` always throws `TypeError` per §8.3.13 to block ordering
+/// comparisons (`<`, `>=`) on Temporal values.
+fn impl_value_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    Err(IntrinsicError::BadReceiver {
+        expected: "Temporal.Instant has no `.valueOf` — use `compare` or `equals`",
+    })
+}
+
+/// Coerce the argument at `index` to a [`temporal_rs::Instant`].
+fn arg_as_instant(
+    args: &IntrinsicArgs<'_>,
+    index: u16,
+) -> Result<temporal_rs::Instant, IntrinsicError> {
+    let arg = args.args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
+        match t.payload_clone(args.gc_heap) {
+            TemporalPayload::Instant(v) => Ok(v),
+            _ => Err(IntrinsicError::BadArgument {
+                index,
+                reason: "must be a Temporal.Instant",
+            }),
+        }
+    } else if let Some(s) = arg.and_then(|v| v.as_string(args.gc_heap)) {
+        temporal_rs::Instant::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
+            .map_err(temporal_err)
+    } else {
+        Err(IntrinsicError::BadArgument {
+            index,
+            reason: "must be a Temporal.Instant or ISO string",
+        })
+    }
+}
+
 /// `Temporal.Instant.prototype` table.
 pub static INSTANT_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
     crate::intrinsics!(
         Temporal,
         "toString" / 0 => impl_to_string,
+        "toJSON"   / 0 => impl_to_json,
+        "valueOf"  / 0 => impl_value_of,
         "add"      / 1 => impl_add,
         "subtract" / 1 => impl_subtract,
         "equals"   / 1 => impl_equals,
+        "until"    / 1 => impl_until,
+        "since"    / 1 => impl_since,
+        "round"    / 1 => impl_round,
     )
 });
 

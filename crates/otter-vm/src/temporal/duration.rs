@@ -353,11 +353,23 @@ fn duration_arg(
     }
 }
 
+fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    impl_to_string(args)
+}
+
+fn impl_value_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    Err(IntrinsicError::BadReceiver {
+        expected: "Temporal.Duration has no `.valueOf` — use `compare`",
+    })
+}
+
 /// `Temporal.Duration.prototype` table.
 pub static DURATION_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
     crate::intrinsics!(
         Temporal,
         "toString" / 0 => impl_to_string,
+        "toJSON"   / 0 => impl_to_json,
+        "valueOf"  / 0 => impl_value_of,
         "add"      / 1 => impl_add,
         "subtract" / 1 => impl_subtract,
         "negated"  / 0 => impl_negated,

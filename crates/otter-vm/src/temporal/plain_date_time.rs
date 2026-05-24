@@ -11,8 +11,9 @@ use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     alloc_temporal_value, arg_or_undef, arg_to_calendar, clamp_to_u16, clamp_to_u8,
-    js_string_value, make_temporal, opt_integer_with_truncation, require_construct,
-    require_plain_date_time, temporal_dispatch_err, temporal_err, to_integer_with_truncation,
+    js_string_value, make_temporal, opt_integer_with_truncation, parse_difference_settings,
+    parse_rounding_options, require_construct, require_plain_date_time, temporal_dispatch_err,
+    temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -228,13 +229,82 @@ fn duration_arg(
     }
 }
 
+fn impl_until(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pdt = require_plain_date_time(args)?;
+    let other = arg_as_plain_date_time(args, 0)?;
+    let settings = parse_difference_settings(args, 1)?;
+    let result = pdt.until(&other, settings).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::Duration(result))
+}
+
+fn impl_since(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pdt = require_plain_date_time(args)?;
+    let other = arg_as_plain_date_time(args, 0)?;
+    let settings = parse_difference_settings(args, 1)?;
+    let result = pdt.since(&other, settings).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::Duration(result))
+}
+
+fn impl_round(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pdt = require_plain_date_time(args)?;
+    let options = parse_rounding_options(args, 0)?;
+    let result = pdt.round(options).map_err(temporal_err)?;
+    make_temporal(args, TemporalPayload::PlainDateTime(result))
+}
+
+fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    let pdt = require_plain_date_time(args)?;
+    let other = arg_as_plain_date_time(args, 0)?;
+    Ok(Value::boolean(pdt == other))
+}
+
+fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    impl_to_string(args)
+}
+
+fn impl_value_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
+    Err(IntrinsicError::BadReceiver {
+        expected: "Temporal.PlainDateTime has no `.valueOf` — use `compare` or `equals`",
+    })
+}
+
+fn arg_as_plain_date_time(
+    args: &IntrinsicArgs<'_>,
+    index: u16,
+) -> Result<temporal_rs::PlainDateTime, IntrinsicError> {
+    let arg = args.args.get(index as usize);
+    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
+        match t.payload_clone(args.gc_heap) {
+            TemporalPayload::PlainDateTime(v) => Ok(v),
+            _ => Err(IntrinsicError::BadArgument {
+                index,
+                reason: "must be a Temporal.PlainDateTime",
+            }),
+        }
+    } else if let Some(s) = arg.and_then(|v| v.as_string(args.gc_heap)) {
+        temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
+            .map_err(temporal_err)
+    } else {
+        Err(IntrinsicError::BadArgument {
+            index,
+            reason: "must be a Temporal.PlainDateTime or ISO string",
+        })
+    }
+}
+
 /// `Temporal.PlainDateTime.prototype` table.
 pub static PLAIN_DATE_TIME_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
     crate::intrinsics!(
         Temporal,
         "toString" / 0 => impl_to_string,
+        "toJSON"   / 0 => impl_to_json,
+        "valueOf"  / 0 => impl_value_of,
         "add"      / 1 => impl_add,
         "subtract" / 1 => impl_subtract,
+        "equals"   / 1 => impl_equals,
+        "until"    / 1 => impl_until,
+        "since"    / 1 => impl_since,
+        "round"    / 1 => impl_round,
     )
 });
 

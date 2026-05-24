@@ -232,6 +232,13 @@ pub(crate) struct CouchInput {
     pub(crate) constructor: ConstructorSpecArgs,
     pub(crate) statics: Vec<MethodEntry>,
     pub(crate) prototype: PrototypeBlock,
+    /// Optional `post_install = path` escape hatch. When set, the
+    /// generated install body calls
+    /// `path(heap, global, ctor)?` after pinning the constructor on
+    /// `globalThis`. Used for things that don't fit the declarative
+    /// rows (e.g. legacy `RegExp` static accessors that need captures
+    /// to bind the constructor identity).
+    pub(crate) post_install: Option<Path>,
 }
 
 impl Parse for CouchInput {
@@ -243,6 +250,7 @@ impl Parse for CouchInput {
         let mut constructor: Option<ConstructorSpecArgs> = None;
         let mut statics: Vec<MethodEntry> = Vec::new();
         let mut prototype: PrototypeBlock = PrototypeBlock::default();
+        let mut post_install: Option<Path> = None;
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -266,12 +274,16 @@ impl Parse for CouchInput {
                 "prototype" => {
                     prototype = input.parse()?;
                 }
+                "post_install" => {
+                    post_install = Some(input.parse()?);
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
-                             `spec`, `intrinsic`, `constructor`, `statics`, or `prototype`"
+                             `spec`, `intrinsic`, `constructor`, `statics`, `prototype`, \
+                             or `post_install`"
                         ),
                     ));
                 }
@@ -316,6 +328,7 @@ impl Parse for CouchInput {
             constructor,
             statics,
             prototype,
+            post_install,
         })
     }
 }
@@ -330,6 +343,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         constructor,
         statics,
         prototype,
+        post_install,
     } = input;
 
     let mut seen = BTreeSet::new();
@@ -456,6 +470,13 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let prototype_block_needed = !prototype.methods.is_empty()
         || !prototype.accessors.is_empty()
         || prototype_has_method_specs;
+
+    let post_install_call = match post_install {
+        Some(path) => quote! {
+            #path(heap, global, ctor)?;
+        },
+        None => quote! {},
+    };
 
     quote! {
         #[allow(non_upper_case_globals)]
@@ -639,6 +660,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     <Self as ::otter_vm::intrinsic_install::BuiltinIntrinsic>::NAME,
                     ctor_value,
                 );
+                #post_install_call
                 ::core::result::Result::Ok(())
             }
         }

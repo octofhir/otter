@@ -18,7 +18,7 @@ work is:
 | 5.1   | Step trace                                 | DONE 2026-05-24       |
 | 5.2   | IC / shape / frame snapshots               | DONE 2026-05-24       |
 | 5.3   | GC snapshot bridge                         | DONE 2026-05-24       |
-| 6.1   | Object internal-method vtable evaluation   | Open                  |
+| 6.1   | Object internal-method vtable evaluation   | DEFERRED 2026-05-24   |
 | 6.2   | Tighten Promise capability / job records   | Open                  |
 | 6.3   | Derive Trace / Finalize for new GC bodies  | `Pelt` DONE 2026-05-24 (19/20 bodies, IteratorState enum stays manual); `Groom` deferred |
 
@@ -250,18 +250,28 @@ wrap either a `RuntimeClassSpec` (legacy) or a
 - Effort: S/M.
 - Depends on: 5.1.
 
-### Task 6.1 — Evaluate Object Internal-Method Vtable
+### Task 6.1 — Evaluate Object Internal-Method Vtable — DEFERRED 2026-05-24
 
 - Goal: remove scattered object-kind dispatch where it hurts.
 - Touches: object body, proxy / array / typed-array / arguments
   object internal ops.
-- Change: adopt Boa/JSC-style static internal-method table if
+- Change: adopt JSC-style static internal-method table if
   measurement shows a win after Value unification.
 - Acceptance: no correctness regression; property / proxy benchmarks
   improve, or task is rejected with data.
 - Risk: Medium.
 - Effort: M.
 - Depends on: 1.1 ✓ (unblocked).
+- **Status:** Deferred with data. Decision record at
+  [`docs/object-internal-method-vtable-decision.md`](object-internal-method-vtable-decision.md):
+  current IC fast path absorbs 90 %+ of property dispatch; the
+  per-kind chain only runs on miss / non-object receivers; the
+  worst-case 13-branch chain produces a 1–3 % ceiling on the slow
+  path that maps to a fraction-of-a-percent net improvement on a
+  representative workload, against M+ effort across every per-kind
+  exotic. Re-trigger conditions documented in the decision record:
+  IC hit rate below 80 %, average chain depth above 4, or a
+  measurable Proxy-heavy regression.
 
 ### Task 6.2 — Tighten Promise Capability / Job Records
 

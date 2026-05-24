@@ -556,6 +556,33 @@ impl StartupPhaseTimer {
     }
 }
 
+/// Read `globalThis.<name>.prototype` regardless of whether the
+/// global binding stores the constructor as a plain [`JsObject`] (the
+/// shape used by hand-rolled bootstrap installers like
+/// [`error_classes`]) or as a `Value::NativeFunction` (the shape
+/// produced by `couch!` for Function / Object / Array / etc.).
+fn resolve_ctor_prototype(
+    heap: &mut otter_gc::GcHeap,
+    global_this: JsObject,
+    name: &str,
+) -> Option<JsObject> {
+    let ctor_value = object::get(global_this, heap, name)?;
+    if let Some(ctor_obj) = ctor_value.as_object() {
+        return object::get(ctor_obj, heap, "prototype").and_then(|v| v.as_object());
+    }
+    if let Some(ctor) = ctor_value.as_native_function() {
+        return ctor
+            .own_property_descriptor(heap, "prototype")
+            .ok()
+            .flatten()
+            .and_then(|d| match d.kind {
+                object::DescriptorKind::Data { value } => value.as_object(),
+                _ => None,
+            });
+    }
+    None
+}
+
 impl Interpreter {
     /// Construct a fresh interpreter with its own interrupt flag,
     /// a no-cap string heap, the default stack-depth limit, and a
@@ -598,10 +625,8 @@ impl Interpreter {
         // Bootstrap can't see `WellKnownSymbols`, so we wire the
         // realm-local @@hasInstance after both Function.prototype
         // and the symbol table exist.
-        let function_prototype_handle = if let Some(function_ctor) =
-            object::get(global_this, &gc_heap, "Function").and_then(|v| v.as_object())
-            && let Some(function_proto) =
-                object::get(function_ctor, &gc_heap, "prototype").and_then(|v| v.as_object())
+        let function_prototype_handle = if let Some(function_proto) =
+            resolve_ctor_prototype(&mut gc_heap, global_this, "Function")
         {
             let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
             let global_root = Value::object(global_this);
@@ -622,10 +647,8 @@ impl Interpreter {
         // chains and surface every error constructor on `globalThis`
         // as a writable, non-enumerable, configurable data property.
         if let Some(function_prototype) = function_prototype_handle
-            && let Some(object_ctor) =
-                object::get(global_this, &gc_heap, "Object").and_then(|v| v.as_object())
             && let Some(object_prototype) =
-                object::get(object_ctor, &gc_heap, "prototype").and_then(|v| v.as_object())
+                resolve_ctor_prototype(&mut gc_heap, global_this, "Object")
         {
             error_classes.finalize_after_bootstrap(
                 &mut gc_heap,

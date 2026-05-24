@@ -37,7 +37,7 @@ use quote::{format_ident, quote};
 use std::collections::BTreeSet;
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Expr, Ident, LitInt, LitStr, Path, Result, Token, braced, bracketed, parenthesized,
+    Expr, Ident, LitBool, LitInt, LitStr, Path, Result, Token, braced, bracketed, parenthesized,
     parse_macro_input,
 };
 
@@ -200,6 +200,13 @@ pub(crate) struct HoltInput {
     pub(crate) methods: Vec<MethodEntry>,
     pub(crate) constants: Vec<ConstantEntry>,
     pub(crate) accessors: Vec<AccessorEntry>,
+    /// When `true`, the generated `install` body links the
+    /// namespace's `[[Prototype]]` to `%Object.prototype%`
+    /// (looked up through `Object.prototype` on the global
+    /// passed to `install`). Defaults to `false` to match the
+    /// historical hand-written installers for Math / JSON /
+    /// Console, which omitted the link.
+    pub(crate) link_object_prototype: bool,
 }
 
 impl Parse for HoltInput {
@@ -211,6 +218,7 @@ impl Parse for HoltInput {
         let mut methods: Vec<MethodEntry> = Vec::new();
         let mut constants: Vec<ConstantEntry> = Vec::new();
         let mut accessors: Vec<AccessorEntry> = Vec::new();
+        let mut link_object_prototype = false;
         let mut methods_seen = false;
 
         while !input.is_empty() {
@@ -252,12 +260,17 @@ impl Parse for HoltInput {
                         }
                     }
                 }
+                "link_object_prototype" => {
+                    let lit: LitBool = input.parse()?;
+                    link_object_prototype = lit.value;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown `holt!` field `{other}` — expected `name`, `feature`, \
-                             `spec`, `intrinsic`, `methods`, `constants`, or `accessors`"
+                             `spec`, `intrinsic`, `methods`, `constants`, `accessors`, \
+                             or `link_object_prototype`"
                         ),
                     ));
                 }
@@ -303,6 +316,7 @@ impl Parse for HoltInput {
             methods,
             constants,
             accessors,
+            link_object_prototype,
         })
     }
 }
@@ -336,6 +350,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         methods,
         constants,
         accessors,
+        link_object_prototype,
     } = input;
 
     // Duplicate-name guards.
@@ -513,6 +528,30 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 )
                 .map_err(::otter_vm::JsSurfaceError::from)?
                 .build()?;
+                // §28.1 / §25.4 link to %Object.prototype% when the
+                // caller opts in via `link_object_prototype = true`.
+                // Built-in object spec calls for every ordinary
+                // namespace to inherit from `%Object.prototype%`;
+                // current hand-written installers for Math / JSON /
+                // Console skip it (their JS surface still works
+                // because property lookup falls through to the
+                // empty `[[Prototype]]` chain). Defaulting the
+                // flag to `false` preserves the existing per-port
+                // shape; Reflect and Atomics opt in.
+                if #link_object_prototype
+                    && let ::core::option::Option::Some(object_ctor) =
+                        ::otter_vm::object::get(global, heap, "Object")
+                            .and_then(|v| v.as_object())
+                    && let ::core::option::Option::Some(object_proto) =
+                        ::otter_vm::object::get(object_ctor, heap, "prototype")
+                            .and_then(|v| v.as_object())
+                {
+                    ::otter_vm::object::set_prototype(
+                        namespace,
+                        heap,
+                        ::core::option::Option::Some(object_proto),
+                    );
+                }
                 ::otter_vm::bootstrap::define_global_value(
                     global,
                     heap,

@@ -16,7 +16,7 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 | 4.1b      | Delete `js_namespace` / `js_class` / `raft` helper attrs       | Pending                      |
 | 4.1c      | mdbook chapter: naming theme + per-macro examples              | DONE (Phase 4.1 commit)      |
 | 4.2a      | Port **JSON** (pathfinder, smallest namespace)                 | DONE 2026-05-24              |
-| 4.2b      | Port Math / Reflect / Atomics / Console in parallel            | Pending                      |
+| 4.2b      | Port Math / Reflect / Atomics / Console in parallel            | DONE 2026-05-24              |
 | 4.2c      | Port Proxy / Date / Iterator (first `couch!` users)            | Pending                      |
 | 4.2d      | Port the rest (collections, weak refs, typed arrays, …)        | Pending                      |
 | 4.3       | Rewrite `otter-modules` (`otter:ffi`, `otter:kv`, `otter:sql`) | Pending                      |
@@ -65,10 +65,10 @@ callsite and Test262 deltas land in the port commit message.
 | Surface             | Source                                                     | Target macro       | Port state |
 | ------------------- | ---------------------------------------------------------- | ------------------ | ---------- |
 | JSON                | `crates/otter-vm/src/json/mod.rs`                          | `holt!`            | **DONE 2026-05-24** (4.2a pathfinder) |
-| Math                | `crates/otter-vm/src/math/mod.rs`                          | `holt!`            | Pending    |
-| Reflect             | `crates/otter-vm/src/reflect.rs`                           | `holt!`            | Pending    |
-| Atomics             | `crates/otter-vm/src/atomics.rs`                           | `holt!`            | Pending    |
-| Console             | `crates/otter-vm/src/console.rs`                           | `holt!`            | Pending    |
+| Math                | `crates/otter-vm/src/math/mod.rs`                          | `holt!`            | **DONE 2026-05-24** |
+| Reflect             | `crates/otter-vm/src/reflect.rs`                           | `holt!`            | **DONE 2026-05-24** |
+| Atomics             | `crates/otter-vm/src/atomics.rs`                           | `holt!`            | **DONE 2026-05-24** |
+| Console             | `crates/otter-vm/src/console.rs`                           | `holt!`            | **DONE 2026-05-24** |
 | Object              | `crates/otter-vm/src/object_statics.rs` + `intrinsics/object.rs` | `holt!` + `couch!` (`Object.prototype`) | Pending |
 | Function            | `crates/otter-vm/src/function_prototype.rs` + `intrinsics/function.rs` | `couch!` | Pending |
 | Array               | `crates/otter-vm/src/array_prototype.rs` + `array_statics.rs` + `intrinsics/array.rs` | `couch!` | Pending |
@@ -111,6 +111,40 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — `link_object_prototype` flag + Math/Reflect/Atomics/Console ports (4.2b)
+
+- `holt!` extended with optional `link_object_prototype = true`
+  field (default `false`). When set, generated `install` body
+  links the namespace's `[[Prototype]]` to `%Object.prototype%`
+  by looking up `Object.prototype` on the global passed to
+  `install`. Matches the spec wording for §28.1 (`Reflect`) and
+  §25.4 (`Atomics`); other ports (`Math`, `JSON`, `console`)
+  keep the previous behaviour where the link is skipped.
+- **Math ported.** ~125 lines (eight `ConstSpec` rows + 35
+  `MethodSpec` rows + hand-rolled install body) → ~50 lines of
+  `holt!` invocation with `constants` + `methods` blocks. All eight
+  ECMA-262 §21.3.1 numeric constants emitted via `Number(expr)`
+  form. Test262 `built-ins/Math` 306/327 flat.
+- **Reflect ported.** ~85 lines collapse to ~30. Uses
+  `link_object_prototype = true` to preserve the §28.1
+  `[[Prototype]]` link. Test262 `built-ins/Reflect` 148/154 flat.
+- **Atomics ported.** ~80 lines → ~25, same
+  `link_object_prototype = true` for §25.4. Test262
+  `built-ins/Atomics` 354/390 flat.
+- **Console ported.** Replaced the hand-written `install` body
+  (which used `object::define_own_property` directly) with a
+  `holt!` invocation. `feature = CONSOLE` so the registry still
+  skips it when the embedder opts out of host I/O.
+  `console::install` removed (no external callers — bootstrap
+  iterates `BOOTSTRAP_ENTRIES` and `console::CONSOLE_SPEC`
+  which the macro still emits).
+- Tests: otter-vm 530/530, otter-macros 5/5 (holt 2 + couch 3),
+  clippy clean. No Test262 regressions in any of the four ported
+  suites.
+- Next: 4.2c — first `couch!` consumers. Proxy is the closest
+  shape to the existing `couch!` skeleton; Date and Iterator
+  follow.
 
 ### 2026-05-24 — full `holt!` + `couch!` surface + JSON port (4.2a)
 

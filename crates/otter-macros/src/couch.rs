@@ -231,6 +231,12 @@ pub(crate) struct CouchInput {
     pub(crate) intrinsic_ident: Ident,
     pub(crate) constructor: ConstructorSpecArgs,
     pub(crate) statics: Vec<MethodEntry>,
+    /// References to pre-built `&[MethodSpec]` slices iterated through
+    /// the constructor's `ObjectBuilder`. Mirrors
+    /// `prototype.method_specs` for cases where the static surface is
+    /// declared via a separate generator macro (e.g.
+    /// `STRING_STATIC_METHODS`).
+    pub(crate) static_method_specs: Vec<Path>,
     /// Numeric / boolean / nullish constants pinned as own data
     /// properties on the constructor itself (e.g. `Number.MAX_VALUE`,
     /// `Math.PI` — though Math is a namespace, not a class). Shares
@@ -254,6 +260,7 @@ impl Parse for CouchInput {
         let mut intrinsic_override: Option<Ident> = None;
         let mut constructor: Option<ConstructorSpecArgs> = None;
         let mut statics: Vec<MethodEntry> = Vec::new();
+        let mut static_method_specs: Vec<Path> = Vec::new();
         let mut static_constants: Vec<ConstantEntry> = Vec::new();
         let mut prototype: PrototypeBlock = PrototypeBlock::default();
         let mut post_install: Option<Path> = None;
@@ -272,6 +279,16 @@ impl Parse for CouchInput {
                     braced!(body in input);
                     while !body.is_empty() {
                         statics.push(body.parse()?);
+                        if body.peek(Token![,]) {
+                            body.parse::<Token![,]>()?;
+                        }
+                    }
+                }
+                "static_method_specs" => {
+                    let body;
+                    bracketed!(body in input);
+                    while !body.is_empty() {
+                        static_method_specs.push(body.parse()?);
                         if body.peek(Token![,]) {
                             body.parse::<Token![,]>()?;
                         }
@@ -298,8 +315,8 @@ impl Parse for CouchInput {
                         key.span(),
                         format!(
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
-                             `spec`, `intrinsic`, `constructor`, `statics`, `static_constants`, \
-                             `prototype`, or `post_install`"
+                             `spec`, `intrinsic`, `constructor`, `statics`, `static_method_specs`, \
+                             `static_constants`, `prototype`, or `post_install`"
                         ),
                     ));
                 }
@@ -343,6 +360,7 @@ impl Parse for CouchInput {
             intrinsic_ident,
             constructor,
             statics,
+            static_method_specs,
             static_constants,
             prototype,
             post_install,
@@ -359,6 +377,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         intrinsic_ident,
         constructor,
         statics,
+        static_method_specs,
         static_constants,
         prototype,
         post_install,
@@ -525,6 +544,40 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     };
 
     let prototype_has_method_specs = !prototype.method_specs.is_empty();
+    let static_method_spec_iters = static_method_specs.iter().map(|path| {
+        quote! {
+            for method_spec in #path.iter() {
+                let call_target = match method_spec.call {
+                    ::otter_vm::NativeCall::Static(f) => f,
+                    ::otter_vm::NativeCall::VmIntrinsic(_)
+                    | ::otter_vm::NativeCall::Dynamic(_) => {
+                        return ::core::result::Result::Err(
+                            ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
+                        );
+                    }
+                };
+                let fn_obj = ::otter_vm::bootstrap::native_static_with_value_roots(
+                    heap,
+                    method_spec.name,
+                    method_spec.length,
+                    call_target,
+                    &[&global_root, &ctor_value],
+                )
+                .map_err(::otter_vm::JsSurfaceError::from)?;
+                let desc = ::otter_vm::object::PropertyDescriptor::data(
+                    ::otter_vm::Value::native_function(fn_obj),
+                    method_spec.attrs.writable,
+                    method_spec.attrs.enumerable,
+                    method_spec.attrs.configurable,
+                );
+                if !ctor.define_own_property(heap, method_spec.name, desc) {
+                    return ::core::result::Result::Err(
+                        ::otter_vm::JsSurfaceError::DefinePropertyFailed(method_spec.name),
+                    );
+                }
+            }
+        }
+    });
     let extra_method_spec_iters = prototype.method_specs.iter().map(|path| {
         quote! {
             for method_spec in #path.iter() {
@@ -645,6 +698,14 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         );
                     }
                 }
+
+                // Extra `static_method_specs = [path, ...]` paths —
+                // iterate each pre-built `&[MethodSpec]` slice and
+                // pin on the constructor as own data properties.
+                // Mirrors the prototype.method_specs path so multi-row
+                // surfaces (e.g. STRING_STATIC_METHODS) stay
+                // declarative.
+                #(#static_method_spec_iters)*
 
                 // Static constants (e.g. `Number.NaN`, `Number.MAX_VALUE`).
                 // Pinned as own data properties on the constructor

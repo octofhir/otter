@@ -1,228 +1,77 @@
 //! `String` built-in installer.
 //!
-//! Owns the full installation of the global `String` constructor:
-//! the constructor object, its `[[Prototype]]` chain to
-//! `Object.prototype`, the `prototype` object with the hidden
-//! `[[StringData]]` slot, the JS-visible static method specs from
-//! [`super::statics`], the prototype methods registered through the
-//! `intrinsics!` table in [`super::prototype`], and the
-//! callable+constructable bridge wired through the dispatch path.
-//!
-//! # Contents
-//! - [`Intrinsic`] — zero-sized type implementing
-//!   [`crate::intrinsic_install::BuiltinIntrinsic`] for `String`.
+//! Routes through `couch!`. Static methods come from the pre-built
+//! `STRING_STATIC_METHODS` slice via `static_method_specs`; prototype
+//! methods come from `STRING_PROTOTYPE_METHODS` via the prototype
+//! `method_specs` field. The constructor itself handles call vs
+//! construct internally (§22.1.1). The `[[StringData]] = ""` slot on
+//! the prototype + the §B.2.3 trimLeft/trimRight identity-sharing
+//! ride the `post_install` hook.
 //!
 //! # Invariants
 //! - `Object` is installed before `String` (see
-//!   [`crate::bootstrap::BOOTSTRAP_ENTRIES`] ordering); the installer
-//!   reads `globalThis.Object.prototype` directly to wire the
-//!   prototype chain. Reordering the bootstrap table would break
-//!   this — call sites that move `String` earlier must drop the
-//!   `Object.prototype` lookup.
-//! - The constructor object's reserved `[[ConstructorNative]]` slot
-//!   carries the `String(...)` native and stays distinct from the
-//!   ordinary own property surface; static methods land on the
-//!   constructor object as ordinary own properties.
-//! - The `prototype` carries an empty `[[StringData]]` so
+//!   [`crate::bootstrap::BOOTSTRAP_ENTRIES`] ordering); `couch!` reads
+//!   `globalThis.Object.prototype` to wire the prototype chain.
+//! - The prototype carries an empty `[[StringData]]` so
 //!   `Object.prototype.toString.call(String.prototype)` reports the
 //!   `String` brand and prototype methods recover a string receiver
 //!   when invoked through `Reflect.get` on the prototype.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-string-constructor>
-//! - <https://tc39.es/ecma262/#sec-string>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-string-prototype-object>
-//! - <https://tc39.es/ecma262/#sec-properties-of-the-string-constructor>
 
-use crate::bootstrap::{
-    BootstrapFeatures, alloc_object_with_value_roots, native_static_with_value_roots,
-};
-use crate::intrinsic_install::BuiltinIntrinsic;
-use crate::js_surface::{JsSurfaceError, ObjectBuilder};
+use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
 use crate::{NativeCtx, NativeError, Value};
 
-/// Zero-sized marker type used to install the global `String`
-/// constructor through [`BuiltinIntrinsic`]. The actual installer
-/// body lives in [`install`].
-pub struct Intrinsic;
-
-impl BuiltinIntrinsic for Intrinsic {
-    const NAME: &'static str = "String";
-    const FEATURE: BootstrapFeatures = BootstrapFeatures::CORE;
-
-    fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-        install(heap, global)
-    }
+otter_macros::couch! {
+    name = "String",
+    feature = CORE,
+    constructor = (length = 1, call = string_ctor_call),
+    static_method_specs = [super::statics::STRING_STATIC_METHODS],
+    prototype = {
+        method_specs = [super::prototype::STRING_PROTOTYPE_METHODS],
+    },
+    post_install = pin_string_data_and_aliases,
 }
 
-/// Materialise the global `String` surface.
-///
-/// # Algorithm
-/// 1. Allocate the constructor and prototype objects with explicit
-///    GC roots so a GC during allocation can find them.
-/// 2. Chain both `[[Prototype]]` links to `Object.prototype` so
-///    `Object.prototype.hasOwnProperty` etc. resolve through ordinary
-///    property lookup on both objects.
-/// 3. Seed `String.prototype` with an empty `[[StringData]]` so
-///    prototype methods that fall through to the prototype recover a
-///    string receiver and brand checks observe the spec invariant.
-/// 4. Install the `String(...)` / `new String(...)` native into the
-///    constructor's reserved bridge slot. The native coerces its
-///    argument through `ToString` (§7.1.17) for the call form and
-///    additionally wraps the result in a `[[StringData]]` object for
-///    the construct form, matching §22.1.1.
-/// 5. Install `String.prototype` as an own property on the
-///    constructor object.
-/// 6. Install the static methods declared by [`super::statics`]
-///    (`fromCharCode`, `fromCodePoint`) so user code reading
-///    `String.fromCharCode` resolves to a real callable rather than
-///    `undefined`.
-/// 7. Cross-link `String.prototype.constructor` and register the
-///    `String` global binding on `globalThis`.
-///
-/// # Errors
-/// - [`JsSurfaceError::OutOfMemory`] — heap exhausted while
-///   allocating the constructor object, prototype object, or native
-///   function metadata.
-/// - [`JsSurfaceError`] propagated from `ObjectBuilder` when
-///   installing static method specs.
-fn install(heap: &mut otter_gc::GcHeap, global: JsObject) -> Result<(), JsSurfaceError> {
-    let global_root = Value::object(global);
-    let constructor = alloc_object_with_value_roots(heap, &[&global_root])?;
-    let constructor_root = Value::object(constructor);
-    let prototype = alloc_object_with_value_roots(heap, &[&global_root, &constructor_root])?;
-    if let Some(object_ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object())
-        && let Some(object_proto) =
-            object::get(object_ctor, heap, "prototype").and_then(|v| v.as_object())
-    {
-        object::set_prototype(constructor, heap, Some(object_proto));
-        object::set_prototype(prototype, heap, Some(object_proto));
-    }
+/// Post-bootstrap fixup:
+/// - §22.1.3 — set `[[StringData]] = ""` on the prototype so brand
+///   checks and prototype-method receivers behave per spec.
+/// - §B.2.3.{2,3} — `String.prototype.trimLeft` is the SAME function
+///   object as `String.prototype.trimStart` (and `trimRight` ===
+///   `trimEnd`). Replace the independently-installed copies with
+///   shared references so identity holds.
+fn pin_string_data_and_aliases(
+    heap: &mut otter_gc::GcHeap,
+    _global: JsObject,
+    ctor: crate::native_function::NativeFunction,
+) -> Result<(), JsSurfaceError> {
+    let descriptor = ctor
+        .own_property_descriptor(heap, "prototype")
+        .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let prototype = match descriptor.and_then(|d| match d.kind {
+        crate::object::DescriptorKind::Data { value } => value.as_object(),
+        _ => None,
+    }) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
     let empty_str =
         crate::string::JsString::from_str("", heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
     crate::object::set_string_data(prototype, heap, empty_str);
 
-    let prototype_root = Value::object(prototype);
-    let ctor_native = native_static_with_value_roots(
-        heap,
-        "String",
-        1,
-        string_ctor_call,
-        &[&global_root, &constructor_root, &prototype_root],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    object::set_constructor_native(constructor, heap, Value::native_function(ctor_native));
-    // §22.1.2.3 — `String.prototype` is a non-writable, non-enumerable,
-    // non-configurable data property.
-    let _ = object::define_own_property(
-        constructor,
-        heap,
-        "prototype",
-        crate::object::PropertyDescriptor::data(Value::object(prototype), false, false, false),
-    );
-    // §22.1.2 — `String.length` is a non-writable, non-enumerable,
-    // configurable data property whose value is 1.
-    let _ = object::define_own_property(
-        constructor,
-        heap,
-        "length",
-        crate::object::PropertyDescriptor::data(Value::number_i32(1), false, false, true),
-    );
-    // §22.1.2 — `String.name` is `"String"`, non-writable,
-    // non-enumerable, configurable.
-    let string_name_value = Value::string(
-        crate::JsString::from_str("String", heap).map_err(|_| JsSurfaceError::OutOfMemory)?,
-    );
-    let _ = object::define_own_property(
-        constructor,
-        heap,
-        "name",
-        crate::object::PropertyDescriptor::data(string_name_value, false, false, true),
-    );
-
-    // §22.1.2 Properties of the String Constructor — install
-    // JS-visible static method specs as ordinary own properties.
-    {
-        let mut builder = ObjectBuilder::from_object_with_value_roots(
-            heap,
-            constructor,
-            vec![global_root, prototype_root],
-        );
-        for spec in super::statics::STRING_STATIC_METHODS {
-            builder.method_from_spec(spec)?;
-        }
-    }
-
-    // §22.1.3 Properties of the String Prototype Object — install
-    // JS-visible prototype method specs so `"abc".split` and
-    // `Reflect.get(String.prototype, "trim")` resolve to real
-    // callables. The compile-time `CallString` opcode keeps using
-    // the prototype intrinsic table directly for the hot path.
-    {
-        let mut builder = ObjectBuilder::from_object_with_value_roots(
-            heap,
-            prototype,
-            vec![global_root, constructor_root],
-        );
-        for spec in super::prototype::STRING_PROTOTYPE_METHODS {
-            builder.method_from_spec(spec)?;
-        }
-    }
-
-    // §B.2.3.{2,3} — `String.prototype.trimLeft` is the **same
-    // function object** as `String.prototype.trimStart`, and
-    // `trimRight` is the same object as `trimEnd`. Replace the
-    // independent installations with shared references so identity
-    // checks (`String.prototype.trimLeft === String.prototype.trimStart`)
-    // hold per spec.
     if let Some(start_fn) = object::get(prototype, heap, "trimStart") {
         object::set(prototype, heap, "trimLeft", start_fn);
     }
     if let Some(end_fn) = object::get(prototype, heap, "trimEnd") {
         object::set(prototype, heap, "trimRight", end_fn);
     }
-
-    let string_value = Value::object(constructor);
-    let _ = object::define_own_property(
-        prototype,
-        heap,
-        "constructor",
-        crate::object::PropertyDescriptor::data(string_value, true, false, true),
-    );
-    crate::bootstrap::define_global_value(
-        global,
-        heap,
-        <Intrinsic as BuiltinIntrinsic>::NAME,
-        string_value,
-    );
     Ok(())
 }
 
 /// `String(...)` / `new String(...)` native — ECMA-262 §22.1.1.
-///
-/// # Algorithm
-/// 1. If no argument was supplied, default to the empty string per
-///    §22.1.1 step 1; an explicit `undefined` still coerces to
-///    `"undefined"` through `ToString`.
-/// 2. If the value is already a primitive (`undefined`, `null`,
-///    `Boolean`, `Number`, `BigInt`, `String`, `Symbol`), pass it
-///    through unchanged. Otherwise call `ToPrimitive(value, "string")`
-///    via the interpreter so `@@toPrimitive` / `toString` / `valueOf`
-///    are observable.
-/// 3. Dispatch through [`crate::string::dispatch::call`] with
-///    [`otter_bytecode::method_id::StringMethod::Construct`]. The
-///    dispatcher performs `ToString` and returns a JS string value.
-/// 4. For the construct form (`new String(...)`), unwrap the string
-///    primitive and install it as the receiver's `[[StringData]]`,
-///    yielding a `String` wrapper object.
-///
-/// # Errors
-/// - [`NativeError::TypeError`] — `ToPrimitive` rejected an exotic
-///   receiver, the dispatcher could not coerce, or the construct form
-///   ran without an object receiver.
-/// - [`NativeError::Thrown`] — `ToPrimitive` raised an uncaught JS
-///   exception (rethrown without wrapping).
 fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let raw = match args.first() {
         Some(value) => *value,

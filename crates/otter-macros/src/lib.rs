@@ -275,6 +275,7 @@ pub fn lodge(input: TokenStream) -> TokenStream {
     lodge::expand(input)
 }
 
+
 /// Emit a `&[MethodSpec]` table plus a `pub static <SPEC>:
 /// NamespaceSpec` that wraps it. Used standalone when assembling a
 /// method table by hand; inline rows inside `holt!` / `couch!`

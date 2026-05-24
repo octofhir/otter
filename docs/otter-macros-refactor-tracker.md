@@ -101,15 +101,61 @@ callsite and Test262 deltas land in the port commit message.
 
 | Surface    | Source                                                   | Target macro | Port state |
 | ---------- | -------------------------------------------------------- | ------------ | ---------- |
-| URL        | `crates/otter-web/src/url.rs`                            | `couch!`     | Pending    |
-| Blob       | `crates/otter-web/src/blob.rs`                           | `couch!`     | Pending    |
-| Headers    | `crates/otter-web/src/headers.rs`                        | `couch!`     | Pending    |
-| Request / Response | `crates/otter-web/src/request_response.rs`       | `couch!` (×2)| Pending    |
+| URL        | `crates/otter-web/src/url.rs`                            | `couch!`     | **DONE 2026-05-24** |
+| Blob       | `crates/otter-web/src/blob.rs`                           | `couch!`     | **DONE 2026-05-24** |
+| Headers    | `crates/otter-web/src/headers.rs`                        | `couch!`     | **DONE 2026-05-24** |
+| Request / Response | `crates/otter-web/src/request_response.rs`       | `couch!` (×2)| **DONE 2026-05-24** |
 
 ## Per-session log
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — otter-web ported to couch! (4.3 wrap)
+
+User push-back: "why is `web` a different macro if Web APIs are just
+global classes?" Right answer — they ARE global classes, same shape
+as bootstrap classes, only the install backend differs (opt-in via
+`RuntimeBuilder::with_web_apis` vs always-on via `BOOTSTRAP_ENTRIES`).
+
+Unification:
+
+- Added `BootstrapFeatures::WEB` flag (no behaviour change at the
+  registry — Web APIs are not in `BOOTSTRAP_ENTRIES`, they bind via
+  the runtime builder).
+- Reshaped `GlobalClass` to wrap either a `RuntimeClassSpec`
+  (legacy) or a `BuiltinIntrinsic::install` fn pointer (new). The
+  runtime install loop pattern-matches and routes accordingly.
+- Added `GlobalClass::from_intrinsic::<I>()` constructor that
+  captures `I::install` + `I::NAME` at const time.
+
+Ports — all five Web classes now use `couch!` with `feature = WEB`:
+
+- `URL` (1 prototype method, `toString`)
+- `Headers` (6 prototype methods)
+- `Blob` (3 prototype methods + 2 getter accessors `size` / `type`)
+- `Request` (1 prototype method, `clone`)
+- `Response` (1 static `json`, 1 prototype `clone`)
+
+`WEB_API_CLASSES` is now `&[GlobalClass]` with five
+`GlobalClass::from_intrinsic::<…>()` rows. `WebApiClass` wrapper
+struct deleted (was redundant — `GlobalClass` already carries the
+name). Hand-rolled `<NAME>_CLASS_SPEC` / `<NAME>_PROTOTYPE_METHODS`
+/ `<NAME>_PROTOTYPE_ACCESSORS` statics all gone.
+
+The short-lived `web!` proc-macro (created earlier in this session)
+deleted — couch! already covers the shape, web! was a transitional
+artifact.
+
+Final macro surface: `holt!` / `couch!` / `lodge!` / `raft!` /
+`#[dive]`. Three install backends (bootstrap registry, runtime
+builder, hosted module loader), one declarative grammar per class
+shape.
+
+Tests: otter-web 6/6 (including runtime install smoke test that
+exercises `new URL(...)`, `new Headers()`, `new Blob(...)`,
+`new Request(...)`, `Response.json(...)`), otter-vm 530/530, clippy
+clean across macros / runtime / vm / web.
 
 ### 2026-05-24 — `lodge!` shipped + `otter-modules` ported (4.3)
 

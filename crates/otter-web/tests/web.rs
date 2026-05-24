@@ -9,11 +9,9 @@ use otter_web::{WebApiBuilderExt, web_api_classes};
 fn web_api_specs_are_static_and_ordered() {
     let specs = web_api_classes();
     assert_eq!(
-        specs.iter().map(|spec| spec.name).collect::<Vec<_>>(),
+        specs.iter().map(|spec| spec.name()).collect::<Vec<_>>(),
         ["URL", "Headers", "Blob", "Request", "Response"]
     );
-    assert_eq!(specs[0].spec.name(), "URL");
-    assert_eq!(specs[2].spec.name(), "Blob");
 }
 
 #[test]

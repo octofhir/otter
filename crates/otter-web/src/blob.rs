@@ -1,11 +1,9 @@
 //! WHATWG Blob host-side bytes.
 
 use otter_runtime::{
-    RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeJsObject as JsObject,
-    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
-    runtime_constructor, runtime_getter, runtime_method, runtime_optional_arg_to_string,
-    runtime_this_object, runtime_with_host_data,
+    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
+    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
 };
 
 /// Owned Blob data.
@@ -69,29 +67,22 @@ fn normalize_type(value: &str) -> String {
     }
 }
 
-/// Static Blob class spec.
-static BLOB_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] = &[
-    runtime_method("arrayBuffer", 0, blob_array_buffer_native),
-    runtime_method("slice", 2, blob_slice_native),
-    runtime_method("text", 0, blob_text_native),
-];
-
-static BLOB_PROTOTYPE_ACCESSORS: &[otter_runtime::RuntimeAccessorSpec] = &[
-    runtime_getter("size", blob_size_native),
-    runtime_getter("type", blob_type_native),
-];
-
-pub static BLOB_CLASS_SPEC: ClassSpec = runtime_class(
-    runtime_constructor(
-        "Blob",
-        0,
-        blob_constructor_native,
-        &[],
-        BLOB_PROTOTYPE_METHODS,
-        Attr::global_binding(),
-    ),
-    BLOB_PROTOTYPE_ACCESSORS,
-);
+otter_macros::couch! {
+    name = "Blob",
+    feature = WEB,
+    constructor = (length = 0, call = blob_constructor_native),
+    prototype = {
+        methods = {
+            "arrayBuffer" / 0 => blob_array_buffer_native,
+            "slice"       / 2 => blob_slice_native,
+            "text"        / 0 => blob_text_native,
+        },
+        accessors = [
+            ("size", get = blob_size_native),
+            ("type", get = blob_type_native),
+        ],
+    },
+}
 
 fn blob_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let text = crate::arg_string(args, 0, ctx.heap());

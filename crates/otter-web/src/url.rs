@@ -1,11 +1,9 @@
 //! WHATWG URL host-side record.
 
 use otter_runtime::{
-    RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeJsObject as JsObject,
-    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
-    runtime_constructor, runtime_method, runtime_optional_arg_to_string, runtime_this_object,
-    runtime_with_host_data,
+    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
+    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
 };
 use url::Url;
 
@@ -119,21 +117,16 @@ impl WebUrl {
     }
 }
 
-/// Static URL class spec.
-static URL_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] =
-    &[runtime_method("toString", 0, url_to_string_native)];
-
-pub static URL_CLASS_SPEC: ClassSpec = runtime_class(
-    runtime_constructor(
-        "URL",
-        1,
-        url_constructor_native,
-        &[],
-        URL_PROTOTYPE_METHODS,
-        Attr::global_binding(),
-    ),
-    &[],
-);
+otter_macros::couch! {
+    name = "URL",
+    feature = WEB,
+    constructor = (length = 1, call = url_constructor_native),
+    prototype = {
+        methods = {
+            "toString" / 0 => url_to_string_native,
+        },
+    },
+}
 
 fn url_constructor_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let input = crate::arg_string(args, 0, ctx.heap());

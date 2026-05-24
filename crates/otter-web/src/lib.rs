@@ -32,55 +32,34 @@ use otter_runtime::{
     runtime_string_value, runtime_type_error,
 };
 
-/// Static descriptor for a Web API class/global.
-#[derive(Debug, Clone, Copy)]
-pub struct WebApiClass {
-    /// Global constructor name.
-    pub name: &'static str,
-    /// Runtime-owned global class surface.
-    pub spec: GlobalClass,
-}
-
-/// Active Web API class specs in deterministic bootstrap order.
-pub static WEB_API_CLASSES: &[WebApiClass] = &[
-    WebApiClass {
-        name: "URL",
-        spec: GlobalClass::from_runtime(&url::URL_CLASS_SPEC),
-    },
-    WebApiClass {
-        name: "Headers",
-        spec: GlobalClass::from_runtime(&headers::HEADERS_CLASS_SPEC),
-    },
-    WebApiClass {
-        name: "Blob",
-        spec: GlobalClass::from_runtime(&blob::BLOB_CLASS_SPEC),
-    },
-    WebApiClass {
-        name: "Request",
-        spec: GlobalClass::from_runtime(&request_response::REQUEST_CLASS_SPEC),
-    },
-    WebApiClass {
-        name: "Response",
-        spec: GlobalClass::from_runtime(&request_response::RESPONSE_CLASS_SPEC),
-    },
+/// Active Web API class globals in deterministic bootstrap order.
+/// Each entry is the `couch!`-generated `BuiltinIntrinsic` for one
+/// Web class. The runtime installs them via the same fn-pointer
+/// path as bootstrap registry entries.
+pub static WEB_API_CLASSES: &[GlobalClass] = &[
+    GlobalClass::from_intrinsic::<url::Intrinsic>(),
+    GlobalClass::from_intrinsic::<headers::Intrinsic>(),
+    GlobalClass::from_intrinsic::<blob::Intrinsic>(),
+    GlobalClass::from_intrinsic::<request_response::RequestIntrinsic>(),
+    GlobalClass::from_intrinsic::<request_response::ResponseIntrinsic>(),
 ];
 
 /// Return active Web API specs.
 #[must_use]
-pub const fn web_api_classes() -> &'static [WebApiClass] {
+pub const fn web_api_classes() -> &'static [GlobalClass] {
     WEB_API_CLASSES
 }
 
 /// Register active Web API globals on a runtime builder.
 #[must_use]
 pub fn with_web_apis(builder: RuntimeBuilder) -> RuntimeBuilder {
-    builder.global_classes(WEB_API_CLASSES.iter().map(|class| class.spec))
+    builder.global_classes(WEB_API_CLASSES.iter().copied())
 }
 
 /// Register active Web API globals on a Layer-A builder.
 #[must_use]
 pub fn with_web_apis_for_otter(builder: OtterBuilder) -> OtterBuilder {
-    builder.global_classes(WEB_API_CLASSES.iter().map(|class| class.spec))
+    builder.global_classes(WEB_API_CLASSES.iter().copied())
 }
 
 /// Ergonomic extension trait for enabling Web APIs on builders.

@@ -1,11 +1,9 @@
 //! Fetch Request and Response host-side records.
 
 use otter_runtime::{
-    RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeHostObjectError,
-    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
-    runtime_constructor, runtime_method, runtime_optional_arg_to_string, runtime_this_object,
-    runtime_with_host_data,
+    RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
+    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
 };
 
 use crate::blob::Blob;
@@ -126,40 +124,32 @@ impl Response {
     }
 }
 
-/// Static Request class spec.
-static REQUEST_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] =
-    &[runtime_method("clone", 0, request_clone_native)];
+otter_macros::couch! {
+    name = "Request",
+    feature = WEB,
+    intrinsic = RequestIntrinsic,
+    constructor = (length = 1, call = request_constructor_native),
+    prototype = {
+        methods = {
+            "clone" / 0 => request_clone_native,
+        },
+    },
+}
 
-pub static REQUEST_CLASS_SPEC: ClassSpec = runtime_class(
-    runtime_constructor(
-        "Request",
-        1,
-        request_constructor_native,
-        &[],
-        REQUEST_PROTOTYPE_METHODS,
-        Attr::global_binding(),
-    ),
-    &[],
-);
-
-/// Static Response class spec.
-static RESPONSE_STATIC_METHODS: &[otter_runtime::RuntimeMethodSpec] =
-    &[runtime_method("json", 1, response_json_native)];
-
-static RESPONSE_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] =
-    &[runtime_method("clone", 0, response_clone_native)];
-
-pub static RESPONSE_CLASS_SPEC: ClassSpec = runtime_class(
-    runtime_constructor(
-        "Response",
-        0,
-        response_constructor_native,
-        RESPONSE_STATIC_METHODS,
-        RESPONSE_PROTOTYPE_METHODS,
-        Attr::global_binding(),
-    ),
-    &[],
-);
+otter_macros::couch! {
+    name = "Response",
+    feature = WEB,
+    intrinsic = ResponseIntrinsic,
+    constructor = (length = 0, call = response_constructor_native),
+    statics = {
+        "json" / 1 => response_json_native,
+    },
+    prototype = {
+        methods = {
+            "clone" / 0 => response_clone_native,
+        },
+    },
+}
 
 fn request_constructor_native(
     ctx: &mut NativeCtx<'_>,

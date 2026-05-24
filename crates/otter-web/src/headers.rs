@@ -3,11 +3,9 @@
 use std::collections::BTreeMap;
 
 use otter_runtime::{
-    RuntimeAttr as Attr, RuntimeClassSpec as ClassSpec, RuntimeHostObjectError,
-    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
-    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_class,
-    runtime_constructor, runtime_method, runtime_this_object, runtime_with_host_data,
-    runtime_with_host_data_mut,
+    RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
+    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
+    runtime_this_object, runtime_with_host_data, runtime_with_host_data_mut,
 };
 
 /// Headers validation error.
@@ -100,27 +98,21 @@ fn normalize_value(value: &str) -> String {
     value.trim_matches(|c| c == ' ' || c == '\t').to_string()
 }
 
-/// Static Headers class spec.
-static HEADERS_PROTOTYPE_METHODS: &[otter_runtime::RuntimeMethodSpec] = &[
-    runtime_method("append", 2, headers_append_native),
-    runtime_method("delete", 1, headers_delete_native),
-    runtime_method("get", 1, headers_get_native),
-    runtime_method("has", 1, headers_has_native),
-    runtime_method("set", 2, headers_set_native),
-    runtime_method("entries", 0, headers_entries_native),
-];
-
-pub static HEADERS_CLASS_SPEC: ClassSpec = runtime_class(
-    runtime_constructor(
-        "Headers",
-        0,
-        headers_constructor_native,
-        &[],
-        HEADERS_PROTOTYPE_METHODS,
-        Attr::global_binding(),
-    ),
-    &[],
-);
+otter_macros::couch! {
+    name = "Headers",
+    feature = WEB,
+    constructor = (length = 0, call = headers_constructor_native),
+    prototype = {
+        methods = {
+            "append"  / 2 => headers_append_native,
+            "delete"  / 1 => headers_delete_native,
+            "get"     / 1 => headers_get_native,
+            "has"     / 1 => headers_has_native,
+            "set"     / 2 => headers_set_native,
+            "entries" / 0 => headers_entries_native,
+        },
+    },
+}
 
 fn headers_constructor_native(
     ctx: &mut NativeCtx<'_>,

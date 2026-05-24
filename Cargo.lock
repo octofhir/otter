@@ -2058,7 +2058,10 @@ dependencies = [
 name = "otter-web"
 version = "0.1.0"
 dependencies = [
+ "otter-gc",
+ "otter-macros",
  "otter-runtime",
+ "otter-vm",
  "thiserror",
  "url",
 ]

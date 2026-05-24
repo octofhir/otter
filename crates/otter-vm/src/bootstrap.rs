@@ -54,6 +54,10 @@ impl BootstrapFeatures {
     pub const CORE: Self = Self(0b0001);
     /// Host console surface.
     pub const CONSOLE: Self = Self(0b0010);
+    /// Web Platform API globals (URL / Blob / Headers / Request /
+    /// Response). Opt-in — runtime callers add it through
+    /// `RuntimeBuilder::with_web_apis`.
+    pub const WEB: Self = Self(0b0100);
 
     /// All default surfaces.
     #[must_use]

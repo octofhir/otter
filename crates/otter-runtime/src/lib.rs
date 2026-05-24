@@ -317,7 +317,24 @@ impl HostedModule {
 /// class specs directly.
 #[derive(Debug, Clone, Copy)]
 pub struct GlobalClass {
-    raw: &'static RuntimeClassSpec,
+    inner: GlobalClassInner,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GlobalClassInner {
+    /// Legacy path — runtime builder installs via `Interpreter::install_global_class`.
+    Spec(&'static RuntimeClassSpec),
+    /// Bootstrap-style path — runtime builder calls the
+    /// `BuiltinIntrinsic::install` fn pointer directly, same as the
+    /// `BOOTSTRAP_ENTRIES` registry. Used by `couch!`-generated Web
+    /// API classes.
+    Intrinsic {
+        install: fn(
+            &mut otter_gc::GcHeap,
+            otter_vm::JsObject,
+        ) -> Result<(), otter_vm::js_surface::JsSurfaceError>,
+        name: &'static str,
+    },
 }
 
 impl GlobalClass {
@@ -325,17 +342,32 @@ impl GlobalClass {
     /// spec.
     #[must_use]
     pub const fn from_runtime(raw: &'static RuntimeClassSpec) -> Self {
-        Self { raw }
+        Self {
+            inner: GlobalClassInner::Spec(raw),
+        }
+    }
+
+    /// Build a runtime global class handle from a `couch!`-generated
+    /// `BuiltinIntrinsic`. Equivalent install shape to bootstrap
+    /// registry entries — the runtime calls `I::install(heap, global)`
+    /// at startup instead of routing through `RuntimeClassSpec`.
+    #[must_use]
+    pub const fn from_intrinsic<I: otter_vm::intrinsic_install::BuiltinIntrinsic>() -> Self {
+        Self {
+            inner: GlobalClassInner::Intrinsic {
+                install: I::install,
+                name: I::NAME,
+            },
+        }
     }
 
     /// Constructor/global name.
     #[must_use]
     pub const fn name(self) -> &'static str {
-        self.raw.constructor.name
-    }
-
-    fn raw(self) -> &'static RuntimeClassSpec {
-        self.raw
+        match self.inner {
+            GlobalClassInner::Spec(raw) => raw.constructor.name,
+            GlobalClassInner::Intrinsic { name, .. } => name,
+        }
     }
 }
 
@@ -1274,12 +1306,25 @@ impl Runtime {
         interp.set_max_stack_depth(config.max_stack_depth);
         interp.set_console_sink(config.console_sink.clone());
         for spec in &config.global_classes {
-            interp
-                .install_global_class(spec.raw())
-                .map_err(|err| OtterError::Internal {
-                    code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                    message: err.to_string(),
-                })?;
+            match spec.inner {
+                GlobalClassInner::Spec(raw) => {
+                    interp
+                        .install_global_class(raw)
+                        .map_err(|err| OtterError::Internal {
+                            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                            message: err.to_string(),
+                        })?;
+                }
+                GlobalClassInner::Intrinsic { install, .. } => {
+                    let global = *interp.global_this();
+                    install(interp.gc_heap_mut(), global).map_err(|err| {
+                        OtterError::Internal {
+                            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                            message: err.to_string(),
+                        }
+                    })?;
+                }
+            }
         }
         process::install_global(
             &mut interp,

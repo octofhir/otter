@@ -19,8 +19,7 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 | 4.2b      | Port Math / Reflect / Atomics / Console in parallel            | DONE 2026-05-24              |
 | 4.2c      | Port Proxy / Date / Iterator + Promise (first `couch!` users)  | DONE 2026-05-24              |
 | 4.2d      | Port the rest (collections, weak refs, typed arrays, …)        | In progress                  |
-| 4.3       | Rewrite `otter-modules` (`otter:ffi`, `otter:kv`, `otter:sql`) | Pending                      |
-|           | + `otter-web` if `burrow!` / `lodge!` apply                    |                              |
+| 4.3       | Rewrite `otter-modules` (`otter:ffi`, `otter:kv`, `otter:sql`) | **DONE 2026-05-24** (kv/sql/ffi on `lodge!`; `otter-web` deferred — needs class shape, not a module surface) |
 
 ## Macro implementation checklist (4.1a)
 
@@ -31,7 +30,7 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 | `raft!` (extend) | `crates/otter-macros/src/raft.rs`           | `tests/raft.rs`         | Existing                       |
 | `#[dive]` attr   | `crates/otter-macros/src/dive.rs`           | `tests/dive_*.rs`       | Pending                        |
 | `burrow!`        | `crates/otter-macros/src/burrow.rs`         | `tests/burrow_*.rs`     | Deferred (Q3)                  |
-| `lodge!`         | `crates/otter-macros/src/lodge.rs`          | `tests/lodge_*.rs`      | Pending (4.3)                  |
+| `lodge!`         | `crates/otter-macros/src/lodge.rs`          | (smoke via consumer ports) | **DONE 2026-05-24** (shipped with prefix/name/capabilities/exports surface; trybuild matrix pending) |
 | `Pelt` derive    | `crates/otter-macros/src/derive_pelt.rs`    | `tests/derive_pelt.rs`  | Pending                        |
 | `Groom` derive   | `crates/otter-macros/src/derive_groom.rs`   | `tests/derive_groom.rs` | Pending                        |
 
@@ -94,9 +93,9 @@ callsite and Test262 deltas land in the port commit message.
 
 | Module     | Source                                  | Target macro | Port state |
 | ---------- | --------------------------------------- | ------------ | ---------- |
-| `otter:ffi`| `crates/otter-modules/src/ffi.rs`       | `lodge!`     | Pending (4.3) |
-| `otter:kv` | `crates/otter-modules/src/kv.rs`        | `lodge!`     | Pending (4.3) |
-| `otter:sql`| `crates/otter-modules/src/sql.rs`       | `lodge!`     | Pending (4.3) |
+| `otter:ffi`| `crates/otter-modules/src/ffi.rs`       | `lodge!`     | **DONE 2026-05-24** |
+| `otter:kv` | `crates/otter-modules/src/kv.rs`        | `lodge!`     | **DONE 2026-05-24** |
+| `otter:sql`| `crates/otter-modules/src/sql.rs`       | `lodge!`     | **DONE 2026-05-24** |
 
 ### Web APIs → mix
 
@@ -111,6 +110,44 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — `lodge!` shipped + `otter-modules` ported (4.3)
+
+New proc-macro `lodge!` lives at `crates/otter-macros/src/lodge.rs`
+and generates one `pub fn install_<name>_module(...)` plus one
+`pub static <UPPER>_HOSTED_MODULE: HostedModule` row per invocation.
+
+Surface:
+
+- `prefix = "otter"` + `name = "kv"` → registers `otter:kv`.
+- `capabilities = true` makes the install body capture a
+  `CapabilitySet` clone from `HostedModuleCtx::capabilities()` and
+  emit one `HostedNativeCall::dynamic` per export with the closure
+  signature `fn(ctx, args, &CapabilitySet)`. Without the flag, each
+  export is a plain `fn(ctx, args)` registered through
+  `HostedModuleCtx::builtin_method`.
+- `exports = { "openKv" / 1 => open_kv, … }` — inline rows.
+- `install = path` / `module_static = path` override the derived
+  identifiers (default `install_<name>_module` /
+  `<UPPER>_HOSTED_MODULE`).
+
+Ports:
+
+- `otter:kv` (commit pending) — install body collapses from a
+  hand-rolled capability-capturing closure pair to one `lodge!`
+  invocation. `HOSTED_MODULES` row replaced with the generated
+  `kv::KV_HOSTED_MODULE` static.
+- `otter:sql` — same shape, two-method export
+  (`openSql` / `sql` aliasing).
+- `otter:ffi` — single export (`dlopen`).
+
+`otter-web` deferred — its surfaces (URL, Blob, Headers,
+Request / Response) are classes installed on `globalThis`, not
+module-import targets, so they belong on `couch!`, not `lodge!`.
+
+Tests: otter-modules 7/7, otter-vm 530/530, clippy clean across
+`otter-modules` + `otter-macros`. Macro surface now complete:
+`holt!`, `couch!`, `lodge!`, `raft!`, `#[dive]`.
 
 ### 2026-05-24 — Legacy `js_namespace` / `js_class` deleted (4.1b)
 

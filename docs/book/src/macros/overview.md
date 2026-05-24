@@ -241,27 +241,52 @@ embedder side.
 ## `lodge!` — Hosted Module
 
 Hosted modules served via `otter:` (built-in), `node:`
-(compatibility shim), and user-defined prefixes. The macro produces
-the module descriptor (prefix, name, ESM export table, capability
-metadata) plus the loader registration glue.
+(compatibility shim), and user-defined prefixes. Each invocation
+emits a `pub fn install_<name>_module(&mut HostedModuleCtx<'_>) ->
+Result<(), String>` installer plus a `pub static
+<UPPER>_HOSTED_MODULE: HostedModule` row callers drop into their
+`HOSTED_MODULES` array.
+
+Plain exports — static `fn(ctx, args) -> Result<Value, NativeError>`
+pointers registered through `HostedModuleCtx::builtin_method`:
 
 ```rust,ignore
-use otter_macros::{lodge, raft};
-
-lodge! {
+otter_macros::lodge! {
     prefix = "otter",
-    name   = "kv",
-    capabilities = [Net("kv.example.com")],
-    exports = raft! {
-        "get"  / 1 => kv_get,
-        "set"  / 2 => kv_set,
-        "open" / 1 => kv_open,
+    name = "math",
+    exports = {
+        "add" / 2 => add_fn,
+        "mul" / 2 => mul_fn,
     },
 }
 ```
 
-Capability metadata is consulted by the loader **before** resolution,
-so denied imports fail at resolve time, not at call time. See
+Capability-aware exports — each export takes a borrowed
+`&CapabilitySet` snapshot captured at install time, registered as a
+`HostedNativeCall::dynamic` closure:
+
+```rust,ignore
+otter_macros::lodge! {
+    prefix = "otter",
+    name = "kv",
+    capabilities = true,
+    exports = {
+        "openKv" / 1 => open_kv,
+        "kv"     / 1 => open_kv,
+    },
+}
+
+fn open_kv(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    caps: &CapabilitySet,
+) -> Result<Value, NativeError> {
+    // … permission-checked open …
+}
+```
+
+Optional fields `install = my_install_fn` and `module_static =
+MY_MODULE` override the derived identifiers. See
 [Hosted Modules](../extensions/hosted-modules.md) for the loader
 contract.
 

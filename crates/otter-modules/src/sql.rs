@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
+use otter_runtime::CapabilitySet;
 use otter_runtime::{
     RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
@@ -184,17 +184,14 @@ fn sqlite_value_to_json(value: ValueRef<'_>) -> JsonValue {
     }
 }
 
-/// Install the `otter:sql` namespace object.
-pub fn install_sql_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    let caps = ctx.capabilities().clone();
-    let open = std::sync::Arc::new(
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            open_sql(ctx, args, &caps)
-        },
-    );
-    ctx.method("openSql", 1, HostedNativeCall::dynamic(open.clone()))?
-        .method("sql", 1, HostedNativeCall::dynamic(open))?;
-    Ok(())
+otter_macros::lodge! {
+    prefix = "otter",
+    name = "sql",
+    capabilities = true,
+    exports = {
+        "openSql" / 1 => open_sql,
+        "sql"     / 1 => open_sql,
+    },
 }
 
 fn open_sql(

@@ -1887,6 +1887,7 @@ name = "otter-modules"
 version = "0.1.0"
 dependencies = [
  "libloading",
+ "otter-macros",
  "otter-runtime",
  "rusqlite",
  "serde_json",

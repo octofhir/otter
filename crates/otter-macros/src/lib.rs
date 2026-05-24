@@ -158,6 +158,7 @@ use syn::{
 
 mod couch;
 mod holt;
+mod lodge;
 
 /// Generate a `NamespaceSpec` + `BuiltinIntrinsic` adapter for a
 /// non-constructible namespace intrinsic (`Math`, `JSON`, `Reflect`,
@@ -238,6 +239,40 @@ pub fn holt(input: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn couch(input: TokenStream) -> TokenStream {
     couch::expand(input)
+}
+
+/// Generate a hosted module installer + `HostedModule` row for an
+/// `otter:*` / `node:*` module surface.
+///
+/// See the crate-level docs and
+/// [`docs/otter-macros-design.md`](../../../docs/otter-macros-design.md)
+/// for the naming theme. The macro emits:
+///
+/// - `pub fn install_<name>_module(&mut HostedModuleCtx) -> Result<(), String>`
+/// - `pub static <UPPER>_HOSTED_MODULE: HostedModule`
+///
+/// Two export shapes are supported. Plain exports are static
+/// `fn(ctx, args) -> Result<Value, NativeError>` pointers
+/// registered through `HostedModuleCtx::builtin_method`.
+/// Capability-aware exports (set `capabilities = true`) take a
+/// `&CapabilitySet` snapshot captured at install time and are
+/// registered through `HostedNativeCall::dynamic` with the
+/// snapshot in the closure capture.
+///
+/// ```rust,ignore
+/// otter_macros::lodge! {
+///     prefix = "otter",
+///     name = "kv",
+///     capabilities = true,
+///     exports = {
+///         "openKv" / 1 => open_kv,
+///         "kv"     / 1 => open_kv,
+///     },
+/// }
+/// ```
+#[proc_macro]
+pub fn lodge(input: TokenStream) -> TokenStream {
+    lodge::expand(input)
 }
 
 /// Emit a `&[MethodSpec]` table plus a `pub static <SPEC>:

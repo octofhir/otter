@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libloading::Library;
-use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
+use otter_runtime::CapabilitySet;
 use otter_runtime::{
     RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
     RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
@@ -194,16 +194,13 @@ impl FfiLibrary {
     }
 }
 
-/// Install the `otter:ffi` namespace object.
-pub fn install_ffi_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    let caps = ctx.capabilities().clone();
-    let dlopen = std::sync::Arc::new(
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            open_library(ctx, args, &caps)
-        },
-    );
-    ctx.method("dlopen", 1, HostedNativeCall::dynamic(dlopen))?;
-    Ok(())
+otter_macros::lodge! {
+    prefix = "otter",
+    name = "ffi",
+    capabilities = true,
+    exports = {
+        "dlopen" / 1 => open_library,
+    },
 }
 
 fn open_library(

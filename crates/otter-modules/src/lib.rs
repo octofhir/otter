@@ -25,7 +25,7 @@ pub mod kv;
 pub mod sql;
 
 use otter_runtime::{
-    HostedModule, HostedModuleInstall, RuntimeNativeCtx as NativeCtx,
+    HostedModule, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeNumberValue as NumberValue, RuntimeValue as Value,
     runtime_arg_to_string, runtime_string_value, runtime_type_error,
 };
@@ -33,15 +33,9 @@ use serde_json::{Number as JsonNumber, Value as JsonValue};
 
 /// Active `otter:*` hosted modules in deterministic install order.
 pub const HOSTED_MODULES: &[HostedModule] = &[
-    HostedModule::new("otter:kv", HostedModuleInstall::new(kv::install_kv_module)),
-    HostedModule::new(
-        "otter:sql",
-        HostedModuleInstall::new(sql::install_sql_module),
-    ),
-    HostedModule::new(
-        "otter:ffi",
-        HostedModuleInstall::new(ffi::install_ffi_module),
-    ),
+    kv::KV_HOSTED_MODULE,
+    sql::SQL_HOSTED_MODULE,
+    ffi::FFI_HOSTED_MODULE,
 ];
 
 /// Return active hosted module installers.

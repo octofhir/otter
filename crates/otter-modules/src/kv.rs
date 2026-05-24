@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use otter_runtime::{CapabilitySet, HostedModuleCtx, HostedNativeCall};
+use otter_runtime::CapabilitySet;
 use otter_runtime::{
     RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
@@ -167,17 +167,14 @@ fn json_object_to_map(value: JsonValue) -> KvResult<BTreeMap<String, JsonValue>>
     }
 }
 
-/// Install the `otter:kv` namespace object.
-pub fn install_kv_module(ctx: &mut HostedModuleCtx<'_>) -> Result<(), String> {
-    let caps = ctx.capabilities().clone();
-    let open = std::sync::Arc::new(
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            open_kv(ctx, args, &caps)
-        },
-    );
-    ctx.method("openKv", 1, HostedNativeCall::dynamic(open.clone()))?
-        .method("kv", 1, HostedNativeCall::dynamic(open))?;
-    Ok(())
+otter_macros::lodge! {
+    prefix = "otter",
+    name = "kv",
+    capabilities = true,
+    exports = {
+        "openKv" / 1 => open_kv,
+        "kv"     / 1 => open_kv,
+    },
 }
 
 fn open_kv(

@@ -473,7 +473,7 @@ pub(crate) fn hoist_function_declarations(
         )?;
         let const_idx = cx.intern_function_id(function_id);
         let tmp = cx.alloc_scratch();
-        emit_make_callable(cx, tmp, const_idx, &captures, false, span);
+        emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
         let storage = cx
             .lookup_binding(&name)
             .expect("pass 2 pre-declared the binding")

@@ -89,6 +89,7 @@ pub(crate) fn compile_chain_into(
                     });
                 }
             }
+            crate::calls::check_call_arity(arg_regs.len(), "Op::Call", span)?;
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(result_reg));
             operands.push(Operand::Register(callee_reg));
@@ -246,6 +247,7 @@ pub(crate) fn compile_chain_into_chain_object(
                     });
                 }
             }
+            crate::calls::check_call_arity(arg_regs.len(), "Op::Call", span)?;
             let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
             operands.push(Operand::Register(result_reg));
             operands.push(Operand::Register(callee_reg));

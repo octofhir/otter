@@ -265,7 +265,7 @@ pub(crate) fn compile_class(
 
     let ctor_const = cx.intern_function_id(ctor_id);
     let ctor_reg = cx.alloc_scratch();
-    emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span);
+    emit_make_callable(cx, ctor_reg, ctor_const, &ctor_captures, false, span)?;
 
     // Per §10.2.1.4 ClassDefinitionEvaluation step 24, the class
     // binding becomes initialised *before* the static elements run
@@ -338,7 +338,7 @@ pub(crate) fn compile_class(
         )?;
         let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
-        emit_make_callable(cx, m_reg, m_const, &m_captures, false, method_span);
+        emit_make_callable(cx, m_reg, m_const, &m_captures, false, method_span)?;
         // §15.7.10 ClassDefinitionEvaluation step 26 / 27 —
         // accessor method definitions (`get foo()` / `set foo(v)`)
         // install an `{ get | set, enumerable: false, configurable:
@@ -532,7 +532,7 @@ pub(crate) fn compile_class(
                     compile_static_block(cx, &display_name, &s.body, bspan)?;
                 let const_idx = cx.intern_function_id(function_id);
                 let fn_reg = cx.alloc_scratch();
-                emit_make_callable(cx, fn_reg, const_idx, &captures, false, bspan);
+                emit_make_callable(cx, fn_reg, const_idx, &captures, false, bspan)?;
                 let dst = cx.alloc_scratch();
                 cx.emit(
                     Op::CallWithThis,

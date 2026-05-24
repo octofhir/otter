@@ -332,7 +332,7 @@ pub(crate) fn compile_statement(
             };
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
-            emit_make_callable(cx, tmp, const_idx, &captures, false, span);
+            emit_make_callable(cx, tmp, const_idx, &captures, false, span)?;
             cx.emit_store_storage(tmp, storage, span);
             cx.mark_initialized(&name);
             cx.emit_module_export_mirror(&name, tmp, span);
@@ -542,7 +542,7 @@ pub(crate) fn compile_statement(
                     )?;
                     let const_idx = cx.intern_function_id(function_id);
                     let dst = cx.alloc_scratch();
-                    emit_make_callable(cx, dst, const_idx, &captures, false, span);
+                    emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
                     dst
                 }
                 oxc_ast::ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {

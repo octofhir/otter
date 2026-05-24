@@ -15,6 +15,39 @@
 
 use crate::*;
 
+/// Maximum argument count for dense `Op::Call` / `Op::CallWithThis`
+/// / `Op::CallMethodValue` / `Op::BindFunction` lowering. The
+/// bytecode wire encoder packs the per-instruction operand count
+/// into one `u8`, so the variadic tail-payload of arguments tops out
+/// at `u8::MAX` minus the fixed-position leading operands (`dst`,
+/// optional callee/receiver, count-imm). 240 leaves enough headroom
+/// across every variadic call op and matches the
+/// `DENSE_NEW_ARRAY_MAX_ELEMENTS` threshold so the encoder layout is
+/// uniform across families.
+pub(crate) const MAX_DENSE_CALL_ARGS: usize = 240;
+
+/// Reject argument lists that exceed [`MAX_DENSE_CALL_ARGS`] with a
+/// catchable `CompileError` instead of panicking inside the wire
+/// encoder. Generated code that fans out to thousands of positional
+/// arguments should use spread (`f(...args)`), which goes through
+/// `Op::CallSpread` and is unaffected by the cap.
+pub(crate) fn check_call_arity(
+    arg_count: usize,
+    op_name: &'static str,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    if arg_count > MAX_DENSE_CALL_ARGS {
+        return Err(CompileError::Unsupported {
+            node: format!(
+                "{op_name} with {arg_count} arguments exceeds the {MAX_DENSE_CALL_ARGS}-arg limit; \
+                 use spread (`f(...args)`) for very wide call sites",
+            ),
+            span,
+        });
+    }
+    Ok(())
+}
+
 /// Lower a call expression. Three forms are supported:
 ///
 /// - `receiver.method(args...)` — emits [`Op::CallMethodValue`].
@@ -416,6 +449,7 @@ pub(crate) fn compile_method_call(
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         let name_idx = cx.intern_string_constant(method_name);
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -436,6 +470,7 @@ pub(crate) fn compile_method_call(
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         let name_idx = cx.intern_string_constant(&mangled);
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -464,6 +499,7 @@ pub(crate) fn compile_method_call(
             span,
         );
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+        check_call_arity(arg_regs.len(), "Op::CallWithThis", span)?;
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
@@ -477,6 +513,7 @@ pub(crate) fn compile_method_call(
     // Free call: `callee(args...)`.
     let callee_reg = compile_expr(cx, callee, span)?;
     let arg_regs = compile_call_args(cx, &call.arguments, span)?;
+    check_call_arity(arg_regs.len(), "Op::Call", span)?;
     let dst = cx.alloc_scratch();
     let mut operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
     operands.push(Operand::Register(dst));
@@ -575,6 +612,7 @@ pub(crate) fn try_compile_function_method(
                 }
             };
             let forwarded: Vec<u16> = iter.collect();
+            check_call_arity(forwarded.len(), "Op::CallWithThis", span)?;
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(4 + forwarded.len());
             operands.push(Operand::Register(dst));
@@ -598,6 +636,7 @@ pub(crate) fn try_compile_function_method(
                 }
             };
             let bound: Vec<u16> = iter.collect();
+            check_call_arity(bound.len(), "Op::BindFunction", span)?;
             let dst = cx.alloc_scratch();
             let mut operands: Vec<Operand> = Vec::with_capacity(4 + bound.len());
             operands.push(Operand::Register(dst));
@@ -697,6 +736,7 @@ pub(crate) fn try_compile_function_method(
             operands.push(Operand::Register(this_reg));
             operands.push(Operand::ConstIndex(forwarded.len() as u32));
             operands.extend(forwarded.into_iter().map(Operand::Register));
+            check_call_arity(operands.len().saturating_sub(4), "Op::CallWithThis", span)?;
             cx.emit(Op::CallWithThis, operands, span);
             Ok(Some(dst))
         }

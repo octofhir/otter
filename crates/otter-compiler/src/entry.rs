@@ -789,7 +789,7 @@ pub(crate) fn compile_export_inner_declaration(
             let storage = cx.declare_binding(&name, false, fspan)?;
             let const_idx = cx.intern_function_id(function_id);
             let tmp = cx.alloc_scratch();
-            emit_make_callable(cx, tmp, const_idx, &captures, false, fspan);
+            emit_make_callable(cx, tmp, const_idx, &captures, false, fspan)?;
             cx.emit_store_storage(tmp, storage, fspan);
             cx.mark_initialized(&name);
             cx.emit_module_export_mirror(&name, tmp, fspan);

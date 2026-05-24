@@ -182,21 +182,15 @@ pub(crate) fn compile_tagged_template(
         raw_regs.push(rr);
     }
 
-    // Materialise the cooked array.
+    // Materialise the cooked + raw arrays. Dense `NewArray` caps
+    // operand count at `u8::MAX` (255); template literals with more
+    // than a couple hundred quasis fall back to the per-element
+    // `ArrayPush` form so the wire encoder never panics. The
+    // threshold matches `compile_array_literal::DENSE_NEW_ARRAY_MAX_ELEMENTS`.
     let strings_reg = cx.alloc_scratch();
-    let mut cooked_operands: Vec<Operand> = Vec::with_capacity(2 + cooked_regs.len());
-    cooked_operands.push(Operand::Register(strings_reg));
-    cooked_operands.push(Operand::ConstIndex(cooked_regs.len() as u32));
-    cooked_operands.extend(cooked_regs.iter().copied().map(Operand::Register));
-    cx.emit(Op::NewArray, cooked_operands, span);
-
-    // Materialise the raw array.
+    emit_array_from_regs(cx, strings_reg, &cooked_regs, span);
     let raw_arr_reg = cx.alloc_scratch();
-    let mut raw_operands: Vec<Operand> = Vec::with_capacity(2 + raw_regs.len());
-    raw_operands.push(Operand::Register(raw_arr_reg));
-    raw_operands.push(Operand::ConstIndex(raw_regs.len() as u32));
-    raw_operands.extend(raw_regs.iter().copied().map(Operand::Register));
-    cx.emit(Op::NewArray, raw_operands, span);
+    emit_array_from_regs(cx, raw_arr_reg, &raw_regs, span);
 
     // Attach `strings.raw = raw_arr`.
     cx.emit_store_property(strings_reg, "raw", raw_arr_reg, span);
@@ -208,15 +202,67 @@ pub(crate) fn compile_tagged_template(
         arg_regs.push(compile_expr(cx, expr, span)?);
     }
 
-    // Emit `tag(strings, ...exprs)`.
+    // Emit `tag(strings, ...exprs)`. Dense `Op::Call` operand count
+    // is bounded by `u8::MAX`; templates that interpolate hundreds
+    // of expressions fall back to `Op::CallSpread` so the encoder
+    // never panics.
     let dst = cx.alloc_scratch();
-    let mut call_operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
-    call_operands.push(Operand::Register(dst));
-    call_operands.push(Operand::Register(tag_reg));
-    call_operands.push(Operand::ConstIndex(arg_regs.len() as u32));
-    call_operands.extend(arg_regs.into_iter().map(Operand::Register));
-    cx.emit(Op::Call, call_operands, span);
+    if arg_regs.len() > DENSE_CALL_MAX_ARGS {
+        let args_arr = cx.alloc_scratch();
+        emit_array_from_regs(cx, args_arr, &arg_regs, span);
+        let this_undef = cx.alloc_scratch();
+        cx.emit(Op::LoadUndefined, [Operand::Register(this_undef)], span);
+        cx.emit(
+            Op::CallSpread,
+            vec![
+                Operand::Register(dst),
+                Operand::Register(tag_reg),
+                Operand::Register(this_undef),
+                Operand::Register(args_arr),
+            ],
+            span,
+        );
+    } else {
+        let mut call_operands: Vec<Operand> = Vec::with_capacity(3 + arg_regs.len());
+        call_operands.push(Operand::Register(dst));
+        call_operands.push(Operand::Register(tag_reg));
+        call_operands.push(Operand::ConstIndex(arg_regs.len() as u32));
+        call_operands.extend(arg_regs.into_iter().map(Operand::Register));
+        cx.emit(Op::Call, call_operands, span);
+    }
     Ok(dst)
+}
+
+/// Dense-form opcode operand cap. Mirrors
+/// `compile_array_literal::DENSE_NEW_ARRAY_MAX_ELEMENTS`; keep the
+/// two in sync.
+const DENSE_CALL_MAX_ARGS: usize = 240;
+
+/// Build a dense or per-element array from a slice of element
+/// registers. Used by both the cooked / raw quasi arrays and the
+/// `Op::CallSpread` fallback args bundle when the count crosses the
+/// `u8::MAX` boundary on the dense `Op::NewArray` form.
+fn emit_array_from_regs(cx: &mut Compiler, dst: u16, elements: &[u16], span: (u32, u32)) {
+    if elements.len() <= DENSE_CALL_MAX_ARGS {
+        let mut operands: Vec<Operand> = Vec::with_capacity(2 + elements.len());
+        operands.push(Operand::Register(dst));
+        operands.push(Operand::ConstIndex(elements.len() as u32));
+        operands.extend(elements.iter().copied().map(Operand::Register));
+        cx.emit(Op::NewArray, operands, span);
+        return;
+    }
+    cx.emit(
+        Op::NewArray,
+        [Operand::Register(dst), Operand::ConstIndex(0)],
+        span,
+    );
+    for &r in elements {
+        cx.emit(
+            Op::ArrayPush,
+            [Operand::Register(dst), Operand::Register(r)],
+            span,
+        );
+    }
 }
 
 /// Inline §22.1.2.4 `String.raw` for the tagged-template call shape.

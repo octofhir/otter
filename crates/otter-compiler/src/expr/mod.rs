@@ -224,7 +224,7 @@ pub(crate) fn compile_expr(
             )?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, false, span);
+            emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
             Ok(dst)
         }
 
@@ -233,7 +233,7 @@ pub(crate) fn compile_expr(
             let (function_id, captures) = compile_arrow_function(cx, a, span)?;
             let dst = cx.alloc_scratch();
             let const_idx = cx.intern_function_id(function_id);
-            emit_make_callable(cx, dst, const_idx, &captures, true, span);
+            emit_make_callable(cx, dst, const_idx, &captures, true, span)?;
             Ok(dst)
         }
 

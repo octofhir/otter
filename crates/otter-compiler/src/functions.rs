@@ -296,14 +296,30 @@ pub(crate) fn emit_make_callable(
     captures: &[u32],
     is_arrow: bool,
     span: (u32, u32),
-) {
+) -> Result<(), CompileError> {
     if captures.is_empty() && !is_arrow {
         cx.emit(
             Op::MakeFunction,
             [Operand::Register(dst), Operand::ConstIndex(function_const)],
             span,
         );
-        return;
+        return Ok(());
+    }
+    // `MakeClosure` operand layout is `[dst, fn_const, count,
+    // capture0, …, captureN-1]`; the wire encoder caps the total
+    // operand count at `u8::MAX` (255), so the capture-count payload
+    // tops out at 252. Beyond that we surface a `CompileError`
+    // instead of panicking inside the bytecode writer.
+    const MAX_CAPTURES: usize = u8::MAX as usize - 3;
+    if captures.len() > MAX_CAPTURES {
+        return Err(CompileError::Unsupported {
+            node: format!(
+                "closure capturing {} upvalues exceeds the {} limit of `Op::MakeClosure`",
+                captures.len(),
+                MAX_CAPTURES
+            ),
+            span,
+        });
     }
     let mut operands: Vec<Operand> = Vec::with_capacity(3 + captures.len());
     operands.push(Operand::Register(dst));
@@ -313,4 +329,5 @@ pub(crate) fn emit_make_callable(
         operands.push(Operand::Imm32(parent_idx as i32));
     }
     cx.emit(Op::MakeClosure, operands, span);
+    Ok(())
 }

@@ -15,6 +15,7 @@
 - [Event Loop](engine/event-loop.md)
 - [Frontend And Compilation](engine/frontend.md)
 - [GC API](engine/gc-api.md)
+- [Step Trace](engine/step-trace.md)
 
 # Package Manager
 

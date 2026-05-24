@@ -84,6 +84,7 @@ pub mod global_functions;
 mod global_ops;
 pub mod intl;
 mod intl_ops;
+pub mod inspect;
 pub mod intrinsic_install;
 pub mod intrinsics;
 mod iterator_ops;
@@ -484,6 +485,12 @@ pub struct Interpreter {
     /// falling back to the string-name path. See
     /// [`crate::realm_intrinsics::RealmIntrinsics`].
     realm_intrinsics: realm_intrinsics::RealmIntrinsics,
+    /// Optional step-trace observer. When `Some`, the dispatch loop
+    /// emits one [`inspect::StepEvent`] per instruction. When `None`,
+    /// the hot path pays a single `Option` discriminant check and
+    /// branches around the observer with no further work. See
+    /// [`crate::inspect`] for the format contract.
+    tracer: Option<Box<dyn inspect::StepTracer>>,
 }
 
 impl std::fmt::Debug for Interpreter {
@@ -673,6 +680,7 @@ impl Interpreter {
             function_kind_prototypes: function_kind::FunctionKindPrototypes::default(),
             cold_frames: cold_frame::ColdFramePool::new(),
             realm_intrinsics: realm_intrinsics::RealmIntrinsics::default(),
+            tracer: None,
         };
         // Cache typed handles for the well-known constructors and
         // prototypes. Subsequent runtime lookups read the slots and
@@ -1356,6 +1364,23 @@ impl Interpreter {
     /// when invoked without a hook.
     pub fn set_eval_hook(&mut self, hook: Option<EvalHook>) {
         self.eval_hook = hook;
+    }
+
+    /// Install (or clear) the per-instruction step tracer.
+    ///
+    /// When `Some`, every dispatched instruction routes through the
+    /// observer. When `None` (the default), the dispatch loop pays a
+    /// single `Option` discriminant check per instruction and never
+    /// touches the tracer slot. The trace format is documented at
+    /// [`crate::inspect`] and `docs/book/src/engine/step-trace.md`.
+    pub fn set_tracer(&mut self, tracer: Option<Box<dyn inspect::StepTracer>>) {
+        self.tracer = tracer;
+    }
+
+    /// Whether a step tracer is installed.
+    #[must_use]
+    pub fn has_tracer(&self) -> bool {
+        self.tracer.is_some()
     }
 
     /// Cloneable handle for cooperative cancellation.
@@ -2656,6 +2681,28 @@ impl Interpreter {
             self.record_runtime_reductions(runtime_budget::opcode_reductions(op));
             self.enforce_runtime_budget_checkpoint()?;
             self.observe_runtime_stack_depth(stack.len());
+
+            // Step-trace hook. The hot path checks one `Option` slot
+            // per instruction; the body only runs when an embedder
+            // installed a tracer through `Interpreter::set_tracer`.
+            if self.tracer.is_some() {
+                let function_name = context
+                    .function(function_id)
+                    .map(|f| f.name.as_str())
+                    .unwrap_or("<unknown>");
+                let operands = context.exec_operands(instr);
+                let event = inspect::StepEvent {
+                    frame_depth: stack.len(),
+                    function_id,
+                    function_name,
+                    byte_pc: pc,
+                    op,
+                    operands,
+                };
+                if let Some(tracer) = self.tracer.as_deref_mut() {
+                    tracer.on_step(&event);
+                }
+            }
 
             // Stack-modifying opcodes go first so we don't hold a
             // `&mut Frame` borrow while pushing / popping.

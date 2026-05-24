@@ -895,6 +895,45 @@ impl InterruptHandle {
     }
 }
 
+/// Re-export of the VM's step-trace interfaces. Embedders that wire
+/// a [`TracerFactory`] through [`RuntimeBuilder`] / [`OtterBuilder`]
+/// build their tracers against these types.
+pub use otter_vm::inspect;
+
+/// Factory for the per-instruction step tracer.
+///
+/// The runtime executes the factory once on the isolate runner
+/// thread immediately after the [`Interpreter`] is constructed.
+/// Returning a tracer installs it through
+/// [`Interpreter::set_tracer`]; the dispatch loop then routes every
+/// instruction through [`inspect::StepTracer::on_step`]. The factory
+/// is `Send + Sync` because the spawned isolate is on a dedicated
+/// thread; the tracer itself never needs to cross threads.
+#[derive(Clone)]
+pub struct TracerFactory(
+    Arc<dyn Fn() -> Box<dyn otter_vm::inspect::StepTracer> + Send + Sync>,
+);
+
+impl TracerFactory {
+    /// Wrap a closure that produces a fresh tracer on demand.
+    pub fn new<F>(factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn otter_vm::inspect::StepTracer> + Send + Sync + 'static,
+    {
+        Self(Arc::new(factory))
+    }
+
+    fn build(&self) -> Box<dyn otter_vm::inspect::StepTracer> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for TracerFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TracerFactory").finish_non_exhaustive()
+    }
+}
+
 /// Runtime configuration.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeConfig {
@@ -909,6 +948,7 @@ pub(crate) struct RuntimeConfig {
     hooks: RuntimeHooks,
     process_argv: Vec<String>,
     process_cwd: PathBuf,
+    tracer_factory: Option<TracerFactory>,
 }
 
 #[derive(Debug, Clone)]
@@ -1088,6 +1128,7 @@ impl Default for RuntimeConfig {
             hooks: RuntimeHooks::default(),
             process_argv: process::default_argv(),
             process_cwd: process::default_cwd(),
+            tracer_factory: None,
         }
     }
 }
@@ -1263,6 +1304,19 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Install a per-instruction step-trace factory. The factory
+    /// runs once on the isolate runner thread immediately after the
+    /// interpreter is constructed; its produced tracer routes every
+    /// dispatched instruction through
+    /// [`inspect::StepTracer::on_step`]. Pass `None` (the default)
+    /// to skip tracing — the dispatch loop then pays only a single
+    /// `Option` check per instruction.
+    #[must_use]
+    pub fn tracer_factory(mut self, factory: Option<TracerFactory>) -> Self {
+        self.config.tracer_factory = factory;
+        self
+    }
+
     /// Construct the runtime.
     ///
     /// # Errors
@@ -1347,6 +1401,9 @@ impl Runtime {
                 .map_err(|e| format!("compile error: {e:?}"))
             });
         interp.set_eval_hook(Some(hook));
+        if let Some(factory) = &config.tracer_factory {
+            interp.set_tracer(Some(factory.build()));
+        }
         Ok(Runtime {
             interp,
             config,
@@ -2710,6 +2767,14 @@ impl OtterBuilder {
     #[must_use]
     pub fn process_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.runtime = self.runtime.process_cwd(cwd);
+        self
+    }
+
+    /// Install a per-instruction step-trace factory. See
+    /// [`RuntimeBuilder::tracer_factory`].
+    #[must_use]
+    pub fn tracer_factory(mut self, factory: Option<TracerFactory>) -> Self {
+        self.runtime = self.runtime.tracer_factory(factory);
         self
     }
 

@@ -77,6 +77,18 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Emit a per-instruction step trace to stderr (or to the path
+    /// given with `--trace=<path>`). Off when omitted.
+    #[arg(
+        long = "trace",
+        value_name = "path",
+        num_args = 0..=1,
+        default_missing_value = "-",
+        require_equals = true,
+        global = true,
+    )]
+    trace: Option<String>,
+
     /// Capability flags (Deno-style).
     #[command(flatten)]
     perms: PermissionFlags,
@@ -440,6 +452,7 @@ async fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse();
     startup_timer.mark("parse_args");
+    install_cli_trace_target(cli.trace.clone());
     let json = cli.json;
     let dump_mode = cli.dump_bytecode.clone();
     let caps = cli.perms.clone().into_capabilities();
@@ -1004,10 +1017,56 @@ async fn run_eval(
 }
 
 fn cli_otter_builder(caps: &CapabilitySet) -> otter_runtime::OtterBuilder {
-    otter_runtime::Otter::builder()
+    let mut builder = otter_runtime::Otter::builder()
         .capabilities(caps.clone())
         .with_node_apis()
-        .with_web_apis()
+        .with_web_apis();
+    if let Some(target) = cli_trace_target() {
+        builder = builder.tracer_factory(Some(trace_factory_for_target(&target)));
+    }
+    builder
+}
+
+std::thread_local! {
+    /// Top-level `--trace[=<path>]` target installed by [`main`].
+    /// `None` disables tracing. `Some("-")` writes to stderr.
+    /// Lives in a thread-local so the many `run_*` helpers do not
+    /// need to thread an extra parameter through every signature.
+    /// The CLI uses `#[tokio::main(flavor = "current_thread")]`, so
+    /// every dispatch stays on the same thread that set the cell.
+    static CLI_TRACE_TARGET: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn install_cli_trace_target(target: Option<String>) {
+    CLI_TRACE_TARGET.with(|cell| *cell.borrow_mut() = target);
+}
+
+fn cli_trace_target() -> Option<String> {
+    CLI_TRACE_TARGET.with(|cell| cell.borrow().clone())
+}
+
+/// Build a [`otter_runtime::TracerFactory`] that emits the
+/// VM-level step trace to the chosen sink. `-` writes to stderr;
+/// any other string is treated as a file path that the factory
+/// opens (truncating any existing contents) on the isolate thread
+/// the first time the tracer is constructed.
+fn trace_factory_for_target(target: &str) -> otter_runtime::TracerFactory {
+    let target = target.to_string();
+    otter_runtime::TracerFactory::new(move || -> Box<dyn otter_runtime::inspect::StepTracer> {
+        let writer: Box<dyn io::Write> = if target == "-" {
+            Box::new(io::BufWriter::new(io::stderr()))
+        } else {
+            match std::fs::File::create(&target) {
+                Ok(file) => Box::new(io::BufWriter::new(file)),
+                Err(err) => {
+                    eprintln!("warning: --trace cannot open {target}: {err}; falling back to stderr");
+                    Box::new(io::BufWriter::new(io::stderr()))
+                }
+            }
+        };
+        Box::new(otter_runtime::inspect::WriterTracer::new(writer))
+    })
 }
 
 async fn cli_loader_config_for_entry(path: &Path) -> otter_runtime::module_loader::LoaderConfig {

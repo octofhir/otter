@@ -15,9 +15,9 @@ work is:
 | 4.1   | Replace macro API with `otter_*`           | DONE 2026-05-24       |
 | 4.2   | Port first intrinsics through new macros   | DONE 2026-05-24       |
 | 4.3   | Module install macro + Web API ports       | DONE 2026-05-24       |
-| 5.1   | Step trace                                 | Open                  |
+| 5.1   | Step trace                                 | DONE 2026-05-24       |
 | 5.2   | IC / shape / frame snapshots               | Open                  |
-| 5.3   | GC snapshot bridge                         | Open, blocked on 5.1  |
+| 5.3   | GC snapshot bridge                         | Open (5.1 shipped)    |
 | 6.1   | Object internal-method vtable evaluation   | Open                  |
 | 6.2   | Tighten Promise capability / job records   | Open                  |
 | 6.3   | Derive Trace / Finalize for new GC bodies  | `Pelt` DONE 2026-05-24 (19/20 bodies, IteratorState enum stays manual); `Groom` deferred |

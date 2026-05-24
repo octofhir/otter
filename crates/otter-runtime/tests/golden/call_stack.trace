@@ -1,0 +1,29 @@
+; otter step trace v1
+frame=1 fn=<main> pc=000000 op=LOAD_UNDEFINED  r0
+frame=1 fn=<main> pc=000005 op=STORE_UPVALUE  r0 i32:0
+frame=1 fn=<main> pc=000015 op=LOAD_UNDEFINED  r2
+frame=1 fn=<main> pc=000020 op=STORE_LOCAL  r2 i32:1
+frame=1 fn=<main> pc=000030 op=MAKE_FUNCTION  r3 k[0]
+frame=1 fn=<main> pc=000040 op=STORE_UPVALUE  r3 i32:0
+frame=1 fn=<main> pc=000050 op=MAKE_CLOSURE  r4 k[2] k[1] i32:0
+frame=1 fn=<main> pc=000070 op=STORE_LOCAL  r4 i32:1
+frame=1 fn=<main> pc=000080 op=LOAD_LOCAL  r5 i32:1
+frame=1 fn=<main> pc=000090 op=CALL  r6 r5 k[0]
+frame=2 fn=outer pc=000000 op=MAKE_FUNCTION  r1 k[2]
+frame=2 fn=outer pc=000010 op=STORE_LOCAL  r1 i32:0
+frame=2 fn=outer pc=000020 op=LOAD_UPVALUE  r2 i32:0
+frame=2 fn=outer pc=000030 op=LOAD_INT32  r3 i32:2
+frame=2 fn=outer pc=000040 op=LOAD_INT32  r4 i32:3
+frame=2 fn=outer pc=000050 op=CALL  r5 r2 k[2] r3 r4
+frame=3 fn=add pc=000000 op=STORE_LOCAL  r0 i32:2
+frame=3 fn=add pc=000010 op=STORE_LOCAL  r1 i32:3
+frame=3 fn=add pc=000020 op=MAKE_FUNCTION  r5 k[0]
+frame=3 fn=add pc=000030 op=STORE_LOCAL  r5 i32:4
+frame=3 fn=add pc=000040 op=LOAD_LOCAL  r6 i32:2
+frame=3 fn=add pc=000050 op=LOAD_LOCAL  r7 i32:3
+frame=3 fn=add pc=000060 op=TO_PRIMITIVE  r8 r6 k[1]
+frame=3 fn=add pc=000073 op=TO_PRIMITIVE  r9 r7 k[1]
+frame=3 fn=add pc=000086 op=ADD  r10 r8 r9
+frame=3 fn=add pc=000097 op=RETURN_VALUE  r10
+frame=2 fn=outer pc=000069 op=RETURN_VALUE  r5
+frame=1 fn=<main> pc=000103 op=RETURN  r6

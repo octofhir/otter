@@ -323,3 +323,20 @@ pub static PLAIN_YEAR_MONTH_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     PLAIN_YEAR_MONTH_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Temporal, name)
 }
+
+crate::temporal::proto_bridge::temporal_proto_methods! {
+    class = "PlainYearMonth",
+    slice = PLAIN_YEAR_MONTH_PROTOTYPE_METHODS,
+    methods = [
+        "toString"    / 0 => impl_to_string    as native_pym_to_string,
+        "toJSON"      / 0 => impl_to_json      as native_pym_to_json,
+        "valueOf"     / 0 => impl_value_of     as native_pym_value_of,
+        "add"         / 1 => impl_add          as native_pym_add,
+        "subtract"    / 1 => impl_subtract     as native_pym_subtract,
+        "equals"      / 1 => impl_equals       as native_pym_equals,
+        "until"       / 1 => impl_until        as native_pym_until,
+        "since"       / 1 => impl_since        as native_pym_since,
+        "with"        / 1 => impl_with         as native_pym_with,
+        "toPlainDate" / 1 => impl_to_plain_date as native_pym_to_plain_date,
+    ]
+}

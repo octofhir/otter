@@ -394,6 +394,31 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `Temporal.<ClassName>.prototype` lookup. Resolves the named
+    /// Temporal class on `globalThis.Temporal` and returns its
+    /// `prototype` object, or `None` if either step fails (the
+    /// class isn't installed, or its constructor lacks the
+    /// data-property prototype slot).
+    pub(crate) fn temporal_prototype_object(
+        &mut self,
+        kind: crate::temporal::TemporalKind,
+    ) -> Option<JsObject> {
+        let temporal_ns = object::get(self.global_this, &self.gc_heap, "Temporal")
+            .and_then(|v| v.as_object())?;
+        let class_value = object::get(temporal_ns, &self.gc_heap, kind.class_name())?;
+        if let Some(ctor_obj) = class_value.as_object() {
+            return object::get(ctor_obj, &self.gc_heap, "prototype").and_then(|v| v.as_object());
+        }
+        if let Some(ctor) = class_value.as_native_function() {
+            let descriptor = ctor
+                .own_property_descriptor(&mut self.gc_heap, "prototype")
+                .ok()
+                .flatten()?;
+            return descriptor_value(&descriptor).as_object();
+        }
+        None
+    }
+
     pub(crate) fn constructor_prototype_value(
         &mut self,
         constructor_name: &str,

@@ -391,3 +391,24 @@ pub static PLAIN_DATE_TIME_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock:
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     PLAIN_DATE_TIME_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Temporal, name)
 }
+
+crate::temporal::proto_bridge::temporal_proto_methods! {
+    class = "PlainDateTime",
+    slice = PLAIN_DATE_TIME_PROTOTYPE_METHODS,
+    methods = [
+        "toString"       / 0 => impl_to_string        as native_pdt_to_string,
+        "toJSON"         / 0 => impl_to_json          as native_pdt_to_json,
+        "valueOf"        / 0 => impl_value_of         as native_pdt_value_of,
+        "add"            / 1 => impl_add              as native_pdt_add,
+        "subtract"       / 1 => impl_subtract         as native_pdt_subtract,
+        "equals"         / 1 => impl_equals           as native_pdt_equals,
+        "until"          / 1 => impl_until            as native_pdt_until,
+        "since"          / 1 => impl_since            as native_pdt_since,
+        "round"          / 1 => impl_round            as native_pdt_round,
+        "with"           / 1 => impl_with             as native_pdt_with,
+        "withCalendar"   / 1 => impl_with_calendar    as native_pdt_with_calendar,
+        "withPlainTime"  / 0 => impl_with_plain_time  as native_pdt_with_plain_time,
+        "toPlainDate"    / 0 => impl_to_plain_date    as native_pdt_to_plain_date,
+        "toPlainTime"    / 0 => impl_to_plain_time    as native_pdt_to_plain_time,
+    ]
+}

@@ -59,6 +59,9 @@ otter_macros::couch! {
         "fromEpochMilliseconds" / 1 => native_instant_from_epoch_ms,
         "compare"               / 2 => native_instant_compare,
     },
+    prototype = {
+        method_specs = [instant::INSTANT_PROTOTYPE_METHODS],
+    },
     install_on = temporal_host,
 }
 
@@ -70,6 +73,9 @@ otter_macros::couch! {
     statics = {
         "from"    / 1 => native_duration_from,
         "compare" / 2 => native_duration_compare,
+    },
+    prototype = {
+        method_specs = [duration::DURATION_PROTOTYPE_METHODS],
     },
     install_on = temporal_host,
 }
@@ -83,6 +89,9 @@ otter_macros::couch! {
         "from"    / 1 => native_plain_date_from,
         "compare" / 2 => native_plain_date_compare,
     },
+    prototype = {
+        method_specs = [plain_date::PLAIN_DATE_PROTOTYPE_METHODS],
+    },
     install_on = temporal_host,
 }
 
@@ -94,6 +103,9 @@ otter_macros::couch! {
     statics = {
         "from"    / 1 => native_plain_time_from,
         "compare" / 2 => native_plain_time_compare,
+    },
+    prototype = {
+        method_specs = [plain_time::PLAIN_TIME_PROTOTYPE_METHODS],
     },
     install_on = temporal_host,
 }
@@ -107,6 +119,9 @@ otter_macros::couch! {
         "from"    / 1 => native_plain_date_time_from,
         "compare" / 2 => native_plain_date_time_compare,
     },
+    prototype = {
+        method_specs = [plain_date_time::PLAIN_DATE_TIME_PROTOTYPE_METHODS],
+    },
     install_on = temporal_host,
 }
 
@@ -118,6 +133,9 @@ otter_macros::couch! {
     statics = {
         "from"    / 1 => native_plain_year_month_from,
         "compare" / 2 => native_plain_year_month_compare,
+    },
+    prototype = {
+        method_specs = [plain_year_month::PLAIN_YEAR_MONTH_PROTOTYPE_METHODS],
     },
     install_on = temporal_host,
 }

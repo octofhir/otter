@@ -278,3 +278,20 @@ pub static PLAIN_TIME_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     PLAIN_TIME_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Temporal, name)
 }
+
+crate::temporal::proto_bridge::temporal_proto_methods! {
+    class = "PlainTime",
+    slice = PLAIN_TIME_PROTOTYPE_METHODS,
+    methods = [
+        "toString" / 0 => impl_to_string as native_pt_to_string,
+        "toJSON"   / 0 => impl_to_json   as native_pt_to_json,
+        "valueOf"  / 0 => impl_value_of  as native_pt_value_of,
+        "add"      / 1 => impl_add       as native_pt_add,
+        "subtract" / 1 => impl_subtract  as native_pt_subtract,
+        "equals"   / 1 => impl_equals    as native_pt_equals,
+        "until"    / 1 => impl_until     as native_pt_until,
+        "since"    / 1 => impl_since     as native_pt_since,
+        "round"    / 1 => impl_round     as native_pt_round,
+        "with"     / 1 => impl_with      as native_pt_with,
+    ]
+}

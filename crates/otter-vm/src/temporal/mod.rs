@@ -38,6 +38,7 @@ pub mod plain_date;
 pub mod plain_date_time;
 pub mod plain_time;
 pub mod plain_year_month;
+pub mod proto_bridge;
 
 pub use dispatch::{TemporalError, call as call_static, load_static};
 pub use payload::{

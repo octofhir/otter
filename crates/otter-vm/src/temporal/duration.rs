@@ -388,3 +388,18 @@ pub static DURATION_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(||
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     DURATION_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Temporal, name)
 }
+
+crate::temporal::proto_bridge::temporal_proto_methods! {
+    class = "Duration",
+    slice = DURATION_PROTOTYPE_METHODS,
+    methods = [
+        "toString" / 0 => impl_to_string as native_duration_to_string,
+        "toJSON"   / 0 => impl_to_json   as native_duration_to_json,
+        "valueOf"  / 0 => impl_value_of  as native_duration_value_of,
+        "add"      / 1 => impl_add       as native_duration_add,
+        "subtract" / 1 => impl_subtract  as native_duration_subtract,
+        "negated"  / 0 => impl_negated   as native_duration_negated,
+        "abs"      / 0 => impl_abs       as native_duration_abs,
+        "total"    / 1 => impl_total     as native_duration_total,
+    ]
+}

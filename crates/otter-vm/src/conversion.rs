@@ -474,6 +474,8 @@ impl Interpreter {
             // The Otter foundation collapses both into the same
             // realm prototype today.
             "Iterator"
+        } else if let Some(t) = value.as_temporal(&self.gc_heap) {
+            return self.temporal_prototype_object(t.kind());
         } else if value.is_symbol() {
             "Symbol"
         } else if value.is_string() {

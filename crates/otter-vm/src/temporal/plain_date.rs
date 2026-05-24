@@ -346,3 +346,21 @@ pub static PLAIN_DATE_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(
 pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
     PLAIN_DATE_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Temporal, name)
 }
+
+crate::temporal::proto_bridge::temporal_proto_methods! {
+    class = "PlainDate",
+    slice = PLAIN_DATE_PROTOTYPE_METHODS,
+    methods = [
+        "toString"        / 0 => impl_to_string         as native_pd_to_string,
+        "toJSON"          / 0 => impl_to_json           as native_pd_to_json,
+        "valueOf"         / 0 => impl_value_of          as native_pd_value_of,
+        "add"             / 1 => impl_add               as native_pd_add,
+        "subtract"        / 1 => impl_subtract          as native_pd_subtract,
+        "equals"          / 1 => impl_equals            as native_pd_equals,
+        "until"           / 1 => impl_until             as native_pd_until,
+        "since"           / 1 => impl_since             as native_pd_since,
+        "with"            / 1 => impl_with              as native_pd_with,
+        "withCalendar"    / 1 => impl_with_calendar     as native_pd_with_calendar,
+        "toPlainDateTime" / 0 => impl_to_plain_date_time as native_pd_to_plain_date_time,
+    ]
+}

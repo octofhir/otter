@@ -1171,6 +1171,12 @@ impl Interpreter {
             }
             return Ok(intrinsic_or_null(self, value));
         }
+        if let Some(t) = value.as_temporal(&self.gc_heap) {
+            return Ok(self
+                .temporal_prototype_object(t.kind())
+                .map(Value::object)
+                .unwrap_or(Value::null()));
+        }
         if let Some(generator) = value.as_generator() {
             if let Some(proto) = generator.prototype_override(&self.gc_heap) {
                 return Ok(proto);

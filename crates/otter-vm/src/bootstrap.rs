@@ -38,7 +38,7 @@ use crate::{
 // re-exported here so per-intrinsic modules + bootstrap call sites can
 // import either path.
 pub(crate) use crate::intrinsics::shared::{
-    alloc_object_with_value_roots, define_global, install_placeholder, native_new_target_prototype,
+    alloc_object_with_value_roots, install_placeholder, native_new_target_prototype,
 };
 pub use crate::intrinsics::shared::{
     alloc_object_with_value_roots_pub, define_global_value,

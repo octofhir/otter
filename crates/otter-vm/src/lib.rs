@@ -156,7 +156,7 @@ use arithmetic_dispatch::{
 };
 pub(crate) use error_ops::{
     intrinsic_to_vm_error, native_to_vm_error, render_thrown_value, snapshot_frames,
-    symbol_to_vm_error, temporal_to_vm_error, vm_err_to_value,
+    symbol_to_vm_error, vm_err_to_value,
 };
 use executable::ExecutableFunction;
 use operand_decode::{apply_branch, register_operand};

@@ -41,6 +41,10 @@ pub enum TemporalPayload {
     PlainDateTime(temporal_rs::PlainDateTime),
     /// `Temporal.PlainYearMonth` — `YYYY-MM` calendar year+month.
     PlainYearMonth(temporal_rs::PlainYearMonth),
+    /// `Temporal.PlainMonthDay` — `MM-DD` calendar month+day.
+    PlainMonthDay(temporal_rs::PlainMonthDay),
+    /// `Temporal.ZonedDateTime` — instant + IANA time zone + calendar.
+    ZonedDateTime(temporal_rs::ZonedDateTime),
 }
 
 impl TemporalPayload {
@@ -54,6 +58,8 @@ impl TemporalPayload {
             TemporalPayload::PlainTime(_) => TemporalKind::PlainTime,
             TemporalPayload::PlainDateTime(_) => TemporalKind::PlainDateTime,
             TemporalPayload::PlainYearMonth(_) => TemporalKind::PlainYearMonth,
+            TemporalPayload::PlainMonthDay(_) => TemporalKind::PlainMonthDay,
+            TemporalPayload::ZonedDateTime(_) => TemporalKind::ZonedDateTime,
         }
     }
 }
@@ -76,6 +82,10 @@ pub enum TemporalKind {
     PlainDateTime,
     /// `Temporal.PlainYearMonth` instance.
     PlainYearMonth,
+    /// `Temporal.PlainMonthDay` instance.
+    PlainMonthDay,
+    /// `Temporal.ZonedDateTime` instance.
+    ZonedDateTime,
 }
 
 impl TemporalKind {
@@ -89,6 +99,8 @@ impl TemporalKind {
             TemporalKind::PlainTime => "PlainTime",
             TemporalKind::PlainDateTime => "PlainDateTime",
             TemporalKind::PlainYearMonth => "PlainYearMonth",
+            TemporalKind::PlainMonthDay => "PlainMonthDay",
+            TemporalKind::ZonedDateTime => "ZonedDateTime",
         }
     }
 
@@ -102,6 +114,8 @@ impl TemporalKind {
             "PlainTime" => TemporalKind::PlainTime,
             "PlainDateTime" => TemporalKind::PlainDateTime,
             "PlainYearMonth" => TemporalKind::PlainYearMonth,
+            "PlainMonthDay" => TemporalKind::PlainMonthDay,
+            "ZonedDateTime" => TemporalKind::ZonedDateTime,
             _ => return None,
         })
     }

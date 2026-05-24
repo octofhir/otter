@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 use crate::{
     ErrorKind, ExecutionContext, Frame, Interpreter, IntrinsicError, JsString, NativeError,
     StackFrameSnapshot, Value, VmError, error_classes, object, read_register, symbol_dispatch,
-    temporal, write_register,
+    write_register,
 };
 
 impl Interpreter {
@@ -346,23 +346,6 @@ pub(crate) fn symbol_to_vm_error(err: symbol_dispatch::SymbolError) -> VmError {
         },
         symbol_dispatch::SymbolError::BadArgument { .. } => VmError::TypeMismatch,
         symbol_dispatch::SymbolError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => VmError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-    }
-}
-
-pub(crate) fn temporal_to_vm_error(err: temporal::TemporalError) -> VmError {
-    match err {
-        temporal::TemporalError::UnknownMember { class, method } => VmError::UnknownIntrinsic {
-            name: format!("Temporal.{class}.{method}"),
-        },
-        temporal::TemporalError::BadArgument { .. } => VmError::TypeMismatch,
-        temporal::TemporalError::Engine { message, .. } => VmError::Uncaught { value: message },
-        temporal::TemporalError::OutOfMemory {
             requested_bytes,
             heap_limit_bytes,
         } => VmError::OutOfMemory {

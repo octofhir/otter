@@ -3057,6 +3057,15 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
+        if base.as_temporal(&self.gc_heap).is_some() {
+            // Temporal value: route property lookup through the
+            // per-class prototype installed on `Temporal.<X>.prototype`.
+            let proto = self.get_prototype_for_op(&base)?;
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
         Err(VmError::TypeMismatch)
     }
 

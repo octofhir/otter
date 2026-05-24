@@ -567,8 +567,11 @@ mod tests {
         // populated `.prototype` carrying every per-class method as
         // an own data property (Tier 4 spec-conformance sweep) plus
         // the new `PlainYearMonth` class.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1280;
-        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 540 * 1024;
+        // Bumped from 1280 → 1350 when `PlainMonthDay` + `ZonedDateTime`
+        // landed, each shipping a constructor, statics, and a populated
+        // prototype.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1350;
+        const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");
         let mut telemetry = BootstrapTelemetry::default();

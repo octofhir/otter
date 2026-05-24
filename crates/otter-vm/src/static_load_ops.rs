@@ -18,7 +18,7 @@
 
 use crate::{
     ExecutionContext, Frame, Interpreter, VmError, math, symbol_dispatch, symbol_to_vm_error,
-    temporal, temporal_to_vm_error, write_register,
+    write_register,
 };
 
 impl Interpreter {
@@ -58,17 +58,14 @@ impl Interpreter {
 
     pub(crate) fn run_temporal_load_reg(
         &self,
-        context: &ExecutionContext,
-        frame: &mut Frame,
-        dst: u16,
-        name_idx: u32,
+        _context: &ExecutionContext,
+        _frame: &mut Frame,
+        _dst: u16,
+        _name_idx: u32,
     ) -> Result<(), VmError> {
-        let name = context
-            .string_constant_str(name_idx)
-            .ok_or(VmError::InvalidOperand)?;
-        let value = temporal::load_static(name).map_err(temporal_to_vm_error)?;
-        write_register(frame, dst, value)?;
-        frame.advance_pc(self.current_byte_len)?;
-        Ok(())
+        // `Op::TemporalLoad` is legacy: the compiler no longer emits
+        // it now that `Temporal.<X>` resolves through ordinary
+        // property access on the namespace object.
+        Err(VmError::InvalidOperand)
     }
 }

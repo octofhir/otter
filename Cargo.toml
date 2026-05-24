@@ -72,7 +72,7 @@ syn         = { version = "2", features = ["full", "parsing", "printing"] }
 num-bigint  = "0.4"
 num-traits  = "0.2"
 
-temporal_rs = { version = "0.2.3", features = ["sys-local"] }
+temporal_rs = { version = "0.2.3", features = ["sys-local", "compiled_data"] }
 
 icu_collator = { version = "2.1", features = ["compiled_data"] }
 icu_decimal  = { version = "2.1", features = ["compiled_data"] }

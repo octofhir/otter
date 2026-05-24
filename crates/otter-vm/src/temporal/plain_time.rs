@@ -3,23 +3,23 @@
 //! # See also
 //! - <https://tc39.es/proposal-temporal/#sec-temporal-plaintime-objects>
 
-use std::sync::LazyLock;
+#![allow(missing_docs)]
 
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::temporal::dispatch::TemporalError;
+
+use crate::js_surface::{Attr, MethodSpec};
+use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    alloc_temporal_value, clamp_to_u16, clamp_to_u8, js_string_value, make_temporal,
+    arg_or_undef, clamp_to_u16, clamp_to_u8, js_string_value, make_temporal,
     opt_integer_with_truncation, parse_difference_settings, parse_partial_time,
-    parse_rounding_options, require_construct, require_plain_time, temporal_dispatch_err,
-    temporal_err,
+    parse_rounding_options, require_construct, require_plain_time, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
-/// §4.1.1 `Temporal.PlainTime([hour [, minute [, second [, ms [, us [, ns]]]]]])`.
+const CLASS: &str = "Temporal.PlainTime";
+
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    const CLASS: &str = "Temporal.PlainTime";
     require_construct(ctx, CLASS)?;
     let heap = ctx.heap();
     let hour = clamp_to_u8(
@@ -60,63 +60,56 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         microsecond,
         nanosecond,
     )
-    .map_err(|e| NativeError::RangeError {
-        name: CLASS,
-        reason: e.to_string(),
-    })?;
-    let heap = ctx.heap_mut();
-    alloc_temporal_value(heap, TemporalPayload::PlainTime(pt)).map_err(temporal_dispatch_err)
+    .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::PlainTime(pt))
 }
 
-/// Dispatch `Temporal.PlainTime.<method>(args...)` via the typed
-/// [`TemporalMethod`].
-pub fn dispatch_static(
-    gc_heap: &mut otter_gc::GcHeap,
-    method: otter_bytecode::method_id::TemporalMethod,
-    args: &[Value],
-) -> Result<Value, TemporalError> {
-    use otter_bytecode::method_id::TemporalMethod as M;
-    match method {
-        M::From => from(args, gc_heap),
-        other => Err(TemporalError::UnknownMember {
-            class: "PlainTime".to_string(),
-            method: other.name().to_string(),
-        }),
+fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = parse_plain_time_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    make_temporal(ctx, TemporalPayload::PlainTime(pt))
+}
+
+fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let a = parse_plain_time_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let b = parse_plain_time_arg(&arg_or_undef(args, 1), ctx.heap())?;
+    let n = if a == b {
+        0
+    } else if a.hour() < b.hour()
+        || (a.hour() == b.hour() && a.minute() < b.minute())
+        || (a.hour() == b.hour() && a.minute() == b.minute() && a.second() < b.second())
+    {
+        -1
+    } else {
+        1
+    };
+    Ok(Value::number_i32(n))
+}
+
+fn parse_plain_time_arg(
+    v: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::PlainTime, NativeError> {
+    if let Some(t) = v.as_temporal(heap) {
+        match t.payload_clone(heap) {
+            TemporalPayload::PlainTime(v) => Ok(v),
+            _ => Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "argument must be a Temporal.PlainTime".to_string(),
+            }),
+        }
+    } else if let Some(s) = v.as_string(heap) {
+        temporal_rs::PlainTime::from_utf8(s.to_lossy_string(heap).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))
+    } else {
+        Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "argument must be a Temporal.PlainTime or ISO string".to_string(),
+        })
     }
 }
 
-fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
-    let bad = || TemporalError::BadArgument {
-        class: "PlainTime",
-        method: "from",
-        index: 0,
-        reason: "must be a Temporal.PlainTime or ISO string",
-    };
-    let first = args.first();
-    let pt = if let Some(t) = first.and_then(|v| v.as_temporal(gc_heap)) {
-        match t.payload_clone(gc_heap) {
-            TemporalPayload::PlainTime(v) => v,
-            _ => return Err(bad()),
-        }
-    } else if let Some(s) = first.and_then(|v| v.as_string(gc_heap)) {
-        temporal_rs::PlainTime::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
-            TemporalError::Engine {
-                class: "PlainTime",
-                method: "from",
-                message: e.to_string(),
-            kind: e.kind(),
-            }
-        })?
-    } else {
-        return Err(bad());
-    };
-    alloc_temporal_value(gc_heap, TemporalPayload::PlainTime(pt))
-}
-
-/// Property reads on a `Temporal.PlainTime` receiver.
-#[must_use]
-pub fn load_property(temporal: JsTemporal, gc_heap: &otter_gc::GcHeap, name: &str) -> Value {
-    let pt = match temporal.payload_clone(gc_heap) {
+pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) -> Value {
+    let pt = match temporal.payload_clone(heap) {
         TemporalPayload::PlainTime(v) => v,
         _ => return Value::undefined(),
     };
@@ -131,167 +124,145 @@ pub fn load_property(temporal: JsTemporal, gc_heap: &otter_gc::GcHeap, name: &st
     }
 }
 
-// ── Prototype table ──────────────────────────────────────────────
-
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = require_plain_time(args)?;
-    let s = pt
-        .to_ixdtf_string(temporal_rs::options::ToStringRoundingOptions::default())
-        .map_err(temporal_err)?;
-    js_string_value(s, args)
-}
-
-fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = require_plain_time(args)?;
-    let dur = duration_arg(args, 0)?;
-    let result = pt.add(&dur).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::PlainTime(result))
-}
-
-fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = require_plain_time(args)?;
-    let dur = duration_arg(args, 0)?;
-    let result = pt.subtract(&dur).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::PlainTime(result))
-}
-
-fn duration_arg(
-    args: &IntrinsicArgs<'_>,
-    index: u16,
-) -> Result<temporal_rs::Duration, IntrinsicError> {
-    let bad = || IntrinsicError::BadArgument {
-        index,
-        reason: "must be a Temporal.Duration",
-    };
-    let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
-        match t.payload_clone(args.gc_heap) {
+fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Duration, NativeError> {
+    if let Some(t) = v.as_temporal(heap) {
+        match t.payload_clone(heap) {
             TemporalPayload::Duration(d) => Ok(d),
-            _ => Err(bad()),
+            _ => Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "must be a Temporal.Duration".to_string(),
+            }),
         }
-    } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
-        let heap = &*args.gc_heap;
-        partial_from_object(&obj, heap).map_err(|_| IntrinsicError::BadArgument {
-            index,
-            reason: "must be a Temporal.Duration partial",
-        })
+    } else if let Some(obj) = v.as_object() {
+        partial_from_object(&obj, heap).map_err(|e| temporal_err(e, CLASS))
     } else {
-        Err(bad())
+        Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "must be a Temporal.Duration".to_string(),
+        })
     }
 }
 
-fn impl_until(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = crate::temporal::helpers::require_plain_time(args)?;
-    let other = arg_as_plain_time(args, 0)?;
-    let settings = parse_difference_settings(args, 1)?;
-    let result = pt.until(&other, settings).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::Duration(result))
+fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let s = pt
+        .to_ixdtf_string(temporal_rs::options::ToStringRoundingOptions::default())
+        .map_err(|e| temporal_err(e, CLASS))?;
+    js_string_value(s, ctx)
 }
 
-fn impl_since(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = crate::temporal::helpers::require_plain_time(args)?;
-    let other = arg_as_plain_time(args, 0)?;
-    let settings = parse_difference_settings(args, 1)?;
-    let result = pt.since(&other, settings).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::Duration(result))
+fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, args)
 }
 
-fn impl_round(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = crate::temporal::helpers::require_plain_time(args)?;
-    let options = parse_rounding_options(args, 0)?;
-    let result = pt.round(options).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::PlainTime(result))
-}
-
-fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = crate::temporal::helpers::require_plain_time(args)?;
-    let other = arg_as_plain_time(args, 0)?;
-    Ok(Value::boolean(pt == other))
-}
-
-fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    impl_to_string(args)
-}
-
-fn impl_value_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Err(IntrinsicError::BadReceiver {
-        expected: "Temporal.PlainTime has no `.valueOf` — use `compare` or `equals`",
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Err(NativeError::TypeError {
+        name: CLASS,
+        reason: "Temporal.PlainTime has no `.valueOf` — use `compare` or `equals`".to_string(),
     })
 }
 
-fn arg_as_plain_time(
-    args: &IntrinsicArgs<'_>,
-    index: u16,
-) -> Result<temporal_rs::PlainTime, IntrinsicError> {
-    let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
-        match t.payload_clone(args.gc_heap) {
-            TemporalPayload::PlainTime(v) => Ok(v),
-            _ => Err(IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.PlainTime",
-            }),
-        }
-    } else if let Some(s) = arg.and_then(|v| v.as_string(args.gc_heap)) {
-        temporal_rs::PlainTime::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
-            .map_err(temporal_err)
-    } else {
-        Err(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a Temporal.PlainTime or ISO string",
-        })
+fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let result = pt.add(&dur).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::PlainTime(result))
+}
+
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let result = pt.subtract(&dur).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::PlainTime(result))
+}
+
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let other = parse_plain_time_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    Ok(Value::boolean(pt == other))
+}
+
+fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let other = parse_plain_time_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let result = pt
+        .until(&other, settings)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Duration(result))
+}
+
+fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let other = parse_plain_time_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let result = pt
+        .since(&other, settings)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Duration(result))
+}
+
+fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let result = pt
+        .round(options)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::PlainTime(result))
+}
+
+fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pt = require_plain_time(ctx)?;
+    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "first argument must be an object".to_string(),
+        });
+    };
+    let partial = parse_partial_time(obj, ctx.heap(), CLASS)?;
+    let result = pt
+        .with(partial, None)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::PlainTime(result))
+}
+
+const fn method(
+    name: &'static str,
+    length: u8,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        length,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(call),
     }
 }
 
-fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let pt = crate::temporal::helpers::require_plain_time(args)?;
-    let Some(obj) = args.args.first().and_then(|v| v.as_object()) else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "first argument must be an object",
-        });
-    };
-    let partial = parse_partial_time(obj, args.gc_heap)?;
-    let result = pt.with(partial, None).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::PlainTime(result))
-}
+pub static PLAIN_TIME_PROTOTYPE_METHODS: &[MethodSpec] = &[
+    method("toString", 0, impl_to_string),
+    method("toJSON", 0, impl_to_json),
+    method("valueOf", 0, impl_value_of),
+    method("add", 1, impl_add),
+    method("subtract", 1, impl_subtract),
+    method("equals", 1, impl_equals),
+    method("until", 1, impl_until),
+    method("since", 1, impl_since),
+    method("round", 1, impl_round),
+    method("with", 1, impl_with),
+];
 
-/// `Temporal.PlainTime.prototype` table.
-pub static PLAIN_TIME_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Temporal,
-        "toString" / 0 => impl_to_string,
-        "toJSON"   / 0 => impl_to_json,
-        "valueOf"  / 0 => impl_value_of,
-        "add"      / 1 => impl_add,
-        "subtract" / 1 => impl_subtract,
-        "equals"   / 1 => impl_equals,
-        "until"    / 1 => impl_until,
-        "since"    / 1 => impl_since,
-        "round"    / 1 => impl_round,
-        "with"     / 1 => impl_with,
-    )
-});
-
-/// Convenience accessor used by [`super::lookup_prototype`].
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    PLAIN_TIME_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Temporal, name)
-}
-
-crate::temporal::proto_bridge::temporal_proto_methods! {
-    class = "PlainTime",
-    slice = PLAIN_TIME_PROTOTYPE_METHODS,
-    methods = [
-        "toString" / 0 => impl_to_string as native_pt_to_string,
-        "toJSON"   / 0 => impl_to_json   as native_pt_to_json,
-        "valueOf"  / 0 => impl_value_of  as native_pt_value_of,
-        "add"      / 1 => impl_add       as native_pt_add,
-        "subtract" / 1 => impl_subtract  as native_pt_subtract,
-        "equals"   / 1 => impl_equals    as native_pt_equals,
-        "until"    / 1 => impl_until     as native_pt_until,
-        "since"    / 1 => impl_since     as native_pt_since,
-        "round"    / 1 => impl_round     as native_pt_round,
-        "with"     / 1 => impl_with      as native_pt_with,
-    ]
+otter_macros::couch! {
+    name = "PlainTime",
+    feature = CORE,
+    intrinsic = PlainTimeIntrinsic,
+    constructor = (length = 0, call = construct),
+    statics = {
+        "from"    / 1 => from,
+        "compare" / 2 => compare,
+    },
+    prototype = {
+        method_specs = [PLAIN_TIME_PROTOTYPE_METHODS],
+    },
+    install_on = crate::temporal::native_dispatch::temporal_host,
 }

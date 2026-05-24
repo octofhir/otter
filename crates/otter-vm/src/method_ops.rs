@@ -35,7 +35,7 @@ use crate::{
     operand_decode::{const_operand, register_operand},
     promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
-    symbol_prototype, temporal, weak_refs, write_register,
+    symbol_prototype, weak_refs, write_register,
 };
 
 /// Object-like family that needs §7.1.1 `ToPrimitive` coercion before
@@ -472,8 +472,6 @@ impl Interpreter {
             weak_refs::lookup_weak_ref(name)
         } else if recv_value.is_finalization_registry() {
             weak_refs::lookup_finalization_registry(name)
-        } else if recv_value.is_temporal() {
-            temporal::lookup_prototype(&recv_value, &self.gc_heap, name)
         } else if recv_value.is_intl() {
             intl::lookup_prototype(&recv_value, &self.gc_heap, name)
         } else if recv_value.is_array_buffer() {
@@ -957,6 +955,7 @@ impl Interpreter {
             || recv_value.is_number()
             || recv_value.is_symbol()
             || recv_value.is_big_int()
+            || recv_value.is_temporal()
         {
             // §7.1.18 ToObject — primitive receivers walk the
             // constructor's prototype to surface inherited

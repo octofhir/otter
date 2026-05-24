@@ -358,6 +358,8 @@ method_id_enum! {
         PlainDateTime = 4 => "PlainDateTime",
         Now = 5 => "Now",
         PlainYearMonth = 6 => "PlainYearMonth",
+        PlainMonthDay = 7 => "PlainMonthDay",
+        ZonedDateTime = 8 => "ZonedDateTime",
     }
 }
 

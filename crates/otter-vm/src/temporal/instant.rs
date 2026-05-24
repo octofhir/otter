@@ -1,44 +1,29 @@
 //! `Temporal.Instant` — point on the UTC timeline.
 //!
-//! Backed entirely by [`temporal_rs::Instant`]; this module is the
-//! thin glue that routes JS-visible static / prototype calls through
-//! the spec algorithms.
-//!
-//! # Contents
-//! - [`dispatch_static`] — `Temporal.Instant.from(...)` /
-//!   `Instant.compare(...)` / `Instant.fromEpochMilliseconds(ms)`.
-//! - [`load_property`] — accessor reads (`epochMilliseconds`,
-//!   `epochNanoseconds`).
-//! - [`INSTANT_PROTOTYPE_TABLE`] — synchronous prototype methods
-//!   (`add`, `subtract`, `equals`, `toString`).
-//!
 //! # See also
 //! - <https://tc39.es/proposal-temporal/#sec-temporal-instant-objects>
 
-use std::sync::LazyLock;
+#![allow(missing_docs)]
 
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::temporal::dispatch::TemporalError;
+
+use num_traits::ToPrimitive;
+
+use crate::js_surface::{Attr, MethodSpec};
+use crate::native_function::NativeCall;
 use crate::temporal::helpers::{
-    alloc_temporal_value, arg_or_undef, js_string_value, make_temporal,
-    parse_difference_settings, parse_rounding_options, require_construct, require_instant,
-    temporal_dispatch_err, temporal_err,
+    arg_or_undef, js_string_value, make_temporal, parse_difference_settings,
+    parse_rounding_options, require_construct, require_instant, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
-/// §8.1.1 `Temporal.Instant(epochNanoseconds)` — `[[Construct]]`
-/// body. Coerces `epochNanoseconds` to a `BigInt`, validates the
-/// epoch range, and allocates a `Value::Temporal`.
+const CLASS: &str = "Temporal.Instant";
+
 pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    const CLASS: &str = "Temporal.Instant";
     require_construct(ctx, CLASS)?;
     let raw = arg_or_undef(args, 0);
     let ns = if let Some(b) = raw.as_big_int() {
-        b.with_inner(ctx.heap(), |bi| {
-            use num_traits::ToPrimitive;
-            bi.to_i128()
-        })
+        b.with_inner(ctx.heap(), |bi| bi.to_i128())
     } else if let Some(s) = raw.as_string(ctx.heap()) {
         let text = s.to_lossy_string(ctx.heap());
         let parsed =
@@ -46,7 +31,6 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
                 name: CLASS,
                 reason: format!("cannot convert {text:?} to a BigInt"),
             })?;
-        use num_traits::ToPrimitive;
         parsed.to_i128()
     } else if let Some(b) = raw.as_boolean() {
         Some(i128::from(b))
@@ -72,72 +56,31 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             reason: "epochNanoseconds out of i128 range".to_string(),
         });
     };
-    let inst = temporal_rs::Instant::try_new(ns).map_err(|e| NativeError::RangeError {
-        name: CLASS,
-        reason: e.to_string(),
-    })?;
-    let heap = ctx.heap_mut();
-    alloc_temporal_value(heap, TemporalPayload::Instant(inst)).map_err(temporal_dispatch_err)
+    let inst = temporal_rs::Instant::try_new(ns).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
-/// Dispatch `Temporal.Instant.<method>(args...)` via the typed
-/// [`TemporalMethod`].
-pub fn dispatch_static(
-    gc_heap: &mut otter_gc::GcHeap,
-    method: otter_bytecode::method_id::TemporalMethod,
-    args: &[Value],
-) -> Result<Value, TemporalError> {
-    use otter_bytecode::method_id::TemporalMethod as M;
-    match method {
-        M::From => from(args, gc_heap),
-        M::FromEpochMilliseconds => from_epoch_milliseconds(args, gc_heap),
-        M::Compare => compare(args, gc_heap),
-        other => Err(TemporalError::UnknownMember {
-            class: "Instant".to_string(),
-            method: other.name().to_string(),
-        }),
-    }
+fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let inst = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
-/// Spec §8.2.1 `Temporal.Instant.from`.
-fn from(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, TemporalError> {
-    let inst = parse_instant_arg(args, gc_heap, 0, "from")?;
-    alloc_temporal_value(gc_heap, TemporalPayload::Instant(inst))
-}
-
-/// Spec §8.2.3 `Temporal.Instant.fromEpochMilliseconds(ms)`.
-fn from_epoch_milliseconds(
-    args: &[Value],
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Value, TemporalError> {
-    let Some(ms) = args
-        .first()
-        .and_then(|v| v.as_number())
-        .map(|n| n.as_f64() as i64)
-    else {
-        return Err(TemporalError::BadArgument {
-            class: "Instant",
-            method: "fromEpochMilliseconds",
-            index: 0,
-            reason: "must be a number",
+fn from_epoch_milliseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let Some(ms) = arg_or_undef(args, 0).as_number().map(|n| n.as_f64() as i64) else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "fromEpochMilliseconds: argument must be a number".to_string(),
         });
     };
-    let inst =
-        temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|e| TemporalError::Engine {
-            class: "Instant",
-            method: "fromEpochMilliseconds",
-            message: e.to_string(),
-            kind: e.kind(),
-        })?;
-    alloc_temporal_value(gc_heap, TemporalPayload::Instant(inst))
+    let inst = temporal_rs::Instant::from_epoch_milliseconds(ms)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
-/// Spec §8.2.4 `Temporal.Instant.compare(a, b)`.
-fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, TemporalError> {
-    let a = parse_instant_arg(args, gc_heap, 0, "compare")?;
-    let b = parse_instant_arg(args, gc_heap, 1, "compare")?;
-    let cmp = a.as_i128().cmp(&b.as_i128());
-    let n = match cmp {
+fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let a = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let b = parse_instant_arg(&arg_or_undef(args, 1), ctx.heap())?;
+    let n = match a.as_i128().cmp(&b.as_i128()) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
         std::cmp::Ordering::Greater => 1,
@@ -146,244 +89,174 @@ fn compare(args: &[Value], gc_heap: &otter_gc::GcHeap) -> Result<Value, Temporal
 }
 
 fn parse_instant_arg(
-    args: &[Value],
-    gc_heap: &otter_gc::GcHeap,
-    index: u16,
-    method: &'static str,
-) -> Result<temporal_rs::Instant, TemporalError> {
-    let arg = args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal(gc_heap)) {
-        match t.payload_clone(gc_heap) {
+    v: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::Instant, NativeError> {
+    if let Some(t) = v.as_temporal(heap) {
+        match t.payload_clone(heap) {
             TemporalPayload::Instant(v) => Ok(v),
-            _ => Err(TemporalError::BadArgument {
-                class: "Instant",
-                method,
-                index,
-                reason: "must be a Temporal.Instant",
+            _ => Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "argument must be a Temporal.Instant".to_string(),
             }),
         }
-    } else if let Some(s) = arg.and_then(|v| v.as_string(gc_heap)) {
-        temporal_rs::Instant::from_utf8(s.to_lossy_string(gc_heap).as_bytes()).map_err(|e| {
-            TemporalError::Engine {
-                class: "Instant",
-                method,
-                message: e.to_string(),
-            kind: e.kind(),
-            }
-        })
+    } else if let Some(s) = v.as_string(heap) {
+        temporal_rs::Instant::from_utf8(s.to_lossy_string(heap).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))
     } else {
-        Err(TemporalError::BadArgument {
-            class: "Instant",
-            method,
-            index,
-            reason: "must be a Temporal.Instant or ISO string",
+        Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "argument must be a Temporal.Instant or ISO string".to_string(),
         })
     }
 }
 
-/// Property reads on a `Temporal.Instant` receiver. The
-/// `epochNanoseconds` accessor allocates a BigInt body and so takes
-/// `&mut GcHeap`; the `epochMilliseconds` arm is heap-free but
-/// shares the signature for uniform dispatch.
-pub fn load_property(temporal: JsTemporal, gc_heap: &mut otter_gc::GcHeap, name: &str) -> Value {
-    let inst = match temporal.payload_clone(gc_heap) {
+pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &str) -> Value {
+    let inst = match temporal.payload_clone(heap) {
         TemporalPayload::Instant(v) => v,
         _ => return Value::undefined(),
     };
     match name {
         "epochMilliseconds" => Value::number_f64(inst.epoch_milliseconds() as f64),
-        "epochNanoseconds" => {
-            // Per spec returns a BigInt. On allocation failure the
-            // accessor returns `undefined` — the caller has no error
-            // channel; this matches the spec's "throws abrupt" only
-            // when the GC cap is hit, which `RangeError` would
-            // normally surface but the property-load path can't
-            // propagate that here without a wider API change.
-            match crate::bigint::BigIntValue::from_i128(gc_heap, inst.as_i128()) {
-                Ok(handle) => Value::big_int(handle),
-                Err(_) => Value::undefined(),
-            }
-        }
+        "epochNanoseconds" => match crate::bigint::BigIntValue::from_i128(heap, inst.as_i128()) {
+            Ok(handle) => Value::big_int(handle),
+            Err(_) => Value::undefined(),
+        },
         _ => Value::undefined(),
     }
 }
 
-// ── Prototype table ──────────────────────────────────────────────
-
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let inst = require_instant(args)?;
+fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
     let s = inst
         .to_ixdtf_string(
             None,
             temporal_rs::options::ToStringRoundingOptions::default(),
         )
-        .map_err(temporal_err)?;
-    js_string_value(s, args)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    js_string_value(s, ctx)
 }
 
-fn impl_add(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let inst = require_instant(args)?;
-    let dur = arg_as_duration(args, 0)?;
-    let result = inst.add(&dur).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::Instant(result))
+fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    impl_to_string(ctx, args)
 }
 
-fn impl_subtract(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let inst = require_instant(args)?;
-    let dur = arg_as_duration(args, 0)?;
-    let result = inst.subtract(&dur).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::Instant(result))
-}
-
-fn impl_equals(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let inst = require_instant(args)?;
-    let first = args.args.first();
-    let other = if let Some(t) = first.and_then(|v| v.as_temporal(args.gc_heap)) {
-        match t.payload_clone(args.gc_heap) {
-            TemporalPayload::Instant(v) => v,
-            _ => {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "must be a Temporal.Instant",
-                });
-            }
-        }
-    } else if let Some(s) = first.and_then(|v| v.as_string(args.gc_heap)) {
-        temporal_rs::Instant::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
-            .map_err(temporal_err)?
-    } else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a Temporal.Instant or ISO string",
-        });
-    };
-    Ok(Value::boolean(inst.as_i128() == other.as_i128()))
-}
-
-/// Coerce the argument at `index` to a [`temporal_rs::Duration`].
-fn arg_as_duration(
-    args: &IntrinsicArgs<'_>,
-    index: u16,
-) -> Result<temporal_rs::Duration, IntrinsicError> {
-    let bad = || IntrinsicError::BadArgument {
-        index,
-        reason: "must be a Temporal.Duration",
-    };
-    let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
-        match t.payload_clone(args.gc_heap) {
-            TemporalPayload::Duration(d) => Ok(d),
-            _ => Err(bad()),
-        }
-    } else if let Some(obj) = arg.and_then(|v| v.as_object()) {
-        let heap = &*args.gc_heap;
-        crate::temporal::duration::partial_from_object(&obj, heap).map_err(|_| {
-            IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Duration partial",
-            }
-        })
-    } else {
-        Err(bad())
-    }
-}
-
-fn impl_until(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let inst = require_instant(args)?;
-    let other = arg_as_instant(args, 0)?;
-    let settings = parse_difference_settings(args, 1)?;
-    let result = inst.until(&other, settings).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::Duration(result))
-}
-
-fn impl_since(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let inst = require_instant(args)?;
-    let other = arg_as_instant(args, 0)?;
-    let settings = parse_difference_settings(args, 1)?;
-    let result = inst.since(&other, settings).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::Duration(result))
-}
-
-fn impl_round(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let inst = require_instant(args)?;
-    let options = parse_rounding_options(args, 0)?;
-    let result = inst.round(options).map_err(temporal_err)?;
-    make_temporal(args, TemporalPayload::Instant(result))
-}
-
-/// `toJSON` returns the same ISO string as `toString` per
-/// §8.3.10 — used by `JSON.stringify`.
-fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    impl_to_string(args)
-}
-
-/// `valueOf` always throws `TypeError` per §8.3.13 to block ordering
-/// comparisons (`<`, `>=`) on Temporal values.
-fn impl_value_of(_args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Err(IntrinsicError::BadReceiver {
-        expected: "Temporal.Instant has no `.valueOf` — use `compare` or `equals`",
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Err(NativeError::TypeError {
+        name: CLASS,
+        reason: "Temporal.Instant has no `.valueOf` — use `compare` or `equals`".to_string(),
     })
 }
 
-/// Coerce the argument at `index` to a [`temporal_rs::Instant`].
-fn arg_as_instant(
-    args: &IntrinsicArgs<'_>,
-    index: u16,
-) -> Result<temporal_rs::Instant, IntrinsicError> {
-    let arg = args.args.get(index as usize);
-    if let Some(t) = arg.and_then(|v| v.as_temporal(args.gc_heap)) {
-        match t.payload_clone(args.gc_heap) {
-            TemporalPayload::Instant(v) => Ok(v),
-            _ => Err(IntrinsicError::BadArgument {
-                index,
-                reason: "must be a Temporal.Instant",
+fn arg_as_duration(
+    v: &Value,
+    heap: &otter_gc::GcHeap,
+) -> Result<temporal_rs::Duration, NativeError> {
+    if let Some(t) = v.as_temporal(heap) {
+        match t.payload_clone(heap) {
+            TemporalPayload::Duration(d) => Ok(d),
+            _ => Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "must be a Temporal.Duration".to_string(),
             }),
         }
-    } else if let Some(s) = arg.and_then(|v| v.as_string(args.gc_heap)) {
-        temporal_rs::Instant::from_utf8(s.to_lossy_string(args.gc_heap).as_bytes())
-            .map_err(temporal_err)
+    } else if let Some(obj) = v.as_object() {
+        crate::temporal::duration::partial_from_object(&obj, heap)
+            .map_err(|e| temporal_err(e, CLASS))
     } else {
-        Err(IntrinsicError::BadArgument {
-            index,
-            reason: "must be a Temporal.Instant or ISO string",
+        Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "must be a Temporal.Duration".to_string(),
         })
     }
 }
 
-/// `Temporal.Instant.prototype` table.
-pub static INSTANT_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Temporal,
-        "toString" / 0 => impl_to_string,
-        "toJSON"   / 0 => impl_to_json,
-        "valueOf"  / 0 => impl_value_of,
-        "add"      / 1 => impl_add,
-        "subtract" / 1 => impl_subtract,
-        "equals"   / 1 => impl_equals,
-        "until"    / 1 => impl_until,
-        "since"    / 1 => impl_since,
-        "round"    / 1 => impl_round,
-    )
-});
-
-/// Convenience accessor used by [`super::lookup_prototype`].
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    INSTANT_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Temporal, name)
+fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let dur = arg_as_duration(&arg_or_undef(args, 0), ctx.heap())?;
+    let result = inst.add(&dur).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Instant(result))
 }
 
-crate::temporal::proto_bridge::temporal_proto_methods! {
-    class = "Instant",
-    slice = INSTANT_PROTOTYPE_METHODS,
-    methods = [
-        "toString" / 0 => impl_to_string as native_instant_to_string,
-        "toJSON"   / 0 => impl_to_json   as native_instant_to_json,
-        "valueOf"  / 0 => impl_value_of  as native_instant_value_of,
-        "add"      / 1 => impl_add       as native_instant_add,
-        "subtract" / 1 => impl_subtract  as native_instant_subtract,
-        "equals"   / 1 => impl_equals    as native_instant_equals,
-        "until"    / 1 => impl_until     as native_instant_until,
-        "since"    / 1 => impl_since     as native_instant_since,
-        "round"    / 1 => impl_round     as native_instant_round,
-    ]
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let dur = arg_as_duration(&arg_or_undef(args, 0), ctx.heap())?;
+    let result = inst.subtract(&dur).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Instant(result))
+}
+
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    Ok(Value::boolean(inst.as_i128() == other.as_i128()))
+}
+
+fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let result = inst
+        .until(&other, settings)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Duration(result))
+}
+
+fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let other = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
+    let settings = parse_difference_settings(args, 1, ctx.heap(), CLASS)?;
+    let result = inst
+        .since(&other, settings)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Duration(result))
+}
+
+fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    let result = inst
+        .round(options)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Instant(result))
+}
+
+const fn method(
+    name: &'static str,
+    length: u8,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        length,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(call),
+    }
+}
+
+pub static INSTANT_PROTOTYPE_METHODS: &[MethodSpec] = &[
+    method("toString", 0, impl_to_string),
+    method("toJSON", 0, impl_to_json),
+    method("valueOf", 0, impl_value_of),
+    method("add", 1, impl_add),
+    method("subtract", 1, impl_subtract),
+    method("equals", 1, impl_equals),
+    method("until", 1, impl_until),
+    method("since", 1, impl_since),
+    method("round", 1, impl_round),
+];
+
+otter_macros::couch! {
+    name = "Instant",
+    feature = CORE,
+    intrinsic = InstantIntrinsic,
+    constructor = (length = 1, call = construct),
+    statics = {
+        "from"                  / 1 => from,
+        "fromEpochMilliseconds" / 1 => from_epoch_milliseconds,
+        "compare"               / 2 => compare,
+    },
+    prototype = {
+        method_specs = [INSTANT_PROTOTYPE_METHODS],
+    },
+    install_on = crate::temporal::native_dispatch::temporal_host,
 }

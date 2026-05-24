@@ -47,10 +47,25 @@
 //!   `Number.NaN`). `Kind` is one of `Undefined`, `Null`, `Boolean`,
 //!   `Number`. Defaults to `Attr::read_only()` per §21.1.2.
 //! - `prototype = { methods = { ... }, accessors = [...],
-//!     method_specs = [...] }` — the prototype block. Inline
-//!   `methods` rows generate a `&[MethodSpec]` slice; `method_specs`
-//!   accepts pre-built slice paths (parallel to
-//!   `static_method_specs`).
+//!     method_specs = [...], parent = path }` — the prototype block.
+//!   Inline `methods` rows generate a `&[MethodSpec]` slice;
+//!   `method_specs` accepts pre-built slice paths (parallel to
+//!   `static_method_specs`). The optional `parent = path` overrides
+//!   the default `%Object.prototype%` link with whatever
+//!   `path(global, heap) -> JsObject` returns — used by per-kind
+//!   TypedArrays that chain to `%TypedArray%.prototype`.
+//! - `prototype_constants = [("NAME", Kind(expr) [, attrs]), ...]` —
+//!   mirrors `static_constants` but pins on the prototype. Used for
+//!   `TypedArray.prototype.BYTES_PER_ELEMENT` per §23.2.6.1.
+//! - `ctor_parent = path` — resolver fn for the constructor's
+//!   `[[Prototype]]` override. `path(global, heap) -> Value`. Used
+//!   by per-kind TypedArrays to inherit from `%TypedArray%`.
+//! - `install_on = path` — resolver fn for the parent host object
+//!   the constructor binds on. `path(global, heap) -> JsObject`.
+//!   Without it, the constructor binds on `globalThis`. Used for
+//!   nested ctors (e.g. `Temporal.Instant`, `Temporal.Duration`).
+//!   Used for nested ctors (e.g. `Temporal.Instant`,
+//!   `Temporal.Duration`) — see [crate::holt::HoltInput].
 //! - `post_install = path` — escape hatch. When set, the generated
 //!   install body calls `path(heap, global, ctor)?` after pinning
 //!   the constructor on `globalThis`. Used for things that don't

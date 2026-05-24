@@ -130,8 +130,21 @@ The following fields are all optional except `name`, `feature`, and
   numeric / boolean / nullish constants as own data properties on
   the constructor. `Kind` is one of `Undefined`, `Null`, `Boolean`,
   `Number`. Defaults to `Attr::read_only()` per §21.1.2.
-- `prototype = { methods = { ... }, accessors = [...], method_specs = [...] }`
-  — same dual (inline rows / slice ref) as the statics side.
+- `prototype = { methods = { ... }, accessors = [...], method_specs = [...], parent = path }`
+  — same dual (inline rows / slice ref) as the statics side, plus
+  the optional `parent = path` override that replaces the default
+  `%Object.prototype%` link. Used by per-kind TypedArrays that chain
+  to `%TypedArray%.prototype`.
+- `prototype_constants = [("NAME", Kind(expr) [, attrs]), ...]` —
+  mirrors `static_constants` but pins on the prototype. Used for
+  `TypedArray.prototype.BYTES_PER_ELEMENT` per §23.2.6.1.
+- `ctor_parent = path` — resolver fn for the constructor's
+  `[[Prototype]]` override. `path(global, heap) -> Value`. Used by
+  per-kind TypedArrays to inherit from `%TypedArray%`.
+- `install_on = path` — resolver fn for the parent host object the
+  constructor binds on. `path(global, heap) -> JsObject`. Without
+  it, the constructor binds on `globalThis`. Used for nested ctors
+  (`Temporal.Instant`, `Temporal.Duration`).
 - `post_install = path` — escape hatch. When set, the generated
   install body calls `path(heap, global, ctor)?` after pinning the
   constructor on `globalThis`. Used for things that don't fit

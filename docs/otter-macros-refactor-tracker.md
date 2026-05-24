@@ -86,7 +86,7 @@ callsite and Test262 deltas land in the port commit message.
 | WeakRef / FinalizationRegistry | `crates/otter-vm/src/bootstrap_weak_refs.rs`     | `couch!` (×2)      | **DONE 2026-05-24** |
 | ArrayBuffer / SharedArrayBuffer | `crates/otter-vm/src/bootstrap_array_buffer.rs` | `couch!` (×2)      | **DONE 2026-05-24** |
 | DataView            | `crates/otter-vm/src/bootstrap_data_view.rs`               | `couch!`           | **DONE 2026-05-24** |
-| TypedArray family   | `crates/otter-vm/src/bootstrap_typed_array.rs`             | bespoke (already decl-macro driven via `typed_array_intrinsic!` + const tables) | **Parked** — see note below |
+| TypedArray family   | `crates/otter-vm/src/bootstrap_typed_array.rs`             | `couch!` (×11) + abstract `couch!` (×1) via `typed_array_kind!` wrapper | **DONE 2026-05-24** (needed `prototype.parent` / `ctor_parent` / `prototype_constants`) |
 | Temporal classes    | `crates/otter-vm/src/temporal/intrinsic.rs`                | `couch!` (×5) + `holt!` (Now) | **DONE 2026-05-24** |
 | Timers              | `crates/otter-vm/src/timers.rs`                            | `holt!` (or `#[dive]` on globalThis) | Pending |
 
@@ -112,30 +112,54 @@ callsite and Test262 deltas land in the port commit message.
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
 
-### 2026-05-24 — TypedArrays parking note
+### 2026-05-24 — TypedArrays ported to couch! (4.2d wrap)
 
-- **Parking TypedArrays.** Per-kind ctors (Int8Array .. BigUint64Array)
-  share an abstract `%TypedArray%.prototype` allocated lazily, plus a
-  per-kind prototype chain to that abstract proto, plus a `BYTES_PER_ELEMENT`
-  data property on both ctor and prototype, plus a ctor `[[Prototype]]`
-  override to the abstract `%TypedArray%` ctor. couch!'s "one ctor with
-  optional prototype, parent prototype defaults to %Object.prototype%"
-  shape doesn't capture this without three new design extensions
-  (`prototype_parent = path`, `ctor_parent = path`, `extra_data_props =
-  [...]`).
-- The existing `typed_array_intrinsic!` decl-macro + `TYPED_ARRAY_CTORS`
-  / `TYPED_ARRAY_METHODS` / `TYPED_ARRAY_STATICS` const tables already
-  give a declarative surface for the family. The macro emits 11
-  `BuiltinIntrinsic` adapters that all delegate to a shared
-  `install_typed_array_entry`. The contribution surface for adding a
-  new TypedArray kind is one row in `TYPED_ARRAY_CTORS` + one row in
-  `TYPED_ARRAY_STATICS` + one row in the per-kind ctor dispatch table —
-  no install body to write.
-- Bringing TypedArrays under couch! would mean adding the three couch!
-  design extensions above, then writing 11 near-identical couch!
-  invocations. Net contributor experience would be worse.
-- **Outcome:** TypedArrays stay on `typed_array_intrinsic!`. The macros
-  chapter and tracker note this as the canonical exception.
+The "TypedArrays don't fit couch!" parking note from earlier today
+was wrong. Adding three couch! extensions makes the family fit:
+
+- `prototype.parent = path` — resolver fn for the prototype's
+  `[[Prototype]]`. Default (link to `%Object.prototype%`) preserved
+  when absent. Per-kind TypedArrays use this to chain to
+  `%TypedArray%.prototype`.
+- `ctor_parent = path` — resolver fn for the ctor's `[[Prototype]]`
+  override. Used by per-kind TypedArrays to inherit from
+  `%TypedArray%` per §23.2.6.1.
+- `prototype_constants = [...]` — mirrors `static_constants` on the
+  prototype side. Used for `BYTES_PER_ELEMENT` which spec requires
+  on both ctor and prototype with the matching per-kind value.
+
+With these, `bootstrap_typed_array.rs` becomes fully declarative:
+
+- `AbstractTypedArrayIntrinsic` is one couch! invocation pinning
+  the abstract `%TypedArray%` under `@@%TypedArray%`. Its prototype
+  carries the 20 shared methods (at / subarray / slice / fill /
+  copyWithin / reverse / indexOf / lastIndexOf / includes / join /
+  toString / toLocaleString / set / toReversed / toSorted / sort /
+  with / keys / values / entries).
+- A `typed_array_kind!` decl-macro wraps couch! with per-kind ctor +
+  from/of statics + BYTES_PER_ELEMENT (ctor + prototype) +
+  `prototype.parent` + `ctor_parent`. The 11 concrete TypedArrays
+  collapse to 11 single-line rows, each picking up its `$bpe`,
+  `$ctor`, `$from`, `$of` from the existing const tables (now
+  inlined directly into each row).
+- Added one BOOTSTRAP_ENTRIES row for `AbstractTypedArrayIntrinsic`
+  before the 11 per-kind rows so the abstract is live before any
+  per-kind `prototype.parent` / `ctor_parent` resolver fires.
+
+`install_typed_array_entry`, `ensure_abstract_*`, and the old
+`typed_array_intrinsic!` decl-macro all delete. The three legacy
+const routing tables (`TYPED_ARRAY_METHODS` / `_STATICS` / `_CTORS`)
+become dead with the install body and delete with it.
+
+`NativeFunction::own_property_descriptor` promoted from `pub(crate)`
+to `pub` so couch! invocations from other crates can resolve the
+generated ctor's `prototype` slot through the public API.
+
+Smoke test confirms: `typeof Int8Array === "function"`,
+`Int8Array.BYTES_PER_ELEMENT === 1`, `new Int8Array(3)` populates
+elements, `Object.getPrototypeOf(Int8Array) === Object.getPrototypeOf(Int16Array)`
+(both inherit from `%TypedArray%`). Test262 built-ins/TypedArray/
+769/1230 (62.5%), 0 crashes.
 
 ### 2026-05-24 — Temporal classes ported (4.2d continued)
 

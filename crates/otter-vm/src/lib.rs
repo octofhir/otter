@@ -678,7 +678,7 @@ impl Interpreter {
         // skip the global → ctor → prototype string walk.
         interp
             .realm_intrinsics
-            .populate(&interp.gc_heap, global_this);
+            .populate(&mut interp.gc_heap, global_this);
         let extra_roots = otter_gc::ExtraRoots::new(&interp);
         let previous = interp.gc_heap.install_extra_roots(Some(extra_roots));
         // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — build the per-kind

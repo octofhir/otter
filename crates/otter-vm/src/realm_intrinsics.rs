@@ -1,46 +1,36 @@
 //! Typed per-realm intrinsic slots.
 //!
-//! Boa-style typed registry: every well-known constructor + prototype
-//! that the dispatch path looks up by name gets a dedicated slot.
-//! Bootstrap runs once and caches the resolved handles; runtime
-//! lookups read the slot directly instead of doing two
-//! `object::get()` calls (global → ctor → prototype) on every call.
+//! Boa-style typed registry: every well-known **prototype** that the
+//! dispatch path looks up by name gets a dedicated slot. Bootstrap
+//! runs once and caches the resolved handles; runtime lookups read
+//! the slot directly instead of doing two `object::get()` calls
+//! (global → ctor → prototype) on every call.
 //!
 //! # Contents
-//! - [`RealmIntrinsics`] — typed slots for `%Object%`,
-//!   `%Object.prototype%`, `%Function.prototype%`, `%Array%`,
-//!   `%Array.prototype%`. Native-function-shaped constructors
-//!   (`Promise`, `RegExp`, `Date`, `Iterator`, …) are intentionally
-//!   excluded for now — they take a different resolution path; a
-//!   follow-up can promote them to `NativeFunction`-typed slots once
-//!   the hot-path payoff justifies the per-slot polymorphism.
-//! - Populate hook called once at the end of `build_global_this_impl`.
+//! - [`RealmIntrinsics`] — typed slots for `%Object.prototype%`,
+//!   `%Function.prototype%`, `%Array.prototype%`. Native-function-shaped
+//!   constructors (`Promise`, `RegExp`, `Date`, `Iterator`, …) take
+//!   a different resolution path; their prototypes are looked up
+//!   through `NativeFunction::own_property_descriptor`.
 //!
 //! # Invariants
 //! - Slots are populated by reading the `globalThis` graph **after**
 //!   `BOOTSTRAP_ENTRIES` finishes running. Each slot is `None` until
 //!   populate runs.
 //! - The dispatch path treats `None` as a cache miss and falls back to
-//!   the original string-lookup helper. The lookup helpers still exist
-//!   so any embedder that builds a non-default global (e.g. partial
-//!   feature gates) keeps working.
+//!   the original string-lookup helper.
 //! - Slots hold `JsObject` handles; tracing rides on the global object
 //!   the bootstrap already roots.
 
 use crate::object::{self, JsObject};
-use crate::value::Value;
 
-/// Resolved well-known intrinsic handles for one realm.
+/// Resolved well-known prototype handles for one realm.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RealmIntrinsics {
-    /// `%Object%` constructor.
-    pub object_constructor: Option<JsObject>,
     /// `%Object.prototype%`.
     pub object_prototype: Option<JsObject>,
     /// `%Function.prototype%`.
     pub function_prototype: Option<JsObject>,
-    /// `%Array%` constructor.
-    pub array_constructor: Option<JsObject>,
     /// `%Array.prototype%`.
     pub array_prototype: Option<JsObject>,
 }
@@ -48,50 +38,43 @@ pub(crate) struct RealmIntrinsics {
 impl RealmIntrinsics {
     /// Populate every slot by walking `global_this`. Called once at the
     /// end of `build_global_this_impl` after every `BuiltinIntrinsic`
-    /// has run. Each lookup is a single `global.get(name)` + at most
-    /// one `ctor.get("prototype")`; the post-bootstrap cost is fixed,
-    /// not per-call.
-    pub(crate) fn populate(&mut self, heap: &otter_gc::GcHeap, global: JsObject) {
-        let resolve_ctor = |name: &'static str| -> Option<JsObject> {
-            object::get(global, heap, name).and_then(|v| v.as_object())
-        };
-        let resolve_proto = |ctor: JsObject| -> Option<JsObject> {
+    /// has run.
+    pub(crate) fn populate(&mut self, heap: &mut otter_gc::GcHeap, global: JsObject) {
+        let resolve_object_prototype = |ctor: JsObject| -> Option<JsObject> {
             object::get(ctor, heap, "prototype").and_then(|v| v.as_object())
         };
 
-        if let Some(ctor) = resolve_ctor("Object") {
-            self.object_constructor = Some(ctor);
-            self.object_prototype = resolve_proto(ctor);
+        if let Some(ctor) = object::get(global, heap, "Object").and_then(|v| v.as_object()) {
+            self.object_prototype = resolve_object_prototype(ctor);
         }
-        if let Some(ctor) = resolve_ctor("Function") {
-            self.function_prototype = resolve_proto(ctor);
+        if let Some(ctor) = object::get(global, heap, "Function").and_then(|v| v.as_object()) {
+            self.function_prototype = resolve_object_prototype(ctor);
         }
-        if let Some(ctor) = resolve_ctor("Array") {
-            self.array_constructor = Some(ctor);
-            self.array_prototype = resolve_proto(ctor);
+        // §23.1.3 — `Array.prototype` lives as own data property on
+        // the constructor, regardless of whether the constructor is a
+        // plain JsObject (legacy) or a NativeFunction (couch!).
+        if let Some(value) = object::get(global, heap, "Array") {
+            if let Some(ctor) = value.as_object() {
+                self.array_prototype = resolve_object_prototype(ctor);
+            } else if let Some(native) = value.as_native_function() {
+                self.array_prototype = native
+                    .own_property_descriptor(heap, "prototype")
+                    .ok()
+                    .flatten()
+                    .and_then(|d| match d.kind {
+                        crate::object::DescriptorKind::Data { value } => value.as_object(),
+                        _ => None,
+                    });
+            }
         }
     }
 
     /// All slots empty?
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.object_constructor.is_none()
-            && self.object_prototype.is_none()
+        self.object_prototype.is_none()
             && self.function_prototype.is_none()
-            && self.array_constructor.is_none()
             && self.array_prototype.is_none()
-    }
-
-    /// `%Object%` constructor as a [`Value`].
-    #[allow(dead_code)]
-    pub(crate) fn object_constructor_value(&self) -> Option<Value> {
-        self.object_constructor.map(Value::object)
-    }
-
-    /// `%Array%` constructor's `prototype` as a [`Value`].
-    #[allow(dead_code)]
-    pub(crate) fn array_prototype_value(&self) -> Option<Value> {
-        self.array_prototype.map(Value::object)
     }
 }
 
@@ -104,18 +87,11 @@ mod tests {
     fn bootstrap_populates_well_known_slots() {
         let interp = Interpreter::new();
         let slots = &interp.realm_intrinsics();
-        // The plain-JsObject-shaped intrinsics are the ones the
-        // dispatch path looks up on every call; assert each lands
-        // in the typed slot. Native-function-shaped constructors
-        // (Promise, RegExp, …) are wired through a different
-        // resolution path and intentionally skipped here.
-        assert!(slots.object_constructor.is_some(), "Object cached");
         assert!(slots.object_prototype.is_some(), "Object.prototype cached");
         assert!(
             slots.function_prototype.is_some(),
             "Function.prototype cached"
         );
-        assert!(slots.array_constructor.is_some(), "Array cached");
         assert!(slots.array_prototype.is_some(), "Array.prototype cached");
     }
 

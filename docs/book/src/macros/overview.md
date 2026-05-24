@@ -86,23 +86,66 @@ its static method surface. Used for `Proxy`, `Date`, `Map`, `Set`,
 every TypedArray.
 
 ```rust,ignore
-use otter_macros::{couch, raft};
+use otter_macros::couch;
 
 couch! {
     name = "Proxy",
     feature = CORE,
     constructor = (length = 2, call = proxy_ctor_call),
-    statics = raft! {
+    statics = {
         "revocable" / 2 => proxy_revocable_call,
     },
     prototype = {
-        methods   = raft! { /* if any */ },
+        methods = {
+            // "name" / length => fn — inline rows
+        },
         accessors = [
-            // (name, getter, setter)
+            // ("name", get = getter_fn, set = setter_fn)
         ],
     },
 }
 ```
+
+### Full surface
+
+The following fields are all optional except `name`, `feature`, and
+`constructor`:
+
+- `constructor = (length = N, call = path[, callable_only = true][, is_abstract = true])`
+  — `callable_only = true` drops the `[[Construct]]` slot so `new Foo(x)`
+  throws "is not a constructor" via §10.1.10. Matches the
+  §20.4.1 (`Symbol`), §21.1.1 (`Number`), §21.2.1 (`BigInt`),
+  §20.3.1 (`Boolean`), §22.1.1 (`String`) shape. `is_abstract`
+  documents intent for things like `%TypedArray%`; the install path
+  is unchanged.
+- `statics = { "name" / N => fn, ... }` — inline rows; auto-generates
+  a `&[MethodSpec]` slice.
+- `static_method_specs = [path::TO_SLICE, ...]` — references to
+  pre-built `&[MethodSpec]` slices iterated through the
+  constructor's `ObjectBuilder`. Used when the same slice is also
+  consumed elsewhere (e.g. `Op::CallMethod` intrinsic dispatch).
+  Inline `statics` and `static_method_specs` are independent — pick
+  whichever fits, or use both.
+- `static_constants = [("NAME", Kind(expr)[, attrs]), ...]` — pins
+  numeric / boolean / nullish constants as own data properties on
+  the constructor. `Kind` is one of `Undefined`, `Null`, `Boolean`,
+  `Number`. Defaults to `Attr::read_only()` per §21.1.2.
+- `prototype = { methods = { ... }, accessors = [...], method_specs = [...] }`
+  — same dual (inline rows / slice ref) as the statics side.
+- `post_install = path` — escape hatch. When set, the generated
+  install body calls `path(heap, global, ctor)?` after pinning the
+  constructor on `globalThis`. Used for things that don't fit
+  declarative rows: setting hidden internal slots on the prototype
+  (e.g. `[[BooleanData]] = false`), legacy accessors that need
+  captures bound to the ctor identity (`RegExp.input` / `$_` /
+  `$1`..`$9`), identity-shared globals (`Number.parseInt ===
+  globalThis.parseInt`), or post-bootstrap installation of methods
+  on `globalThis` that share the same plumbing.
+
+Cross-class fixups that depend on the per-realm `WellKnownSymbols`
+table (`@@toStringTag`, `@@iterator`, species accessors) do **not**
+ride `couch!`; they stay in dedicated `install_<class>_well_knowns_post_bootstrap`
+hooks that bootstrap calls after the symbol table is materialised.
 
 For abstract constructors (e.g. `%TypedArray%`) the constructor body
 throws `TypeError("not constructible directly")`. The macro syntax

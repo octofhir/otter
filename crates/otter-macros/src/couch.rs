@@ -26,8 +26,39 @@
 //!
 //! Optional fields:
 //!
-//! - `statics = { "name" / length => path, ... }` — own properties
-//!   on the constructor itself (`Proxy.revocable`).
+//! - `constructor = (length = N, call = path
+//!     [, callable_only = true]
+//!     [, is_abstract = true])` — `callable_only = true` drops the
+//!   `[[Construct]]` slot so `new Foo(x)` throws via §10.1.10
+//!   (Symbol / BigInt / Number / Boolean / String). `is_abstract`
+//!   documents intent for things like `%TypedArray%`; the install
+//!   path is unchanged.
+//! - `statics = { "name" / length => path, ... }` — inline rows
+//!   pinned as own data properties on the constructor
+//!   (`Proxy.revocable`).
+//! - `static_method_specs = [path::TO_SLICE, ...]` — references to
+//!   pre-built `&[MethodSpec]` slices iterated through the
+//!   constructor's `ObjectBuilder`. Used when the same slice is
+//!   also consumed elsewhere (e.g. `Op::CallMethod` intrinsic
+//!   dispatch fast path for `String.fromCharCode`).
+//! - `static_constants = [("NAME", Kind(expr) [, attrs]), ...]` —
+//!   numeric / boolean / nullish constants pinned as own data
+//!   properties on the constructor (`Number.MAX_VALUE`,
+//!   `Number.NaN`). `Kind` is one of `Undefined`, `Null`, `Boolean`,
+//!   `Number`. Defaults to `Attr::read_only()` per §21.1.2.
+//! - `prototype = { methods = { ... }, accessors = [...],
+//!     method_specs = [...] }` — the prototype block. Inline
+//!   `methods` rows generate a `&[MethodSpec]` slice; `method_specs`
+//!   accepts pre-built slice paths (parallel to
+//!   `static_method_specs`).
+//! - `post_install = path` — escape hatch. When set, the generated
+//!   install body calls `path(heap, global, ctor)?` after pinning
+//!   the constructor on `globalThis`. Used for things that don't
+//!   fit declarative rows: setting hidden internal slots on the
+//!   prototype (e.g. `[[BooleanData]] = false`), legacy accessors
+//!   that need captures bound to the ctor identity (`RegExp.input`
+//!   / `$_` / `$1`..`$9`), identity-shared globals
+//!   (`Number.parseInt === globalThis.parseInt`).
 //! - `spec = MY_SPEC,` — override the derived `<NAME>_SPEC` ident.
 //! - `intrinsic = MyIntrinsic,` — override the default `Intrinsic`
 //!   ident.
@@ -35,21 +66,38 @@
 //! # Generated symbols
 //!
 //! - `pub static <NAME>_SPEC: ::otter_vm::ConstructorSpec` — the
-//!   raw constructor spec (constructor metadata + static methods +
-//!   empty prototype methods slot).
+//!   raw constructor spec (metadata + inline static methods +
+//!   inline prototype methods).
 //! - `pub struct <INTRINSIC>;` + `impl BuiltinIntrinsic for
-//!   <INTRINSIC>` whose `install` body allocates the constructor
-//!   via `bootstrap::native_constructor_static_with_value_roots`,
-//!   pins each static as an own data property on the constructor,
-//!   and binds it on `globalThis` through
-//!   `bootstrap::define_global_value`.
+//!   <INTRINSIC>` whose `install` body:
+//!   1. allocates the constructor via
+//!      `bootstrap::native_constructor_static_with_value_roots`
+//!      (or `native_static_with_value_roots` when
+//!      `callable_only = true`),
+//!   2. pins each `statics` row + `static_method_specs` slice +
+//!      `static_constants` row as own properties on the ctor,
+//!   3. if the prototype block has any content, allocates the
+//!      prototype, links it to `%Object.prototype%`, installs the
+//!      prototype methods (inline + slice) + accessors via
+//!      `ObjectBuilder`, attaches it on the ctor's `prototype` slot
+//!      (non-writable / non-enumerable / non-configurable), and
+//!      pins the `prototype.constructor = ctor` back-pointer
+//!      (writable / non-enumerable / configurable),
+//!   4. binds the ctor on `globalThis` through
+//!      `bootstrap::define_global_value`,
+//!   5. calls `post_install(heap, global, ctor)?` when supplied.
 //!
-//! Prototype methods + accessors are intentionally **not** wired
-//! in the 4.1a skeleton — that lands once the first `couch!`
-//! consumer needs them and we agree on the install path. The
-//! constructor's `.prototype` slot is still allocated (NativeFunction
-//! constructors always carry one), it just receives no extra
-//! methods until the field is added.
+//! # Out of scope
+//!
+//! Cross-class fixups that depend on the per-realm
+//! `WellKnownSymbols` table (`@@toStringTag`, `@@iterator`, species
+//! accessors) do **not** ride `couch!`; they stay in dedicated
+//! `install_<class>_well_knowns_post_bootstrap` hooks that
+//! bootstrap calls after the symbol table is materialised. The
+//! shared abstract-prototype shape used by TypedArrays (one
+//! abstract `%TypedArray%.prototype` with 11 per-kind prototypes
+//! chained to it) is also out of scope; that surface uses a
+//! hand-written installer.
 //!
 //! # See also
 //! - [`crate::holt`](super::holt) — namespace intrinsic generator

@@ -18,7 +18,7 @@ Plan entry: Task 4.1 / 4.2 / 4.3 in
 | 4.2a      | Port **JSON** (pathfinder, smallest namespace)                 | DONE 2026-05-24              |
 | 4.2b      | Port Math / Reflect / Atomics / Console in parallel            | DONE 2026-05-24              |
 | 4.2c      | Port Proxy / Date / Iterator + Promise (first `couch!` users)  | DONE 2026-05-24              |
-| 4.2d      | Port the rest (collections, weak refs, typed arrays, …)        | Pending                      |
+| 4.2d      | Port the rest (collections, weak refs, typed arrays, …)        | In progress                  |
 | 4.3       | Rewrite `otter-modules` (`otter:ffi`, `otter:kv`, `otter:sql`) | Pending                      |
 |           | + `otter-web` if `burrow!` / `lodge!` apply                    |                              |
 
@@ -71,22 +71,22 @@ callsite and Test262 deltas land in the port commit message.
 | Console             | `crates/otter-vm/src/console.rs`                           | `holt!`            | **DONE 2026-05-24** |
 | Object              | `crates/otter-vm/src/object_statics.rs` + `intrinsics/object.rs` | `holt!` + `couch!` (`Object.prototype`) | Pending |
 | Function            | `crates/otter-vm/src/function_prototype.rs` + `intrinsics/function.rs` | `couch!` | Pending |
-| Array               | `crates/otter-vm/src/array_prototype.rs` + `array_statics.rs` + `intrinsics/array.rs` | `couch!` | Pending |
-| String              | `crates/otter-vm/src/string/{intrinsic,prototype,statics}.rs` | `couch!`         | Pending    |
-| Number              | `crates/otter-vm/src/number/prototype.rs` + `intrinsics/number.rs` | `couch!`    | Pending    |
-| Boolean             | `crates/otter-vm/src/boolean/{intrinsic,mod,prototype}.rs` | `couch!`           | Pending    |
-| Symbol              | `crates/otter-vm/src/intrinsics/symbol.rs`                 | `couch!` + `holt!` (Symbol namespace) | Pending |
+| Array               | `crates/otter-vm/src/array_prototype.rs` + `array_statics.rs` + `intrinsics/array.rs` | `couch!` | **DONE 2026-05-24** |
+| String              | `crates/otter-vm/src/string/{intrinsic,prototype,statics}.rs` | `couch!`         | **DONE 2026-05-24** |
+| Number              | `crates/otter-vm/src/number/prototype.rs` + `intrinsics/number.rs` | `couch!`    | **DONE 2026-05-24** |
+| Boolean             | `crates/otter-vm/src/boolean/{intrinsic,mod,prototype}.rs` | `couch!`           | **DONE 2026-05-24** |
+| Symbol              | `crates/otter-vm/src/intrinsics/symbol.rs`                 | `couch!`           | **DONE 2026-05-24** |
 | Date                | `crates/otter-vm/src/date/prototype.rs` + `intrinsics/date.rs` | `couch!`       | **DONE 2026-05-24** |
 | Proxy               | `crates/otter-vm/src/intrinsics/proxy.rs`                  | `couch!`           | **DONE 2026-05-24** |
 | Iterator            | `crates/otter-vm/src/intrinsics/iterator.rs`               | `couch!` + `holt!` | **DONE 2026-05-24** |
 | Promise             | `crates/otter-vm/src/bootstrap_promise.rs`                 | `couch!`           | **DONE 2026-05-24** |
-| RegExp              | `crates/otter-vm/src/bootstrap_regexp.rs`                  | `couch!`           | Pending    |
-| BigInt              | `crates/otter-vm/src/bootstrap_bigint.rs`                  | `couch!`           | Pending    |
-| Map / Set / WeakMap / WeakSet | `crates/otter-vm/src/bootstrap_collections.rs`    | `couch!` (×4)      | Pending    |
-| WeakRef / FinalizationRegistry | `crates/otter-vm/src/bootstrap_weak_refs.rs`     | `couch!` (×2)      | Pending    |
-| ArrayBuffer / SharedArrayBuffer | `crates/otter-vm/src/bootstrap_array_buffer.rs` | `couch!` (×2)      | Pending    |
-| DataView            | `crates/otter-vm/src/bootstrap_data_view.rs`               | `couch!`           | Pending    |
-| TypedArray family   | `crates/otter-vm/src/bootstrap_typed_array.rs`             | `couch!` (×N + `%TypedArray%`) | Pending |
+| RegExp              | `crates/otter-vm/src/bootstrap_regexp.rs`                  | `couch!`           | **DONE 2026-05-24** |
+| BigInt              | `crates/otter-vm/src/bootstrap_bigint.rs`                  | `couch!`           | **DONE 2026-05-24** |
+| Map / Set / WeakMap / WeakSet | `crates/otter-vm/src/bootstrap_collections.rs`    | `couch!` (×4)      | **DONE 2026-05-24** |
+| WeakRef / FinalizationRegistry | `crates/otter-vm/src/bootstrap_weak_refs.rs`     | `couch!` (×2)      | **DONE 2026-05-24** |
+| ArrayBuffer / SharedArrayBuffer | `crates/otter-vm/src/bootstrap_array_buffer.rs` | `couch!` (×2)      | **DONE 2026-05-24** |
+| DataView            | `crates/otter-vm/src/bootstrap_data_view.rs`               | `couch!`           | **DONE 2026-05-24** |
+| TypedArray family   | `crates/otter-vm/src/bootstrap_typed_array.rs`             | `couch!` (×N + `%TypedArray%`) | Pending (shared abstract proto — needs design) |
 | Temporal classes    | `crates/otter-vm/src/temporal/intrinsic.rs`                | `couch!` (×5) + `holt!` (Now) | Pending |
 | Timers              | `crates/otter-vm/src/timers.rs`                            | `holt!` (or `#[dive]` on globalThis) | Pending |
 
@@ -111,6 +111,74 @@ callsite and Test262 deltas land in the port commit message.
 
 Most recent session first. One-line "what landed + what's next"
 per entry. New entries go at the top.
+
+### 2026-05-24 — bulk 4.2d batch (WeakRef..String/Array) + couch! surface fills
+
+couch! grew four new fields during this session:
+
+- `callable_only = true` on the `constructor` tuple — drops
+  `[[Construct]]` slot, install path switches to
+  `native_static_with_value_roots`. Used by BigInt / Symbol /
+  Boolean per §10.1.10.
+- `static_method_specs = [path, ...]` — references to pre-built
+  `&[MethodSpec]` slices iterated through the constructor's
+  `ObjectBuilder`. Mirrors the existing `prototype.method_specs`
+  field. Used by String / Array which share their static-method
+  slice with the `Op::CallMethod` intrinsic dispatch fast path.
+- `static_constants = [("NAME", Kind(expr) [, attrs]), ...]` —
+  reuses the holt! constant grammar (Number / Boolean / Null /
+  Undefined). Used by Number for the eight §21.1.2 numeric
+  constants.
+- `post_install = path` — escape hatch. Generated install body
+  calls `path(heap, global, ctor)?` after pinning the ctor on
+  `globalThis`. Used for hidden-slot pinning ([[BooleanData]],
+  [[StringData]], [[NumberData]]), legacy captures
+  (`RegExp.input` / `$1`..`$9`), identity-shared globals
+  (`Number.parseInt === globalThis.parseInt`).
+
+Ports in this session:
+
+- **WeakRef / FinalizationRegistry / BigInt / Map / Set / WeakMap /
+  WeakSet / ArrayBuffer / SharedArrayBuffer / DataView** ported via
+  couch!. Net 705 lines removed across the six bootstrap_* files
+  (commit 3f898740). Test262 unchanged on each suite except a
+  minor -1/-3 dip on Map/Set/WeakSet under investigation.
+- **RegExp** ported (commit 2abe5edd) — exec/test/toString/compile,
+  10 prototype accessors, 21 §B.2.4 legacy static accessors
+  through `post_install`. built-ins/RegExp 88.9% pass.
+- **Boolean / Number** ported (commit d778d1bd) using
+  `static_constants` and `post_install` for the hidden data slots
+  and Number global identity-sharing. Both drop their legacy
+  plain-JsObject + `set_constructor_native` shim. Boolean 82%,
+  Number 80.8%, parseInt 78%, parseFloat 89%, encodeURI 100%.
+- **Symbol** ported (commit 7f29520c) — `callable_only = true`,
+  inline statics for / keyFor, prototype toString / valueOf,
+  description getter. Cross-class well-known wiring stays in the
+  dedicated post-bootstrap hook. built-ins/Symbol 97.4%.
+- **String** ported (commit 37360a9a) using
+  `static_method_specs = [STRING_STATIC_METHODS]` + prototype
+  `method_specs = [STRING_PROTOTYPE_METHODS]`. Post-install pins
+  `[[StringData]] = ""` and the §B.2.3 trimLeft / trimRight
+  identity aliases. built-ins/String 68.4%.
+- **Array** ported (in this session) — Array.prototype is now
+  reachable only through `NativeFunction::own_property_descriptor`
+  (not `as_object`). Updated `RealmIntrinsics::populate` to follow
+  both paths. Stripped vestigial `object_constructor` /
+  `array_constructor` slots that were unused.
+
+Docs:
+
+- couch! module doc + mdbook macros chapter rewritten to document
+  `callable_only`, `static_method_specs`, `static_constants`,
+  `post_install`, and the rationale for inline vs slice-ref dual
+  on both static and prototype sides.
+
+Tests: otter-vm 530/530 lib, otter-macros 5/5, clippy clean.
+
+Next: Function / Object / Array (verify) / Temporal classes / Error
+classes (still on legacy installers). TypedArrays deferred — the
+abstract `%TypedArray%` shared prototype needs a couch! design
+extension (or stays bespoke).
 
 ### 2026-05-24 — couch! prototype back-pointer + method_specs + Proxy/Promise/Iterator/Date ports (4.2c)
 

@@ -8,15 +8,39 @@
 
 use std::sync::LazyLock;
 
-use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::number::NumberValue;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    alloc_temporal_value, js_string_value, make_temporal, require_plain_date, temporal_err,
+    alloc_temporal_value, arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value,
+    make_temporal, require_construct, require_plain_date, temporal_dispatch_err, temporal_err,
+    to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
+use crate::{NativeCtx, NativeError, Value};
+
+/// §3.1.1 `Temporal.PlainDate(isoYear, isoMonth, isoDay [, calendar])`.
+pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const CLASS: &str = "Temporal.PlainDate";
+    require_construct(ctx, CLASS)?;
+    let heap = ctx.heap();
+    let year = to_integer_with_truncation(&arg_or_undef(args, 0), heap, CLASS, "isoYear")? as i32;
+    let month_f = to_integer_with_truncation(&arg_or_undef(args, 1), heap, CLASS, "isoMonth")?;
+    let day_f = to_integer_with_truncation(&arg_or_undef(args, 2), heap, CLASS, "isoDay")?;
+    let calendar = arg_to_calendar(args, 3, heap, CLASS)?;
+    let month = clamp_to_u8(month_f, CLASS, "isoMonth")?;
+    let day = clamp_to_u8(day_f, CLASS, "isoDay")?;
+    let pd =
+        temporal_rs::PlainDate::try_new(year, month, day, calendar).map_err(|e| {
+            NativeError::RangeError {
+                name: CLASS,
+                reason: e.to_string(),
+            }
+        })?;
+    let heap = ctx.heap_mut();
+    alloc_temporal_value(heap, TemporalPayload::PlainDate(pd)).map_err(temporal_dispatch_err)
+}
 
 /// Dispatch `Temporal.PlainDate.<method>(args...)` via the typed
 /// [`TemporalMethod`].

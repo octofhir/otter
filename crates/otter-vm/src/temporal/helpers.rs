@@ -15,11 +15,12 @@
 //! - [`make_temporal`] — construct a [`crate::Value::Temporal`]
 //!   from a payload.
 
-use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 use crate::object::JsObject;
 use crate::string::JsString;
+use crate::temporal::dispatch::TemporalError;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
+use crate::{NativeCtx, NativeError, Value};
 
 /// Coerce arg `index` to a Rust string. Returns
 /// [`IntrinsicError::BadArgument`] when the slot is missing or the
@@ -235,4 +236,180 @@ pub fn js_string_value(
     args: &mut IntrinsicArgs<'_>,
 ) -> Result<Value, IntrinsicError> {
     Ok(Value::string(JsString::from_str(&value, args.gc_heap)?))
+}
+
+// ── Constructor helpers ──────────────────────────────────────────
+//
+// Shared between each `Temporal.<Class>` `[[Construct]]` body
+// (`instant::construct`, `duration::construct`, …). The naming
+// mirrors the ECMA-262 / proposal-temporal abstract operations.
+
+/// Reject a `Foo(...)` call form on a class constructor that must
+/// be invoked as `new Foo(...)`. Per ECMA-262, each Temporal class
+/// constructor throws `TypeError` if `NewTarget` is undefined.
+pub fn require_construct(ctx: &NativeCtx<'_>, class: &'static str) -> Result<(), NativeError> {
+    if ctx.is_construct_call() {
+        Ok(())
+    } else {
+        Err(NativeError::TypeError {
+            name: class,
+            reason: format!("{class} constructor must be invoked with `new`"),
+        })
+    }
+}
+
+/// §7.1.6 `ToIntegerWithTruncation(value)` — `ToNumber`, then reject
+/// `NaN`/`±∞` with `RangeError`, then truncate toward zero. `Symbol`
+/// / `BigInt` inputs surface as `TypeError` per §7.1.4.
+pub fn to_integer_with_truncation(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+    field: &str,
+) -> Result<f64, NativeError> {
+    if value.is_symbol() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: format!("{field}: cannot convert a Symbol to a Number"),
+        });
+    }
+    if value.is_big_int() {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: format!("{field}: cannot convert a BigInt to a Number"),
+        });
+    }
+    let n = crate::number::parse::to_number_value(value, heap);
+    if n.is_nan() || n.is_infinite() {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("{field}: must be a finite integer"),
+        });
+    }
+    Ok(n.trunc())
+}
+
+/// Temporal-specific `ToIntegerIfIntegral(value)` — like
+/// [`to_integer_with_truncation`] but also rejects non-integral
+/// finite numbers with `RangeError`.
+pub fn to_integer_if_integral(
+    value: &Value,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+    field: &str,
+) -> Result<f64, NativeError> {
+    let n = to_integer_with_truncation(value, heap, class, field)?;
+    let raw = crate::number::parse::to_number_value(value, heap);
+    if (raw - n).abs() > 0.0 {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("{field}: must be an integer"),
+        });
+    }
+    Ok(n)
+}
+
+/// Read positional arg `index`, defaulting to `undefined`.
+#[must_use]
+pub fn arg_or_undef(args: &[Value], index: usize) -> Value {
+    args.get(index).copied().unwrap_or(Value::undefined())
+}
+
+/// Coerce an optional numeric arg (defaulting to `0` when missing
+/// or `undefined`) via [`to_integer_with_truncation`].
+pub fn opt_integer_with_truncation(
+    args: &[Value],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+    field: &str,
+) -> Result<f64, NativeError> {
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(0.0);
+    }
+    to_integer_with_truncation(&v, heap, class, field)
+}
+
+/// Coerce an optional numeric arg (defaulting to `0` when missing
+/// or `undefined`) via [`to_integer_if_integral`].
+pub fn opt_integer_if_integral(
+    args: &[Value],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+    field: &str,
+) -> Result<f64, NativeError> {
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(0.0);
+    }
+    to_integer_if_integral(&v, heap, class, field)
+}
+
+/// Resolve a calendar argument to [`temporal_rs::Calendar`]. Missing
+/// or `undefined` defaults to ISO 8601. Strings are parsed; any other
+/// value surfaces as `TypeError`.
+pub fn arg_to_calendar(
+    args: &[Value],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+) -> Result<temporal_rs::Calendar, NativeError> {
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(temporal_rs::Calendar::default());
+    }
+    let Some(js) = v.as_string(heap) else {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "calendar argument must be a string".to_string(),
+        });
+    };
+    let s = js.to_lossy_string(heap);
+    temporal_rs::Calendar::try_from_utf8(s.as_bytes()).map_err(|e| NativeError::RangeError {
+        name: class,
+        reason: format!("invalid calendar identifier: {e}"),
+    })
+}
+
+/// Clamp a coerced numeric component to `u8`, surfacing
+/// `RangeError` when the value falls outside `0..=255`. Per-field
+/// bounds (`isoMonth ∈ 1..=12`, etc.) are then enforced by
+/// `temporal_rs`.
+pub fn clamp_to_u8(n: f64, class: &'static str, field: &str) -> Result<u8, NativeError> {
+    if !(0.0..=255.0).contains(&n) {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("{field} out of range"),
+        });
+    }
+    Ok(n as u8)
+}
+
+/// `u16` companion to [`clamp_to_u8`].
+pub fn clamp_to_u16(n: f64, class: &'static str, field: &str) -> Result<u16, NativeError> {
+    if !(0.0..=65_535.0).contains(&n) {
+        return Err(NativeError::RangeError {
+            name: class,
+            reason: format!("{field} out of range"),
+        });
+    }
+    Ok(n as u16)
+}
+
+/// Convert the dispatch-level `TemporalError` into a `NativeError`
+/// — used by `[[Construct]]` bodies to surface OOM and any
+/// future pass-through cases via the native-fn boundary.
+pub fn temporal_dispatch_err(err: TemporalError) -> NativeError {
+    match err {
+        TemporalError::OutOfMemory { .. } => NativeError::TypeError {
+            name: "Temporal",
+            reason: "out of memory".to_string(),
+        },
+        other => NativeError::TypeError {
+            name: "Temporal",
+            reason: other.to_string(),
+        },
+    }
 }

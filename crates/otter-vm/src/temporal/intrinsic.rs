@@ -13,11 +13,12 @@
 //! sub-namespace and then drives each per-class couch!-generated
 //! install fn in declaration order.
 //!
-//! Direct construction (`new Temporal.Instant(...)`) throws a
-//! `TypeError` for now — the foundation does not yet thread the
-//! `epochNanoseconds` / partial-record argument shapes through the
-//! `[[Construct]]` path. Spec-recommended factories (`from`,
-//! `Now.instant()`, ...) work end-to-end.
+//! Direct construction (`new Temporal.Instant(epochNanoseconds)`,
+//! `new Temporal.PlainDate(y, m, d)`, etc.) is implemented per
+//! proposal-temporal §7.1.1, §8.1.1, §3.1.1, §4.1.1, §5.1.1.
+//! Each class has its own ctor body that pre-checks `new.target`
+//! and coerces the positional argument shape; calling the
+//! constructor without `new` throws `TypeError`.
 //!
 //! # See also
 //! - <https://tc39.es/proposal-temporal/>
@@ -28,6 +29,7 @@ use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, Name
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
 use crate::temporal::dispatch::{TemporalError, call as call_static};
+use crate::temporal::{duration, instant, plain_date, plain_date_time, plain_time};
 use crate::{NativeCtx, NativeError, Value};
 
 // ---------------------------------------------------------------
@@ -49,7 +51,7 @@ otter_macros::couch! {
     name = "Instant",
     feature = CORE,
     intrinsic = InstantIntrinsic,
-    constructor = (length = 0, call = temporal_class_direct_construct),
+    constructor = (length = 1, call = instant::construct),
     statics = {
         "from"                  / 1 => native_instant_from,
         "fromEpochMilliseconds" / 1 => native_instant_from_epoch_ms,
@@ -62,7 +64,7 @@ otter_macros::couch! {
     name = "Duration",
     feature = CORE,
     intrinsic = DurationIntrinsic,
-    constructor = (length = 0, call = temporal_class_direct_construct),
+    constructor = (length = 0, call = duration::construct),
     statics = {
         "from"    / 1 => native_duration_from,
         "compare" / 2 => native_duration_compare,
@@ -74,7 +76,7 @@ otter_macros::couch! {
     name = "PlainDate",
     feature = CORE,
     intrinsic = PlainDateIntrinsic,
-    constructor = (length = 0, call = temporal_class_direct_construct),
+    constructor = (length = 3, call = plain_date::construct),
     statics = {
         "from"    / 1 => native_plain_date_from,
         "compare" / 2 => native_plain_date_compare,
@@ -86,7 +88,7 @@ otter_macros::couch! {
     name = "PlainTime",
     feature = CORE,
     intrinsic = PlainTimeIntrinsic,
-    constructor = (length = 0, call = temporal_class_direct_construct),
+    constructor = (length = 0, call = plain_time::construct),
     statics = {
         "from"    / 1 => native_plain_time_from,
         "compare" / 2 => native_plain_time_compare,
@@ -98,7 +100,7 @@ otter_macros::couch! {
     name = "PlainDateTime",
     feature = CORE,
     intrinsic = PlainDateTimeIntrinsic,
-    constructor = (length = 0, call = temporal_class_direct_construct),
+    constructor = (length = 3, call = plain_date_time::construct),
     statics = {
         "from"    / 1 => native_plain_date_time_from,
         "compare" / 2 => native_plain_date_time_compare,
@@ -145,23 +147,6 @@ impl BuiltinIntrinsic for Intrinsic {
         object::set(temporal, heap, NOW_SPEC.name, Value::object(now));
         Ok(())
     }
-}
-
-fn temporal_class_direct_construct(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
-    let name = if ctx.is_construct_call() {
-        "Temporal class constructor"
-    } else {
-        "Temporal class call"
-    };
-    Err(NativeError::TypeError {
-        name,
-        reason: "direct construction not implemented; use the class's spec-defined factory \
-                 (e.g. `Temporal.Instant.from`, `Temporal.Now.instant`)"
-            .to_string(),
-    })
 }
 
 const TEMPORAL_SPEC: NamespaceSpec = NamespaceSpec {

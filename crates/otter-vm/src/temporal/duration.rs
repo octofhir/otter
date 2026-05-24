@@ -23,15 +23,43 @@
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::object::JsObject;
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{
-    alloc_temporal_value, js_string_value, make_temporal, optional_object_arg, read_i64_field,
-    read_string_field, require_duration, temporal_err,
+    alloc_temporal_value, js_string_value, make_temporal, opt_integer_if_integral,
+    optional_object_arg, read_i64_field, read_string_field, require_construct, require_duration,
+    temporal_dispatch_err, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
+use crate::{NativeCtx, NativeError, Value};
+
+/// §7.1.1 `Temporal.Duration(years, months, weeks, days, hours,
+/// minutes, seconds, milliseconds, microseconds, nanoseconds)`.
+pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const CLASS: &str = "Temporal.Duration";
+    require_construct(ctx, CLASS)?;
+    let heap = ctx.heap();
+    let years = opt_integer_if_integral(args, 0, heap, CLASS, "years")? as i64;
+    let months = opt_integer_if_integral(args, 1, heap, CLASS, "months")? as i64;
+    let weeks = opt_integer_if_integral(args, 2, heap, CLASS, "weeks")? as i64;
+    let days = opt_integer_if_integral(args, 3, heap, CLASS, "days")? as i64;
+    let hours = opt_integer_if_integral(args, 4, heap, CLASS, "hours")? as i64;
+    let minutes = opt_integer_if_integral(args, 5, heap, CLASS, "minutes")? as i64;
+    let seconds = opt_integer_if_integral(args, 6, heap, CLASS, "seconds")? as i64;
+    let ms = opt_integer_if_integral(args, 7, heap, CLASS, "milliseconds")? as i64;
+    let us = opt_integer_if_integral(args, 8, heap, CLASS, "microseconds")? as i128;
+    let ns = opt_integer_if_integral(args, 9, heap, CLASS, "nanoseconds")? as i128;
+    let dur = temporal_rs::Duration::new(
+        years, months, weeks, days, hours, minutes, seconds, ms, us, ns,
+    )
+    .map_err(|e| NativeError::RangeError {
+        name: CLASS,
+        reason: e.to_string(),
+    })?;
+    let heap = ctx.heap_mut();
+    alloc_temporal_value(heap, TemporalPayload::Duration(dur)).map_err(temporal_dispatch_err)
+}
 
 /// Dispatch `Temporal.Duration.<method>(args...)` via the typed
 /// [`TemporalMethod`].

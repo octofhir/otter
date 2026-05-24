@@ -6,14 +6,84 @@
 
 use std::sync::LazyLock;
 
-use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    alloc_temporal_value, js_string_value, make_temporal, require_plain_date_time, temporal_err,
+    alloc_temporal_value, arg_or_undef, arg_to_calendar, clamp_to_u16, clamp_to_u8,
+    js_string_value, make_temporal, opt_integer_with_truncation, require_construct,
+    require_plain_date_time, temporal_dispatch_err, temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
+use crate::{NativeCtx, NativeError, Value};
+
+/// §5.1.1 `Temporal.PlainDateTime(isoYear, isoMonth, isoDay [, hour
+/// [, minute [, second [, ms [, us [, ns [, calendar]]]]]]])`.
+pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const CLASS: &str = "Temporal.PlainDateTime";
+    require_construct(ctx, CLASS)?;
+    let heap = ctx.heap();
+    let year = to_integer_with_truncation(&arg_or_undef(args, 0), heap, CLASS, "isoYear")? as i32;
+    let month = clamp_to_u8(
+        to_integer_with_truncation(&arg_or_undef(args, 1), heap, CLASS, "isoMonth")?,
+        CLASS,
+        "isoMonth",
+    )?;
+    let day = clamp_to_u8(
+        to_integer_with_truncation(&arg_or_undef(args, 2), heap, CLASS, "isoDay")?,
+        CLASS,
+        "isoDay",
+    )?;
+    let hour = clamp_to_u8(
+        opt_integer_with_truncation(args, 3, heap, CLASS, "hour")?,
+        CLASS,
+        "hour",
+    )?;
+    let minute = clamp_to_u8(
+        opt_integer_with_truncation(args, 4, heap, CLASS, "minute")?,
+        CLASS,
+        "minute",
+    )?;
+    let second = clamp_to_u8(
+        opt_integer_with_truncation(args, 5, heap, CLASS, "second")?,
+        CLASS,
+        "second",
+    )?;
+    let millisecond = clamp_to_u16(
+        opt_integer_with_truncation(args, 6, heap, CLASS, "millisecond")?,
+        CLASS,
+        "millisecond",
+    )?;
+    let microsecond = clamp_to_u16(
+        opt_integer_with_truncation(args, 7, heap, CLASS, "microsecond")?,
+        CLASS,
+        "microsecond",
+    )?;
+    let nanosecond = clamp_to_u16(
+        opt_integer_with_truncation(args, 8, heap, CLASS, "nanosecond")?,
+        CLASS,
+        "nanosecond",
+    )?;
+    let calendar = arg_to_calendar(args, 9, heap, CLASS)?;
+    let pdt = temporal_rs::PlainDateTime::try_new(
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        millisecond,
+        microsecond,
+        nanosecond,
+        calendar,
+    )
+    .map_err(|e| NativeError::RangeError {
+        name: CLASS,
+        reason: e.to_string(),
+    })?;
+    let heap = ctx.heap_mut();
+    alloc_temporal_value(heap, TemporalPayload::PlainDateTime(pdt)).map_err(temporal_dispatch_err)
+}
 
 /// Dispatch `Temporal.PlainDateTime.<method>(args...)` via the
 /// typed [`TemporalMethod`].

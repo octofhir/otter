@@ -17,13 +17,67 @@
 
 use std::sync::LazyLock;
 
-use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::helpers::{
-    alloc_temporal_value, js_string_value, make_temporal, require_instant, temporal_err,
+    alloc_temporal_value, arg_or_undef, js_string_value, make_temporal, require_construct,
+    require_instant, temporal_dispatch_err, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
+use crate::{NativeCtx, NativeError, Value};
+
+/// §8.1.1 `Temporal.Instant(epochNanoseconds)` — `[[Construct]]`
+/// body. Coerces `epochNanoseconds` to a `BigInt`, validates the
+/// epoch range, and allocates a `Value::Temporal`.
+pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const CLASS: &str = "Temporal.Instant";
+    require_construct(ctx, CLASS)?;
+    let raw = arg_or_undef(args, 0);
+    let ns = if let Some(b) = raw.as_big_int() {
+        b.with_inner(ctx.heap(), |bi| {
+            use num_traits::ToPrimitive;
+            bi.to_i128()
+        })
+    } else if let Some(s) = raw.as_string(ctx.heap()) {
+        let text = s.to_lossy_string(ctx.heap());
+        let parsed =
+            crate::abstract_ops::string_to_big_int(&text).ok_or(NativeError::SyntaxError {
+                name: CLASS,
+                reason: format!("cannot convert {text:?} to a BigInt"),
+            })?;
+        use num_traits::ToPrimitive;
+        parsed.to_i128()
+    } else if let Some(b) = raw.as_boolean() {
+        Some(i128::from(b))
+    } else if raw.is_number() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "epochNanoseconds: cannot convert a Number to a BigInt".to_string(),
+        });
+    } else if raw.is_symbol() {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "epochNanoseconds: cannot convert a Symbol to a BigInt".to_string(),
+        });
+    } else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "epochNanoseconds must be a BigInt".to_string(),
+        });
+    };
+    let Some(ns) = ns else {
+        return Err(NativeError::RangeError {
+            name: CLASS,
+            reason: "epochNanoseconds out of i128 range".to_string(),
+        });
+    };
+    let inst = temporal_rs::Instant::try_new(ns).map_err(|e| NativeError::RangeError {
+        name: CLASS,
+        reason: e.to_string(),
+    })?;
+    let heap = ctx.heap_mut();
+    alloc_temporal_value(heap, TemporalPayload::Instant(inst)).map_err(temporal_dispatch_err)
+}
 
 /// Dispatch `Temporal.Instant.<method>(args...)` via the typed
 /// [`TemporalMethod`].

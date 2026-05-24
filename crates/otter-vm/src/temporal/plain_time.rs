@@ -5,14 +5,67 @@
 
 use std::sync::LazyLock;
 
-use crate::Value;
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::temporal::dispatch::TemporalError;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    alloc_temporal_value, js_string_value, make_temporal, require_plain_time, temporal_err,
+    alloc_temporal_value, clamp_to_u16, clamp_to_u8, js_string_value, make_temporal,
+    opt_integer_with_truncation, require_construct, require_plain_time, temporal_dispatch_err,
+    temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
+use crate::{NativeCtx, NativeError, Value};
+
+/// §4.1.1 `Temporal.PlainTime([hour [, minute [, second [, ms [, us [, ns]]]]]])`.
+pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    const CLASS: &str = "Temporal.PlainTime";
+    require_construct(ctx, CLASS)?;
+    let heap = ctx.heap();
+    let hour = clamp_to_u8(
+        opt_integer_with_truncation(args, 0, heap, CLASS, "hour")?,
+        CLASS,
+        "hour",
+    )?;
+    let minute = clamp_to_u8(
+        opt_integer_with_truncation(args, 1, heap, CLASS, "minute")?,
+        CLASS,
+        "minute",
+    )?;
+    let second = clamp_to_u8(
+        opt_integer_with_truncation(args, 2, heap, CLASS, "second")?,
+        CLASS,
+        "second",
+    )?;
+    let millisecond = clamp_to_u16(
+        opt_integer_with_truncation(args, 3, heap, CLASS, "millisecond")?,
+        CLASS,
+        "millisecond",
+    )?;
+    let microsecond = clamp_to_u16(
+        opt_integer_with_truncation(args, 4, heap, CLASS, "microsecond")?,
+        CLASS,
+        "microsecond",
+    )?;
+    let nanosecond = clamp_to_u16(
+        opt_integer_with_truncation(args, 5, heap, CLASS, "nanosecond")?,
+        CLASS,
+        "nanosecond",
+    )?;
+    let pt = temporal_rs::PlainTime::try_new(
+        hour,
+        minute,
+        second,
+        millisecond,
+        microsecond,
+        nanosecond,
+    )
+    .map_err(|e| NativeError::RangeError {
+        name: CLASS,
+        reason: e.to_string(),
+    })?;
+    let heap = ctx.heap_mut();
+    alloc_temporal_value(heap, TemporalPayload::PlainTime(pt)).map_err(temporal_dispatch_err)
+}
 
 /// Dispatch `Temporal.PlainTime.<method>(args...)` via the typed
 /// [`TemporalMethod`].

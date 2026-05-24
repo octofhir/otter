@@ -3,10 +3,15 @@
 //! Installs the global `Temporal` object together with its
 //! sub-classes — `Instant`, `Duration`, `PlainDate`, `PlainTime`,
 //! `PlainDateTime` — as real `NativeFunction` constructors (each
-//! `typeof === "function"`) plus the `Now` namespace object. Each
-//! constructor carries its static methods (`from`, `compare`,
-//! `fromEpochMilliseconds`) as own data properties backed by the
-//! existing `temporal::dispatch::call` engine.
+//! `typeof === "function"`) plus the `Now` namespace object.
+//!
+//! The five class constructors are declared via `couch!` with
+//! `install_on = temporal_host`, so the per-class install bodies
+//! bind their constructor on the `Temporal` namespace object
+//! instead of on `globalThis`. `TemporalIntrinsic` is the single
+//! `BOOTSTRAP_ENTRIES` row; it allocates the namespace + `Now`
+//! sub-namespace and then drives each per-class couch!-generated
+//! install fn in declaration order.
 //!
 //! Direct construction (`new Temporal.Instant(...)`) throws a
 //! `TypeError` for now — the foundation does not yet thread the
@@ -14,28 +19,99 @@
 //! `[[Construct]]` path. Spec-recommended factories (`from`,
 //! `Now.instant()`, ...) work end-to-end.
 //!
-//! # Contents
-//! - [`Intrinsic`] — `BuiltinIntrinsic` adapter installed by
-//!   bootstrap.
-//!
 //! # See also
 //! - <https://tc39.es/proposal-temporal/>
 
-use crate::bootstrap::{
-    BootstrapFeatures, define_global_value, native_constructor_static_with_value_roots,
-    native_static_with_value_roots,
-};
+use crate::bootstrap::BootstrapFeatures;
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec};
 use crate::native_function::NativeCall;
-use crate::object::{self, JsObject, PropertyDescriptor};
+use crate::object::{self, JsObject};
 use crate::temporal::dispatch::{TemporalError, call as call_static};
 use crate::{NativeCtx, NativeError, Value};
 
+// ---------------------------------------------------------------
+// Per-class constructors — couch!-driven, all nested under Temporal.
+// ---------------------------------------------------------------
+
+/// Resolve the `Temporal` namespace object that the per-class
+/// couch! installers bind on. `TemporalIntrinsic` allocates it
+/// first; the per-class installers are private (not in
+/// `BOOTSTRAP_ENTRIES`) so this lookup is always satisfied at
+/// callee time.
+fn temporal_host(global: JsObject, heap: &mut otter_gc::GcHeap) -> JsObject {
+    object::get(global, heap, "Temporal")
+        .and_then(|v| v.as_object())
+        .expect("Temporal namespace must be installed before class constructors")
+}
+
+otter_macros::couch! {
+    name = "Instant",
+    feature = CORE,
+    intrinsic = InstantIntrinsic,
+    constructor = (length = 0, call = temporal_class_direct_construct),
+    statics = {
+        "from"                  / 1 => native_instant_from,
+        "fromEpochMilliseconds" / 1 => native_instant_from_epoch_ms,
+        "compare"               / 2 => native_instant_compare,
+    },
+    install_on = temporal_host,
+}
+
+otter_macros::couch! {
+    name = "Duration",
+    feature = CORE,
+    intrinsic = DurationIntrinsic,
+    constructor = (length = 0, call = temporal_class_direct_construct),
+    statics = {
+        "from"    / 1 => native_duration_from,
+        "compare" / 2 => native_duration_compare,
+    },
+    install_on = temporal_host,
+}
+
+otter_macros::couch! {
+    name = "PlainDate",
+    feature = CORE,
+    intrinsic = PlainDateIntrinsic,
+    constructor = (length = 0, call = temporal_class_direct_construct),
+    statics = {
+        "from"    / 1 => native_plain_date_from,
+        "compare" / 2 => native_plain_date_compare,
+    },
+    install_on = temporal_host,
+}
+
+otter_macros::couch! {
+    name = "PlainTime",
+    feature = CORE,
+    intrinsic = PlainTimeIntrinsic,
+    constructor = (length = 0, call = temporal_class_direct_construct),
+    statics = {
+        "from"    / 1 => native_plain_time_from,
+        "compare" / 2 => native_plain_time_compare,
+    },
+    install_on = temporal_host,
+}
+
+otter_macros::couch! {
+    name = "PlainDateTime",
+    feature = CORE,
+    intrinsic = PlainDateTimeIntrinsic,
+    constructor = (length = 0, call = temporal_class_direct_construct),
+    statics = {
+        "from"    / 1 => native_plain_date_time_from,
+        "compare" / 2 => native_plain_date_time_compare,
+    },
+    install_on = temporal_host,
+}
+
+// ---------------------------------------------------------------
+// `Temporal` namespace + `Temporal.Now` sub-namespace.
+// ---------------------------------------------------------------
+
 /// `BuiltinIntrinsic` adapter that installs the real `Temporal`
-/// namespace. Replaces the previous empty placeholder so
-/// `Temporal.Now.instant()` and friends resolve through ordinary
-/// dynamic dispatch.
+/// namespace and drives the per-class couch! installers in order.
 pub struct Intrinsic;
 
 impl BuiltinIntrinsic for Intrinsic {
@@ -48,10 +124,15 @@ impl BuiltinIntrinsic for Intrinsic {
             NamespaceBuilder::from_spec_with_value_roots(heap, &TEMPORAL_SPEC, vec![global_root])?
                 .build()?;
         let temporal_value = Value::object(temporal);
+        crate::bootstrap::define_global_value(global, heap, Self::NAME, temporal_value);
 
-        for spec in TEMPORAL_CLASSES {
-            install_class(heap, global_root, temporal, temporal_value, spec)?;
-        }
+        // Per-class installers — each binds itself on the Temporal
+        // namespace via `install_on = temporal_host`.
+        InstantIntrinsic::install(heap, global)?;
+        DurationIntrinsic::install(heap, global)?;
+        PlainDateIntrinsic::install(heap, global)?;
+        PlainTimeIntrinsic::install(heap, global)?;
+        PlainDateTimeIntrinsic::install(heap, global)?;
 
         // `Temporal.Now` is a namespace object per spec, not a
         // constructor — keep it as a plain object with method specs.
@@ -62,112 +143,8 @@ impl BuiltinIntrinsic for Intrinsic {
         )?
         .build()?;
         object::set(temporal, heap, NOW_SPEC.name, Value::object(now));
-
-        define_global_value(global, heap, Self::NAME, temporal_value);
         Ok(())
     }
-}
-
-/// Per-class installer descriptor: the JS-visible class name plus
-/// the static methods exposed on the constructor function.
-struct TemporalClassSpec {
-    name: &'static str,
-    methods: &'static [TemporalStatic],
-}
-
-struct TemporalStatic {
-    name: &'static str,
-    length: u8,
-    call: crate::native_function::NativeFastFn,
-}
-
-const fn temporal_static(
-    name: &'static str,
-    length: u8,
-    call: crate::native_function::NativeFastFn,
-) -> TemporalStatic {
-    TemporalStatic { name, length, call }
-}
-
-const TEMPORAL_CLASSES: &[TemporalClassSpec] = &[
-    TemporalClassSpec {
-        name: "Instant",
-        methods: &[
-            temporal_static("from", 1, native_instant_from),
-            temporal_static("fromEpochMilliseconds", 1, native_instant_from_epoch_ms),
-            temporal_static("compare", 2, native_instant_compare),
-        ],
-    },
-    TemporalClassSpec {
-        name: "Duration",
-        methods: &[
-            temporal_static("from", 1, native_duration_from),
-            temporal_static("compare", 2, native_duration_compare),
-        ],
-    },
-    TemporalClassSpec {
-        name: "PlainDate",
-        methods: &[
-            temporal_static("from", 1, native_plain_date_from),
-            temporal_static("compare", 2, native_plain_date_compare),
-        ],
-    },
-    TemporalClassSpec {
-        name: "PlainTime",
-        methods: &[
-            temporal_static("from", 1, native_plain_time_from),
-            temporal_static("compare", 2, native_plain_time_compare),
-        ],
-    },
-    TemporalClassSpec {
-        name: "PlainDateTime",
-        methods: &[
-            temporal_static("from", 1, native_plain_date_time_from),
-            temporal_static("compare", 2, native_plain_date_time_compare),
-        ],
-    },
-];
-
-fn install_class(
-    heap: &mut otter_gc::GcHeap,
-    global_root: Value,
-    temporal: JsObject,
-    temporal_value: Value,
-    spec: &TemporalClassSpec,
-) -> Result<(), JsSurfaceError> {
-    // Constructor itself — direct `new Temporal.X(...)` throws a
-    // `TypeError` until the foundation wires the spec partial-record
-    // / epochNanoseconds argument shapes through `[[Construct]]`.
-    let ctor = native_constructor_static_with_value_roots(
-        heap,
-        spec.name,
-        0,
-        temporal_class_direct_construct,
-        &[&global_root, &temporal_value],
-    )
-    .map_err(|_| JsSurfaceError::OutOfMemory)?;
-    let ctor_value = Value::native_function(ctor);
-
-    // Install each spec-listed static method as an own data property
-    // on the constructor. Length / attrs match the namespace methods
-    // installed by the prior namespace-object form.
-    for method in spec.methods {
-        let fn_obj = native_static_with_value_roots(
-            heap,
-            method.name,
-            method.length,
-            method.call,
-            &[&global_root, &temporal_value, &ctor_value],
-        )
-        .map_err(|_| JsSurfaceError::OutOfMemory)?;
-        let desc = PropertyDescriptor::data(Value::native_function(fn_obj), true, false, true);
-        if !ctor.define_own_property(heap, method.name, desc) {
-            return Err(JsSurfaceError::DefinePropertyFailed(method.name));
-        }
-    }
-
-    object::set(temporal, heap, spec.name, ctor_value);
-    Ok(())
 }
 
 fn temporal_class_direct_construct(
@@ -221,12 +198,10 @@ const NOW_SPEC: NamespaceSpec = NamespaceSpec {
     attrs: Attr::builtin_function(),
 };
 
-// ----- native function bodies -----
-//
-// Each native delegates to `temporal::dispatch::call` with the
-// matching `TemporalClassId` / `TemporalMethod`. The dispatcher
-// returns either a `Value` or a `TemporalError`; we surface the
-// latter as a `NativeError` keyed to the call site.
+// ---------------------------------------------------------------
+// Native function bodies — each delegates to
+// `temporal::dispatch::call`.
+// ---------------------------------------------------------------
 
 fn temporal_native(
     ctx: &mut NativeCtx<'_>,

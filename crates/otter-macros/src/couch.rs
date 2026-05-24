@@ -291,6 +291,13 @@ pub(crate) struct CouchInput {
     /// the `holt!` constant grammar.
     pub(crate) static_constants: Vec<ConstantEntry>,
     pub(crate) prototype: PrototypeBlock,
+    /// Optional `install_on = path` parent override. When set, the
+    /// generated install body looks up the parent host object via
+    /// `path(global, heap)` and binds the constructor there instead
+    /// of on `globalThis`. Used for nested class ctors that live
+    /// under a namespace object (e.g. `Temporal.Instant`,
+    /// `Temporal.Duration`).
+    pub(crate) install_on: Option<Path>,
     /// Optional `post_install = path` escape hatch. When set, the
     /// generated install body calls
     /// `path(heap, global, ctor)?` after pinning the constructor on
@@ -311,6 +318,7 @@ impl Parse for CouchInput {
         let mut static_method_specs: Vec<Path> = Vec::new();
         let mut static_constants: Vec<ConstantEntry> = Vec::new();
         let mut prototype: PrototypeBlock = PrototypeBlock::default();
+        let mut install_on: Option<Path> = None;
         let mut post_install: Option<Path> = None;
 
         while !input.is_empty() {
@@ -355,6 +363,9 @@ impl Parse for CouchInput {
                 "prototype" => {
                     prototype = input.parse()?;
                 }
+                "install_on" => {
+                    install_on = Some(input.parse()?);
+                }
                 "post_install" => {
                     post_install = Some(input.parse()?);
                 }
@@ -364,7 +375,7 @@ impl Parse for CouchInput {
                         format!(
                             "unknown `couch!` field `{other}` — expected `name`, `feature`, \
                              `spec`, `intrinsic`, `constructor`, `statics`, `static_method_specs`, \
-                             `static_constants`, `prototype`, or `post_install`"
+                             `static_constants`, `prototype`, `install_on`, or `post_install`"
                         ),
                     ));
                 }
@@ -411,6 +422,7 @@ impl Parse for CouchInput {
             static_method_specs,
             static_constants,
             prototype,
+            install_on,
             post_install,
         })
     }
@@ -428,6 +440,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         static_method_specs,
         static_constants,
         prototype,
+        install_on,
         post_install,
     } = input;
 
@@ -646,6 +659,43 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
         None => quote! {},
     };
 
+    let bind_call = match install_on {
+        Some(path) => quote! {
+            // §<chapter> — nested constructor lives on a host
+            // namespace object. The host resolver returns the
+            // parent object; bind the constructor as an own data
+            // property (writable / non-enumerable / configurable,
+            // matching the conventional builtin shape).
+            let host = #path(global, heap);
+            let bind_desc = ::otter_vm::object::PropertyDescriptor::data(
+                ctor_value,
+                true,
+                false,
+                true,
+            );
+            if !::otter_vm::object::define_own_property(
+                host,
+                heap,
+                <Self as ::otter_vm::intrinsic_install::BuiltinIntrinsic>::NAME,
+                bind_desc,
+            ) {
+                return ::core::result::Result::Err(
+                    ::otter_vm::JsSurfaceError::DefinePropertyFailed(
+                        <Self as ::otter_vm::intrinsic_install::BuiltinIntrinsic>::NAME,
+                    ),
+                );
+            }
+        },
+        None => quote! {
+            ::otter_vm::bootstrap::define_global_value(
+                global,
+                heap,
+                <Self as ::otter_vm::intrinsic_install::BuiltinIntrinsic>::NAME,
+                ctor_value,
+            );
+        },
+    };
+
     quote! {
         #[allow(non_upper_case_globals)]
         static #statics_ident: &[::otter_vm::MethodSpec] = &[
@@ -860,12 +910,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     );
                 }
 
-                ::otter_vm::bootstrap::define_global_value(
-                    global,
-                    heap,
-                    <Self as ::otter_vm::intrinsic_install::BuiltinIntrinsic>::NAME,
-                    ctor_value,
-                );
+                #bind_call
                 #post_install_call
                 ::core::result::Result::Ok(())
             }

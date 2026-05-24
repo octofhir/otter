@@ -241,8 +241,8 @@ impl ExecutableFunction {
                     .get(idx + 1)
                     .copied()
                     .unwrap_or(code_byte_len);
-                let byte_len = u8::try_from(next_byte_pc - byte_pc)
-                    .expect("single instruction exceeds 255-byte encoding");
+                let byte_len = u16::try_from(next_byte_pc - byte_pc)
+                    .expect("single instruction exceeds 65535-byte encoding");
                 // Compiler emits branch deltas in instruction-index units;
                 // the dispatcher resolves them as byte offsets relative to
                 // `(byte_pc + 1)` (the byte right after the opcode), so the
@@ -350,7 +350,11 @@ pub(crate) struct ExecInstr {
     op: Op,
     /// Byte length of this instruction in the encoded stream
     /// (`opcode` + `operand_count` header + tagged operand bytes).
-    byte_len: u8,
+    /// `u16` to cover pathological inputs (constant-pool indices that
+    /// occupy multiple varint bytes per operand combined with
+    /// variadic opcodes) — a single instruction can encode up to
+    /// ~640 bytes for `NewArray` over thousands of literals.
+    byte_len: u16,
     /// Dense module-local property IC site id for named property ops.
     property_ic_site: u32,
     /// Byte-offset PC of this instruction in the encoded stream.
@@ -367,7 +371,7 @@ impl ExecInstr {
         operands: Vec<Operand>,
         property_ic_site: u32,
         byte_pc: u32,
-        byte_len: u8,
+        byte_len: u16,
     ) -> Self {
         Self {
             op,

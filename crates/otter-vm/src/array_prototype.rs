@@ -778,7 +778,13 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             if elements.is_empty() {
                 return None;
             }
-            let mut i = from as i64;
+            // §23.1.3.18 step 6 — clamp the cursor to the elements
+            // backing-store length so a sparse array with a spec
+            // length larger than `elements.len()` (e.g.
+            // `arr.length = 2**31`) does not index out of bounds.
+            // Trailing slots beyond `elements.len()` are holes that
+            // can never `===` the needle.
+            let mut i = (from as usize).min(elements.len() - 1) as i64;
             while i >= 0 {
                 if elements[i as usize] == needle {
                     return Some(i as i32);

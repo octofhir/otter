@@ -450,14 +450,21 @@ pub fn to_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
         }
         let resolved = heap.read_payload(node, |b| match &b.repr {
             JsStringBodyRepr::Flat(units) => {
-                let s = start as usize;
-                let e = s + length as usize;
+                // Clamp the view to the body's actual length. A
+                // sliced body may carry a `start` that exceeds the
+                // flat parent's length when the parent was replaced
+                // (e.g. interned via `from_str` and a smaller body
+                // now lives at the same handle), or when callers
+                // build an out-of-bounds substring through the
+                // pre-existing `String.prototype.slice` clamping.
+                let s = (start as usize).min(units.len());
+                let e = s.saturating_add(length as usize).min(units.len());
                 out.extend_from_slice(&units[s..e]);
                 Resolved::Flat
             }
             JsStringBodyRepr::Latin1(bytes) => {
-                let s = start as usize;
-                let e = s + length as usize;
+                let s = (start as usize).min(bytes.len());
+                let e = s.saturating_add(length as usize).min(bytes.len());
                 out.extend(bytes[s..e].iter().map(|&b| u16::from(b)));
                 Resolved::Latin1
             }

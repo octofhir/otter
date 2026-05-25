@@ -1290,11 +1290,11 @@ impl Interpreter {
                 }
                 return Err(VmError::TypeMismatch);
             };
-            let value =
-                crate::object::get(obj, &self.gc_heap, "value").unwrap_or(Value::undefined());
-            let done_value =
-                crate::object::get(obj, &self.gc_heap, "done").unwrap_or(Value::undefined());
-            let done = done_value.to_boolean(&self.gc_heap);
+            let step = iterator_step_read(self, context, &Value::object(obj))?;
+            let (value, done) = match step {
+                Some(value) => (value, false),
+                None => (Value::undefined(), true),
+            };
             if done && let Some(rc) = state.iterator.as_iterator() {
                 self.gc_heap
                     .with_payload(rc, |state| *state = IteratorState::Exhausted);

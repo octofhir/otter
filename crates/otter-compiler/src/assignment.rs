@@ -633,50 +633,56 @@ pub(crate) fn assign_array_pattern(
 ) -> Result<(), CompileError> {
     emit_require_object_coercible(cx, value_reg, span);
 
-    for (idx, element) in arr.elements.iter().enumerate() {
+    let iter_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::GetIterator,
+        [Operand::Register(iter_reg), Operand::Register(value_reg)],
+        span,
+    );
+    for element in &arr.elements {
+        let val_reg = cx.alloc_scratch();
+        let done_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::IteratorNext,
+            [
+                Operand::Register(val_reg),
+                Operand::Register(done_reg),
+                Operand::Register(iter_reg),
+            ],
+            span,
+        );
         let Some(element) = element else { continue };
         let elem_span = span;
-        let idx_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadInt32,
-            [Operand::Register(idx_reg), Operand::Imm32(idx as i32)],
-            elem_span,
-        );
-        let val_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadElement,
-            vec![
-                Operand::Register(val_reg),
-                Operand::Register(value_reg),
-                Operand::Register(idx_reg),
-            ],
-            elem_span,
-        );
         assign_maybe_default(cx, element, val_reg, elem_span)?;
     }
     if let Some(rest) = arr.rest.as_ref() {
-        // Foundation: collect the trailing slice via CollectRest
-        // (already used by parameter rest binding) into a fresh
-        // array, then assign into the rest target.
-        let start_reg = cx.alloc_scratch();
-        cx.emit(
-            Op::LoadInt32,
-            vec![
-                Operand::Register(start_reg),
-                Operand::Imm32(arr.elements.len() as i32),
-            ],
-            span,
-        );
         let collected = cx.alloc_scratch();
         cx.emit(
-            Op::CollectRest,
-            vec![
-                Operand::Register(collected),
-                Operand::Register(value_reg),
-                Operand::Register(start_reg),
+            Op::NewArray,
+            [Operand::Register(collected), Operand::ConstIndex(0)],
+            span,
+        );
+        let val_reg = cx.alloc_scratch();
+        let done_reg = cx.alloc_scratch();
+        let loop_top = cx.next_pc;
+        cx.emit(
+            Op::IteratorNext,
+            [
+                Operand::Register(val_reg),
+                Operand::Register(done_reg),
+                Operand::Register(iter_reg),
             ],
             span,
         );
+        let exit = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+        cx.emit(
+            Op::ArrayPush,
+            [Operand::Register(collected), Operand::Register(val_reg)],
+            span,
+        );
+        let back = cx.emit_branch_placeholder(Op::Jump, None, span);
+        cx.patch_branch(back, loop_top);
+        cx.patch_branch_to_here(exit);
         assign_to_target(cx, &rest.target, collected, span)?;
     }
     Ok(())

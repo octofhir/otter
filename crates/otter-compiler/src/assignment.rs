@@ -304,6 +304,9 @@ pub(crate) fn compile_assignment(
     let value = match compound_op {
         None => compile_expr(cx, &a.right, span)?,
         Some(op) => {
+            if storage.is_none() && cx.is_strict {
+                return Ok(emit_reference_error(cx, &name, span));
+            }
             let current = cx.alloc_scratch();
             match storage {
                 Some(s) => cx.emit_load_storage(current, s, span),
@@ -335,6 +338,10 @@ pub(crate) fn compile_assignment(
             cx.emit_module_export_mirror(&name, value, span);
         }
         None => {
+            if cx.is_strict {
+                emit_reference_error(cx, &name, span);
+                return Ok(value);
+            }
             // Store to the globalThis property table.
             let global = cx.alloc_scratch();
             cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
@@ -371,6 +378,8 @@ pub(crate) fn compile_logical_assignment(
                 cx.emit_load_storage(load, info.storage, span);
             } else if let Some(idx) = cx.resolve_capture(&name) {
                 cx.emit_load_storage(load, BindingStorage::Upvalue { idx }, span);
+            } else if cx.is_strict {
+                return Ok(emit_reference_error(cx, &name, span));
             } else {
                 let global = cx.alloc_scratch();
                 cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
@@ -944,6 +953,10 @@ pub(crate) fn store_identifier(
             cx.emit_module_export_mirror(name, value_reg, span);
         }
         None => {
+            if cx.is_strict {
+                emit_reference_error(cx, name, span);
+                return Ok(());
+            }
             // §10.2.4.1 PutValue fallback to globalThis.
             let global = cx.alloc_scratch();
             cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
@@ -962,6 +975,31 @@ pub(crate) fn store_identifier(
         }
     }
     Ok(())
+}
+
+fn emit_reference_error(cx: &mut Compiler, name: &str, span: (u32, u32)) -> u16 {
+    let message_reg = cx.alloc_scratch();
+    let message = cx.intern_string_constant(&format!("{name} is not defined"));
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(message_reg), Operand::ConstIndex(message)],
+        span,
+    );
+    let error_reg = cx.alloc_scratch();
+    let kind = cx.intern_string_constant("ReferenceError");
+    cx.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
+    let result = cx.alloc_scratch();
+    cx.emit(Op::LoadUndefined, [Operand::Register(result)], span);
+    result
 }
 
 /// Map a compound `AssignmentOperator` to the bytecode binop used

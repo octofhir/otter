@@ -1123,6 +1123,7 @@ impl Value {
     /// - String → false iff length is zero (cached on the handle).
     /// - BigInt → false iff body decodes to 0 ([`crate::bigint::BigIntValue::is_zero`]).
     /// - Symbol → always true.
+    /// - Annex B `[[IsHTMLDDA]]` host value → false.
     ///
     /// Everything decidable without heap is delegated to
     /// [`Self::to_boolean_pure`].
@@ -1130,6 +1131,9 @@ impl Value {
     #[must_use]
     #[allow(dead_code)] // Wired up at Phase-1 swap; ~50 call sites flip over from legacy::Value.
     pub fn to_boolean(self, heap: &otter_gc::GcHeap) -> bool {
+        if self.is_html_dda(heap) {
+            return false;
+        }
         if let Some(b) = self.to_boolean_pure() {
             return b;
         }
@@ -1142,6 +1146,15 @@ impl Value {
         // Remaining TAG_PTR_OTHER residue (Symbol, plus any future
         // `other`-family body) is truthy per §7.1.2 step 7.
         true
+    }
+
+    /// `true` for the Test262 host object that emulates Annex B
+    /// `[[IsHTMLDDA]]`.
+    #[inline]
+    #[must_use]
+    pub fn is_html_dda(self, heap: &otter_gc::GcHeap) -> bool {
+        self.as_native_function()
+            .is_some_and(|native| native.name(heap) == "__otter_is_htmldda")
     }
 
     /// Spec [`typeof`](https://tc39.es/ecma262/#sec-typeof-operator) —
@@ -1175,6 +1188,9 @@ impl Value {
     #[must_use]
     #[allow(dead_code)] // Wired up at Phase-1 swap.
     pub fn typeof_string_with_heap(self, heap: &otter_gc::GcHeap) -> &'static str {
+        if self.is_html_dda(heap) {
+            return "undefined";
+        }
         if let Some(obj) = self.as_object()
             && crate::object::call_native(obj, heap).is_some_and(|v| v.is_native_function())
         {

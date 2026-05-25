@@ -119,6 +119,7 @@ pub fn install_natives(runtime: &mut Runtime) -> Result<(), OtterError> {
 
 /// `(name, length, fn)` table installed by [`install_natives`].
 const NATIVES: &[(&str, u8, NativeFastFn)] = &[
+    ("__otter_is_htmldda", 0, is_html_dda),
     ("__otter_agent_start", 1, agent_start),
     ("__otter_agent_broadcast", 2, agent_broadcast),
     ("__otter_agent_get_report", 0, agent_get_report),
@@ -142,6 +143,10 @@ fn type_err(reason: impl Into<String>) -> NativeError {
         name: "$262.agent",
         reason: reason.into(),
     }
+}
+
+fn is_html_dda(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::null())
 }
 
 fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, NativeError> {

@@ -254,6 +254,14 @@ impl Interpreter {
         x: &Value,
         y: &Value,
     ) -> Result<bool, VmError> {
+        let x_html_dda = x.is_html_dda(&self.gc_heap);
+        let y_html_dda = y.is_html_dda(&self.gc_heap);
+        if x_html_dda && (y.is_undefined() || y.is_null()) {
+            return Ok(true);
+        }
+        if y_html_dda && (x.is_undefined() || x.is_null()) {
+            return Ok(true);
+        }
         if abstract_ops::is_primitive(x) && abstract_ops::is_primitive(y) {
             return Ok(abstract_ops::is_loosely_equal(x, y, &self.gc_heap));
         }

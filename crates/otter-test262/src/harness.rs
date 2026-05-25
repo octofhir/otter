@@ -51,9 +51,8 @@ globalThis.$DONE = function $DONE(reason) {
 ///   `host-gc-required` feature gate.
 /// - `$262.detachArrayBuffer(buf)` — calls `buf.transfer()` which
 ///   detaches the source per §25.1.5.5.
-/// - `$262.IsHTMLDDA` — placeholder callable function. Tests that
-///   probe `[[IsHTMLDDA]]` semantics will fail; most uses just need
-///   the function identity / a no-op call.
+/// - `$262.IsHTMLDDA` — host native branded by the VM for the Annex B
+///   `[[IsHTMLDDA]]` ToBoolean / `typeof` / loose-equality rules.
 /// - `$262.evalScript(s)` — uses `new Function(s)()`; differs from
 ///   real indirect-`eval` in that top-level `var` declarations
 ///   stay function-scoped. Tests sensitive to global scope leakage
@@ -68,7 +67,7 @@ globalThis.$DONE = function $DONE(reason) {
 /// - <https://github.com/tc39/test262/blob/main/INTERPRETING.md#host-defined-functions>
 pub const D262_HOST_PREAMBLE: &str = r#"
 var $262 = (function () {
-    var IsHTMLDDA = function IsHTMLDDA() { return null; };
+    var IsHTMLDDA = __otter_is_htmldda;
     return {
         global: globalThis,
         gc: function () { /* engine gc is automatic */ },

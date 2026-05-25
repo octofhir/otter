@@ -82,6 +82,7 @@ impl Interpreter {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
+        let caller_byte_len = self.current_byte_len;
         let top_idx = stack.len() - 1;
         let recv_value = *read_register(&stack[top_idx], recv_reg)?;
         let mut arg_values: SmallVec<[Value; 8]> = SmallVec::with_capacity(argc);
@@ -181,11 +182,8 @@ impl Interpreter {
                 let is_async_gen = g.is_async(&self.gc_heap);
                 if is_async_gen {
                     // §27.6.3 — async-generator method calls always
-                    // return a Promise. Allocate the outer
-                    // capability up front and stash it on
-                    // `pending_request` so `Op::Yield` /
-                    // `resume_generator` / the await-resume native
-                    // can settle it from inside the dispatch loop.
+                    // return a Promise. Queue the request; only a
+                    // suspended generator resumes immediately.
                     let cap = promise_dispatch::PromiseBuilder::with_context(context.clone())
                         .capability_stack_rooted(
                             self,
@@ -194,38 +192,53 @@ impl Interpreter {
                             &[arg_values.as_slice()],
                         )?;
                     let promise = cap.promise;
-                    g.set_pending_request(&mut self.gc_heap, cap.clone());
-                    let outcome = self.resume_generator(context, &g, kind);
-                    match outcome {
-                        Ok(_) => {
-                            // resume_generator drained the request
-                            // — either by Op::Yield, by completion,
-                            // or it left the request pending while
-                            // an `Op::Await` parked the body. In
-                            // any case, the outer promise is the
-                            // user-visible handle.
-                        }
-                        Err(err) => {
-                            if let Some(thrown) = self.pending_generator_throw.take() {
-                                if let Some(req) = g.take_pending_request(&mut self.gc_heap) {
-                                    let request_context =
-                                        req.context.clone().unwrap_or_else(|| context.clone());
-                                    self.run_callable_sync(
-                                        &request_context,
-                                        &req.reject,
-                                        Value::undefined(),
-                                        smallvec::smallvec![thrown],
-                                    )?;
-                                }
-                            } else {
-                                g.clear_pending_request(&mut self.gc_heap);
-                                return Err(err);
+
+                    if g.async_state(&self.gc_heap)
+                        == crate::generator::AsyncGeneratorState::Completed
+                    {
+                        match kind {
+                            GeneratorResumeKind::Throw(reason) => {
+                                self.async_generator_settle_capability(
+                                    context,
+                                    &cap,
+                                    Err(reason),
+                                    true,
+                                )?;
                             }
+                            GeneratorResumeKind::Next(_) => {
+                                self.async_generator_settle_capability(
+                                    context,
+                                    &cap,
+                                    Ok(Value::undefined()),
+                                    true,
+                                )?;
+                            }
+                            GeneratorResumeKind::Return(value) => {
+                                self.async_generator_settle_capability(
+                                    context,
+                                    &cap,
+                                    Ok(value),
+                                    true,
+                                )?;
+                            }
+                        }
+                    } else {
+                        let state = g.async_state(&self.gc_heap);
+                        g.enqueue_async_request(&mut self.gc_heap, kind, cap.clone());
+                        if matches!(
+                            state,
+                            crate::generator::AsyncGeneratorState::SuspendedStart
+                                | crate::generator::AsyncGeneratorState::SuspendedYield
+                        ) {
+                            let resume = g
+                                .front_async_resume(&self.gc_heap)
+                                .ok_or(VmError::InvalidOperand)?;
+                            self.resume_generator(context, &g, resume)?;
                         }
                     }
                     let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                     write_register(frame, dst, promise)?;
-                    frame.advance_pc(self.current_byte_len)?;
+                    frame.advance_pc(caller_byte_len)?;
                     return Ok(());
                 }
                 match self.resume_generator(context, &g, kind) {

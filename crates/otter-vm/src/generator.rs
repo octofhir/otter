@@ -27,8 +27,9 @@
 //! - <https://tc39.es/ecma262/#await>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
-use crate::Frame;
+use crate::{Frame, GeneratorResumeKind};
 use otter_gc::raw::{RawGc, SlotVisitor};
+use std::collections::VecDeque;
 
 /// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`GeneratorBody`].
 pub const GENERATOR_BODY_TYPE_TAG: u8 = 0x1a;
@@ -44,6 +45,32 @@ pub struct JsGenerator {
 
 /// GC-managed parked async frame handle.
 pub type ParkedFrame = otter_gc::Gc<ParkedFrameBody>;
+
+/// Async-generator scheduling state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncGeneratorState {
+    /// Body is parked before its first user statement.
+    SuspendedStart,
+    /// Body is parked at an async-generator `yield`.
+    SuspendedYield,
+    /// Body is running on an interpreter stack.
+    Executing,
+    /// Body is parked on an awaited promise.
+    Awaiting,
+    /// Body finished; queued requests drain as done.
+    Draining,
+    /// No frame or queued work remains.
+    Completed,
+}
+
+/// Queued `.next` / `.return` / `.throw` request.
+#[derive(Debug, Clone)]
+pub struct AsyncGeneratorRequest {
+    /// Resume operation to inject into the generator body.
+    pub resume: GeneratorResumeKind,
+    /// Promise capability returned from the public async-generator method.
+    pub capability: crate::promise::PromiseCapability,
+}
 
 /// Internal generator storage.
 #[derive(Debug, otter_macros::Pelt)]
@@ -76,9 +103,12 @@ pub struct GeneratorBody {
     /// `prototype` property at call time.
     pub prototype_override: Option<crate::Value>,
     /// Pending Promise capability for an in-flight async-generator
-    /// request.
-    #[pelt(via = trace_promise_capability)]
-    pub pending_request: Option<crate::promise::PromiseCapability>,
+    /// request queue.
+    #[pelt(via = trace_async_generator_queue)]
+    pub async_requests: VecDeque<AsyncGeneratorRequest>,
+    /// Async-generator state. Ignored for sync generators.
+    #[pelt(skip)]
+    pub async_state: AsyncGeneratorState,
 }
 
 fn trace_generator_frame(field: &Option<Box<Frame>>, visitor: &mut SlotVisitor<'_>) {
@@ -96,14 +126,19 @@ fn trace_generator_cold(
     }
 }
 
-fn trace_promise_capability(
-    field: &Option<crate::promise::PromiseCapability>,
+fn trace_async_generator_queue(
+    field: &VecDeque<AsyncGeneratorRequest>,
     visitor: &mut SlotVisitor<'_>,
 ) {
-    if let Some(capability) = field {
-        capability.promise.trace_value_slots(visitor);
-        capability.resolve.trace_value_slots(visitor);
-        capability.reject.trace_value_slots(visitor);
+    for request in field {
+        match &request.resume {
+            GeneratorResumeKind::Next(value)
+            | GeneratorResumeKind::Return(value)
+            | GeneratorResumeKind::Throw(value) => value.trace_value_slots(visitor),
+        }
+        request.capability.promise.trace_value_slots(visitor);
+        request.capability.resolve.trace_value_slots(visitor);
+        request.capability.reject.trace_value_slots(visitor);
     }
 }
 
@@ -144,7 +179,8 @@ impl JsGenerator {
                 yielded: None,
                 is_async: false,
                 prototype_override,
-                pending_request: None,
+                async_requests: VecDeque::new(),
+                async_state: AsyncGeneratorState::SuspendedStart,
             })?,
         })
     }
@@ -190,7 +226,12 @@ impl JsGenerator {
 
     /// Set the async-generator flag.
     pub fn set_async(&self, heap: &mut otter_gc::GcHeap, is_async: bool) {
-        heap.with_payload(self.inner, |body| body.is_async = is_async);
+        heap.with_payload(self.inner, |body| {
+            body.is_async = is_async;
+            if is_async {
+                body.async_state = AsyncGeneratorState::SuspendedStart;
+            }
+        });
     }
 
     /// `true` for async generators.
@@ -287,36 +328,62 @@ impl JsGenerator {
         heap.with_payload(self.inner, |body| body.frame = None);
     }
 
-    /// Store a pending async-generator request.
-    pub fn set_pending_request(
+    /// Read async-generator scheduling state.
+    #[must_use]
+    pub fn async_state(&self, heap: &otter_gc::GcHeap) -> AsyncGeneratorState {
+        heap.read_payload(self.inner, |body| body.async_state)
+    }
+
+    /// Set async-generator scheduling state.
+    pub fn set_async_state(&self, heap: &mut otter_gc::GcHeap, state: AsyncGeneratorState) {
+        heap.with_payload(self.inner, |body| body.async_state = state);
+    }
+
+    /// Enqueue an async-generator request.
+    pub fn enqueue_async_request(
         &self,
         heap: &mut otter_gc::GcHeap,
+        resume: GeneratorResumeKind,
         capability: crate::promise::PromiseCapability,
     ) {
+        let barrier_resume = resume.clone();
         let barrier_capability = capability.clone();
         heap.with_payload(self.inner, |body| {
-            body.pending_request = Some(capability);
+            body.async_requests
+                .push_back(AsyncGeneratorRequest { resume, capability });
         });
+        match barrier_resume {
+            GeneratorResumeKind::Next(value)
+            | GeneratorResumeKind::Return(value)
+            | GeneratorResumeKind::Throw(value) => heap.record_write(self.inner, &value),
+        }
         heap.record_write(self.inner, &barrier_capability);
     }
 
-    /// Clear the pending async-generator request.
-    pub fn clear_pending_request(&self, heap: &mut otter_gc::GcHeap) {
-        heap.with_payload(self.inner, |body| body.pending_request = None);
+    /// Clear all queued async-generator requests.
+    pub fn clear_async_requests(&self, heap: &mut otter_gc::GcHeap) {
+        heap.with_payload(self.inner, |body| body.async_requests.clear());
     }
 
-    /// Take the pending async-generator request.
-    pub fn take_pending_request(
-        &self,
-        heap: &mut otter_gc::GcHeap,
-    ) -> Option<crate::promise::PromiseCapability> {
-        heap.with_payload(self.inner, |body| body.pending_request.take())
+    /// Pop the front async-generator request.
+    pub fn pop_async_request(&self, heap: &mut otter_gc::GcHeap) -> Option<AsyncGeneratorRequest> {
+        heap.with_payload(self.inner, |body| body.async_requests.pop_front())
     }
 
-    /// `true` when a pending request exists.
+    /// Clone the front async-generator resume request.
     #[must_use]
-    pub fn has_pending_request(&self, heap: &otter_gc::GcHeap) -> bool {
-        heap.read_payload(self.inner, |body| body.pending_request.is_some())
+    pub fn front_async_resume(&self, heap: &otter_gc::GcHeap) -> Option<GeneratorResumeKind> {
+        heap.read_payload(self.inner, |body| {
+            body.async_requests
+                .front()
+                .map(|request| request.resume.clone())
+        })
+    }
+
+    /// `true` when queued async-generator requests exist.
+    #[must_use]
+    pub fn has_async_requests(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| !body.async_requests.is_empty())
     }
 
     /// Install the generator self-reference into the saved frame.

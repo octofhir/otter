@@ -2941,31 +2941,17 @@ impl Interpreter {
                     let mut popped = stack.pop().expect("frame present");
                     let detached_cold = self.frame_detach_cold(&mut popped);
                     owner.park_after_yield(&mut self.gc_heap, popped, detached_cold, dst, yielded);
-                    let pending_request = if owner.is_async(&self.gc_heap) {
-                        owner.take_pending_request(&mut self.gc_heap)
-                    } else {
-                        None
-                    };
                     // §27.6 — async-generator yield settles the
                     // outer `.next()` promise immediately with
                     // `{value, done: false}`. Sync generators bubble
                     // the yielded value out so the `resume_generator`
                     // caller can shape it.
-                    if let Some(cap) = pending_request {
-                        let record = self.make_runtime_rooted_iter_result(
-                            yielded,
-                            false,
-                            &[&cap.resolve],
-                            &[],
-                        )?;
-                        let capability_context =
-                            cap.context.clone().unwrap_or_else(|| context.clone());
-                        self.run_callable_sync(
-                            &capability_context,
-                            &cap.resolve,
-                            Value::undefined(),
-                            smallvec::smallvec![record],
-                        )?;
+                    if owner.is_async(&self.gc_heap) {
+                        owner.set_async_state(
+                            &mut self.gc_heap,
+                            crate::generator::AsyncGeneratorState::SuspendedYield,
+                        );
+                        self.async_generator_complete_step(context, &owner, Ok(yielded), false)?;
                     }
                     return Ok(yielded);
                 }

@@ -77,7 +77,7 @@ impl Interpreter {
         // but it carries a `generator_owner` whose body was flagged
         // async. Park the frame on a dedicated resume native that
         // re-enters the generator body and either settles the
-        // outer `pending_request` from a subsequent `Op::Yield` /
+        // front queued request from a subsequent `Op::Yield` /
         // completion, or chains another `Op::Await`.
         if stack[top_idx].async_state.is_none() {
             if let Some(owner) = stack[top_idx].generator_owner
@@ -121,7 +121,7 @@ impl Interpreter {
     /// §27.6.3 — `Op::Await` inside an async-generator body. Parks
     /// the running frame and attaches resume / reject reactions
     /// that re-enter the body when the awaited promise settles. On
-    /// resume, the generator's `pending_request` is settled by a
+    /// resume, the generator's front request is settled by a
     /// subsequent `Op::Yield`, completion, or further `Op::Await`.
     fn do_await_async_gen(
         &mut self,
@@ -163,7 +163,7 @@ impl Interpreter {
 
     /// Resume an async-generator body whose `Op::Await` parked
     /// `frame`. Mirrors [`Self::run_async_resume`] but settles the
-    /// generator's `pending_request` on completion / unhandled
+    /// generator's request queue on completion / unhandled
     /// throw rather than the frame's `async_state` promise.
     // `Box<Frame>` is intentional: the parked frame travels heap-owned
     // through the microtask queue. Inlining it would require copying
@@ -194,6 +194,10 @@ impl Interpreter {
         }
         let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
         stack.push(*frame);
+        owner.set_async_state(
+            &mut self.gc_heap,
+            crate::generator::AsyncGeneratorState::Executing,
+        );
         if !fulfilled {
             if let Err(error) = self.unwind_throw(&mut stack, value) {
                 let frames = snapshot_frames(context, &stack);
@@ -201,23 +205,12 @@ impl Interpreter {
             }
             if stack.is_empty() {
                 // Throw drained out of the gen body; settle the
-                // pending request as rejected.
-                let req = owner.take_pending_request(&mut self.gc_heap);
-                if let Some(req) = req {
-                    let request_context = req.context.clone().unwrap_or_else(|| context.clone());
-                    if let Err(error) = self.run_callable_sync(
-                        &request_context,
-                        &req.reject,
-                        Value::undefined(),
-                        smallvec::smallvec![value],
-                    ) {
-                        return Err(RunError {
-                            error,
-                            frames: Vec::new(),
-                        });
-                    }
-                }
+                // front request as rejected.
+                self.async_generator_complete_step(context, &owner, Err(value), true)
+                    .map_err(RunError::bare)?;
                 owner.mark_done(&mut self.gc_heap);
+                self.async_generator_drain_done(context, &owner)
+                    .map_err(RunError::bare)?;
                 return Ok(());
             }
         }
@@ -230,32 +223,37 @@ impl Interpreter {
                     owner.take_yielded(&mut self.gc_heap);
                     return Ok(());
                 }
-                // Body completed: settle the pending request with
+                // Body completed: settle the front request with
                 // the final return value as `done: true`.
-                let req = owner.take_pending_request(&mut self.gc_heap);
-                if let Some(req) = req {
-                    let record = self
-                        .make_runtime_rooted_iter_result(value, true, &[&req.resolve], &[])
-                        .map_err(RunError::bare)?;
-                    let request_context = req.context.clone().unwrap_or_else(|| context.clone());
-                    if let Err(error) = self.run_callable_sync(
-                        &request_context,
-                        &req.resolve,
-                        Value::undefined(),
-                        smallvec::smallvec![record],
-                    ) {
-                        return Err(RunError {
-                            error,
-                            frames: Vec::new(),
-                        });
-                    }
-                }
+                self.async_generator_complete_step(context, &owner, Ok(value), true)
+                    .map_err(RunError::bare)?;
                 owner.mark_done(&mut self.gc_heap);
+                self.async_generator_drain_done(context, &owner)
+                    .map_err(RunError::bare)?;
                 Ok(())
             }
             Err(error) => {
-                let frames = snapshot_frames(context, &stack);
-                Err(RunError { error, frames })
+                owner.mark_done(&mut self.gc_heap);
+                if matches!(error, VmError::MissingReturn) {
+                    self.async_generator_drain_done(context, &owner)
+                        .map_err(RunError::bare)?;
+                    return Ok(());
+                }
+                let rejection = if let Some(thrown) = self.pending_uncaught_throw.take() {
+                    Some(thrown)
+                } else {
+                    self.vm_error_to_throwable_with_stack_roots(&stack, &error)
+                };
+                if let Some(reason) = rejection {
+                    self.async_generator_complete_step(context, &owner, Err(reason), true)
+                        .map_err(RunError::bare)?;
+                    self.async_generator_drain_done(context, &owner)
+                        .map_err(RunError::bare)?;
+                    Ok(())
+                } else {
+                    let frames = snapshot_frames(context, &stack);
+                    Err(RunError { error, frames })
+                }
             }
         }
     }

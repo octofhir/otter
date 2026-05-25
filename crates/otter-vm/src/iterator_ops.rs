@@ -26,8 +26,9 @@ use otter_bytecode::Operand;
 
 use crate::{
     ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IteratorHandle, IteratorState,
-    JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome, VmPropertyKey,
-    array, is_callable, operand_decode::register_operand, read_register, require_callable,
+    JsPromise, JsString, PendingGetIterator, PendingIteratorNext, Value, VmError, VmGetOutcome,
+    VmPropertyKey, array, generator::AsyncGeneratorState, is_callable,
+    operand_decode::register_operand, promise::PromiseCapability, read_register, require_callable,
     step_iterator, symbol, take_drop_count, value_kind_name, write_register,
 };
 
@@ -1078,6 +1079,74 @@ impl Interpreter {
         result
     }
 
+    /// Complete the front async-generator request.
+    pub(crate) fn async_generator_complete_step(
+        &mut self,
+        context: &ExecutionContext,
+        handle: &crate::generator::JsGenerator,
+        completion: Result<Value, Value>,
+        done: bool,
+    ) -> Result<(), VmError> {
+        let Some(req) = handle.pop_async_request(&mut self.gc_heap) else {
+            return Ok(());
+        };
+        self.async_generator_settle_capability(context, &req.capability, completion, done)
+    }
+
+    /// Settle an async-generator request capability without re-entering JS.
+    pub(crate) fn async_generator_settle_capability(
+        &mut self,
+        _context: &ExecutionContext,
+        capability: &PromiseCapability,
+        completion: Result<Value, Value>,
+        done: bool,
+    ) -> Result<(), VmError> {
+        let Some(promise) = capability.promise.as_promise() else {
+            return Err(VmError::InvalidOperand);
+        };
+        let jobs = match completion {
+            Ok(value) => {
+                let record =
+                    self.make_runtime_rooted_iter_result(value, done, &[&capability.promise], &[])?;
+                promise.fulfill(&mut self.gc_heap, record)
+            }
+            Err(reason) => promise.reject(&mut self.gc_heap, reason),
+        };
+        for job in jobs.jobs {
+            self.microtasks.enqueue(job);
+        }
+        Ok(())
+    }
+
+    /// Drain queued async-generator requests after the body is done.
+    pub(crate) fn async_generator_drain_done(
+        &mut self,
+        context: &ExecutionContext,
+        handle: &crate::generator::JsGenerator,
+    ) -> Result<(), VmError> {
+        handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Draining);
+        while let Some(resume) = handle.front_async_resume(&self.gc_heap) {
+            match resume {
+                GeneratorResumeKind::Throw(reason) => {
+                    self.async_generator_complete_step(context, handle, Err(reason), true)?;
+                }
+                GeneratorResumeKind::Next(_) => {
+                    self.async_generator_complete_step(
+                        context,
+                        handle,
+                        Ok(Value::undefined()),
+                        true,
+                    )?;
+                }
+                GeneratorResumeKind::Return(value) => {
+                    self.async_generator_complete_step(context, handle, Ok(value), true)?;
+                }
+            }
+        }
+        handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Completed);
+        Ok(())
+    }
+
     /// Resume a generator object — drives the saved frame on a fresh sub-stack
     /// until either an [`otter_bytecode::Op::Yield`] pauses it (returning
     /// `{value, done: false}`) or the body runs to completion (returning
@@ -1173,6 +1242,9 @@ impl Interpreter {
             self.pending_generator_throw = None;
         }
         let is_async = handle.is_async(&self.gc_heap);
+        if is_async {
+            handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Executing);
+        }
         let outcome = self.dispatch_loop(context, &mut sub_stack);
         match outcome {
             Ok(value) => {
@@ -1182,7 +1254,7 @@ impl Interpreter {
                 if let Some(v) = yielded {
                     // Sync generators surface the iter result
                     // through the return value; async generators
-                    // already settled `pending_request` from inside
+                    // already settled their front request from inside
                     // `Op::Yield`.
                     if is_async {
                         return Ok(Value::undefined());
@@ -1199,34 +1271,23 @@ impl Interpreter {
                 let parked = is_async && !handle.has_frame(&self.gc_heap) && {
                     // The await machinery stored the parked frame
                     // in its closure, not on the gen handle. Detect
-                    // that case by checking if pending_request is
-                    // still set — if so, it's awaiting.
-                    handle.has_pending_request(&self.gc_heap)
+                    // that case by checking if queued requests still
+                    // exist — if so, it is awaiting.
+                    handle.has_async_requests(&self.gc_heap)
                 };
                 let _ = frame_taken_by_await;
                 if parked {
                     // Body suspended on `Op::Await`; the resume
                     // microtask will eventually settle
-                    // `pending_request`.
+                    // the queued request.
+                    handle.set_async_state(&mut self.gc_heap, AsyncGeneratorState::Awaiting);
                     return Ok(Value::undefined());
                 }
                 // Body completed.
                 handle.mark_done(&mut self.gc_heap);
                 if is_async {
-                    if let Some(req) = handle.take_pending_request(&mut self.gc_heap) {
-                        let record = self.make_runtime_rooted_iter_result(
-                            value,
-                            true,
-                            &[&req.resolve],
-                            &[],
-                        )?;
-                        self.run_callable_sync(
-                            context,
-                            &req.resolve,
-                            Value::undefined(),
-                            smallvec::smallvec![record],
-                        )?;
-                    }
+                    self.async_generator_complete_step(context, handle, Ok(value), true)?;
+                    self.async_generator_drain_done(context, handle)?;
                     return Ok(Value::undefined());
                 }
                 self.make_runtime_rooted_iter_result(value, true, &[], &[])
@@ -1234,9 +1295,22 @@ impl Interpreter {
             Err(err) => {
                 handle.mark_done(&mut self.gc_heap);
                 if is_async {
-                    // Pending request stays alive — the caller
-                    // (do_call_method_value) settles it on the
-                    // pending_generator_throw side-channel.
+                    if matches!(err, VmError::MissingReturn) {
+                        self.async_generator_drain_done(context, handle)?;
+                        return Ok(Value::undefined());
+                    }
+                    let rejection = if let Some(thrown) = self.pending_generator_throw.take() {
+                        Some(thrown)
+                    } else if let Some(thrown) = self.pending_uncaught_throw.take() {
+                        Some(thrown)
+                    } else {
+                        self.vm_error_to_throwable_with_stack_roots(&sub_stack, &err)
+                    };
+                    if let Some(reason) = rejection {
+                        self.async_generator_complete_step(context, handle, Err(reason), true)?;
+                        self.async_generator_drain_done(context, handle)?;
+                        return Ok(Value::undefined());
+                    }
                 }
                 Err(err)
             }

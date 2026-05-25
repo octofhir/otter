@@ -195,6 +195,17 @@ pub fn same_value_non_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> 
     x == y
 }
 
+/// §7.2.15 IsStrictlyEqual ( x, y )
+///
+/// Returns a Boolean.
+#[must_use]
+pub fn is_strictly_equal(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> bool {
+    if let (Some(a), Some(b)) = (x.as_number(), y.as_number()) {
+        return number::strict_equals(a, b);
+    }
+    same_value_non_numeric(x, y, heap)
+}
+
 /// SameValue restricted to two `NumberValue` operands.
 ///
 /// `+0` and `-0` are distinct; `NaN` matches `NaN`.

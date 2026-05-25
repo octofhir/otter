@@ -702,11 +702,13 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
         let len = array::len(arr, heap);
         let from = clamp_index(from_raw, len);
         let found = array::with_elements(arr, heap, |elements| {
-            elements
-                .iter()
-                .enumerate()
-                .skip(from)
-                .find_map(|(i, v)| if v == &needle { Some(i) } else { None })
+            elements.iter().enumerate().skip(from).find_map(|(i, v)| {
+                if crate::abstract_ops::is_strictly_equal(v, &needle, heap) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
         });
         if let Some(i) = found {
             return Ok(Value::number(NumberValue::from_i32(i as i32)));
@@ -721,7 +723,7 @@ fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
         if i < from {
             continue;
         }
-        if v == needle {
+        if crate::abstract_ops::is_strictly_equal(&v, &needle, args.gc_heap) {
             return Ok(Value::number(NumberValue::from_i32(i as i32)));
         }
     }
@@ -790,7 +792,11 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
             // can never `===` the needle.
             let mut i = from.min(elements.len() - 1) as i64;
             while i >= 0 {
-                if elements[i as usize] == needle {
+                if crate::abstract_ops::is_strictly_equal(
+                    &elements[i as usize],
+                    &needle,
+                    &*args.gc_heap,
+                ) {
                     return Some(i as i32);
                 }
                 i -= 1;
@@ -824,7 +830,7 @@ fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicEr
         if i > from {
             continue;
         }
-        if v == needle {
+        if crate::abstract_ops::is_strictly_equal(&v, &needle, args.gc_heap) {
             return Ok(Value::number(NumberValue::from_i32(i as i32)));
         }
     }

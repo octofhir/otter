@@ -678,6 +678,8 @@ pub(crate) fn compile_statement(
 
         Statement::LabeledStatement(s) => compile_labeled_statement(cx, s),
 
+        Statement::DebuggerStatement(_) => Ok(None),
+
         other => Err(CompileError::Unsupported {
             node: stmt_kind_name(other).to_string(),
             span: stmt_span(other),

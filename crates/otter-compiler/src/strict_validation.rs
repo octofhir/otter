@@ -627,6 +627,32 @@ impl<'a> Visit<'a> for StrictValidator {
         if body_strict && !is_simple_parameter_list(&it.params) {
             self.flag_non_simple_use_strict(it.span);
         }
+        if it.r#async {
+            let mut await_scanner = ContainsAwaitScanner { found: None };
+            await_scanner.visit_formal_parameters(&it.params);
+            if let Some(span) = await_scanner.found {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "ASYNC_FUNCTION_PARAMS_CONTAIN_AWAIT".to_string(),
+                    message: "SyntaxError: async function parameters must not contain an AwaitExpression (§15.8.1)"
+                        .to_string(),
+                    range: Some((span.start, span.end)),
+                    help: Some("move `await` out of the parameter list".to_string()),
+                });
+            }
+        }
+        if it.generator {
+            let mut yield_scanner = ContainsYieldScanner { found: None };
+            yield_scanner.visit_formal_parameters(&it.params);
+            if let Some(span) = yield_scanner.found {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "GENERATOR_FUNCTION_PARAMS_CONTAIN_YIELD".to_string(),
+                    message: "SyntaxError: generator function parameters must not contain a YieldExpression (§15.5.1)"
+                        .to_string(),
+                    range: Some((span.start, span.end)),
+                    help: Some("move `yield` out of the parameter list".to_string()),
+                });
+            }
+        }
         if it.r#async
             && let Some(body) = it.body.as_ref()
         {

@@ -211,7 +211,7 @@ pub(crate) fn compile_arrow_function(
     let function_id = module.borrow().functions.len() as u32;
     module.borrow_mut().functions.push(Function {
         id: function_id,
-        name: "<arrow>".to_string(),
+        name: String::new(),
         span,
         is_strict: function_is_strict,
         ..Default::default()

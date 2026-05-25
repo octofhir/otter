@@ -27,9 +27,8 @@ use smallvec::SmallVec;
 
 use crate::{
     ExecutionContext, Frame, Interpreter, JsObject, JsString, Value, VmError, VmGetOutcome,
-    VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata,
-    make_array_iterator_factory_runtime_rooted, object, object_statics, proxy, regexp_prototype,
-    string, symbol, to_length,
+    VmPropertyKey, abstract_ops, array, descriptor_value, function_metadata, object,
+    object_statics, proxy, regexp_prototype, string, symbol, to_length,
 };
 
 #[derive(Clone, Copy)]
@@ -2655,11 +2654,6 @@ impl Interpreter {
                 VmPropertyKey::Symbol(sym) => {
                     if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, *sym) {
                         v
-                    } else if sym
-                        .well_known_tag()
-                        .is_some_and(|t| t == symbol::WellKnown::Iterator)
-                    {
-                        make_array_iterator_factory_runtime_rooted(self, arr)?
                     } else if let Some(p) = self
                         .constructor_prototype_value("Array")
                         .ok()

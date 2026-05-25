@@ -4760,6 +4760,7 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     Ok(())
 }
 
+#[cfg(test)]
 fn make_array_iterator_factory(
     array: JsArray,
     heap: &mut otter_gc::GcHeap,
@@ -4772,19 +4773,7 @@ fn make_array_iterator_factory(
     )
 }
 
-pub(crate) fn make_array_iterator_factory_runtime_rooted(
-    interp: &mut Interpreter,
-    array: JsArray,
-) -> Result<Value, otter_gc::OutOfMemory> {
-    interp.native_value_with_captures_runtime_rooted(
-        "Array[Symbol.iterator]",
-        smallvec::smallvec![Value::array(array)],
-        &[],
-        &[],
-        array_iterator_factory_call,
-    )
-}
-
+#[cfg(test)]
 fn array_iterator_factory_call(
     ctx: &mut NativeCtx<'_>,
     _: &[Value],

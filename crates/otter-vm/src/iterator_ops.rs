@@ -1299,6 +1299,7 @@ impl Interpreter {
                 self.invoke(stack, context, &callee, value, SmallVec::new(), dst)?;
                 return Ok(true);
             }
+            return Err(VmError::TypeMismatch);
         }
         let Some(obj) = value.as_object() else {
             return Ok(false);

@@ -419,6 +419,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
     crate::bootstrap_typed_array::install_typed_array_well_knowns_post_bootstrap(
         heap, global, well_known,
     )?;
+    crate::array_prototype::install_array_well_knowns_post_bootstrap(heap, global, well_known)?;
     install_iterator_well_knowns_post_bootstrap(heap, global, well_known)?;
     crate::bootstrap_array_buffer::install_array_buffer_well_knowns_post_bootstrap(
         heap, global, well_known,

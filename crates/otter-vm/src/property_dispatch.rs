@@ -28,7 +28,7 @@ use crate::{
     VmError, VmGetOutcome, VmPropertyKey, abstract_ops,
     array::JsArray,
     binary, collections_prototype, descriptor_value, function_metadata,
-    is_restricted_function_property, make_array_iterator_factory, object,
+    is_restricted_function_property, object,
     operand_decode::{const_operand, register_operand},
     property_atom::AtomizedPropertyKey,
     property_ic::{HasPropertyIc, LoadPropertyIc, PropertyIcKind, StorePropertyIc},
@@ -1187,12 +1187,18 @@ impl Interpreter {
                     .well_known_tag()
                     .is_some_and(|t| t == symbol::WellKnown::Iterator)
                 {
-                    // §22.1.5.1 — own Symbol.iterator override on the
-                    // array exotic body wins over the prototype slot.
                     if let Some(v) = crate::array::get_symbol_property(arr, &self.gc_heap, sym) {
                         v
                     } else {
-                        make_array_iterator_factory(arr, &mut self.gc_heap)?
+                        let key = VmPropertyKey::Symbol(sym);
+                        match self.ordinary_get_value(context, recv, recv, &key, 0)? {
+                            crate::VmGetOutcome::Value(v) => v,
+                            crate::VmGetOutcome::InvokeGetter { getter } => {
+                                let args: smallvec::SmallVec<[Value; 8]> =
+                                    smallvec::SmallVec::new();
+                                self.run_callable_sync(context, &getter, recv, args)?
+                            }
+                        }
                     }
                 } else {
                     // §22.1 Array exotic — symbol-keyed access reads
@@ -2911,6 +2917,47 @@ impl Interpreter {
                 }
             }
         }
+        if let ComputedPropertyKey::String(key) = &key
+            && (receiver.is_function()
+                || receiver.is_closure()
+                || receiver.is_native_function()
+                || receiver.is_class_constructor())
+        {
+            let own_present = if let Some(fid) = receiver.as_function().or_else(|| {
+                receiver
+                    .as_closure(&self.gc_heap)
+                    .map(|c| c.cached_function_id)
+            }) {
+                self.function_user_props
+                    .get(&fid)
+                    .copied()
+                    .is_some_and(|bag| {
+                        !matches!(
+                            object::lookup_own(bag, &self.gc_heap, key),
+                            object::PropertyLookup::Absent
+                        )
+                    })
+            } else if let Some(c) = receiver.as_class_constructor() {
+                !matches!(
+                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, key),
+                    object::PropertyLookup::Absent
+                )
+            } else if let Some(native) = receiver.as_native_function() {
+                native
+                    .own_property_descriptor(&mut self.gc_heap, key)?
+                    .is_some()
+            } else {
+                false
+            };
+            if !own_present && is_restricted_function_property(key) {
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                let callee = self.restricted_throw_type_error()?;
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
+                return Ok(true);
+            }
+        }
         if let (Some(native), ComputedPropertyKey::Symbol(sym)) =
             (receiver.as_native_function(), &key)
         {
@@ -3370,6 +3417,46 @@ impl Interpreter {
                         return Ok(true);
                     }
                 }
+            }
+        }
+        if receiver.is_function()
+            || receiver.is_closure()
+            || receiver.is_native_function()
+            || receiver.is_class_constructor()
+        {
+            let own_present = if let Some(fid) = receiver.as_function().or_else(|| {
+                receiver
+                    .as_closure(&self.gc_heap)
+                    .map(|c| c.cached_function_id)
+            }) {
+                self.function_user_props
+                    .get(&fid)
+                    .copied()
+                    .is_some_and(|bag| {
+                        !matches!(
+                            object::lookup_own(bag, &self.gc_heap, name),
+                            object::PropertyLookup::Absent
+                        )
+                    })
+            } else if let Some(c) = receiver.as_class_constructor() {
+                !matches!(
+                    object::lookup_own(c.statics(&self.gc_heap), &self.gc_heap, name),
+                    object::PropertyLookup::Absent
+                )
+            } else if let Some(native) = receiver.as_native_function() {
+                native
+                    .own_property_descriptor(&mut self.gc_heap, name)?
+                    .is_some()
+            } else {
+                false
+            };
+            if !own_present && is_restricted_function_property(name) {
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                let callee = self.restricted_throw_type_error()?;
+                let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+                args.push(value);
+                self.invoke(stack, context, &callee, receiver, args, scratch_reg)?;
+                return Ok(true);
             }
         }
         if receiver.is_boolean()

@@ -29,9 +29,11 @@ use smallvec::SmallVec;
 use crate::Value;
 use crate::array::{self, JsArray};
 use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::js_surface::{Attr, MethodSpec};
+use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
 use crate::number::NumberValue;
+use crate::object::{self, PartialPropertyDescriptor};
 use crate::string::JsString;
+use crate::symbol::{WellKnown, WellKnownSymbols};
 use crate::{NativeCall, NativeCtx, NativeError};
 
 fn receiver_array(args: &IntrinsicArgs<'_>) -> Result<JsArray, IntrinsicError> {
@@ -1729,6 +1731,66 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("reduceRight", 1, native_reduce_right),
     method("flatMap", 1, native_flat_map),
 ];
+
+pub(crate) fn install_array_well_knowns_post_bootstrap(
+    heap: &mut otter_gc::GcHeap,
+    global: object::JsObject,
+    well_known: &WellKnownSymbols,
+) -> Result<(), JsSurfaceError> {
+    let Some(array_ctor) = object::get(global, heap, "Array").and_then(|v| v.as_native_function())
+    else {
+        return Ok(());
+    };
+    let Some(descriptor) = array_ctor
+        .own_property_descriptor(&mut *heap, "prototype")
+        .ok()
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let object::DescriptorKind::Data { value } = descriptor.kind else {
+        return Ok(());
+    };
+    let Some(prototype) = value.as_object() else {
+        return Ok(());
+    };
+    let global_root = Value::object(global);
+    let prototype_root = Value::object(prototype);
+    let values_fn = crate::bootstrap::native_static_with_value_roots(
+        heap,
+        "values",
+        0,
+        native_values_iter,
+        &[&global_root, &prototype_root],
+    )
+    .map_err(|_| JsSurfaceError::OutOfMemory)?;
+    let values_value = Value::native_function(values_fn);
+    object::define_own_property_partial(
+        prototype,
+        heap,
+        "values",
+        PartialPropertyDescriptor {
+            value: Some(values_value),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    object::define_own_symbol_property_partial(
+        prototype,
+        heap,
+        well_known.get(WellKnown::Iterator),
+        PartialPropertyDescriptor {
+            value: Some(values_value),
+            writable: Some(true),
+            enumerable: Some(false),
+            configurable: Some(true),
+            ..Default::default()
+        },
+    );
+    Ok(())
+}
 
 const fn method(
     name: &'static str,

@@ -24,8 +24,8 @@ use otter_gc::raw::RawGc;
 use smallvec::SmallVec;
 
 use crate::{
-    ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeCtx,
-    NativeError, NativeFastFn, NativeFunction, Value, VmError,
+    ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeFastFn,
+    NativeFunction, Value, VmError,
     operand_decode::{const_operand, register_operand},
     read_register, regexp,
     runtime_state::RuntimeState,
@@ -239,45 +239,6 @@ impl Interpreter {
                 &mut external_visit,
             )?,
         ))
-    }
-
-    pub(crate) fn native_value_with_captures_runtime_rooted<F>(
-        &mut self,
-        name: &'static str,
-        captures: smallvec::SmallVec<[Value; 4]>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
-        call: F,
-    ) -> Result<Value, otter_gc::OutOfMemory>
-    where
-        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
-            + 'static,
-    {
-        let roots = self.collect_runtime_roots();
-        let capture_roots = captures.clone();
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-            for value in &capture_roots {
-                value.trace_value_slots(visitor);
-            }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
-            }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
-                }
-            }
-        };
-        crate::native_function::native_value_with_captures_unchecked_with_roots(
-            &mut self.gc_heap,
-            name,
-            captures,
-            &mut external_visit,
-            call,
-        )
     }
 
     /// Allocate a host-created native function while exposing runtime

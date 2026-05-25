@@ -81,18 +81,18 @@ impl Interpreter {
         current: Value,
         effective_this: Value,
         heap: &otter_gc::GcHeap,
-    ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>, Value), VmError> {
+    ) -> Result<(u32, std::rc::Rc<[UpvalueCell]>, Value, Option<Value>), VmError> {
         if let Some(function_id) = current.as_function() {
-            return Ok((function_id, Frame::empty_upvalues(), effective_this));
+            return Ok((function_id, Frame::empty_upvalues(), effective_this, None));
         }
         if let Some(c) = current.as_closure(heap) {
             let function_id = c.function_id();
-            let (upvalues, bound_this) = heap.read_payload(c.handle, |body| {
+            let (upvalues, bound_this, bound_new_target) = heap.read_payload(c.handle, |body| {
                 let ups: std::rc::Rc<[UpvalueCell]> = std::rc::Rc::from(&body.upvalues[..]);
-                (ups, body.bound_this)
+                (ups, body.bound_this, body.bound_new_target)
             });
             let this_value = bound_this.unwrap_or(effective_this);
-            return Ok((function_id, upvalues, this_value));
+            return Ok((function_id, upvalues, this_value, bound_new_target));
         }
         Err(VmError::NotCallable)
     }
@@ -208,6 +208,7 @@ impl Interpreter {
         function_id: u32,
         parent_upvalues: std::rc::Rc<[UpvalueCell]>,
         this_for_callee: Value,
+        new_target_for_callee: Option<Value>,
         effective_args: SmallVec<[Value; 8]>,
         dst: u16,
     ) -> Result<(), VmError> {
@@ -266,6 +267,10 @@ impl Interpreter {
             this_for_callee,
         );
         new_frame.async_state = async_state;
+        if let Some(new_target) = new_target_for_callee {
+            let cold = self.frame_ensure_cold(&mut new_frame);
+            cold.new_target = Some(new_target);
+        }
         self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5 Generator-call entry: instead of pushing the frame
         // onto the dispatch stack, hand the caller a paused
@@ -308,6 +313,7 @@ impl Interpreter {
         function_id: u32,
         parent_upvalues: std::rc::Rc<[UpvalueCell]>,
         this_for_callee: Value,
+        new_target_for_callee: Option<Value>,
         args: &BytecodeArgumentWindow<'_>,
         return_register: Option<u16>,
         async_state: Option<AsyncFrameState>,
@@ -341,6 +347,10 @@ impl Interpreter {
             let cold = self.frame_ensure_cold(&mut frame);
             cold.rest_args = extras.rest_args;
             cold.incoming_args = extras.incoming_args;
+        }
+        if let Some(new_target) = new_target_for_callee {
+            let cold = self.frame_ensure_cold(&mut frame);
+            cold.new_target = Some(new_target);
         }
         Ok(PreparedBytecodeFrame {
             frame,
@@ -423,7 +433,7 @@ impl Interpreter {
         if !current.is_function() && !current.is_closure() {
             return Ok(false);
         }
-        let (function_id, parent_upvalues, this_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
             Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
@@ -453,6 +463,7 @@ impl Interpreter {
                 function_id,
                 parent_upvalues,
                 this_for_callee,
+                new_target_for_callee,
                 &args,
                 return_register,
                 async_state,
@@ -620,7 +631,7 @@ impl Interpreter {
             break;
         }
         if current.is_function() || current.is_closure() {
-            let (function_id, parent_upvalues, this_for_callee) =
+            let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
                 Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
             return self.push_bytecode_call_frame(
                 stack,
@@ -628,6 +639,7 @@ impl Interpreter {
                 function_id,
                 parent_upvalues,
                 this_for_callee,
+                new_target_for_callee,
                 effective_args,
                 dst,
             );
@@ -701,7 +713,7 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, result)?;
             return Ok(());
         }
-        let (function_id, parent_upvalues, this_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
             Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         self.push_bytecode_call_frame(
             stack,
@@ -709,6 +721,7 @@ impl Interpreter {
             function_id,
             parent_upvalues,
             this_for_callee,
+            new_target_for_callee,
             effective_args,
             dst,
         )
@@ -1383,7 +1396,7 @@ impl Interpreter {
                 .invoke(&mut ctx, effective_args.as_slice())
                 .map_err(native_to_vm_error);
         }
-        let (function_id, parent_upvalues, this_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, new_target_for_callee) =
             Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap)?;
         let function = context
             .exec_function(function_id)
@@ -1409,6 +1422,10 @@ impl Interpreter {
         let mut inner: SmallVec<[Frame; 8]> = SmallVec::new();
         let mut new_frame =
             Frame::with_exec_return_upvalues_and_this(function, None, upvalues, this_for_callee);
+        if let Some(new_target) = new_target_for_callee {
+            let cold = self.frame_ensure_cold(&mut new_frame);
+            cold.new_target = Some(new_target);
+        }
         self.bind_bytecode_call_arguments(function, &mut new_frame, effective_args)?;
         // §27.5.1 GeneratorFunction call evaluation returns a
         // generator object without executing the body. `invoke`

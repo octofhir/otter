@@ -2493,7 +2493,7 @@ impl Interpreter {
                 }
             };
         }
-        let (function_id, parent_upvalues, this_for_callee) =
+        let (function_id, parent_upvalues, this_for_callee, _new_target_for_callee) =
             match Self::bytecode_call_target_parts(current, effective_this, &self.gc_heap) {
                 Ok(parts) => parts,
                 Err(error) => {
@@ -7524,7 +7524,8 @@ mod tests {
         assert!(is_callable(&Value::function(7)));
         let mut closure_heap = otter_gc::GcHeap::new().expect("closure heap");
         let closure_handle =
-            crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None).expect("closure");
+            crate::closure::alloc_closure(&mut closure_heap, 7, Vec::new(), None, None)
+                .expect("closure");
         assert!(is_callable(&Value::closure(closure_handle)));
         let mut heap = otter_gc::GcHeap::new().expect("gc heap");
         let bound = BoundFunction::new(
@@ -7990,6 +7991,7 @@ mod tests {
             1,
             Vec::new(),
             Some(Value::string(bound)),
+            None,
         )
         .expect("closure alloc");
         let closure = Value::closure(closure_handle);

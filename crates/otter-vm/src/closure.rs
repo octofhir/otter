@@ -6,12 +6,13 @@
 //! - the captured upvalue spine (one [`crate::UpvalueCell`] per
 //!   binding, in declaration order),
 //! - an optional bound `this` (arrow closures capture their receiver
-//!   lexically; non-arrow closures take `this` from the call site).
+//!   lexically; non-arrow closures take `this` from the call site),
+//! - an optional bound `new.target` for arrow closures.
 //!
 //! # Contents
 //!
 //! - [`JsClosureBody`] — GC body holding `function_id`, the upvalue
-//!   slice, and `bound_this`.
+//!   slice, `bound_this`, and `bound_new_target`.
 //! - [`JsClosure`] — 4-byte `Gc<JsClosureBody>` handle.
 //! - [`alloc_closure`] / [`alloc_closure_with_roots`] — allocators.
 //! - [`JS_CLOSURE_BODY_TYPE_TAG`] — reserved
@@ -25,8 +26,8 @@
 //!   [`crate::store_upvalue`] / [`crate::read_upvalue`].
 //! - `bound_this == None` → take `this` from the call site (non-arrow).
 //!   `Some(value)` → override any caller-supplied receiver (arrow).
-//! - Trace walks every upvalue handle plus the `bound_this` value
-//!   slots.
+//! - Trace walks every upvalue handle plus lexical `this` /
+//!   `new.target` value slots.
 //!
 //! # Spec
 //!
@@ -59,6 +60,9 @@ pub struct JsClosureBody {
     /// Arrow closures: `Some(this)` overrides the caller's receiver.
     /// Non-arrow closures: `None` (take `this` from the call site).
     pub bound_this: Option<Value>,
+    /// Arrow closures: lexical `new.target` captured from the
+    /// enclosing frame. Non-arrow closures: `None`.
+    pub bound_new_target: Option<Value>,
 }
 
 /// 4-byte compressed `Gc<JsClosureBody>` handle to the underlying
@@ -122,6 +126,12 @@ impl JsClosure {
         heap.read_payload(self.handle, |body| body.bound_this)
     }
 
+    /// Lexical `new.target` captured for arrow closures.
+    #[must_use]
+    pub fn bound_new_target(self, heap: &GcHeap) -> Option<Value> {
+        heap.read_payload(self.handle, |body| body.bound_new_target)
+    }
+
     /// Number of captured upvalue cells. Reads the body once.
     #[must_use]
     pub fn upvalue_count(self, heap: &GcHeap) -> usize {
@@ -178,11 +188,13 @@ pub fn alloc_closure(
     function_id: u32,
     upvalues: Vec<UpvalueCell>,
     bound_this: Option<Value>,
+    bound_new_target: Option<Value>,
 ) -> Result<JsClosure, OutOfMemory> {
     let handle = heap.alloc_old(JsClosureBody {
         function_id,
         upvalues,
         bound_this,
+        bound_new_target,
     })?;
     Ok(JsClosure::from_parts(handle, function_id))
 }
@@ -202,6 +214,7 @@ pub fn alloc_closure_with_roots(
     function_id: u32,
     upvalues: Vec<UpvalueCell>,
     bound_this: Option<Value>,
+    bound_new_target: Option<Value>,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsClosure, OutOfMemory> {
     let handle = heap.alloc_with_roots(
@@ -209,6 +222,7 @@ pub fn alloc_closure_with_roots(
             function_id,
             upvalues,
             bound_this,
+            bound_new_target,
         },
         external_visit,
     )?;
@@ -223,7 +237,7 @@ mod tests {
     #[test]
     fn allocates_empty_closure() {
         let mut heap = GcHeap::new().expect("heap");
-        let closure = alloc_closure(&mut heap, 7, Vec::new(), None).expect("alloc");
+        let closure = alloc_closure(&mut heap, 7, Vec::new(), None, None).expect("alloc");
         assert_eq!(closure.function_id(), 7);
         heap.read_payload(closure.handle(), |body| {
             assert_eq!(body.function_id, 7);
@@ -238,7 +252,8 @@ mod tests {
         let cell_a = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
         let cell_b = alloc_upvalue(&mut heap, Value::undefined()).expect("cell");
         let upvalues = vec![cell_a, cell_b];
-        let closure = alloc_closure(&mut heap, 42, upvalues, Some(Value::null())).expect("alloc");
+        let closure =
+            alloc_closure(&mut heap, 42, upvalues, Some(Value::null()), None).expect("alloc");
         assert_eq!(closure.function_id(), 42);
         assert_eq!(closure.upvalue_count(&heap), 2);
         heap.read_payload(closure.handle(), |body| {

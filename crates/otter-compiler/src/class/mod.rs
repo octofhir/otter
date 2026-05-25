@@ -317,7 +317,9 @@ pub(crate) fn compile_class(
                             span: method_span,
                         })?,
                 ),
-                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => Some(lit.value.to_string()),
+                oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
+                    Some(number_literal_property_name(lit.value))
+                }
                 _ => None,
             }
         } else {
@@ -533,7 +535,9 @@ pub(crate) fn compile_class(
                             id.name.as_str().to_string()
                         }
                         oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
-                        oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
+                        oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
+                            number_literal_property_name(lit.value)
+                        }
                         oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => cx
                             .mangle_private(pid.name.as_str())
                             .ok_or(CompileError::Unsupported {
@@ -596,6 +600,17 @@ pub(crate) fn compile_class(
     cx.private_namespaces.pop();
     cx.exit_scope();
     Ok(class_reg)
+}
+
+fn number_literal_property_name(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let abs = value.abs();
+    if !(1e-6..1e21).contains(&abs) {
+        return format!("{value:e}").replace("e+", "e").replace("e-0", "e-");
+    }
+    value.to_string()
 }
 
 /// Returns the computed-key `Expression` view of a `PropertyKey`,

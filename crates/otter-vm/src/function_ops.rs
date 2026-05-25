@@ -89,9 +89,19 @@ impl Interpreter {
         } else {
             None
         };
-        let closure =
-            crate::closure::alloc_closure(&mut self.gc_heap, function_id, upvalues, bound_this)
-                .map_err(crate::oom_to_vm)?;
+        let bound_new_target = if context.function_is_arrow(function_id) {
+            self.frame_cold(frame).and_then(|cold| cold.new_target)
+        } else {
+            None
+        };
+        let closure = crate::closure::alloc_closure(
+            &mut self.gc_heap,
+            function_id,
+            upvalues,
+            bound_this,
+            bound_new_target,
+        )
+        .map_err(crate::oom_to_vm)?;
         write_register(frame, dst, Value::closure(closure))?;
         frame.advance_pc(self.current_byte_len)?;
         Ok(())

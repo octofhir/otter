@@ -355,6 +355,28 @@ pub(crate) fn compile_assignment(
     if let Some(probe) = &with_ref {
         let fallback = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
         let name_idx = cx.intern_string_constant(&name);
+        if cx.is_strict {
+            let key_reg = cx.alloc_scratch();
+            cx.emit(
+                Op::LoadString,
+                [Operand::Register(key_reg), Operand::ConstIndex(name_idx)],
+                span,
+            );
+            let still_exists = cx.alloc_scratch();
+            cx.emit(
+                Op::HasProperty,
+                [
+                    Operand::Register(still_exists),
+                    Operand::Register(key_reg),
+                    Operand::Register(probe.object_reg),
+                ],
+                span,
+            );
+            let still_exists_ok =
+                cx.emit_branch_placeholder(Op::JumpIfTrue, Some(still_exists), span);
+            emit_reference_error(cx, &name, span);
+            cx.patch_branch_to_here(still_exists_ok);
+        }
         let scratch = cx.alloc_scratch();
         cx.emit(
             Op::StoreProperty,

@@ -1174,6 +1174,7 @@ impl Interpreter {
             });
         }
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
+        write_register(frame, idx_reg, idx_value)?;
         let value = if let Some(obj) = recv.as_object() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
                 crate::object::get_symbol(obj, &self.gc_heap, sym).unwrap_or(Value::undefined())
@@ -2397,6 +2398,7 @@ impl Interpreter {
             });
         }
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
+        write_register(&mut stack[top_idx], key_reg, key_value)?;
         let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
         } else if let Some(n) = key_value.as_number() {

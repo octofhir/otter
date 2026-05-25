@@ -5,12 +5,11 @@
 
 #![allow(missing_docs)]
 
-
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    arg_or_undef, arg_to_calendar, clamp_to_u16, clamp_to_u8, js_string_value, make_temporal,
+    arg_or_undef, arg_to_calendar, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
     opt_integer_with_truncation, parse_date_time_fields, parse_difference_settings,
     parse_partial_time, parse_rounding_options, require_construct, require_plain_date_time,
     temporal_err, to_integer_with_truncation,
@@ -225,9 +224,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
     let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
-    let result = pdt
-        .round(options)
-        .map_err(|e| temporal_err(e, CLASS))?;
+    let result = pdt.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDateTime(result))
 }
 

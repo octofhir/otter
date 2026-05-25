@@ -45,7 +45,6 @@ use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
 
-
 /// Install `@@toStringTag` on each per-kind prototype after the
 /// well-known symbol table exists. Also installs `@@iterator =
 /// values` on the abstract `%TypedArray%.prototype`.
@@ -724,7 +723,6 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
     ))
 }
 
-
 // ---------------------------------------------------------------
 // Per-kind constructor wrappers
 // ---------------------------------------------------------------
@@ -1065,7 +1063,6 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
     }
 }
 
-
 // ---------------------------------------------------------------
 // Abstract %TypedArray% + per-kind couch!-driven installers.
 // ---------------------------------------------------------------
@@ -1200,14 +1197,91 @@ macro_rules! typed_array_kind {
     };
 }
 
-typed_array_kind!("Int8Array",         Int8ArrayIntrinsic,         1.0, ctor_int8,          from_int8,          of_int8);
-typed_array_kind!("Uint8Array",        Uint8ArrayIntrinsic,        1.0, ctor_uint8,         from_uint8,         of_uint8);
-typed_array_kind!("Uint8ClampedArray", Uint8ClampedArrayIntrinsic, 1.0, ctor_uint8_clamped, from_uint8_clamped, of_uint8_clamped);
-typed_array_kind!("Int16Array",        Int16ArrayIntrinsic,        2.0, ctor_int16,         from_int16,         of_int16);
-typed_array_kind!("Uint16Array",       Uint16ArrayIntrinsic,       2.0, ctor_uint16,        from_uint16,        of_uint16);
-typed_array_kind!("Int32Array",        Int32ArrayIntrinsic,        4.0, ctor_int32,         from_int32,         of_int32);
-typed_array_kind!("Uint32Array",       Uint32ArrayIntrinsic,       4.0, ctor_uint32,        from_uint32,        of_uint32);
-typed_array_kind!("Float32Array",      Float32ArrayIntrinsic,      4.0, ctor_float32,       from_float32,       of_float32);
-typed_array_kind!("Float64Array",      Float64ArrayIntrinsic,      8.0, ctor_float64,       from_float64,       of_float64);
-typed_array_kind!("BigInt64Array",     BigInt64ArrayIntrinsic,     8.0, ctor_bigint64,      from_bigint64,      of_bigint64);
-typed_array_kind!("BigUint64Array",    BigUint64ArrayIntrinsic,    8.0, ctor_biguint64,     from_biguint64,     of_biguint64);
+typed_array_kind!(
+    "Int8Array",
+    Int8ArrayIntrinsic,
+    1.0,
+    ctor_int8,
+    from_int8,
+    of_int8
+);
+typed_array_kind!(
+    "Uint8Array",
+    Uint8ArrayIntrinsic,
+    1.0,
+    ctor_uint8,
+    from_uint8,
+    of_uint8
+);
+typed_array_kind!(
+    "Uint8ClampedArray",
+    Uint8ClampedArrayIntrinsic,
+    1.0,
+    ctor_uint8_clamped,
+    from_uint8_clamped,
+    of_uint8_clamped
+);
+typed_array_kind!(
+    "Int16Array",
+    Int16ArrayIntrinsic,
+    2.0,
+    ctor_int16,
+    from_int16,
+    of_int16
+);
+typed_array_kind!(
+    "Uint16Array",
+    Uint16ArrayIntrinsic,
+    2.0,
+    ctor_uint16,
+    from_uint16,
+    of_uint16
+);
+typed_array_kind!(
+    "Int32Array",
+    Int32ArrayIntrinsic,
+    4.0,
+    ctor_int32,
+    from_int32,
+    of_int32
+);
+typed_array_kind!(
+    "Uint32Array",
+    Uint32ArrayIntrinsic,
+    4.0,
+    ctor_uint32,
+    from_uint32,
+    of_uint32
+);
+typed_array_kind!(
+    "Float32Array",
+    Float32ArrayIntrinsic,
+    4.0,
+    ctor_float32,
+    from_float32,
+    of_float32
+);
+typed_array_kind!(
+    "Float64Array",
+    Float64ArrayIntrinsic,
+    8.0,
+    ctor_float64,
+    from_float64,
+    of_float64
+);
+typed_array_kind!(
+    "BigInt64Array",
+    BigInt64ArrayIntrinsic,
+    8.0,
+    ctor_bigint64,
+    from_bigint64,
+    of_bigint64
+);
+typed_array_kind!(
+    "BigUint64Array",
+    BigUint64ArrayIntrinsic,
+    8.0,
+    ctor_biguint64,
+    from_biguint64,
+    of_biguint64
+);

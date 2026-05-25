@@ -910,9 +910,7 @@ pub use otter_vm::inspect;
 /// is `Send + Sync` because the spawned isolate is on a dedicated
 /// thread; the tracer itself never needs to cross threads.
 #[derive(Clone)]
-pub struct TracerFactory(
-    Arc<dyn Fn() -> Box<dyn otter_vm::inspect::StepTracer> + Send + Sync>,
-);
+pub struct TracerFactory(Arc<dyn Fn() -> Box<dyn otter_vm::inspect::StepTracer> + Send + Sync>);
 
 impl TracerFactory {
     /// Wrap a closure that produces a fresh tracer on demand.
@@ -1371,11 +1369,9 @@ impl Runtime {
                 }
                 GlobalClassInner::Intrinsic { install, .. } => {
                     let global = *interp.global_this();
-                    install(interp.gc_heap_mut(), global).map_err(|err| {
-                        OtterError::Internal {
-                            code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
-                            message: err.to_string(),
-                        }
+                    install(interp.gc_heap_mut(), global).map_err(|err| OtterError::Internal {
+                        code: DiagnosticCode::GlobalClassBootstrap.as_str().to_string(),
+                        message: err.to_string(),
                     })?;
                 }
             }

@@ -41,12 +41,12 @@ fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
         apply_array_new_target_prototype(ctx, arr)?;
         return Ok(Value::array(arr));
     }
-    let arr =
-        ctx.array_from_elements(std::iter::empty())
-            .map_err(|_| NativeError::TypeError {
-                name: "Array",
-                reason: "out of memory while allocating array".to_string(),
-            })?;
+    let arr = ctx
+        .array_from_elements(std::iter::empty())
+        .map_err(|_| NativeError::TypeError {
+            name: "Array",
+            reason: "out of memory while allocating array".to_string(),
+        })?;
     if let Some(n) = args[0].as_number() {
         let raw = n.as_f64();
         let len = raw as u32;

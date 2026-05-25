@@ -198,10 +198,7 @@ fn number_is_safe_integer_native(
     Ok(Value::boolean(crate::number::parse::is_safe_integer(&v)))
 }
 
-fn number_parse_int_native(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
+fn number_parse_int_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let s = if let Some(arg) = args.first() {
         if let Some(s) = arg.as_string(ctx.heap()) {
             s.to_lossy_string(ctx.heap())

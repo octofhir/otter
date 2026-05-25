@@ -322,6 +322,28 @@ impl Interpreter {
             crate::object::delete(o, &mut self.gc_heap, name)
         } else if let Some(arr) = receiver.as_array() {
             crate::array::delete_named_property(arr, &mut self.gc_heap, name)
+        } else if let Some(class) = receiver.as_class_constructor() {
+            let statics = class.statics(&self.gc_heap);
+            if crate::object::get_own_descriptor(statics, &self.gc_heap, name).is_some() {
+                crate::object::delete(statics, &mut self.gc_heap, name)
+            } else if name == "prototype" {
+                false
+            } else if let Some(function_id) =
+                class.ctor(&self.gc_heap).as_function().or_else(|| {
+                    class
+                        .ctor(&self.gc_heap)
+                        .as_closure(&self.gc_heap)
+                        .map(|c| c.cached_function_id)
+                })
+            {
+                self.ordinary_function_delete_own_property(function_id, name)
+            } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
+                native.delete_own_property(&mut self.gc_heap, name)
+            } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
+                function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, name)
+            } else {
+                true
+            }
         } else if let Some(function_id) = receiver.as_function().or_else(|| {
             receiver
                 .as_closure(&self.gc_heap)
@@ -416,6 +438,35 @@ impl Interpreter {
                 crate::array::delete_named_property(arr, &mut self.gc_heap, &name)
             } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 crate::array::delete_symbol_property(arr, &mut self.gc_heap, sym)
+            } else {
+                return Err(VmError::TypeMismatch);
+            }
+        } else if let Some(class) = receiver.as_class_constructor() {
+            let statics = class.statics(&self.gc_heap);
+            if let Some(sym) = idx.as_symbol(&self.gc_heap) {
+                crate::object::delete_symbol(statics, &mut self.gc_heap, sym)
+            } else if let Some(s) = idx.as_string(&self.gc_heap) {
+                let name = s.to_lossy_string(&self.gc_heap);
+                if crate::object::get_own_descriptor(statics, &self.gc_heap, &name).is_some() {
+                    crate::object::delete(statics, &mut self.gc_heap, &name)
+                } else if name == "prototype" {
+                    false
+                } else if let Some(function_id) =
+                    class.ctor(&self.gc_heap).as_function().or_else(|| {
+                        class
+                            .ctor(&self.gc_heap)
+                            .as_closure(&self.gc_heap)
+                            .map(|c| c.cached_function_id)
+                    })
+                {
+                    self.ordinary_function_delete_own_property(function_id, &name)
+                } else if let Some(native) = class.ctor(&self.gc_heap).as_native_function() {
+                    native.delete_own_property(&mut self.gc_heap, &name)
+                } else if let Some(bound) = class.ctor(&self.gc_heap).as_bound_function() {
+                    function_metadata::bound_delete_own_property(&bound, &mut self.gc_heap, &name)
+                } else {
+                    true
+                }
             } else {
                 return Err(VmError::TypeMismatch);
             }

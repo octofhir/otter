@@ -112,6 +112,9 @@ fn install_function_prototype_callable_and_accessors(
 }
 
 /// `Function.prototype()` — returns `undefined` per §20.2.3.
-fn function_prototype_call(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn function_prototype_call(
+    _ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
     Ok(Value::undefined())
 }

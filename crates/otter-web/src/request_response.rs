@@ -2,8 +2,9 @@
 
 use otter_runtime::{
     RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
-    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
+    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
+    RuntimeValue as Value, runtime_optional_arg_to_string, runtime_this_object,
+    runtime_with_host_data,
 };
 
 use crate::blob::Blob;

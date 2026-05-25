@@ -197,10 +197,7 @@ impl StepTracer for CapturingTracer {
         // method dispatch.
         if event.function_name == "<main>" {
             let snap = FrameSnapshot::from_step_event(event, false);
-            self.events
-                .lock()
-                .expect("capture mutex")
-                .push(snap);
+            self.events.lock().expect("capture mutex").push(snap);
         }
     }
 }
@@ -266,7 +263,10 @@ fn chrome_heap_snapshot_emits_documented_schema() {
         .get("nodes")
         .and_then(|v| v.as_array())
         .expect("`nodes` array");
-    assert!(!nodes.is_empty(), "snapshot should describe at least the synthetic root");
+    assert!(
+        !nodes.is_empty(),
+        "snapshot should describe at least the synthetic root"
+    );
     let edges = json
         .get("edges")
         .and_then(|v| v.as_array())

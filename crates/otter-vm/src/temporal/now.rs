@@ -5,7 +5,6 @@
 
 #![allow(missing_docs)]
 
-
 use crate::temporal::helpers::{make_temporal, temporal_err};
 use crate::temporal::payload::TemporalPayload;
 use crate::{NativeCtx, NativeError, Value};

@@ -7,7 +7,6 @@
 
 #![allow(missing_docs)]
 
-
 use crate::object::{self, JsObject};
 use crate::string::JsString;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
@@ -204,12 +203,12 @@ where
     F: FnOnce(TemporalPayload) -> Option<T>,
 {
     let recv = *ctx.this_value();
-    let t = recv.as_temporal(ctx.heap()).ok_or_else(|| {
-        NativeError::TypeError {
+    let t = recv
+        .as_temporal(ctx.heap())
+        .ok_or_else(|| NativeError::TypeError {
             name: expected,
             reason: format!("receiver must be a {expected}"),
-        }
-    })?;
+        })?;
     extract(t.payload_clone(ctx.heap())).ok_or_else(|| NativeError::TypeError {
         name: expected,
         reason: format!("receiver must be a {expected}"),
@@ -343,21 +342,19 @@ pub fn parse_difference_settings(
         && !name.is_empty()
         && !name.eq_ignore_ascii_case("auto")
     {
-        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            NativeError::RangeError {
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
                 reason: "invalid `largestUnit`".to_string(),
-            }
-        })?;
+            })?;
         settings.largest_unit = Some(unit);
     }
     if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
-        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            NativeError::RangeError {
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
                 reason: "invalid `smallestUnit`".to_string(),
-            }
-        })?;
+            })?;
         settings.smallest_unit = Some(unit);
     }
     if let Some(name) = read_string_field(obj, "roundingMode", heap) {
@@ -399,12 +396,11 @@ pub fn parse_rounding_options(
     let v = arg_or_undef(args, index);
     if let Some(s) = v.as_string(heap) {
         let name = s.to_lossy_string(heap);
-        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            NativeError::RangeError {
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
                 reason: "invalid smallest-unit shorthand".to_string(),
-            }
-        })?;
+            })?;
         options.smallest_unit = Some(unit);
         return Ok(options);
     }
@@ -418,21 +414,19 @@ pub fn parse_rounding_options(
         });
     };
     if let Some(name) = read_string_field(obj, "largestUnit", heap) {
-        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            NativeError::RangeError {
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
                 reason: "invalid `largestUnit`".to_string(),
-            }
-        })?;
+            })?;
         options.largest_unit = Some(unit);
     }
     if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
-        let unit = temporal_rs::options::Unit::from_str(&name).map_err(|_| {
-            NativeError::RangeError {
+        let unit =
+            temporal_rs::options::Unit::from_str(&name).map_err(|_| NativeError::RangeError {
                 name: class,
                 reason: "invalid `smallestUnit`".to_string(),
-            }
-        })?;
+            })?;
         options.smallest_unit = Some(unit);
     }
     if let Some(name) = read_string_field(obj, "roundingMode", heap) {

@@ -38,13 +38,13 @@ Current fast-path CLI surface:
 ## Key Architecture
 
 Current runtime stack:
-- `crates-next/otter-gc`
-- `crates-next/otter-vm`
-- `crates-next/otter-runtime`
-- product crates under `crates-next/*`
+- `crates/otter-gc`
+- `crates/otter-vm`
+- `crates/otter-runtime`
+- product crates under `crates/*`
 
 Compatibility rules:
-- New runtime/VM/API work belongs on the active `crates-next/*` stack.
+- New runtime/VM/API work belongs on the active `crates/*` stack.
 - Do not add new dependencies from active crates into parked compatibility shims.
 - Keep `otter-nodejs` and `otter-node-compat` compileable, but treat them as parked surfaces rather than active implementation homes.
 
@@ -64,9 +64,9 @@ otter-gc
 
 ### Critical Implementation Details
 
-1. **Value Representation**: The active value model lives in `crates-next/otter-vm/src/lib.rs`.
+1. **Value Representation**: The active value model lives in `crates/otter-vm/src/lib.rs`.
 
-2. **Object Model**: The active object model lives in `crates-next/otter-vm/src/object.rs`.
+2. **Object Model**: The active object model lives in `crates/otter-vm/src/object.rs`.
 
 3. **GC Safety**: Use active `otter-gc` handles and explicit heap/runtime context. Values must be properly rooted across GC boundaries.
 

@@ -5,7 +5,6 @@
 
 #![allow(missing_docs)]
 
-
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
@@ -137,7 +136,9 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let dur = duration_arg(&arg_or_undef(args, 0), ctx.heap())?;
-    let result = pd.subtract(&dur, None).map_err(|e| temporal_err(e, CLASS))?;
+    let result = pd
+        .subtract(&dur, None)
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 

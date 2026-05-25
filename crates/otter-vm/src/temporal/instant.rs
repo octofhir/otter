@@ -5,7 +5,6 @@
 
 #![allow(missing_docs)]
 
-
 use num_traits::ToPrimitive;
 
 use crate::js_surface::{Attr, MethodSpec};
@@ -72,8 +71,8 @@ fn from_epoch_milliseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             reason: "fromEpochMilliseconds: argument must be a number".to_string(),
         });
     };
-    let inst = temporal_rs::Instant::from_epoch_milliseconds(ms)
-        .map_err(|e| temporal_err(e, CLASS))?;
+    let inst =
+        temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
@@ -214,9 +213,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
-    let result = inst
-        .round(options)
-        .map_err(|e| temporal_err(e, CLASS))?;
+    let result = inst.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(result))
 }
 

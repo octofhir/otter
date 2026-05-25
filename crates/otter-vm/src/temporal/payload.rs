@@ -19,7 +19,6 @@
 //! # See also
 //! - <https://tc39.es/proposal-temporal/>
 
-
 /// One Temporal value, parameterised over the [`temporal_rs`] type.
 ///
 /// Foundation slice ships every variant the task acceptance criteria

@@ -403,8 +403,8 @@ impl Interpreter {
         &mut self,
         kind: crate::temporal::TemporalKind,
     ) -> Option<JsObject> {
-        let temporal_ns = object::get(self.global_this, &self.gc_heap, "Temporal")
-            .and_then(|v| v.as_object())?;
+        let temporal_ns =
+            object::get(self.global_this, &self.gc_heap, "Temporal").and_then(|v| v.as_object())?;
         let class_value = object::get(temporal_ns, &self.gc_heap, kind.class_name())?;
         if let Some(ctor_obj) = class_value.as_object() {
             return object::get(ctor_obj, &self.gc_heap, "prototype").and_then(|v| v.as_object());
@@ -729,6 +729,52 @@ impl Interpreter {
                     .expect("non-symbol key has string spelling");
                 native.own_property_descriptor(&mut self.gc_heap, key)?
             });
+        }
+        if let Some(class) = target.as_class_constructor() {
+            if let VmPropertyKey::Symbol(sym) = key {
+                return Ok(object::get_own_symbol_descriptor(
+                    class.statics(&self.gc_heap),
+                    &self.gc_heap,
+                    *sym,
+                ));
+            }
+            let key = key
+                .string_name()
+                .expect("non-symbol key has string spelling");
+            if let Some(desc) =
+                object::get_own_descriptor(class.statics(&self.gc_heap), &self.gc_heap, key)
+            {
+                return Ok(Some(desc));
+            }
+            if key == "prototype" {
+                return Ok(Some(object::PropertyDescriptor::data(
+                    Value::object(class.prototype(&self.gc_heap)),
+                    false,
+                    false,
+                    false,
+                )));
+            }
+            let ctor = class.ctor(&self.gc_heap);
+            if let Some(function_id) = ctor
+                .as_function()
+                .or_else(|| ctor.as_closure(&self.gc_heap).map(|c| c.cached_function_id))
+            {
+                return self.ordinary_function_own_property_descriptor(
+                    Some(context),
+                    function_id,
+                    key,
+                );
+            }
+            if let Some(native) = ctor.as_native_function() {
+                return Ok(native.own_property_descriptor(&mut self.gc_heap, key)?);
+            }
+            if let Some(bound) = ctor.as_bound_function() {
+                return function_metadata::bound_own_property_descriptor(
+                    &bound,
+                    &mut self.gc_heap,
+                    key,
+                );
+            }
         }
         Ok(None)
     }

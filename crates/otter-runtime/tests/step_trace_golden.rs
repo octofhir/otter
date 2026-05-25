@@ -86,16 +86,14 @@ fn assert_golden(name: &str, actual: &str) {
         .join("golden")
         .join(format!("{name}.trace"));
     if std::env::var_os("OTTER_BLESS_TRACES").is_some() {
-        std::fs::create_dir_all(path.parent().expect("golden dir"))
-            .expect("create golden dir");
+        std::fs::create_dir_all(path.parent().expect("golden dir")).expect("create golden dir");
         std::fs::write(&path, actual).expect("write golden");
         return;
     }
     let expected = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("golden trace missing at {}: {err}", path.display()));
     assert_eq!(
-        actual,
-        expected,
+        actual, expected,
         "trace drift for {name}: run with OTTER_BLESS_TRACES=1 after confirming the diff is intentional",
     );
 }

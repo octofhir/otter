@@ -2,7 +2,6 @@
 
 #![allow(missing_docs)]
 
-
 use crate::bootstrap::BootstrapFeatures;
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, NamespaceBuilder, NamespaceSpec};
@@ -69,7 +68,11 @@ const NOW_SPEC: NamespaceSpec = NamespaceSpec {
     name: "Now",
     methods: &[
         method("instant", 0, crate::temporal::now::instant),
-        method("plainDateTimeISO", 0, crate::temporal::now::plain_date_time_iso),
+        method(
+            "plainDateTimeISO",
+            0,
+            crate::temporal::now::plain_date_time_iso,
+        ),
         method("plainDateISO", 0, crate::temporal::now::plain_date_iso),
         method("plainTimeISO", 0, crate::temporal::now::plain_time_iso),
     ],

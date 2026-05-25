@@ -25,9 +25,9 @@ pub mod kv;
 pub mod sql;
 
 use otter_runtime::{
-    HostedModule, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeNumberValue as NumberValue, RuntimeValue as Value,
-    runtime_arg_to_string, runtime_string_value, runtime_type_error,
+    HostedModule, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeNumberValue as NumberValue, RuntimeValue as Value, runtime_arg_to_string,
+    runtime_string_value, runtime_type_error,
 };
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 

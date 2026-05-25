@@ -87,10 +87,7 @@ impl ShapeRuntime {
     /// observer fires on every transition take —
     /// [`ShapeTransitionEvent::reused`] distinguishes cached lookups
     /// from fresh shape allocations.
-    pub(crate) fn set_observer(
-        &mut self,
-        observer: Option<Box<dyn ShapeTransitionObserver>>,
-    ) {
+    pub(crate) fn set_observer(&mut self, observer: Option<Box<dyn ShapeTransitionObserver>>) {
         self.observer = observer;
     }
 

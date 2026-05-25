@@ -1,9 +1,9 @@
 //! WHATWG Blob host-side bytes.
 
 use otter_runtime::{
-    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
-    runtime_optional_arg_to_string, runtime_this_object, runtime_with_host_data,
+    RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value, runtime_optional_arg_to_string,
+    runtime_this_object, runtime_with_host_data,
 };
 
 /// Owned Blob data.

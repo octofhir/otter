@@ -1060,7 +1060,9 @@ fn trace_factory_for_target(target: &str) -> otter_runtime::TracerFactory {
             match std::fs::File::create(&target) {
                 Ok(file) => Box::new(io::BufWriter::new(file)),
                 Err(err) => {
-                    eprintln!("warning: --trace cannot open {target}: {err}; falling back to stderr");
+                    eprintln!(
+                        "warning: --trace cannot open {target}: {err}; falling back to stderr"
+                    );
                     Box::new(io::BufWriter::new(io::stderr()))
                 }
             }

@@ -547,8 +547,8 @@ pub(crate) fn build_shape_transition_snapshot(
 
     let mut raw: Vec<(u64, u64, String, u32)> = Vec::new();
     for (parent_id, child) in shape_runtime.transitions_for_snapshot() {
-        let (child_id, transition_key_handle, property_count, _own_offset) = heap
-            .read_payload(child, |body| {
+        let (child_id, transition_key_handle, property_count, _own_offset) =
+            heap.read_payload(child, |body| {
                 (
                     body.id(),
                     body.transition_key(),
@@ -631,7 +631,11 @@ impl HeapSnapshotSummary {
                 })
             })
             .collect();
-        buckets.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.type_tag.cmp(&b.type_tag)));
+        buckets.sort_by(|a, b| {
+            b.bytes
+                .cmp(&a.bytes)
+                .then_with(|| a.type_tag.cmp(&b.type_tag))
+        });
         let total_bytes = buckets.iter().map(|b| b.bytes).sum();
         Self {
             object_count,
@@ -698,7 +702,11 @@ mod tests {
 
     #[test]
     fn single_event_renders_canonical_line() {
-        let operands = [Operand::Register(2), Operand::Register(0), Operand::Register(1)];
+        let operands = [
+            Operand::Register(2),
+            Operand::Register(0),
+            Operand::Register(1),
+        ];
         let registers: [Value; 0] = [];
         let event = StepEvent {
             frame_depth: 1,

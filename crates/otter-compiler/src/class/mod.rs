@@ -339,12 +339,6 @@ pub(crate) fn compile_class(
         let m_const = cx.intern_function_id(m_id);
         let m_reg = cx.alloc_scratch();
         emit_make_callable(cx, m_reg, m_const, &m_captures, false, method_span)?;
-        // §15.7.10 ClassDefinitionEvaluation step 26 / 27 —
-        // accessor method definitions (`get foo()` / `set foo(v)`)
-        // install an `{ get | set, enumerable: false, configurable:
-        // true }` accessor descriptor via `DefinePropertyOrThrow`.
-        // Plain methods stay on the data-property fast path.
-        // <https://tc39.es/ecma262/#sec-runtime-semantics-classdefinitionevaluation>
         let is_accessor = matches!(
             m.kind,
             oxc_ast::ast::MethodDefinitionKind::Get | oxc_ast::ast::MethodDefinitionKind::Set
@@ -438,24 +432,18 @@ pub(crate) fn compile_class(
             );
             continue;
         }
-        match (&static_name, m.computed) {
+        let key_reg = match (&static_name, m.computed) {
             (Some(name), false) => {
-                let name_const = cx.intern_string_constant(name);
-                let store_scratch = cx.alloc_scratch();
+                let r = cx.alloc_scratch();
+                let const_idx = cx.intern_string_constant(name);
                 cx.emit(
-                    Op::StoreProperty,
-                    vec![
-                        Operand::Register(target_reg),
-                        Operand::ConstIndex(name_const),
-                        Operand::Register(m_reg),
-                        Operand::Register(store_scratch),
-                    ],
+                    Op::LoadString,
+                    [Operand::Register(r), Operand::ConstIndex(const_idx)],
                     method_span,
                 );
+                r
             }
             _ => {
-                // Computed key (or unsupported key kind) — evaluate
-                // at runtime and write via Op::StoreElement.
                 let key_expr = m
                     .key
                     .as_expression()
@@ -463,10 +451,54 @@ pub(crate) fn compile_class(
                         node: "ClassDeclaration: non-expression computed key".to_string(),
                         span: method_span,
                     })?;
-                let key_reg = compile_expr(cx, key_expr, method_span)?;
-                cx.emit_store_element(target_reg, key_reg, m_reg, method_span);
+                compile_expr(cx, key_expr, method_span)?
             }
+        };
+        let desc_reg = cx.alloc_scratch();
+        cx.emit(Op::NewObject, [Operand::Register(desc_reg)], method_span);
+        let value_const = cx.intern_string_constant("value");
+        let value_scratch = cx.alloc_scratch();
+        cx.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(desc_reg),
+                Operand::ConstIndex(value_const),
+                Operand::Register(m_reg),
+                Operand::Register(value_scratch),
+            ],
+            method_span,
+        );
+        let true_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadTrue, [Operand::Register(true_reg)], method_span);
+        let false_reg = cx.alloc_scratch();
+        cx.emit(Op::LoadFalse, [Operand::Register(false_reg)], method_span);
+        for (attr, value_reg) in [
+            ("writable", true_reg),
+            ("enumerable", false_reg),
+            ("configurable", true_reg),
+        ] {
+            let attr_const = cx.intern_string_constant(attr);
+            let attr_scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(desc_reg),
+                    Operand::ConstIndex(attr_const),
+                    Operand::Register(value_reg),
+                    Operand::Register(attr_scratch),
+                ],
+                method_span,
+            );
         }
+        cx.emit(
+            Op::DefineOwnProperty,
+            [
+                Operand::Register(target_reg),
+                Operand::Register(key_reg),
+                Operand::Register(desc_reg),
+            ],
+            method_span,
+        );
     }
 
     // §15.7.10 InitializeStaticElements — walk the body in source

@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use otter_runtime::{
     RuntimeHostObjectError, RuntimeJsObject as JsObject, RuntimeNativeCtx as NativeCtx,
-    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder, RuntimeValue as Value,
-    runtime_this_object, runtime_with_host_data, runtime_with_host_data_mut,
+    RuntimeNativeError as NativeError, RuntimeObjectBuilder as ObjectBuilder,
+    RuntimeValue as Value, runtime_this_object, runtime_with_host_data, runtime_with_host_data_mut,
 };
 
 /// Headers validation error.

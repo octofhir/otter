@@ -9,7 +9,6 @@
 
 #![allow(missing_docs)]
 
-
 use num_traits::ToPrimitive;
 
 use crate::bigint::BigIntValue;
@@ -35,12 +34,12 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             reason: "epochNanoseconds must be a BigInt".to_string(),
         });
     };
-    let nanos = bi
-        .with_inner(heap, |big| big.to_i128())
-        .ok_or_else(|| NativeError::RangeError {
-            name: CLASS,
-            reason: "epochNanoseconds out of i128 range".to_string(),
-        })?;
+    let nanos =
+        bi.with_inner(heap, |big| big.to_i128())
+            .ok_or_else(|| NativeError::RangeError {
+                name: CLASS,
+                reason: "epochNanoseconds out of i128 range".to_string(),
+            })?;
     let Some(tz_str) = arg_or_undef(args, 1).as_string(heap) else {
         return Err(NativeError::TypeError {
             name: CLASS,
@@ -292,7 +291,10 @@ fn impl_to_plain_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
 
 fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
-    make_temporal(ctx, TemporalPayload::PlainDateTime(zdt.to_plain_date_time()))
+    make_temporal(
+        ctx,
+        TemporalPayload::PlainDateTime(zdt.to_plain_date_time()),
+    )
 }
 
 const fn method(

@@ -7,7 +7,6 @@
 
 #![allow(missing_docs)]
 
-
 use std::str::FromStr;
 
 use crate::js_surface::{Attr, MethodSpec};
@@ -220,20 +219,20 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         });
     };
     let unit_name = object::get(opts, ctx.heap(), "unit")
-        .and_then(|v| v.as_string(ctx.heap()).map(|s| s.to_lossy_string(ctx.heap())))
+        .and_then(|v| {
+            v.as_string(ctx.heap())
+                .map(|s| s.to_lossy_string(ctx.heap()))
+        })
         .ok_or_else(|| NativeError::TypeError {
             name: CLASS,
             reason: "options must include a `unit` string".to_string(),
         })?;
-    let unit = temporal_rs::options::Unit::from_str(&unit_name).map_err(|_| {
-        NativeError::RangeError {
+    let unit =
+        temporal_rs::options::Unit::from_str(&unit_name).map_err(|_| NativeError::RangeError {
             name: CLASS,
             reason: "unknown duration unit".to_string(),
-        }
-    })?;
-    let total = dur
-        .total(unit, None)
-        .map_err(|e| temporal_err(e, CLASS))?;
+        })?;
+    let total = dur.total(unit, None).map_err(|e| temporal_err(e, CLASS))?;
     Ok(Value::number_f64(total.as_inner()))
 }
 

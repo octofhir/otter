@@ -135,7 +135,6 @@ impl Default for ExtensibleFlag {
     }
 }
 
-
 /// Read the Array exotic's per-instance `[[Prototype]]` override.
 pub(crate) fn prototype_override(arr: JsArray, heap: &GcHeap) -> Option<Value> {
     heap.read_payload(arr, |body| body.prototype_override)

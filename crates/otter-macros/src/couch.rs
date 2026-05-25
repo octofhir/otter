@@ -538,8 +538,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
 
     let statics_ident = format_ident!("__OTTER_{}_STATICS", spec_ident);
     let static_constants_ident = format_ident!("__OTTER_{}_STATIC_CONSTANTS", spec_ident);
-    let prototype_constants_ident =
-        format_ident!("__OTTER_{}_PROTOTYPE_CONSTANTS", spec_ident);
+    let prototype_constants_ident = format_ident!("__OTTER_{}_PROTOTYPE_CONSTANTS", spec_ident);
     let prototype_methods_ident = format_ident!("__OTTER_{}_PROTOTYPE_METHODS", spec_ident);
     let prototype_accessors_ident = format_ident!("__OTTER_{}_PROTOTYPE_ACCESSORS", spec_ident);
     let static_entries = statics.iter().map(|m| {

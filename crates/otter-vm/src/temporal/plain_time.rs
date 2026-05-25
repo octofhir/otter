@@ -5,12 +5,11 @@
 
 #![allow(missing_docs)]
 
-
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    arg_or_undef, clamp_to_u16, clamp_to_u8, js_string_value, make_temporal,
+    arg_or_undef, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
     opt_integer_with_truncation, parse_difference_settings, parse_partial_time,
     parse_rounding_options, require_construct, require_plain_time, temporal_err,
 };
@@ -52,15 +51,9 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         CLASS,
         "nanosecond",
     )?;
-    let pt = temporal_rs::PlainTime::try_new(
-        hour,
-        minute,
-        second,
-        millisecond,
-        microsecond,
-        nanosecond,
-    )
-    .map_err(|e| temporal_err(e, CLASS))?;
+    let pt =
+        temporal_rs::PlainTime::try_new(hour, minute, second, millisecond, microsecond, nanosecond)
+            .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(pt))
 }
 
@@ -205,9 +198,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
-    let result = pt
-        .round(options)
-        .map_err(|e| temporal_err(e, CLASS))?;
+    let result = pt.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(result))
 }
 
@@ -220,9 +211,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
         });
     };
     let partial = parse_partial_time(obj, ctx.heap(), CLASS)?;
-    let result = pt
-        .with(partial, None)
-        .map_err(|e| temporal_err(e, CLASS))?;
+    let result = pt.with(partial, None).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(result))
 }
 

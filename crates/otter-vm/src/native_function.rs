@@ -232,10 +232,7 @@ pub struct NativeFunctionBody {
     prototype_override: Option<Value>,
 }
 
-fn trace_native_trace_hook(
-    trace: &Option<Rc<NativeTraceFn>>,
-    visitor: &mut SlotVisitor<'_>,
-) {
+fn trace_native_trace_hook(trace: &Option<Rc<NativeTraceFn>>, visitor: &mut SlotVisitor<'_>) {
     if let Some(t) = trace {
         t(visitor);
     }

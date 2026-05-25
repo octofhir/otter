@@ -252,7 +252,6 @@ impl MapEntry {
     }
 }
 
-
 /// Allocate a fresh empty `Map`.
 pub fn alloc_map(heap: &mut otter_gc::GcHeap) -> Result<JsMap, otter_gc::OutOfMemory> {
     heap.alloc_old(MapBody::default())
@@ -523,7 +522,6 @@ impl SetEntry {
         self.value = None;
     }
 }
-
 
 /// Allocate a fresh empty `Set`.
 pub fn alloc_set(heap: &mut otter_gc::GcHeap) -> Result<JsSet, otter_gc::OutOfMemory> {

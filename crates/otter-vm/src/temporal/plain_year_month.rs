@@ -5,7 +5,6 @@
 
 #![allow(missing_docs)]
 
-
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
@@ -75,12 +74,13 @@ fn parse_pym_arg(
             calendar_fields: fields,
             calendar: temporal_rs::Calendar::default(),
         };
-        temporal_rs::PlainYearMonth::from_partial(partial, None)
-            .map_err(|e| temporal_err(e, CLASS))
+        temporal_rs::PlainYearMonth::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "argument must be a Temporal.PlainYearMonth, ISO string, or year-month-like object".to_string(),
+            reason:
+                "argument must be a Temporal.PlainYearMonth, ISO string, or year-month-like object"
+                    .to_string(),
         })
     }
 }

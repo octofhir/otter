@@ -280,7 +280,6 @@ fn ctor_prototype(
     }
 }
 
-
 /// §24.1.2.1 `Map.groupBy(items, callbackfn)` — drain `items`
 /// into groups keyed by callback return value, store result in
 /// a new Map.
@@ -382,7 +381,6 @@ fn map_group_by_vm_error(err: crate::VmError) -> NativeError {
         },
     }
 }
-
 
 // ---------------------------------------------------------------
 // Constructor bodies

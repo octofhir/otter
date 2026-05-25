@@ -145,15 +145,24 @@ impl Parse for LodgeInput {
         let prefix = prefix.ok_or_else(|| {
             syn::Error::new(Span::call_site(), "lodge!: missing `prefix = \"...\"`")
         })?;
-        let name = name
-            .ok_or_else(|| syn::Error::new(Span::call_site(), "lodge!: missing `name = \"...\"`"))?;
+        let name = name.ok_or_else(|| {
+            syn::Error::new(Span::call_site(), "lodge!: missing `name = \"...\"`")
+        })?;
         let name_str = name.value();
         let install_ident = install_override.unwrap_or_else(|| {
-            format_ident!("install_{}_module", sanitize_ident(&name_str), span = name.span())
+            format_ident!(
+                "install_{}_module",
+                sanitize_ident(&name_str),
+                span = name.span()
+            )
         });
         let static_ident = static_override.unwrap_or_else(|| {
             let upper = name_str.to_ascii_uppercase();
-            format_ident!("{}_HOSTED_MODULE", sanitize_ident(&upper), span = name.span())
+            format_ident!(
+                "{}_HOSTED_MODULE",
+                sanitize_ident(&upper),
+                span = name.span()
+            )
         });
 
         Ok(Self {

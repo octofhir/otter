@@ -82,10 +82,10 @@ pub mod gc_trace;
 pub mod generator;
 pub mod global_functions;
 mod global_ops;
-pub mod intl;
-mod intl_ops;
 pub mod groom;
 pub mod inspect;
+pub mod intl;
+mod intl_ops;
 pub mod intrinsic_install;
 pub mod intrinsics;
 mod iterator_ops;
@@ -1430,8 +1430,11 @@ impl Interpreter {
     /// borrow.
     #[must_use]
     pub fn ic_snapshot(&self) -> Vec<inspect::IcSiteSnapshot> {
-        let mut out =
-            Vec::with_capacity(self.load_property_ics.len() + self.store_property_ics.len() + self.has_property_ics.len());
+        let mut out = Vec::with_capacity(
+            self.load_property_ics.len()
+                + self.store_property_ics.len()
+                + self.has_property_ics.len(),
+        );
         for (index, entry) in self.load_property_ics.iter().enumerate() {
             out.push(inspect::IcSiteSnapshot {
                 site_index: index as u32,

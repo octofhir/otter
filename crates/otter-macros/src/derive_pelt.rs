@@ -78,12 +78,9 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             Err(err) => return err.to_compile_error().into(),
         },
         Data::Union(_) => {
-            return syn::Error::new(
-                Span::call_site(),
-                "#[derive(Pelt)] does not support unions",
-            )
-            .to_compile_error()
-            .into();
+            return syn::Error::new(Span::call_site(), "#[derive(Pelt)] does not support unions")
+                .to_compile_error()
+                .into();
         }
     };
 
@@ -275,7 +272,10 @@ fn field_calls(fields: &Fields) -> Result<Vec<proc_macro2::TokenStream>> {
     Ok(calls)
 }
 
-fn emit_field_call(access: &proc_macro2::TokenStream, via: Option<&Path>) -> proc_macro2::TokenStream {
+fn emit_field_call(
+    access: &proc_macro2::TokenStream,
+    via: Option<&Path>,
+) -> proc_macro2::TokenStream {
     match via {
         Some(path) => quote! { #path(#access, visitor); },
         None => quote! {

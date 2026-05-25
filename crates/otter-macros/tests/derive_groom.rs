@@ -13,8 +13,8 @@
 
 use std::cell::Cell;
 
-use otter_gc::{SafeFinalize, SafeTraceable};
 use otter_gc::raw::SlotVisitor;
+use otter_gc::{SafeFinalize, SafeTraceable};
 use otter_macros::{Groom, Pelt};
 
 const GROOM_NAMED_TAG: u8 = 0xD1;

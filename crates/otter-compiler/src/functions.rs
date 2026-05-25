@@ -35,7 +35,9 @@ pub(crate) fn compile_function_full(
     let needs_arguments = body_references_arguments(params, body.as_deref());
     let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
+    let active_with_envs = parent.active_with_envs.clone();
     let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
+    child.active_with_envs = active_with_envs;
     child.is_async_generator = is_async_generator;
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
@@ -190,7 +192,9 @@ pub(crate) fn compile_arrow_function(
     let module = Rc::clone(&parent.top_mut().module);
     let function_is_strict = parent.is_strict || arrow.body.has_use_strict_directive();
     validate_formal_parameter_names(&arrow.params, function_is_strict, false, span)?;
+    let active_with_envs = parent.active_with_envs.clone();
     let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
+    child.active_with_envs = active_with_envs;
     child.captured_names = capture::analyze_arrow(arrow);
     parent.push(child);
     parent.enter_scope();

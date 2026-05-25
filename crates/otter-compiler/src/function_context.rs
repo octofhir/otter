@@ -73,6 +73,14 @@ pub(crate) struct FunctionContext {
     /// Inner functions inherit module-mode lookups via the
     /// existing capture walk — they never set this themselves.
     pub(crate) module_state: Option<ModuleState>,
+    /// Synthetic object-environment bindings introduced by sloppy
+    /// `with` statements that enclose the code currently being
+    /// lowered. Entries are binding names whose values are captured
+    /// `JsObject` references.
+    pub(crate) active_with_envs: Vec<String>,
+    /// Monotonic suffix for synthetic `with` bindings in this
+    /// function.
+    pub(crate) next_with_env_id: u32,
 }
 
 impl FunctionContext {
@@ -95,6 +103,8 @@ impl FunctionContext {
             parent_captures: Vec::new(),
             captured_uv: HashMap::new(),
             module_state: None,
+            active_with_envs: Vec::new(),
+            next_with_env_id: 0,
         }
     }
 

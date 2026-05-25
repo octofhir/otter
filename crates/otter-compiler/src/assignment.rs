@@ -308,6 +308,8 @@ pub(crate) fn compile_assignment(
             .resolve_capture(&name)
             .map(|idx| BindingStorage::Upvalue { idx }),
     };
+    let active_with_envs = cx.active_with_envs.clone();
+    let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
     let value = match compound_op {
         None => compile_expr(cx, &a.right, span)?,
         Some(op) => {
@@ -315,6 +317,14 @@ pub(crate) fn compile_assignment(
                 return Ok(emit_reference_error(cx, &name, span));
             }
             let current = cx.alloc_scratch();
+            let mut with_done = None;
+            if let Some(probe) = &with_ref {
+                let fallback =
+                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+                cx.emit_load_property(current, probe.object_reg, &name, span);
+                with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+                cx.patch_branch_to_here(fallback);
+            }
             match storage {
                 Some(s) => cx.emit_load_storage(current, s, span),
                 None => {
@@ -322,6 +332,9 @@ pub(crate) fn compile_assignment(
                     cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
                     cx.emit_load_property(current, global, &name, span);
                 }
+            }
+            if let Some(done) = with_done {
+                cx.patch_branch_to_here(done);
             }
             let rhs = compile_expr(cx, &a.right, span)?;
             let (cur_p, rhs_p) = coerce_compound_operands(cx, op, current, rhs, span);
@@ -338,6 +351,24 @@ pub(crate) fn compile_assignment(
             dst
         }
     };
+    let mut with_store_done = None;
+    if let Some(probe) = &with_ref {
+        let fallback = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+        let name_idx = cx.intern_string_constant(&name);
+        let scratch = cx.alloc_scratch();
+        cx.emit(
+            Op::StoreProperty,
+            vec![
+                Operand::Register(probe.object_reg),
+                Operand::ConstIndex(name_idx),
+                Operand::Register(value),
+                Operand::Register(scratch),
+            ],
+            span,
+        );
+        with_store_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+        cx.patch_branch_to_here(fallback);
+    }
     match storage {
         Some(s) => {
             cx.emit_store_storage(value, s, span);
@@ -365,6 +396,9 @@ pub(crate) fn compile_assignment(
                 span,
             );
         }
+    }
+    if let Some(done) = with_store_done {
+        cx.patch_branch_to_here(done);
     }
     Ok(value)
 }

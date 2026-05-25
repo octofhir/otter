@@ -64,6 +64,7 @@ mod synthetic;
 mod template;
 mod try_catch;
 mod ts_erasure;
+mod with_statement;
 
 use compiled_module::collect_module_metadata;
 pub use compiled_module::{
@@ -111,6 +112,7 @@ pub(crate) use ts_erasure::{
     expr_kind_name, expr_span, init_to_expression, is_erased_ts_statement, rejected_ts_statement,
     stmt_kind_name, stmt_span,
 };
+pub(crate) use with_statement::*;
 
 pub(crate) use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Constant, Function, Instruction,

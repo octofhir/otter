@@ -162,6 +162,7 @@ pub(crate) fn compile_update(
         Identifier {
             name: String,
             storage: Option<BindingStorage>,
+            with_ref: Option<WithBindingProbe>,
         },
         StaticMember {
             obj_reg: u16,
@@ -188,6 +189,16 @@ pub(crate) fn compile_update(
                     .resolve_capture(&name)
                     .map(|idx| BindingStorage::Upvalue { idx }),
             };
+            let active_with_envs = cx.active_with_envs.clone();
+            let with_ref = emit_with_binding_probe(cx, &name, &active_with_envs, span)?;
+            let mut with_done = None;
+            if let Some(probe) = &with_ref {
+                let fallback =
+                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+                cx.emit_load_property(old, probe.object_reg, &name, span);
+                with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+                cx.patch_branch_to_here(fallback);
+            }
             match storage {
                 Some(s) => cx.emit_load_storage(old, s, span),
                 None => {
@@ -196,7 +207,14 @@ pub(crate) fn compile_update(
                     cx.emit_load_property(old, global, &name, span);
                 }
             }
-            UpdateTarget::Identifier { name, storage }
+            if let Some(done) = with_done {
+                cx.patch_branch_to_here(done);
+            }
+            UpdateTarget::Identifier {
+                name,
+                storage,
+                with_ref,
+            }
         }
         SimpleAssignmentTarget::StaticMemberExpression(member) => {
             let obj_reg = compile_expr(cx, &member.object, span)?;
@@ -260,25 +278,53 @@ pub(crate) fn compile_update(
         span,
     );
     match target {
-        UpdateTarget::Identifier { name, storage } => match storage {
-            Some(s) => cx.emit_store_storage(next, s, span),
-            None => {
-                let global = cx.alloc_scratch();
-                cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
+        UpdateTarget::Identifier {
+            name,
+            storage,
+            with_ref,
+        } => {
+            let mut with_store_done = None;
+            if let Some(probe) = &with_ref {
+                let fallback =
+                    cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
                 let name_idx = cx.intern_string_constant(&name);
                 let scratch = cx.alloc_scratch();
                 cx.emit(
                     Op::StoreProperty,
                     vec![
-                        Operand::Register(global),
+                        Operand::Register(probe.object_reg),
                         Operand::ConstIndex(name_idx),
                         Operand::Register(next),
                         Operand::Register(scratch),
                     ],
                     span,
                 );
+                with_store_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+                cx.patch_branch_to_here(fallback);
             }
-        },
+            match storage {
+                Some(s) => cx.emit_store_storage(next, s, span),
+                None => {
+                    let global = cx.alloc_scratch();
+                    cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
+                    let name_idx = cx.intern_string_constant(&name);
+                    let scratch = cx.alloc_scratch();
+                    cx.emit(
+                        Op::StoreProperty,
+                        vec![
+                            Operand::Register(global),
+                            Operand::ConstIndex(name_idx),
+                            Operand::Register(next),
+                            Operand::Register(scratch),
+                        ],
+                        span,
+                    );
+                }
+            }
+            if let Some(done) = with_store_done {
+                cx.patch_branch_to_here(done);
+            }
+        }
         UpdateTarget::StaticMember { obj_reg, name } => {
             let name_idx = cx.intern_string_constant(name);
             let scratch = cx.alloc_scratch();

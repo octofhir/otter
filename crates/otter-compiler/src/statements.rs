@@ -670,14 +670,7 @@ pub(crate) fn compile_statement(
             Ok(None)
         }
 
-        // §14.13 — `with` is forbidden in strict mode and ES modules.
-        // Foundation is always strict, so reject with a clear
-        // diagnostic rather than the generic "unsupported".
-        // <https://tc39.es/ecma262/#sec-with-statement>
-        Statement::WithStatement(w) => Err(CompileError::Unsupported {
-            node: "WithStatement is forbidden in strict mode / ES modules (§14.13)".to_string(),
-            span: (w.span.start, w.span.end),
-        }),
+        Statement::WithStatement(w) => compile_with_statement(cx, w),
 
         Statement::SwitchStatement(s) => compile_switch_statement(cx, s),
 

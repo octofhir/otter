@@ -53,6 +53,11 @@ pub(crate) struct FunctionContext {
     /// sloppy mapped arguments object can alias them without exposing
     /// frame registers outside the VM.
     pub(crate) mapped_argument_names: HashSet<String>,
+    /// Pre-assigned own-upvalue slots for names known before codegen
+    /// starts. This keeps later parent-capture slots stable when
+    /// parameter default expressions capture outer bindings before
+    /// body `var` declarations are lowered.
+    pub(crate) reserved_own_upvalues: HashMap<String, u16>,
     /// Number of own-upvalue cells allocated so far. The first
     /// `own_upvalue_count` slots in `frame.upvalues` belong to this
     /// function's own captured bindings.
@@ -99,6 +104,7 @@ impl FunctionContext {
             hoisted_function_names: HashSet::new(),
             captured_names: HashSet::new(),
             mapped_argument_names: HashSet::new(),
+            reserved_own_upvalues: HashMap::new(),
             own_upvalue_count: 0,
             parent_captures: Vec::new(),
             captured_uv: HashMap::new(),
@@ -113,6 +119,23 @@ impl FunctionContext {
         self
     }
 
+    pub(crate) fn reserve_known_own_upvalues(&mut self) {
+        if !self.reserved_own_upvalues.is_empty() {
+            return;
+        }
+        let mut names: Vec<String> = self
+            .captured_names
+            .union(&self.mapped_argument_names)
+            .cloned()
+            .collect();
+        names.sort();
+        for name in names {
+            let idx = self.own_upvalue_count;
+            self.own_upvalue_count = idx.checked_add(1).expect("own_upvalue_count overflow");
+            self.reserved_own_upvalues.insert(name, idx);
+        }
+    }
+
     /// Check `name` against this function's `captured_names` set
     /// (computed by the pre-pass) and, when present, allocate a
     /// fresh own-upvalue index for it. Returns the assigned index
@@ -121,6 +144,9 @@ impl FunctionContext {
     pub(crate) fn allocate_own_upvalue(&mut self, name: &str) -> Option<u16> {
         if !self.captured_names.contains(name) && !self.mapped_argument_names.contains(name) {
             return None;
+        }
+        if let Some(&idx) = self.reserved_own_upvalues.get(name) {
+            return Some(idx);
         }
         let idx = self.own_upvalue_count;
         self.own_upvalue_count = idx.checked_add(1).expect("own_upvalue_count overflow");

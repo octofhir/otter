@@ -86,12 +86,11 @@ impl Compiler {
         // direct-parent (top_idx - 1) downward.
         let mut found: Option<(usize, u16)> = None;
         for i in (0..top_idx).rev() {
-            // Already-captured upvalue in this ancestor?
-            if let Some(&idx) = self.stack[i].captured_uv.get(name) {
-                found = Some((i, idx));
-                break;
-            }
-            // Local binding declared as own-upvalue?
+            // Local bindings shadow passthrough captures with the
+            // same name. This matters for functions with parameter
+            // expressions: a default initializer may capture outer
+            // `x`, while body `var x` must be captured by closures
+            // created in the body.
             let mut hit: Option<u16> = None;
             for scope in self.stack[i].scopes.iter().rev() {
                 if let Some(info) = scope.bindings.get(name) {
@@ -102,6 +101,11 @@ impl Compiler {
                 }
             }
             if let Some(idx) = hit {
+                found = Some((i, idx));
+                break;
+            }
+            // Already-captured upvalue in this ancestor?
+            if let Some(&idx) = self.stack[i].captured_uv.get(name) {
                 found = Some((i, idx));
                 break;
             }

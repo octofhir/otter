@@ -45,6 +45,7 @@ pub(crate) fn compile_function_full(
     if uses_mapped_arguments {
         child.mapped_argument_names = simple_formal_names(params).into_iter().collect();
     }
+    child.reserve_known_own_upvalues();
     parent.push(child);
     parent.enter_scope();
 
@@ -196,6 +197,7 @@ pub(crate) fn compile_arrow_function(
     let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
     child.active_with_envs = active_with_envs;
     child.captured_names = capture::analyze_arrow(arrow);
+    child.reserve_known_own_upvalues();
     parent.push(child);
     parent.enter_scope();
 

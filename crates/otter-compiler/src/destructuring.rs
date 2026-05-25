@@ -180,6 +180,8 @@ pub(crate) fn destructure_array_inner(
         [Operand::Register(iter_reg), Operand::Register(src_reg)],
         span,
     );
+    parent.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
+    let mut last_done_reg = None;
     for elem in &pattern.elements {
         let value_reg = parent.alloc_scratch();
         let done_reg = parent.alloc_scratch();
@@ -192,6 +194,7 @@ pub(crate) fn destructure_array_inner(
             ],
             span,
         );
+        last_done_reg = Some(done_reg);
         // A hole (`,,`) leaves the slot unbound — nothing to emit.
         let Some(inner) = elem else {
             continue;
@@ -228,6 +231,15 @@ pub(crate) fn destructure_array_inner(
         parent.patch_branch(back, loop_top);
         parent.patch_branch_to_here(exit);
         destructure_pattern(parent, arr_reg, &rest.argument, span, assign_existing)?;
+        parent.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
+    } else if let Some(done_reg) = last_done_reg {
+        let skip_close = parent.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+        parent.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
+        parent.patch_branch_to_here(skip_close);
+        parent.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
+    } else {
+        parent.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
+        parent.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
     }
     Ok(())
 }

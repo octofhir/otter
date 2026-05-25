@@ -715,6 +715,61 @@ fn assign_prepared_target(
     }
 }
 
+fn prepare_maybe_default_target(
+    cx: &mut Compiler,
+    target: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
+    span: (u32, u32),
+) -> Result<Option<PreparedAssignmentTarget>, CompileError> {
+    use oxc_ast::ast::AssignmentTargetMaybeDefault;
+    let inner = match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => &d.binding,
+        other => other
+            .as_assignment_target()
+            .ok_or_else(|| CompileError::Unsupported {
+                node: format!("AssignmentTargetMaybeDefault ({other:?})"),
+                span,
+            })?,
+    };
+    prepare_assignment_target(cx, inner, span)
+}
+
+fn assign_maybe_default_with_prepared(
+    cx: &mut Compiler,
+    target: &oxc_ast::ast::AssignmentTargetMaybeDefault<'_>,
+    prepared: Option<PreparedAssignmentTarget>,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    use oxc_ast::ast::AssignmentTargetMaybeDefault;
+    match target {
+        AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
+            let inferred_name = match &d.binding {
+                oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    Some(id.name.as_str())
+                }
+                _ => None,
+            };
+            let resolved = apply_default_with_name(cx, value_reg, &d.init, inferred_name, span)?;
+            match prepared {
+                Some(target) => assign_prepared_target(cx, target, resolved, span),
+                None => assign_to_target(cx, &d.binding, resolved, span),
+            }
+        }
+        other => {
+            let inner = other
+                .as_assignment_target()
+                .ok_or_else(|| CompileError::Unsupported {
+                    node: format!("AssignmentTargetMaybeDefault ({other:?})"),
+                    span,
+                })?;
+            match prepared {
+                Some(target) => assign_prepared_target(cx, target, value_reg, span),
+                None => assign_to_target(cx, inner, value_reg, span),
+            }
+        }
+    }
+}
+
 /// Apply `value_reg` to a `ArrayAssignmentTarget`. Walks the
 /// iterator, assigns each yielded value, and closes non-exhausted
 /// iterators on normal completion. Defaults (`= expr`) substitute
@@ -737,6 +792,10 @@ pub(crate) fn assign_array_pattern(
     cx.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
     let mut last_done_reg = None;
     for element in &arr.elements {
+        let prepared = match element {
+            Some(element) => prepare_maybe_default_target(cx, element, span)?,
+            None => None,
+        };
         let val_reg = cx.alloc_scratch();
         let done_reg = cx.alloc_scratch();
         cx.emit(
@@ -751,7 +810,7 @@ pub(crate) fn assign_array_pattern(
         last_done_reg = Some(done_reg);
         let Some(element) = element else { continue };
         let elem_span = span;
-        assign_maybe_default(cx, element, val_reg, elem_span)?;
+        assign_maybe_default_with_prepared(cx, element, prepared, val_reg, elem_span)?;
     }
     if let Some(rest) = arr.rest.as_ref() {
         let prepared_rest = prepare_assignment_target(cx, &rest.target, span)?;

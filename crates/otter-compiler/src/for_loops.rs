@@ -42,49 +42,67 @@ pub(crate) fn compile_for_of_statement(
 
     let iterable_reg = compile_expr(cx, &s.right, span)?;
     let iter_reg = cx.alloc_scratch();
-    cx.emit(
-        Op::GetIterator,
-        [Operand::Register(iter_reg), Operand::Register(iterable_reg)],
-        span,
-    );
+    if is_for_await {
+        cx.emit(
+            Op::GetAsyncIterator,
+            [Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+            span,
+        );
+    } else {
+        cx.emit(
+            Op::GetIterator,
+            [Operand::Register(iter_reg), Operand::Register(iterable_reg)],
+            span,
+        );
+    }
 
     let value_reg = cx.alloc_scratch();
     let done_reg = cx.alloc_scratch();
 
     cx.push_loop_frame(LoopFrame::iteration());
     let loop_top = cx.next_pc;
-    cx.emit(
-        Op::IteratorNext,
-        vec![
-            Operand::Register(value_reg),
-            Operand::Register(done_reg),
-            Operand::Register(iter_reg),
-        ],
-        span,
-    );
-    let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
-
-    // §14.7.5.6 step `for await … of` — per the iteration semantics
-    // for async iterables, the value produced by each step must be
-    // awaited before binding it to the loop variable. The
-    // foundation lowers `Op::IteratorNext` against a `Value::Generator`
-    // synchronously (the helper unwraps the gen's `{value, done}`
-    // record before re-emerging here), so by awaiting the value we
-    // both unwrap any user-yielded Promises and stay
-    // spec-compatible with sync-iterable inputs (await of a
-    // non-thenable resolves to the value itself).
-    // <https://tc39.es/ecma262/#sec-for-in-and-for-of-statements>
-    let bind_source = if is_for_await {
-        let awaited = cx.alloc_scratch();
+    if is_for_await {
+        let result_reg = cx.alloc_scratch();
+        let awaited_reg = cx.alloc_scratch();
+        let next_name = cx.intern_string_constant("next");
         cx.emit(
-            Op::Await,
-            [Operand::Register(awaited), Operand::Register(value_reg)],
+            Op::CallMethodValue,
+            vec![
+                Operand::Register(result_reg),
+                Operand::Register(iter_reg),
+                Operand::ConstIndex(next_name),
+                Operand::ConstIndex(0),
+            ],
             span,
         );
-        awaited
+        cx.emit(
+            Op::Await,
+            [
+                Operand::Register(awaited_reg),
+                Operand::Register(result_reg),
+            ],
+            span,
+        );
+        cx.emit_load_property(done_reg, awaited_reg, "done", span);
+        cx.emit_load_property(value_reg, awaited_reg, "value", span);
     } else {
-        value_reg
-    };
+        cx.emit(
+            Op::IteratorNext,
+            vec![
+                Operand::Register(value_reg),
+                Operand::Register(done_reg),
+                Operand::Register(iter_reg),
+            ],
+            span,
+        );
+    }
+    let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+
+    // §14.7.5.6 step `for await … of` — async iterators already
+    // produced an awaited result record above; ordinary `for-of`
+    // uses the synchronous `IteratorNext` value directly.
+    // <https://tc39.es/ecma262/#sec-for-in-and-for-of-statements>
+    let bind_source = value_reg;
 
     // §14.7.5.6 ForIn/OfBodyEvaluation: `let`/`const` re-bind per
     // iteration in a fresh lexical scope; `var` writes back into

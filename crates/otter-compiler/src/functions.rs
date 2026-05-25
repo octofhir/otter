@@ -63,6 +63,7 @@ pub(crate) fn compile_function_full(
         ..Default::default()
     });
 
+    predeclare_formal_parameters(parent, params, allow_duplicate_formals, span)?;
     // Bind every formal parameter, in source order. Side-effects
     // (default-value evaluation, iterator-protocol calls for array
     // patterns) follow the spec's per-call ordering.
@@ -206,6 +207,7 @@ pub(crate) fn compile_arrow_function(
         ..Default::default()
     });
 
+    predeclare_formal_parameters(parent, &arrow.params, false, span)?;
     for (ordinal, param) in arrow.params.items.iter().enumerate() {
         compile_formal_parameter(
             parent,

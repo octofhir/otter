@@ -50,9 +50,32 @@ pub(crate) fn compile_formal_parameter(
             &asgn.right,
             (asgn.span.start, asgn.span.end),
         )?;
-        return destructure_into(parent, ordinal, &asgn.left, span);
+        return destructure_assign(parent, ordinal, &asgn.left, span);
     }
-    destructure_into(parent, ordinal, pattern, span)
+    destructure_assign(parent, ordinal, pattern, span)
+}
+
+pub(crate) fn predeclare_formal_parameters(
+    parent: &mut Compiler,
+    params: &oxc_ast::ast::FormalParameters<'_>,
+    allow_duplicate_formals: bool,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let mut names = Vec::new();
+    for param in &params.items {
+        collect_pattern_var_names(&param.pattern, &mut names);
+    }
+    if let Some(rest) = &params.rest {
+        collect_pattern_var_names(&rest.rest.argument, &mut names);
+    }
+    let mut seen = HashSet::new();
+    for name in names {
+        if allow_duplicate_formals && !seen.insert(name.clone()) {
+            continue;
+        }
+        parent.declare_binding(&name, false, span)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn bind_simple_formal_parameter(
@@ -62,7 +85,9 @@ pub(crate) fn bind_simple_formal_parameter(
     span: (u32, u32),
     allow_duplicate_formals: bool,
 ) -> Result<(), CompileError> {
-    let storage = if allow_duplicate_formals {
+    let storage = if let Some(info) = parent.lookup_in_current_scope(name) {
+        info.storage
+    } else if allow_duplicate_formals {
         match parent.lookup_in_current_scope(name) {
             Some(info) => info.storage,
             None => parent.declare_binding(name, false, span)?,
@@ -130,7 +155,7 @@ pub(crate) fn compile_rest_parameter(
 ) -> Result<(), CompileError> {
     let rest_reg = parent.alloc_scratch();
     parent.emit(Op::CollectRest, [Operand::Register(rest_reg)], span);
-    destructure_into(parent, rest_reg, pattern, span)
+    destructure_assign(parent, rest_reg, pattern, span)
 }
 
 pub(crate) fn simple_formal_names(params: &oxc_ast::ast::FormalParameters<'_>) -> Vec<String> {

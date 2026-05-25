@@ -133,6 +133,7 @@ pub(crate) fn compile_class_constructor(
         ..Default::default()
     });
 
+    predeclare_formal_parameters(parent, params, false, span)?;
     for (ordinal, param) in params.items.iter().enumerate() {
         compile_formal_parameter(
             parent,

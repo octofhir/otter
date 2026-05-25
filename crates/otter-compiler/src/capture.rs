@@ -40,6 +40,7 @@ pub fn analyze_function(
     if let Some(p) = params {
         own.visit_formal_parameters(p);
     }
+    own.names.insert("arguments".to_string());
     own.visit_function_body(body);
 
     let mut inner = InnerRefCollector::default();

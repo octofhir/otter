@@ -71,6 +71,8 @@ pub(crate) fn compile_yield(
             let awaited_reg = cx.alloc_scratch();
             let done_reg = cx.alloc_scratch();
             let value_reg = cx.alloc_scratch();
+            let resume_arg_reg = cx.alloc_scratch();
+            cx.emit(Op::LoadUndefined, [Operand::Register(resume_arg_reg)], span);
             let next_name = cx.intern_string_constant("next");
             let loop_top = cx.next_pc;
             cx.emit(
@@ -79,7 +81,8 @@ pub(crate) fn compile_yield(
                     Operand::Register(result_reg),
                     Operand::Register(iter_reg),
                     Operand::ConstIndex(next_name),
-                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(1),
+                    Operand::Register(resume_arg_reg),
                 ],
                 span,
             );
@@ -94,10 +97,12 @@ pub(crate) fn compile_yield(
             cx.emit_load_property(done_reg, awaited_reg, "done", span);
             let exit_jmp = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
             cx.emit_load_property(value_reg, awaited_reg, "value", span);
-            let yield_dst = cx.alloc_scratch();
             cx.emit(
                 Op::Yield,
-                [Operand::Register(yield_dst), Operand::Register(value_reg)],
+                [
+                    Operand::Register(resume_arg_reg),
+                    Operand::Register(value_reg),
+                ],
                 span,
             );
             let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);

@@ -28,7 +28,10 @@ use smallvec::SmallVec;
 
 use crate::Value;
 use crate::number::NumberValue;
-use crate::object::{self, JsObject, MappedArgumentEntry, PropertyDescriptor};
+use crate::object::{
+    self, JsObject, MappedArgumentEntry, PartialPropertyDescriptor, PropertyDescriptor,
+};
+use crate::symbol::JsSymbol;
 
 /// Populate an unmapped `arguments` object from a captured argv list.
 pub(crate) fn initialize_unmapped(
@@ -36,6 +39,7 @@ pub(crate) fn initialize_unmapped(
     heap: &mut otter_gc::GcHeap,
     args: SmallVec<[Value; 4]>,
     throw_type_error: Value,
+    iterator: Option<(JsSymbol, Value)>,
 ) {
     object::mark_as_arguments_object(obj, heap);
     for (index, value) in args.iter().cloned().enumerate() {
@@ -57,6 +61,20 @@ pub(crate) fn initialize_unmapped(
         "callee",
         PropertyDescriptor::accessor(Some(throw_type_error), Some(throw_type_error), false, false),
     );
+    if let Some((symbol, method)) = iterator {
+        object::define_own_symbol_property_partial(
+            obj,
+            heap,
+            symbol,
+            PartialPropertyDescriptor {
+                value: Some(method),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+    }
 }
 
 /// Populate a sloppy mapped `arguments` object from a captured argv
@@ -67,6 +85,7 @@ pub(crate) fn initialize_mapped(
     args: SmallVec<[Value; 4]>,
     callee: Value,
     mapped_entries: Vec<MappedArgumentEntry>,
+    iterator: Option<(JsSymbol, Value)>,
 ) {
     object::mark_as_arguments_object(obj, heap);
     for (index, value) in args.iter().cloned().enumerate() {
@@ -88,5 +107,19 @@ pub(crate) fn initialize_mapped(
         "callee",
         PropertyDescriptor::data(callee, true, false, true),
     );
+    if let Some((symbol, method)) = iterator {
+        object::define_own_symbol_property_partial(
+            obj,
+            heap,
+            symbol,
+            PartialPropertyDescriptor {
+                value: Some(method),
+                writable: Some(true),
+                enumerable: Some(false),
+                configurable: Some(true),
+                ..Default::default()
+            },
+        );
+    }
     object::install_mapped_arguments(obj, heap, mapped_entries);
 }

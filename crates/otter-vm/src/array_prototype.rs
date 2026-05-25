@@ -18,8 +18,10 @@
 //! - One private `impl_*` function per method.
 //!
 //! # Invariants
-//! - Receivers must be `Value::Array`; non-arrays raise
-//!   `IntrinsicError::BadReceiver`.
+//! - Receivers must be `Value::Array`; `values()` also accepts
+//!   arguments-exotic objects because `%Array.prototype.values%`
+//!   is their spec `@@iterator`.
+//! - Other non-arrays raise `IntrinsicError::BadReceiver`.
 //! - Spec-mandated argument coercion (e.g., `slice` clamping
 //!   negatives) follows the foundation subset; rare edge cases
 //!   are documented inline.
@@ -1469,10 +1471,25 @@ fn impl_keys_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError>
 }
 
 fn impl_values_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = args
-        .receiver
-        .as_array()
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
+    let arr = if let Some(arr) = args.receiver.as_array() {
+        arr
+    } else if let Some(obj) = args.receiver.as_object()
+        && object::is_arguments_object(obj, args.gc_heap)
+    {
+        let len = object::get(obj, args.gc_heap, "length")
+            .and_then(|v| v.as_number())
+            .map(|n| n.as_f64().max(0.0) as usize)
+            .unwrap_or(0);
+        let mut snapshot: SmallVec<[Value; 4]> = SmallVec::with_capacity(len);
+        for index in 0..len {
+            snapshot.push(
+                object::get(obj, args.gc_heap, &index.to_string()).unwrap_or(Value::undefined()),
+            );
+        }
+        args.array_from_elements_rooted(snapshot.iter().cloned(), &[], &[snapshot.as_slice()])?
+    } else {
+        return Err(IntrinsicError::BadReceiver { expected: "array" });
+    };
     let handle = args.alloc_iterator_state_rooted(
         crate::IteratorState::Array {
             array: arr,

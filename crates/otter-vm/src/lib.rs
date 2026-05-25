@@ -3347,10 +3347,40 @@ impl Interpreter {
                             callee,
                         )
                     };
+                    let iterator_method =
+                        crate::object::get(self.global_this, &self.gc_heap, "Array")
+                            .and_then(|v| {
+                                if let Some(ctor) = v.as_object() {
+                                    crate::object::get(ctor, &self.gc_heap, "prototype")
+                                } else if let Some(native) = v.as_native_function() {
+                                    native
+                                        .own_property_descriptor(&mut self.gc_heap, "prototype")
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|d| match d.kind {
+                                            crate::object::DescriptorKind::Data { value } => {
+                                                Some(value)
+                                            }
+                                            _ => None,
+                                        })
+                                } else {
+                                    None
+                                }
+                            })
+                            .and_then(|v| v.as_object())
+                            .and_then(|prototype| {
+                                crate::object::get(prototype, &self.gc_heap, "values")
+                            });
+                    let iterator_symbol = self
+                        .well_known_symbols
+                        .get(crate::symbol::WellKnown::Iterator);
+                    let iterator_root = iterator_method.unwrap_or(Value::undefined());
+                    let iterator_descriptor =
+                        iterator_method.map(|method| (iterator_symbol, method));
                     let obj = if kind == ArgumentsObjectKind::Mapped {
                         let obj = self.alloc_stack_rooted_object_with_value_roots(
                             stack,
-                            &[&callee],
+                            &[&callee, &iterator_root],
                             &elements,
                         )?;
                         if let Some(proto) = self.object_prototype_object_opt() {
@@ -3362,13 +3392,14 @@ impl Interpreter {
                             elements,
                             callee,
                             mapped_entries,
+                            iterator_descriptor,
                         );
                         obj
                     } else {
                         let thrower = self.restricted_throw_type_error()?;
                         let obj = self.alloc_stack_rooted_object_with_value_roots(
                             stack,
-                            &[&thrower],
+                            &[&thrower, &iterator_root],
                             &elements,
                         )?;
                         if let Some(proto) = self.object_prototype_object_opt() {
@@ -3379,6 +3410,7 @@ impl Interpreter {
                             &mut self.gc_heap,
                             elements,
                             thrower,
+                            iterator_descriptor,
                         );
                         obj
                     };

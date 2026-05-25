@@ -16,7 +16,7 @@
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
-use crate::{NativeCtx, NativeError, Value};
+use crate::{NativeCtx, NativeError, Value, VmError};
 
 otter_macros::couch! {
     name = "Number",
@@ -333,8 +333,14 @@ fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     ctx.interp_mut()
         .run_eval(&arg, false)
-        .map_err(|err| NativeError::TypeError {
-            name: "eval",
-            reason: err.to_string(),
+        .map_err(|err| match err {
+            VmError::SyntaxError { message } => NativeError::SyntaxError {
+                name: "eval",
+                reason: message,
+            },
+            err => NativeError::TypeError {
+                name: "eval",
+                reason: err.to_string(),
+            },
         })
 }

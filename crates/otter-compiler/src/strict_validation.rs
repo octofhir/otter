@@ -32,10 +32,11 @@ use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, AwaitExpression,
     BindingIdentifier, BindingPattern, Class, ClassElement, DoWhileStatement, Expression,
     ForInStatement, ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
-    IdentifierReference, IfStatement, LabeledStatement, MethodDefinitionKind, NumericLiteral,
-    Program, PropertyKey, SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral,
-    SwitchStatement, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
-    VariableDeclarationKind, WhileStatement, YieldExpression,
+    IdentifierReference, IfStatement, LabeledStatement, MethodDefinition, MethodDefinitionKind,
+    NumericLiteral, ObjectProperty, Program, PropertyDefinition, PropertyKey, PropertyKind,
+    SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral, Super, SwitchStatement,
+    UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator, VariableDeclarationKind,
+    WhileStatement, YieldExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -65,6 +66,8 @@ pub fn validate_strict_mode_early_errors(
     let source_strict = force_strict || program.has_use_strict_directive();
     let mut visitor = StrictValidator {
         strict_stack: vec![source_strict],
+        super_stack: vec![false],
+        next_function_super_allowed: None,
         diagnostics: Vec::new(),
     };
     visitor.visit_program(program);
@@ -84,12 +87,18 @@ pub fn validate_strict_mode_early_errors(
 
 struct StrictValidator {
     strict_stack: Vec<bool>,
+    super_stack: Vec<bool>,
+    next_function_super_allowed: Option<bool>,
     diagnostics: Vec<SyntaxDiagnostic>,
 }
 
 impl StrictValidator {
     fn is_strict(&self) -> bool {
         self.strict_stack.last().copied().unwrap_or(false)
+    }
+
+    fn super_allowed(&self) -> bool {
+        self.super_stack.last().copied().unwrap_or(false)
     }
 
     /// Scan a class field / accessor initializer for free
@@ -613,6 +622,7 @@ fn function_declaration_body_span(body: &Statement<'_>) -> Option<Span> {
 
 impl<'a> Visit<'a> for StrictValidator {
     fn visit_function(&mut self, it: &Function<'a>, flags: ScopeFlags) {
+        let function_super_allowed = self.next_function_super_allowed.take().unwrap_or(false);
         let body_strict = it
             .body
             .as_ref()
@@ -676,7 +686,9 @@ impl<'a> Visit<'a> for StrictValidator {
         }
         let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);
+        self.super_stack.push(function_super_allowed);
         walk::walk_function(self, it, flags);
+        self.super_stack.pop();
         self.strict_stack.pop();
     }
 
@@ -734,6 +746,35 @@ impl<'a> Visit<'a> for StrictValidator {
         self.strict_stack.push(inner_strict);
         walk::walk_arrow_function_expression(self, it);
         self.strict_stack.pop();
+    }
+
+    fn visit_method_definition(&mut self, it: &MethodDefinition<'a>) {
+        self.next_function_super_allowed = Some(true);
+        walk::walk_method_definition(self, it);
+        self.next_function_super_allowed = None;
+    }
+
+    fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
+        let is_method = it.method || matches!(it.kind, PropertyKind::Get | PropertyKind::Set);
+        if is_method {
+            walk::walk_property_key(self, &it.key);
+            self.next_function_super_allowed = Some(true);
+            self.visit_expression(&it.value);
+            self.next_function_super_allowed = None;
+            return;
+        }
+        walk::walk_object_property(self, it);
+    }
+
+    fn visit_property_definition(&mut self, it: &PropertyDefinition<'a>) {
+        if let Some(value) = &it.value {
+            self.visit_property_key(&it.key);
+            self.super_stack.push(true);
+            self.visit_expression(value);
+            self.super_stack.pop();
+            return;
+        }
+        walk::walk_property_definition(self, it);
     }
 
     fn visit_class(&mut self, it: &Class<'a>) {
@@ -800,7 +841,27 @@ impl<'a> Visit<'a> for StrictValidator {
                 ),
             });
         }
+        self.super_stack.push(true);
         walk::walk_static_block(self, it);
+        self.super_stack.pop();
+    }
+
+    fn visit_super(&mut self, it: &Super) {
+        if !self.super_allowed() {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "SUPER_OUTSIDE_METHOD".to_string(),
+                message:
+                    "SyntaxError: `super` is only valid in methods and eval code within methods \
+                     (§19.2.1.1 PerformEval / SuperProperty early error)"
+                        .to_string(),
+                range: Some((it.span.start, it.span.end)),
+                help: Some(
+                    "`super` needs a method home object; indirect eval and ordinary functions \
+                     do not provide one"
+                        .to_string(),
+                ),
+            });
+        }
     }
 
     fn visit_numeric_literal(&mut self, it: &NumericLiteral<'a>) {

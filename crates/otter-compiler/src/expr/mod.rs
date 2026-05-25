@@ -272,6 +272,57 @@ pub(crate) fn compile_expr(
     }
 }
 
+pub(crate) fn compile_expr_with_inferred_name(
+    cx: &mut Compiler,
+    expr: &Expression<'_>,
+    inferred_name: &str,
+    enclosing_span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let expr = unwrap_ts_expr(expr);
+    match expr {
+        Expression::ParenthesizedExpression(p) => compile_expr_with_inferred_name(
+            cx,
+            &p.expression,
+            inferred_name,
+            (p.span.start, p.span.end),
+        ),
+        Expression::FunctionExpression(f) if f.id.is_none() => {
+            let span = (f.span.start, f.span.end);
+            let (function_id, captures) = compile_function_full(
+                cx,
+                inferred_name,
+                &f.params,
+                &f.body,
+                span,
+                f.r#async,
+                f.generator,
+                false,
+            )?;
+            let dst = cx.alloc_scratch();
+            let const_idx = cx.intern_function_id(function_id);
+            emit_make_callable(cx, dst, const_idx, &captures, false, span)?;
+            Ok(dst)
+        }
+        Expression::ArrowFunctionExpression(a) => {
+            let span = (a.span.start, a.span.end);
+            let (function_id, captures) = compile_arrow_function(cx, a, span)?;
+            {
+                let module = Rc::clone(&cx.top_mut().module);
+                module.borrow_mut().functions[function_id as usize].name =
+                    inferred_name.to_string();
+            }
+            let dst = cx.alloc_scratch();
+            let const_idx = cx.intern_function_id(function_id);
+            emit_make_callable(cx, dst, const_idx, &captures, true, span)?;
+            Ok(dst)
+        }
+        Expression::ClassExpression(class) if class.id.is_none() => {
+            compile_class(cx, class, Some(inferred_name))
+        }
+        _ => compile_expr(cx, expr, enclosing_span),
+    }
+}
+
 /// Lower a non-static `PropertyKey` to a register holding the
 /// runtime key value. Used by destructuring patterns when the
 /// key is a computed expression or a primitive literal that we

@@ -31,6 +31,16 @@ pub(crate) fn apply_default_into(
     default_expr: &Expression<'_>,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
+    apply_default_into_with_name(parent, value_reg, default_expr, None, span)
+}
+
+pub(crate) fn apply_default_into_with_name(
+    parent: &mut Compiler,
+    value_reg: u16,
+    default_expr: &Expression<'_>,
+    inferred_name: Option<&str>,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
     let undef_reg = parent.alloc_scratch();
     parent.emit(Op::LoadUndefined, [Operand::Register(undef_reg)], span);
     let cond_reg = parent.alloc_scratch();
@@ -47,7 +57,10 @@ pub(crate) fn apply_default_into(
     // evaluation entirely so the user's expression doesn't fire on
     // the common path.
     let skip_default = parent.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
-    let default_value = compile_expr(parent, default_expr, span)?;
+    let default_value = match inferred_name {
+        Some(name) => compile_expr_with_inferred_name(parent, default_expr, name, span)?,
+        None => compile_expr(parent, default_expr, span)?,
+    };
     parent.emit(
         Op::StoreLocal,
         vec![
@@ -108,7 +121,11 @@ pub(crate) fn destructure_pattern(
         }
         oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) => {
             let asgn_span = (asgn.span.start, asgn.span.end);
-            apply_default_into(parent, src_reg, &asgn.right, asgn_span)?;
+            let inferred_name = match &asgn.left {
+                oxc_ast::ast::BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+                _ => None,
+            };
+            apply_default_into_with_name(parent, src_reg, &asgn.right, inferred_name, asgn_span)?;
             destructure_pattern(parent, src_reg, &asgn.left, span, assign_existing)
         }
         oxc_ast::ast::BindingPattern::ArrayPattern(arr) => {

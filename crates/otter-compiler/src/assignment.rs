@@ -815,7 +815,13 @@ pub(crate) fn assign_maybe_default(
     use oxc_ast::ast::AssignmentTargetMaybeDefault;
     match target {
         AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(d) => {
-            let resolved = apply_default(cx, value_reg, &d.init, span)?;
+            let inferred_name = match &d.binding {
+                oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                    Some(id.name.as_str())
+                }
+                _ => None,
+            };
+            let resolved = apply_default_with_name(cx, value_reg, &d.init, inferred_name, span)?;
             assign_to_target(cx, &d.binding, resolved, span)
         }
         other => {
@@ -837,6 +843,16 @@ pub(crate) fn apply_default(
     cx: &mut Compiler,
     value_reg: u16,
     init: &oxc_ast::ast::Expression<'_>,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    apply_default_with_name(cx, value_reg, init, None, span)
+}
+
+pub(crate) fn apply_default_with_name(
+    cx: &mut Compiler,
+    value_reg: u16,
+    init: &oxc_ast::ast::Expression<'_>,
+    inferred_name: Option<&str>,
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
     // Test `value_reg !== undefined` and pick.
@@ -870,7 +886,10 @@ pub(crate) fn apply_default(
     // Default branch: if !is_undef (i.e. value defined) jump to
     // the "use value" arm; fall through into "use init".
     let jump_to_use_value = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_undef), span);
-    let init_val = compile_expr(cx, init, span)?;
+    let init_val = match inferred_name {
+        Some(name) => compile_expr_with_inferred_name(cx, init, name, span)?,
+        None => compile_expr(cx, init, span)?,
+    };
     cx.emit(
         Op::StoreLocal,
         [Operand::Register(init_val), Operand::Imm32(result as i32)],

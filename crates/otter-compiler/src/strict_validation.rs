@@ -35,7 +35,7 @@ use oxc_ast::ast::{
     IdentifierReference, IfStatement, LabeledStatement, MethodDefinitionKind, NumericLiteral,
     Program, PropertyKey, SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral,
     SwitchStatement, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
-    VariableDeclarationKind, WhileStatement,
+    VariableDeclarationKind, WhileStatement, YieldExpression,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
@@ -399,10 +399,9 @@ fn is_simple_parameter_list(params: &FormalParameters<'_>) -> bool {
     if params.rest.is_some() {
         return false;
     }
-    params
-        .items
-        .iter()
-        .all(|p| matches!(p.pattern, BindingPattern::BindingIdentifier(_)))
+    params.items.iter().all(|p| {
+        p.initializer.is_none() && matches!(p.pattern, BindingPattern::BindingIdentifier(_))
+    })
 }
 
 /// Collect names introduced by **lexical** declarations directly
@@ -558,6 +557,22 @@ where
     }
 }
 
+struct ContainsYieldScanner {
+    found: Option<Span>,
+}
+
+impl<'a> Visit<'a> for ContainsYieldScanner {
+    fn visit_yield_expression(&mut self, it: &YieldExpression<'a>) {
+        if self.found.is_none() {
+            self.found = Some(it.span);
+        }
+    }
+
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    fn visit_static_block(&mut self, _: &StaticBlock<'a>) {}
+}
+
 /// Return the source span of a `FunctionDeclaration` when `body` is
 /// that exact AST shape (rather than e.g. a `BlockStatement` or a
 /// `LabeledStatement` that wraps one). Used by the strict-mode body
@@ -597,6 +612,18 @@ impl<'a> Visit<'a> for StrictValidator {
         // non-simple-params restriction applies.
         if body_strict && !is_simple_parameter_list(&it.params) {
             self.flag_non_simple_use_strict(it.span);
+        }
+        let mut yield_scanner = ContainsYieldScanner { found: None };
+        yield_scanner.visit_formal_parameters(&it.params);
+        if let Some(span) = yield_scanner.found {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "ARROW_PARAMS_CONTAIN_YIELD".to_string(),
+                message:
+                    "SyntaxError: ArrowParameters must not contain a YieldExpression (§15.4.1)"
+                        .to_string(),
+                range: Some((span.start, span.end)),
+                help: Some("move `yield` out of the arrow parameter list".to_string()),
+            });
         }
         let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);

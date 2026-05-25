@@ -200,10 +200,9 @@ impl Interpreter {
     ///    clear the parked state. Otherwise advance the stage.
     /// 3. **`SymbolToPrim`** — look up `[Symbol.toPrimitive]`. If
     ///    callable, push a frame with `[hint]` and `this = obj`,
-    ///    park state with `stage = OrdinaryFirst` (set so a
-    ///    non-primitive result falls through to the ordinary
-    ///    chain). Otherwise fall through to `OrdinaryFirst`
-    ///    immediately.
+    ///    park state with `stage = SymbolResult` so a non-primitive
+    ///    result throws immediately. Otherwise fall through to
+    ///    `OrdinaryFirst`.
     /// 4. **`OrdinaryFirst` / `OrdinarySecond`** — pick `valueOf`
     ///    (default / number) or `toString` (string) for the first
     ///    slot; the other method for the second. If callable, push
@@ -253,6 +252,14 @@ impl Interpreter {
                 }
                 stack[top_idx].advance_pc(self.current_byte_len)?;
                 return Ok(false);
+            }
+            if state.stage == ToPrimitiveStage::SymbolResult {
+                if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                    cold.pending_to_primitive = None;
+                }
+                return Err(VmError::TypeError {
+                    message: "Symbol.toPrimitive returned a non-primitive".to_string(),
+                });
             }
             // Non-primitive — advance to the next stage.
             return self.drive_to_primitive_stage(
@@ -560,25 +567,13 @@ impl Interpreter {
                             let hint_str = JsString::from_str(hint.as_token(), &mut self.gc_heap)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
                             args.push(Value::string(hint_str));
-                            // §7.1.1 step 5.d. The resume guard
-                            // upstream validates the result is a
-                            // primitive — if not, that branch lands
-                            // on `OrdinaryFirst` which is **wrong**
-                            // per spec (a non-primitive return from
-                            // `[Symbol.toPrimitive]` is supposed to
-                            // throw TypeError directly). The runtime
-                            // currently routes that case through the
-                            // ordinary chain rather than throwing, to
-                            // mirror the existing `Op::ToNumber` hook
-                            // behaviour. Task 25 + a follow-up will
-                            // tighten this branch to spec.
                             return self.push_to_primitive_call(
                                 stack,
                                 context,
                                 dst,
                                 obj,
                                 hint,
-                                ToPrimitiveStage::OrdinaryFirst,
+                                ToPrimitiveStage::SymbolResult,
                                 &callee,
                                 obj,
                                 args,
@@ -707,6 +702,15 @@ impl Interpreter {
                         cold.pending_to_primitive = None;
                     }
                     return Err(VmError::TypeMismatch);
+                }
+                ToPrimitiveStage::SymbolResult => {
+                    let top_idx = stack.len() - 1;
+                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                        cold.pending_to_primitive = None;
+                    }
+                    return Err(VmError::TypeError {
+                        message: "Symbol.toPrimitive returned a non-primitive".to_string(),
+                    });
                 }
             }
         }

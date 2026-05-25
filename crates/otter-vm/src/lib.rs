@@ -5091,7 +5091,9 @@ fn ordinary_method_for(
     match stage {
         ToPrimitiveStage::OrdinaryFirst => first,
         ToPrimitiveStage::OrdinarySecond => second,
-        ToPrimitiveStage::SymbolToPrim | ToPrimitiveStage::Exhausted => "",
+        ToPrimitiveStage::SymbolToPrim
+        | ToPrimitiveStage::SymbolResult
+        | ToPrimitiveStage::Exhausted => "",
     }
 }
 

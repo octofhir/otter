@@ -195,9 +195,11 @@ pub enum PendingBindStage {
 #[non_exhaustive]
 pub enum ToPrimitiveStage {
     /// About to look up `[Symbol.toPrimitive]` and (if callable)
-    /// invoke it. On resume, validate the result is primitive;
-    /// otherwise fall through to [`Self::OrdinaryFirst`].
+    /// invoke it.
     SymbolToPrim,
+    /// Resuming from `[Symbol.toPrimitive]`; non-primitive results
+    /// throw instead of falling through to the ordinary chain.
+    SymbolResult,
     /// First slot of the OrdinaryToPrimitive chain — `valueOf` for
     /// `Default` / `Number` hints, `toString` for `String` hint.
     OrdinaryFirst,

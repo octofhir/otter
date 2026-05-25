@@ -302,6 +302,9 @@ pub enum Op {
     /// `Error(x)` lowering — the foundation makes no observable
     /// distinction yet (subclassing arrives with task 26).
     NewError,
+    /// Park a generator after call-time parameter/body-instantiation
+    /// prologue. No operands.
+    GeneratorStart,
 
     /// `r<dst> = GetIterator(r<src>)`. Operands:
     /// `Register(dst), Register(src)`. The runtime produces an
@@ -940,6 +943,7 @@ impl Op {
             Op::LeaveTry => "LEAVE_TRY",
             Op::EndFinally => "END_FINALLY",
             Op::NewError => "NEW_ERROR",
+            Op::GeneratorStart => "GENERATOR_START",
             Op::GetIterator => "GET_ITERATOR",
             Op::IteratorNext => "ITERATOR_NEXT",
             Op::IteratorClose => "ITERATOR_CLOSE",
@@ -1054,7 +1058,7 @@ impl Op {
     #[must_use]
     pub const fn operand_count(self) -> usize {
         match self {
-            Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally => 0,
+            Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally | Op::GeneratorStart => 0,
             Op::LoadUndefined
             | Op::LoadHole
             | Op::LoadNull

@@ -226,7 +226,7 @@ impl Interpreter {
         // visible synchronously, and park the new frame with
         // `return_register = None` so its eventual completion
         // settles the promise instead of writing back.
-        let (return_register, async_state) = if function.is_async {
+        let (return_register, async_state) = if function.is_async && !function.is_generator {
             let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(
                     self,
@@ -283,6 +283,16 @@ impl Interpreter {
             // Backlink the generator into the frame so `Op::Yield`
             // can find its owner once execution starts.
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
+            let (frame, cold) = gen_handle
+                .take_frame(&mut self.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            let mut frame = *frame;
+            if let Some(cold) = cold {
+                self.frame_attach_cold(&mut frame, cold);
+            }
+            let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            prologue_stack.push(frame);
+            self.dispatch_loop(context, &mut prologue_stack)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
             return Ok(());
@@ -343,6 +353,7 @@ impl Interpreter {
     fn push_prepared_bytecode_call_frame(
         &mut self,
         stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
         dst: u16,
         prepared: PreparedBytecodeFrame,
     ) -> Result<(), VmError> {
@@ -361,6 +372,16 @@ impl Interpreter {
             )?;
             gen_handle.set_async(&mut self.gc_heap, is_async_generator);
             gen_handle.install_owner_on_frame(&mut self.gc_heap);
+            let (frame, cold) = gen_handle
+                .take_frame(&mut self.gc_heap)
+                .ok_or(VmError::InvalidOperand)?;
+            let mut frame = *frame;
+            if let Some(cold) = cold {
+                self.frame_attach_cold(&mut frame, cold);
+            }
+            let mut prologue_stack: SmallVec<[Frame; 8]> = SmallVec::new();
+            prologue_stack.push(frame);
+            self.dispatch_loop(context, &mut prologue_stack)?;
             let top_idx = stack.len() - 1;
             write_register(&mut stack[top_idx], dst, Value::generator(gen_handle))?;
             return Ok(());
@@ -414,7 +435,7 @@ impl Interpreter {
             });
         }
         let top_idx = stack.len() - 1;
-        let (return_register, async_state) = if function.is_async {
+        let (return_register, async_state) = if function.is_async && !function.is_generator {
             let result_promise = promise_dispatch::PromiseBuilder::with_context(context.clone())
                 .pending_stack_rooted(self, stack, &[&this_for_callee], &[])?;
             let promise_value = Value::promise(result_promise);
@@ -437,7 +458,7 @@ impl Interpreter {
                 async_state,
             )?
         };
-        self.push_prepared_bytecode_call_frame(stack, dst, prepared)?;
+        self.push_prepared_bytecode_call_frame(stack, context, dst, prepared)?;
         Ok(true)
     }
 

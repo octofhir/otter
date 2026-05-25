@@ -128,6 +128,9 @@ pub(crate) fn compile_function_full(
         // means calls placed textually above the declaration
         // resolve correctly.
         hoist_function_declarations(parent, &body.statements)?;
+        if is_generator {
+            parent.emit(Op::GeneratorStart, vec![], span);
+        }
         for stmt in &body.statements {
             compile_statement(parent, stmt)?;
         }

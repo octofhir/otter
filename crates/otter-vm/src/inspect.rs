@@ -861,6 +861,7 @@ mod tests {
         Op::LeaveTry,
         Op::EndFinally,
         Op::NewError,
+        Op::GeneratorStart,
         Op::GetIterator,
         Op::IteratorNext,
         Op::IteratorClose,

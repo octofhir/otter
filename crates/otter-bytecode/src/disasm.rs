@@ -215,6 +215,7 @@ mod tests {
             Op::LeaveTry,
             Op::EndFinally,
             Op::NewError,
+            Op::GeneratorStart,
             Op::GetIterator,
             Op::IteratorNext,
             Op::IteratorClose,
@@ -284,7 +285,9 @@ mod tests {
 
     fn fixture_operands(op: Op) -> Vec<Operand> {
         match op {
-            Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally => Vec::new(),
+            Op::Nop | Op::ReturnUndefined | Op::LeaveTry | Op::EndFinally | Op::GeneratorStart => {
+                Vec::new()
+            }
             Op::LoadUndefined
             | Op::LoadHole
             | Op::Return

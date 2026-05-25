@@ -2969,6 +2969,15 @@ impl Interpreter {
                     }
                     return Ok(yielded);
                 }
+                Op::GeneratorStart => {
+                    let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    let owner = frame.generator_owner.ok_or(VmError::TypeMismatch)?;
+                    frame.advance_pc(self.current_byte_len)?;
+                    let mut popped = stack.pop().expect("frame present");
+                    let detached_cold = self.frame_detach_cold(&mut popped);
+                    owner.park_frame(&mut self.gc_heap, popped, detached_cold);
+                    return Ok(Value::undefined());
+                }
                 // ToNumber on an object whose `[Symbol.toPrimitive]`
                 // is callable must invoke that hook (ECMA-262
                 // §7.1.1 OrdinaryToPrimitive). The synchronous path

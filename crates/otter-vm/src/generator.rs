@@ -248,6 +248,21 @@ impl JsGenerator {
         heap.record_write(self.inner, &barrier_value);
     }
 
+    /// Store a frame that is suspended before the first body
+    /// statement runs.
+    pub fn park_frame(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+        frame: Frame,
+        cold: Option<Box<crate::cold_frame::ColdFrame>>,
+    ) {
+        heap.with_payload(self.inner, |body| {
+            body.frame = Some(Box::new(frame));
+            body.cold = cold;
+            body.yielded = None;
+        });
+    }
+
     /// Take the last yielded value.
     pub fn take_yielded(&self, heap: &mut otter_gc::GcHeap) -> Option<crate::Value> {
         heap.with_payload(self.inner, |body| body.yielded.take())

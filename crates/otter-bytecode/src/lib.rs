@@ -312,6 +312,11 @@ pub enum Op {
     /// elements, `String` walks code units, and user objects route
     /// through `[@@iterator]`.
     GetIterator,
+    /// `r<dst> = GetAsyncIterator(r<src>)`. Operands:
+    /// `Register(dst), Register(src)`. The runtime first observes
+    /// `[@@asyncIterator]`; when absent it falls back to a sync
+    /// iterator value for async-from-sync delegation.
+    GetAsyncIterator,
     /// Drive an iterator one step. Operands:
     /// `Register(value_dst), Register(done_dst), Register(iter)`.
     /// Writes the next value into `value_dst` and a `Boolean` into
@@ -945,6 +950,7 @@ impl Op {
             Op::NewError => "NEW_ERROR",
             Op::GeneratorStart => "GENERATOR_START",
             Op::GetIterator => "GET_ITERATOR",
+            Op::GetAsyncIterator => "GET_ASYNC_ITERATOR",
             Op::IteratorNext => "ITERATOR_NEXT",
             Op::IteratorClose => "ITERATOR_CLOSE",
             Op::IteratorCloseStart => "ITERATOR_CLOSE_START",
@@ -1145,6 +1151,7 @@ impl Op {
             | Op::ArrayLength
             | Op::NewError
             | Op::GetIterator
+            | Op::GetAsyncIterator
             | Op::ArrayPush
             | Op::NewWeakRef
             | Op::NewFinalizationRegistry => 2,

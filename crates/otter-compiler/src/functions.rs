@@ -36,6 +36,7 @@ pub(crate) fn compile_function_full(
     let uses_mapped_arguments = needs_arguments && !function_is_strict && simple_params;
     validate_formal_parameter_names(params, function_is_strict, allow_duplicate_formals, span)?;
     let mut child = FunctionContext::new(Rc::clone(&module)).with_strict(function_is_strict);
+    child.is_async_generator = is_async_generator;
     if let Some(b) = body {
         child.captured_names = capture::analyze_function(Some(params), b);
     }

@@ -863,6 +863,7 @@ mod tests {
         Op::NewError,
         Op::GeneratorStart,
         Op::GetIterator,
+        Op::GetAsyncIterator,
         Op::IteratorNext,
         Op::IteratorClose,
         Op::IteratorCloseStart,

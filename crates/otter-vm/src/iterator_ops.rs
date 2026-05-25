@@ -170,6 +170,66 @@ impl Interpreter {
         Ok(())
     }
 
+    pub(crate) fn run_get_async_iterator_regs(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        top_idx: usize,
+        dst: u16,
+        src: u16,
+    ) -> Result<(), VmError> {
+        let value = *read_register(&stack[top_idx], src)?;
+        if let Some(handle) = value.as_generator()
+            && handle.is_async(&self.gc_heap)
+        {
+            write_register(&mut stack[top_idx], dst, value)?;
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
+
+        let async_iter_sym = self
+            .well_known_symbols
+            .get(symbol::WellKnown::AsyncIterator);
+        let can_have_method = value.as_object().is_some()
+            || value.as_array().is_some()
+            || value.as_map().is_some()
+            || value.as_set().is_some()
+            || value.is_proxy();
+        if can_have_method {
+            let method = match self.ordinary_get_value(
+                context,
+                value,
+                value,
+                &VmPropertyKey::Symbol(async_iter_sym),
+                0,
+            )? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                }
+            };
+            if !method.is_nullish() {
+                if !is_callable(&method) {
+                    return Err(VmError::TypeMismatch);
+                }
+                let produced = self.run_callable_sync(context, &method, value, SmallVec::new())?;
+                if produced.as_object().is_none()
+                    && produced.as_generator().is_none()
+                    && produced.as_iterator().is_none()
+                    && produced.as_array().is_none()
+                    && !produced.is_proxy()
+                {
+                    return Err(VmError::TypeMismatch);
+                }
+                write_register(&mut stack[top_idx], dst, produced)?;
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
+        }
+
+        self.run_get_iterator_regs(stack, top_idx, dst, src)
+    }
+
     pub(crate) fn run_iterator_next_regs(
         &mut self,
         frame: &mut Frame,

@@ -3030,6 +3030,16 @@ impl Interpreter {
                     self.run_get_iterator_regs(&mut *stack, top_idx, dst, src)?;
                     continue;
                 }
+                Op::GetAsyncIterator => {
+                    let dst = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let src = context
+                        .exec_register(instr, 1)
+                        .ok_or(VmError::InvalidOperand)?;
+                    self.run_get_async_iterator_regs(context, &mut *stack, top_idx, dst, src)?;
+                    continue;
+                }
                 // §7.4.5 `IteratorNext`. Built-in iterators step
                 // synchronously; user iterators push a call to
                 // `iter.next()` and resume to extract `value` /

@@ -29,6 +29,7 @@ pub(crate) struct FunctionContext {
     /// lowered. This is compile-time metadata stored on the
     /// resulting bytecode function and also drives early errors.
     pub(crate) is_strict: bool,
+    pub(crate) is_async_generator: bool,
     /// Stack of enclosing loops; the innermost is on top.
     pub(crate) loops: Vec<LoopFrame>,
     /// Label deposited by the immediately-enclosing
@@ -84,6 +85,7 @@ impl FunctionContext {
             scratch: 0,
             scopes: Vec::new(),
             is_strict: false,
+            is_async_generator: false,
             loops: Vec::new(),
             pending_label: None,
             hoisted_function_names: HashSet::new(),

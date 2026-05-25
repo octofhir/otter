@@ -217,6 +217,7 @@ mod tests {
             Op::NewError,
             Op::GeneratorStart,
             Op::GetIterator,
+            Op::GetAsyncIterator,
             Op::IteratorNext,
             Op::IteratorClose,
             Op::IteratorCloseStart,
@@ -386,6 +387,7 @@ mod tests {
             | Op::PromiseCall
             | Op::DefineOwnProperty => vec![reg(0), reg(1), reg(2)],
             Op::IteratorNext => vec![reg(0), reg(1), reg(2)],
+            Op::GetAsyncIterator => vec![reg(0), reg(1)],
             Op::IteratorClose | Op::IteratorCloseStart | Op::IteratorCloseEnd => vec![reg(0)],
             Op::CallSpread | Op::New | Op::MakeClass | Op::StoreProperty | Op::StoreElement => {
                 vec![reg(0), reg(1), reg(2), reg(3)]

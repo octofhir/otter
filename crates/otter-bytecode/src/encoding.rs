@@ -556,6 +556,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::IteratorCloseStart, 0x7D),
     (Op::IteratorCloseEnd, 0x7E),
     (Op::GeneratorStart, 0x7F),
+    (Op::GetAsyncIterator, 0x80),
 ];
 
 #[cfg(test)]

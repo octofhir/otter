@@ -637,8 +637,14 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let name = key.name();
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let value = if let Some(o) = receiver.as_object() {
-            crate::object::get(o, &self.gc_heap, name).unwrap_or(Value::undefined())
+        let value = if receiver.as_object().is_some() {
+            let key = VmPropertyKey::String(name);
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+                }
+            }
         } else if let Some(c) = receiver.as_class_constructor() {
             if name == "prototype" {
                 Value::object(c.prototype(&self.gc_heap))

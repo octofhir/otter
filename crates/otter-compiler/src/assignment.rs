@@ -313,9 +313,6 @@ pub(crate) fn compile_assignment(
     let value = match compound_op {
         None => compile_expr(cx, &a.right, span)?,
         Some(op) => {
-            if storage.is_none() && cx.is_strict {
-                return Ok(emit_reference_error(cx, &name, span));
-            }
             let current = cx.alloc_scratch();
             let mut with_done = None;
             if let Some(probe) = &with_ref {
@@ -328,9 +325,12 @@ pub(crate) fn compile_assignment(
             match storage {
                 Some(s) => cx.emit_load_storage(current, s, span),
                 None => {
-                    let global = cx.alloc_scratch();
-                    cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
-                    cx.emit_load_property(current, global, &name, span);
+                    let name_idx = cx.intern_string_constant(&name);
+                    cx.emit(
+                        Op::LoadGlobalOrThrow,
+                        [Operand::Register(current), Operand::ConstIndex(name_idx)],
+                        span,
+                    );
                 }
             }
             if let Some(done) = with_done {
@@ -398,14 +398,37 @@ pub(crate) fn compile_assignment(
             cx.emit_module_export_mirror(&name, value, span);
         }
         None => {
-            if cx.is_strict {
-                emit_reference_error(cx, &name, span);
-                return Ok(value);
-            }
-            // Store to the globalThis property table.
+            // §9.1.1.4.5 Object Environment Records
+            // SetMutableBinding(N, V, S): after the compound
+            // assignment has evaluated the getter/RHS, strict stores
+            // must re-check that the global object binding still
+            // exists before PutValue writes the new value.
             let global = cx.alloc_scratch();
             cx.emit(Op::LoadGlobalThis, [Operand::Register(global)], span);
             let name_idx = cx.intern_string_constant(&name);
+            if cx.is_strict {
+                let key_reg = cx.alloc_scratch();
+                cx.emit(
+                    Op::LoadString,
+                    [Operand::Register(key_reg), Operand::ConstIndex(name_idx)],
+                    span,
+                );
+                let still_exists = cx.alloc_scratch();
+                cx.emit(
+                    Op::HasProperty,
+                    [
+                        Operand::Register(still_exists),
+                        Operand::Register(key_reg),
+                        Operand::Register(global),
+                    ],
+                    span,
+                );
+                let still_exists_ok =
+                    cx.emit_branch_placeholder(Op::JumpIfTrue, Some(still_exists), span);
+                emit_reference_error(cx, &name, span);
+                cx.patch_branch_to_here(still_exists_ok);
+            }
+            // Store to the globalThis property table.
             let scratch = cx.alloc_scratch();
             cx.emit(
                 Op::StoreProperty,

@@ -17,7 +17,12 @@
 //! - [`crate::executable`]
 //! - [`crate::object`]
 
-use crate::{ExecutionContext, Frame, Interpreter, Value, VmError, object, write_register};
+use smallvec::SmallVec;
+
+use crate::{
+    ExecutionContext, Frame, Interpreter, Value, VmError, VmGetOutcome, VmPropertyKey, object,
+    write_register,
+};
 
 impl Interpreter {
     pub(crate) fn run_load_global_this_reg(
@@ -31,7 +36,7 @@ impl Interpreter {
     }
 
     pub(crate) fn run_load_global_or_throw_reg(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         frame: &mut Frame,
         dst: u16,
@@ -40,15 +45,22 @@ impl Interpreter {
         let name = context
             .string_constant_str(name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(value) = crate::object::get(self.global_this, &self.gc_heap, name) {
-            write_register(frame, dst, value)?;
-            frame.advance_pc(self.current_byte_len)?;
-            Ok(())
-        } else {
-            Err(VmError::UndefinedIdentifier {
+        let receiver = Value::object(self.global_this);
+        let key = VmPropertyKey::String(name);
+        if !self.ordinary_has_property_value(context, receiver, &key, 0)? {
+            return Err(VmError::UndefinedIdentifier {
                 name: name.to_string(),
-            })
+            });
         }
+        let value = match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, receiver, SmallVec::new())?
+            }
+        };
+        write_register(frame, dst, value)?;
+        frame.advance_pc(self.current_byte_len)?;
+        Ok(())
     }
 
     pub(crate) fn run_load_global_or_undefined_reg(

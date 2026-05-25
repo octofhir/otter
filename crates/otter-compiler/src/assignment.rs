@@ -1097,15 +1097,34 @@ pub(crate) fn store_identifier(
 ) -> Result<(), CompileError> {
     let storage = match cx.lookup_binding(name) {
         Some(info) if info.is_const => {
-            return Err(CompileError::Unsupported {
-                node: format!("destructuring assignment to const `{name}`"),
+            emit_assignment_type_error(
+                cx,
+                &format!("Assignment to constant variable `{name}`"),
                 span,
-            });
+            );
+            return Ok(());
         }
         Some(info) => Some(info.storage),
-        None => cx
-            .resolve_capture(name)
-            .map(|idx| BindingStorage::Upvalue { idx }),
+        None => {
+            let captured_const = cx.stack.iter().rev().skip(1).any(|frame| {
+                frame
+                    .scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.bindings.get(name))
+                    .is_some_and(|info| info.is_const)
+            });
+            if captured_const {
+                emit_assignment_type_error(
+                    cx,
+                    &format!("Assignment to constant variable `{name}`"),
+                    span,
+                );
+                return Ok(());
+            }
+            cx.resolve_capture(name)
+                .map(|idx| BindingStorage::Upvalue { idx })
+        }
     };
     match storage {
         Some(s) => {
@@ -1136,6 +1155,31 @@ pub(crate) fn store_identifier(
         }
     }
     Ok(())
+}
+
+fn emit_assignment_type_error(cx: &mut Compiler, message: &str, span: (u32, u32)) -> u16 {
+    let message_reg = cx.alloc_scratch();
+    let message = cx.intern_string_constant(message);
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(message_reg), Operand::ConstIndex(message)],
+        span,
+    );
+    let error_reg = cx.alloc_scratch();
+    let kind = cx.intern_string_constant("TypeError");
+    cx.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
+    let result = cx.alloc_scratch();
+    cx.emit(Op::LoadUndefined, [Operand::Register(result)], span);
+    result
 }
 
 fn emit_reference_error(cx: &mut Compiler, name: &str, span: (u32, u32)) -> u16 {

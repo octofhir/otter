@@ -29,9 +29,9 @@ use std::collections::BTreeMap;
 
 use otter_syntax::SyntaxDiagnostic;
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingIdentifier,
-    BindingPattern, Class, ClassElement, DoWhileStatement, Expression, ForInStatement,
-    ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
+    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, AwaitExpression,
+    BindingIdentifier, BindingPattern, Class, ClassElement, DoWhileStatement, Expression,
+    ForInStatement, ForOfStatement, ForStatement, ForStatementLeft, FormalParameters, Function,
     IdentifierReference, IfStatement, LabeledStatement, MethodDefinitionKind, NumericLiteral,
     Program, PropertyKey, SimpleAssignmentTarget, Statement, StaticBlock, StringLiteral,
     SwitchStatement, UnaryExpression, UnaryOperator, UpdateExpression, UpdateOperator,
@@ -404,6 +404,18 @@ fn is_simple_parameter_list(params: &FormalParameters<'_>) -> bool {
     })
 }
 
+fn collect_param_bound_names<'a, F>(params: &'a FormalParameters<'a>, emit: &mut F)
+where
+    F: FnMut(&'a str, oxc_span::Span),
+{
+    for param in &params.items {
+        for_each_bound_identifier(&param.pattern, emit);
+    }
+    if let Some(rest) = &params.rest {
+        for_each_bound_identifier(&rest.rest.argument, emit);
+    }
+}
+
 /// Collect names introduced by **lexical** declarations directly
 /// inside `stmts` — `let`, `const`, `class`, and every
 /// `FunctionDeclaration` shape (sync, async, generator, async
@@ -573,6 +585,22 @@ impl<'a> Visit<'a> for ContainsYieldScanner {
     fn visit_static_block(&mut self, _: &StaticBlock<'a>) {}
 }
 
+struct ContainsAwaitScanner {
+    found: Option<Span>,
+}
+
+impl<'a> Visit<'a> for ContainsAwaitScanner {
+    fn visit_await_expression(&mut self, it: &AwaitExpression<'a>) {
+        if self.found.is_none() {
+            self.found = Some(it.span);
+        }
+    }
+
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    fn visit_static_block(&mut self, _: &StaticBlock<'a>) {}
+}
+
 /// Return the source span of a `FunctionDeclaration` when `body` is
 /// that exact AST shape (rather than e.g. a `BlockStatement` or a
 /// `LabeledStatement` that wraps one). Used by the strict-mode body
@@ -625,6 +653,36 @@ impl<'a> Visit<'a> for StrictValidator {
                 help: Some("move `yield` out of the arrow parameter list".to_string()),
             });
         }
+        let mut await_scanner = ContainsAwaitScanner { found: None };
+        await_scanner.visit_formal_parameters(&it.params);
+        if let Some(span) = await_scanner.found {
+            self.diagnostics.push(SyntaxDiagnostic {
+                code: "ARROW_PARAMS_CONTAIN_AWAIT".to_string(),
+                message:
+                    "SyntaxError: ArrowParameters must not contain an AwaitExpression (§15.4.1)"
+                        .to_string(),
+                range: Some((span.start, span.end)),
+                help: Some("move `await` out of the arrow parameter list".to_string()),
+            });
+        }
+        let mut param_names: BTreeMap<&str, Span> = BTreeMap::new();
+        collect_param_bound_names(&it.params, &mut |name, span| {
+            param_names.entry(name).or_insert(span);
+        });
+        collect_lex_decl_names(&it.body.statements, &mut |name, span| {
+            if param_names.contains_key(name) {
+                self.diagnostics.push(SyntaxDiagnostic {
+                    code: "ARROW_PARAM_LEXICAL_REDECLARATION".to_string(),
+                    message: format!(
+                        "SyntaxError: arrow parameter `{name}` conflicts with a lexical declaration in the body (§15.4.1)"
+                    ),
+                    range: Some((span.start, span.end)),
+                    help: Some(
+                        "rename either the parameter or the lexical declaration".to_string(),
+                    ),
+                });
+            }
+        });
         let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);
         walk::walk_arrow_function_expression(self, it);

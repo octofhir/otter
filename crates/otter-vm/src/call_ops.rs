@@ -1069,8 +1069,18 @@ impl Interpreter {
         if callee.is_bound_function() {
             return self.construct_prototype_via_get(context, callee);
         }
-        if callee.is_native_function() {
-            return Ok(None);
+        if let Some(native) = callee.as_native_function() {
+            return native
+                .own_property_descriptor(&mut self.gc_heap, "prototype")
+                .map_err(|_| VmError::InvalidOperand)
+                .map(|desc| {
+                    desc.and_then(|d| match d.kind {
+                        crate::object::DescriptorKind::Data { value } if value.is_object_type() => {
+                            Some(value)
+                        }
+                        _ => None,
+                    })
+                });
         }
         Ok(None)
     }
@@ -1111,8 +1121,18 @@ impl Interpreter {
         if callee.is_bound_function() {
             return self.construct_prototype_via_get(context, callee);
         }
-        if callee.is_native_function() {
-            return Ok(None);
+        if let Some(native) = callee.as_native_function() {
+            return native
+                .own_property_descriptor(&mut self.gc_heap, "prototype")
+                .map_err(|_| VmError::InvalidOperand)
+                .map(|desc| {
+                    desc.and_then(|d| match d.kind {
+                        crate::object::DescriptorKind::Data { value } if value.is_object_type() => {
+                            Some(value)
+                        }
+                        _ => None,
+                    })
+                });
         }
         Ok(None)
     }

@@ -1168,6 +1168,11 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let recv = *read_register(frame, recv_reg)?;
         let idx_value_raw = *read_register(frame, idx_reg)?;
+        if recv.is_nullish() {
+            return Err(VmError::TypeError {
+                message: "Cannot read property of null or undefined".to_string(),
+            });
+        }
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         let value = if let Some(obj) = recv.as_object() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
@@ -2386,6 +2391,11 @@ impl Interpreter {
         let top_idx = stack.len() - 1;
         let receiver = *read_register(&stack[top_idx], obj_reg)?;
         let key_value_raw = *read_register(&stack[top_idx], key_reg)?;
+        if receiver.is_nullish() {
+            return Err(VmError::TypeError {
+                message: "Cannot read property of null or undefined".to_string(),
+            });
+        }
         let key_value = self.coerce_property_key_value(context, key_value_raw)?;
         let key = if let Some(s) = key_value.as_string(&self.gc_heap) {
             VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))

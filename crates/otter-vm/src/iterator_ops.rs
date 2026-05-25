@@ -1227,16 +1227,29 @@ impl Interpreter {
             let produced = *read_register(&stack[top_idx], dst)?;
             // §7.4.3 step 2 — `[@@iterator]()` must return an
             // Object. Anything else is a TypeError.
-            if !produced.is_object() {
-                if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
-                    cold.pending_get_iterator = None;
-                }
-                return Err(VmError::TypeMismatch);
-            }
-            let iter_state = IteratorState::User { iterator: produced };
-            let iter =
-                self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
-            write_register(&mut stack[top_idx], dst, Value::iterator(iter))?;
+            let produced_value = if let Some(iter) = produced.as_iterator() {
+                Value::iterator(iter)
+            } else {
+                let iter_state = if let Some(handle) = produced.as_generator() {
+                    IteratorState::Generator { handle }
+                } else if produced.is_object()
+                    || produced.is_proxy()
+                    || produced.is_array()
+                    || produced.is_map()
+                    || produced.is_set()
+                {
+                    IteratorState::User { iterator: produced }
+                } else {
+                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
+                        cold.pending_get_iterator = None;
+                    }
+                    return Err(VmError::TypeMismatch);
+                };
+                let iter =
+                    self.alloc_stack_rooted_iterator_state(stack, iter_state, &[&produced], &[])?;
+                Value::iterator(iter)
+            };
+            write_register(&mut stack[top_idx], dst, produced_value)?;
             if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx]) {
                 cold.pending_get_iterator = None;
             }
@@ -1247,10 +1260,49 @@ impl Interpreter {
         // 2 + 3. Fresh entry — only intercept user objects. The
         // built-in fast path is the existing in-frame match arm.
         let value = *read_register(&stack[top_idx], src)?;
+        let iter_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
+        if let Some(arr) = value.as_array() {
+            let own_method = array::get_symbol_property(arr, &self.gc_heap, iter_sym);
+            let proto = self.constructor_prototype_value("Array")?;
+            let proto_has = if own_method.is_none() {
+                self.ordinary_has_property_value(
+                    context,
+                    proto,
+                    &VmPropertyKey::Symbol(iter_sym),
+                    0,
+                )?
+            } else {
+                false
+            };
+            if own_method.is_some() || proto_has {
+                let callee = if let Some(method) = own_method {
+                    method
+                } else {
+                    match self.ordinary_get_value(
+                        context,
+                        proto,
+                        value,
+                        &VmPropertyKey::Symbol(iter_sym),
+                        0,
+                    )? {
+                        VmGetOutcome::Value(v) => v,
+                        VmGetOutcome::InvokeGetter { getter } => {
+                            self.run_callable_sync(context, &getter, value, SmallVec::new())?
+                        }
+                    }
+                };
+                if callee.is_undefined() || callee.is_null() || !is_callable(&callee) {
+                    return Err(VmError::TypeMismatch);
+                }
+                self.frame_ensure_cold(&mut stack[top_idx])
+                    .pending_get_iterator = Some(PendingGetIterator { pc, dst });
+                self.invoke(stack, context, &callee, value, SmallVec::new(), dst)?;
+                return Ok(true);
+            }
+        }
         let Some(obj) = value.as_object() else {
             return Ok(false);
         };
-        let iter_sym = self.well_known_symbols.get(symbol::WellKnown::Iterator);
         let Some(callee) = crate::object::get_symbol(obj, &self.gc_heap, iter_sym) else {
             // No `[Symbol.iterator]` — §7.4.3 step 2 throws.
             return Err(VmError::TypeMismatch);

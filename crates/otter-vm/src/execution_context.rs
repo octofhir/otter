@@ -264,6 +264,7 @@ mod tests {
                 locals: 0,
                 scratch,
                 param_count: 0,
+                length: 0,
                 own_upvalue_count: 0,
                 is_strict: false,
                 is_arrow: false,

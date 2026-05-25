@@ -111,6 +111,22 @@ pub(crate) fn formal_parameters_are_simple(params: &oxc_ast::ast::FormalParamete
         })
 }
 
+pub(crate) fn formal_parameter_length(params: &oxc_ast::ast::FormalParameters<'_>) -> u16 {
+    let mut count = 0u16;
+    for param in &params.items {
+        if param.initializer.is_some()
+            || matches!(
+                param.pattern,
+                oxc_ast::ast::BindingPattern::AssignmentPattern(_)
+            )
+        {
+            break;
+        }
+        count = count.checked_add(1).expect("too many parameters");
+    }
+    count
+}
+
 pub(crate) fn validate_formal_parameter_names(
     params: &oxc_ast::ast::FormalParameters<'_>,
     is_strict: bool,

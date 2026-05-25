@@ -1511,6 +1511,9 @@ pub struct Function {
     /// register slots are reserved for parameter binding.
     #[serde(default)]
     pub param_count: u16,
+    /// ECMAScript `Function.prototype.length` metadata.
+    #[serde(default)]
+    pub length: u16,
     /// Number of fresh [`UpvalueCell`]s the prologue allocates for
     /// this function's own locals that are captured by inner
     /// closures. The frame's `upvalues` array is laid out as

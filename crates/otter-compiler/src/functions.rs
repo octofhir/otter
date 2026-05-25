@@ -49,6 +49,7 @@ pub(crate) fn compile_function_full(
     // can address them by ordinal. The compiler's scratch counter
     // tracks them so subsequent register allocations don't collide.
     let param_count = u16::try_from(params.items.len()).expect("too many parameters");
+    let length = formal_parameter_length(params);
     parent.scratch = param_count;
     let has_rest = params.rest.is_some();
 
@@ -150,6 +151,7 @@ pub(crate) fn compile_function_full(
     slot.locals = 0;
     slot.scratch = child.scratch;
     slot.param_count = param_count;
+    slot.length = length;
     slot.has_rest = has_rest;
     slot.is_async = is_async;
     slot.is_generator = is_generator;
@@ -193,6 +195,7 @@ pub(crate) fn compile_arrow_function(
     parent.enter_scope();
 
     let param_count = u16::try_from(arrow.params.items.len()).expect("too many parameters");
+    let length = formal_parameter_length(&arrow.params);
     parent.scratch = param_count;
     let has_rest = arrow.params.rest.is_some();
 
@@ -275,6 +278,7 @@ pub(crate) fn compile_arrow_function(
     slot.locals = 0;
     slot.scratch = child.scratch;
     slot.param_count = param_count;
+    slot.length = length;
     slot.has_rest = has_rest;
     slot.is_async = arrow.r#async;
     slot.own_upvalue_count = child.own_upvalue_count;

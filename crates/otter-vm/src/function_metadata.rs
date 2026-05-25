@@ -414,7 +414,7 @@ fn callable_length(ctx: &mut FunctionMetadataContext<'_>, callee: &Value) -> Res
             return Ok(0.0);
         }
         let function = ctx.context.function(fid).ok_or(VmError::InvalidOperand)?;
-        return Ok(f64::from(function.param_count));
+        return Ok(f64::from(function.length));
     }
     if let Some(native) = callee.as_native_function() {
         return match native.own_property_descriptor(ctx.gc_heap, "length")? {

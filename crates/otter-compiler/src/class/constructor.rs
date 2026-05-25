@@ -84,6 +84,7 @@ pub(crate) fn compile_synthetic_constructor(
     slot.locals = 0;
     slot.scratch = child.scratch;
     slot.param_count = 0;
+    slot.length = 0;
     slot.has_rest = is_derived;
     slot.own_upvalue_count = child.own_upvalue_count;
     slot.code = child.code;
@@ -121,6 +122,7 @@ pub(crate) fn compile_class_constructor(
     parent.enter_scope();
 
     let param_count = u16::try_from(params.items.len()).expect("too many parameters");
+    let length = formal_parameter_length(params);
     parent.scratch = param_count;
     let has_rest = params.rest.is_some();
 
@@ -209,6 +211,7 @@ pub(crate) fn compile_class_constructor(
     slot.locals = 0;
     slot.scratch = child.scratch;
     slot.param_count = param_count;
+    slot.length = length;
     slot.has_rest = has_rest;
     slot.is_async = is_async;
     slot.own_upvalue_count = child.own_upvalue_count;

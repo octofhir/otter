@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - simple and rest parameter compilation
+//! - parameter-default eval conflict checks
 //! - strict-name validation
 //! - mapped arguments binding metadata
 //!
@@ -41,7 +42,13 @@ pub(crate) fn compile_formal_parameter(
         );
     }
     if let Some(default_expr) = initializer {
-        apply_default_into(parent, ordinal, default_expr, span)?;
+        if let Some(name) = simple_binding_name(pattern)
+            && direct_eval_var_declares(default_expr, name)
+        {
+            apply_default_syntax_error_into(parent, ordinal, name, span)?;
+        } else {
+            apply_default_into(parent, ordinal, default_expr, span)?;
+        }
     }
     if let oxc_ast::ast::BindingPattern::AssignmentPattern(asgn) = pattern {
         apply_default_into(
@@ -53,6 +60,85 @@ pub(crate) fn compile_formal_parameter(
         return destructure_assign(parent, ordinal, &asgn.left, span);
     }
     destructure_assign(parent, ordinal, pattern, span)
+}
+
+fn simple_binding_name<'a>(pattern: &'a oxc_ast::ast::BindingPattern<'a>) -> Option<&'a str> {
+    match pattern {
+        oxc_ast::ast::BindingPattern::BindingIdentifier(id) => Some(id.name.as_str()),
+        _ => None,
+    }
+}
+
+fn direct_eval_var_declares(default_expr: &Expression<'_>, formal_name: &str) -> bool {
+    let Expression::CallExpression(call) = default_expr else {
+        return false;
+    };
+    let Expression::Identifier(callee) = &call.callee else {
+        return false;
+    };
+    if callee.name.as_str() != "eval" || call.arguments.len() != 1 {
+        return false;
+    }
+    let Some(arg) = call.arguments.first() else {
+        return false;
+    };
+    let Expression::StringLiteral(source) = arg.to_expression() else {
+        return false;
+    };
+    with_program(
+        source.value.as_str(),
+        SyntaxSourceKind::JavaScript,
+        |program| {
+            let mut var_names = Vec::new();
+            hoist_var_names(&program.body, &mut var_names);
+            var_names.iter().any(|name| name == formal_name)
+        },
+    )
+    .unwrap_or(false)
+}
+
+fn apply_default_syntax_error_into(
+    parent: &mut Compiler,
+    value_reg: u16,
+    formal_name: &str,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let undef_reg = parent.alloc_scratch();
+    parent.emit(Op::LoadUndefined, [Operand::Register(undef_reg)], span);
+    let cond_reg = parent.alloc_scratch();
+    parent.emit(
+        Op::Equal,
+        vec![
+            Operand::Register(cond_reg),
+            Operand::Register(value_reg),
+            Operand::Register(undef_reg),
+        ],
+        span,
+    );
+    let skip_default = parent.emit_branch_placeholder(Op::JumpIfFalse, Some(cond_reg), span);
+    let message_reg = parent.alloc_scratch();
+    let message = parent.intern_string_constant(&format!(
+        "direct eval var `{formal_name}` conflicts with parameter binding"
+    ));
+    parent.emit(
+        Op::LoadString,
+        [Operand::Register(message_reg), Operand::ConstIndex(message)],
+        span,
+    );
+    let error_reg = parent.alloc_scratch();
+    let kind = parent.intern_string_constant("SyntaxError");
+    parent.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    parent.emit(Op::Throw, [Operand::Register(error_reg)], span);
+    parent.patch_branch_to_here(skip_default);
+    Ok(())
 }
 
 pub(crate) fn predeclare_formal_parameters(

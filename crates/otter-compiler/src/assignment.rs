@@ -631,6 +631,8 @@ pub(crate) fn assign_array_pattern(
     value_reg: u16,
     span: (u32, u32),
 ) -> Result<(), CompileError> {
+    emit_require_object_coercible(cx, value_reg, span);
+
     for (idx, element) in arr.elements.iter().enumerate() {
         let Some(element) = element else { continue };
         let elem_span = span;
@@ -688,6 +690,8 @@ pub(crate) fn assign_object_pattern(
     span: (u32, u32),
 ) -> Result<(), CompileError> {
     use oxc_ast::ast::{AssignmentTargetProperty, PropertyKey};
+    emit_require_object_coercible(cx, value_reg, span);
+
     enum ExtractedKey {
         Static(String),
         Runtime(u16),

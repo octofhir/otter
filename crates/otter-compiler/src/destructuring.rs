@@ -73,6 +73,36 @@ pub(crate) fn apply_default_into_with_name(
     Ok(())
 }
 
+pub(crate) fn emit_require_object_coercible(
+    parent: &mut Compiler,
+    value_reg: u16,
+    span: (u32, u32),
+) {
+    let jump_to_throw = parent.emit_branch_placeholder(Op::JumpIfNullish, Some(value_reg), span);
+    let jump_to_body = parent.emit_branch_placeholder(Op::Jump, None, span);
+    parent.patch_branch_to_here(jump_to_throw);
+    let message_reg = parent.alloc_scratch();
+    let message = parent.intern_string_constant("Cannot destructure null or undefined");
+    parent.emit(
+        Op::LoadString,
+        [Operand::Register(message_reg), Operand::ConstIndex(message)],
+        span,
+    );
+    let error_reg = parent.alloc_scratch();
+    let kind = parent.intern_string_constant("TypeError");
+    parent.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    parent.emit(Op::Throw, [Operand::Register(error_reg)], span);
+    parent.patch_branch_to_here(jump_to_body);
+}
+
 /// Recursively destructure the value in `src_reg` into the named
 /// bindings declared by `pattern`. Handles `BindingIdentifier`
 /// (the leaf), `ArrayPattern` (via the iterator protocol),
@@ -209,6 +239,8 @@ pub(crate) fn destructure_object_inner(
     span: (u32, u32),
     assign_existing: bool,
 ) -> Result<(), CompileError> {
+    emit_require_object_coercible(parent, src_reg, span);
+
     // Track keys extracted by named/computed properties so the
     // rest element (`...r`) can exclude them when copying the
     // remaining own enumerable properties.

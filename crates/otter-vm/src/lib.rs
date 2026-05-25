@@ -3049,16 +3049,33 @@ impl Interpreter {
                         .exec_register(instr, 0)
                         .ok_or(VmError::InvalidOperand)?;
                     let iterator = *read_register(&stack[top_idx], iter_reg)?;
-                    let close_target = if let Some(handle) = iterator.as_iterator() {
-                        self.gc_heap.read_payload(handle, |state| match state {
-                            IteratorState::User { iterator } => Some(*iterator),
-                            _ => None,
-                        })
-                    } else {
-                        Some(iterator)
-                    };
-                    if let Some(close_target) = close_target {
-                        self.iterator_close_sync(context, &close_target)?;
+                    self.iterator_close_value_sync(context, iterator)?;
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    continue;
+                }
+                Op::IteratorCloseStart => {
+                    let iter_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    self.frame_ensure_cold(&mut stack[top_idx])
+                        .active_iterator_closers
+                        .push(iterator);
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    continue;
+                }
+                Op::IteratorCloseEnd => {
+                    let iter_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    if let Some(cold) = self.frame_cold_mut(&mut stack[top_idx])
+                        && let Some(pos) = cold
+                            .active_iterator_closers
+                            .iter()
+                            .rposition(|value| *value == iterator)
+                    {
+                        cold.active_iterator_closers.remove(pos);
                     }
                     stack[top_idx].advance_pc(self.current_byte_len)?;
                     continue;

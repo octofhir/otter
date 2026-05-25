@@ -891,6 +891,25 @@ impl Interpreter {
         Ok(())
     }
 
+    pub(crate) fn iterator_close_value_sync(
+        &mut self,
+        context: &ExecutionContext,
+        iterator: Value,
+    ) -> Result<(), VmError> {
+        let close_target = if let Some(handle) = iterator.as_iterator() {
+            self.gc_heap.read_payload(handle, |state| match state {
+                IteratorState::User { iterator } => Some(*iterator),
+                _ => None,
+            })
+        } else {
+            Some(iterator)
+        };
+        if let Some(close_target) = close_target {
+            self.iterator_close_sync(context, &close_target)?;
+        }
+        Ok(())
+    }
+
     /// §7.4.13 IteratorToList synchronous helper.
     ///
     /// Drives the iterator to exhaustion and returns the collected
@@ -1054,8 +1073,13 @@ impl Interpreter {
                 }
             }
             GeneratorResumeKind::Return(arg) => {
-                // Foundation: mark done and surface arg without
-                // running the body further.
+                let closers = self
+                    .frame_cold(&frame)
+                    .map(|cold| cold.active_iterator_closers.clone())
+                    .unwrap_or_default();
+                for iterator in closers.iter().rev() {
+                    self.iterator_close_value_sync(context, *iterator)?;
+                }
                 handle.mark_done(&mut self.gc_heap);
                 return self.make_runtime_rooted_iter_result(*arg, true, &[], &[]);
             }

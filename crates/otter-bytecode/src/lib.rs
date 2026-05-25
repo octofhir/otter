@@ -317,6 +317,12 @@ pub enum Op {
     IteratorNext,
     /// Close an iterator. Operands: `Register(iter)`.
     IteratorClose,
+    /// Register an iterator for abrupt close while the frame is parked.
+    /// Operands: `Register(iter)`.
+    IteratorCloseStart,
+    /// Remove a registered iterator after destructuring completes.
+    /// Operands: `Register(iter)`.
+    IteratorCloseEnd,
     /// Append `r<value>` to the array in `r<arr>`. Operands:
     /// `Register(arr), Register(value)`. No result. Used by the
     /// spread lowering for array literals.
@@ -937,6 +943,8 @@ impl Op {
             Op::GetIterator => "GET_ITERATOR",
             Op::IteratorNext => "ITERATOR_NEXT",
             Op::IteratorClose => "ITERATOR_CLOSE",
+            Op::IteratorCloseStart => "ITERATOR_CLOSE_START",
+            Op::IteratorCloseEnd => "ITERATOR_CLOSE_END",
             Op::ArrayPush => "ARRAY_PUSH",
             Op::CallSpread => "CALL_SPREAD",
             Op::New => "NEW",
@@ -1062,6 +1070,8 @@ impl Op {
             | Op::NewObject
             | Op::CollectRest
             | Op::IteratorClose
+            | Op::IteratorCloseStart
+            | Op::IteratorCloseEnd
             | Op::CollectArguments
             | Op::LoadGlobalThis => 1,
             Op::LoadString

@@ -100,6 +100,9 @@ pub struct ColdFrame {
     /// `Op::LeaveTry` or by exception unwind landing on a matching
     /// catch / finally. Innermost handler on top.
     pub handlers: SmallVec<[TryHandler; 4]>,
+    /// Iterators that must be closed if a generator is parked inside
+    /// destructuring and later resumed with `.return()`.
+    pub active_iterator_closers: SmallVec<[Value; 2]>,
 }
 
 impl ColdFrame {
@@ -117,6 +120,7 @@ impl ColdFrame {
             && self.rest_args.is_empty()
             && self.incoming_args.is_empty()
             && self.handlers.is_empty()
+            && self.active_iterator_closers.is_empty()
     }
 
     /// Trace GC slots reachable through cold protocol state.
@@ -156,6 +160,9 @@ impl ColdFrame {
             v.trace_value_slots(visitor);
         }
         for v in &self.incoming_args {
+            v.trace_value_slots(visitor);
+        }
+        for v in &self.active_iterator_closers {
             v.trace_value_slots(visitor);
         }
     }

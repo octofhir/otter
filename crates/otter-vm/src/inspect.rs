@@ -864,6 +864,8 @@ mod tests {
         Op::GetIterator,
         Op::IteratorNext,
         Op::IteratorClose,
+        Op::IteratorCloseStart,
+        Op::IteratorCloseEnd,
         Op::ArrayPush,
         Op::CallSpread,
         Op::New,

@@ -14,6 +14,13 @@
 
 use crate::*;
 
+enum PreparedAssignmentTarget {
+    Identifier(String),
+    StaticMember { obj_reg: u16, name_idx: u32 },
+    ComputedMember { obj_reg: u16, key_reg: u16 },
+    PrivateField { obj_reg: u16, name_idx: u32 },
+}
+
 pub(crate) fn compile_assignment(
     cx: &mut Compiler,
     a: &oxc_ast::ast::AssignmentExpression<'_>,
@@ -629,6 +636,85 @@ pub(crate) fn assign_to_target(
     }
 }
 
+fn prepare_assignment_target(
+    cx: &mut Compiler,
+    target: &oxc_ast::ast::AssignmentTarget<'_>,
+    span: (u32, u32),
+) -> Result<Option<PreparedAssignmentTarget>, CompileError> {
+    use oxc_ast::ast::AssignmentTarget;
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(id) => Ok(Some(
+            PreparedAssignmentTarget::Identifier(id.name.as_str().to_string()),
+        )),
+        AssignmentTarget::StaticMemberExpression(member) => {
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            let name_idx = cx.intern_string_constant(member.property.name.as_str());
+            Ok(Some(PreparedAssignmentTarget::StaticMember {
+                obj_reg,
+                name_idx,
+            }))
+        }
+        AssignmentTarget::ComputedMemberExpression(member) => {
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            let key_reg = compile_expr(cx, &member.expression, span)?;
+            Ok(Some(PreparedAssignmentTarget::ComputedMember {
+                obj_reg,
+                key_reg,
+            }))
+        }
+        AssignmentTarget::PrivateFieldExpression(member) => {
+            let mangled =
+                cx.mangle_private(member.field.name.as_str())
+                    .ok_or(CompileError::Unsupported {
+                        node: "PrivateFieldExpression assignment outside class".to_string(),
+                        span,
+                    })?;
+            let obj_reg = compile_expr(cx, &member.object, span)?;
+            let name_idx = cx.intern_string_constant(&mangled);
+            Ok(Some(PreparedAssignmentTarget::PrivateField {
+                obj_reg,
+                name_idx,
+            }))
+        }
+        AssignmentTarget::ArrayAssignmentTarget(_)
+        | AssignmentTarget::ObjectAssignmentTarget(_) => Ok(None),
+        other => Err(CompileError::Unsupported {
+            node: format!("AssignmentTarget ({other:?})"),
+            span,
+        }),
+    }
+}
+
+fn assign_prepared_target(
+    cx: &mut Compiler,
+    target: PreparedAssignmentTarget,
+    value_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    match target {
+        PreparedAssignmentTarget::Identifier(name) => store_identifier(cx, &name, value_reg, span),
+        PreparedAssignmentTarget::StaticMember { obj_reg, name_idx }
+        | PreparedAssignmentTarget::PrivateField { obj_reg, name_idx } => {
+            let scratch = cx.alloc_scratch();
+            cx.emit(
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(obj_reg),
+                    Operand::ConstIndex(name_idx),
+                    Operand::Register(value_reg),
+                    Operand::Register(scratch),
+                ],
+                span,
+            );
+            Ok(())
+        }
+        PreparedAssignmentTarget::ComputedMember { obj_reg, key_reg } => {
+            cx.emit_store_element(obj_reg, key_reg, value_reg, span);
+            Ok(())
+        }
+    }
+}
+
 /// Apply `value_reg` to a `ArrayAssignmentTarget`. Walks the
 /// iterator, assigns each yielded value, and closes non-exhausted
 /// iterators on normal completion. Defaults (`= expr`) substitute
@@ -648,6 +734,7 @@ pub(crate) fn assign_array_pattern(
         [Operand::Register(iter_reg), Operand::Register(value_reg)],
         span,
     );
+    cx.emit(Op::IteratorCloseStart, [Operand::Register(iter_reg)], span);
     let mut last_done_reg = None;
     for element in &arr.elements {
         let val_reg = cx.alloc_scratch();
@@ -667,6 +754,7 @@ pub(crate) fn assign_array_pattern(
         assign_maybe_default(cx, element, val_reg, elem_span)?;
     }
     if let Some(rest) = arr.rest.as_ref() {
+        let prepared_rest = prepare_assignment_target(cx, &rest.target, span)?;
         let collected = cx.alloc_scratch();
         cx.emit(
             Op::NewArray,
@@ -694,13 +782,19 @@ pub(crate) fn assign_array_pattern(
         let back = cx.emit_branch_placeholder(Op::Jump, None, span);
         cx.patch_branch(back, loop_top);
         cx.patch_branch_to_here(exit);
-        assign_to_target(cx, &rest.target, collected, span)?;
+        match prepared_rest {
+            Some(target) => assign_prepared_target(cx, target, collected, span)?,
+            None => assign_to_target(cx, &rest.target, collected, span)?,
+        }
+        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
     } else if let Some(done_reg) = last_done_reg {
         let skip_close = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
         cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
         cx.patch_branch_to_here(skip_close);
+        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
     } else {
         cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
+        cx.emit(Op::IteratorCloseEnd, [Operand::Register(iter_reg)], span);
     }
     Ok(())
 }

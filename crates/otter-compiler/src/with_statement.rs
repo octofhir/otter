@@ -6,8 +6,8 @@
 //!
 //! # Invariants
 //! - Strict functions and modules still reject `with`.
-//! - The object environment is stored in an own-upvalue cell so
-//!   functions created inside the body can capture it.
+//! - The object environment is stored in an own-upvalue cell only
+//!   while doing so cannot shift existing parent-capture slots.
 //!
 //! # See also
 //! - `expr::identifier` for dynamic `with` identifier reads.
@@ -35,7 +35,11 @@ pub(crate) fn compile_with_statement(
     let id = cx.next_with_env_id;
     cx.next_with_env_id = id.checked_add(1).expect("with env id overflow");
     let env_name = format!("__otter_with_env_{id}");
-    let storage = cx.declare_captured_binding(&env_name, false, span)?;
+    let storage = if cx.parent_captures.is_empty() {
+        cx.declare_captured_binding(&env_name, false, span)?
+    } else {
+        cx.declare_binding(&env_name, false, span)?
+    };
     cx.emit_store_storage(object, storage, span);
     cx.mark_initialized(&env_name);
 
@@ -81,6 +85,60 @@ pub(crate) fn emit_with_binding_probe(
             span,
         );
         let next_env = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), span);
+        let unscopables_sym = cx.alloc_scratch();
+        let unscopables_idx = cx.intern_string_constant("unscopables");
+        cx.emit(
+            Op::SymbolLoad,
+            [
+                Operand::Register(unscopables_sym),
+                Operand::ConstIndex(unscopables_idx),
+            ],
+            span,
+        );
+        let unscopables = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadElement,
+            vec![
+                Operand::Register(unscopables),
+                Operand::Register(env_reg),
+                Operand::Register(unscopables_sym),
+            ],
+            span,
+        );
+        let unscopables_type = cx.alloc_scratch();
+        cx.emit(
+            Op::TypeOf,
+            [
+                Operand::Register(unscopables_type),
+                Operand::Register(unscopables),
+            ],
+            span,
+        );
+        let object_type = cx.alloc_scratch();
+        let object_idx = cx.intern_string_constant("object");
+        cx.emit(
+            Op::LoadString,
+            [
+                Operand::Register(object_type),
+                Operand::ConstIndex(object_idx),
+            ],
+            span,
+        );
+        let is_object = cx.alloc_scratch();
+        cx.emit(
+            Op::Equal,
+            [
+                Operand::Register(is_object),
+                Operand::Register(unscopables_type),
+                Operand::Register(object_type),
+            ],
+            span,
+        );
+        let bind_env = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(is_object), span);
+        let blocked = cx.alloc_scratch();
+        cx.emit_load_property(blocked, unscopables, name, span);
+        let next_env_for_blocked = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(blocked), span);
+        cx.patch_branch_to_here(bind_env);
         cx.emit(
             Op::StoreLocal,
             [
@@ -91,6 +149,7 @@ pub(crate) fn emit_with_binding_probe(
         );
         cx.emit(Op::LoadTrue, [Operand::Register(found_reg)], span);
         done_patches.push(cx.emit_branch_placeholder(Op::Jump, None, span));
+        cx.patch_branch_to_here(next_env_for_blocked);
         cx.patch_branch_to_here(next_env);
     }
 

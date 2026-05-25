@@ -55,40 +55,22 @@ fn compile_identifier_with_envs(
     span: (u32, u32),
 ) -> Result<u16, CompileError> {
     let dst = cx.alloc_scratch();
-    let mut done_patches = Vec::new();
-    for env_name in active_with_envs.iter().rev() {
-        let env_reg = load_with_env_object(cx, env_name, span)?;
-        let key_reg = cx.alloc_scratch();
-        let key_idx = cx.intern_string_constant(name);
-        cx.emit(
-            Op::LoadString,
-            [Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
-            span,
-        );
-        let present = cx.alloc_scratch();
-        cx.emit(
-            Op::HasProperty,
-            [
-                Operand::Register(present),
-                Operand::Register(key_reg),
-                Operand::Register(env_reg),
-            ],
-            span,
-        );
-        let next_env = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(present), span);
-        cx.emit_load_property(dst, env_reg, name, span);
-        done_patches.push(cx.emit_branch_placeholder(Op::Jump, None, span));
-        cx.patch_branch_to_here(next_env);
+    let probe = emit_with_binding_probe(cx, name, active_with_envs, span)?;
+    let mut with_done = None;
+    if let Some(probe) = &probe {
+        let fallback = cx.emit_branch_placeholder(Op::JumpIfFalse, Some(probe.found_reg), span);
+        cx.emit_load_property(dst, probe.object_reg, name, span);
+        with_done = Some(cx.emit_branch_placeholder(Op::Jump, None, span));
+        cx.patch_branch_to_here(fallback);
     }
-
     let fallback = compile_identifier_without_with(cx, name, span)?;
     cx.emit(
         Op::StoreLocal,
         [Operand::Register(fallback), Operand::Imm32(dst as i32)],
         span,
     );
-    for patch in done_patches {
-        cx.patch_branch_to_here(patch);
+    if let Some(done) = with_done {
+        cx.patch_branch_to_here(done);
     }
     Ok(dst)
 }

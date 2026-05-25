@@ -345,9 +345,8 @@ impl<'a> Visit<'a> for ContainsArgumentsScanner {
         }
     }
 
-    // Bail at function / arrow boundaries (own arguments scope).
+    // Bail at function boundaries (own arguments scope).
     fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
-    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
     // A nested class static block is its own ContainsArguments scope.
     fn visit_static_block(&mut self, _: &StaticBlock<'a>) {}
 

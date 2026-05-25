@@ -3044,6 +3044,25 @@ impl Interpreter {
                     self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg)?;
                     continue;
                 }
+                Op::IteratorClose => {
+                    let iter_reg = context
+                        .exec_register(instr, 0)
+                        .ok_or(VmError::InvalidOperand)?;
+                    let iterator = *read_register(&stack[top_idx], iter_reg)?;
+                    let close_target = if let Some(handle) = iterator.as_iterator() {
+                        self.gc_heap.read_payload(handle, |state| match state {
+                            IteratorState::User { iterator } => Some(*iterator),
+                            _ => None,
+                        })
+                    } else {
+                        Some(iterator)
+                    };
+                    if let Some(close_target) = close_target {
+                        self.iterator_close_sync(context, &close_target)?;
+                    }
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    continue;
+                }
                 // §10.1.8 [[Get]] — when the resolved property is an
                 // accessor descriptor at any depth in the prototype
                 // chain, the runtime invokes the getter with `this`

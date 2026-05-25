@@ -863,6 +863,7 @@ mod tests {
         Op::NewError,
         Op::GetIterator,
         Op::IteratorNext,
+        Op::IteratorClose,
         Op::ArrayPush,
         Op::CallSpread,
         Op::New,

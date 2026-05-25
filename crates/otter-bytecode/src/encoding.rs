@@ -552,6 +552,7 @@ pub const OP_BYTE_TABLE: &[(Op, u8)] = &[
     (Op::ForInKeys, 0x79),
     (Op::CopyDataProperties, 0x7A),
     (Op::DefineOwnProperty, 0x7B),
+    (Op::IteratorClose, 0x7C),
 ];
 
 #[cfg(test)]
@@ -915,7 +916,7 @@ mod tests {
         // Catches accidental opcode additions that forget to wire
         // through OP_BYTE_TABLE. If this fires, append the missing
         // opcode at the next unused byte.
-        const EXPECTED_OPCODE_COUNT: usize = 124;
+        const EXPECTED_OPCODE_COUNT: usize = 125;
         assert_eq!(
             OP_BYTE_TABLE.len(),
             EXPECTED_OPCODE_COUNT,

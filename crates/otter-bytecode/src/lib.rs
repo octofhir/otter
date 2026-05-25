@@ -306,9 +306,8 @@ pub enum Op {
     /// `r<dst> = GetIterator(r<src>)`. Operands:
     /// `Register(dst), Register(src)`. The runtime produces an
     /// internal iterator value over the source: `Array` walks
-    /// elements, `String` walks code units, anything else raises
-    /// `TypeMismatch`. Real `[@@iterator]` resolution lands when
-    /// `Symbol` arrives (task 37).
+    /// elements, `String` walks code units, and user objects route
+    /// through `[@@iterator]`.
     GetIterator,
     /// Drive an iterator one step. Operands:
     /// `Register(value_dst), Register(done_dst), Register(iter)`.
@@ -316,6 +315,8 @@ pub enum Op {
     /// `done_dst`; once `done_dst` is `true` the value is
     /// `undefined` and further calls keep returning `done = true`.
     IteratorNext,
+    /// Close an iterator. Operands: `Register(iter)`.
+    IteratorClose,
     /// Append `r<value>` to the array in `r<arr>`. Operands:
     /// `Register(arr), Register(value)`. No result. Used by the
     /// spread lowering for array literals.
@@ -935,6 +936,7 @@ impl Op {
             Op::NewError => "NEW_ERROR",
             Op::GetIterator => "GET_ITERATOR",
             Op::IteratorNext => "ITERATOR_NEXT",
+            Op::IteratorClose => "ITERATOR_CLOSE",
             Op::ArrayPush => "ARRAY_PUSH",
             Op::CallSpread => "CALL_SPREAD",
             Op::New => "NEW",
@@ -1059,6 +1061,7 @@ impl Op {
             | Op::Throw
             | Op::NewObject
             | Op::CollectRest
+            | Op::IteratorClose
             | Op::CollectArguments
             | Op::LoadGlobalThis => 1,
             Op::LoadString

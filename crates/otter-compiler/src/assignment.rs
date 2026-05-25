@@ -629,11 +629,11 @@ pub(crate) fn assign_to_target(
     }
 }
 
-/// Apply `value_reg` to a `ArrayAssignmentTarget`. Walks each
-/// element, reads `value[i]` via `Op::LoadElement`, and recurses
-/// into the element's target. Defaults (`= expr`) substitute when
-/// the element is `undefined`. Rest elements (`...rest`) collect
-/// the trailing slice via `Op::CollectRest`.
+/// Apply `value_reg` to a `ArrayAssignmentTarget`. Walks the
+/// iterator, assigns each yielded value, and closes non-exhausted
+/// iterators on normal completion. Defaults (`= expr`) substitute
+/// when the element is `undefined`. Rest elements (`...rest`) drain
+/// the iterator into a fresh array.
 pub(crate) fn assign_array_pattern(
     cx: &mut Compiler,
     arr: &oxc_ast::ast::ArrayAssignmentTarget<'_>,
@@ -648,6 +648,7 @@ pub(crate) fn assign_array_pattern(
         [Operand::Register(iter_reg), Operand::Register(value_reg)],
         span,
     );
+    let mut last_done_reg = None;
     for element in &arr.elements {
         let val_reg = cx.alloc_scratch();
         let done_reg = cx.alloc_scratch();
@@ -660,6 +661,7 @@ pub(crate) fn assign_array_pattern(
             ],
             span,
         );
+        last_done_reg = Some(done_reg);
         let Some(element) = element else { continue };
         let elem_span = span;
         assign_maybe_default(cx, element, val_reg, elem_span)?;
@@ -693,6 +695,12 @@ pub(crate) fn assign_array_pattern(
         cx.patch_branch(back, loop_top);
         cx.patch_branch_to_here(exit);
         assign_to_target(cx, &rest.target, collected, span)?;
+    } else if let Some(done_reg) = last_done_reg {
+        let skip_close = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(done_reg), span);
+        cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
+        cx.patch_branch_to_here(skip_close);
+    } else {
+        cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
     }
     Ok(())
 }

@@ -627,6 +627,28 @@ impl<'a> Visit<'a> for StrictValidator {
         if body_strict && !is_simple_parameter_list(&it.params) {
             self.flag_non_simple_use_strict(it.span);
         }
+        if it.r#async
+            && let Some(body) = it.body.as_ref()
+        {
+            let mut param_names: BTreeMap<&str, Span> = BTreeMap::new();
+            collect_param_bound_names(&it.params, &mut |name, span| {
+                param_names.entry(name).or_insert(span);
+            });
+            collect_lex_decl_names(&body.statements, &mut |name, span| {
+                if param_names.contains_key(name) {
+                    self.diagnostics.push(SyntaxDiagnostic {
+                        code: "ASYNC_FUNCTION_PARAM_LEXICAL_REDECLARATION".to_string(),
+                        message: format!(
+                            "SyntaxError: async function parameter `{name}` conflicts with a lexical declaration in the body (§15.8.1)"
+                        ),
+                        range: Some((span.start, span.end)),
+                        help: Some(
+                            "rename either the parameter or the lexical declaration".to_string(),
+                        ),
+                    });
+                }
+            });
+        }
         let inner_strict = self.is_strict() || body_strict;
         self.strict_stack.push(inner_strict);
         walk::walk_function(self, it, flags);

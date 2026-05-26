@@ -13,8 +13,8 @@ use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
 use crate::temporal::helpers::{
-    arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, require_construct,
-    require_duration, temporal_err,
+    arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, parse_rounding_options,
+    require_construct, require_duration, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -236,6 +236,18 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     Ok(Value::number_f64(total.as_inner()))
 }
 
+fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let dur = require_duration(ctx)?;
+    let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
+    // `relativeTo` is not yet parsed: with `None`, time-unit rounding
+    // works and calendar-unit rounding (year/month/week) surfaces the
+    // spec-mandated RangeError from temporal_rs.
+    let result = dur
+        .round(options, None)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Duration(result))
+}
+
 fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Duration, NativeError> {
     if let Some(t) = v.as_temporal(heap) {
         match t.payload_clone(heap) {
@@ -276,6 +288,7 @@ pub static DURATION_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("subtract", 1, impl_subtract),
     method("negated", 0, impl_negated),
     method("abs", 0, impl_abs),
+    method("round", 1, impl_round),
     method("total", 1, impl_total),
 ];
 

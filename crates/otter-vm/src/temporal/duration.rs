@@ -267,6 +267,32 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
     }
 }
 
+/// Generate a `Temporal.Duration.prototype` accessor getter. Each
+/// getter re-validates the receiver through [`require_duration`] so a
+/// branding `TypeError` is thrown when `this` is not a Duration, then
+/// returns the corresponding field as a [`Value`].
+macro_rules! duration_getter {
+    ($fn:ident, $d:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $d = require_duration(ctx)?;
+            Ok($val)
+        }
+    };
+}
+
+duration_getter!(get_years, d => Value::number_i32(d.years() as i32));
+duration_getter!(get_months, d => Value::number_i32(d.months() as i32));
+duration_getter!(get_weeks, d => Value::number_i32(d.weeks() as i32));
+duration_getter!(get_days, d => Value::number_i32(d.days() as i32));
+duration_getter!(get_hours, d => Value::number_i32(d.hours() as i32));
+duration_getter!(get_minutes, d => Value::number_i32(d.minutes() as i32));
+duration_getter!(get_seconds, d => Value::number_i32(d.seconds() as i32));
+duration_getter!(get_milliseconds, d => Value::number_i32(d.milliseconds() as i32));
+duration_getter!(get_microseconds, d => Value::number_f64(d.microseconds() as f64));
+duration_getter!(get_nanoseconds, d => Value::number_f64(d.nanoseconds() as f64));
+duration_getter!(get_sign, d => Value::number_i32(d.sign() as i32));
+duration_getter!(get_blank, d => Value::boolean(d.is_zero()));
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -303,6 +329,20 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [DURATION_PROTOTYPE_METHODS],
+        accessors = [
+            ("years",        get = get_years),
+            ("months",       get = get_months),
+            ("weeks",        get = get_weeks),
+            ("days",         get = get_days),
+            ("hours",        get = get_hours),
+            ("minutes",      get = get_minutes),
+            ("seconds",      get = get_seconds),
+            ("milliseconds", get = get_milliseconds),
+            ("microseconds", get = get_microseconds),
+            ("nanoseconds",  get = get_nanoseconds),
+            ("sign",         get = get_sign),
+            ("blank",        get = get_blank),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

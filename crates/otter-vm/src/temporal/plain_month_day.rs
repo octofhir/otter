@@ -9,7 +9,7 @@ use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
-    parse_calendar_fields, require_construct, require_plain_month_day, temporal_err,
+    parse_calendar_fields, require_construct, require_plain_month_day, str_or_undef, temporal_err,
     to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
@@ -79,13 +79,15 @@ fn parse_pmd_arg(
     }
 }
 
-pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     let pmd = match temporal.payload_clone(heap) {
         TemporalPayload::PlainMonthDay(v) => v,
         _ => return Value::undefined(),
     };
     match name {
         "day" => Value::number_i32(pmd.day() as i32),
+        "monthCode" => str_or_undef(pmd.month_code().as_str(), heap),
+        "calendarId" => str_or_undef(pmd.calendar().identifier(), heap),
         _ => Value::undefined(),
     }
 }

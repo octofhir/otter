@@ -11,7 +11,7 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
     parse_calendar_fields, parse_difference_settings, parse_partial_time, require_construct,
-    require_plain_date, temporal_err, to_integer_with_truncation,
+    require_plain_date, str_or_undef, temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -71,7 +71,7 @@ fn parse_plain_date_arg(
     }
 }
 
-pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     let pd = match temporal.payload_clone(heap) {
         TemporalPayload::PlainDate(v) => v,
         _ => return Value::undefined(),
@@ -79,13 +79,24 @@ pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) 
     match name {
         "year" => Value::number_i32(pd.year()),
         "month" => Value::number_i32(pd.month() as i32),
+        "monthCode" => str_or_undef(pd.month_code().as_str(), heap),
         "day" => Value::number_i32(pd.day() as i32),
         "dayOfWeek" => Value::number_i32(pd.day_of_week() as i32),
         "dayOfYear" => Value::number_i32(pd.day_of_year() as i32),
+        "weekOfYear" => pd
+            .week_of_year()
+            .map_or(Value::undefined(), |w| Value::number_i32(w as i32)),
+        "yearOfWeek" => pd.year_of_week().map_or(Value::undefined(), Value::number_i32),
+        "daysInWeek" => Value::number_i32(pd.days_in_week() as i32),
         "daysInMonth" => Value::number_i32(pd.days_in_month() as i32),
         "daysInYear" => Value::number_i32(pd.days_in_year() as i32),
         "monthsInYear" => Value::number_i32(pd.months_in_year() as i32),
         "inLeapYear" => Value::boolean(pd.in_leap_year()),
+        "era" => pd
+            .era()
+            .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)),
+        "eraYear" => pd.era_year().map_or(Value::undefined(), Value::number_i32),
+        "calendarId" => str_or_undef(pd.calendar().identifier(), heap),
         _ => Value::undefined(),
     }
 }

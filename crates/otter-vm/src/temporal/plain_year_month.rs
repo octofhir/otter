@@ -11,7 +11,7 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
     parse_calendar_fields, parse_difference_settings, parse_year_month_fields, require_construct,
-    require_plain_year_month, temporal_err, to_integer_with_truncation,
+    require_plain_year_month, str_or_undef, temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -85,7 +85,7 @@ fn parse_pym_arg(
     }
 }
 
-pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     let pym = match temporal.payload_clone(heap) {
         TemporalPayload::PlainYearMonth(v) => v,
         _ => return Value::undefined(),
@@ -93,10 +93,16 @@ pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) 
     match name {
         "year" => Value::number_i32(pym.year()),
         "month" => Value::number_i32(pym.month() as i32),
+        "monthCode" => str_or_undef(pym.month_code().as_str(), heap),
         "daysInMonth" => Value::number_i32(pym.days_in_month() as i32),
         "daysInYear" => Value::number_i32(pym.days_in_year() as i32),
         "monthsInYear" => Value::number_i32(pym.months_in_year() as i32),
         "inLeapYear" => Value::boolean(pym.in_leap_year()),
+        "era" => pym
+            .era()
+            .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)),
+        "eraYear" => pym.era_year().map_or(Value::undefined(), Value::number_i32),
+        "calendarId" => str_or_undef(pym.calendar().identifier(), heap),
         _ => Value::undefined(),
     }
 }

@@ -14,6 +14,7 @@ use crate::temporal::helpers::{
     parse_partial_time, parse_rounding_options, require_construct, require_plain_date_time,
     temporal_err, to_integer_with_truncation,
 };
+use crate::temporal::helpers::str_or_undef;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -119,7 +120,7 @@ fn parse_plain_date_time_arg(
     }
 }
 
-pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) -> Value {
+pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &str) -> Value {
     let pdt = match temporal.payload_clone(heap) {
         TemporalPayload::PlainDateTime(v) => v,
         _ => return Value::undefined(),
@@ -127,6 +128,7 @@ pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) 
     match name {
         "year" => Value::number_i32(pdt.year()),
         "month" => Value::number_i32(pdt.month() as i32),
+        "monthCode" => str_or_undef(pdt.month_code().as_str(), heap),
         "day" => Value::number_i32(pdt.day() as i32),
         "hour" => Value::number_i32(pdt.hour() as i32),
         "minute" => Value::number_i32(pdt.minute() as i32),
@@ -134,6 +136,22 @@ pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) 
         "millisecond" => Value::number_i32(pdt.millisecond() as i32),
         "microsecond" => Value::number_i32(pdt.microsecond() as i32),
         "nanosecond" => Value::number_i32(pdt.nanosecond() as i32),
+        "dayOfWeek" => Value::number_i32(pdt.day_of_week() as i32),
+        "dayOfYear" => Value::number_i32(pdt.day_of_year() as i32),
+        "weekOfYear" => pdt
+            .week_of_year()
+            .map_or(Value::undefined(), |w| Value::number_i32(w as i32)),
+        "yearOfWeek" => pdt.year_of_week().map_or(Value::undefined(), Value::number_i32),
+        "daysInWeek" => Value::number_i32(pdt.days_in_week() as i32),
+        "daysInMonth" => Value::number_i32(pdt.days_in_month() as i32),
+        "daysInYear" => Value::number_i32(pdt.days_in_year() as i32),
+        "monthsInYear" => Value::number_i32(pdt.months_in_year() as i32),
+        "inLeapYear" => Value::boolean(pdt.in_leap_year()),
+        "era" => pdt
+            .era()
+            .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)),
+        "eraYear" => pdt.era_year().map_or(Value::undefined(), Value::number_i32),
+        "calendarId" => str_or_undef(pdt.calendar().identifier(), heap),
         _ => Value::undefined(),
     }
 }

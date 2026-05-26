@@ -36,6 +36,15 @@ pub fn js_string_value(value: String, ctx: &mut NativeCtx<'_>) -> Result<Value, 
     Ok(Value::string(s))
 }
 
+/// Build a string [`Value`] from `s` for `load_property` getters,
+/// falling back to `undefined` if the GC string allocation fails.
+pub fn str_or_undef(s: &str, heap: &mut otter_gc::GcHeap) -> Value {
+    match JsString::from_str(s, heap) {
+        Ok(js) => Value::string(js),
+        Err(_) => Value::undefined(),
+    }
+}
+
 pub fn require_construct(ctx: &NativeCtx<'_>, class: &'static str) -> Result<(), NativeError> {
     if ctx.is_construct_call() {
         Ok(())

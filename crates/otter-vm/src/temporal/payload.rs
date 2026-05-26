@@ -131,8 +131,19 @@ pub const TEMPORAL_BODY_TYPE_TAG: u8 = 0x27;
 #[pelt(tag = TEMPORAL_BODY_TYPE_TAG)]
 pub struct TemporalBody {
     /// Variant-typed Temporal payload.
+    ///
+    /// Boxed so the body stays 8-byte aligned. `temporal_rs::Instant`
+    /// embeds an `i128` (epoch nanoseconds), giving [`TemporalPayload`]
+    /// a 16-byte alignment the GC cage cannot satisfy inline: the
+    /// allocator only guarantees [`otter_gc::OBJECT_ALIGNMENT`]-aligned
+    /// (8-byte) cells and the payload sits one [`otter_gc::GcHeader`]
+    /// (8 bytes) past the cell start, so an inline 16-aligned field
+    /// would land on an 8-aligned address and trip the misaligned-read
+    /// check. The `Box` moves the over-aligned record to a side
+    /// allocation, matching the V8-style rule that managed cells never
+    /// embed data needing more than pointer alignment.
     #[pelt(skip)]
-    pub payload: TemporalPayload,
+    pub payload: Box<TemporalPayload>,
 }
 
 /// 4-byte compressed GC handle to a [`TemporalBody`]. `Copy`. Packs
@@ -148,7 +159,9 @@ pub fn alloc_temporal(
     heap: &mut otter_gc::GcHeap,
     payload: TemporalPayload,
 ) -> Result<TemporalHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(TemporalBody { payload })
+    heap.alloc_old(TemporalBody {
+        payload: Box::new(payload),
+    })
 }
 
 /// Heap handle for [`crate::Value::Temporal`].
@@ -203,7 +216,7 @@ impl JsTemporal {
     #[inline]
     #[must_use]
     pub fn payload_clone(self, heap: &otter_gc::GcHeap) -> TemporalPayload {
-        heap.read_payload(self.inner, |body| body.payload.clone())
+        heap.read_payload(self.inner, |body| (*body.payload).clone())
     }
 
     /// Tag for prototype routing. Read from the wrapper-side cache

@@ -620,6 +620,17 @@ impl GcHeap {
         mut value: T,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
+        // A cell payload sits one `GcHeader` past an
+        // `OBJECT_ALIGNMENT`-aligned cell start, so it is at most
+        // `OBJECT_ALIGNMENT`-aligned. A body needing more (e.g. an
+        // inline `i128`) would be read through a misaligned reference —
+        // UB. Box the over-aligned field instead (see `TemporalBody`).
+        const {
+            assert!(
+                std::mem::align_of::<T>() <= crate::OBJECT_ALIGNMENT,
+                "GC body alignment exceeds OBJECT_ALIGNMENT; box the over-aligned field",
+            )
+        };
         // Lazy register so callers never forget. Idempotent.
         if self.trace_table.get(T::TYPE_TAG).is_none() {
             self.trace_table.register::<T>();
@@ -769,6 +780,14 @@ impl GcHeap {
         value: T,
         enforce_cap: bool,
     ) -> Result<Gc<T>, OutOfMemory> {
+        // See `alloc_with_roots`: payloads are at most
+        // `OBJECT_ALIGNMENT`-aligned, so over-aligned bodies must box.
+        const {
+            assert!(
+                std::mem::align_of::<T>() <= crate::OBJECT_ALIGNMENT,
+                "GC body alignment exceeds OBJECT_ALIGNMENT; box the over-aligned field",
+            )
+        };
         if self.trace_table.get(T::TYPE_TAG).is_none() {
             self.trace_table.register::<T>();
         }

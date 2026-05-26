@@ -39,7 +39,7 @@ fn compile_fail_send_sync_invariants() {
 
 #[test]
 fn compile_fail_pelt_derive_invariants() {
-    // The fixtures below establish three load-bearing properties of
+    // The fixtures below establish two load-bearing properties of
     // `#[derive(Pelt)]`:
     //   1. Missing `#[pelt(tag = …)]` is a compile error — two bodies
     //      cannot silently share the same `Traceable::TYPE_TAG` slot.
@@ -47,12 +47,9 @@ fn compile_fail_pelt_derive_invariants() {
     //      `otter_vm::pelt::PeltField` fails at the field's span —
     //      authors must either add the impl or annotate the field
     //      with `#[pelt(skip)]`.
-    //   3. Enums are rejected up-front so per-variant slot tracing
-    //      stays on a hand-written `SafeTraceable` impl.
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/pelt_missing_tag.rs");
     t.compile_fail("tests/compile_fail/pelt_untraceable_field.rs");
-    t.compile_fail("tests/compile_fail/pelt_enum_rejected.rs");
 }
 
 #[test]

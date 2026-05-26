@@ -295,6 +295,38 @@ fn read_string_field(obj: JsObject, name: &str, heap: &otter_gc::GcHeap) -> Opti
     v.as_string(heap).map(|s| s.to_lossy_string(heap))
 }
 
+/// Parse the `calendarName` option (`"auto"`/`"always"`/`"never"`/
+/// `"critical"`) from a Temporal `toString` options argument into a
+/// [`temporal_rs::options::DisplayCalendar`]. Absent options or an
+/// absent `calendarName` default to `Auto`.
+pub fn parse_display_calendar(
+    args: &[Value],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+) -> Result<temporal_rs::options::DisplayCalendar, NativeError> {
+    use core::str::FromStr;
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(temporal_rs::options::DisplayCalendar::Auto);
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "toString() options must be an object or undefined".to_string(),
+        });
+    };
+    match read_string_field(obj, "calendarName", heap) {
+        Some(name) => temporal_rs::options::DisplayCalendar::from_str(&name).map_err(|_| {
+            NativeError::RangeError {
+                name: class,
+                reason: "invalid `calendarName`".to_string(),
+            }
+        }),
+        None => Ok(temporal_rs::options::DisplayCalendar::Auto),
+    }
+}
+
 fn read_partial_integer(
     obj: JsObject,
     name: &str,

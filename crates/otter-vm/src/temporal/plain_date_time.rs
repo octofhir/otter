@@ -11,10 +11,9 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
     opt_integer_with_truncation, parse_date_time_fields, parse_difference_settings,
-    parse_partial_time, parse_rounding_options, require_construct, require_plain_date_time,
-    temporal_err, to_integer_with_truncation,
+    parse_display_calendar, parse_partial_time, parse_rounding_options, require_construct,
+    require_plain_date_time, str_or_undef, temporal_err, to_integer_with_truncation,
 };
-use crate::temporal::helpers::str_or_undef;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -175,13 +174,11 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pdt = require_plain_date_time(ctx)?;
+    let display = parse_display_calendar(args, 0, ctx.heap(), CLASS)?;
     let s = pdt
-        .to_ixdtf_string(
-            temporal_rs::options::ToStringRoundingOptions::default(),
-            temporal_rs::options::DisplayCalendar::Auto,
-        )
+        .to_ixdtf_string(temporal_rs::options::ToStringRoundingOptions::default(), display)
         .map_err(|e| temporal_err(e, CLASS))?;
     js_string_value(s, ctx)
 }

@@ -10,8 +10,9 @@ use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
-    parse_calendar_fields, parse_difference_settings, parse_year_month_fields, require_construct,
-    require_plain_year_month, str_or_undef, temporal_err, to_integer_with_truncation,
+    parse_calendar_fields, parse_difference_settings, parse_display_calendar,
+    parse_year_month_fields, require_construct, require_plain_year_month, str_or_undef,
+    temporal_err, to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -126,9 +127,10 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
-    let s = pym.to_ixdtf_string(temporal_rs::options::DisplayCalendar::Auto);
+    let display = parse_display_calendar(args, 0, ctx.heap(), CLASS)?;
+    let s = pym.to_ixdtf_string(display);
     js_string_value(s, ctx)
 }
 

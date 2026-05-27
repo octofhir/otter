@@ -29,8 +29,17 @@ conformance-gated before the next starts.
     through `ToPrimitive(String)` at the regexp dispatch arm so an
     Object argument's user `toString` fires (was matched against
     `"[object Object]"`). built-ins/RegExp 1147→1155 pass.
-  - [ ] `Array.join` / other array-likes generic `length`-getter;
-    TypedArray generic receiver for Array methods.
+  - [x] **TypedArray integer-indexed string-key `[[Get]]`/`[[HasProperty]]`**
+    — `ordinary_get_value` now resolves a CanonicalNumericIndexString
+    key to the element (§10.4.5.4 IntegerIndexedElementGet) instead of
+    `undefined`, and `in` (`run_has_property_regs`) delegates a
+    TypedArray receiver to `ordinary_has_property_value`. Fixes
+    `Reflect.get/has(ta,"i")`, `n in ta` (was a TypeError crash), and
+    generic `Array.prototype.indexOf/includes.call(ta)`. built-ins/
+    TypedArray 1498→1508 pass.
+  - [ ] `Array.join` / other array-likes generic `length`-getter
+    (needs the IntrinsicArgs→re-entrant migration so `impl_join` reads
+    `length` through the interpreter).
   - [ ] Mechanical `IntrinsicArgs` → re-entrant-context signature
     migration, per type (String 46 fns, …).
 - [ ] **Stage 3** — single callback re-entry path (`invoke` →

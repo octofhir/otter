@@ -309,6 +309,19 @@ impl Interpreter {
             } else {
                 false
             }
+        } else if rhs.as_typed_array(&self.gc_heap).is_some() {
+            // §10.4.5.2 TypedArray [[HasProperty]] — integer-indexed
+            // elements, the expando bag, then the prototype chain.
+            // Delegate to the shared resolver instead of re-deriving it
+            // here so `in` matches `Reflect.has` / generic Array methods.
+            let key = if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
+                VmPropertyKey::Symbol(sym)
+            } else if let Some(name) = key_name.as_deref() {
+                VmPropertyKey::String(name)
+            } else {
+                return Err(VmError::TypeMismatch);
+            };
+            self.ordinary_has_property_value(context, rhs, &key, 0)?
         } else {
             return Err(VmError::TypeMismatch);
         };

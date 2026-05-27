@@ -3004,13 +3004,35 @@ impl Interpreter {
             };
         }
         if let Some(t) = base.as_typed_array(&self.gc_heap) {
-            // §10.4.5.4 TypedArray [[Get]] for non-index keys —
-            // expando own properties first (so user-assigned
-            // `constructor` / accessors win), then the per-kind
-            // builtin prototype methods, then the kind's constructor
-            // prototype chain. Mirrors the opcode `run_load_property_reg`
-            // path so synchronous gets (`SpeciesConstructor`,
-            // `Reflect.get`) resolve identically.
+            // §10.4.5.4 — a CanonicalNumericIndexString key reads the
+            // integer-indexed element via IntegerIndexedElementGet
+            // (the element value, or `undefined` when the index is
+            // out of bounds / fractional / the buffer is detached). It
+            // does NOT consult the expando bag or walk the prototype.
+            // The element-opcode path resolves these, but a string-key
+            // `[[Get]]` (`Reflect.get`, generic `Array.prototype.*`,
+            // HasProperty) reached `load_property`, which only knew the
+            // named accessors — so `ta["0"]` came back `undefined`.
+            if !matches!(key, VmPropertyKey::Symbol(_)) {
+                let name = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name) {
+                    let value = if n.is_finite() && n.fract() == 0.0 && n >= 0.0 {
+                        t.get(&mut self.gc_heap, n as usize)?
+                    } else {
+                        Value::undefined()
+                    };
+                    return Ok(VmGetOutcome::Value(value));
+                }
+            }
+            // TypedArray [[Get]] for non-index keys — expando own
+            // properties first (so user-assigned `constructor` /
+            // accessors win), then the per-kind builtin prototype
+            // methods, then the kind's constructor prototype chain.
+            // Mirrors the opcode `run_load_property_reg` path so
+            // synchronous gets (`SpeciesConstructor`, `Reflect.get`)
+            // resolve identically.
             if let Some(bag) = t.expando(&self.gc_heap) {
                 let lookup = match key {
                     VmPropertyKey::Symbol(sym) => {

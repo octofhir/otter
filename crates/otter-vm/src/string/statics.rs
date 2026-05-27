@@ -71,7 +71,78 @@ pub static STRING_STATIC_METHODS: &[MethodSpec] = &[
         attrs: Attr::builtin_function(),
         call: NativeCall::Static(string_from_code_point),
     },
+    MethodSpec {
+        name: "raw",
+        length: 1,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(string_raw),
+    },
 ];
+
+/// `String.raw(template, ...substitutions)` — ECMA-262 §22.1.2.4.
+///
+/// # Algorithm
+/// 1. `cooked = ? ToObject(template)`; `raw = ? ToObject(? Get(cooked,
+///    "raw"))`.
+/// 2. `literalSegments = ? LengthOfArrayLike(raw)`; return `""` when
+///    it is `<= 0`.
+/// 3. Walk `nextIndex` in `[0, literalSegments)`, appending
+///    `? ToString(? Get(raw, ToString(nextIndex)))` and — for every
+///    index but the last — `? ToString(substitutions[nextIndex])`.
+///
+/// Each `Get` flows through the interpreter's `[[Get]]` ladder so
+/// accessor `raw` segments observe user getters, and every `ToString`
+/// re-enters `@@toPrimitive` / `toString` / `valueOf` on object
+/// operands.
+fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let template = args.first().copied().unwrap_or_else(Value::undefined);
+    let context = ctx
+        .execution_context()
+        .cloned()
+        .ok_or(NativeError::TypeError {
+            name: "String.raw",
+            reason: "no execution context available".to_string(),
+        })?;
+    let interp = &mut ctx.cx.interp;
+
+    let raw = interp
+        .get_property_value_for_call(&context, template, "raw")
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+    let len_val = interp
+        .get_property_value_for_call(&context, raw, "length")
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+    let literal_segments = crate::to_length(&len_val, interp.gc_heap())
+        .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+    if literal_segments == 0 {
+        return Ok(Value::string(JsString::from_str("", interp.gc_heap_mut())?));
+    }
+
+    let mut out = String::new();
+    let substitutions = args.get(1..).unwrap_or(&[]);
+    for next_index in 0..literal_segments {
+        let key = next_index.to_string();
+        let seg_val = interp
+            .get_property_value_for_call(&context, raw, &key)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+        let seg = interp
+            .coerce_to_string(&context, &seg_val)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+        out.push_str(&seg);
+        if next_index + 1 == literal_segments {
+            break;
+        }
+        if let Some(sub) = substitutions.get(next_index) {
+            let sub_str = interp
+                .coerce_to_string(&context, sub)
+                .map_err(|e| crate::native_function::vm_to_native_error(e, "String.raw"))?;
+            out.push_str(&sub_str);
+        }
+    }
+    Ok(Value::string(JsString::from_str(
+        &out,
+        interp.gc_heap_mut(),
+    )?))
+}
 
 /// `String.fromCharCode(...codeUnits)` — ECMA-262 §22.1.2.1.
 ///

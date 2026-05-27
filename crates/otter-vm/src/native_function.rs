@@ -1127,6 +1127,37 @@ impl From<otter_gc::OutOfMemory> for NativeError {
     }
 }
 
+/// Map a re-entry [`crate::VmError`] onto the native error model.
+///
+/// `VmError::Uncaught` carries a user-thrown JS value and is preserved
+/// as [`NativeError::Thrown`] so callbacks that `throw` surface intact;
+/// the spec error classes map to their `NativeError` counterparts and
+/// everything else falls back to a `TypeError` with the rendered cause.
+pub(crate) fn vm_to_native_error(err: crate::VmError, name: &'static str) -> NativeError {
+    match err {
+        crate::VmError::Uncaught { value } => NativeError::Thrown {
+            name,
+            message: value,
+        },
+        crate::VmError::TypeError { message } => NativeError::TypeError {
+            name,
+            reason: message,
+        },
+        crate::VmError::RangeError { message } => NativeError::RangeError {
+            name,
+            reason: message,
+        },
+        crate::VmError::SyntaxError { message } => NativeError::SyntaxError {
+            name,
+            reason: message,
+        },
+        other => NativeError::TypeError {
+            name,
+            reason: other.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

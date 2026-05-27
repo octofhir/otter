@@ -2844,18 +2844,29 @@ impl Interpreter {
                                 _ => VmGetOutcome::Value(Value::undefined()),
                             });
                         }
-                        None => self
-                            .function_prototype_object()
-                            .ok()
-                            .and_then(|p| object::get_symbol(p, &self.gc_heap, *sym))
-                            .unwrap_or(Value::undefined()),
+                        None => {
+                            // §10.1.8 — a native constructor with a
+                            // non-default [[Prototype]] (e.g. `Uint8Array`
+                            // → abstract `%TypedArray%`) must walk that
+                            // chain for inherited accessors like
+                            // `@@species`, not jump straight to
+                            // `Function.prototype`.
+                            if let Some(proto) = native.prototype_override(&self.gc_heap) {
+                                return self
+                                    .ordinary_get_value(context, proto, receiver, key, hops + 1);
+                            }
+                            self.function_prototype_object()
+                                .ok()
+                                .and_then(|p| object::get_symbol(p, &self.gc_heap, *sym))
+                                .unwrap_or(Value::undefined())
+                        }
                     }
                 }
                 _ => {
-                    let key = key
+                    let key_name = key
                         .string_name()
                         .expect("non-symbol key has string spelling");
-                    match native.own_property_descriptor(&mut self.gc_heap, key)? {
+                    match native.own_property_descriptor(&mut self.gc_heap, key_name)? {
                         Some(object::PropertyDescriptor {
                             kind: object::DescriptorKind::Data { value },
                             ..
@@ -2871,10 +2882,15 @@ impl Interpreter {
                                 _ => VmGetOutcome::Value(Value::undefined()),
                             });
                         }
-                        None => self
-                            .load_function_prototype_method(key)
-                            .or_else(|| self.load_object_prototype_method(key))
-                            .unwrap_or(Value::undefined()),
+                        None => {
+                            if let Some(proto) = native.prototype_override(&self.gc_heap) {
+                                return self
+                                    .ordinary_get_value(context, proto, receiver, key, hops + 1);
+                            }
+                            self.load_function_prototype_method(key_name)
+                                .or_else(|| self.load_object_prototype_method(key_name))
+                                .unwrap_or(Value::undefined())
+                        }
                     }
                 }
             };
@@ -3032,8 +3048,13 @@ impl Interpreter {
                 }
             };
             return if direct.is_undefined() {
-                let kind_name = t.kind().name();
-                let proto = self.constructor_prototype_value(kind_name)?;
+                // §10.4.5.4 walks the instance's actual [[Prototype]]
+                // (a subclass `X.prototype` when `class X extends
+                // Uint8Array`), not the kind's default prototype — so
+                // `O.constructor` / user-added prototype props resolve
+                // against the real chain. `get_prototype_for_op`
+                // returns the per-instance override or the intrinsic.
+                let proto = self.get_prototype_for_op(&base)?;
                 if proto.is_nullish() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
                 }

@@ -437,6 +437,12 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         "RegExp",
         "ArrayBuffer",
         "SharedArrayBuffer",
+        // §23.2.2.4 `get %TypedArray% [ @@species ]` lives on the
+        // abstract constructor (hidden global slot); every per-kind
+        // `Int8Array` … inherits it through its constructor
+        // [[Prototype]] chain, so subclasses observe a working
+        // SpeciesConstructor.
+        "@@%TypedArray%",
     ] {
         install_constructor_species_accessor(heap, global, well_known, ctor_name)?;
     }

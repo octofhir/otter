@@ -894,8 +894,32 @@ impl Interpreter {
             } else {
                 let direct = binary::typed_array_prototype::load_property(&t, &self.gc_heap, name);
                 if direct.is_undefined() {
-                    let kind_name = t.kind().name();
-                    self.load_from_constructor_prototype(context, kind_name, &receiver, name)?
+                    // §10.4.5.4 walks the instance's actual [[Prototype]]
+                    // (a subclass `X.prototype`), not the kind default,
+                    // so `O.constructor` / user prototype props resolve
+                    // against the real chain.
+                    let proto = self.get_prototype_for_op(&receiver)?;
+                    match proto.as_object() {
+                        Some(proto_obj) => {
+                            let key = VmPropertyKey::String(name);
+                            match self.ordinary_get_value(
+                                context,
+                                Value::object(proto_obj),
+                                receiver,
+                                &key,
+                                0,
+                            )? {
+                                VmGetOutcome::Value(v) => v,
+                                VmGetOutcome::InvokeGetter { getter } => self.run_callable_sync(
+                                    context,
+                                    &getter,
+                                    receiver,
+                                    smallvec::SmallVec::new(),
+                                )?,
+                            }
+                        }
+                        None => Value::undefined(),
+                    }
                 } else {
                     direct
                 }

@@ -157,10 +157,13 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
         }
     } else if let Some(obj) = v.as_object() {
         partial_from_object(&obj, heap).map_err(|e| temporal_err(e, CLASS))
+    } else if let Some(s) = v.as_string(heap) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(heap).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "must be a Temporal.Duration".to_string(),
+            reason: "must be a Temporal.Duration, ISO string, or duration-like object".to_string(),
         })
     }
 }

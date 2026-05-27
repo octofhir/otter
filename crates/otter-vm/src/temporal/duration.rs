@@ -214,21 +214,27 @@ fn impl_abs(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeErr
 
 fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
-    let Some(opts) = arg_or_undef(args, 0).as_object() else {
+    // §7.3.23 totalOf: a string is the `unit` shorthand; an object
+    // supplies `{ unit }`.
+    let total_of = arg_or_undef(args, 0);
+    let unit_name = if let Some(s) = total_of.as_string(ctx.heap()) {
+        s.to_lossy_string(ctx.heap())
+    } else if let Some(opts) = total_of.as_object() {
+        object::get(opts, ctx.heap(), "unit")
+            .and_then(|v| {
+                v.as_string(ctx.heap())
+                    .map(|s| s.to_lossy_string(ctx.heap()))
+            })
+            .ok_or_else(|| NativeError::TypeError {
+                name: CLASS,
+                reason: "options must include a `unit` string".to_string(),
+            })?
+    } else {
         return Err(NativeError::TypeError {
             name: CLASS,
-            reason: "must be { unit: '<unit>' } options".to_string(),
+            reason: "total() requires a unit string or { unit } options".to_string(),
         });
     };
-    let unit_name = object::get(opts, ctx.heap(), "unit")
-        .and_then(|v| {
-            v.as_string(ctx.heap())
-                .map(|s| s.to_lossy_string(ctx.heap()))
-        })
-        .ok_or_else(|| NativeError::TypeError {
-            name: CLASS,
-            reason: "options must include a `unit` string".to_string(),
-        })?;
     let unit =
         temporal_rs::options::Unit::from_str(&unit_name).map_err(|_| NativeError::RangeError {
             name: CLASS,
@@ -319,10 +325,13 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
         }
     } else if let Some(obj) = v.as_object() {
         partial_from_object(&obj, heap).map_err(|e| temporal_err(e, CLASS))
+    } else if let Some(s) = v.as_string(heap) {
+        temporal_rs::Duration::from_utf8(s.to_lossy_string(heap).as_bytes())
+            .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "must be a Temporal.Duration".to_string(),
+            reason: "must be a Temporal.Duration, ISO string, or duration-like object".to_string(),
         })
     }
 }

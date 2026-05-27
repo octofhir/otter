@@ -1986,6 +1986,21 @@ fn native_array_method(
                 .map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
+    // §23.1.3.23 / .21 — `push` / `pop` on a non-Array receiver run the
+    // re-entrant driver (generic array-like `length`, Set/Delete + Set
+    // length throwing). Dense `Value::Array` keeps the fast intrinsic.
+    if matches!(name, "push" | "pop") && !receiver.is_array() {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let interp = ctx.interp_mut();
+            let result = if name == "push" {
+                interp.array_push(&exec, receiver, args, &[args])
+            } else {
+                interp.array_pop(&exec, receiver, &[args])
+            };
+            return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -2618,6 +2633,115 @@ impl Interpreter {
             self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
         }
         Ok(o)
+    }
+
+    /// `Set(O, "length", v, true)` — a `false` result (non-writable /
+    /// frozen length) raises the spec TypeError.
+    fn array_set_length_throwing(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        len: f64,
+    ) -> Result<(), VmError> {
+        let ok = self.ordinary_set_data_value(
+            context,
+            o,
+            &crate::VmPropertyKey::String("length"),
+            Value::number(NumberValue::from_f64(len)),
+            o,
+            0,
+        )?;
+        if ok {
+            Ok(())
+        } else {
+            Err(VmError::TypeError {
+                message: "Cannot assign to read only property 'length' of object".to_string(),
+            })
+        }
+    }
+
+    /// §23.1.3.23 `Array.prototype.push` over a generic array-like
+    /// receiver: `O = ToObject(this)`, `len = LengthOfArrayLike(O)`,
+    /// reject when `len + argCount > 2**53 - 1`, then `Set(O, len+i, arg)`
+    /// and finally `Set(O, "length", len + argCount, true)`.
+    pub(crate) fn array_push(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)? as f64;
+        let arg_count = args.len() as f64;
+        // §23.1.3.23 step 4 — len + argCount must stay a safe integer.
+        if len + arg_count > 9_007_199_254_740_991.0 {
+            return Err(VmError::TypeError {
+                message: "Pushing too many elements onto an array-like".to_string(),
+            });
+        }
+        let mut n = len;
+        for &arg in args {
+            let key = format_index_key(n);
+            self.ordinary_set_data_value(
+                context,
+                o,
+                &crate::VmPropertyKey::String(&key),
+                arg,
+                o,
+                0,
+            )?;
+            n += 1.0;
+        }
+        self.array_set_length_throwing(context, o, n)?;
+        Ok(Value::number(NumberValue::from_f64(n)))
+    }
+
+    /// §23.1.3.21 `Array.prototype.pop` over a generic array-like
+    /// receiver: removes and returns the element at `len - 1`, observing
+    /// `Get` / `DeletePropertyOrThrow` / `Set(length)`.
+    pub(crate) fn array_pop(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)? as f64;
+        if len == 0.0 {
+            self.array_set_length_throwing(context, o, 0.0)?;
+            return Ok(Value::undefined());
+        }
+        let new_len = len - 1.0;
+        let key = format_index_key(new_len);
+        let element = self.get_property_value_for_call(context, o, &key)?;
+        let deleted = self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+        if !deleted {
+            return Err(VmError::TypeError {
+                message: format!("Cannot delete property '{key}'"),
+            });
+        }
+        self.array_set_length_throwing(context, o, new_len)?;
+        Ok(element)
+    }
+}
+
+/// Format an array index that may exceed `u32` (`length` runs to
+/// `2**53 - 1`) as its canonical decimal string for use as a property
+/// key, avoiding the float exponent form `to_string` would produce.
+fn format_index_key(n: f64) -> String {
+    if (0.0..9_007_199_254_740_992.0).contains(&n) && n.fract() == 0.0 {
+        (n as u64).to_string()
+    } else {
+        crate::number::NumberValue::from_f64(n).to_display_string()
     }
 }
 

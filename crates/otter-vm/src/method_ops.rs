@@ -54,6 +54,19 @@ fn needs_to_primitive(v: &Value) -> bool {
         || v.is_regexp()
 }
 
+/// Clamp a `ToIntegerOrInfinity` result to an absolute index within
+/// `[0, len]` per the relative-index convention shared by §23.2.3
+/// `slice` / `subarray` (negative counts from the end, `±Infinity`
+/// saturate to the bounds).
+fn relative_index_clamp(relative: f64, len: i64) -> i64 {
+    if relative < 0.0 {
+        let v = len as f64 + relative;
+        if v < 0.0 { 0 } else { v as i64 }
+    } else {
+        relative.min(len as f64) as i64
+    }
+}
+
 impl Interpreter {
     /// Handle `Op::CallMethodValue`: the universal method-call op.
     /// Branches by receiver kind:
@@ -348,6 +361,18 @@ impl Interpreter {
             )
             && self.typed_array_callback_dispatch(stack, context, &t, name, &arg_values, dst)?
         {
+            return Ok(());
+        }
+        // §23.2.3.26 `%TypedArray%.prototype.slice` allocates its
+        // result through `TypedArraySpeciesCreate` and coerces its
+        // `start` / `end` operands through `ToIntegerOrInfinity`
+        // (which observes user `@@toPrimitive` / `valueOf`). The
+        // intrinsic-table impl can do neither, so intercept here while
+        // a re-entrant interpreter handle is in scope.
+        if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
+            && name == "slice"
+        {
+            self.typed_array_slice_dispatch(stack, context, &t, &arg_values, dst)?;
             return Ok(());
         }
         // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
@@ -1786,6 +1811,90 @@ impl Interpreter {
         Ok(new_ta)
     }
 
+    /// §23.2.3.26 `%TypedArray%.prototype.slice(start, end)`. Coerces
+    /// both operands through `ToIntegerOrInfinity` (observing user
+    /// `@@toPrimitive` / `valueOf`), allocates the result via
+    /// `TypedArraySpeciesCreate(O, « count »)`, then copies the
+    /// in-range elements. The result is parked in `dst` before the
+    /// copy so it stays GC-rooted, and the source buffer is re-checked
+    /// for detachment after the (potentially re-entrant) species
+    /// constructor runs.
+    fn typed_array_slice_dispatch(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        t: &crate::binary::typed_array::JsTypedArray,
+        args: &SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+            return Err(VmError::TypeError {
+                message: "Cannot slice a TypedArray backed by a detached buffer".to_string(),
+            });
+        }
+        let len = t.length(&self.gc_heap) as i64;
+        let start = self.integer_or_infinity_for_arg(context, args.first())?;
+        let k = relative_index_clamp(start, len);
+        let relative_end = match args.get(1) {
+            None => len as f64,
+            Some(v) if v.is_undefined() => len as f64,
+            Some(_) => self.integer_or_infinity_for_arg(context, args.get(1))?,
+        };
+        let final_index = relative_index_clamp(relative_end, len);
+        let count = (final_index - k).max(0) as usize;
+
+        let top_idx = stack.len() - 1;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
+
+        let a = self.typed_array_species_create(context, t, count)?;
+        let a_value = Value::typed_array(a);
+        {
+            let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+            write_register(frame_top, dst, a_value)?;
+        }
+        if count > 0 {
+            if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "TypedArray buffer was detached during slice".to_string(),
+                });
+            }
+            let target_kind = a.kind();
+            let base = k as usize;
+            for n in 0..count {
+                let value = t.get(&mut self.gc_heap, base + n).map_err(crate::oom_to_vm)?;
+                let coerced = crate::binary::dispatch::coerce_element_for_store(
+                    &mut self.gc_heap,
+                    target_kind,
+                    &value,
+                )?;
+                a.set(&mut self.gc_heap, n, &coerced);
+            }
+        }
+        Ok(())
+    }
+
+    /// §7.1.5 `ToIntegerOrInfinity` applied to an optional argument
+    /// (missing / `undefined` → `0`). Re-enters user `@@toPrimitive`
+    /// / `valueOf` via `coerce_to_number` and raises TypeError for
+    /// Symbol / BigInt operands.
+    fn integer_or_infinity_for_arg(
+        &mut self,
+        context: &ExecutionContext,
+        arg: Option<&Value>,
+    ) -> Result<f64, VmError> {
+        let n = match arg {
+            None => return Ok(0.0),
+            Some(v) if v.is_undefined() => return Ok(0.0),
+            Some(v) => self.coerce_to_number(context, v)?.as_f64(),
+        };
+        if n.is_nan() {
+            Ok(0.0)
+        } else if n.is_infinite() {
+            Ok(n)
+        } else {
+            Ok(n.trunc())
+        }
+    }
 
     fn dispatch_function_method(
         &mut self,

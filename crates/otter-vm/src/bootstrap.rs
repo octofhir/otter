@@ -570,7 +570,11 @@ mod tests {
         // Bumped from 1280 → 1350 when `PlainMonthDay` + `ZonedDateTime`
         // landed, each shipping a constructor, statics, and a populated
         // prototype.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1350;
+        // Bumped from 1350 → 1500 when every Temporal plain/zoned type
+        // gained real `prototype` accessor properties (one native
+        // getter closure + accessor descriptor per field) so branding
+        // and prop-desc semantics match the spec.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1500;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

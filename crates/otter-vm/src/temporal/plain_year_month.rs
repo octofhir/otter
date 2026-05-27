@@ -219,6 +219,40 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 
+/// Generate a `Temporal.PlainYearMonth.prototype` accessor getter,
+/// re-validating the receiver via [`require_plain_year_month`]
+/// (branding `TypeError`). The heap arm exposes `&mut GcHeap`.
+macro_rules! plain_year_month_getter {
+    ($fn:ident, $pym:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pym = require_plain_year_month(ctx)?;
+            Ok($val)
+        }
+    };
+    ($fn:ident, $pym:ident, $heap:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pym = require_plain_year_month(ctx)?;
+            let $heap = ctx.heap_mut();
+            Ok($val)
+        }
+    };
+}
+
+plain_year_month_getter!(get_year, pym => Value::number_i32(pym.year()));
+plain_year_month_getter!(get_month, pym => Value::number_i32(pym.month() as i32));
+plain_year_month_getter!(get_month_code, pym, heap => str_or_undef(pym.month_code().as_str(), heap));
+plain_year_month_getter!(get_days_in_month, pym => Value::number_i32(pym.days_in_month() as i32));
+plain_year_month_getter!(get_days_in_year, pym => Value::number_i32(pym.days_in_year() as i32));
+plain_year_month_getter!(get_months_in_year, pym => Value::number_i32(pym.months_in_year() as i32));
+plain_year_month_getter!(get_in_leap_year, pym => Value::boolean(pym.in_leap_year()));
+plain_year_month_getter!(get_era, pym, heap => pym
+    .era()
+    .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)));
+plain_year_month_getter!(get_era_year, pym => pym
+    .era_year()
+    .map_or(Value::undefined(), Value::number_i32));
+plain_year_month_getter!(get_calendar_id, pym, heap => str_or_undef(pym.calendar().identifier(), heap));
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -256,6 +290,18 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [PLAIN_YEAR_MONTH_PROTOTYPE_METHODS],
+        accessors = [
+            ("calendarId",  get = get_calendar_id),
+            ("era",         get = get_era),
+            ("eraYear",     get = get_era_year),
+            ("year",        get = get_year),
+            ("month",       get = get_month),
+            ("monthCode",   get = get_month_code),
+            ("daysInMonth", get = get_days_in_month),
+            ("daysInYear",  get = get_days_in_year),
+            ("monthsInYear", get = get_months_in_year),
+            ("inLeapYear",  get = get_in_leap_year),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

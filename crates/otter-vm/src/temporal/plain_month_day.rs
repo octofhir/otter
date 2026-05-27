@@ -144,6 +144,30 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 
+/// Generate a `Temporal.PlainMonthDay.prototype` accessor getter,
+/// re-validating the receiver via [`require_plain_month_day`]
+/// (branding `TypeError`). The heap arm exposes `&mut GcHeap` for
+/// string-valued fields.
+macro_rules! plain_month_day_getter {
+    ($fn:ident, $pmd:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pmd = require_plain_month_day(ctx)?;
+            Ok($val)
+        }
+    };
+    ($fn:ident, $pmd:ident, $heap:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pmd = require_plain_month_day(ctx)?;
+            let $heap = ctx.heap_mut();
+            Ok($val)
+        }
+    };
+}
+
+plain_month_day_getter!(get_day, pmd => Value::number_i32(pmd.day() as i32));
+plain_month_day_getter!(get_month_code, pmd, heap => str_or_undef(pmd.month_code().as_str(), heap));
+plain_month_day_getter!(get_calendar_id, pmd, heap => str_or_undef(pmd.calendar().identifier(), heap));
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -176,6 +200,11 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [PLAIN_MONTH_DAY_PROTOTYPE_METHODS],
+        accessors = [
+            ("calendarId", get = get_calendar_id),
+            ("monthCode",  get = get_month_code),
+            ("day",        get = get_day),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

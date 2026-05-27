@@ -314,6 +314,56 @@ fn impl_to_plain_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
     make_temporal(ctx, TemporalPayload::PlainTime(pdt.to_plain_time()))
 }
 
+/// Generate a `Temporal.PlainDateTime.prototype` accessor getter,
+/// re-validating the receiver via [`require_plain_date_time`]
+/// (branding `TypeError`). The heap arm exposes `&mut GcHeap`.
+macro_rules! plain_date_time_getter {
+    ($fn:ident, $pdt:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pdt = require_plain_date_time(ctx)?;
+            Ok($val)
+        }
+    };
+    ($fn:ident, $pdt:ident, $heap:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pdt = require_plain_date_time(ctx)?;
+            let $heap = ctx.heap_mut();
+            Ok($val)
+        }
+    };
+}
+
+plain_date_time_getter!(get_year, pdt => Value::number_i32(pdt.year()));
+plain_date_time_getter!(get_month, pdt => Value::number_i32(pdt.month() as i32));
+plain_date_time_getter!(get_month_code, pdt, heap => str_or_undef(pdt.month_code().as_str(), heap));
+plain_date_time_getter!(get_day, pdt => Value::number_i32(pdt.day() as i32));
+plain_date_time_getter!(get_hour, pdt => Value::number_i32(pdt.hour() as i32));
+plain_date_time_getter!(get_minute, pdt => Value::number_i32(pdt.minute() as i32));
+plain_date_time_getter!(get_second, pdt => Value::number_i32(pdt.second() as i32));
+plain_date_time_getter!(get_millisecond, pdt => Value::number_i32(pdt.millisecond() as i32));
+plain_date_time_getter!(get_microsecond, pdt => Value::number_i32(pdt.microsecond() as i32));
+plain_date_time_getter!(get_nanosecond, pdt => Value::number_i32(pdt.nanosecond() as i32));
+plain_date_time_getter!(get_day_of_week, pdt => Value::number_i32(pdt.day_of_week() as i32));
+plain_date_time_getter!(get_day_of_year, pdt => Value::number_i32(pdt.day_of_year() as i32));
+plain_date_time_getter!(get_week_of_year, pdt => pdt
+    .week_of_year()
+    .map_or(Value::undefined(), |w| Value::number_i32(w as i32)));
+plain_date_time_getter!(get_year_of_week, pdt => pdt
+    .year_of_week()
+    .map_or(Value::undefined(), Value::number_i32));
+plain_date_time_getter!(get_days_in_week, pdt => Value::number_i32(pdt.days_in_week() as i32));
+plain_date_time_getter!(get_days_in_month, pdt => Value::number_i32(pdt.days_in_month() as i32));
+plain_date_time_getter!(get_days_in_year, pdt => Value::number_i32(pdt.days_in_year() as i32));
+plain_date_time_getter!(get_months_in_year, pdt => Value::number_i32(pdt.months_in_year() as i32));
+plain_date_time_getter!(get_in_leap_year, pdt => Value::boolean(pdt.in_leap_year()));
+plain_date_time_getter!(get_era, pdt, heap => pdt
+    .era()
+    .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)));
+plain_date_time_getter!(get_era_year, pdt => pdt
+    .era_year()
+    .map_or(Value::undefined(), Value::number_i32));
+plain_date_time_getter!(get_calendar_id, pdt, heap => str_or_undef(pdt.calendar().identifier(), heap));
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -355,6 +405,30 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [PLAIN_DATE_TIME_PROTOTYPE_METHODS],
+        accessors = [
+            ("calendarId",   get = get_calendar_id),
+            ("era",          get = get_era),
+            ("eraYear",      get = get_era_year),
+            ("year",         get = get_year),
+            ("month",        get = get_month),
+            ("monthCode",    get = get_month_code),
+            ("day",          get = get_day),
+            ("hour",         get = get_hour),
+            ("minute",       get = get_minute),
+            ("second",       get = get_second),
+            ("millisecond",  get = get_millisecond),
+            ("microsecond",  get = get_microsecond),
+            ("nanosecond",   get = get_nanosecond),
+            ("dayOfWeek",    get = get_day_of_week),
+            ("dayOfYear",    get = get_day_of_year),
+            ("weekOfYear",   get = get_week_of_year),
+            ("yearOfWeek",   get = get_year_of_week),
+            ("daysInWeek",   get = get_days_in_week),
+            ("daysInMonth",  get = get_days_in_month),
+            ("daysInYear",   get = get_days_in_year),
+            ("monthsInYear", get = get_months_in_year),
+            ("inLeapYear",   get = get_in_leap_year),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

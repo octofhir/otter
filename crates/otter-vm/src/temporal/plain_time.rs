@@ -215,6 +215,25 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     make_temporal(ctx, TemporalPayload::PlainTime(result))
 }
 
+/// Generate a `Temporal.PlainTime.prototype` accessor getter. Each
+/// re-validates the receiver via [`require_plain_time`] (branding
+/// `TypeError`) before returning its field.
+macro_rules! plain_time_getter {
+    ($fn:ident, $pt:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pt = require_plain_time(ctx)?;
+            Ok($val)
+        }
+    };
+}
+
+plain_time_getter!(get_hour, pt => Value::number_i32(pt.hour() as i32));
+plain_time_getter!(get_minute, pt => Value::number_i32(pt.minute() as i32));
+plain_time_getter!(get_second, pt => Value::number_i32(pt.second() as i32));
+plain_time_getter!(get_millisecond, pt => Value::number_i32(pt.millisecond() as i32));
+plain_time_getter!(get_microsecond, pt => Value::number_i32(pt.microsecond() as i32));
+plain_time_getter!(get_nanosecond, pt => Value::number_i32(pt.nanosecond() as i32));
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -252,6 +271,14 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [PLAIN_TIME_PROTOTYPE_METHODS],
+        accessors = [
+            ("hour",        get = get_hour),
+            ("minute",      get = get_minute),
+            ("second",      get = get_second),
+            ("millisecond", get = get_millisecond),
+            ("microsecond", get = get_microsecond),
+            ("nanosecond",  get = get_nanosecond),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

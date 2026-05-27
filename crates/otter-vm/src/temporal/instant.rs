@@ -217,6 +217,25 @@ fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Instant(result))
 }
 
+/// `Temporal.Instant.prototype` accessor getters, re-validating the
+/// receiver via [`require_instant`] (branding `TypeError`).
+fn get_epoch_milliseconds(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    Ok(Value::number_f64(inst.epoch_milliseconds() as f64))
+}
+
+fn get_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let nanos = inst.as_i128();
+    match crate::bigint::BigIntValue::from_i128(ctx.heap_mut(), nanos) {
+        Ok(handle) => Ok(Value::big_int(handle)),
+        Err(_) => Ok(Value::undefined()),
+    }
+}
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -254,6 +273,10 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [INSTANT_PROTOTYPE_METHODS],
+        accessors = [
+            ("epochMilliseconds", get = get_epoch_milliseconds),
+            ("epochNanoseconds",  get = get_epoch_nanoseconds),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

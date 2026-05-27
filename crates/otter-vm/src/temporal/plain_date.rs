@@ -243,6 +243,48 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
 }
 
+/// Generate a `Temporal.PlainDate.prototype` accessor getter,
+/// re-validating the receiver via [`require_plain_date`] (branding
+/// `TypeError`). The heap arm exposes `&mut GcHeap` for string fields.
+macro_rules! plain_date_getter {
+    ($fn:ident, $pd:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pd = require_plain_date(ctx)?;
+            Ok($val)
+        }
+    };
+    ($fn:ident, $pd:ident, $heap:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $pd = require_plain_date(ctx)?;
+            let $heap = ctx.heap_mut();
+            Ok($val)
+        }
+    };
+}
+
+plain_date_getter!(get_year, pd => Value::number_i32(pd.year()));
+plain_date_getter!(get_month, pd => Value::number_i32(pd.month() as i32));
+plain_date_getter!(get_month_code, pd, heap => str_or_undef(pd.month_code().as_str(), heap));
+plain_date_getter!(get_day, pd => Value::number_i32(pd.day() as i32));
+plain_date_getter!(get_day_of_week, pd => Value::number_i32(pd.day_of_week() as i32));
+plain_date_getter!(get_day_of_year, pd => Value::number_i32(pd.day_of_year() as i32));
+plain_date_getter!(get_week_of_year, pd => pd
+    .week_of_year()
+    .map_or(Value::undefined(), |w| Value::number_i32(w as i32)));
+plain_date_getter!(get_year_of_week, pd => pd
+    .year_of_week()
+    .map_or(Value::undefined(), Value::number_i32));
+plain_date_getter!(get_days_in_week, pd => Value::number_i32(pd.days_in_week() as i32));
+plain_date_getter!(get_days_in_month, pd => Value::number_i32(pd.days_in_month() as i32));
+plain_date_getter!(get_days_in_year, pd => Value::number_i32(pd.days_in_year() as i32));
+plain_date_getter!(get_months_in_year, pd => Value::number_i32(pd.months_in_year() as i32));
+plain_date_getter!(get_in_leap_year, pd => Value::boolean(pd.in_leap_year()));
+plain_date_getter!(get_era, pd, heap => pd
+    .era()
+    .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)));
+plain_date_getter!(get_era_year, pd => pd.era_year().map_or(Value::undefined(), Value::number_i32));
+plain_date_getter!(get_calendar_id, pd, heap => str_or_undef(pd.calendar().identifier(), heap));
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -281,6 +323,24 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [PLAIN_DATE_PROTOTYPE_METHODS],
+        accessors = [
+            ("calendarId",  get = get_calendar_id),
+            ("era",         get = get_era),
+            ("eraYear",     get = get_era_year),
+            ("year",        get = get_year),
+            ("month",       get = get_month),
+            ("monthCode",   get = get_month_code),
+            ("day",         get = get_day),
+            ("dayOfWeek",   get = get_day_of_week),
+            ("dayOfYear",   get = get_day_of_year),
+            ("weekOfYear",  get = get_week_of_year),
+            ("yearOfWeek",  get = get_year_of_week),
+            ("daysInWeek",  get = get_days_in_week),
+            ("daysInMonth", get = get_days_in_month),
+            ("daysInYear",  get = get_days_in_year),
+            ("monthsInYear", get = get_months_in_year),
+            ("inLeapYear",  get = get_in_leap_year),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

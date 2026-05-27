@@ -18,7 +18,7 @@ use crate::string::JsString;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_difference_settings,
-    parse_rounding_options, require_construct, require_zoned_date_time, temporal_err,
+    parse_rounding_options, require_construct, require_zoned_date_time, str_or_undef, temporal_err,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -297,6 +297,71 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<V
     )
 }
 
+/// Generate a `Temporal.ZonedDateTime.prototype` accessor getter,
+/// re-validating the receiver via [`require_zoned_date_time`]
+/// (branding `TypeError`). The heap arm exposes `&mut GcHeap` for
+/// string- and BigInt-valued fields.
+macro_rules! zoned_date_time_getter {
+    ($fn:ident, $zdt:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $zdt = require_zoned_date_time(ctx)?;
+            Ok($val)
+        }
+    };
+    ($fn:ident, $zdt:ident, $heap:ident => $val:expr) => {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+            let $zdt = require_zoned_date_time(ctx)?;
+            let $heap = ctx.heap_mut();
+            Ok($val)
+        }
+    };
+}
+
+zoned_date_time_getter!(get_year, zdt => Value::number_i32(zdt.year()));
+zoned_date_time_getter!(get_month, zdt => Value::number_i32(zdt.month() as i32));
+zoned_date_time_getter!(get_month_code, zdt, heap => str_or_undef(zdt.month_code().as_str(), heap));
+zoned_date_time_getter!(get_day, zdt => Value::number_i32(zdt.day() as i32));
+zoned_date_time_getter!(get_hour, zdt => Value::number_i32(zdt.hour() as i32));
+zoned_date_time_getter!(get_minute, zdt => Value::number_i32(zdt.minute() as i32));
+zoned_date_time_getter!(get_second, zdt => Value::number_i32(zdt.second() as i32));
+zoned_date_time_getter!(get_millisecond, zdt => Value::number_i32(zdt.millisecond() as i32));
+zoned_date_time_getter!(get_microsecond, zdt => Value::number_i32(zdt.microsecond() as i32));
+zoned_date_time_getter!(get_nanosecond, zdt => Value::number_i32(zdt.nanosecond() as i32));
+zoned_date_time_getter!(get_day_of_week, zdt => Value::number_i32(zdt.day_of_week() as i32));
+zoned_date_time_getter!(get_day_of_year, zdt => Value::number_i32(zdt.day_of_year() as i32));
+zoned_date_time_getter!(get_week_of_year, zdt => zdt
+    .week_of_year()
+    .map_or(Value::undefined(), |w| Value::number_i32(w as i32)));
+zoned_date_time_getter!(get_year_of_week, zdt => zdt
+    .year_of_week()
+    .map_or(Value::undefined(), Value::number_i32));
+zoned_date_time_getter!(get_days_in_week, zdt => Value::number_i32(zdt.days_in_week() as i32));
+zoned_date_time_getter!(get_days_in_month, zdt => Value::number_i32(zdt.days_in_month() as i32));
+zoned_date_time_getter!(get_days_in_year, zdt => Value::number_i32(zdt.days_in_year() as i32));
+zoned_date_time_getter!(get_months_in_year, zdt => Value::number_i32(zdt.months_in_year() as i32));
+zoned_date_time_getter!(get_in_leap_year, zdt => Value::boolean(zdt.in_leap_year()));
+zoned_date_time_getter!(get_hours_in_day, zdt => zdt
+    .hours_in_day()
+    .map_or(Value::undefined(), Value::number_f64));
+zoned_date_time_getter!(get_epoch_milliseconds, zdt => Value::number_f64(zdt.epoch_milliseconds() as f64));
+zoned_date_time_getter!(get_offset_nanoseconds, zdt => Value::number_f64(zdt.offset_nanoseconds() as f64));
+zoned_date_time_getter!(get_era, zdt, heap => zdt
+    .era()
+    .map_or(Value::undefined(), |era| str_or_undef(era.as_str(), heap)));
+zoned_date_time_getter!(get_era_year, zdt => zdt.era_year().map_or(Value::undefined(), Value::number_i32));
+zoned_date_time_getter!(get_epoch_nanoseconds, zdt, heap => {
+    match BigIntValue::from_i128(heap, zdt.epoch_nanoseconds().0) {
+        Ok(b) => Value::big_int(b),
+        Err(_) => Value::undefined(),
+    }
+});
+zoned_date_time_getter!(get_offset, zdt, heap => str_or_undef(&zdt.offset(), heap));
+zoned_date_time_getter!(get_time_zone_id, zdt, heap => {
+    let id = zdt.time_zone().identifier().unwrap_or_default();
+    str_or_undef(&id, heap)
+});
+zoned_date_time_getter!(get_calendar_id, zdt, heap => str_or_undef(zdt.calendar().identifier(), heap));
+
 const fn method(
     name: &'static str,
     length: u8,
@@ -340,6 +405,36 @@ otter_macros::couch! {
     },
     prototype = {
         method_specs = [ZONED_DATE_TIME_PROTOTYPE_METHODS],
+        accessors = [
+            ("calendarId",        get = get_calendar_id),
+            ("timeZoneId",        get = get_time_zone_id),
+            ("era",               get = get_era),
+            ("eraYear",           get = get_era_year),
+            ("year",              get = get_year),
+            ("month",             get = get_month),
+            ("monthCode",         get = get_month_code),
+            ("day",               get = get_day),
+            ("hour",              get = get_hour),
+            ("minute",            get = get_minute),
+            ("second",            get = get_second),
+            ("millisecond",       get = get_millisecond),
+            ("microsecond",       get = get_microsecond),
+            ("nanosecond",        get = get_nanosecond),
+            ("epochMilliseconds", get = get_epoch_milliseconds),
+            ("epochNanoseconds",  get = get_epoch_nanoseconds),
+            ("dayOfWeek",         get = get_day_of_week),
+            ("dayOfYear",         get = get_day_of_year),
+            ("weekOfYear",        get = get_week_of_year),
+            ("yearOfWeek",        get = get_year_of_week),
+            ("hoursInDay",        get = get_hours_in_day),
+            ("daysInWeek",        get = get_days_in_week),
+            ("daysInMonth",       get = get_days_in_month),
+            ("daysInYear",        get = get_days_in_year),
+            ("monthsInYear",      get = get_months_in_year),
+            ("inLeapYear",        get = get_in_leap_year),
+            ("offsetNanoseconds", get = get_offset_nanoseconds),
+            ("offset",            get = get_offset),
+        ],
     },
     install_on = crate::temporal::native_dispatch::temporal_host,
 }

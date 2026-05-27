@@ -336,37 +336,51 @@ fn construct_typed_array_with_roots(
         if buf.is_detached(gc_heap) {
             return Err(VmError::TypeMismatch);
         }
+        // §23.2.5.1 InitializeTypedArrayFromArrayBuffer: byteOffset
+        // coercion and alignment / bounds failures are RangeErrors
+        // (TypeError only for the Symbol/BigInt ToNumber failures that
+        // `to_index_error` distinguishes).
         let byte_offset = match args.get(1) {
             None => 0u64,
             Some(v) if v.is_undefined() => 0u64,
-            Some(v) => to_index(v, gc_heap).ok_or(VmError::TypeMismatch)?,
+            Some(v) => to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "byteOffset"))?,
         } as usize;
         if !byte_offset.is_multiple_of(bpe) {
-            return Err(VmError::TypeMismatch);
+            return Err(VmError::RangeError {
+                message: format!("start offset must be a multiple of {bpe}"),
+            });
         }
         let buf_len = buf.byte_length(gc_heap);
         if byte_offset > buf_len {
-            return Err(VmError::TypeMismatch);
+            return Err(VmError::RangeError {
+                message: "start offset is outside the bounds of the buffer".to_string(),
+            });
         }
         let length = match args.get(2) {
             None => {
                 let remaining = buf_len - byte_offset;
                 if !remaining.is_multiple_of(bpe) {
-                    return Err(VmError::TypeMismatch);
+                    return Err(VmError::RangeError {
+                        message: format!("buffer length minus the offset must be a multiple of {bpe}"),
+                    });
                 }
                 remaining / bpe
             }
             Some(v) if v.is_undefined() => {
                 let remaining = buf_len - byte_offset;
                 if !remaining.is_multiple_of(bpe) {
-                    return Err(VmError::TypeMismatch);
+                    return Err(VmError::RangeError {
+                        message: format!("buffer length minus the offset must be a multiple of {bpe}"),
+                    });
                 }
                 remaining / bpe
             }
             Some(v) => {
-                let n = to_index(v, gc_heap).ok_or(VmError::TypeMismatch)? as usize;
+                let n = to_index(v, gc_heap).ok_or_else(|| to_index_error(v, "length"))? as usize;
                 if byte_offset + n * bpe > buf_len {
-                    return Err(VmError::TypeMismatch);
+                    return Err(VmError::RangeError {
+                        message: "invalid typed array length".to_string(),
+                    });
                 }
                 n
             }

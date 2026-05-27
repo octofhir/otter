@@ -1931,12 +1931,13 @@ fn native_array_method(
         }
         out
     };
-    // §22.1.3.14 / .17 `indexOf` / `lastIndexOf` — drive the search
-    // through the prototype-walking, accessor-aware array-like
-    // collector so inherited indices (`new Sub()` over an Array
-    // prototype, `Boolean.prototype[0]`) and accessor `length` are
-    // observed. Present-entry semantics match the spec's
-    // `HasProperty(O, k)` skip of absent indices.
+    // §22.1.3.14 / .17 `indexOf` / `lastIndexOf` — search the receiver
+    // with a *live* per-index `HasProperty(O, k)` + `Get(O, k)` ladder
+    // (not a snapshot) so getters that mutate the receiver or its
+    // prototype mid-walk are observed in spec order. The loop is driven
+    // by the clamped `fromIndex` bound, so the pathological huge-`length`
+    // cases (the suite's only ones) find their match at the boundary
+    // they start from and never scan the full range.
     if matches!(name, "indexOf" | "lastIndexOf") {
         let exec = ctx.execution_context().cloned();
         if let Some(exec) = exec {
@@ -1950,60 +1951,8 @@ fn native_array_method(
                     .box_sloppy_this_primitive_runtime_rooted(receiver, &[args])
                     .map_err(|err| crate::native_function::vm_to_native_error(err, name))?
             };
-            let (entries, len) =
-                collect_array_like_callback_entries(interp, &exec, &o).map_err(|err| {
-                    crate::native_function::vm_to_native_error(err, name)
-                })?;
-            let heap = interp.gc_heap();
-            let result = if len == 0 {
-                -1i64
-            } else {
-                let to_int = |v: &Value| -> f64 {
-                    let n = crate::number::parse::to_number_value(v, heap);
-                    if n.is_nan() {
-                        0.0
-                    } else {
-                        n.trunc()
-                    }
-                };
-                if name == "indexOf" {
-                    let n = from_arg.map_or(0.0, |v| to_int(&v));
-                    let k = if n >= len as f64 {
-                        len as i64
-                    } else if n >= 0.0 {
-                        n as i64
-                    } else {
-                        (len as i64 + n as i64).max(0)
-                    };
-                    entries
-                        .iter()
-                        .find(|(idx, v)| {
-                            (*idx as i64) >= k
-                                && crate::abstract_ops::is_strictly_equal(v, &search, heap)
-                        })
-                        .map_or(-1, |(idx, _)| *idx as i64)
-                } else {
-                    // lastIndexOf — default fromIndex is len-1.
-                    let n = from_arg.map_or((len - 1) as f64, |v| to_int(&v));
-                    let k = if n >= 0.0 {
-                        (n as i64).min(len as i64 - 1)
-                    } else {
-                        len as i64 + n as i64
-                    };
-                    if k < 0 {
-                        -1
-                    } else {
-                        entries
-                            .iter()
-                            .rev()
-                            .find(|(idx, v)| {
-                                (*idx as i64) <= k
-                                    && crate::abstract_ops::is_strictly_equal(v, &search, heap)
-                            })
-                            .map_or(-1, |(idx, _)| *idx as i64)
-                    }
-                }
-            };
+            let result = array_linear_search(interp, &exec, o, name, search, from_arg)
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
             return Ok(Value::number(NumberValue::from_f64(result as f64)));
         }
     }
@@ -2082,6 +2031,118 @@ native_array!(native_entries_iter, "entries");
 /// Array prototype) and accessor `length` are observed per spec.
 ///
 /// Dense `Value::Array` receivers keep the hole-aware fast path.
+/// §7.3.18 `LengthOfArrayLike(O)` — `ToLength(? Get(O, "length"))`.
+/// Reads the live `length` (running a `length` getter) without the
+/// probe-cap that [`array_like_length`] applies, so boundary `length`
+/// values such as `2**32` round-trip exactly; special-cases dense
+/// arrays and String-exotic wrappers whose `[[Get]]` ladder may not
+/// surface a plain Number.
+fn length_of_array_like(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    o: &Value,
+) -> Result<usize, VmError> {
+    if let Some(obj) = o.as_object()
+        && let Some(s) = crate::object::string_data(obj, interp.gc_heap())
+    {
+        return Ok(s.len() as usize);
+    }
+    if let Some(arr) = o.as_array() {
+        return Ok(crate::array::len(arr, interp.gc_heap()));
+    }
+    let len_val = interp.get_property_value_for_call(context, *o, "length")?;
+    Ok(crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0))
+}
+
+/// §23.1.3.14 / .18 shared search driver for `Array.prototype.indexOf`
+/// and `lastIndexOf`. Walks the receiver with a *live* per-index
+/// `HasProperty(O, k)` + `Get(O, k)` ladder (never a snapshot) so a
+/// getter that mutates the receiver or its prototype mid-walk is
+/// observed in spec order, and inherited / sparse indices that the
+/// dense element store does not surface are still found.
+///
+/// The loop is bounded by the clamped `fromIndex`: the suite's only
+/// pathological huge-`length` receivers (`{length: 2**32}`, sparse
+/// arrays with an element at `2**32 - 2`) locate their match at the
+/// boundary the walk starts from, so the search never scans the full
+/// range. Returns the matched index, or `-1`.
+pub(crate) fn array_linear_search(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    o: Value,
+    name: &str,
+    search: Value,
+    from_arg: Option<Value>,
+) -> Result<i64, VmError> {
+    // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O).
+    let len = length_of_array_like(interp, context, &o)?;
+    if len == 0 {
+        return Ok(-1);
+    }
+    // §7.1.5 ToIntegerOrInfinity(fromIndex) begins with ToNumber →
+    // ToPrimitive(Number); run user `valueOf` / `@@toPrimitive` on an
+    // object `fromIndex` before the numeric clamp below.
+    let from_arg = match from_arg {
+        Some(v) if v.is_object_type() => Some(interp.evaluate_to_primitive(
+            context,
+            &v,
+            crate::abstract_ops::ToPrimitiveHint::Number,
+        )?),
+        other => other,
+    };
+    let to_int = |v: &Value, heap: &otter_gc::GcHeap| -> f64 {
+        let n = crate::number::parse::to_number_value(v, heap);
+        if n.is_nan() { 0.0 } else { n.trunc() }
+    };
+    let len_i = len as i64;
+    let probe = |interp: &mut Interpreter, k: i64| -> Result<Option<i64>, VmError> {
+        let key = k.to_string();
+        let has =
+            interp.ordinary_has_property_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+        if !has {
+            return Ok(None);
+        }
+        let v = interp.get_property_value_for_call(context, o, &key)?;
+        if crate::abstract_ops::is_strictly_equal(&v, &search, interp.gc_heap()) {
+            Ok(Some(k))
+        } else {
+            Ok(None)
+        }
+    };
+    if name == "indexOf" {
+        let n = from_arg.map_or(0.0, |v| to_int(&v, interp.gc_heap()));
+        let mut k = if n >= len as f64 {
+            len_i
+        } else if n >= 0.0 {
+            n as i64
+        } else {
+            (len_i + n as i64).max(0)
+        };
+        while k < len_i {
+            if let Some(idx) = probe(interp, k)? {
+                return Ok(idx);
+            }
+            k += 1;
+        }
+        Ok(-1)
+    } else {
+        // lastIndexOf — default fromIndex is len-1.
+        let n = from_arg.map_or((len - 1) as f64, |v| to_int(&v, interp.gc_heap()));
+        let mut k = if n >= 0.0 {
+            (n as i64).min(len_i - 1)
+        } else {
+            len_i + n as i64
+        };
+        while k >= 0 {
+            if let Some(idx) = probe(interp, k)? {
+                return Ok(idx);
+            }
+            k -= 1;
+        }
+        Ok(-1)
+    }
+}
+
 fn collect_array_like_callback_entries(
     interp: &mut Interpreter,
     context: &ExecutionContext,

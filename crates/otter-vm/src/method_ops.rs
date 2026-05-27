@@ -339,6 +339,22 @@ impl Interpreter {
         {
             return Ok(());
         }
+        // §23.1.3.14 / .18 — `indexOf` / `lastIndexOf` on an Array
+        // receiver. The intrinsic-table impls walk only the dense
+        // element store, so they miss inherited / sparse indices and a
+        // getter that mutates the receiver mid-search. Route through the
+        // re-entrant live `HasProperty` + `Get` driver while a context
+        // is in scope.
+        if recv_value.is_array() && matches!(name, "indexOf" | "lastIndexOf") {
+            let search = arg_values.first().copied().unwrap_or_else(Value::undefined);
+            let from_arg = arg_values.get(1).copied();
+            let result =
+                array_prototype::array_linear_search(self, context, recv_value, name, search, from_arg)?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, Value::number(NumberValue::from_f64(result as f64)))?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         // §23.2.3.{8,11,12,13,14,15,17,18,21,22,28} — TypedArray
         // prototype callback methods. Same shape as the Array set
         // but routed through a TypedArray-specific dispatcher so

@@ -666,6 +666,25 @@ pub fn parse_calendar_fields(
     if let Some(v) = read_partial_integer(obj, "day", heap, class)? {
         f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
+    if let Some(s) = read_string_field(obj, "monthCode", heap) {
+        let code =
+            temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| NativeError::TypeError {
+                name: class,
+                reason: "invalid monthCode".to_string(),
+            })?;
+        f.month_code = Some(code);
+    }
+    if let Some(s) = read_string_field(obj, "era", heap) {
+        let era =
+            temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| NativeError::RangeError {
+                name: class,
+                reason: "invalid era".to_string(),
+            })?;
+        f.era = Some(era);
+    }
+    if let Some(v) = read_partial_integer(obj, "eraYear", heap, class)? {
+        f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+    }
     Ok(f)
 }
 
@@ -700,6 +719,17 @@ pub fn parse_year_month_fields(
             }
         })?;
         f.month_code = Some(code);
+    }
+    if let Some(s) = read_string_field(obj, "era", heap) {
+        let era =
+            temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| NativeError::RangeError {
+                name: class,
+                reason: "invalid era".to_string(),
+            })?;
+        f.era = Some(era);
+    }
+    if let Some(v) = read_partial_integer(obj, "eraYear", heap, class)? {
+        f.era_year = Some(v.clamp(i32::MIN as i64, i32::MAX as i64) as i32);
     }
     Ok(f)
 }

@@ -1931,49 +1931,21 @@ fn native_array_method(
         }
         out
     };
-    // §22.1.3.14 / .17 `indexOf` / `lastIndexOf` — search the receiver
-    // with a *live* per-index `HasProperty(O, k)` + `Get(O, k)` ladder
-    // (not a snapshot) so getters that mutate the receiver or its
-    // prototype mid-walk are observed in spec order. The loop is driven
-    // by the clamped `fromIndex` bound, so the pathological huge-`length`
-    // cases (the suite's only ones) find their match at the boundary
-    // they start from and never scan the full range.
-    if matches!(name, "indexOf" | "lastIndexOf") {
+    // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` / `includes`
+    // run through the single re-entrant driver so the `.call` /
+    // `.apply` path matches the Array-receiver fast path exactly
+    // (live per-index `[[Get]]`, observes getters / sparse / inherited
+    // indices). Falls through to the intrinsic table only when no
+    // execution context is available (cannot re-enter user code).
+    if matches!(name, "indexOf" | "lastIndexOf" | "includes") {
         let exec = ctx.execution_context().cloned();
         if let Some(exec) = exec {
             let search = args.first().copied().unwrap_or_else(Value::undefined);
             let from_arg = coerced_args.get(1).copied();
             let interp = ctx.interp_mut();
-            let o = if receiver.is_object_type() {
-                receiver
-            } else {
-                interp
-                    .box_sloppy_this_primitive_runtime_rooted(receiver, &[args])
-                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?
-            };
-            let result = array_linear_search(interp, &exec, o, name, search, from_arg)
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
-            return Ok(Value::number(NumberValue::from_f64(result as f64)));
-        }
-    }
-    // §23.1.3.13 `includes` — live `Get` + `SameValueZero` walk; holes
-    // read as `undefined`, so `includes(undefined)` matches a hole.
-    if name == "includes" {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let search = args.first().copied().unwrap_or_else(Value::undefined);
-            let from_arg = coerced_args.get(1).copied();
-            let interp = ctx.interp_mut();
-            let o = if receiver.is_object_type() {
-                receiver
-            } else {
-                interp
-                    .box_sloppy_this_primitive_runtime_rooted(receiver, &[args])
-                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?
-            };
-            let found = array_includes(interp, &exec, o, search, from_arg)
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
-            return Ok(Value::boolean(found));
+            return interp
+                .array_indexed_search(&exec, receiver, name, search, from_arg, &[args])
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
     let allocation_roots = ctx.collect_native_roots();
@@ -2250,6 +2222,40 @@ pub(crate) fn array_includes(
         k += 1;
     }
     Ok(false)
+}
+
+impl Interpreter {
+    /// Single entry for the live indexed array searches —
+    /// `indexOf` / `lastIndexOf` (`[[Get]]` + strict equality, returns
+    /// the index or `-1`) and `includes` (`[[Get]]` + SameValueZero,
+    /// returns a boolean). Shared by the Array-receiver fast path in
+    /// `do_call_method_value` and the generic `.call` path in
+    /// `native_array_method`, so both invocation styles run identical
+    /// spec-faithful logic. Boxes a primitive receiver (§7.1.18
+    /// ToObject) first; `roots` keeps the call arguments reachable
+    /// across that allocation.
+    pub(crate) fn array_indexed_search(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        name: &str,
+        search: Value,
+        from_arg: Option<Value>,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        if name == "includes" {
+            let found = array_includes(self, context, o, search, from_arg)?;
+            Ok(Value::boolean(found))
+        } else {
+            let idx = array_linear_search(self, context, o, name, search, from_arg)?;
+            Ok(Value::number(NumberValue::from_f64(idx as f64)))
+        }
+    }
 }
 
 fn collect_array_like_callback_entries(

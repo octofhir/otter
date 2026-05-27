@@ -339,32 +339,25 @@ impl Interpreter {
         {
             return Ok(());
         }
-        // §23.1.3.14 / .18 — `indexOf` / `lastIndexOf` on an Array
-        // receiver. The intrinsic-table impls walk only the dense
-        // element store, so they miss inherited / sparse indices and a
-        // getter that mutates the receiver mid-search. Route through the
-        // re-entrant live `HasProperty` + `Get` driver while a context
-        // is in scope.
-        if recv_value.is_array() && matches!(name, "indexOf" | "lastIndexOf") {
+        // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` /
+        // `includes` on an Array receiver. The intrinsic-table impls
+        // walk only the dense element store, so they miss inherited /
+        // sparse indices and a getter that mutates the receiver
+        // mid-search. Route through the single re-entrant driver
+        // (shared with the `.call` path) while a context is in scope.
+        if recv_value.is_array() && matches!(name, "indexOf" | "lastIndexOf" | "includes") {
             let search = arg_values.first().copied().unwrap_or_else(Value::undefined);
             let from_arg = arg_values.get(1).copied();
-            let result =
-                array_prototype::array_linear_search(self, context, recv_value, name, search, from_arg)?;
+            let result = self.array_indexed_search(
+                context,
+                recv_value,
+                name,
+                search,
+                from_arg,
+                &[arg_values.as_slice()],
+            )?;
             let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::number(NumberValue::from_f64(result as f64)))?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        // §23.1.3.13 `includes` on an Array receiver — live `Get` +
-        // `SameValueZero` so holes match `undefined` and inherited /
-        // sparse indices are found; route through the re-entrant driver.
-        if recv_value.is_array() && name == "includes" {
-            let search = arg_values.first().copied().unwrap_or_else(Value::undefined);
-            let from_arg = arg_values.get(1).copied();
-            let found =
-                array_prototype::array_includes(self, context, recv_value, search, from_arg)?;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::boolean(found))?;
+            write_register(frame, dst, result)?;
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }

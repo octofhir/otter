@@ -10,9 +10,13 @@ conformance-gated before the next starts.
 - [x] **Side spec-bug: for-of `break` IteratorClose** (§14.7.5.6) —
   fixed in `compile_for_of_statement` (commit `f4a30331`). Separate from
   the dispatch scatter; `for await` IteratorClose still pending.
-- [ ] **Stage 1** — collapse `indexOf`/`lastIndexOf`/`includes` to one
-  `Interpreter` entry; delete the dead array arm of `impl_index_of` /
-  `impl_last_index_of` / `impl_includes`.
+- [x] **Stage 1** — collapse `indexOf`/`lastIndexOf`/`includes` to one
+  `Interpreter::array_indexed_search` entry shared by both call sites
+  (was 4 duplicated interception blocks). Pure structural refactor,
+  conformance unchanged (indexOf 176/21, lastIndexOf 174/21,
+  includes 23/4). The intrinsic-table dense array arms of `impl_*` are
+  now reachable only on the context-less fallback path; their removal
+  is folded into Stage 5 (table collapse).
 - [ ] **Stage 2** — give every builtin a re-entrant handle (replace
   `IntrinsicArgs`); fold context-carrying interceptions back into impls.
   Fixes the String/RegExp/join receiver-coercion gaps as a class.

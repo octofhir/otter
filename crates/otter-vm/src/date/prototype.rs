@@ -458,6 +458,7 @@ pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
             "toTemporalInstant"   / 0 => impl_to_temporal_instant,
             "toString"            / 0 => impl_to_string,
             "toUTCString"         / 0 => impl_to_string,
+            "toGMTString"         / 0 => impl_to_string,
             "toDateString"        / 0 => impl_to_date_string,
             "toTimeString"        / 0 => impl_to_time_string,
             "toLocaleString"      / 0 => impl_to_string,
@@ -570,6 +571,7 @@ date_prototype_methods!(
     bridge_to_temporal_instant   => "toTemporalInstant",   0;
     bridge_to_string             => "toString",            0;
     bridge_to_utc_string         => "toUTCString",         0;
+    bridge_to_gmt_string         => "toGMTString",         0;
     bridge_to_date_string        => "toDateString",        0;
     bridge_to_time_string        => "toTimeString",        0;
     bridge_to_locale_string      => "toLocaleString",      0;

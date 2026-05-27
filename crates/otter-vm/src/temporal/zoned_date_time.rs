@@ -15,10 +15,12 @@ use crate::bigint::BigIntValue;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::string::JsString;
+use crate::object;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
-    arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_difference_settings,
-    parse_rounding_options, require_construct, require_zoned_date_time, str_or_undef, temporal_err,
+    arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_calendar_fields,
+    parse_difference_settings, parse_partial_time, parse_rounding_options, parse_time_zone,
+    require_construct, require_zoned_date_time, str_or_undef, temporal_err,
 };
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
@@ -84,6 +86,24 @@ fn parse_zdt_arg(
                 reason: "argument must be a Temporal.ZonedDateTime".to_string(),
             }),
         }
+    } else if let Some(obj) = v.as_object() {
+        // §ToTemporalZonedDateTime property bag: `timeZone` is
+        // required; calendar/time fields and offset are optional.
+        let tz_v = object::get(obj, heap, "timeZone")
+            .filter(|x| !x.is_undefined())
+            .ok_or_else(|| NativeError::TypeError {
+                name: CLASS,
+                reason: "object must have a timeZone property".to_string(),
+            })?;
+        let tz = parse_time_zone(&tz_v, heap, CLASS)?;
+        let calendar_fields = parse_calendar_fields(obj, heap, CLASS)?;
+        let time = parse_partial_time(obj, heap, CLASS)?;
+        let partial = temporal_rs::partial::PartialZonedDateTime::new()
+            .with_calendar_fields(calendar_fields)
+            .with_time(time)
+            .with_timezone(Some(tz));
+        temporal_rs::ZonedDateTime::from_partial(partial, None, None, None)
+            .map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(heap) {
         temporal_rs::ZonedDateTime::from_utf8(
             s.to_lossy_string(heap).as_bytes(),
@@ -94,7 +114,8 @@ fn parse_zdt_arg(
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "argument must be a Temporal.ZonedDateTime or ISO string".to_string(),
+            reason: "argument must be a Temporal.ZonedDateTime, ISO string, or object with a timeZone"
+                .to_string(),
         })
     }
 }
@@ -279,6 +300,18 @@ fn impl_with_time_zone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
+fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let zdt = require_zoned_date_time(ctx)?;
+    let v = arg_or_undef(args, 0);
+    let time = if v.is_undefined() {
+        None
+    } else {
+        Some(crate::temporal::plain_time::parse_plain_time_arg(&v, ctx.heap())?)
+    };
+    let result = zdt.with_plain_time(time).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
+}
+
 fn impl_to_instant(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     make_temporal(ctx, TemporalPayload::Instant(zdt.to_instant()))
@@ -393,6 +426,7 @@ pub static ZONED_DATE_TIME_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("startOfDay", 0, impl_start_of_day),
     method("withCalendar", 1, impl_with_calendar),
     method("withTimeZone", 1, impl_with_time_zone),
+    method("withPlainTime", 0, impl_with_plain_time),
     method("toInstant", 0, impl_to_instant),
     method("toPlainDate", 0, impl_to_plain_date),
     method("toPlainTime", 0, impl_to_plain_time),

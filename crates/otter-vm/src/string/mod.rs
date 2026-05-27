@@ -453,7 +453,7 @@ impl JsString {
         if p_len == 0 {
             return true;
         }
-        if from + p_len > self.cached_len {
+        if from.saturating_add(p_len) > self.cached_len {
             return false;
         }
         if let Some(result) = try_with_two_latin1(self, prefix, heap, |h, p| {

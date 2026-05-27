@@ -25,9 +25,12 @@ conformance-gated before the next starts.
     method except `toString`/`valueOf` (was HTML-methods only), so
     `String.prototype.X.call(obj)` observes a user `toString`.
     built-ins/String 1067→1147 pass (+80), 0 crash.
-  - [ ] RegExp `exec`/`@@`-method argument `ToString`; `Array.join` /
-    other array-likes generic `length`-getter; TypedArray generic
-    receiver for Array methods.
+  - [x] **RegExp `exec`/`test` argument `ToString`** — pre-coerce arg 0
+    through `ToPrimitive(String)` at the regexp dispatch arm so an
+    Object argument's user `toString` fires (was matched against
+    `"[object Object]"`). built-ins/RegExp 1147→1155 pass.
+  - [ ] `Array.join` / other array-likes generic `length`-getter;
+    TypedArray generic receiver for Array methods.
   - [ ] Mechanical `IntrinsicArgs` → re-entrant-context signature
     migration, per type (String 46 fns, …).
 - [ ] **Stage 3** — single callback re-entry path (`invoke` →

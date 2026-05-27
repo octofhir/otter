@@ -782,6 +782,36 @@ impl Interpreter {
                     *slot = primitive;
                 }
             }
+            // §22.2.7.1 / .2 `RegExp.prototype.exec` / `test` —
+            // step `S = ? ToString(string)` on the argument. The
+            // intrinsic's `arg_to_string_primitive` only inspects
+            // slots, so an Object arg with a user `toString` was
+            // stringified to `"[object Object]"` (matching nothing).
+            // Pre-coerce through `ToPrimitive(String)` so the user
+            // callback fires; the intrinsic then finishes ToString.
+            if recv_value.is_regexp()
+                && matches!(name, "exec" | "test")
+                && let Some(slot) = small_args.get_mut(0)
+                && (slot.is_object()
+                    || slot.is_array()
+                    || slot.is_function()
+                    || slot.is_closure()
+                    || slot.is_native_function()
+                    || slot.is_bound_function()
+                    || slot.is_class_constructor()
+                    || slot.is_proxy()
+                    || slot.is_regexp()
+                    || slot.is_promise()
+                    || slot.is_map()
+                    || slot.is_set())
+            {
+                let primitive = self.evaluate_to_primitive(
+                    context,
+                    slot,
+                    crate::abstract_ops::ToPrimitiveHint::String,
+                )?;
+                *slot = primitive;
+            }
             // §21.4.4.x `Date.prototype.set*` — capture `t` from
             // `[[DateValue]]` BEFORE coercing args (step 3), run
             // `ToNumber` on every provided arg in declaration order

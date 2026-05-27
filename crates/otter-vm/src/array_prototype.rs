@@ -2000,6 +2000,18 @@ fn native_array_method(
             return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
+    // §23.1.3.26 — `shift` needs the live `Get` / `HasProperty` /
+    // `Set` / `Delete` ladder so generic receivers, inherited indices,
+    // accessors, and frozen array length all behave like the spec path.
+    if name == "shift" {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let interp = ctx.interp_mut();
+            return interp
+                .array_shift(&exec, receiver, &[args])
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -2656,6 +2668,13 @@ impl Interpreter {
         o: Value,
         len: f64,
     ) -> Result<(), VmError> {
+        if let Some(arr) = o.as_array()
+            && !crate::array::length_writable(arr, self.gc_heap())
+        {
+            return Err(VmError::TypeError {
+                message: "Cannot assign to read only property 'length' of object".to_string(),
+            });
+        }
         let ok = self.ordinary_set_data_value(
             context,
             o,
@@ -2669,6 +2688,47 @@ impl Interpreter {
         } else {
             Err(VmError::TypeError {
                 message: "Cannot assign to read only property 'length' of object".to_string(),
+            })
+        }
+    }
+
+    fn array_set_property_throwing(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        key: &str,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let ok = self.ordinary_set_data_value(
+            context,
+            o,
+            &crate::VmPropertyKey::String(key),
+            value,
+            o,
+            0,
+        )?;
+        if ok {
+            Ok(())
+        } else {
+            Err(VmError::TypeError {
+                message: format!("Cannot assign to read only property '{key}' of object"),
+            })
+        }
+    }
+
+    fn array_delete_property_throwing(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        key: &str,
+    ) -> Result<(), VmError> {
+        let deleted =
+            self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(key), 0)?;
+        if deleted {
+            Ok(())
+        } else {
+            Err(VmError::TypeError {
+                message: format!("Cannot delete property '{key}'"),
             })
         }
     }
@@ -2745,6 +2805,49 @@ impl Interpreter {
         }
         self.array_set_length_throwing(context, o, new_len)?;
         Ok(element)
+    }
+
+    /// §23.1.3.26 `Array.prototype.shift`: `O = ToObject(this)`, read
+    /// `len` once, return `Get(O, "0")`, shift live properties down with
+    /// `HasProperty` / `Get` / `Set`, delete the tail, then write length.
+    pub(crate) fn array_shift(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        if len == 0 {
+            self.array_set_length_throwing(context, o, 0.0)?;
+            return Ok(Value::undefined());
+        }
+        let first = self.get_property_value_for_call(context, o, "0")?;
+        let scan_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        for k in 1..scan_len {
+            let from = k.to_string();
+            let to = (k - 1).to_string();
+            let has = self.ordinary_has_property_value(
+                context,
+                o,
+                &crate::VmPropertyKey::String(&from),
+                0,
+            )?;
+            if has {
+                let value = self.get_property_value_for_call(context, o, &from)?;
+                self.array_set_property_throwing(context, o, &to, value)?;
+            } else {
+                self.array_delete_property_throwing(context, o, &to)?;
+            }
+        }
+        let tail = format_index_key((len - 1) as f64);
+        self.array_delete_property_throwing(context, o, &tail)?;
+        self.array_set_length_throwing(context, o, (len - 1) as f64)?;
+        Ok(first)
     }
 }
 

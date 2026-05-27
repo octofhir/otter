@@ -455,6 +455,16 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
+        // §23.1.3.26 — `shift` funnels through the re-entrant driver so
+        // inherited indices and strict length/set/delete failures match
+        // the `.call` bridge.
+        if recv_value.is_array() && name == "shift" {
+            let result = self.array_shift(context, recv_value, &[arg_values.as_slice()])?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` /
         // `includes` on an Array receiver. The intrinsic-table impls
         // walk only the dense element store, so they miss inherited /

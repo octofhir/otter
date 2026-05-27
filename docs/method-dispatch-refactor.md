@@ -62,11 +62,26 @@ conformance-gated before the next starts.
       `native_string_method` — so the receiver/arg coercion is no
       longer duplicated; folding coercion into each body is the
       remaining polish.)
-    - [~] Array — `join` + array-like `length` coercion done (above).
-      `indexOf`/`lastIndexOf`/`includes` already unified (Stage 1).
-      The callback set (`reduce`/`reduceRight`/`map`/`filter`/`forEach`/
-      `every`/`some`/`find*`/`flatMap`) is **not** unified — see the
-      callback-dispatch map under Stage 3.
+    - [x] Array — migrated to re-entrant drivers (2026-05-27,
+      built-ins/Array 2230 → 2647, 0 crash/timeout/oom):
+      - `join` + array-like `length` ToNumber coercion.
+      - `indexOf`/`lastIndexOf`/`includes` (Stage 1).
+      - **callback set unified** (`reduce`/`reduceRight`/`map`/`filter`/
+        `forEach`/`every`/`some`/`find*`/`flatMap`) onto one live driver
+        `array_callback_native_dispatch`; dead `array_callback_dispatch`
+        removed.
+      - **Array index `[[Get]]`/`[[HasProperty]]` now walk the prototype
+        chain** (§10.4.2.4) — `a[k]`, `k in a`, and the generic methods
+        all observe inherited `Array.prototype[k]`.
+      - `concat` (IsConcatSpreadable), `sort` (SortIndexedProperties,
+        stable merge sort, comparator re-entry), `push`/`pop` (generic
+        length, Set/Delete throwing).
+      - **Remaining Array clusters** (~352 fails) follow the identical
+        IntrinsicArgs→re-entrant pattern: `splice` 32, `slice` 17,
+        `unshift` 15, `shift` 11, `copyWithin` 11, `toSpliced` 13,
+        `toSorted`/`toReversed`, `Array/length` 15, plus `sort` 19
+        residual (setter-on-`Array.prototype` not invoked by the array
+        `[[Set]]` fast path; UTF-16 vs UTF-8 lexicographic order).
     - [ ] TypedArray, Date, … same treatment.
 - [ ] **Stage 3** — single callback re-entry path (`invoke` →
   `run_callable_sync`). **Array callback-dispatch map (measured

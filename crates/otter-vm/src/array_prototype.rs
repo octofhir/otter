@@ -36,7 +36,9 @@ use crate::number::NumberValue;
 use crate::object::{self, PartialPropertyDescriptor};
 use crate::string::JsString;
 use crate::symbol::{WellKnown, WellKnownSymbols};
-use crate::{NativeCall, NativeCtx, NativeError};
+use crate::{
+    ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, VmError, VmPropertyKey,
+};
 
 fn receiver_array(args: &IntrinsicArgs<'_>) -> Result<JsArray, IntrinsicError> {
     args.receiver
@@ -1987,6 +1989,113 @@ native_array!(native_entries_iter, "entries");
 /// don't trigger an `O(len)` HasProperty scan. The `this_arg`
 /// argument and the callback shape `(value, index, O)` follow the
 /// spec algorithm for each method.
+/// Collect `(index, value)` pairs and the array-like length for a
+/// generic `Array.prototype.*` callback walk, using full
+/// `[[Get]]` / `[[HasProperty]]` semantics: `length` comes from
+/// `ToLength(? Get(O, "length"))` (so accessors fire), and each index
+/// `k < len` is probed with `HasProperty(O, k)` then read with
+/// `Get(O, k)` — both walk the prototype chain and invoke accessors,
+/// so inherited indices (`Boolean.prototype[0]`, `new Sub()` over an
+/// Array prototype) and accessor `length` are observed per spec.
+///
+/// Dense `Value::Array` receivers keep the hole-aware fast path.
+fn collect_array_like_callback_entries(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    receiver: &Value,
+) -> Result<(Vec<(usize, Value)>, usize), VmError> {
+    if let Some(arr) = receiver.as_array() {
+        let len = crate::array::len(arr, interp.gc_heap());
+        let entries = crate::array::with_elements(arr, interp.gc_heap(), |els| {
+            els.iter()
+                .enumerate()
+                .filter_map(|(i, v)| if v.is_hole() { None } else { Some((i, *v)) })
+                .collect()
+        });
+        return Ok((entries, len));
+    }
+    let len_val = interp.get_property_value_for_call(context, *receiver, "length")?;
+    let len = crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0);
+    if len == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    // Gather candidate indices `< len` from the receiver and every
+    // object on its prototype chain (sparse-friendly — never an
+    // `O(len)` scan, so a pathological `length` like 2^32 stays cheap).
+    // Each level contributes its own indexed keys; `HasProperty` /
+    // `Get` below still observe the spec lookup order.
+    let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut current = *receiver;
+    let mut hops = 0usize;
+    loop {
+        collect_own_indices_below(interp, &current, len, &mut indices);
+        if hops >= object::PROTO_CHAIN_HARD_CAP {
+            break;
+        }
+        let proto = interp.get_prototype_for_op(&current)?;
+        if proto.is_null() || !proto.is_object_type() {
+            break;
+        }
+        current = proto;
+        hops += 1;
+    }
+    let mut entries = Vec::with_capacity(indices.len());
+    for k in indices {
+        let key = k.to_string();
+        if interp.ordinary_has_property_value(context, *receiver, &VmPropertyKey::String(&key), 0)? {
+            let v = interp.get_property_value_for_call(context, *receiver, &key)?;
+            entries.push((k, v));
+        }
+    }
+    Ok((entries, len))
+}
+
+/// Add the own indexed keys (`< len`) of a single value to `indices`.
+/// Covers dense arrays (non-hole element positions), string primitives
+/// / wrappers (code-unit indices), and ordinary objects (numeric keys
+/// in the property bag). Does not walk the prototype chain.
+fn collect_own_indices_below(
+    interp: &Interpreter,
+    value: &Value,
+    len: usize,
+    indices: &mut std::collections::BTreeSet<usize>,
+) {
+    let heap = interp.gc_heap();
+    if let Some(arr) = value.as_array() {
+        let alen = crate::array::len(arr, heap).min(len);
+        crate::array::with_elements(arr, heap, |els| {
+            for (i, v) in els.iter().enumerate().take(alen) {
+                if !v.is_hole() {
+                    indices.insert(i);
+                }
+            }
+        });
+        return;
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(s) = crate::object::string_data(obj, heap) {
+            for i in 0..(s.len() as usize).min(len) {
+                indices.insert(i);
+            }
+        }
+        crate::object::with_properties(obj, heap, |p| {
+            for k in p.keys() {
+                if let Ok(i) = k.parse::<usize>()
+                    && i < len
+                {
+                    indices.insert(i);
+                }
+            }
+        });
+        return;
+    }
+    if let Some(s) = value.as_string(heap) {
+        for i in 0..(s.len() as usize).min(len) {
+            indices.insert(i);
+        }
+    }
+}
+
 fn array_callback_native_dispatch(
     name: &str,
     ctx: &mut NativeCtx<'_>,
@@ -2000,14 +2109,11 @@ fn array_callback_native_dispatch(
         name: "Array.prototype callback",
         reason: "missing execution context".to_string(),
     })?;
-    let entries = {
-        let heap = interp.gc_heap_mut();
-        array_like_present_entries(&receiver, heap).ok_or(NativeError::TypeError {
+    let (entries, len) = collect_array_like_callback_entries(interp, &context, &receiver)
+        .map_err(|err| NativeError::TypeError {
             name: "Array.prototype callback",
-            reason: "receiver is not array-like".to_string(),
-        })?
-    };
-    let len = array_like_length(&receiver, interp.gc_heap());
+            reason: err.to_string(),
+        })?;
     let mut acc = Value::undefined();
     let mut out: Vec<(usize, Value)> = Vec::new();
     let mut found_idx: Option<usize> = None;
@@ -2112,11 +2218,21 @@ fn array_callback_native_dispatch(
             Ok(acc)
         }
         "map" => {
-            // Materialise into a dense array of length `len`. Absent
-            // positions stay `undefined`.
-            let mut buf: Vec<Value> = vec![Value::undefined(); len];
+            // Densely materialise only up to the highest present
+            // index, then set the logical `length` to `len` (which is
+            // sparse-safe for huge lengths). Absent positions stay
+            // `undefined` in the dense region; the sparse tail is
+            // holes. Avoids a `len`-sized allocation when `len` is a
+            // pathological array-like length.
+            let dense_len = out
+                .iter()
+                .map(|(i, _)| i + 1)
+                .max()
+                .unwrap_or(0)
+                .min(len);
+            let mut buf: Vec<Value> = vec![Value::undefined(); dense_len];
             for (i, v) in out {
-                if i < len {
+                if i < dense_len {
                     buf[i] = v;
                 }
             }
@@ -2136,6 +2252,10 @@ fn array_callback_native_dispatch(
             crate::array::with_elements_mut(arr, heap, |elements| {
                 elements.extend(buf);
             });
+            crate::array::set_length(arr, heap, len).map_err(|_| NativeError::RangeError {
+                name: "map",
+                reason: "Invalid array length".to_string(),
+            })?;
             Ok(Value::array(arr))
         }
         "filter" | "flatMap" => {

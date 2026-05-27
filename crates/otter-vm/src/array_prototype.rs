@@ -2095,7 +2095,31 @@ pub(crate) fn array_linear_search(
         if n.is_nan() { 0.0 } else { n.trunc() }
     };
     let len_i = len as i64;
+    // String primitives / `String` wrappers expose code-unit indices
+    // through `[[StringData]]`, which the ordinary `[[Get]]` /
+    // `[[HasProperty]]` ladder may not surface. Resolve those indices
+    // directly; `len` is already the string length, so inherited
+    // beyond-length indices (`String.prototype[3]`) are never probed.
+    let string_data = if let Some(obj) = o.as_object() {
+        crate::object::string_data(obj, interp.gc_heap())
+    } else {
+        o.as_string(interp.gc_heap())
+    };
     let probe = |interp: &mut Interpreter, k: i64| -> Result<Option<i64>, VmError> {
+        if let Some(s) = string_data {
+            let Some(unit) = s.char_code_at(k as u32, interp.gc_heap()) else {
+                return Ok(None);
+            };
+            let ch = crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
+                .map(Value::string)?;
+            return Ok(
+                if crate::abstract_ops::is_strictly_equal(&ch, &search, interp.gc_heap()) {
+                    Some(k)
+                } else {
+                    None
+                },
+            );
+        }
         let key = k.to_string();
         let has =
             interp.ordinary_has_property_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;

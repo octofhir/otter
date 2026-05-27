@@ -240,7 +240,10 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
             name: CLASS,
             reason: "unknown duration unit".to_string(),
         })?;
-    let total = dur.total(unit, None).map_err(|e| temporal_err(e, CLASS))?;
+    let relative_to = parse_relative_to(args, 0, ctx.heap())?;
+    let total = dur
+        .total(unit, relative_to)
+        .map_err(|e| temporal_err(e, CLASS))?;
     Ok(Value::number_f64(total.as_inner()))
 }
 
@@ -302,14 +305,63 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
+/// Parse the `relativeTo` option from a rounding/total options
+/// argument into a [`temporal_rs::options::RelativeTo`]. Accepts a
+/// `Temporal.PlainDate`/`PlainDateTime`/`ZonedDateTime`, an ISO
+/// string, or a property bag (`timeZone` present → zoned).
+fn parse_relative_to(
+    args: &[Value],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+) -> Result<Option<temporal_rs::options::RelativeTo>, NativeError> {
+    let Some(opts) = arg_or_undef(args, index).as_object() else {
+        return Ok(None);
+    };
+    let Some(rel) = object::get(opts, heap, "relativeTo").filter(|v| !v.is_undefined()) else {
+        return Ok(None);
+    };
+    if let Some(t) = rel.as_temporal(heap) {
+        return match t.payload_clone(heap) {
+            TemporalPayload::PlainDate(pd) => Ok(Some(pd.into())),
+            TemporalPayload::PlainDateTime(pdt) => Ok(Some(pdt.to_plain_date().into())),
+            TemporalPayload::ZonedDateTime(zdt) => Ok(Some(zdt.into())),
+            _ => Err(NativeError::TypeError {
+                name: CLASS,
+                reason: "relativeTo must be a date, date-time, or zoned-date-time".to_string(),
+            }),
+        };
+    }
+    if let Some(s) = rel.as_string(heap) {
+        return temporal_rs::options::RelativeTo::try_from_str(&s.to_lossy_string(heap))
+            .map(Some)
+            .map_err(|e| temporal_err(e, CLASS));
+    }
+    if let Some(obj) = rel.as_object() {
+        if object::get(obj, heap, "timeZone")
+            .filter(|v| !v.is_undefined())
+            .is_some()
+        {
+            return Ok(Some(
+                crate::temporal::zoned_date_time::parse_zdt_arg(&rel, heap)?.into(),
+            ));
+        }
+        return Ok(Some(
+            crate::temporal::plain_date::parse_plain_date_arg(&rel, heap)?.into(),
+        ));
+    }
+    Err(NativeError::TypeError {
+        name: CLASS,
+        reason: "relativeTo must be a date, date-time, zoned-date-time, string, or object"
+            .to_string(),
+    })
+}
+
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
-    // `relativeTo` is not yet parsed: with `None`, time-unit rounding
-    // works and calendar-unit rounding (year/month/week) surfaces the
-    // spec-mandated RangeError from temporal_rs.
+    let relative_to = parse_relative_to(args, 0, ctx.heap())?;
     let result = dur
-        .round(options, None)
+        .round(options, relative_to)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Duration(result))
 }

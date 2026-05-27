@@ -74,7 +74,7 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
     Ok(Value::number_i32(n))
 }
 
-fn parse_zdt_arg(
+pub(crate) fn parse_zdt_arg(
     v: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::ZonedDateTime, NativeError> {
@@ -300,6 +300,28 @@ fn impl_with_time_zone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
+fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let zdt = require_zoned_date_time(ctx)?;
+    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "with() requires a ZonedDateTime-like object".to_string(),
+        });
+    };
+    let heap = ctx.heap();
+    let calendar_fields = parse_calendar_fields(obj, heap, CLASS)?;
+    let time = parse_partial_time(obj, heap, CLASS)?;
+    let fields = temporal_rs::fields::ZonedDateTimeFields {
+        calendar_fields,
+        time,
+        offset: None,
+    };
+    let result = zdt
+        .with(fields, None, None, None)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
+}
+
 fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let v = arg_or_undef(args, 0);
@@ -424,6 +446,7 @@ pub static ZONED_DATE_TIME_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("since", 1, impl_since),
     method("round", 1, impl_round),
     method("startOfDay", 0, impl_start_of_day),
+    method("with", 1, impl_with),
     method("withCalendar", 1, impl_with_calendar),
     method("withTimeZone", 1, impl_with_time_zone),
     method("withPlainTime", 0, impl_with_plain_time),

@@ -479,6 +479,16 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
+        // §23.1.3.28 — `slice` allocates through ArraySpeciesCreate
+        // and copies with live HasProperty/Get semantics.
+        if recv_value.is_array() && name == "slice" {
+            let result =
+                self.array_slice(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` /
         // `includes` on an Array receiver. The intrinsic-table impls
         // walk only the dense element store, so they miss inherited /
@@ -753,8 +763,6 @@ impl Interpreter {
                 "indexOf" | "lastIndexOf" | "includes" => &[1],
                 // §23.1.3.7 fill(value, start, end)
                 "fill" => &[1, 2],
-                // §23.1.3.26 slice(start, end)
-                "slice" => &[0, 1],
                 // §23.1.3.1 at(index)
                 "at" => &[0],
                 _ => &[],

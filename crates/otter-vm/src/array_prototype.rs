@@ -1887,7 +1887,6 @@ fn native_array_method(
     let int_coerce_indices: &[usize] = match name {
         "indexOf" | "lastIndexOf" | "includes" => &[1],
         "fill" => &[1, 2],
-        "slice" => &[0, 1],
         "at" => &[0],
         _ => &[],
     };
@@ -2023,6 +2022,18 @@ fn native_array_method(
             let interp = ctx.interp_mut();
             return interp
                 .array_copy_within(&exec, receiver, args, &[args])
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
+    // §23.1.3.28 — `slice` uses ArraySpeciesCreate, then copies
+    // only present indices through live HasProperty/Get and
+    // CreateDataPropertyOrThrow.
+    if name == "slice" {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let interp = ctx.interp_mut();
+            return interp
+                .array_slice(&exec, receiver, args, &[args])
                 .map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
@@ -3191,6 +3202,204 @@ impl Interpreter {
             }
             if index >= to && index < to.saturating_add(count) {
                 offsets.insert(index - to);
+            }
+        }
+        Ok(offsets)
+    }
+
+    /// §23.1.3.28 `Array.prototype.slice`: allocate the result with
+    /// `ArraySpeciesCreate`, copy present source indices via live
+    /// `HasProperty`/`Get`, define result elements with
+    /// `CreateDataPropertyOrThrow`, then set the result length.
+    pub(crate) fn array_slice(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let start = self.array_relative_index(context, args.first(), 0.0, len)?;
+        let final_index = self.array_relative_index(context, args.get(1), len as f64, len)?;
+        let count = final_index.saturating_sub(start);
+        let a = self.array_species_create(context, o, count, roots)?;
+        if count <= MAX_ARRAY_LIKE_PROBE_LEN {
+            for n in 0..count {
+                self.slice_copy_index(context, o, a, start + n, n)?;
+            }
+        } else {
+            for n in self.slice_sparse_offsets(o, len, start, count)? {
+                self.slice_copy_index(context, o, a, start + n, n)?;
+            }
+        }
+        self.array_set_property_throwing(
+            context,
+            a,
+            "length",
+            Value::number(NumberValue::from_f64(count as f64)),
+        )?;
+        Ok(a)
+    }
+
+    fn slice_copy_index(
+        &mut self,
+        context: &ExecutionContext,
+        from_object: Value,
+        to_object: Value,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<(), VmError> {
+        let from = format_index_key(from_index as f64);
+        if !self.array_method_has_property(context, from_object, &from)? {
+            return Ok(());
+        }
+        let value = self.array_method_get_property(context, from_object, &from)?;
+        let to = format_index_key(to_index as f64);
+        self.create_data_property_or_throw(context, to_object, &to, value)
+    }
+
+    fn array_species_create(
+        &mut self,
+        context: &ExecutionContext,
+        original: Value,
+        length: usize,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        if length > u32::MAX as usize {
+            return Err(VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            });
+        }
+        if !self.array_species_is_array(context, original)? {
+            return self.array_create_with_length(original, length, roots);
+        }
+        let default_ctor = crate::object::get(self.global_this, &self.gc_heap, "Array")
+            .ok_or_else(|| VmError::TypeError {
+                message: "%Array% intrinsic is missing".to_string(),
+            })?;
+        let constructor = self.species_constructor_value(context, &original, &default_ctor)?;
+        if crate::abstract_ops::same_value(&constructor, &default_ctor, &self.gc_heap) {
+            return self.array_create_with_length(original, length, roots);
+        }
+        let argv: SmallVec<[Value; 8]> =
+            smallvec::smallvec![Value::number(NumberValue::from_f64(length as f64))];
+        self.run_construct_sync(context, &constructor, constructor, argv)
+    }
+
+    fn array_create_with_length(
+        &mut self,
+        receiver_root: Value,
+        length: usize,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            receiver_root.trace_value_slots(visit);
+            for root in roots {
+                for value in *root {
+                    value.trace_value_slots(visit);
+                }
+            }
+        };
+        let arr = crate::array::alloc_array_with_roots(&mut self.gc_heap, &mut external_visit)
+            .map_err(|_| VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            })?;
+        crate::array::set_length(arr, &mut self.gc_heap, length).map_err(|_| {
+            VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            }
+        })?;
+        Ok(Value::array(arr))
+    }
+
+    fn array_species_is_array(
+        &self,
+        _context: &ExecutionContext,
+        original: Value,
+    ) -> Result<bool, VmError> {
+        let mut current = original;
+        let mut hops = 0usize;
+        loop {
+            if current.is_array() {
+                return Ok(true);
+            }
+            let Some(proxy) = current.as_proxy() else {
+                return Ok(false);
+            };
+            if proxy.is_revoked(&self.gc_heap) {
+                return Err(VmError::TypeError {
+                    message: "Cannot perform IsArray on a proxy that has been revoked".to_string(),
+                });
+            }
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                return Ok(false);
+            }
+            current = proxy.target(&self.gc_heap);
+            hops += 1;
+        }
+    }
+
+    fn create_data_property_or_throw(
+        &mut self,
+        context: &ExecutionContext,
+        target: Value,
+        key: &str,
+        value: Value,
+    ) -> Result<(), VmError> {
+        let descriptor = PartialPropertyDescriptor {
+            value: Some(value),
+            writable: Some(true),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..Default::default()
+        };
+        let ok = self.define_own_property_value(
+            context,
+            &target,
+            &crate::VmPropertyKey::String(key),
+            descriptor,
+        )?;
+        if ok {
+            Ok(())
+        } else {
+            Err(VmError::TypeError {
+                message: format!("Cannot create property '{key}'"),
+            })
+        }
+    }
+
+    fn slice_sparse_offsets(
+        &mut self,
+        o: Value,
+        len: usize,
+        start: usize,
+        count: usize,
+    ) -> Result<std::collections::BTreeSet<usize>, VmError> {
+        let mut indices = std::collections::BTreeSet::new();
+        let mut current = o;
+        let mut hops = 0usize;
+        loop {
+            collect_own_indices_below(self, &current, len, &mut indices);
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            let proto = self.get_prototype_for_op(&current)?;
+            if proto.is_null() || !proto.is_object_type() {
+                break;
+            }
+            current = proto;
+            hops += 1;
+        }
+
+        let mut offsets = std::collections::BTreeSet::new();
+        for index in indices {
+            if index >= start && index < start.saturating_add(count) {
+                offsets.insert(index - start);
             }
         }
         Ok(offsets)

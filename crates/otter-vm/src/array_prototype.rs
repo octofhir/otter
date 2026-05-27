@@ -2014,6 +2014,29 @@ fn collect_array_like_callback_entries(
         });
         return Ok((entries, len));
     }
+    // Primitive receivers: §7.1.18 ToObject. A primitive string boxes
+    // to a String exotic whose indices/length come from the backing
+    // text — read directly (the interpreter `[[Get]]` ladder rejects a
+    // primitive base). Other primitives box to wrappers with no own
+    // indexed properties.
+    if !receiver.is_object_type() {
+        if let Some(s) = receiver.as_string(interp.gc_heap()) {
+            let units = s.to_utf16_vec(interp.gc_heap());
+            let len = units.len();
+            let entries = units
+                .iter()
+                .enumerate()
+                .map(|(i, &u)| {
+                    let ch = crate::string::JsString::from_utf16_units(&[u], interp.gc_heap_mut())
+                        .map(Value::string)
+                        .unwrap_or(Value::undefined());
+                    (i, ch)
+                })
+                .collect();
+            return Ok((entries, len));
+        }
+        return Ok((Vec::new(), 0));
+    }
     let len_val = interp.get_property_value_for_call(context, *receiver, "length")?;
     let len = crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0);
     if len == 0 {
@@ -2110,10 +2133,7 @@ fn array_callback_native_dispatch(
         reason: "missing execution context".to_string(),
     })?;
     let (entries, len) = collect_array_like_callback_entries(interp, &context, &receiver)
-        .map_err(|err| NativeError::TypeError {
-            name: "Array.prototype callback",
-            reason: err.to_string(),
-        })?;
+        .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?;
     let mut acc = Value::undefined();
     let mut out: Vec<(usize, Value)> = Vec::new();
     let mut found_idx: Option<usize> = None;
@@ -2151,10 +2171,7 @@ fn array_callback_native_dispatch(
         };
         let result = interp
             .run_callable_sync(&context, &callback, this_arg, cb_args)
-            .map_err(|err| NativeError::TypeError {
-                name: "Array.prototype callback",
-                reason: err.to_string(),
-            })?;
+            .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?;
         match name {
             "forEach" => {}
             "map" => out.push((idx, result)),

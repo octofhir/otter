@@ -29,6 +29,7 @@ publish = false
 license = "MIT"
 
 [workspace.dependencies]
+rustc-hash      = "2.1"
 oxc_allocator   = "0.129"
 oxc_span        = "0.129"
 oxc_syntax      = "0.129"

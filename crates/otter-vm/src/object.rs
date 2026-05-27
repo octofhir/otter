@@ -325,6 +325,14 @@ pub struct ObjectBody {
     /// Fallback/dictionary string-key order used only when [`Self::shape`]
     /// is null, for raw heap fixtures and delete-shaped objects.
     dictionary_keys: Vec<String>,
+    /// O(1) `key → slot offset` index mirroring [`Self::dictionary_keys`]
+    /// in dictionary mode. Without it, property lookup on a
+    /// many-property object is a linear scan, making bulk property
+    /// addition O(n²). Maintained in lockstep with `dictionary_keys`
+    /// through [`Self::dict_push_key`] / [`Self::dict_set_keys`] /
+    /// [`Self::dict_clear_keys`]. Holds only owned `String` keys (no
+    /// GC references), so it needs no tracing.
+    dictionary_index: rustc_hash::FxHashMap<String, u16>,
     /// Whether string-keyed shape assumptions are IC-compatible.
     ///
     /// Ordinary shape transitions stay in [`ShapeCacheMode::Fast`].
@@ -513,6 +521,7 @@ fn empty_object_body() -> ObjectBody {
         shape: ShapeHandle::null(),
         dictionary_shape_id: next_shape_id(),
         dictionary_keys: Vec::new(),
+        dictionary_index: rustc_hash::FxHashMap::default(),
         shape_cache_mode: ShapeCacheMode::Fast,
         slots: SmallVec::new(),
         prototype: ObjectPrototype::Null,
@@ -608,6 +617,7 @@ pub(crate) fn alloc_host_object_with_roots<T: HostObjectData>(
             shape: ShapeHandle::null(),
             dictionary_shape_id: next_shape_id(),
             dictionary_keys: Vec::new(),
+        dictionary_index: rustc_hash::FxHashMap::default(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
@@ -640,6 +650,7 @@ pub(crate) fn alloc_host_object_with_shape_roots<T: HostObjectData>(
             shape,
             dictionary_shape_id: next_shape_id(),
             dictionary_keys: Vec::new(),
+        dictionary_index: rustc_hash::FxHashMap::default(),
             shape_cache_mode: ShapeCacheMode::Fast,
             slots: SmallVec::new(),
             prototype: ObjectPrototype::Null,
@@ -771,10 +782,54 @@ pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &s
         return shape_body::shape_offset_of_str(heap, body.shape, key)
             .and_then(|offset| u16::try_from(offset).ok());
     }
-    body.dictionary_keys
-        .iter()
-        .position(|candidate| candidate == key)
-        .and_then(|offset| u16::try_from(offset).ok())
+    // O(1) dictionary lookup via the maintained index — a linear scan
+    // here makes bulk property addition O(n²).
+    body.dictionary_index.get(key).copied()
+}
+
+/// Number of own string-keyed properties recorded in a fast-mode
+/// shape (`0` for the null/dictionary shape). Used to decide when an
+/// object should normalize to dictionary storage.
+pub(crate) fn shape_property_count(shape: ShapeHandle, heap: &otter_gc::GcHeap) -> u32 {
+    if shape.is_null() {
+        0
+    } else {
+        shape_body::shape_property_count(heap, shape)
+    }
+}
+
+/// Maximum number of own properties an object keeps in fast
+/// transition-shape storage before it normalizes to dictionary mode.
+/// Beyond this, growing the shape transition chain makes property
+/// lookup O(n) (and bulk addition O(n²)); dictionary mode keeps both
+/// O(1). Mirrors the fast-property cap used by production engines.
+pub(crate) const MAX_FAST_PROPERTIES: u32 = 128;
+
+/// Push a new dictionary key, keeping [`ObjectBody::dictionary_index`]
+/// in lockstep. The caller pushes the matching slot separately; the
+/// new offset is the pre-push length (slots and keys stay aligned).
+pub(super) fn dict_push_key(body: &mut ObjectBody, key: String) {
+    let offset = body.dictionary_keys.len() as u16;
+    body.dictionary_index.insert(key.clone(), offset);
+    body.dictionary_keys.push(key);
+}
+
+/// Replace the whole dictionary key order (shape→dictionary transition
+/// or post-delete compaction) and rebuild the index from scratch.
+pub(super) fn dict_set_keys(body: &mut ObjectBody, keys: Vec<String>) {
+    body.dictionary_index.clear();
+    body.dictionary_index.reserve(keys.len());
+    for (offset, key) in keys.iter().enumerate() {
+        body.dictionary_index.insert(key.clone(), offset as u16);
+    }
+    body.dictionary_keys = keys;
+}
+
+/// Clear all dictionary keys and the index together.
+#[cfg(test)]
+pub(super) fn dict_clear_keys(body: &mut ObjectBody) {
+    body.dictionary_keys.clear();
+    body.dictionary_index.clear();
 }
 
 fn body_has_key_at(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize) -> bool {
@@ -1487,7 +1542,7 @@ pub fn set(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str, value: Value) 
             return;
         }
         body.dictionary_shape_id = next_shape_id();
-        body.dictionary_keys.push(key.to_owned());
+        dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
         body.slots.push(PropertySlot::data_default(value));
     });
@@ -1700,7 +1755,7 @@ pub fn delete(obj: JsObject, heap: &mut otter_gc::GcHeap, key: &str) -> bool {
         }
         body.slots.remove(offset as usize);
         body.dictionary_shape_id = next_shape_id();
-        body.dictionary_keys = replacement_keys;
+        dict_set_keys(body, replacement_keys);
         body.shape = ShapeHandle::null();
         shape_cache::invalidate_fast_shape_assumptions(
             body,
@@ -1802,9 +1857,9 @@ pub fn define_own_property_partial(
             }
             body.dictionary_shape_id = next_shape_id();
             if let Some(dictionary_keys) = dictionary_keys {
-                body.dictionary_keys = dictionary_keys;
+                dict_set_keys(body, dictionary_keys);
             }
-            body.dictionary_keys.push(key.to_owned());
+            dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
             body.slots
                 .push(PropertySlot::from_descriptor(completed.clone()));
@@ -1962,9 +2017,9 @@ pub fn define_own_property(
             }
             body.dictionary_shape_id = next_shape_id();
             if let Some(dictionary_keys) = dictionary_keys {
-                body.dictionary_keys = dictionary_keys;
+                dict_set_keys(body, dictionary_keys);
             }
-            body.dictionary_keys.push(key.to_owned());
+            dict_push_key(body, key.to_owned());
             body.shape = ShapeHandle::null();
             body.slots.push(PropertySlot::from_descriptor(descriptor));
             true
@@ -2529,7 +2584,7 @@ mod tests {
             .set_property(o, "x", Value::boolean(true))
             .expect("set x");
         interp.gc_heap_mut().with_payload(o, |body| {
-            body.dictionary_keys.clear();
+            dict_clear_keys(body);
             body.dictionary_shape_id = next_shape_id();
         });
 

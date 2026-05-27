@@ -2037,6 +2037,7 @@ dependencies = [
  "otter-gc",
  "otter-macros",
  "regress",
+ "rustc-hash",
  "serde",
  "serde_json",
  "smallvec",

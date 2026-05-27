@@ -59,9 +59,9 @@ pub(super) fn ordinary_set_data_property(
         }
         body.dictionary_shape_id = next_shape_id();
         if let Some(dictionary_keys) = dictionary_keys {
-            body.dictionary_keys = dictionary_keys;
+            super::dict_set_keys(body, dictionary_keys);
         }
-        body.dictionary_keys.push(key.to_owned());
+        super::dict_push_key(body, key.to_owned());
         body.shape = ShapeHandle::null();
         body.slots.push(PropertySlot::data_default(value));
         true

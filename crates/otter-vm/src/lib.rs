@@ -1931,7 +1931,13 @@ impl Interpreter {
         value: Value,
     ) -> Result<bool, VmError> {
         let shape = object::shape(obj, &self.gc_heap);
-        let should_add_shape = self.should_add_property(obj, key);
+        // Past the fast-property cap, stop extending the transition
+        // chain and let `object::ordinary_set_data_property` normalize
+        // the object to dictionary storage (shape → null). Otherwise a
+        // growing chain makes every lookup O(n) and bulk addition
+        // O(n²).
+        let should_add_shape = self.should_add_property(obj, key)
+            && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
             Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &value)?)
         } else {
@@ -1961,7 +1967,8 @@ impl Interpreter {
         value: Value,
     ) -> Result<(), VmError> {
         let shape = object::shape(obj, &self.gc_heap);
-        let should_add_shape = self.should_add_property(obj, key);
+        let should_add_shape = self.should_add_property(obj, key)
+            && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
             Some(self.shape_child_rooting_object_value(shape, key, &mut obj, &value)?)
         } else {
@@ -1986,7 +1993,8 @@ impl Interpreter {
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<(), VmError> {
         let shape = object::shape(obj, &self.gc_heap);
-        let should_add_shape = self.should_add_property(obj, key);
+        let should_add_shape = self.should_add_property(obj, key)
+            && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
             Some(self.shape_child_rooting_object_value_with_extra_roots(
                 shape,
@@ -2017,7 +2025,8 @@ impl Interpreter {
     ) -> Result<bool, VmError> {
         let completed = descriptor.complete_for_new_property();
         let shape = object::shape(obj, &self.gc_heap);
-        let should_add_shape = self.should_add_property(obj, key);
+        let should_add_shape = self.should_add_property(obj, key)
+            && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES;
         let next_shape = if should_add_shape {
             Some(self.shape_child_rooting_object_descriptor(shape, key, &mut obj, &completed)?)
         } else {

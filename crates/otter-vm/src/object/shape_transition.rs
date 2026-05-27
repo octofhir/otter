@@ -112,7 +112,7 @@ pub(crate) fn capture_store_property_transition(
         let slot = u16::try_from(body.slots.len()).ok()?;
         let to_shape_id = super::next_shape_id();
         body.dictionary_shape_id = to_shape_id;
-        body.dictionary_keys.push(key.name().to_owned());
+        super::dict_push_key(body, key.name().to_owned());
         body.shape = super::ShapeHandle::null();
         body.slots.push(PropertySlot::data_default(*value));
         Some(StorePropertyTransition {
@@ -206,7 +206,7 @@ pub(crate) fn replay_store_property_transition(
         }
         if transition.to_shape.is_null() {
             body.dictionary_shape_id = transition.to_shape_id;
-            body.dictionary_keys.push(key.name().to_owned());
+            super::dict_push_key(body, key.name().to_owned());
             body.shape = super::ShapeHandle::null();
         } else {
             debug_assert_eq!(to_shape_id, Some(transition.to_shape_id));

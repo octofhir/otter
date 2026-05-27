@@ -75,6 +75,15 @@ impl Interpreter {
         if parent.is_null() || self.shape_offset_of(parent, key.name()).is_some() {
             return Ok(None);
         }
+        // Normalize to dictionary storage past the fast-property cap:
+        // returning `None` routes the caller to `ordinary_set_data_property`
+        // (which sets `shape = null`), after which every further add sees
+        // a null parent shape above and stays dictionary. This keeps bulk
+        // property addition O(1) instead of growing an O(n) transition
+        // chain that makes lookups — and therefore bulk addition — O(n²).
+        if object::shape_property_count(parent, &self.gc_heap) >= object::MAX_FAST_PROPERTIES {
+            return Ok(None);
+        }
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {

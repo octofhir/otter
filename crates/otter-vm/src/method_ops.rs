@@ -434,6 +434,17 @@ impl Interpreter {
         {
             return Ok(());
         }
+        // §23.1.3.1 — `concat` on an Array receiver funnels into the
+        // re-entrant driver (same path as `.call`), so spreadable
+        // arguments, `@@isConcatSpreadable`, and array-like `length` /
+        // indexed getters are observed.
+        if recv_value.is_array() && name == "concat" {
+            let result = self.array_concat(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` /
         // `includes` on an Array receiver. The intrinsic-table impls
         // walk only the dense element store, so they miss inherited /

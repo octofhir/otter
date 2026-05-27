@@ -1963,6 +1963,18 @@ fn native_array_method(
                 .map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
+    // §23.1.3.1 — `concat` runs the re-entrant driver so
+    // `@@isConcatSpreadable`, a `length` getter, indexed getters, and
+    // array-like arguments are observed.
+    if name == "concat" {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let interp = ctx.interp_mut();
+            return interp
+                .array_concat(&exec, receiver, args, &[args])
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -2357,6 +2369,110 @@ impl Interpreter {
         }
         let joined = parts.join(&separator);
         Ok(Value::string(JsString::from_str(&joined, self.gc_heap_mut())?))
+    }
+
+    /// §22.1.3.10.1 IsConcatSpreadable(O): a non-object is never spread;
+    /// otherwise `Get(O, @@isConcatSpreadable)` decides when not
+    /// undefined (ToBoolean), else `IsArray(O)`.
+    fn is_concat_spreadable(
+        &mut self,
+        context: &ExecutionContext,
+        e: Value,
+    ) -> Result<bool, VmError> {
+        if !e.is_object_type() {
+            return Ok(false);
+        }
+        let sym = self.well_known_symbols.get(WellKnown::IsConcatSpreadable);
+        let spread = match self.ordinary_get_value(
+            context,
+            e,
+            e,
+            &crate::VmPropertyKey::Symbol(sym),
+            0,
+        )? {
+            crate::VmGetOutcome::Value(v) => v,
+            crate::VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, e, smallvec::SmallVec::new())?
+            }
+        };
+        if spread.is_undefined() {
+            Ok(e.is_array())
+        } else {
+            Ok(spread.to_boolean(self.gc_heap()))
+        }
+    }
+
+    /// Append element `e` to `out` per the §23.1.3.1 concat loop body:
+    /// a spreadable `e` contributes `Get(E, k)` for each present index
+    /// (absent indices stay holes), else `e` is appended as a single
+    /// value. Bounded by `MAX_ARRAY_LIKE_PROBE_LEN`.
+    fn concat_append(
+        &mut self,
+        context: &ExecutionContext,
+        e: Value,
+        out: &mut Vec<Value>,
+    ) -> Result<(), VmError> {
+        if self.is_concat_spreadable(context, e)? {
+            let len = length_of_array_like(self, context, &e)?;
+            let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+            for k in 0..cap {
+                let key = k.to_string();
+                let has = self.ordinary_has_property_value(
+                    context,
+                    e,
+                    &crate::VmPropertyKey::String(&key),
+                    0,
+                )?;
+                if has {
+                    out.push(self.get_property_value_for_call(context, e, &key)?);
+                } else {
+                    out.push(Value::hole());
+                }
+            }
+        } else {
+            out.push(e);
+        }
+        Ok(())
+    }
+
+    /// §23.1.3.1 `Array.prototype.concat` over a generic receiver. The
+    /// intrinsic `impl_concat` cannot observe `@@isConcatSpreadable`, a
+    /// `length` getter, indexed getters, or an array-like argument. This
+    /// driver runs the spec ladder with re-entry: `O = ToObject(this)`,
+    /// then each of `O` and the arguments is appended via
+    /// [`Self::concat_append`]. The result is a fresh dense Array
+    /// (species creation is not yet modelled).
+    pub(crate) fn array_concat(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let mut combined: Vec<Value> = Vec::new();
+        self.concat_append(context, o, &mut combined)?;
+        for &a in args {
+            self.concat_append(context, a, &mut combined)?;
+        }
+        let heap = self.gc_heap_mut();
+        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for value in &combined {
+                value.trace_value_slots(visit);
+            }
+        };
+        let arr = crate::array::alloc_array_with_roots(heap, &mut visitor)
+            .map_err(|_| VmError::TypeError {
+                message: "array allocation failed".to_string(),
+            })?;
+        crate::array::with_elements_mut(arr, heap, |elements| {
+            elements.extend(combined);
+        });
+        Ok(Value::array(arr))
     }
 }
 

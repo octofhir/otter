@@ -1602,6 +1602,26 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
     STRING_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::String, name)
 }
 
+/// Single re-entrant entry for `String.prototype.*`, shared by the
+/// primitive-string fast path in `do_call_method_value` and the
+/// `.call` / property bridge. Resolves the `'static` method name, then
+/// runs [`native_string_method`] so every invocation style takes one
+/// path: `RequireObjectCoercible` + `ToString(this)`, the shared
+/// argument coercion, callable `replace`, and `@@`-method delegation.
+/// `TypeError` for an unknown name lets the caller fall back to the
+/// ordinary property/prototype walk.
+pub(crate) fn string_method_call(
+    ctx: &mut NativeCtx<'_>,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let entry = lookup(name).ok_or(NativeError::TypeError {
+        name: "String.prototype",
+        reason: "unknown String.prototype method".to_string(),
+    })?;
+    native_string_method(entry.name, ctx, args)
+}
+
 /// Generic bridge that exposes a `String.prototype.<name>` intrinsic
 /// as a JS-visible NativeFunction so user code reading the property
 /// directly (`const f = "".split; f.call(s, ",")`) resolves to a
@@ -1692,88 +1712,19 @@ fn native_string_method(
     } else {
         receiver
     };
-    // §22.1.3.* String.prototype.* int / string arg coercion.
-    // Mirrors the `Op::CallMethodValue` String arm in
-    // `method_ops.rs` so `.call(...)` / `.apply(...)` invocations
-    // run the spec `ToIntegerOrInfinity` / `ToString` ladders on
-    // non-primitive operands and observe user `@@toPrimitive` /
+    // §22.1.3.* String.prototype.* int / string argument coercion —
+    // run the SAME shared routine as the `Op::CallMethodValue` String
+    // arm (`Interpreter::coerce_string_method_args`) so `.call(...)` /
+    // `.apply(...)` and `"s".m(...)` coerce identically (index-like
+    // operands via full `ToNumber`, string operands via
+    // `ToPrimitive(String)`), observing user `@@toPrimitive` /
     // `valueOf` / `toString`.
-    let (string_int_coerce, string_str_coerce): (&[usize], &[usize]) = match name {
-        "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => (&[1], &[0]),
-        "slice" | "substring" | "substr" => (&[0, 1], &[]),
-        "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
-        "repeat" => (&[0], &[]),
-        "padStart" | "padEnd" => (&[0], &[1]),
-        "replace" | "replaceAll" => (&[], &[0]),
-        "split" => (&[1], &[0]),
-        "concat" => (&[], &[0, 1, 2, 3]),
-        // §B.2.3.2 / §B.2.3.7 / §B.2.3.8 / §B.2.3.10 — the
-        // attribute-bearing AnnexB HTML wrappers run
-        // `ToString(value)` on their first argument before splicing
-        // it into the resulting tag.
-        "anchor" | "fontcolor" | "fontsize" | "link" => (&[], &[0]),
-        _ => (&[], &[]),
-    };
-    let coerced_args: smallvec::SmallVec<[Value; 4]> =
-        if string_int_coerce.is_empty() && string_str_coerce.is_empty() {
-            args.iter().cloned().collect()
-        } else {
-            let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
-            if let Some(exec) = ctx.execution_context().cloned() {
-                let is_non_primitive = |v: &Value| {
-                    v.is_object()
-                        || v.is_array()
-                        || v.is_function()
-                        || v.is_closure()
-                        || v.is_native_function()
-                        || v.is_bound_function()
-                        || v.is_class_constructor()
-                        || v.is_proxy()
-                        || v.is_regexp()
-                };
-                for &idx in string_int_coerce {
-                    let Some(slot) = out.get_mut(idx) else {
-                        continue;
-                    };
-                    if !is_non_primitive(slot) {
-                        continue;
-                    }
-                    let interp = ctx.interp_mut();
-                    let primitive = interp
-                        .evaluate_to_primitive(
-                            &exec,
-                            slot,
-                            crate::abstract_ops::ToPrimitiveHint::Number,
-                        )
-                        .map_err(|e| NativeError::TypeError {
-                            name,
-                            reason: e.to_string(),
-                        })?;
-                    *slot = primitive;
-                }
-                for &idx in string_str_coerce {
-                    let Some(slot) = out.get_mut(idx) else {
-                        continue;
-                    };
-                    if !is_non_primitive(slot) {
-                        continue;
-                    }
-                    let interp = ctx.interp_mut();
-                    let primitive = interp
-                        .evaluate_to_primitive(
-                            &exec,
-                            slot,
-                            crate::abstract_ops::ToPrimitiveHint::String,
-                        )
-                        .map_err(|e| NativeError::TypeError {
-                            name,
-                            reason: e.to_string(),
-                        })?;
-                    *slot = primitive;
-                }
-            }
-            out
-        };
+    let mut coerced_args: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    if let Some(exec) = ctx.execution_context().cloned() {
+        ctx.interp_mut()
+            .coerce_string_method_args(&exec, name, &mut coerced_args)
+            .map_err(|e| crate::native_function::vm_to_native_error(e, name))?;
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -1889,8 +1840,10 @@ fn native_string_replace_callable(
             })?,
         ));
     }
-    let last_start = recv_units.len().saturating_sub(needle_len);
-    while cursor <= last_start {
+    // Guard `cursor + needle_len <= len` (not `cursor <= len - needle_len`)
+    // so a needle longer than the receiver — `"a".replaceAll("aa", fn)` —
+    // never slices out of bounds; the loop body simply never runs.
+    while cursor + needle_len <= recv_units.len() {
         if recv_units[cursor..cursor + needle_len] == needle_units[..] {
             let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 Value::string(needle),

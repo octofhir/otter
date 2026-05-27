@@ -40,8 +40,21 @@ conformance-gated before the next starts.
   - [ ] `Array.join` / other array-likes generic `length`-getter
     (needs the IntrinsicArgs→re-entrant migration so `impl_join` reads
     `length` through the interpreter).
-  - [ ] Mechanical `IntrinsicArgs` → re-entrant-context signature
-    migration, per type (String 46 fns, …).
+  - [~] Mechanical migration toward one re-entrant dispatch per type,
+    per type (String first):
+    - [x] **String unified** — extracted the shared argument coercion
+      into `Interpreter::coerce_string_method_args`; both the
+      primitive-string fast path in `do_call_method_value` and the
+      `.call`/property bridge now funnel through one entry
+      (`string_method_call` → `native_string_method`) with identical
+      receiver + argument coercion. Fixed a `replaceAll` slice OOB
+      panic (`"a".replaceAll("aa", fn)`) exposed by the funnel.
+      built-ins/String 1147→1152, 0 crash. (The 46 `impl_*` bodies
+      still take `IntrinsicArgs` — invoked once from
+      `native_string_method` — so the receiver/arg coercion is no
+      longer duplicated; folding coercion into each body is the
+      remaining polish.)
+    - [ ] Array, TypedArray, Date, … same treatment.
 - [ ] **Stage 3** — single callback re-entry path (`invoke` →
   `run_callable_sync`).
 - [ ] **Stage 4** — `do_call_method_value` → GetMethod + Call with a

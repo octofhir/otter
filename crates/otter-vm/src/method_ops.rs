@@ -68,6 +68,77 @@ fn relative_index_clamp(relative: f64, len: i64) -> i64 {
 }
 
 impl Interpreter {
+    /// §22.1.3 — pre-coerce the arguments of a `String.prototype`
+    /// method in place: index-like operands run full `ToNumber`
+    /// (`ToIntegerOrInfinity`'s first step, so Symbol / BigInt raise
+    /// TypeError at the right slot and user `@@toPrimitive` / `valueOf`
+    /// fire), and string operands run `ToPrimitive(String)`. Shared by
+    /// the primitive-string fast path in `do_call_method_value` and the
+    /// `.call` / property bridge so both invocation styles coerce
+    /// identically. A `RegExp` argument to `match` / `matchAll` /
+    /// `search` / `normalize` passes through unchanged for its
+    /// `@@`-method.
+    pub(crate) fn coerce_string_method_args(
+        &mut self,
+        context: &ExecutionContext,
+        name: &str,
+        args: &mut [Value],
+    ) -> Result<(), VmError> {
+        let (int_coerce, str_coerce): (&[usize], &[usize]) = match name {
+            "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => (&[1], &[0]),
+            "slice" | "substring" | "substr" => (&[0, 1], &[]),
+            "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
+            "repeat" => (&[0], &[]),
+            "padStart" | "padEnd" => (&[0], &[1]),
+            "replace" | "replaceAll" => (&[], &[0]),
+            "split" => (&[1], &[0]),
+            "concat" => (&[], &[0, 1, 2, 3]),
+            "match" | "matchAll" | "search" | "normalize" => (&[], &[0]),
+            "anchor" | "fontcolor" | "fontsize" | "link" => (&[], &[0]),
+            _ => (&[], &[]),
+        };
+        if int_coerce.is_empty() && str_coerce.is_empty() {
+            return Ok(());
+        }
+        let regexp_pass_through = matches!(name, "match" | "matchAll" | "search" | "normalize");
+        let is_non_primitive = |v: &Value| {
+            v.is_object()
+                || v.is_array()
+                || v.is_function()
+                || v.is_closure()
+                || v.is_native_function()
+                || v.is_bound_function()
+                || v.is_class_constructor()
+                || v.is_proxy()
+                || (!regexp_pass_through && v.is_regexp())
+        };
+        for &idx in int_coerce {
+            let Some(&v) = args.get(idx) else {
+                continue;
+            };
+            // Skip primitives the intrinsic body already recognises
+            // (`undefined` is the "absent" sentinel some §B.2.3.1
+            // substr-style methods key on).
+            if v.is_number() || v.is_boolean() || v.is_null() || v.is_undefined() {
+                continue;
+            }
+            let coerced = self.coerce_to_number(context, &v)?;
+            args[idx] = Value::number(coerced);
+        }
+        for &idx in str_coerce {
+            let Some(&v) = args.get(idx) else {
+                continue;
+            };
+            if !is_non_primitive(&v) {
+                continue;
+            }
+            let primitive =
+                self.evaluate_to_primitive(context, &v, crate::abstract_ops::ToPrimitiveHint::String)?;
+            args[idx] = primitive;
+        }
+        Ok(())
+    }
+
     /// Handle `Op::CallMethodValue`: the universal method-call op.
     /// Branches by receiver kind:
     /// - `String` / `Array` — synchronous intrinsic-table dispatch.
@@ -361,6 +432,28 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
+        // §22.1.3 — a primitive-string receiver routes every known
+        // `String.prototype` method through the single re-entrant
+        // `string_method_call`, the same path the `.call` / property
+        // bridge uses. Receiver `ToString`, argument coercion (the
+        // shared `coerce_string_method_args`), callable `replace`, and
+        // `@@`-method delegation all live there now. Unknown names fall
+        // through to the ordinary property / prototype walk below.
+        if recv_value.is_string() && string_prototype::lookup(name).is_some() {
+            let result = {
+                let mut ctx = NativeCtx::new_with_call_info_and_context(
+                    self,
+                    NativeCallInfo::call(recv_value),
+                    Some(context.clone()),
+                );
+                string_prototype::string_method_call(&mut ctx, name, &arg_values)
+                    .map_err(native_to_vm_error)?
+            };
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         // §23.2.3.{8,11,12,13,14,15,17,18,21,22,28} — TypedArray
         // prototype callback methods. Same shape as the Array set
         // but routed through a TypedArray-specific dispatcher so
@@ -621,34 +714,6 @@ impl Interpreter {
             // `ToPrimitive(arg, "string")`. Pre-coerce both shapes
             // when the receiver is a String primitive so user
             // `@@toPrimitive` / `valueOf` / `toString` fires per spec.
-            let (string_int_coerce, string_str_coerce): (&[usize], &[usize]) = match name {
-                "indexOf" | "lastIndexOf" | "includes" | "startsWith" | "endsWith" => (&[1], &[0]),
-                "slice" | "substring" | "substr" => (&[0, 1], &[]),
-                "at" | "charAt" | "charCodeAt" | "codePointAt" => (&[0], &[]),
-                "repeat" => (&[0], &[]),
-                "padStart" | "padEnd" => (&[0], &[1]),
-                "replace" | "replaceAll" => (&[], &[0]),
-                // §22.1.3.21 split(separator, limit) — separator [0]
-                // ToString (unless RegExp, but our impl doesn't fast-
-                // path RegExp on String yet so coercing through ladder
-                // is fine), limit [1] ToInteger.
-                "split" => (&[1], &[0]),
-                // §22.1.3.5 concat(...) — every arg ToString. Cover
-                // the first four slots (matches our 4-wide SmallVec).
-                "concat" => (&[], &[0, 1, 2, 3]),
-                // §22.1.3.{13,14,15,16} match / matchAll / search /
-                // normalize — non-RegExp arg passes through
-                // `RegExpCreate` which itself starts with `ToString`.
-                // Pre-coerce so user `@@toPrimitive` / `toString` /
-                // `valueOf` fire when the arg is an Object literal.
-                "match" | "matchAll" | "search" | "normalize" => (&[], &[0]),
-                // §B.2.3.2 / .7 / .8 / .10 — attribute-bearing
-                // AnnexB HTML wrappers run `ToString(value)` on
-                // their first argument before splicing it into the
-                // tag attribute.
-                "anchor" | "fontcolor" | "fontsize" | "link" => (&[], &[0]),
-                _ => (&[], &[]),
-            };
             // §24.3.1.{1,2} GetViewValue / SetViewValue on
             // `DataView.prototype.*` — pre-coerce `byteOffset` (and
             // setter `value`) through `ToPrimitive(Number)` so user
@@ -722,65 +787,8 @@ impl Interpreter {
                     small_args[idx] = Value::number(n);
                 }
             }
-            if recv_value.is_string()
-                && (!string_int_coerce.is_empty() || !string_str_coerce.is_empty())
-            {
-                // §22.1.3.{13,14,15} `match` / `matchAll` / `search`
-                // forward a `RegExp` arg unchanged through the
-                // `@@match` / `@@matchAll` / `@@search` ladder, so the
-                // pre-coerce here must not stringify a RegExp.
-                let regexp_pass_through =
-                    matches!(name, "match" | "matchAll" | "search" | "normalize");
-                let is_non_primitive = |v: &Value| {
-                    v.is_object()
-                        || v.is_array()
-                        || v.is_function()
-                        || v.is_closure()
-                        || v.is_native_function()
-                        || v.is_bound_function()
-                        || v.is_class_constructor()
-                        || v.is_proxy()
-                        || (!regexp_pass_through && v.is_regexp())
-                };
-                for &idx in string_int_coerce {
-                    let Some(slot) = small_args.get_mut(idx) else {
-                        continue;
-                    };
-                    // §7.1.5 `ToIntegerOrInfinity` opens with full
-                    // `ToNumber` — Symbol / BigInt operands must
-                    // raise TypeError at *this* slot before any
-                    // subsequent argument is coerced. Going through
-                    // the shared interpreter ToNumber path also
-                    // observes user `@@toPrimitive` / `valueOf`
-                    // overrides on object operands.
-                    // Skip slots that are already primitives the
-                    // intrinsic body recognises (`undefined` is the
-                    // "absent" sentinel that some §B.2.3.1 substr-
-                    // style methods key on; let the impl decide).
-                    if slot.is_number()
-                        || slot.is_boolean()
-                        || slot.is_null()
-                        || slot.is_undefined()
-                    {
-                        continue;
-                    }
-                    let coerced = self.coerce_to_number(context, slot)?;
-                    *slot = Value::number(coerced);
-                }
-                for &idx in string_str_coerce {
-                    let Some(slot) = small_args.get_mut(idx) else {
-                        continue;
-                    };
-                    if !is_non_primitive(slot) {
-                        continue;
-                    }
-                    let primitive = self.evaluate_to_primitive(
-                        context,
-                        slot,
-                        crate::abstract_ops::ToPrimitiveHint::String,
-                    )?;
-                    *slot = primitive;
-                }
+            if recv_value.is_string() {
+                self.coerce_string_method_args(context, name, &mut small_args)?;
             }
             // §22.2.7.1 / .2 `RegExp.prototype.exec` / `test` —
             // step `S = ? ToString(string)` on the argument. The

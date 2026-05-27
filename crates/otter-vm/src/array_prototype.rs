@@ -1975,6 +1975,17 @@ fn native_array_method(
                 .map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
+    // §23.1.3.30 — `sort` runs the re-entrant SortIndexedProperties driver.
+    if name == "sort" {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
+            let interp = ctx.interp_mut();
+            return interp
+                .array_sort(&exec, receiver, comparefn, &[args])
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -2473,6 +2484,140 @@ impl Interpreter {
             elements.extend(combined);
         });
         Ok(Value::array(arr))
+    }
+
+    /// §23.1.3.30.1 SortCompare(x, y, comparefn). `undefined` sorts to
+    /// the end; with a comparefn the result is `ToNumber(comparefn(x,y))`
+    /// (NaN → equal); otherwise the ToString lexicographic order.
+    fn sort_compare(
+        &mut self,
+        context: &ExecutionContext,
+        x: Value,
+        y: Value,
+        comparefn: Value,
+    ) -> Result<std::cmp::Ordering, VmError> {
+        use std::cmp::Ordering;
+        let x_undef = x.is_undefined();
+        let y_undef = y.is_undefined();
+        if x_undef && y_undef {
+            return Ok(Ordering::Equal);
+        }
+        if x_undef {
+            return Ok(Ordering::Greater);
+        }
+        if y_undef {
+            return Ok(Ordering::Less);
+        }
+        if !comparefn.is_undefined() {
+            let args: smallvec::SmallVec<[Value; 8]> = smallvec::smallvec![x, y];
+            let r = self.run_callable_sync(context, &comparefn, Value::undefined(), args)?;
+            let n = self.coerce_to_number(context, &r)?;
+            let f = n.as_f64();
+            return Ok(if f.is_nan() {
+                Ordering::Equal
+            } else if f < 0.0 {
+                Ordering::Less
+            } else if f > 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            });
+        }
+        let xs = self.coerce_to_string(context, &x)?;
+        let ys = self.coerce_to_string(context, &y)?;
+        Ok(xs.cmp(&ys))
+    }
+
+    /// Stable merge sort over `items`, propagating an abrupt completion
+    /// from the comparator (Rust's `sort_by` cannot carry a `Result`).
+    fn sort_merge(
+        &mut self,
+        context: &ExecutionContext,
+        items: Vec<Value>,
+        comparefn: Value,
+    ) -> Result<Vec<Value>, VmError> {
+        use std::cmp::Ordering;
+        let n = items.len();
+        if n <= 1 {
+            return Ok(items);
+        }
+        let mid = n / 2;
+        let mut left = items;
+        let right = left.split_off(mid);
+        let left = self.sort_merge(context, left, comparefn)?;
+        let right = self.sort_merge(context, right, comparefn)?;
+        let mut out = Vec::with_capacity(n);
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < left.len() && j < right.len() {
+            // Stable: keep the left element on a tie.
+            if self.sort_compare(context, left[i], right[j], comparefn)? != Ordering::Greater {
+                out.push(left[i]);
+                i += 1;
+            } else {
+                out.push(right[j]);
+                j += 1;
+            }
+        }
+        out.extend_from_slice(&left[i..]);
+        out.extend_from_slice(&right[j..]);
+        Ok(out)
+    }
+
+    /// §23.1.3.30 `Array.prototype.sort` over a generic receiver. The
+    /// intrinsic path sorts only the dense element store with no
+    /// comparator re-entry; this driver runs the spec ladder:
+    /// `comparefn` validity (step 1), `O = ToObject(this)`,
+    /// `len = LengthOfArrayLike(O)`, SortIndexedProperties (collect the
+    /// present indices via `Get`, stable-sort with SortCompare), then
+    /// write the sorted prefix back with `Set` and `Delete` the trailing
+    /// slots. Returns `O`.
+    pub(crate) fn array_sort(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        comparefn: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        // §23.1.3.30 step 1 — comparefn must be undefined or callable.
+        if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
+            return Err(VmError::TypeError {
+                message: "Array.prototype.sort comparator is not a function".to_string(),
+            });
+        }
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        // SortIndexedProperties: collect the present indexed values.
+        let mut items: Vec<Value> = Vec::new();
+        for k in 0..cap {
+            let key = k.to_string();
+            if self.ordinary_has_property_value(context, o, &crate::VmPropertyKey::String(&key), 0)? {
+                items.push(self.get_property_value_for_call(context, o, &key)?);
+            }
+        }
+        let item_count = items.len();
+        let sorted = self.sort_merge(context, items, comparefn)?;
+        // Write the sorted prefix back, then delete the trailing holes.
+        for (j, item) in sorted.into_iter().enumerate() {
+            let key = j.to_string();
+            self.ordinary_set_data_value(
+                context,
+                o,
+                &crate::VmPropertyKey::String(&key),
+                item,
+                o,
+                0,
+            )?;
+        }
+        for k in item_count..cap {
+            let key = k.to_string();
+            self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+        }
+        Ok(o)
     }
 }
 

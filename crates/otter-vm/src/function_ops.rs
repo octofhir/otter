@@ -639,6 +639,52 @@ impl Interpreter {
             }
         }
     }
+
+    /// §7.3.22 `SpeciesConstructor(O, defaultConstructor)`. Reads
+    /// `O.constructor`, then its `@@species`, validating each per the
+    /// spec ladder and falling back to `default_ctor` when the
+    /// constructor or species hook is absent / nullish. Both reads run
+    /// through the `[[Get]]` ladder so user getters fire.
+    pub(crate) fn species_constructor_value(
+        &mut self,
+        context: &ExecutionContext,
+        obj: &Value,
+        default_ctor: &Value,
+    ) -> Result<Value, VmError> {
+        let c = self.get_property_value_for_call(context, *obj, "constructor")?;
+        if c.is_undefined() {
+            return Ok(*default_ctor);
+        }
+        if !c.is_object_type() {
+            return Err(VmError::TypeError {
+                message: "constructor property is not an object".to_string(),
+            });
+        }
+        let species_sym = self
+            .well_known_symbols()
+            .get(crate::symbol::WellKnown::Species);
+        let s = match self.ordinary_get_value(
+            context,
+            c,
+            c,
+            &VmPropertyKey::Symbol(species_sym),
+            0,
+        )? {
+            VmGetOutcome::Value(value) => value,
+            VmGetOutcome::InvokeGetter { getter } => {
+                self.run_callable_sync(context, &getter, c, SmallVec::new())?
+            }
+        };
+        if s.is_nullish() {
+            return Ok(*default_ctor);
+        }
+        if abstract_ops::is_constructor(&s, context, &self.gc_heap) {
+            return Ok(s);
+        }
+        Err(VmError::TypeError {
+            message: "Symbol.species value is not a constructor".to_string(),
+        })
+    }
     fn callable_bind_metadata_get(
         &mut self,
         context: &ExecutionContext,

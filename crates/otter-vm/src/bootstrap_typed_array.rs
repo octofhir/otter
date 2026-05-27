@@ -373,21 +373,31 @@ fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let callee = ta_require_callable(args, "TypedArray.prototype.map")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    let kind = t.kind();
-    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
-    for (i, v) in elements.into_iter().enumerate() {
-        let mapped = ta_invoke_callback(ctx, &callee, &this_arg, &v, i, &ta_value)?;
+    // §23.2.3.20 step 3 — capture `len` before any user callback runs.
+    let len = t.length(ctx.heap());
+    // Step 5 — `A = ? TypedArraySpeciesCreate(O, « len »)` runs before
+    // the per-element callback loop, so a throwing species constructor
+    // is observed before any callback is invoked.
+    let a = ta_species_create(ctx, t, len, "TypedArray.prototype.map")?;
+    let target_kind = a.kind();
+    // Step 6 — read each source element live (so callbacks that mutate
+    // the receiver mid-iteration are observed per `Get(O, k)`), invoke
+    // the callback, then `Set(A, k, mappedValue)` through the target
+    // kind's element coercion.
+    for i in 0..len {
+        let kvalue = t
+            .get(ctx.interp_mut().gc_heap_mut(), i)
+            .map_err(ta_oom_to_native("TypedArray.prototype.map"))?;
+        let mapped = ta_invoke_callback(ctx, &callee, &this_arg, &kvalue, i, &ta_value)?;
         let coerced = crate::binary::dispatch::coerce_element_for_store(
             ctx.interp_mut().gc_heap_mut(),
-            kind,
+            target_kind,
             &mapped,
         )
         .map_err(|e| vm_to_native(e, "TypedArray.prototype.map"))?;
-        out.push(coerced);
+        a.set(ctx.interp_mut().gc_heap_mut(), i, &coerced);
     }
-    ta_build_result(ctx, kind, &out, "TypedArray.prototype.map")
+    Ok(Value::typed_array(a))
 }
 
 fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -395,16 +405,33 @@ fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     let callee = ta_require_callable(args, "TypedArray.prototype.filter")?;
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let ta_value = Value::typed_array(t);
-    let elements = ta_callback_snapshot(&t, ctx.interp_mut().gc_heap_mut())
-        .map_err(ta_oom_to_native("TypedArray callback"))?;
-    let mut out: Vec<Value> = Vec::new();
-    for (i, v) in elements.iter().enumerate() {
-        let kept = ta_invoke_callback(ctx, &callee, &this_arg, v, i, &ta_value)?;
-        if kept.to_boolean(ctx.interp_mut().gc_heap()) {
-            out.push(*v);
+    // §23.2.3.10 — run the predicate over every element first, reading
+    // each live so mid-iteration receiver mutations are observed, and
+    // collect the kept values. The species constructor is only invoked
+    // afterwards with the kept count (step 9).
+    let len = t.length(ctx.heap());
+    let mut kept: Vec<Value> = Vec::new();
+    for i in 0..len {
+        let kvalue = t
+            .get(ctx.interp_mut().gc_heap_mut(), i)
+            .map_err(ta_oom_to_native("TypedArray.prototype.filter"))?;
+        let selected = ta_invoke_callback(ctx, &callee, &this_arg, &kvalue, i, &ta_value)?;
+        if selected.to_boolean(ctx.interp_mut().gc_heap()) {
+            kept.push(kvalue);
         }
     }
-    ta_build_result(ctx, t.kind(), &out, "TypedArray.prototype.filter")
+    let a = ta_species_create(ctx, t, kept.len(), "TypedArray.prototype.filter")?;
+    let target_kind = a.kind();
+    for (i, v) in kept.iter().enumerate() {
+        let coerced = crate::binary::dispatch::coerce_element_for_store(
+            ctx.interp_mut().gc_heap_mut(),
+            target_kind,
+            v,
+        )
+        .map_err(|e| vm_to_native(e, "TypedArray.prototype.filter"))?;
+        a.set(ctx.interp_mut().gc_heap_mut(), i, &coerced);
+    }
+    Ok(Value::typed_array(a))
 }
 
 fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -577,69 +604,68 @@ fn ta_proto_reduce_dir(
     Ok(acc)
 }
 
-fn ta_build_result(
+/// §23.2.4.1 `TypedArraySpeciesCreate(exemplar, argumentList)` for the
+/// single-`length` argument case used by `map` / `filter` / `slice` /
+/// `subarray`.
+///
+/// Resolves `SpeciesConstructor(exemplar, %DefaultConstructor%)`
+/// (§7.3.22) — observing a user `constructor` / `Symbol.species`
+/// override — then performs `TypedArrayCreate(constructor, « length »)`
+/// (§23.2.4.2): constructs the result, then verifies it is a
+/// TypedArray, its buffer is not detached, and its length is at least
+/// `length`.
+fn ta_species_create(
     ctx: &mut NativeCtx<'_>,
-    kind: crate::binary::typed_array::TypedArrayKind,
-    values: &[Value],
+    exemplar: crate::binary::typed_array::JsTypedArray,
+    length: usize,
     method: &'static str,
-) -> Result<Value, NativeError> {
-    let bpe = kind.bytes_per_element();
-    let byte_len = values
-        .len()
-        .checked_mul(bpe)
-        .ok_or(NativeError::RangeError {
-            name: method,
-            reason: "TypedArray byte length overflow".to_string(),
-        })?;
-    let roots = ctx.collect_native_roots();
-    let this_value = *ctx.this_value();
-    let new_target = ctx.new_target().cloned();
-    let value_slice: &[Value] = values;
-    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        crate::runtime_cx::visit_native_roots(
-            visitor,
-            &roots,
-            &this_value,
-            new_target.as_ref(),
-            &[],
-            &[value_slice],
-        );
+) -> Result<crate::binary::typed_array::JsTypedArray, NativeError> {
+    let exemplar_value = Value::typed_array(exemplar);
+    let default_name = exemplar.kind().name();
+    let default_ctor = {
+        let interp = &ctx.cx.interp;
+        crate::object::get(interp.global_this, &interp.gc_heap, default_name).ok_or_else(|| {
+            NativeError::TypeError {
+                name: method,
+                reason: format!("%{default_name}% intrinsic missing"),
+            }
+        })?
     };
-    let new_buf = crate::binary::array_buffer::JsArrayBuffer::try_new_with_roots(
-        byte_len,
-        ctx.heap_mut(),
-        &mut external_visit,
-    )
-    .map_err(|err| NativeError::RangeError {
+    let constructor =
+        crate::regexp_prototype::species_constructor_runtime(ctx, &exemplar_value, &default_ctor, method)?;
+
+    let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
+    argv.push(Value::number(crate::number::NumberValue::from_f64(
+        length as f64,
+    )));
+    let (interp, exec) = ctx.interp_mut_and_context();
+    let exec = exec.ok_or_else(|| NativeError::TypeError {
         name: method,
-        reason: format!(
-            "TypedArray allocation of {byte_len} bytes exceeds the available heap (limit {})",
-            err.heap_limit_bytes()
-        ),
-    })?
-    .ok_or_else(|| NativeError::RangeError {
-        name: method,
-        reason: format!("TypedArray allocation of {byte_len} bytes exceeds the available heap"),
+        reason: "missing execution context".to_string(),
     })?;
-    let view = crate::binary::typed_array::JsTypedArray::new(
-        ctx.heap_mut(),
-        new_buf,
-        kind,
-        0,
-        values.len(),
-    )
-    .map_err(|err| NativeError::RangeError {
-        name: method,
-        reason: format!(
-            "TypedArray allocation failed: requested {} bytes, heap limit {}",
-            err.requested_bytes(),
-            err.heap_limit_bytes(),
-        ),
-    })?;
-    for (i, v) in values.iter().enumerate() {
-        view.set(ctx.heap_mut(), i, v);
+    let result = interp
+        .run_construct_sync(&exec, &constructor, constructor, argv)
+        .map_err(|e| vm_to_native(e, method))?;
+
+    let Some(new_ta) = result.as_typed_array(&interp.gc_heap) else {
+        return Err(NativeError::TypeError {
+            name: method,
+            reason: "Species constructor did not return a TypedArray".to_string(),
+        });
+    };
+    if new_ta.buffer(&interp.gc_heap).is_detached(&interp.gc_heap) {
+        return Err(NativeError::TypeError {
+            name: method,
+            reason: "Species constructor returned a TypedArray with a detached buffer".to_string(),
+        });
     }
-    Ok(Value::typed_array(view))
+    if new_ta.length(&interp.gc_heap) < length {
+        return Err(NativeError::TypeError {
+            name: method,
+            reason: "Species constructor returned a TypedArray smaller than the source".to_string(),
+        });
+    }
+    Ok(new_ta)
 }
 
 /// §22.2.6.1 `get %TypedArray%.prototype.buffer` — return the

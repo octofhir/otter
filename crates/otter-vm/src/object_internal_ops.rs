@@ -1205,8 +1205,10 @@ impl Interpreter {
             // enumerable, configurable data property; any other key is
             // an ordinary define on the typed array's expando bag.
             if let VmPropertyKey::Symbol(sym) = key {
-                let bag =
-                    crate::property_dispatch::typed_array_ensure_expando_pub(&mut self.gc_heap, &t)?;
+                let bag = crate::property_dispatch::typed_array_ensure_expando_pub(
+                    &mut self.gc_heap,
+                    &t,
+                )?;
                 return Ok(object::define_own_symbol_property_partial(
                     bag,
                     &mut self.gc_heap,
@@ -2977,6 +2979,61 @@ impl Interpreter {
             };
             return if direct.is_undefined() {
                 let proto = self.constructor_prototype_value("RegExp")?;
+                if proto.is_nullish() {
+                    return Ok(VmGetOutcome::Value(Value::undefined()));
+                }
+                self.ordinary_get_value(context, proto, receiver, key, hops + 1)
+            } else {
+                Ok(VmGetOutcome::Value(direct))
+            };
+        }
+        if let Some(t) = base.as_typed_array(&self.gc_heap) {
+            // §10.4.5.4 TypedArray [[Get]] for non-index keys —
+            // expando own properties first (so user-assigned
+            // `constructor` / accessors win), then the per-kind
+            // builtin prototype methods, then the kind's constructor
+            // prototype chain. Mirrors the opcode `run_load_property_reg`
+            // path so synchronous gets (`SpeciesConstructor`,
+            // `Reflect.get`) resolve identically.
+            if let Some(bag) = t.expando(&self.gc_heap) {
+                let lookup = match key {
+                    VmPropertyKey::Symbol(sym) => {
+                        object::lookup_own_symbol(bag, &self.gc_heap, *sym)
+                    }
+                    _ => {
+                        let key = key
+                            .string_name()
+                            .expect("non-symbol key has string spelling");
+                        object::lookup_own(bag, &self.gc_heap, key)
+                    }
+                };
+                match lookup {
+                    object::PropertyLookup::Data { value, .. } => {
+                        return Ok(VmGetOutcome::Value(value));
+                    }
+                    object::PropertyLookup::Accessor { getter, .. } => {
+                        return Ok(match getter {
+                            Some(getter) if abstract_ops::is_callable(&getter) => {
+                                VmGetOutcome::InvokeGetter { getter }
+                            }
+                            _ => VmGetOutcome::Value(Value::undefined()),
+                        });
+                    }
+                    object::PropertyLookup::Absent => {}
+                }
+            }
+            let direct = match key {
+                VmPropertyKey::Symbol(_) => Value::undefined(),
+                _ => {
+                    let key = key
+                        .string_name()
+                        .expect("non-symbol key has string spelling");
+                    crate::binary::typed_array_prototype::load_property(&t, &self.gc_heap, key)
+                }
+            };
+            return if direct.is_undefined() {
+                let kind_name = t.kind().name();
+                let proto = self.constructor_prototype_value(kind_name)?;
                 if proto.is_nullish() {
                     return Ok(VmGetOutcome::Value(Value::undefined()));
                 }

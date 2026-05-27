@@ -1291,7 +1291,7 @@ pub(crate) fn get_symbol_property_runtime(
 /// is absent / undefined, throws TypeError on the spec-mandated
 /// invalid shapes, and otherwise hands back `Symbol.species` (or the
 /// constructor itself when species is absent / nullish).
-fn species_constructor_runtime(
+pub(crate) fn species_constructor_runtime(
     ctx: &mut NativeCtx<'_>,
     obj: &Value,
     default_ctor: &Value,

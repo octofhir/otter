@@ -1546,7 +1546,6 @@ impl Interpreter {
         dst: u16,
     ) -> Result<bool, VmError> {
         let ta_value = Value::typed_array(*t);
-        let kind = t.kind();
         let len = t.length(&self.gc_heap);
         let elements: Vec<Value> = {
             let mut tmp = Vec::with_capacity(len);
@@ -1571,31 +1570,61 @@ impl Interpreter {
                 Value::undefined()
             }
             "map" => {
+                // §23.2.3.20 — `A = ? TypedArraySpeciesCreate(O, « len »)`
+                // (step 5) runs before any callback, so a throwing /
+                // overriding species constructor is observed first. `A`
+                // is parked in `dst` immediately so it is GC-rooted (via
+                // the frame register scan) across each callback re-entry.
                 let callee = require_callable(args.first())?;
-                let mut out: Vec<Value> = Vec::with_capacity(len);
+                let a = self.typed_array_species_create(context, t, len)?;
+                let a_value = Value::typed_array(a);
+                let target_kind = a.kind();
+                {
+                    let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    write_register(frame_top, dst, a_value)?;
+                }
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     let mapped = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                     let coerced = crate::binary::dispatch::coerce_element_for_store(
                         &mut self.gc_heap,
-                        kind,
+                        target_kind,
                         &mapped,
                     )?;
-                    out.push(coerced);
+                    a.set(&mut self.gc_heap, i, &coerced);
                 }
-                self.typed_array_from_values_stack_rooted(stack, kind, &out, &[&ta_value, &callee])?
+                return Ok(true);
             }
             "filter" => {
+                // §23.2.3.10 — run the predicate over every element,
+                // collecting kept values, *then* call
+                // `TypedArraySpeciesCreate(O, « captured »)` (step 9)
+                // with the kept count and copy the survivors in.
                 let callee = require_callable(args.first())?;
-                let mut out: Vec<Value> = Vec::new();
+                let mut kept: Vec<Value> = Vec::new();
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let kept = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    if kept.to_boolean(&self.gc_heap) {
-                        out.push(t.get(&mut self.gc_heap, i).map_err(crate::oom_to_vm)?);
+                    let selected = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
+                    if selected.to_boolean(&self.gc_heap) {
+                        kept.push(value);
                     }
                 }
-                self.typed_array_from_values_stack_rooted(stack, kind, &out, &[&ta_value, &callee])?
+                let a = self.typed_array_species_create(context, t, kept.len())?;
+                let a_value = Value::typed_array(a);
+                let target_kind = a.kind();
+                {
+                    let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+                    write_register(frame_top, dst, a_value)?;
+                }
+                for (i, value) in kept.iter().enumerate() {
+                    let coerced = crate::binary::dispatch::coerce_element_for_store(
+                        &mut self.gc_heap,
+                        target_kind,
+                        value,
+                    )?;
+                    a.set(&mut self.gc_heap, i, &coerced);
+                }
+                return Ok(true);
             }
             "find" => {
                 let callee = require_callable(args.first())?;
@@ -1712,56 +1741,51 @@ impl Interpreter {
         Ok(true)
     }
 
-    fn typed_array_from_values_stack_rooted(
+    /// §23.2.4.1 `TypedArraySpeciesCreate(exemplar, « length »)`.
+    /// Resolves `SpeciesConstructor(exemplar, %DefaultConstructor%)`
+    /// (§7.3.22) — observing a user `constructor` / `@@species`
+    /// override — then performs `TypedArrayCreate(constructor,
+    /// « length »)` (§23.2.4.2) and validates the result is a
+    /// non-detached TypedArray of at least `length` elements.
+    fn typed_array_species_create(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        kind: crate::binary::typed_array::TypedArrayKind,
-        values: &[Value],
-        value_roots: &[&Value],
-    ) -> Result<Value, VmError> {
-        let stack_roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for &slot in &stack_roots {
-                visitor(slot);
-            }
-            for v in value_roots {
-                v.trace_value_slots(visitor);
-            }
-            for v in values {
-                v.trace_value_slots(visitor);
-            }
+        context: &ExecutionContext,
+        exemplar: &crate::binary::typed_array::JsTypedArray,
+        length: usize,
+    ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
+        let exemplar_value = Value::typed_array(*exemplar);
+        let default_name = exemplar.kind().name();
+        let default_ctor =
+            crate::object::get(self.global_this, &self.gc_heap, default_name).ok_or_else(|| {
+                VmError::TypeError {
+                    message: format!("%{default_name}% intrinsic is missing"),
+                }
+            })?;
+        let constructor =
+            self.species_constructor_value(context, &exemplar_value, &default_ctor)?;
+        let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
+        argv.push(Value::number(NumberValue::from_f64(length as f64)));
+        let result = self.run_construct_sync(context, &constructor, constructor, argv)?;
+        let Some(new_ta) = result.as_typed_array(&self.gc_heap) else {
+            return Err(VmError::TypeError {
+                message: "Species constructor did not return a TypedArray".to_string(),
+            });
         };
-        let bpe = kind.bytes_per_element();
-        let byte_len = values.len().checked_mul(bpe).ok_or(VmError::RangeError {
-            message: "TypedArray byte length overflow".to_string(),
-        })?;
-        let new_buf = crate::binary::array_buffer::JsArrayBuffer::try_new_with_roots(
-            byte_len,
-            &mut self.gc_heap,
-            &mut external_visit,
-        )
-        .map_err(|err| VmError::OutOfMemory {
-            requested_bytes: err.requested_bytes(),
-            heap_limit_bytes: err.heap_limit_bytes(),
-        })?
-        .ok_or_else(|| VmError::RangeError {
-            message: format!(
-                "TypedArray allocation of {byte_len} bytes exceeds the available heap"
-            ),
-        })?;
-        let view = crate::binary::typed_array::JsTypedArray::new(
-            &mut self.gc_heap,
-            new_buf,
-            kind,
-            0,
-            values.len(),
-        )
-        .map_err(crate::oom_to_vm)?;
-        for (i, value) in values.iter().enumerate() {
-            view.set(&mut self.gc_heap, i, value);
+        if new_ta.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
+            return Err(VmError::TypeError {
+                message: "Species constructor returned a TypedArray with a detached buffer"
+                    .to_string(),
+            });
         }
-        Ok(Value::typed_array(view))
+        if new_ta.length(&self.gc_heap) < length {
+            return Err(VmError::TypeError {
+                message: "Species constructor returned a TypedArray smaller than required"
+                    .to_string(),
+            });
+        }
+        Ok(new_ta)
     }
+
 
     fn dispatch_function_method(
         &mut self,

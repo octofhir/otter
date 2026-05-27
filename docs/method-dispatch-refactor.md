@@ -37,9 +37,17 @@ conformance-gated before the next starts.
     `Reflect.get/has(ta,"i")`, `n in ta` (was a TypeError crash), and
     generic `Array.prototype.indexOf/includes.call(ta)`. built-ins/
     TypedArray 1498→1508 pass.
-  - [ ] `Array.join` / other array-likes generic `length`-getter
-    (needs the IntrinsicArgs→re-entrant migration so `impl_join` reads
-    `length` through the interpreter).
+  - [x] `Array.join` generic receiver — `Interpreter::array_join`
+    runs the §23.1.3.16 ladder with re-entry (LengthOfArrayLike →
+    ToString(sep) → per-index Get + ToString), routed from the
+    `.call` bridge for non-Array receivers; observes a `get length()`
+    accessor and boxes a primitive (string) receiver. Plus
+    `length_of_array_like` now ToNumber-coerces a wrapper-object /
+    `valueOf` length (§7.1.20), shared by join / indexOf / lastIndexOf
+    / includes. built-ins/Array 2230→2245, 0 crash. (Dense-Array
+    `.join` still uses `impl_join`: separator/element ToString and
+    inherited `Array.prototype[k]` indices on a dense receiver are the
+    remaining ~3 join tests — fold the dense path into `array_join`.)
   - [~] Mechanical migration toward one re-entrant dispatch per type,
     per type (String first):
     - [x] **String unified** — extracted the shared argument coercion
@@ -54,9 +62,46 @@ conformance-gated before the next starts.
       `native_string_method` — so the receiver/arg coercion is no
       longer duplicated; folding coercion into each body is the
       remaining polish.)
-    - [ ] Array, TypedArray, Date, … same treatment.
+    - [~] Array — `join` + array-like `length` coercion done (above).
+      `indexOf`/`lastIndexOf`/`includes` already unified (Stage 1).
+      The callback set (`reduce`/`reduceRight`/`map`/`filter`/`forEach`/
+      `every`/`some`/`find*`/`flatMap`) is **not** unified — see the
+      callback-dispatch map under Stage 3.
+    - [ ] TypedArray, Date, … same treatment.
 - [ ] **Stage 3** — single callback re-entry path (`invoke` →
-  `run_callable_sync`).
+  `run_callable_sync`). **Array callback-dispatch map (measured
+  2026-05-27, the two mechanisms + their bugs):**
+  - **Dense fast path** `method_ops::array_callback_dispatch`
+    (`array_prototype.rs` body via the in-loop dispatcher) — used for
+    `arr.method(cb)` with a real `Value::Array` receiver. Uses a stack
+    frame per callback.
+  - **Generic path** `array_prototype::array_callback_native_dispatch`
+    (NativeCtx, `run_callable_sync`) — used for
+    `Array.prototype.X.call(arrayLike, cb)`. Builds a **one-shot
+    snapshot** via `collect_array_like_callback_entries`, then iterates.
+  - **Bug A (both paths): snapshot, not live.** Spec callback methods
+    read `length` once but re-`Get(O,k)` (and re-`HasProperty`) every
+    index *during* the walk, so a callback that mutates the receiver is
+    observed (`reduce/15.4.4.21-9-1`: `[1,2,,4,'5'].reduce` whose cb
+    sets `arr[2]=3` must yield `"105"`, we give `"75"`). Fix: replace
+    the snapshot with a live per-index `HasProperty(O,k)`+`Get(O,k)`
+    ladder bounded by the once-read `len` — mirror `array_linear_search`
+    (but no `fromIndex` escape, so guard pathological `length` before
+    enabling a `0..len` walk; confirm the suite has no huge-`length`
+    callback test that would time out).
+  - **Bug B (generic path): non-object receivers' indexed props
+    invisible.** `collect_own_indices_below` only enumerates
+    `as_array`/`as_object`/`as_string`; a **Function** receiver's
+    expando indices (`Array.prototype.reduce.call(fnObj, cb, init)` with
+    `fnObj[0]=…`) are dropped, so the walk sees no entries and returns
+    the initial value (`reduce/15.4.4.21-1-9`, the `-3-19`/`-3-2x`
+    cluster). A live `[[Get]]` ladder (Bug A's fix) subsumes this since
+    `Get(fnObj,"0")` already resolves the expando.
+  - Per-method Array failure counts (post-fix baseline): reduceRight 72,
+    reduce 68, map 51, filter 48, every 38, forEach 37, some 37 — the
+    callback cluster dominates the remaining ~691 `Array/prototype`
+    fails, so unifying the two dispatchers onto one live
+    `run_callable_sync` ladder is the next big lever.
 - [ ] **Stage 4** — `do_call_method_value` → GetMethod + Call with a
   call IC; receiver type-switch retires.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into

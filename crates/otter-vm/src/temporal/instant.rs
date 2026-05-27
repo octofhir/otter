@@ -11,7 +11,7 @@ use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::helpers::{
     arg_or_undef, js_string_value, make_temporal, parse_difference_settings,
-    parse_rounding_options, require_construct, require_instant, temporal_err,
+    parse_rounding_options, parse_time_zone, require_construct, require_instant, temporal_err,
 };
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
@@ -75,6 +75,18 @@ fn from_epoch_milliseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     let inst =
         temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
+}
+
+fn impl_to_zoned_date_time_iso(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let inst = require_instant(ctx)?;
+    let tz = parse_time_zone(&arg_or_undef(args, 0), ctx.heap(), CLASS)?;
+    let zdt = inst
+        .to_zoned_date_time_iso(tz)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
 fn from_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -274,6 +286,7 @@ pub static INSTANT_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("until", 1, impl_until),
     method("since", 1, impl_since),
     method("round", 1, impl_round),
+    method("toZonedDateTimeISO", 1, impl_to_zoned_date_time_iso),
 ];
 
 otter_macros::couch! {

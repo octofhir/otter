@@ -7,11 +7,13 @@
 
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
+use crate::object;
 use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, js_string_value, make_temporal,
     parse_calendar_fields, parse_difference_settings, parse_display_calendar, parse_partial_time,
-    require_construct, require_plain_date, str_or_undef, temporal_err, to_integer_with_truncation,
+    parse_time_zone, require_construct, require_plain_date, str_or_undef, temporal_err,
+    to_integer_with_truncation,
 };
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
@@ -260,6 +262,35 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
 }
 
+fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pd = require_plain_date(ctx)?;
+    let item = arg_or_undef(args, 0);
+    // §ToZonedDateTime: an object with a `timeZone` property supplies
+    // {timeZone, plainTime}; any other value is itself the time-zone
+    // identifier (string or ZonedDateTime).
+    let (tz, time) = if let Some(obj) = item.as_object() {
+        match object::get(obj, ctx.heap(), "timeZone").filter(|v| !v.is_undefined()) {
+            Some(tz_v) => {
+                let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
+                let time = match object::get(obj, ctx.heap(), "plainTime") {
+                    Some(v) if !v.is_undefined() => {
+                        Some(crate::temporal::plain_time::parse_plain_time_arg(&v, ctx.heap())?)
+                    }
+                    _ => None,
+                };
+                (tz, time)
+            }
+            None => (parse_time_zone(&item, ctx.heap(), CLASS)?, None),
+        }
+    } else {
+        (parse_time_zone(&item, ctx.heap(), CLASS)?, None)
+    };
+    let zdt = pd
+        .to_zoned_date_time(tz, time)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
+}
+
 fn impl_to_plain_year_month(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let pym = pd.to_plain_year_month().map_err(|e| temporal_err(e, CLASS))?;
@@ -341,6 +372,7 @@ pub static PLAIN_DATE_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toPlainDateTime", 0, impl_to_plain_date_time),
     method("toPlainYearMonth", 0, impl_to_plain_year_month),
     method("toPlainMonthDay", 0, impl_to_plain_month_day),
+    method("toZonedDateTime", 1, impl_to_zoned_date_time),
 ];
 
 otter_macros::couch! {

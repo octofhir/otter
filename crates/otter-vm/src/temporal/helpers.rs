@@ -295,6 +295,60 @@ fn read_string_field(obj: JsObject, name: &str, heap: &otter_gc::GcHeap) -> Opti
     v.as_string(heap).map(|s| s.to_lossy_string(heap))
 }
 
+/// Parse the `disambiguation` option (`"compatible"`/`"earlier"`/
+/// `"later"`/`"reject"`) from an options argument, defaulting to
+/// `Compatible`.
+pub fn parse_disambiguation(
+    args: &[Value],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+) -> Result<temporal_rs::options::Disambiguation, NativeError> {
+    use core::str::FromStr;
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(temporal_rs::options::Disambiguation::Compatible);
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "options must be an object or undefined".to_string(),
+        });
+    };
+    match read_string_field(obj, "disambiguation", heap) {
+        Some(name) => temporal_rs::options::Disambiguation::from_str(&name).map_err(|_| {
+            NativeError::RangeError {
+                name: class,
+                reason: "invalid `disambiguation`".to_string(),
+            }
+        }),
+        None => Ok(temporal_rs::options::Disambiguation::Compatible),
+    }
+}
+
+/// Resolve a time-zone argument: a string identifier (e.g.
+/// `"UTC"`, `"+05:00"`, `"America/New_York"`) or a
+/// `Temporal.ZonedDateTime` whose own time zone is reused.
+pub fn parse_time_zone(
+    v: &Value,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+) -> Result<temporal_rs::TimeZone, NativeError> {
+    if let Some(t) = v.as_temporal(heap)
+        && let TemporalPayload::ZonedDateTime(zdt) = t.payload_clone(heap)
+    {
+        return Ok(*zdt.time_zone());
+    }
+    if let Some(s) = v.as_string(heap) {
+        return temporal_rs::TimeZone::try_from_str(&s.to_lossy_string(heap))
+            .map_err(|e| temporal_err(e, class));
+    }
+    Err(NativeError::TypeError {
+        name: class,
+        reason: "time zone must be a string identifier or a Temporal.ZonedDateTime".to_string(),
+    })
+}
+
 /// Parse the rounding options (`smallestUnit`, `roundingMode`,
 /// `fractionalSecondDigits`) from a time-bearing Temporal `toString`
 /// options argument into a

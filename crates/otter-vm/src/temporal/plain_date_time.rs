@@ -11,8 +11,9 @@ use crate::temporal::duration::partial_from_object;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
     opt_integer_with_truncation, parse_date_time_fields, parse_difference_settings,
-    parse_display_calendar, parse_partial_time, parse_rounding_options, require_construct,
-    require_plain_date_time, str_or_undef, temporal_err, to_integer_with_truncation,
+    parse_disambiguation, parse_display_calendar, parse_partial_time, parse_rounding_options,
+    parse_time_zone, require_construct, require_plain_date_time, str_or_undef, temporal_err,
+    to_integer_with_truncation,
 };
 use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
@@ -202,6 +203,16 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 
 fn impl_to_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     impl_to_string(ctx, args)
+}
+
+fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let pdt = require_plain_date_time(ctx)?;
+    let tz = parse_time_zone(&arg_or_undef(args, 0), ctx.heap(), CLASS)?;
+    let disambiguation = parse_disambiguation(args, 1, ctx.heap(), CLASS)?;
+    let zdt = pdt
+        .to_zoned_date_time(tz, disambiguation)
+        .map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
 fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -409,6 +420,7 @@ pub static PLAIN_DATE_TIME_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("withPlainTime", 0, impl_with_plain_time),
     method("toPlainDate", 0, impl_to_plain_date),
     method("toPlainTime", 0, impl_to_plain_time),
+    method("toZonedDateTime", 1, impl_to_zoned_date_time),
 ];
 
 otter_macros::couch! {

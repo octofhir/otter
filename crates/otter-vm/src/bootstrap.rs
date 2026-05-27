@@ -574,7 +574,10 @@ mod tests {
         // gained real `prototype` accessor properties (one native
         // getter closure + accessor descriptor per field) so branding
         // and prop-desc semantics match the spec.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1500;
+        // Bumped from 1500 → 1550 for newly wired conversion methods
+        // (toZonedDateTime, toPlainYearMonth/MonthDay, fromEpochNanoseconds,
+        // toZonedDateTimeISO, Duration.with) each adding a prototype fn.
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1550;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

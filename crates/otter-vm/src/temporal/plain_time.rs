@@ -79,7 +79,7 @@ fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
     Ok(Value::number_i32(n))
 }
 
-fn parse_plain_time_arg(
+pub(crate) fn parse_plain_time_arg(
     v: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::PlainTime, NativeError> {

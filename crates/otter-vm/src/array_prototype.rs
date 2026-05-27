@@ -76,10 +76,12 @@ const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
 /// clamp to [`MAX_ARRAY_LIKE_PROBE_LEN`].
 fn read_array_like_length(obj: crate::object::JsObject, heap: &otter_gc::GcHeap) -> usize {
     let len_val = crate::object::get(obj, heap, "length").unwrap_or(Value::undefined());
-    let Some(n) = len_val.as_number() else {
-        return 0;
-    };
-    let f = n.as_f64();
+    // §7.1.20 ToLength(? ToNumber(length)). `length` is routinely a
+    // string / boolean / float in array-like receivers, so coerce
+    // through the primitive ToNumber ladder (which parses numeric
+    // strings, maps booleans, etc.) rather than only accepting an
+    // existing Number.
+    let f = crate::number::parse::to_number_value(&len_val, heap);
     if f.is_nan() || f <= 0.0 {
         0
     } else if f >= MAX_ARRAY_LIKE_PROBE_LEN as f64 {
@@ -121,6 +123,37 @@ pub(crate) fn array_like_present_entries(
         }));
     }
     if let Some(obj) = receiver.as_object() {
+        // §10.4.3 String-exotic wrappers (`new String("…")`) expose
+        // their `length` and each code unit through `[[StringData]]`,
+        // not the ordinary property table. Seed entries from the
+        // backing string, then overlay any own indexed props.
+        if let Some(s) = crate::object::string_data(obj, heap) {
+            let units = s.to_utf16_vec(heap);
+            let mut entries: Vec<(usize, Value)> = units
+                .iter()
+                .enumerate()
+                .map(|(i, &u)| {
+                    let ch = crate::string::JsString::from_utf16_units(&[u], heap)
+                        .map(Value::string)
+                        .unwrap_or(Value::undefined());
+                    (i, ch)
+                })
+                .collect();
+            let extra: Vec<usize> = crate::object::with_properties(obj, heap, |p| {
+                p.keys()
+                    .filter_map(|k| k.parse::<usize>().ok())
+                    .filter(|&i| i >= entries.len())
+                    .collect()
+            });
+            for i in extra {
+                let v = crate::object::get(obj, heap, &i.to_string())
+                    .unwrap_or(Value::undefined());
+                entries.push((i, v));
+            }
+            entries.sort_unstable_by_key(|(i, _)| *i);
+            entries.dedup_by_key(|(i, _)| *i);
+            return Some(entries);
+        }
         let len = read_array_like_length(obj, heap);
         if len == 0 {
             return Some(Vec::new());
@@ -216,6 +249,9 @@ pub(crate) fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> us
         return array::len(arr, heap);
     }
     if let Some(obj) = receiver.as_object() {
+        if let Some(s) = crate::object::string_data(obj, heap) {
+            return s.len() as usize;
+        }
         return read_array_like_length(obj, heap);
     }
     if let Some(s) = receiver.as_string(heap) {

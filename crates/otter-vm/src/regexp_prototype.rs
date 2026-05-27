@@ -558,6 +558,23 @@ fn arg_to_string_primitive(
         n.to_display_string()
     } else if let Some(bi) = raw.as_big_int() {
         bi.to_decimal_string(&*args.gc_heap)
+    } else if let Some(obj) = raw.as_object() {
+        // Built-in primitive wrappers ToString to their wrapped
+        // value (`new String("12")` -> "12", `new Number(1.0)` ->
+        // "1"). Plain objects fall back to the display form; a user
+        // `toString` callback would need interpreter re-entry the
+        // intrinsic layer lacks.
+        let gc = &*args.gc_heap;
+        if let Some(s) = crate::object::string_data(obj, gc) {
+            return Ok(s);
+        }
+        if let Some(n) = crate::object::number_data(obj, gc) {
+            n.to_display_string()
+        } else if let Some(b) = crate::object::boolean_data(obj, gc) {
+            if b { "true" } else { "false" }.to_string()
+        } else {
+            raw.display_string(gc)
+        }
     } else {
         raw.display_string(&*args.gc_heap)
     };
@@ -727,6 +744,18 @@ fn string_arg_to_jsstring(
         n.to_display_string()
     } else if let Some(bi) = raw.as_big_int() {
         bi.to_decimal_string(ctx.heap())
+    } else if let Some(obj) = raw.as_object() {
+        let gc = ctx.heap();
+        if let Some(s) = crate::object::string_data(obj, gc) {
+            return Ok(s);
+        }
+        if let Some(n) = crate::object::number_data(obj, gc) {
+            n.to_display_string()
+        } else if let Some(b) = crate::object::boolean_data(obj, gc) {
+            if b { "true" } else { "false" }.to_string()
+        } else {
+            raw.display_string(gc)
+        }
     } else {
         raw.display_string(ctx.heap())
     };

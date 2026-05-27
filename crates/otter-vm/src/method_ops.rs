@@ -469,6 +469,16 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
+        // §23.1.3.4 — `copyWithin` reads length, coerces indices, then
+        // copies through live HasProperty/Get/Set/Delete.
+        if recv_value.is_array() && name == "copyWithin" {
+            let result =
+                self.array_copy_within(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` /
         // `includes` on an Array receiver. The intrinsic-table impls
         // walk only the dense element store, so they miss inherited /
@@ -743,8 +753,6 @@ impl Interpreter {
                 "indexOf" | "lastIndexOf" | "includes" => &[1],
                 // §23.1.3.7 fill(value, start, end)
                 "fill" => &[1, 2],
-                // §23.1.3.4 copyWithin(target, start, end)
-                "copyWithin" => &[0, 1, 2],
                 // §23.1.3.26 slice(start, end)
                 "slice" => &[0, 1],
                 // §23.1.3.1 at(index)

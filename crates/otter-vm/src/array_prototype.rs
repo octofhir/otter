@@ -1887,7 +1887,6 @@ fn native_array_method(
     let int_coerce_indices: &[usize] = match name {
         "indexOf" | "lastIndexOf" | "includes" => &[1],
         "fill" => &[1, 2],
-        "copyWithin" => &[0, 1, 2],
         "slice" => &[0, 1],
         "at" => &[0],
         _ => &[],
@@ -2016,6 +2015,17 @@ fn native_array_method(
             return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
+    // §23.1.3.4 — `copyWithin` must read `length` before coercing
+    // target/start/end, then copy through live HasProperty/Get/Set/Delete.
+    if name == "copyWithin" {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let interp = ctx.interp_mut();
+            return interp
+                .array_copy_within(&exec, receiver, args, &[args])
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -2123,7 +2133,7 @@ fn length_of_array_like(
     } else {
         len_val
     };
-    Ok(crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0))
+    crate::to_length(&len_val, interp.gc_heap())
 }
 
 /// §23.1.3.14 / .18 shared search driver for `Array.prototype.indexOf`
@@ -2724,6 +2734,21 @@ impl Interpreter {
                 }
             }
         }
+        if let Some(obj) = o.as_object() {
+            match crate::object::resolve_set(obj, self.gc_heap(), key) {
+                crate::object::SetOutcome::InvokeSetter { setter } => {
+                    let args: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                    self.run_callable_sync(context, &setter, o, args)?;
+                    return Ok(());
+                }
+                crate::object::SetOutcome::Reject { .. } => {
+                    return Err(VmError::TypeError {
+                        message: format!("Cannot assign to property '{key}'"),
+                    });
+                }
+                crate::object::SetOutcome::AssignData => {}
+            }
+        }
         let ok = self.ordinary_set_data_value(
             context,
             o,
@@ -2755,6 +2780,37 @@ impl Interpreter {
             Err(VmError::TypeError {
                 message: format!("Cannot delete property '{key}'"),
             })
+        }
+    }
+
+    fn array_relative_index(
+        &mut self,
+        context: &ExecutionContext,
+        arg: Option<&Value>,
+        default: f64,
+        len: usize,
+    ) -> Result<usize, VmError> {
+        let n = match arg {
+            None => default,
+            Some(v) if v.is_undefined() => default,
+            Some(v) => {
+                let n = self.coerce_to_number(context, v)?.as_f64();
+                if n.is_nan() {
+                    0.0
+                } else if n.is_infinite() {
+                    n
+                } else {
+                    n.trunc()
+                }
+            }
+        };
+        if n == f64::NEG_INFINITY {
+            return Ok(0);
+        }
+        if n < 0.0 {
+            Ok(((len as f64) + n).max(0.0) as usize)
+        } else {
+            Ok(n.min(len as f64) as usize)
         }
     }
 
@@ -2975,6 +3031,169 @@ impl Interpreter {
             }
         }
         Ok(candidates)
+    }
+
+    /// §23.1.3.4 `Array.prototype.copyWithin`: `O = ToObject(this)`,
+    /// `len = LengthOfArrayLike(O)`, then target/start/end coercion and
+    /// a direction-aware live copy with `HasProperty`, `Get`, `Set`, and
+    /// `DeletePropertyOrThrow`.
+    pub(crate) fn array_copy_within(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let to = self.array_relative_index(context, args.first(), 0.0, len)?;
+        let from = self.array_relative_index(context, args.get(1), 0.0, len)?;
+        let final_index = self.array_relative_index(context, args.get(2), len as f64, len)?;
+        let count = final_index.saturating_sub(from).min(len.saturating_sub(to));
+        if count == 0 {
+            return Ok(o);
+        }
+
+        let backwards = from < to && to < from.saturating_add(count);
+        if count <= MAX_ARRAY_LIKE_PROBE_LEN {
+            if backwards {
+                for offset in (0..count).rev() {
+                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                }
+            } else {
+                for offset in 0..count {
+                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                }
+            }
+        } else {
+            let mut offsets = self.copy_within_sparse_offsets(o, len, from, to, count)?;
+            if backwards {
+                while let Some(offset) = offsets.pop_last() {
+                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                }
+            } else {
+                for offset in offsets {
+                    self.copy_within_move_index(context, o, from + offset, to + offset)?;
+                }
+            }
+        }
+        Ok(o)
+    }
+
+    fn copy_within_move_index(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<(), VmError> {
+        let from = format_index_key(from_index as f64);
+        let to = format_index_key(to_index as f64);
+        let has = self.array_method_has_property(context, o, &from)?;
+        if has {
+            let value = self.array_method_get_property(context, o, &from)?;
+            self.array_set_property_throwing(context, o, &to, value)
+        } else {
+            self.array_delete_property_throwing(context, o, &to)
+        }
+    }
+
+    fn array_method_has_property(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        key: &str,
+    ) -> Result<bool, VmError> {
+        let property_key = crate::VmPropertyKey::String(key);
+        if self.ordinary_has_property_value(context, o, &property_key, 0)? {
+            return Ok(true);
+        }
+        if o.is_array() {
+            let proto = self.get_prototype_for_op(&o)?;
+            if !proto.is_nullish() {
+                return self.ordinary_has_property_value(context, proto, &property_key, 0);
+            }
+        }
+        Ok(false)
+    }
+
+    fn array_method_get_property(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        key: &str,
+    ) -> Result<Value, VmError> {
+        if let Some(arr) = o.as_array() {
+            if let Some((getter, _setter)) = crate::array::get_accessor(arr, self.gc_heap(), key) {
+                return match getter {
+                    Some(getter) if crate::abstract_ops::is_callable(&getter) => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, o, args)
+                    }
+                    _ => Ok(Value::undefined()),
+                };
+            }
+            if let Some(idx) = crate::object::array_index_property_name(key)
+                && crate::array::has_own_element(arr, self.gc_heap(), idx as usize)
+            {
+                return Ok(crate::array::get(arr, self.gc_heap(), idx as usize));
+            }
+            if let Some(value) = crate::array::get_named_property(arr, self.gc_heap(), key) {
+                return Ok(value);
+            }
+            let proto = self.get_prototype_for_op(&o)?;
+            if !proto.is_nullish()
+                && self.ordinary_has_property_value(
+                    context,
+                    proto,
+                    &crate::VmPropertyKey::String(key),
+                    0,
+                )?
+            {
+                return self.get_property_value_for_call(context, proto, key);
+            }
+        }
+        self.get_property_value_for_call(context, o, key)
+    }
+
+    fn copy_within_sparse_offsets(
+        &mut self,
+        o: Value,
+        len: usize,
+        from: usize,
+        to: usize,
+        count: usize,
+    ) -> Result<std::collections::BTreeSet<usize>, VmError> {
+        let mut indices = std::collections::BTreeSet::new();
+        let mut current = o;
+        let mut hops = 0usize;
+        loop {
+            collect_own_indices_below(self, &current, len, &mut indices);
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            let proto = self.get_prototype_for_op(&current)?;
+            if proto.is_null() || !proto.is_object_type() {
+                break;
+            }
+            current = proto;
+            hops += 1;
+        }
+
+        let mut offsets = std::collections::BTreeSet::new();
+        for index in indices {
+            if index >= from && index < from.saturating_add(count) {
+                offsets.insert(index - from);
+            }
+            if index >= to && index < to.saturating_add(count) {
+                offsets.insert(index - to);
+            }
+        }
+        Ok(offsets)
     }
 }
 

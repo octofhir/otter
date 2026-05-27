@@ -257,6 +257,18 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
 }
 
+fn impl_to_plain_year_month(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let pd = require_plain_date(ctx)?;
+    let pym = pd.to_plain_year_month().map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::PlainYearMonth(pym))
+}
+
+fn impl_to_plain_month_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let pd = require_plain_date(ctx)?;
+    let pmd = pd.to_plain_month_day().map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd))
+}
+
 /// Generate a `Temporal.PlainDate.prototype` accessor getter,
 /// re-validating the receiver via [`require_plain_date`] (branding
 /// `TypeError`). The heap arm exposes `&mut GcHeap` for string fields.
@@ -324,6 +336,8 @@ pub static PLAIN_DATE_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("with", 1, impl_with),
     method("withCalendar", 1, impl_with_calendar),
     method("toPlainDateTime", 0, impl_to_plain_date_time),
+    method("toPlainYearMonth", 0, impl_to_plain_year_month),
+    method("toPlainMonthDay", 0, impl_to_plain_month_day),
 ];
 
 otter_macros::couch! {

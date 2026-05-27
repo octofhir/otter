@@ -77,6 +77,22 @@ fn from_epoch_milliseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
+fn from_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let v = arg_or_undef(args, 0);
+    let Some(bv) = v.as_big_int() else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "fromEpochNanoseconds: argument must be a BigInt".to_string(),
+        });
+    };
+    let nanos = i128::try_from(bv.clone_inner(ctx.heap())).map_err(|_| NativeError::RangeError {
+        name: CLASS,
+        reason: "epoch nanoseconds out of range".to_string(),
+    })?;
+    let inst = temporal_rs::Instant::try_new(nanos).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Instant(inst))
+}
+
 fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let a = parse_instant_arg(&arg_or_undef(args, 0), ctx.heap())?;
     let b = parse_instant_arg(&arg_or_undef(args, 1), ctx.heap())?;
@@ -268,6 +284,7 @@ otter_macros::couch! {
     statics = {
         "from"                  / 1 => from,
         "fromEpochMilliseconds" / 1 => from_epoch_milliseconds,
+        "fromEpochNanoseconds"  / 1 => from_epoch_nanoseconds,
         "compare"               / 2 => compare,
     },
     prototype = {

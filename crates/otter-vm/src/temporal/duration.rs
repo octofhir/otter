@@ -238,6 +238,64 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     Ok(Value::number_f64(total.as_inner()))
 }
 
+fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let dur = require_duration(ctx)?;
+    let Some(obj) = arg_or_undef(args, 0).as_object() else {
+        return Err(NativeError::TypeError {
+            name: CLASS,
+            reason: "with() requires a Temporal.Duration-like object".to_string(),
+        });
+    };
+    // §7.3.21: fields present on the argument override the receiver's;
+    // absent fields are inherited unchanged.
+    let mut p = temporal_rs::partial::PartialDuration {
+        years: Some(dur.years()),
+        months: Some(dur.months()),
+        weeks: Some(dur.weeks()),
+        days: Some(dur.days()),
+        hours: Some(dur.hours()),
+        minutes: Some(dur.minutes()),
+        seconds: Some(dur.seconds()),
+        milliseconds: Some(dur.milliseconds()),
+        microseconds: Some(dur.microseconds()),
+        nanoseconds: Some(dur.nanoseconds()),
+    };
+    let heap = ctx.heap();
+    if let Some(v) = optional_field(&obj, "years", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.years = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "months", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.months = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "weeks", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.weeks = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "days", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.days = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "hours", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.hours = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "minutes", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.minutes = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "seconds", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.seconds = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "milliseconds", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.milliseconds = Some(v);
+    }
+    if let Some(v) = optional_field(&obj, "microseconds", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.microseconds = Some(v as i128);
+    }
+    if let Some(v) = optional_field(&obj, "nanoseconds", heap).map_err(|e| temporal_err(e, CLASS))? {
+        p.nanoseconds = Some(v as i128);
+    }
+    let result =
+        temporal_rs::Duration::from_partial_duration(p).map_err(|e| temporal_err(e, CLASS))?;
+    make_temporal(ctx, TemporalPayload::Duration(result))
+}
+
 fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     let options = parse_rounding_options(args, 0, ctx.heap(), CLASS)?;
@@ -316,6 +374,7 @@ pub static DURATION_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("subtract", 1, impl_subtract),
     method("negated", 0, impl_negated),
     method("abs", 0, impl_abs),
+    method("with", 1, impl_with),
     method("round", 1, impl_round),
     method("total", 1, impl_total),
 ];

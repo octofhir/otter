@@ -2534,11 +2534,34 @@ pub(crate) fn array_callback_native_dispatch(
                 None => (false, Value::undefined()),
             }
         } else if let Some(arr) = receiver.as_array() {
-            let v = crate::array::get(arr, interp.gc_heap(), idx);
-            if v.is_hole() {
-                (false, Value::undefined())
-            } else {
+            // A present own element (data or accessor) reads through the
+            // ordinary `[[Get]]`. An absent index (hole / beyond the
+            // element store but `< len`) is not skipped outright:
+            // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
+            // inherited `Array.prototype[k]` is observed; a hole with no
+            // inherited value reads as absent.
+            let key = idx.to_string();
+            let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
+                || crate::array::get_accessor(arr, interp.gc_heap(), &key).is_some()
+                || interp
+                    .ordinary_has_property_value(
+                        &context,
+                        receiver,
+                        &crate::VmPropertyKey::String(&key),
+                        0,
+                    )
+                    .map_err(|err| {
+                        crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+                    })?;
+            if present {
+                let v = interp
+                    .get_property_value_for_call(&context, receiver, &key)
+                    .map_err(|err| {
+                        crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+                    })?;
                 (true, v)
+            } else {
+                (false, Value::undefined())
             }
         } else {
             let key = idx.to_string();

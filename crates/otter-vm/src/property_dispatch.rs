@@ -250,7 +250,17 @@ impl Interpreter {
         let present = if let Some(obj) = rhs.as_object() {
             has_object_property(self, obj, &lhs)
         } else if let Some(arr) = rhs.as_array() {
-            has_array_property(self, arr, &lhs)
+            // §13.10.1 `in` → HasProperty → OrdinaryHasProperty: own
+            // elements / named props, then the Array.prototype chain
+            // (inherited indices, `@@iterator`, …). The own-only
+            // `has_array_property` is kept as the symbol-less fallback.
+            if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
+                self.ordinary_has_property_value(context, rhs, &VmPropertyKey::Symbol(sym), 0)?
+            } else if let Some(name) = key_name.as_deref() {
+                self.ordinary_has_property_value(context, rhs, &VmPropertyKey::String(name), 0)?
+            } else {
+                has_array_property(self, arr, &lhs)
+            }
         } else if let Some(c) = rhs.as_class_constructor() {
             has_class_static_property(self, &c, &lhs)
         } else if let Some(function_id) = rhs
@@ -1293,7 +1303,14 @@ impl Interpreter {
                         _ => Value::undefined(),
                     }
                 } else if let Some(idx) = crate::object::array_index_property_name(&name) {
-                    crate::array::get(arr, &self.gc_heap, idx as usize)
+                    // §10.4.2.4 [[Get]] — an absent integer index is not a
+                    // dead end; OrdinaryGet walks the Array.prototype chain
+                    // (e.g. `Array.prototype[0]` inherited by a hole slot).
+                    if crate::array::has_own_element(arr, &self.gc_heap, idx as usize) {
+                        crate::array::get(arr, &self.gc_heap, idx as usize)
+                    } else {
+                        self.load_from_constructor_prototype(context, "Array", &recv, &name)?
+                    }
                 } else {
                     match crate::array::get_named_property(arr, &self.gc_heap, &name) {
                         Some(v) => v,
@@ -1322,8 +1339,16 @@ impl Interpreter {
                                 }
                                 _ => Value::undefined(),
                             }
-                        } else {
+                        } else if crate::array::has_own_element(arr, &self.gc_heap, idx) {
                             crate::array::get(arr, &self.gc_heap, idx)
+                        } else {
+                            // §10.4.2.4 — an absent index falls to Array.prototype.
+                            self.load_from_constructor_prototype(
+                                context,
+                                "Array",
+                                &recv,
+                                &idx.to_string(),
+                            )?
                         }
                     }
                     None => {

@@ -13,6 +13,7 @@ use crate::temporal::helpers::{
     opt_integer_with_truncation, parse_difference_settings, parse_partial_time,
     parse_rounding_options, require_construct, require_plain_time, temporal_err,
 };
+use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -145,10 +146,11 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
+    let rounding = parse_to_string_rounding_options(args, 0, ctx.heap(), CLASS)?;
     let s = pt
-        .to_ixdtf_string(temporal_rs::options::ToStringRoundingOptions::default())
+        .to_ixdtf_string(rounding)
         .map_err(|e| temporal_err(e, CLASS))?;
     js_string_value(s, ctx)
 }

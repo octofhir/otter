@@ -295,6 +295,78 @@ fn read_string_field(obj: JsObject, name: &str, heap: &otter_gc::GcHeap) -> Opti
     v.as_string(heap).map(|s| s.to_lossy_string(heap))
 }
 
+/// Parse the rounding options (`smallestUnit`, `roundingMode`,
+/// `fractionalSecondDigits`) from a time-bearing Temporal `toString`
+/// options argument into a
+/// [`temporal_rs::options::ToStringRoundingOptions`]. Absent options
+/// keep `Precision::Auto` / no unit / default mode.
+pub fn parse_to_string_rounding_options(
+    args: &[Value],
+    index: usize,
+    heap: &otter_gc::GcHeap,
+    class: &'static str,
+) -> Result<temporal_rs::options::ToStringRoundingOptions, NativeError> {
+    use core::str::FromStr;
+    let mut opts = temporal_rs::options::ToStringRoundingOptions::default();
+    let v = arg_or_undef(args, index);
+    if v.is_undefined() {
+        return Ok(opts);
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(NativeError::TypeError {
+            name: class,
+            reason: "toString() options must be an object or undefined".to_string(),
+        });
+    };
+    if let Some(name) = read_string_field(obj, "smallestUnit", heap) {
+        opts.smallest_unit = Some(temporal_rs::options::Unit::from_str(&name).map_err(|_| {
+            NativeError::RangeError {
+                name: class,
+                reason: "invalid `smallestUnit`".to_string(),
+            }
+        })?);
+    }
+    if let Some(name) = read_string_field(obj, "roundingMode", heap) {
+        opts.rounding_mode =
+            Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
+                NativeError::RangeError {
+                    name: class,
+                    reason: "invalid `roundingMode`".to_string(),
+                }
+            })?);
+    }
+    if let Some(val) = object::get(obj, heap, "fractionalSecondDigits")
+        && !val.is_undefined()
+    {
+        if let Some(s) = val.as_string(heap) {
+            if s.to_lossy_string(heap) == "auto" {
+                opts.precision = temporal_rs::parsers::Precision::Auto;
+            } else {
+                return Err(NativeError::RangeError {
+                    name: class,
+                    reason: "`fractionalSecondDigits` must be \"auto\" or an integer 0-9"
+                        .to_string(),
+                });
+            }
+        } else if let Some(num) = val.as_number() {
+            let d = num.as_f64().trunc();
+            if !(0.0..=9.0).contains(&d) {
+                return Err(NativeError::RangeError {
+                    name: class,
+                    reason: "`fractionalSecondDigits` must be an integer 0-9".to_string(),
+                });
+            }
+            opts.precision = temporal_rs::parsers::Precision::Digit(d as u8);
+        } else {
+            return Err(NativeError::RangeError {
+                name: class,
+                reason: "`fractionalSecondDigits` must be \"auto\" or an integer 0-9".to_string(),
+            });
+        }
+    }
+    Ok(opts)
+}
+
 /// Parse the `calendarName` option (`"auto"`/`"always"`/`"never"`/
 /// `"critical"`) from a Temporal `toString` options argument into a
 /// [`temporal_rs::options::DisplayCalendar`]. Absent options or an

@@ -20,6 +20,7 @@ use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_difference_settings,
     parse_rounding_options, require_construct, require_zoned_date_time, str_or_undef, temporal_err,
 };
+use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -164,14 +165,15 @@ fn duration_arg(v: &Value, heap: &otter_gc::GcHeap) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
+    let rounding = parse_to_string_rounding_options(args, 0, ctx.heap(), CLASS)?;
     let s = zdt
         .to_ixdtf_string(
             temporal_rs::options::DisplayOffset::Auto,
             temporal_rs::options::DisplayTimeZone::Auto,
             temporal_rs::options::DisplayCalendar::Auto,
-            temporal_rs::options::ToStringRoundingOptions::default(),
+            rounding,
         )
         .map_err(|e| temporal_err(e, CLASS))?;
     js_string_value(s, ctx)

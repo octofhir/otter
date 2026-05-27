@@ -2360,90 +2360,6 @@ impl Interpreter {
     }
 }
 
-fn collect_array_like_callback_entries(
-    interp: &mut Interpreter,
-    context: &ExecutionContext,
-    receiver: &Value,
-) -> Result<(Vec<(usize, Value)>, usize), VmError> {
-    if let Some(arr) = receiver.as_array() {
-        let len = crate::array::len(arr, interp.gc_heap());
-        let entries = crate::array::with_elements(arr, interp.gc_heap(), |els| {
-            els.iter()
-                .enumerate()
-                .filter_map(|(i, v)| if v.is_hole() { None } else { Some((i, *v)) })
-                .collect()
-        });
-        return Ok((entries, len));
-    }
-    // Primitive receivers: §7.1.18 ToObject. A primitive string boxes
-    // to a String exotic whose indices/length come from the backing
-    // text — read directly (the interpreter `[[Get]]` ladder rejects a
-    // primitive base). Other primitives box to wrappers with no own
-    // indexed properties.
-    if !receiver.is_object_type() {
-        if let Some(s) = receiver.as_string(interp.gc_heap()) {
-            let units = s.to_utf16_vec(interp.gc_heap());
-            let len = units.len();
-            let entries = units
-                .iter()
-                .enumerate()
-                .map(|(i, &u)| {
-                    let ch = crate::string::JsString::from_utf16_units(&[u], interp.gc_heap_mut())
-                        .map(Value::string)
-                        .unwrap_or(Value::undefined());
-                    (i, ch)
-                })
-                .collect();
-            return Ok((entries, len));
-        }
-        return Ok((Vec::new(), 0));
-    }
-    // String-exotic wrappers expose `length` through `[[StringData]]`,
-    // which the interpreter `[[Get]]` ladder may not surface as a
-    // plain Number; read it from the backing string directly.
-    let len = if let Some(obj) = receiver.as_object()
-        && let Some(s) = crate::object::string_data(obj, interp.gc_heap())
-    {
-        s.len() as usize
-    } else {
-        let len_val = interp.get_property_value_for_call(context, *receiver, "length")?;
-        crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0)
-    };
-    if len == 0 {
-        return Ok((Vec::new(), 0));
-    }
-    // Gather candidate indices `< len` from the receiver and every
-    // object on its prototype chain (sparse-friendly — never an
-    // `O(len)` scan, so a pathological `length` like 2^32 stays cheap).
-    // Each level contributes its own indexed keys; `HasProperty` /
-    // `Get` below still observe the spec lookup order.
-    let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    let mut current = *receiver;
-    let mut hops = 0usize;
-    loop {
-        collect_own_indices_below(interp, &current, len, &mut indices);
-        if hops >= object::PROTO_CHAIN_HARD_CAP {
-            break;
-        }
-        let proto = interp.get_prototype_for_op(&current)?;
-        if proto.is_null() || !proto.is_object_type() {
-            break;
-        }
-        current = proto;
-        hops += 1;
-    }
-    // `indices` were collected from present own keys across the chain,
-    // so each is observably present per `HasProperty(O, k)` — read it
-    // directly with `Get` (which also resolves String-exotic indices
-    // that the ordinary HasProperty probe does not surface).
-    let mut entries = Vec::with_capacity(indices.len());
-    for k in indices {
-        let key = k.to_string();
-        let v = interp.get_property_value_for_call(context, *receiver, &key)?;
-        entries.push((k, v));
-    }
-    Ok((entries, len))
-}
 
 /// Add the own indexed keys (`< len`) of a single value to `indices`.
 /// Covers dense arrays (non-hole element positions), string primitives
@@ -2491,7 +2407,7 @@ fn collect_own_indices_below(
     }
 }
 
-fn array_callback_native_dispatch(
+pub(crate) fn array_callback_native_dispatch(
     name: &str,
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
@@ -2521,32 +2437,130 @@ fn array_callback_native_dispatch(
             .box_sloppy_this_primitive_runtime_rooted(raw_receiver, &[args])
             .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?
     };
-    let (entries, len) = collect_array_like_callback_entries(interp, &context, &receiver)
+    // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O), read once via
+    // `[[Get]]` (observes a `get length()`). The walk below is LIVE:
+    // each index is re-checked with `HasProperty(O, k)` / `Get(O, k)`
+    // during iteration, so a callback that mutates the receiver is
+    // observed in spec order and a Function / exotic receiver's indexed
+    // properties are seen (the previous one-shot snapshot saw neither).
+    let len = length_of_array_like(interp, &context, &receiver)
         .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?;
+    // §23.1.3.* step 3 — `if IsCallable(callbackfn) is false, throw a
+    // TypeError`, ordered after `ToObject` + `LengthOfArrayLike`.
+    if !interp.is_callable_runtime(&callback) {
+        return Err(NativeError::TypeError {
+            name: "Array.prototype callback",
+            reason: "callback is not a function".to_string(),
+        });
+    }
+    // `find` family visits every index `0..len` (an absent slot yields
+    // `undefined` for the element); the rest skip absent indices.
+    let visit_all = matches!(name, "find" | "findIndex" | "findLast" | "findLastIndex");
+    let reverse = matches!(name, "reduceRight" | "findLast" | "findLastIndex");
+    // `reduce` / `reduceRight` do not accept a `thisArg`; the callback
+    // runs with `undefined` this (the second positional is the
+    // initialValue, not a receiver).
+    let cb_this = if name == "reduce" || name == "reduceRight" {
+        Value::undefined()
+    } else {
+        this_arg
+    };
+    // String-exotic wrappers expose their code-unit indices through
+    // `[[StringData]]`, which the ordinary `[[HasProperty]]` ladder may
+    // not surface — resolve those directly.
+    let string_data = receiver
+        .as_object()
+        .and_then(|o| crate::object::string_data(o, interp.gc_heap()));
+    // Index visit order. A bounded `0..len` ladder is spec-exact for any
+    // receiver (dense array, Function, object with getters, mutation
+    // mid-walk). A pathological `length` (> MAX_ARRAY_LIKE_PROBE_LEN)
+    // falls back to the sparse present-index set across the prototype
+    // chain so the walk never runs billions of `HasProperty` probes.
+    let index_iter: Box<dyn Iterator<Item = usize>> = if len <= MAX_ARRAY_LIKE_PROBE_LEN {
+        if reverse {
+            Box::new((0..len).rev())
+        } else {
+            Box::new(0..len)
+        }
+    } else {
+        let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut current = receiver;
+        let mut hops = 0usize;
+        loop {
+            collect_own_indices_below(interp, &current, len, &mut indices);
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            let proto = interp.get_prototype_for_op(&current).map_err(|err| {
+                crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+            })?;
+            if proto.is_null() || !proto.is_object_type() {
+                break;
+            }
+            current = proto;
+            hops += 1;
+        }
+        let mut v: Vec<usize> = indices.into_iter().collect();
+        if reverse {
+            v.reverse();
+        }
+        Box::new(v.into_iter())
+    };
+
     let mut acc = Value::undefined();
     let mut out: Vec<(usize, Value)> = Vec::new();
     let mut found_idx: Option<usize> = None;
     let mut found_val = Value::undefined();
-    let mut bool_acc: bool = match name {
-        "every" => true,
-        "some" => false,
-        _ => false,
-    };
+    let mut bool_acc: bool = matches!(name, "every");
     let mut reduce_has_init = args.len() >= 2;
-    if name == "reduce" || name == "reduceRight" {
-        acc = if reduce_has_init {
-            args[1]
-        } else {
-            Value::undefined()
-        };
+    if (name == "reduce" || name == "reduceRight") && reduce_has_init {
+        acc = args[1];
     }
-    let iter: Box<dyn Iterator<Item = (usize, Value)>> =
-        if name == "reduceRight" || name == "findLast" || name == "findLastIndex" {
-            Box::new(entries.into_iter().rev())
+    for idx in index_iter {
+        // Live `HasProperty(O, k)` + `Get(O, k)`. An absent index reads
+        // as `(false, undefined)`; `find`-family methods visit it anyway.
+        let (present, v) = if let Some(s) = string_data {
+            match s.char_code_at(idx as u32, interp.gc_heap()) {
+                Some(unit) => {
+                    let ch =
+                        crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
+                            .map(Value::string)
+                            .map_err(|_| NativeError::TypeError {
+                                name: "Array.prototype callback",
+                                reason: "out of memory".to_string(),
+                            })?;
+                    (true, ch)
+                }
+                None => (false, Value::undefined()),
+            }
+        } else if let Some(arr) = receiver.as_array() {
+            let v = crate::array::get(arr, interp.gc_heap(), idx);
+            if v.is_hole() {
+                (false, Value::undefined())
+            } else {
+                (true, v)
+            }
         } else {
-            Box::new(entries.into_iter())
+            let key = idx.to_string();
+            let has = interp
+                .ordinary_has_property_value(&context, receiver, &crate::VmPropertyKey::String(&key), 0)
+                .map_err(|err| {
+                    crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+                })?;
+            if has {
+                let v = interp
+                    .get_property_value_for_call(&context, receiver, &key)
+                    .map_err(|err| {
+                        crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+                    })?;
+                (true, v)
+            } else {
+                (false, Value::undefined())
+            }
         };
-    for (idx, v) in iter {
+        if !present && !visit_all {
+            continue;
+        }
         let cb_args: SmallVec<[Value; 8]> = match name {
             "reduce" | "reduceRight" => {
                 if !reduce_has_init {
@@ -2559,7 +2573,7 @@ fn array_callback_native_dispatch(
             _ => smallvec::smallvec![v, Value::number_f64(idx as f64), receiver,],
         };
         let result = interp
-            .run_callable_sync(&context, &callback, this_arg, cb_args)
+            .run_callable_sync(&context, &callback, cb_this, cb_args)
             .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?;
         match name {
             "forEach" => {}

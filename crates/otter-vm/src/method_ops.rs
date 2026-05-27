@@ -391,7 +391,15 @@ impl Interpreter {
         // matches its ECMA-262 algorithm with sloppy edge handling
         // (sparse holes, throwing comparators, length mutation
         // mid-walk) deferred to follow-ups.
-        if let Some(arr) = recv_value.as_array()
+        // Callback-driven `Array.prototype` methods on an Array receiver
+        // funnel into the single live driver
+        // (`array_callback_native_dispatch`), the same path the `.call` /
+        // property bridge uses, so `arr.map(cb)` and
+        // `Array.prototype.map.call(arr, cb)` run identical spec logic:
+        // `len` read once, then a live `Get(O, k)` per index (a callback
+        // mutating the receiver is observed). `sort` keeps its dedicated
+        // comparator dispatcher.
+        if recv_value.is_array()
             && matches!(
                 name,
                 "forEach"
@@ -404,8 +412,24 @@ impl Interpreter {
                     | "every"
                     | "some"
                     | "flatMap"
-                    | "sort"
             )
+        {
+            let result = {
+                let mut ctx = NativeCtx::new_with_call_info_and_context(
+                    self,
+                    NativeCallInfo::call(recv_value),
+                    Some(context.clone()),
+                );
+                array_prototype::array_callback_native_dispatch(name, &mut ctx, &arg_values)
+                    .map_err(native_to_vm_error)?
+            };
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, result)?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
+        if let Some(arr) = recv_value.as_array()
+            && name == "sort"
             && self.array_callback_dispatch(stack, context, &arr, name, &arg_values, dst)?
         {
             return Ok(());

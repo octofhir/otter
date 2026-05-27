@@ -1872,6 +1872,15 @@ fn native_array_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
+    // §22.1.3 step 1 — every generic `Array.prototype.*` opens with
+    // `ToObject(this value)`, which throws a TypeError on `null` /
+    // `undefined` (RequireObjectCoercible).
+    if receiver.is_null() || receiver.is_undefined() {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "Array.prototype method called on null or undefined".to_string(),
+        });
+    }
     // Pre-coerce integer-typed args via `ToPrimitive(Number)` so the
     // intrinsic's strict `arg_signed_index` guard observes user
     // `@@toPrimitive` / `valueOf` / `toString` side effects per spec.
@@ -1924,6 +1933,75 @@ fn native_array_method(
         }
         out
     };
+    // §22.1.3.14 / .17 `indexOf` / `lastIndexOf` — drive the search
+    // through the prototype-walking, accessor-aware array-like
+    // collector so inherited indices (`new Sub()` over an Array
+    // prototype, `Boolean.prototype[0]`) and accessor `length` are
+    // observed. Present-entry semantics match the spec's
+    // `HasProperty(O, k)` skip of absent indices.
+    if matches!(name, "indexOf" | "lastIndexOf") {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let search = args.first().copied().unwrap_or_else(Value::undefined);
+            let from_arg = coerced_args.get(1).copied();
+            let interp = ctx.interp_mut();
+            let (entries, len) =
+                collect_array_like_callback_entries(interp, &exec, &receiver).map_err(|err| {
+                    crate::native_function::vm_to_native_error(err, name)
+                })?;
+            let heap = interp.gc_heap();
+            let result = if len == 0 {
+                -1i64
+            } else {
+                let to_int = |v: &Value| -> f64 {
+                    let n = crate::number::parse::to_number_value(v, heap);
+                    if n.is_nan() {
+                        0.0
+                    } else {
+                        n.trunc()
+                    }
+                };
+                if name == "indexOf" {
+                    let n = from_arg.map_or(0.0, |v| to_int(&v));
+                    let k = if n >= len as f64 {
+                        len as i64
+                    } else if n >= 0.0 {
+                        n as i64
+                    } else {
+                        (len as i64 + n as i64).max(0)
+                    };
+                    entries
+                        .iter()
+                        .find(|(idx, v)| {
+                            (*idx as i64) >= k
+                                && crate::abstract_ops::is_strictly_equal(v, &search, heap)
+                        })
+                        .map_or(-1, |(idx, _)| *idx as i64)
+                } else {
+                    // lastIndexOf — default fromIndex is len-1.
+                    let n = from_arg.map_or((len - 1) as f64, |v| to_int(&v));
+                    let k = if n >= 0.0 {
+                        (n as i64).min(len as i64 - 1)
+                    } else {
+                        len as i64 + n as i64
+                    };
+                    if k < 0 {
+                        -1
+                    } else {
+                        entries
+                            .iter()
+                            .rev()
+                            .find(|(idx, v)| {
+                                (*idx as i64) <= k
+                                    && crate::abstract_ops::is_strictly_equal(v, &search, heap)
+                            })
+                            .map_or(-1, |(idx, _)| *idx as i64)
+                    }
+                }
+            };
+            return Ok(Value::number(NumberValue::from_f64(result as f64)));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,

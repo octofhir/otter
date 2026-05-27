@@ -116,15 +116,30 @@ pub(crate) fn compile_for_of_statement(
 
     let back_jmp = cx.emit_branch_placeholder(Op::Jump, None, span);
     cx.patch_branch(back_jmp, loop_top);
-    cx.patch_branch_to_here(exit_jmp);
 
     let frame = cx.loops.pop().expect("for-of loop frame");
+    // `continue` re-iterates without closing the iterator (§14.7.5.6 —
+    // a continue completion is not abrupt with respect to the loop).
     for pc in frame.continue_patches {
         cx.patch_branch(pc, loop_top);
     }
-    for pc in frame.break_patches {
-        cx.patch_branch_to_here(pc);
+    // §14.7.5.6 ForIn/OfBodyEvaluation — a `break` is an abrupt
+    // completion that must run IteratorClose (calling the iterator's
+    // `return`). The exhausted-iterator exit (`done` true) must NOT,
+    // so breaks land before the close op and the `done` jump lands
+    // after it. (`for await` would need AsyncIteratorClose; left to a
+    // follow-up so the sync close doesn't skip its await.)
+    if !is_for_await && !frame.break_patches.is_empty() {
+        for pc in frame.break_patches {
+            cx.patch_branch_to_here(pc);
+        }
+        cx.emit(Op::IteratorClose, [Operand::Register(iter_reg)], span);
+    } else {
+        for pc in frame.break_patches {
+            cx.patch_branch_to_here(pc);
+        }
     }
+    cx.patch_branch_to_here(exit_jmp);
     Ok(None)
 }
 

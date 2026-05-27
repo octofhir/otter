@@ -17,9 +17,19 @@ conformance-gated before the next starts.
   includes 23/4). The intrinsic-table dense array arms of `impl_*` are
   now reachable only on the context-less fallback path; their removal
   is folded into Stage 5 (table collapse).
-- [ ] **Stage 2** — give every builtin a re-entrant handle (replace
+- [~] **Stage 2** — give every builtin a re-entrant handle (replace
   `IntrinsicArgs`); fold context-carrying interceptions back into impls.
   Fixes the String/RegExp/join receiver-coercion gaps as a class.
+  - [x] **String receiver coercion** — `native_string_method` now runs
+    `RequireObjectCoercible` + `ToString(this)` uniformly for every
+    method except `toString`/`valueOf` (was HTML-methods only), so
+    `String.prototype.X.call(obj)` observes a user `toString`.
+    built-ins/String 1067→1147 pass (+80), 0 crash.
+  - [ ] RegExp `exec`/`@@`-method argument `ToString`; `Array.join` /
+    other array-likes generic `length`-getter; TypedArray generic
+    receiver for Array methods.
+  - [ ] Mechanical `IntrinsicArgs` → re-entrant-context signature
+    migration, per type (String 46 fns, …).
 - [ ] **Stage 3** — single callback re-entry path (`invoke` →
   `run_callable_sync`).
 - [ ] **Stage 4** — `do_call_method_value` → GetMethod + Call with a

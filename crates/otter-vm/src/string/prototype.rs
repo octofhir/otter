@@ -1631,33 +1631,18 @@ fn native_string_method(
         return native_string_replace_callable(name == "replaceAll", ctx, args);
     }
     let receiver = *ctx.this_value();
-    // §B.2.3.* CreateHTML — `String.prototype.{anchor, big, blink,
-    // bold, fixed, fontcolor, fontsize, italics, link, small, strike,
-    // sub, sup}` and §B.2.3.1 `substr` start with
-    // `RequireObjectCoercible(this)` then `ToString(this)`. The
-    // intrinsic path's `receiver_string` only inspects internal
-    // slots, so non-wrapper Object receivers with a user `toString`
-    // (or one that throws) silently fall back to `"[object Object]"`.
-    // Pre-coerce here so the spec ToString ladder fires and Symbol
-    // / abrupt completions surface correctly.
-    let html_wrap = matches!(
-        name,
-        "anchor"
-            | "big"
-            | "blink"
-            | "bold"
-            | "fixed"
-            | "fontcolor"
-            | "fontsize"
-            | "italics"
-            | "link"
-            | "small"
-            | "strike"
-            | "sub"
-            | "sup"
-            | "substr"
-    );
-    let receiver = if html_wrap {
+    // §22.1.3 — every `String.prototype` method (other than
+    // `toString` / `valueOf`, which use `thisStringValue`) opens with
+    // `RequireObjectCoercible(this)` then `S = ? ToString(this)`. The
+    // intrinsic path's `receiver_string` only inspects internal slots,
+    // so a non-wrapper Object receiver with a user `toString` (or one
+    // that throws / returns a Symbol) silently fell back to
+    // `"[object Object]"`. Coerce the receiver here, uniformly, so the
+    // spec `ToString` ladder fires for `.call` / `.apply` on any
+    // receiver and user `toString` / `@@toPrimitive` / abrupt
+    // completions are observed.
+    let coerce_receiver = !matches!(name, "toString" | "valueOf");
+    let receiver = if coerce_receiver {
         let needs_coerce = receiver.is_object()
             || receiver.is_array()
             || receiver.is_function()

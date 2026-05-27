@@ -36,9 +36,7 @@ use crate::number::NumberValue;
 use crate::object::{self, PartialPropertyDescriptor};
 use crate::string::JsString;
 use crate::symbol::{WellKnown, WellKnownSymbols};
-use crate::{
-    ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, VmError, VmPropertyKey,
-};
+use crate::{ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, VmError};
 
 fn receiver_array(args: &IntrinsicArgs<'_>) -> Result<JsArray, IntrinsicError> {
     args.receiver
@@ -1945,8 +1943,15 @@ fn native_array_method(
             let search = args.first().copied().unwrap_or_else(Value::undefined);
             let from_arg = coerced_args.get(1).copied();
             let interp = ctx.interp_mut();
+            let o = if receiver.is_object_type() {
+                receiver
+            } else {
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(receiver, &[args])
+                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?
+            };
             let (entries, len) =
-                collect_array_like_callback_entries(interp, &exec, &receiver).map_err(|err| {
+                collect_array_like_callback_entries(interp, &exec, &o).map_err(|err| {
                     crate::native_function::vm_to_native_error(err, name)
                 })?;
             let heap = interp.gc_heap();
@@ -2115,8 +2120,17 @@ fn collect_array_like_callback_entries(
         }
         return Ok((Vec::new(), 0));
     }
-    let len_val = interp.get_property_value_for_call(context, *receiver, "length")?;
-    let len = crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0);
+    // String-exotic wrappers expose `length` through `[[StringData]]`,
+    // which the interpreter `[[Get]]` ladder may not surface as a
+    // plain Number; read it from the backing string directly.
+    let len = if let Some(obj) = receiver.as_object()
+        && let Some(s) = crate::object::string_data(obj, interp.gc_heap())
+    {
+        s.len() as usize
+    } else {
+        let len_val = interp.get_property_value_for_call(context, *receiver, "length")?;
+        crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0)
+    };
     if len == 0 {
         return Ok((Vec::new(), 0));
     }
@@ -2140,13 +2154,15 @@ fn collect_array_like_callback_entries(
         current = proto;
         hops += 1;
     }
+    // `indices` were collected from present own keys across the chain,
+    // so each is observably present per `HasProperty(O, k)` — read it
+    // directly with `Get` (which also resolves String-exotic indices
+    // that the ordinary HasProperty probe does not surface).
     let mut entries = Vec::with_capacity(indices.len());
     for k in indices {
         let key = k.to_string();
-        if interp.ordinary_has_property_value(context, *receiver, &VmPropertyKey::String(&key), 0)? {
-            let v = interp.get_property_value_for_call(context, *receiver, &key)?;
-            entries.push((k, v));
-        }
+        let v = interp.get_property_value_for_call(context, *receiver, &key)?;
+        entries.push((k, v));
     }
     Ok((entries, len))
 }
@@ -2202,7 +2218,13 @@ fn array_callback_native_dispatch(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    let receiver = *ctx.this_value();
+    let raw_receiver = *ctx.this_value();
+    if raw_receiver.is_null() || raw_receiver.is_undefined() {
+        return Err(NativeError::TypeError {
+            name: "Array.prototype callback",
+            reason: "Array.prototype method called on null or undefined".to_string(),
+        });
+    }
     let callback = args.first().cloned().unwrap_or(Value::undefined());
     let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
     let (interp, ctx_opt) = ctx.interp_mut_and_context();
@@ -2210,6 +2232,17 @@ fn array_callback_native_dispatch(
         name: "Array.prototype callback",
         reason: "missing execution context".to_string(),
     })?;
+    // §22.1.3 step 1 — `O = ? ToObject(this value)`. Box primitive
+    // receivers so the callback's `O` argument and the prototype-chain
+    // walk see a real wrapper (e.g. `Boolean.prototype[k]` inherited
+    // indices).
+    let receiver = if raw_receiver.is_object_type() {
+        raw_receiver
+    } else {
+        interp
+            .box_sloppy_this_primitive_runtime_rooted(raw_receiver, &[args])
+            .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?
+    };
     let (entries, len) = collect_array_like_callback_entries(interp, &context, &receiver)
         .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?;
     let mut acc = Value::undefined();

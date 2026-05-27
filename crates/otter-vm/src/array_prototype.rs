@@ -1948,6 +1948,21 @@ fn native_array_method(
                 .map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
+    // §23.1.3.16 — `join` on a non-Array receiver routes through the
+    // re-entrant driver so a `get length()` accessor, indexed getters,
+    // and user element `toString` are observed (and a primitive receiver
+    // boxes via `ToObject`). Dense `Value::Array` receivers fall through
+    // to the tight `impl_join` walk below.
+    if name == "join" && !receiver.is_array() {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let separator_arg = args.first().copied();
+            let interp = ctx.interp_mut();
+            return interp
+                .array_join(&exec, receiver, separator_arg, &[args])
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -2255,6 +2270,85 @@ impl Interpreter {
             let idx = array_linear_search(self, context, o, name, search, from_arg)?;
             Ok(Value::number(NumberValue::from_f64(idx as f64)))
         }
+    }
+
+    /// §23.1.3.16 `Array.prototype.join` over a generic array-like
+    /// receiver. The intrinsic-table `impl_join` runs without an
+    /// interpreter handle, so it reads `length` and each index from the
+    /// raw property bag and cannot observe a `get length()` accessor, an
+    /// indexed getter, or a user element `toString`. This driver runs
+    /// the spec ladder with re-entry: `LengthOfArrayLike(O)` (step 2),
+    /// `ToString(separator)` (step 3, after the length read), then a
+    /// `Get(O, k)` + `ToString` per present index. Shared by the
+    /// `.call` / `.apply` bridge for non-Array receivers; dense
+    /// `Value::Array` receivers keep the tight `impl_join` walk.
+    pub(crate) fn array_join(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        separator_arg: Option<Value>,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        // §23.1.3.16 step 1 — O = ToObject(this value).
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        // §23.1.3.16 step 2 — len = ? LengthOfArrayLike(O). Reads
+        // `O.length` through `[[Get]]`, so a `get length()` accessor
+        // fires here exactly once.
+        let len = length_of_array_like(self, context, &o)?;
+        // §23.1.3.16 step 3 — sep = (separator is undefined) ? ","
+        // : ? ToString(separator). Ordered AFTER the length read.
+        let separator = match separator_arg {
+            None => ",".to_string(),
+            Some(v) if v.is_undefined() => ",".to_string(),
+            Some(v) => self.coerce_to_string(context, &v)?,
+        };
+        // Allocation is bounded by `MAX_ARRAY_LIKE_PROBE_LEN`, matching
+        // `impl_join`, so a pathological `length` (`2**32`) never sizes a
+        // multi-gigabyte parts buffer.
+        let cap = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        if cap == 0 {
+            return Ok(Value::string(JsString::from_str("", self.gc_heap_mut())?));
+        }
+        // Sparse-safe index gathering: present own indices `< len` from
+        // the receiver and every prototype-chain object. An absent index
+        // joins as the empty string, indistinguishable from a `Get`
+        // returning `undefined`, so skipping it is spec-faithful for the
+        // array-like generic case (same caveat `impl_join` carries).
+        let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut current = o;
+        let mut hops = 0usize;
+        loop {
+            collect_own_indices_below(self, &current, cap, &mut indices);
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            let proto = self.get_prototype_for_op(&current)?;
+            if proto.is_null() || !proto.is_object_type() {
+                break;
+            }
+            current = proto;
+            hops += 1;
+        }
+        // §23.1.3.16 steps 4-8 — element = ? Get(O, ToString(k)); the
+        // element joins as "" when undefined / null, else ? ToString.
+        let mut parts: Vec<String> = vec![String::new(); cap];
+        for k in indices {
+            if k >= cap {
+                continue;
+            }
+            let v = self.get_property_value_for_call(context, o, &k.to_string())?;
+            parts[k] = if v.is_undefined() || v.is_null() {
+                String::new()
+            } else {
+                self.coerce_to_string(context, &v)?
+            };
+        }
+        let joined = parts.join(&separator);
+        Ok(Value::string(JsString::from_str(&joined, self.gc_heap_mut())?))
     }
 }
 

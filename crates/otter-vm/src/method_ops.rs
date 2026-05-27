@@ -355,6 +355,19 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
+        // §23.1.3.13 `includes` on an Array receiver — live `Get` +
+        // `SameValueZero` so holes match `undefined` and inherited /
+        // sparse indices are found; route through the re-entrant driver.
+        if recv_value.is_array() && name == "includes" {
+            let search = arg_values.first().copied().unwrap_or_else(Value::undefined);
+            let from_arg = arg_values.get(1).copied();
+            let found =
+                array_prototype::array_includes(self, context, recv_value, search, from_arg)?;
+            let frame = &mut stack[top_idx];
+            write_register(frame, dst, Value::boolean(found))?;
+            frame.advance_pc(self.current_byte_len)?;
+            return Ok(());
+        }
         // §23.2.3.{8,11,12,13,14,15,17,18,21,22,28} — TypedArray
         // prototype callback methods. Same shape as the Array set
         // but routed through a TypedArray-specific dispatcher so

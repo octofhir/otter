@@ -1956,6 +1956,26 @@ fn native_array_method(
             return Ok(Value::number(NumberValue::from_f64(result as f64)));
         }
     }
+    // §23.1.3.13 `includes` — live `Get` + `SameValueZero` walk; holes
+    // read as `undefined`, so `includes(undefined)` matches a hole.
+    if name == "includes" {
+        let exec = ctx.execution_context().cloned();
+        if let Some(exec) = exec {
+            let search = args.first().copied().unwrap_or_else(Value::undefined);
+            let from_arg = coerced_args.get(1).copied();
+            let interp = ctx.interp_mut();
+            let o = if receiver.is_object_type() {
+                receiver
+            } else {
+                interp
+                    .box_sloppy_this_primitive_runtime_rooted(receiver, &[args])
+                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?
+            };
+            let found = array_includes(interp, &exec, o, search, from_arg)
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
+            return Ok(Value::boolean(found));
+        }
+    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
@@ -2165,6 +2185,71 @@ pub(crate) fn array_linear_search(
         }
         Ok(-1)
     }
+}
+
+/// §23.1.3.13 `Array.prototype.includes(searchElement, fromIndex)`.
+/// Unlike `indexOf`, every index in `[from, len)` is read with a live
+/// `Get(O, k)` (no `HasProperty` skip — holes read as `undefined`, so
+/// `includes(undefined)` matches an absent slot) and compared by
+/// `SameValueZero`. Bounded by the clamped `fromIndex`, so the suite's
+/// huge-`length` receivers match at the boundary and never full-scan.
+pub(crate) fn array_includes(
+    interp: &mut Interpreter,
+    context: &ExecutionContext,
+    o: Value,
+    search: Value,
+    from_arg: Option<Value>,
+) -> Result<bool, VmError> {
+    let len = length_of_array_like(interp, context, &o)?;
+    if len == 0 {
+        return Ok(false);
+    }
+    // §7.1.5 ToIntegerOrInfinity(fromIndex): ToNumber → ToPrimitive(Number).
+    let from_arg = match from_arg {
+        Some(v) if v.is_object_type() => Some(interp.evaluate_to_primitive(
+            context,
+            &v,
+            crate::abstract_ops::ToPrimitiveHint::Number,
+        )?),
+        other => other,
+    };
+    let len_i = len as i64;
+    let n = match from_arg {
+        Some(v) => {
+            let f = crate::number::parse::to_number_value(&v, interp.gc_heap());
+            if f.is_nan() { 0.0 } else { f.trunc() }
+        }
+        None => 0.0,
+    };
+    let mut k = if n >= len as f64 {
+        return Ok(false);
+    } else if n >= 0.0 {
+        n as i64
+    } else {
+        (len_i + n as i64).max(0)
+    };
+    let string_data = if let Some(obj) = o.as_object() {
+        crate::object::string_data(obj, interp.gc_heap())
+    } else {
+        o.as_string(interp.gc_heap())
+    };
+    while k < len_i {
+        let v = if let Some(s) = string_data {
+            match s.char_code_at(k as u32, interp.gc_heap()) {
+                Some(unit) => crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
+                    .map(Value::string)?,
+                None => Value::undefined(),
+            }
+        } else {
+            let key = k.to_string();
+            interp.get_property_value_for_call(context, o, &key)?
+        };
+        if crate::abstract_ops::same_value_zero(&v, &search, interp.gc_heap()) {
+            return Ok(true);
+        }
+        k += 1;
+    }
+    Ok(false)
 }
 
 fn collect_array_like_callback_entries(

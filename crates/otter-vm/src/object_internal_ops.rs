@@ -1199,6 +1199,51 @@ impl Interpreter {
             }
             return self.define_array_named_property(arr, k, descriptor);
         }
+        if let Some(t) = target.as_typed_array(&self.gc_heap) {
+            // §10.4.5.3 Integer-Indexed exotic [[DefineOwnProperty]].
+            // A canonical numeric index must be an in-bounds, writable,
+            // enumerable, configurable data property; any other key is
+            // an ordinary define on the typed array's expando bag.
+            if let VmPropertyKey::Symbol(sym) = key {
+                let bag =
+                    crate::property_dispatch::typed_array_ensure_expando_pub(&mut self.gc_heap, &t)?;
+                return Ok(object::define_own_symbol_property_partial(
+                    bag,
+                    &mut self.gc_heap,
+                    *sym,
+                    descriptor,
+                ));
+            }
+            let Some(name) = key.string_name() else {
+                return Ok(false);
+            };
+            if let Some(n) = crate::property_dispatch::canonical_numeric_index_string(name) {
+                if t.buffer(&self.gc_heap).is_detached(&self.gc_heap)
+                    || !n.is_finite()
+                    || n.fract() != 0.0
+                    || n < 0.0
+                    || (n as usize) >= t.length(&self.gc_heap)
+                    || descriptor.configurable == Some(false)
+                    || descriptor.enumerable == Some(false)
+                    || descriptor.writable == Some(false)
+                    || descriptor.is_accessor()
+                {
+                    return Ok(false);
+                }
+                if let Some(value) = descriptor.value {
+                    let coerced = crate::binary::dispatch::coerce_element_for_store(
+                        &mut self.gc_heap,
+                        t.kind(),
+                        &value,
+                    )?;
+                    t.set(&mut self.gc_heap, n as usize, &coerced);
+                }
+                return Ok(true);
+            }
+            let bag =
+                crate::property_dispatch::typed_array_ensure_expando_pub(&mut self.gc_heap, &t)?;
+            return self.define_own_property_partial(bag, name, descriptor);
+        }
         Ok(false)
     }
 

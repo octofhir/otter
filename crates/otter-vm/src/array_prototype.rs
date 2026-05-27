@@ -2000,16 +2000,20 @@ fn native_array_method(
             return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
-    // §23.1.3.26 — `shift` needs the live `Get` / `HasProperty` /
-    // `Set` / `Delete` ladder so generic receivers, inherited indices,
-    // accessors, and frozen array length all behave like the spec path.
-    if name == "shift" {
+    // §23.1.3.26 / .34 — `shift` / `unshift` need the live `Get` /
+    // `HasProperty` / `Set` / `Delete` ladder so generic receivers,
+    // inherited indices, accessors, and frozen array length all behave
+    // like the spec path.
+    if matches!(name, "shift" | "unshift") {
         let exec = ctx.execution_context().cloned();
         if let Some(exec) = exec {
             let interp = ctx.interp_mut();
-            return interp
-                .array_shift(&exec, receiver, &[args])
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
+            let result = if name == "shift" {
+                interp.array_shift(&exec, receiver, &[args])
+            } else {
+                interp.array_unshift(&exec, receiver, args, &[args])
+            };
+            return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
     let allocation_roots = ctx.collect_native_roots();
@@ -2699,6 +2703,27 @@ impl Interpreter {
         key: &str,
         value: Value,
     ) -> Result<(), VmError> {
+        if let Some(arr) = o.as_array()
+            && crate::object::array_index_property_name(key).is_some()
+            && crate::array::get_named_property(arr, self.gc_heap(), key).is_none()
+        {
+            let proto = self.constructor_prototype_value("Array")?;
+            if let Some(proto) = proto.as_object() {
+                match crate::object::resolve_set(proto, self.gc_heap(), key) {
+                    crate::object::SetOutcome::InvokeSetter { setter } => {
+                        let args: SmallVec<[Value; 8]> = smallvec::smallvec![value];
+                        self.run_callable_sync(context, &setter, o, args)?;
+                        return Ok(());
+                    }
+                    crate::object::SetOutcome::Reject { .. } => {
+                        return Err(VmError::TypeError {
+                            message: format!("Cannot assign to property '{key}'"),
+                        });
+                    }
+                    crate::object::SetOutcome::AssignData => {}
+                }
+            }
+        }
         let ok = self.ordinary_set_data_value(
             context,
             o,
@@ -2848,6 +2873,108 @@ impl Interpreter {
         self.array_delete_property_throwing(context, o, &tail)?;
         self.array_set_length_throwing(context, o, (len - 1) as f64)?;
         Ok(first)
+    }
+
+    /// §23.1.3.34 `Array.prototype.unshift`: move existing properties
+    /// upward in descending order, write new arguments, then set length.
+    /// Uses a sparse candidate walk for huge array-likes so boundary
+    /// tests near `2**53 - 1` do not require a full `0..len` scan.
+    pub(crate) fn array_unshift(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let arg_count = args.len();
+        if arg_count == 0 {
+            self.array_set_length_throwing(context, o, len as f64)?;
+            return Ok(Value::number(NumberValue::from_f64(len as f64)));
+        }
+        let new_len = len as f64 + arg_count as f64;
+        if new_len > 9_007_199_254_740_991.0 {
+            return Err(VmError::TypeError {
+                message: "Unshifting too many elements onto an array-like".to_string(),
+            });
+        }
+
+        if len <= MAX_ARRAY_LIKE_PROBE_LEN {
+            for k in (0..len).rev() {
+                self.unshift_move_index(context, o, k, arg_count)?;
+            }
+        } else {
+            let mut candidates = self.unshift_sparse_candidates(o, len, arg_count)?;
+            while let Some(k) = candidates.pop_last() {
+                self.unshift_move_index(context, o, k, arg_count)?;
+            }
+        }
+
+        for (j, value) in args.iter().enumerate() {
+            self.array_set_property_throwing(context, o, &j.to_string(), *value)?;
+        }
+        self.array_set_length_throwing(context, o, new_len)?;
+        Ok(Value::number(NumberValue::from_f64(new_len)))
+    }
+
+    fn unshift_move_index(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        from_index: usize,
+        arg_count: usize,
+    ) -> Result<(), VmError> {
+        let from = format_index_key(from_index as f64);
+        let to = format_index_key((from_index + arg_count) as f64);
+        let has =
+            self.ordinary_has_property_value(context, o, &crate::VmPropertyKey::String(&from), 0)?;
+        if has {
+            let value = self.get_property_value_for_call(context, o, &from)?;
+            self.array_set_property_throwing(context, o, &to, value)
+        } else {
+            self.array_delete_property_throwing(context, o, &to)
+        }
+    }
+
+    fn unshift_sparse_candidates(
+        &mut self,
+        o: Value,
+        len: usize,
+        arg_count: usize,
+    ) -> Result<std::collections::BTreeSet<usize>, VmError> {
+        let mut indices = std::collections::BTreeSet::new();
+        let mut current = o;
+        let mut hops = 0usize;
+        loop {
+            collect_own_indices_below(self, &current, len.saturating_add(arg_count), &mut indices);
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            let proto = self.get_prototype_for_op(&current)?;
+            if proto.is_null() || !proto.is_object_type() {
+                break;
+            }
+            current = proto;
+            hops += 1;
+        }
+        let mut candidates = std::collections::BTreeSet::new();
+        for index in indices {
+            if index < len {
+                candidates.insert(index);
+            }
+            if index >= arg_count {
+                let from = index - arg_count;
+                if from < len {
+                    candidates.insert(from);
+                }
+            }
+        }
+        Ok(candidates)
     }
 }
 

@@ -455,11 +455,15 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
-        // §23.1.3.26 — `shift` funnels through the re-entrant driver so
-        // inherited indices and strict length/set/delete failures match
-        // the `.call` bridge.
-        if recv_value.is_array() && name == "shift" {
-            let result = self.array_shift(context, recv_value, &[arg_values.as_slice()])?;
+        // §23.1.3.26 / .34 — `shift` / `unshift` funnel through
+        // re-entrant drivers so inherited indices and strict
+        // length/set/delete failures match the `.call` bridge.
+        if recv_value.is_array() && matches!(name, "shift" | "unshift") {
+            let result = if name == "shift" {
+                self.array_shift(context, recv_value, &[arg_values.as_slice()])
+            } else {
+                self.array_unshift(context, recv_value, &arg_values, &[arg_values.as_slice()])
+            }?;
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
             frame.advance_pc(self.current_byte_len)?;

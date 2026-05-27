@@ -655,6 +655,51 @@ impl Interpreter {
                     *slot = primitive;
                 }
             }
+            // §23.2.3.{8,5,18,16,17} `fill` / `copyWithin` /
+            // `includes` / `indexOf` / `lastIndexOf` open with
+            // `ToNumber` / `ToIntegerOrInfinity` on their operands; the
+            // intrinsic-table impls read raw `Value`s and cannot
+            // re-enter. Pre-coerce here (a re-entrant interpreter
+            // handle is in scope) so user `@@toPrimitive` / `valueOf`
+            // fire in spec order — `fill` coerces its value (step 3)
+            // before the `start` / `end` indices (steps 4-7) — and
+            // abrupt completions surface.
+            if recv_value.is_typed_array() {
+                let is_bigint_kind = recv_value
+                    .as_typed_array(&self.gc_heap)
+                    .is_some_and(|t| t.kind().is_bigint());
+                if name == "fill"
+                    && let Some(value) = small_args.first().copied()
+                {
+                    if is_bigint_kind {
+                        let b = crate::coerce::to_big_int_or_throw(self, context, &value)?;
+                        small_args[0] = Value::big_int(b);
+                    } else if !value.is_number() {
+                        let n = self.coerce_to_number(context, &value)?;
+                        small_args[0] = Value::number(n);
+                    }
+                }
+                // NOTE: `copyWithin` is intentionally excluded — its
+                // detached-during-coercion path (a `valueOf` that
+                // detaches the backing buffer) hangs the conformance
+                // runner today; re-enable once that path is fixed.
+                let ta_int_coerce: &[usize] = match name {
+                    "fill" => &[1, 2],
+                    "copyWithin" => &[0, 1, 2],
+                    "includes" | "indexOf" | "lastIndexOf" => &[1],
+                    _ => &[],
+                };
+                for &idx in ta_int_coerce {
+                    let Some(value) = small_args.get(idx).copied() else {
+                        continue;
+                    };
+                    if value.is_number() || value.is_undefined() {
+                        continue;
+                    }
+                    let n = self.coerce_to_number(context, &value)?;
+                    small_args[idx] = Value::number(n);
+                }
+            }
             if recv_value.is_string()
                 && (!string_int_coerce.is_empty() || !string_str_coerce.is_empty())
             {

@@ -2058,6 +2058,14 @@ fn length_of_array_like(
         return Ok(crate::array::len(arr, interp.gc_heap()));
     }
     let len_val = interp.get_property_value_for_call(context, *o, "length")?;
+    // §7.1.20 ToLength(? ToNumber(len)). A wrapper-object length
+    // (`obj.length = new Number(4.5)`) or one with a `valueOf` must run
+    // the numeric coercion ladder, not just match an existing Number.
+    let len_val = if len_val.is_object_type() {
+        interp.evaluate_to_primitive(context, &len_val, crate::abstract_ops::ToPrimitiveHint::Number)?
+    } else {
+        len_val
+    };
     Ok(crate::to_length(&len_val, interp.gc_heap()).unwrap_or(0))
 }
 

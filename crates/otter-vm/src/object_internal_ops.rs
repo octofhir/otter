@@ -2852,8 +2852,13 @@ impl Interpreter {
                             // `@@species`, not jump straight to
                             // `Function.prototype`.
                             if let Some(proto) = native.prototype_override(&self.gc_heap) {
-                                return self
-                                    .ordinary_get_value(context, proto, receiver, key, hops + 1);
+                                return self.ordinary_get_value(
+                                    context,
+                                    proto,
+                                    receiver,
+                                    key,
+                                    hops + 1,
+                                );
                             }
                             self.function_prototype_object()
                                 .ok()
@@ -2884,8 +2889,13 @@ impl Interpreter {
                         }
                         None => {
                             if let Some(proto) = native.prototype_override(&self.gc_heap) {
-                                return self
-                                    .ordinary_get_value(context, proto, receiver, key, hops + 1);
+                                return self.ordinary_get_value(
+                                    context,
+                                    proto,
+                                    receiver,
+                                    key,
+                                    hops + 1,
+                                );
                             }
                             self.load_function_prototype_method(key_name)
                                 .or_else(|| self.load_object_prototype_method(key_name))

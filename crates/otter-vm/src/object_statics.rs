@@ -458,7 +458,7 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
         return Ok(Value::object(proto));
     }
     interp
-        .get_prototype_for_op(&target)
+        .ordinary_get_prototype_value(&exec_ctx, target, 0)
         .map_err(|err| object_native_error("Object.getPrototypeOf", err))
 }
 
@@ -1438,7 +1438,7 @@ pub fn call(
         // <https://tc39.es/ecma262/#sec-object.create>
         M::Create => {
             let proto = args.first().cloned().unwrap_or(Value::undefined());
-            let proto_value = if proto.is_object() || proto.is_iterator() {
+            let proto_value = if proto.is_object_type() {
                 Some(proto)
             } else if proto.is_null() {
                 None

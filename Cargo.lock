@@ -2063,7 +2063,6 @@ dependencies = [
  "otter-gc",
  "otter-macros",
  "otter-runtime",
- "otter-vm",
  "thiserror",
  "url",
 ]

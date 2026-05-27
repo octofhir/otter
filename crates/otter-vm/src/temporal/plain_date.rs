@@ -102,7 +102,9 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
         "weekOfYear" => pd
             .week_of_year()
             .map_or(Value::undefined(), |w| Value::number_i32(w as i32)),
-        "yearOfWeek" => pd.year_of_week().map_or(Value::undefined(), Value::number_i32),
+        "yearOfWeek" => pd
+            .year_of_week()
+            .map_or(Value::undefined(), Value::number_i32),
         "daysInWeek" => Value::number_i32(pd.days_in_week() as i32),
         "daysInMonth" => Value::number_i32(pd.days_in_month() as i32),
         "daysInYear" => Value::number_i32(pd.days_in_year() as i32),
@@ -273,9 +275,9 @@ fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
             Some(tz_v) => {
                 let tz = parse_time_zone(&tz_v, ctx.heap(), CLASS)?;
                 let time = match object::get(obj, ctx.heap(), "plainTime") {
-                    Some(v) if !v.is_undefined() => {
-                        Some(crate::temporal::plain_time::parse_plain_time_arg(&v, ctx.heap())?)
-                    }
+                    Some(v) if !v.is_undefined() => Some(
+                        crate::temporal::plain_time::parse_plain_time_arg(&v, ctx.heap())?,
+                    ),
                     _ => None,
                 };
                 (tz, time)
@@ -291,15 +293,22 @@ fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
-fn impl_to_plain_year_month(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_year_month(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
-    let pym = pd.to_plain_year_month().map_err(|e| temporal_err(e, CLASS))?;
+    let pym = pd
+        .to_plain_year_month()
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainYearMonth(pym))
 }
 
 fn impl_to_plain_month_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
-    let pmd = pd.to_plain_month_day().map_err(|e| temporal_err(e, CLASS))?;
+    let pmd = pd
+        .to_plain_month_day()
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd))
 }
 

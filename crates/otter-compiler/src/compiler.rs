@@ -46,9 +46,9 @@ impl Compiler {
         self.private_namespaces.last().copied()
     }
 
-    pub(crate) fn mangle_private(&self, name: &str) -> Option<String> {
+    pub(crate) fn private_key_binding_name(&self, name: &str) -> Option<String> {
         self.current_private_namespace()
-            .map(|ns| format!("__priv_{ns}_{name}"))
+            .map(|ns| format!("__privsym_{ns}_{name}"))
     }
 
     pub(crate) fn top_mut(&mut self) -> &mut FunctionContext {

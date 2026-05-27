@@ -18,21 +18,16 @@ pub(crate) fn compile_private_field(
 ) -> Result<u16, CompileError> {
     let _ = span;
     let pspan = (p.span.start, p.span.end);
-    let mangled = cx
-        .mangle_private(p.field.name.as_str())
-        .ok_or(CompileError::Unsupported {
-            node: "PrivateFieldExpression outside any class body".to_string(),
-            span: pspan,
-        })?;
     let obj_reg = compile_expr(cx, &p.object, pspan)?;
-    let name_idx = cx.intern_string_constant(&mangled);
+    let key_reg = crate::class::load_private_key(cx, p.field.name.as_str(), pspan)?;
+    crate::class::emit_private_has_throw(cx, obj_reg, key_reg, pspan)?;
     let dst = cx.alloc_scratch();
     cx.emit(
-        Op::LoadProperty,
+        Op::LoadElement,
         vec![
             Operand::Register(dst),
             Operand::Register(obj_reg),
-            Operand::ConstIndex(name_idx),
+            Operand::Register(key_reg),
         ],
         pspan,
     );

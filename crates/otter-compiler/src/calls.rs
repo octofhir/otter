@@ -461,24 +461,28 @@ pub(crate) fn compile_method_call(
         return Ok(dst);
     }
     if let Expression::PrivateFieldExpression(member) = callee {
-        let mangled =
-            cx.mangle_private(member.field.name.as_str())
-                .ok_or(CompileError::Unsupported {
-                    node: "PrivateFieldExpression call outside any class body".to_string(),
-                    span,
-                })?;
         let receiver_reg = compile_expr(cx, &member.object, span)?;
-        let name_idx = cx.intern_string_constant(&mangled);
+        let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
+        let callee_reg = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadElement,
+            [
+                Operand::Register(callee_reg),
+                Operand::Register(receiver_reg),
+                Operand::Register(key_reg),
+            ],
+            span,
+        );
         let arg_regs = compile_call_args(cx, &call.arguments, span)?;
         check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
         let dst = cx.alloc_scratch();
         let mut operands: Vec<Operand> = Vec::with_capacity(4 + arg_regs.len());
         operands.push(Operand::Register(dst));
+        operands.push(Operand::Register(callee_reg));
         operands.push(Operand::Register(receiver_reg));
-        operands.push(Operand::ConstIndex(name_idx));
         operands.push(Operand::ConstIndex(arg_regs.len() as u32));
         operands.extend(arg_regs.into_iter().map(Operand::Register));
-        cx.emit(Op::CallMethodValue, operands, span);
+        cx.emit(Op::CallWithThis, operands, span);
         return Ok(dst);
     }
     // `obj[expr](args...)` — computed-member call. Lower as

@@ -10,7 +10,6 @@ description = "Web API surfaces for the active Otter runtime stack."
 otter-gc = { workspace = true }
 otter-macros = { workspace = true }
 otter-runtime = { workspace = true }
-otter-vm = { workspace = true }
 thiserror = { workspace = true }
 url = "2"
 

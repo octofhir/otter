@@ -81,7 +81,7 @@ use otter_compiler::{
 };
 use otter_gc::GcStats;
 use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
-use otter_vm::{EvalCompileOptions, ExecutionContext, Interpreter, InterruptFlag, JsObject};
+use otter_vm::{EvalCompileOptions, ExecutionContext, Interpreter, InterruptFlag};
 use serde::{Deserialize, Serialize};
 
 pub use compiled_program::CompiledProgram;
@@ -100,6 +100,10 @@ pub use otter_compiler::{
     CompiledSourceSpan, LiveBindingSlot,
 };
 pub use otter_gc;
+pub use otter_vm::{
+    AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
+    MethodSpec, NativeCall, ObjectBuilder, Value, bootstrap, intrinsic_install, object,
+};
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
 pub use otter_vm::{RuntimeBudget, RuntimeBudgetExceededAction, RuntimeBudgetStats};
 pub use promise_registry::{HostSettleOutcome, PromiseId};

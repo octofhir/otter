@@ -14,15 +14,15 @@ use num_traits::ToPrimitive;
 use crate::bigint::BigIntValue;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
-use crate::string::JsString;
 use crate::object;
+use crate::string::JsString;
 use crate::temporal::duration::partial_from_object;
+use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, js_string_value, make_temporal, parse_calendar_fields,
     parse_difference_settings, parse_partial_time, parse_rounding_options, parse_time_zone,
     require_construct, require_zoned_date_time, str_or_undef, temporal_err,
 };
-use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -114,8 +114,9 @@ pub(crate) fn parse_zdt_arg(
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "argument must be a Temporal.ZonedDateTime, ISO string, or object with a timeZone"
-                .to_string(),
+            reason:
+                "argument must be a Temporal.ZonedDateTime, ISO string, or object with a timeZone"
+                    .to_string(),
         })
     }
 }
@@ -328,9 +329,14 @@ fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     let time = if v.is_undefined() {
         None
     } else {
-        Some(crate::temporal::plain_time::parse_plain_time_arg(&v, ctx.heap())?)
+        Some(crate::temporal::plain_time::parse_plain_time_arg(
+            &v,
+            ctx.heap(),
+        )?)
     };
-    let result = zdt.with_plain_time(time).map_err(|e| temporal_err(e, CLASS))?;
+    let result = zdt
+        .with_plain_time(time)
+        .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 

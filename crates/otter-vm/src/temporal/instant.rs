@@ -9,11 +9,11 @@ use num_traits::ToPrimitive;
 
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
+use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, js_string_value, make_temporal, parse_difference_settings,
     parse_rounding_options, parse_time_zone, require_construct, require_instant, temporal_err,
 };
-use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -97,10 +97,11 @@ fn from_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
             reason: "fromEpochNanoseconds: argument must be a BigInt".to_string(),
         });
     };
-    let nanos = i128::try_from(bv.clone_inner(ctx.heap())).map_err(|_| NativeError::RangeError {
-        name: CLASS,
-        reason: "epoch nanoseconds out of range".to_string(),
-    })?;
+    let nanos =
+        i128::try_from(bv.clone_inner(ctx.heap())).map_err(|_| NativeError::RangeError {
+            name: CLASS,
+            reason: "epoch nanoseconds out of range".to_string(),
+        })?;
     let inst = temporal_rs::Instant::try_new(nanos).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
@@ -246,10 +247,7 @@ fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 /// `Temporal.Instant.prototype` accessor getters, re-validating the
 /// receiver via [`require_instant`] (branding `TypeError`).
-fn get_epoch_milliseconds(
-    ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-) -> Result<Value, NativeError> {
+fn get_epoch_milliseconds(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     Ok(Value::number_f64(inst.epoch_milliseconds() as f64))
 }

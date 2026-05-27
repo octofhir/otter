@@ -18,7 +18,7 @@ enum PreparedAssignmentTarget {
     Identifier(String),
     StaticMember { obj_reg: u16, name_idx: u32 },
     ComputedMember { obj_reg: u16, key_reg: u16 },
-    PrivateField { obj_reg: u16, name_idx: u32 },
+    PrivateField { obj_reg: u16, key_reg: u16 },
 }
 
 pub(crate) fn compile_assignment(
@@ -125,24 +125,19 @@ pub(crate) fn compile_assignment(
         return Ok(new_value);
     }
     if let AssignmentTarget::PrivateFieldExpression(member) = &a.left {
-        let mangled =
-            cx.mangle_private(member.field.name.as_str())
-                .ok_or(CompileError::Unsupported {
-                    node: "PrivateFieldExpression assignment outside any class body".to_string(),
-                    span,
-                })?;
         let obj_reg = compile_expr(cx, &member.object, span)?;
-        let name_idx = cx.intern_string_constant(&mangled);
+        let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
         let new_value = match compound_op {
             None => compile_expr(cx, &a.right, span)?,
             Some(op) => {
+                crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
                 let current = cx.alloc_scratch();
                 cx.emit(
-                    Op::LoadProperty,
+                    Op::LoadElement,
                     vec![
                         Operand::Register(current),
                         Operand::Register(obj_reg),
-                        Operand::ConstIndex(name_idx),
+                        Operand::Register(key_reg),
                     ],
                     span,
                 );
@@ -161,17 +156,8 @@ pub(crate) fn compile_assignment(
                 dst
             }
         };
-        let store_scratch = cx.alloc_scratch();
-        cx.emit(
-            Op::StoreProperty,
-            vec![
-                Operand::Register(obj_reg),
-                Operand::ConstIndex(name_idx),
-                Operand::Register(new_value),
-                Operand::Register(store_scratch),
-            ],
-            span,
-        );
+        crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
+        cx.emit_store_element(obj_reg, key_reg, new_value, span);
         return Ok(new_value);
     }
     if let AssignmentTarget::ComputedMemberExpression(member) = &a.left {
@@ -504,25 +490,16 @@ pub(crate) fn compile_logical_assignment(
             load
         }
         AssignmentTarget::PrivateFieldExpression(m) => {
-            // §13.15.4 LogicalAssignment with a private-field target.
-            // Mangle the `#name` to its synthesised property key and
-            // route through ordinary load/store so the foundation
-            // doesn't pay for a dedicated `Op::LoadPrivate` slot.
-            let mangled =
-                cx.mangle_private(m.field.name.as_str())
-                    .ok_or(CompileError::Unsupported {
-                        node: "LogicalAssignment: private field outside class".to_string(),
-                        span,
-                    })?;
             let obj_reg = compile_expr(cx, &m.object, span)?;
-            let name_idx = cx.intern_string_constant(&mangled);
+            let key_reg = crate::class::load_private_key(cx, m.field.name.as_str(), span)?;
+            crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
             let load = cx.alloc_scratch();
             cx.emit(
-                Op::LoadProperty,
+                Op::LoadElement,
                 vec![
                     Operand::Register(load),
                     Operand::Register(obj_reg),
-                    Operand::ConstIndex(name_idx),
+                    Operand::Register(key_reg),
                 ],
                 span,
             );
@@ -685,27 +662,10 @@ pub(crate) fn assign_to_target(
             Ok(())
         }
         AssignmentTarget::PrivateFieldExpression(member) => {
-            // §13.15.4 LogicalAssignment store leg — mirror the
-            // synthesised property key used by the load leg above.
-            let mangled =
-                cx.mangle_private(member.field.name.as_str())
-                    .ok_or(CompileError::Unsupported {
-                        node: "PrivateFieldExpression assignment outside class".to_string(),
-                        span,
-                    })?;
             let obj_reg = compile_expr(cx, &member.object, span)?;
-            let name_idx = cx.intern_string_constant(&mangled);
-            let scratch = cx.alloc_scratch();
-            cx.emit(
-                Op::StoreProperty,
-                vec![
-                    Operand::Register(obj_reg),
-                    Operand::ConstIndex(name_idx),
-                    Operand::Register(value_reg),
-                    Operand::Register(scratch),
-                ],
-                span,
-            );
+            let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
+            crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
+            cx.emit_store_element(obj_reg, key_reg, value_reg, span);
             Ok(())
         }
         other => Err(CompileError::Unsupported {
@@ -742,17 +702,11 @@ fn prepare_assignment_target(
             }))
         }
         AssignmentTarget::PrivateFieldExpression(member) => {
-            let mangled =
-                cx.mangle_private(member.field.name.as_str())
-                    .ok_or(CompileError::Unsupported {
-                        node: "PrivateFieldExpression assignment outside class".to_string(),
-                        span,
-                    })?;
             let obj_reg = compile_expr(cx, &member.object, span)?;
-            let name_idx = cx.intern_string_constant(&mangled);
+            let key_reg = crate::class::load_private_key(cx, member.field.name.as_str(), span)?;
             Ok(Some(PreparedAssignmentTarget::PrivateField {
                 obj_reg,
-                name_idx,
+                key_reg,
             }))
         }
         AssignmentTarget::ArrayAssignmentTarget(_)
@@ -772,8 +726,7 @@ fn assign_prepared_target(
 ) -> Result<(), CompileError> {
     match target {
         PreparedAssignmentTarget::Identifier(name) => store_identifier(cx, &name, value_reg, span),
-        PreparedAssignmentTarget::StaticMember { obj_reg, name_idx }
-        | PreparedAssignmentTarget::PrivateField { obj_reg, name_idx } => {
+        PreparedAssignmentTarget::StaticMember { obj_reg, name_idx } => {
             let scratch = cx.alloc_scratch();
             cx.emit(
                 Op::StoreProperty,
@@ -785,6 +738,11 @@ fn assign_prepared_target(
                 ],
                 span,
             );
+            Ok(())
+        }
+        PreparedAssignmentTarget::PrivateField { obj_reg, key_reg } => {
+            crate::class::emit_private_has_throw(cx, obj_reg, key_reg, span)?;
+            cx.emit_store_element(obj_reg, key_reg, value_reg, span);
             Ok(())
         }
         PreparedAssignmentTarget::ComputedMember { obj_reg, key_reg } => {

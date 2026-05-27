@@ -248,7 +248,11 @@ impl Interpreter {
             None
         };
         let present = if let Some(obj) = rhs.as_object() {
-            has_object_property(self, obj, &lhs)
+            if let Some(sym) = lhs.as_symbol(&self.gc_heap) {
+                self.ordinary_has_property_value(context, rhs, &VmPropertyKey::Symbol(sym), 0)?
+            } else {
+                has_object_property(self, obj, &lhs)
+            }
         } else if let Some(arr) = rhs.as_array() {
             // §13.10.1 `in` → HasProperty → OrdinaryHasProperty: own
             // elements / named props, then the Array.prototype chain
@@ -1239,7 +1243,14 @@ impl Interpreter {
         write_register(frame, idx_reg, idx_value)?;
         let value = if let Some(obj) = recv.as_object() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                crate::object::get_symbol(obj, &self.gc_heap, sym).unwrap_or(Value::undefined())
+                let key = VmPropertyKey::Symbol(sym);
+                match self.ordinary_get_value(context, Value::object(obj), recv, &key, 0)? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, recv, args)?
+                    }
+                }
             } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 crate::object::get(obj, &self.gc_heap, &key.to_lossy_string(&self.gc_heap))
                     .unwrap_or(Value::undefined())
@@ -1664,9 +1675,7 @@ impl Interpreter {
         let idx_value = self.coerce_property_key_value(context, idx_value_raw)?;
         if let Some(obj) = recv.as_object() {
             if let Some(sym) = idx_value.as_symbol(&self.gc_heap) {
-                if !crate::object::set_symbol(obj, &mut self.gc_heap, sym, value) {
-                    Self::failed_set_result(strict, "Cannot assign to symbol property")?;
-                }
+                self.ordinary_set_symbol_with_callable_setter(context, obj, sym, value, strict)?;
             } else if let Some(key) = idx_value.as_string(&self.gc_heap) {
                 let key = key.to_lossy_string(&self.gc_heap);
                 self.store_computed_ordinary_property(obj, &key, value, strict)?;
@@ -3951,6 +3960,16 @@ fn has_class_static_property(
     class: &ClassConstructor,
     key: &Value,
 ) -> bool {
+    if let Some(sym) = key.as_symbol(&interpreter.gc_heap) {
+        return !matches!(
+            crate::object::lookup_own_symbol(
+                class.statics(&interpreter.gc_heap),
+                &interpreter.gc_heap,
+                sym
+            ),
+            object::PropertyLookup::Absent
+        );
+    }
     if let Some(s) = key.as_string(&interpreter.gc_heap) {
         let k = s.to_lossy_string(&interpreter.gc_heap);
         if k == "prototype" {

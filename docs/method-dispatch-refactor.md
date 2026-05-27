@@ -10,6 +10,17 @@ conformance-gated before the next starts.
 - [x] **Side spec-bug: for-of `break` IteratorClose** (§14.7.5.6) —
   fixed in `compile_for_of_statement` (commit `f4a30331`). Separate from
   the dispatch scatter; `for await` IteratorClose still pending.
+- [x] **Crash gate A: finally invalid operand + private brand re-eval**
+  (§14.15 `try`, §15.7 private names/brands, §10.5 proxy internal
+  methods) — fixed the real VM abort in the try/finally handler target
+  and made private names per class evaluation by capturing runtime
+  `Symbol("#name")` keys. The six private
+  `multiple-evaluations-of-class-function-ctor` tests now pass; the
+  try/finally filter has 0 crash/timeout/OOM. `S12.14_A11_T4.js` now
+  passes; `completion-values-fn-finally-abrupt.js` is downgraded from
+  process abort to ordinary semantic fail pending completion-value
+  semantics. Full project gate (`cargo test --all --all-features`,
+  `cargo clippy --all-targets --all-features -- -D warnings`) is green.
 - [x] **Stage 1** — collapse `indexOf`/`lastIndexOf`/`includes` to one
   `Interpreter::array_indexed_search` entry shared by both call sites
   (was 4 duplicated interception blocks). Pure structural refactor,

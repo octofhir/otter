@@ -558,11 +558,7 @@ mod tests {
 
     #[test]
     fn unsupported_statement_rejects() {
-        // `with` is not in the foundation subset and never will be —
-        // expect the Unsupported diagnostic with a descriptive node
-        // name. (`try`/`catch` shipped in task 24 so it's no longer
-        // a useful exemplar here.)
-        let err = compile_script_src_err("with (o) { x; }");
+        let err = compile_script_src_err("continue;");
         assert!(matches!(err, CompileError::Unsupported { .. }));
     }
 

@@ -631,8 +631,12 @@ fn ta_species_create(
             }
         })?
     };
-    let constructor =
-        crate::regexp_prototype::species_constructor_runtime(ctx, &exemplar_value, &default_ctor, method)?;
+    let constructor = crate::regexp_prototype::species_constructor_runtime(
+        ctx,
+        &exemplar_value,
+        &default_ctor,
+        method,
+    )?;
 
     let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
     argv.push(Value::number(crate::number::NumberValue::from_f64(

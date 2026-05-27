@@ -59,8 +59,7 @@ fn global_this_default_snapshot() {
     //   surface report `typeof === "function"`; namespace objects
     //   and internal prototype markers remain object-typed.
     let expected = "\
-@@%TypedArray% ... function
-@@%TypedArrayPrototype% ... object
+@@%TypedArray% w.c function
 AggregateError w.c function
 Array w.c function
 ArrayBuffer w.c function

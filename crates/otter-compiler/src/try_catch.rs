@@ -76,8 +76,8 @@ pub(crate) fn compile_try_statement(
 
         cx.patch_branch_to_here(success_jump);
 
-        cx.patch_enter_try_offset(outer, /* finally */ false);
         cx.emit(Op::LeaveTry, vec![], span);
+        cx.patch_enter_try_offset(outer, /* finally */ false);
         compile_finalizer(cx, s.finalizer.as_ref().unwrap())?;
         cx.emit(Op::EndFinally, vec![], span);
         return Ok(None);

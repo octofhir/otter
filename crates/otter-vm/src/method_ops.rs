@@ -25,8 +25,8 @@ use smallvec::SmallVec;
 
 use crate::{
     BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IntrinsicArgs,
-    JsString, NativeCallInfo, NativeCtx, NumberValue, Value, VmError, VmGetOutcome,
-    VmPropertyKey, array_prototype, bigint, binary,
+    JsString, NativeCallInfo, NativeCtx, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey,
+    array_prototype, bigint, binary,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, bound_function_object_prototype_intercept, build_array_cb_args,
     collections_prototype, date, descriptor_value, function_metadata, intl, intrinsic_to_vm_error,
@@ -132,8 +132,11 @@ impl Interpreter {
             if !is_non_primitive(&v) {
                 continue;
             }
-            let primitive =
-                self.evaluate_to_primitive(context, &v, crate::abstract_ops::ToPrimitiveHint::String)?;
+            let primitive = self.evaluate_to_primitive(
+                context,
+                &v,
+                crate::abstract_ops::ToPrimitiveHint::String,
+            )?;
             args[idx] = primitive;
         }
         Ok(())
@@ -445,7 +448,8 @@ impl Interpreter {
         // arguments, `@@isConcatSpreadable`, and array-like `length` /
         // indexed getters are observed.
         if recv_value.is_array() && name == "concat" {
-            let result = self.array_concat(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
+            let result =
+                self.array_concat(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
             frame.advance_pc(self.current_byte_len)?;
@@ -1376,7 +1380,6 @@ impl Interpreter {
         Ok(())
     }
 
-
     /// §23.2.3 TypedArray prototype callback methods —
     /// `forEach` / `map` / `filter` / `find` / `findIndex` /
     /// `findLast` / `findLastIndex` / `every` / `some` / `reduce` /
@@ -1626,11 +1629,9 @@ impl Interpreter {
     ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
         let exemplar_value = Value::typed_array(*exemplar);
         let default_name = exemplar.kind().name();
-        let default_ctor =
-            crate::object::get(self.global_this, &self.gc_heap, default_name).ok_or_else(|| {
-                VmError::TypeError {
-                    message: format!("%{default_name}% intrinsic is missing"),
-                }
+        let default_ctor = crate::object::get(self.global_this, &self.gc_heap, default_name)
+            .ok_or_else(|| VmError::TypeError {
+                message: format!("%{default_name}% intrinsic is missing"),
             })?;
         let constructor =
             self.species_constructor_value(context, &exemplar_value, &default_ctor)?;
@@ -1691,7 +1692,9 @@ impl Interpreter {
 
         let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
         argv.push(Value::array_buffer(buffer));
-        argv.push(Value::number(NumberValue::from_f64(begin_byte_offset as f64)));
+        argv.push(Value::number(NumberValue::from_f64(
+            begin_byte_offset as f64,
+        )));
         argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
         let a = self.typed_array_create_via_species(context, t, argv, None)?;
         let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
@@ -1749,7 +1752,9 @@ impl Interpreter {
             let target_kind = a.kind();
             let base = k as usize;
             for n in 0..count {
-                let value = t.get(&mut self.gc_heap, base + n).map_err(crate::oom_to_vm)?;
+                let value = t
+                    .get(&mut self.gc_heap, base + n)
+                    .map_err(crate::oom_to_vm)?;
                 let coerced = crate::binary::dispatch::coerce_element_for_store(
                     &mut self.gc_heap,
                     target_kind,

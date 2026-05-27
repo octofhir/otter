@@ -146,8 +146,7 @@ pub(crate) fn array_like_present_entries(
                     .collect()
             });
             for i in extra {
-                let v = crate::object::get(obj, heap, &i.to_string())
-                    .unwrap_or(Value::undefined());
+                let v = crate::object::get(obj, heap, &i.to_string()).unwrap_or(Value::undefined());
                 entries.push((i, v));
             }
             entries.sort_unstable_by_key(|(i, _)| *i);
@@ -2100,7 +2099,11 @@ fn length_of_array_like(
     // (`obj.length = new Number(4.5)`) or one with a `valueOf` must run
     // the numeric coercion ladder, not just match an existing Number.
     let len_val = if len_val.is_object_type() {
-        interp.evaluate_to_primitive(context, &len_val, crate::abstract_ops::ToPrimitiveHint::Number)?
+        interp.evaluate_to_primitive(
+            context,
+            &len_val,
+            crate::abstract_ops::ToPrimitiveHint::Number,
+        )?
     } else {
         len_val
     };
@@ -2174,8 +2177,12 @@ pub(crate) fn array_linear_search(
             );
         }
         let key = k.to_string();
-        let has =
-            interp.ordinary_has_property_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+        let has = interp.ordinary_has_property_value(
+            context,
+            o,
+            &crate::VmPropertyKey::String(&key),
+            0,
+        )?;
         if !has {
             return Ok(None);
         }
@@ -2269,8 +2276,10 @@ pub(crate) fn array_includes(
     while k < len_i {
         let v = if let Some(s) = string_data {
             match s.char_code_at(k as u32, interp.gc_heap()) {
-                Some(unit) => crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
-                    .map(Value::string)?,
+                Some(unit) => {
+                    crate::string::JsString::from_utf16_units(&[unit], interp.gc_heap_mut())
+                        .map(Value::string)?
+                }
                 None => Value::undefined(),
             }
         } else {
@@ -2394,7 +2403,10 @@ impl Interpreter {
             };
         }
         let joined = parts.join(&separator);
-        Ok(Value::string(JsString::from_str(&joined, self.gc_heap_mut())?))
+        Ok(Value::string(JsString::from_str(
+            &joined,
+            self.gc_heap_mut(),
+        )?))
     }
 
     /// §22.1.3.10.1 IsConcatSpreadable(O): a non-object is never spread;
@@ -2409,18 +2421,13 @@ impl Interpreter {
             return Ok(false);
         }
         let sym = self.well_known_symbols.get(WellKnown::IsConcatSpreadable);
-        let spread = match self.ordinary_get_value(
-            context,
-            e,
-            e,
-            &crate::VmPropertyKey::Symbol(sym),
-            0,
-        )? {
-            crate::VmGetOutcome::Value(v) => v,
-            crate::VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, e, smallvec::SmallVec::new())?
-            }
-        };
+        let spread =
+            match self.ordinary_get_value(context, e, e, &crate::VmPropertyKey::Symbol(sym), 0)? {
+                crate::VmGetOutcome::Value(v) => v,
+                crate::VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, e, smallvec::SmallVec::new())?
+                }
+            };
         if spread.is_undefined() {
             Ok(e.is_array())
         } else {
@@ -2491,10 +2498,11 @@ impl Interpreter {
                 value.trace_value_slots(visit);
             }
         };
-        let arr = crate::array::alloc_array_with_roots(heap, &mut visitor)
-            .map_err(|_| VmError::TypeError {
+        let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
+            VmError::TypeError {
                 message: "array allocation failed".to_string(),
-            })?;
+            }
+        })?;
         crate::array::with_elements_mut(arr, heap, |elements| {
             elements.extend(combined);
         });
@@ -2610,7 +2618,12 @@ impl Interpreter {
         let mut items: Vec<Value> = Vec::new();
         for k in 0..cap {
             let key = k.to_string();
-            if self.ordinary_has_property_value(context, o, &crate::VmPropertyKey::String(&key), 0)? {
+            if self.ordinary_has_property_value(
+                context,
+                o,
+                &crate::VmPropertyKey::String(&key),
+                0,
+            )? {
                 items.push(self.get_property_value_for_call(context, o, &key)?);
             }
         }
@@ -2723,7 +2736,8 @@ impl Interpreter {
         let new_len = len - 1.0;
         let key = format_index_key(new_len);
         let element = self.get_property_value_for_call(context, o, &key)?;
-        let deleted = self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
+        let deleted =
+            self.ordinary_delete_value(context, o, &crate::VmPropertyKey::String(&key), 0)?;
         if !deleted {
             return Err(VmError::TypeError {
                 message: format!("Cannot delete property '{key}'"),
@@ -2744,7 +2758,6 @@ fn format_index_key(n: f64) -> String {
         crate::number::NumberValue::from_f64(n).to_display_string()
     }
 }
-
 
 /// Add the own indexed keys (`< len`) of a single value to `indices`.
 /// Covers dense arrays (non-hole element positions), string primitives
@@ -2820,7 +2833,9 @@ pub(crate) fn array_callback_native_dispatch(
     } else {
         interp
             .box_sloppy_this_primitive_runtime_rooted(raw_receiver, &[args])
-            .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?
+            .map_err(|err| {
+                crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+            })?
     };
     // §23.1.3.* step 2 — len = ? LengthOfArrayLike(O), read once via
     // `[[Get]]` (observes a `get length()`). The walk below is LIVE:
@@ -2828,8 +2843,9 @@ pub(crate) fn array_callback_native_dispatch(
     // during iteration, so a callback that mutates the receiver is
     // observed in spec order and a Function / exotic receiver's indexed
     // properties are seen (the previous one-shot snapshot saw neither).
-    let len = length_of_array_like(interp, &context, &receiver)
-        .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?;
+    let len = length_of_array_like(interp, &context, &receiver).map_err(|err| {
+        crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+    })?;
     // §23.1.3.* step 3 — `if IsCallable(callbackfn) is false, throw a
     // TypeError`, ordered after `ToObject` + `LengthOfArrayLike`.
     if !interp.is_callable_runtime(&callback) {
@@ -2951,7 +2967,12 @@ pub(crate) fn array_callback_native_dispatch(
         } else {
             let key = idx.to_string();
             let has = interp
-                .ordinary_has_property_value(&context, receiver, &crate::VmPropertyKey::String(&key), 0)
+                .ordinary_has_property_value(
+                    &context,
+                    receiver,
+                    &crate::VmPropertyKey::String(&key),
+                    0,
+                )
                 .map_err(|err| {
                     crate::native_function::vm_to_native_error(err, "Array.prototype callback")
                 })?;
@@ -2982,7 +3003,9 @@ pub(crate) fn array_callback_native_dispatch(
         };
         let result = interp
             .run_callable_sync(&context, &callback, cb_this, cb_args)
-            .map_err(|err| crate::native_function::vm_to_native_error(err, "Array.prototype callback"))?;
+            .map_err(|err| {
+                crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+            })?;
         match name {
             "forEach" => {}
             "map" => out.push((idx, result)),
@@ -3052,12 +3075,7 @@ pub(crate) fn array_callback_native_dispatch(
             // `undefined` in the dense region; the sparse tail is
             // holes. Avoids a `len`-sized allocation when `len` is a
             // pathological array-like length.
-            let dense_len = out
-                .iter()
-                .map(|(i, _)| i + 1)
-                .max()
-                .unwrap_or(0)
-                .min(len);
+            let dense_len = out.iter().map(|(i, _)| i + 1).max().unwrap_or(0).min(len);
             let mut buf: Vec<Value> = vec![Value::undefined(); dense_len];
             for (i, v) in out {
                 if i < dense_len {

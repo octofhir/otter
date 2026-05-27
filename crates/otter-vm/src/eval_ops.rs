@@ -23,8 +23,8 @@ use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
 use crate::{
-    AsyncFrameState, EvalCompileOptions, ExecutionContext, Frame, Interpreter, NativeCtx, Value,
-    VmError, abstract_ops, function_metadata, native_function, object,
+    AsyncFrameState, ClassConstructor, EvalCompileOptions, ExecutionContext, Frame, Interpreter,
+    NativeCtx, Value, VmError, abstract_ops, function_metadata, native_function, object,
     operand_decode::register_operand, promise_dispatch, read_register, render_thrown_value,
     write_register,
 };
@@ -194,6 +194,15 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[&[Value]],
     ) -> Result<Value, VmError> {
+        if let Some(class) = value.as_class_constructor() {
+            return self.wrap_eval_class_constructor_with_roots(
+                function_context,
+                class,
+                stack_roots,
+                value_roots,
+                slice_roots,
+            );
+        }
         if !value.is_function() && !value.is_closure() {
             return Ok(value);
         }
@@ -320,6 +329,164 @@ impl Interpreter {
         }
 
         Ok(wrapper)
+    }
+
+    fn wrap_eval_class_constructor_with_roots(
+        &mut self,
+        function_context: ExecutionContext,
+        class: ClassConstructor,
+        stack_roots: Option<&SmallVec<[Frame; 8]>>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let target_capture = Value::class_constructor(class);
+        let prototype = class.prototype(&self.gc_heap);
+        let statics = class.statics(&self.gc_heap);
+        self.wrap_eval_object_callables(&function_context, prototype, target_capture)?;
+        self.wrap_eval_object_callables(&function_context, statics, target_capture)?;
+        let callback_context = function_context.clone();
+        let stack_slots = stack_roots
+            .map(|stack| self.collect_allocation_roots(stack))
+            .unwrap_or_default();
+        let native_value_root = target_capture;
+        let prototype_root = Value::object(prototype);
+        let statics_root = Value::object(statics);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &stack_slots {
+                visitor(slot);
+            }
+            native_value_root.trace_value_slots(visitor);
+            prototype_root.trace_value_slots(visitor);
+            statics_root.trace_value_slots(visitor);
+            for root in value_roots {
+                root.trace_value_slots(visitor);
+            }
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
+            }
+        };
+        let wrapper_ctor =
+            native_function::native_constructor_value_with_captures_unchecked_with_roots(
+                &mut self.gc_heap,
+                "anonymous",
+                smallvec::smallvec![target_capture],
+                &mut external_visit,
+                move |ctx: &mut NativeCtx<'_>, call_args: &[Value], captures: &[Value]| {
+                    if !ctx.is_construct_call() {
+                        return Err(crate::native_function::NativeError::TypeError {
+                            name: "anonymous",
+                            reason: "Class constructor cannot be invoked without 'new'".to_string(),
+                        });
+                    }
+                    let Some(target) = captures.first().cloned() else {
+                        return Err(crate::native_function::NativeError::TypeError {
+                            name: "anonymous",
+                            reason: "missing wrapped class target".to_string(),
+                        });
+                    };
+                    let args: SmallVec<[Value; 8]> = call_args.iter().cloned().collect();
+                    ctx.interp_mut()
+                        .run_construct_sync(&callback_context, &target, target, args)
+                        .map_err(|err| crate::native_function::NativeError::TypeError {
+                            name: "anonymous",
+                            reason: format!("{err}"),
+                        })
+                },
+            )
+            .map_err(VmError::from)?;
+        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            wrapper_ctor.trace_value_slots(visitor);
+            prototype_root.trace_value_slots(visitor);
+            statics_root.trace_value_slots(visitor);
+        };
+        let wrapped = ClassConstructor::new_with_roots(
+            &mut self.gc_heap,
+            wrapper_ctor,
+            prototype,
+            statics,
+            &mut roots,
+        )?;
+        Ok(Value::class_constructor(wrapped))
+    }
+
+    fn wrap_eval_object_callables(
+        &mut self,
+        function_context: &ExecutionContext,
+        obj: crate::object::JsObject,
+        owner_root: Value,
+    ) -> Result<(), VmError> {
+        let (string_keys, symbol_keys): (Vec<String>, Vec<_>) =
+            object::with_properties(obj, &self.gc_heap, |props| {
+                (
+                    props.keys().map(str::to_string).collect(),
+                    props.symbol_keys().collect(),
+                )
+            });
+        for key in string_keys {
+            if key == "constructor" {
+                continue;
+            }
+            let Some(desc) = object::get_own_descriptor(obj, &self.gc_heap, &key) else {
+                continue;
+            };
+            let wrapped =
+                self.wrap_eval_descriptor_callables(function_context, desc, owner_root)?;
+            object::define_own_property(obj, &mut self.gc_heap, &key, wrapped);
+        }
+        for sym in symbol_keys {
+            let Some(desc) = object::get_own_symbol_descriptor(obj, &self.gc_heap, sym) else {
+                continue;
+            };
+            object::define_own_symbol_property(obj, &mut self.gc_heap, sym, desc);
+        }
+        Ok(())
+    }
+
+    fn wrap_eval_descriptor_callables(
+        &mut self,
+        function_context: &ExecutionContext,
+        desc: object::PropertyDescriptor,
+        owner_root: Value,
+    ) -> Result<object::PropertyDescriptor, VmError> {
+        let flags = desc.flags;
+        let kind = match desc.kind {
+            object::DescriptorKind::Data { value } => {
+                let value = self.wrap_eval_function_value_with_roots(
+                    function_context.clone(),
+                    value,
+                    None,
+                    &[&owner_root],
+                    &[],
+                )?;
+                object::DescriptorKind::Data { value }
+            }
+            object::DescriptorKind::Accessor { getter, setter } => {
+                let getter = match getter {
+                    Some(value) => Some(self.wrap_eval_function_value_with_roots(
+                        function_context.clone(),
+                        value,
+                        None,
+                        &[&owner_root],
+                        &[],
+                    )?),
+                    None => None,
+                };
+                let setter = match setter {
+                    Some(value) => Some(self.wrap_eval_function_value_with_roots(
+                        function_context.clone(),
+                        value,
+                        None,
+                        &[&owner_root],
+                        &[],
+                    )?),
+                    None => None,
+                };
+                object::DescriptorKind::Accessor { getter, setter }
+            }
+        };
+        Ok(object::PropertyDescriptor { kind, flags })
     }
 
     fn function_constructor_arg_to_string(

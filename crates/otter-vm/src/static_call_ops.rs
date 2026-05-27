@@ -306,7 +306,7 @@ impl Interpreter {
         args: &[Value],
     ) -> Result<Value, VmError> {
         let proto = args.first().cloned().unwrap_or(Value::undefined());
-        let proto_value = if proto.is_object() || proto.is_iterator() {
+        let proto_value = if proto.is_object_type() {
             Some(proto)
         } else if proto.is_null() {
             None

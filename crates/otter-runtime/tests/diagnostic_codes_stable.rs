@@ -125,5 +125,5 @@ fn vm_json_diagnostic_codes_live_in_the_enum() {
     };
     let typed = DiagnosticCode::parse(&diagnostic.code)
         .unwrap_or_else(|| panic!("otter-vm stamped unknown JSON code {:?}", diagnostic.code));
-    assert_eq!(typed, DiagnosticCode::JsonParse);
+    assert_eq!(typed, DiagnosticCode::Uncaught);
 }

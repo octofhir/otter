@@ -257,12 +257,11 @@ pub(crate) fn emit_instance_field_inits(
             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
             oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
             oxc_ast::ast::PropertyKey::NumericLiteral(lit) => lit.value.to_string(),
-            oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => cx
-                .mangle_private(pid.name.as_str())
-                .ok_or(CompileError::Unsupported {
-                    node: "ClassDeclaration: private instance field outside class".to_string(),
-                    span: pspan,
-                })?,
+            oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
+                let key_reg = crate::class::load_private_key(cx, pid.name.as_str(), pspan)?;
+                cx.emit_store_element(this_reg, key_reg, value_reg, pspan);
+                continue;
+            }
             _ => {
                 return Err(CompileError::Unsupported {
                     node: "ClassDeclaration: non-string instance field key".to_string(),

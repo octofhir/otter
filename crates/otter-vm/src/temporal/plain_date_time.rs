@@ -8,6 +8,7 @@
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
+use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, arg_to_calendar, clamp_to_u8, clamp_to_u16, js_string_value, make_temporal,
     opt_integer_with_truncation, parse_date_time_fields, parse_difference_settings,
@@ -15,7 +16,6 @@ use crate::temporal::helpers::{
     parse_time_zone, require_construct, require_plain_date_time, str_or_undef, temporal_err,
     to_integer_with_truncation,
 };
-use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -127,8 +127,9 @@ fn parse_plain_date_time_arg(
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "argument must be a Temporal.PlainDateTime, ISO string, or date-time-like object"
-                .to_string(),
+            reason:
+                "argument must be a Temporal.PlainDateTime, ISO string, or date-time-like object"
+                    .to_string(),
         })
     }
 }
@@ -154,7 +155,9 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
         "weekOfYear" => pdt
             .week_of_year()
             .map_or(Value::undefined(), |w| Value::number_i32(w as i32)),
-        "yearOfWeek" => pdt.year_of_week().map_or(Value::undefined(), Value::number_i32),
+        "yearOfWeek" => pdt
+            .year_of_week()
+            .map_or(Value::undefined(), Value::number_i32),
         "daysInWeek" => Value::number_i32(pdt.days_in_week() as i32),
         "daysInMonth" => Value::number_i32(pdt.days_in_month() as i32),
         "daysInYear" => Value::number_i32(pdt.days_in_year() as i32),

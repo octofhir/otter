@@ -663,18 +663,13 @@ impl Interpreter {
         let species_sym = self
             .well_known_symbols()
             .get(crate::symbol::WellKnown::Species);
-        let s = match self.ordinary_get_value(
-            context,
-            c,
-            c,
-            &VmPropertyKey::Symbol(species_sym),
-            0,
-        )? {
-            VmGetOutcome::Value(value) => value,
-            VmGetOutcome::InvokeGetter { getter } => {
-                self.run_callable_sync(context, &getter, c, SmallVec::new())?
-            }
-        };
+        let s =
+            match self.ordinary_get_value(context, c, c, &VmPropertyKey::Symbol(species_sym), 0)? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, c, SmallVec::new())?
+                }
+            };
         if s.is_nullish() {
             return Ok(*default_ctor);
         }
@@ -1651,11 +1646,14 @@ impl Interpreter {
         let bag_root = Value::object(bag);
         let proto =
             self.alloc_stack_rooted_object_with_extra_roots(stack, &[&function_root, &bag_root])?;
-        if let Some(object_ctor) = crate::object::get(self.global_this, &self.gc_heap, "Object")
-            .and_then(|v| v.as_object())
-            && let Some(object_proto) = crate::object::get(object_ctor, &self.gc_heap, "prototype")
+        if let Some(object_proto) = self.realm_intrinsics.object_prototype.or_else(|| {
+            crate::object::get(self.global_this, &self.gc_heap, "Object")
                 .and_then(|v| v.as_object())
-        {
+                .and_then(|object_ctor| {
+                    crate::object::get(object_ctor, &self.gc_heap, "prototype")
+                        .and_then(|v| v.as_object())
+                })
+        }) {
             crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
         }
         if context
@@ -1709,11 +1707,14 @@ impl Interpreter {
         proto_roots.push(&bag_root);
         proto_roots.extend_from_slice(value_roots);
         let proto = self.alloc_runtime_rooted_object_with_roots(&proto_roots, slice_roots)?;
-        if let Some(object_ctor) = crate::object::get(self.global_this, &self.gc_heap, "Object")
-            .and_then(|v| v.as_object())
-            && let Some(object_proto) = crate::object::get(object_ctor, &self.gc_heap, "prototype")
+        if let Some(object_proto) = self.realm_intrinsics.object_prototype.or_else(|| {
+            crate::object::get(self.global_this, &self.gc_heap, "Object")
                 .and_then(|v| v.as_object())
-        {
+                .and_then(|object_ctor| {
+                    crate::object::get(object_ctor, &self.gc_heap, "prototype")
+                        .and_then(|v| v.as_object())
+                })
+        }) {
             crate::object::set_prototype(proto, &mut self.gc_heap, Some(object_proto));
         }
         if context
@@ -1780,6 +1781,15 @@ impl Interpreter {
         constructor_name: &str,
         name: &str,
     ) -> Option<Value> {
+        let cached = match constructor_name {
+            "Object" => self.realm_intrinsics.object_prototype,
+            "Function" => self.realm_intrinsics.function_prototype,
+            "Array" => self.realm_intrinsics.array_prototype,
+            _ => None,
+        };
+        if let Some(prototype_obj) = cached {
+            return crate::object::get(prototype_obj, &self.gc_heap, name);
+        }
         let constructor_obj = crate::object::get(self.global_this, &self.gc_heap, constructor_name)
             .and_then(|v| v.as_object())?;
         let prototype_obj = crate::object::get(constructor_obj, &self.gc_heap, "prototype")

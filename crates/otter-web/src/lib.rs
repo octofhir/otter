@@ -21,6 +21,8 @@
 //! # See also
 //! - [Web API contribution workflow](../../../docs/book/src/web/contributing.md)
 
+extern crate otter_runtime as otter_vm;
+
 pub mod blob;
 pub mod headers;
 pub mod request_response;

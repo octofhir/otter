@@ -89,19 +89,7 @@ pub(crate) fn compile_private_in(
 ) -> Result<u16, CompileError> {
     let _ = span;
     let pspan = (p.span.start, p.span.end);
-    let mangled = cx
-        .mangle_private(p.left.name.as_str())
-        .ok_or(CompileError::Unsupported {
-            node: "PrivateInExpression outside any class body".to_string(),
-            span: pspan,
-        })?;
-    let key_reg = cx.alloc_scratch();
-    let key_idx = cx.intern_string_constant(&mangled);
-    cx.emit(
-        Op::LoadString,
-        [Operand::Register(key_reg), Operand::ConstIndex(key_idx)],
-        pspan,
-    );
+    let key_reg = crate::class::load_private_key(cx, p.left.name.as_str(), pspan)?;
     let obj_reg = compile_expr(cx, &p.right, pspan)?;
     let dst = cx.alloc_scratch();
     cx.emit(

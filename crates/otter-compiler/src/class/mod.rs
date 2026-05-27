@@ -109,6 +109,23 @@ pub(crate) fn compile_class(
     };
     cx.private_namespaces.push(private_namespace);
 
+    // Allocate one runtime-unique symbol per private name for this
+    // class evaluation. Methods capture these bindings, so repeated
+    // evaluation of the same class body gets distinct private keys.
+    let private_bound = collect_class_private_bound(&class.body);
+    for name in &private_bound {
+        let binding = cx
+            .private_key_binding_name(name)
+            .ok_or(CompileError::Unsupported {
+                node: "ClassDeclaration: private name outside class".to_string(),
+                span,
+            })?;
+        let storage = cx.declare_captured_binding(&binding, true, span)?;
+        let key_reg = emit_private_symbol_key(cx, name, span)?;
+        cx.emit_store_storage(key_reg, storage, span);
+        cx.mark_initialized(&binding);
+    }
+
     // Evaluate the parent class first so observable side-effects
     // happen exactly once per declaration, in source order.
     let super_reg = match &class.super_class {
@@ -304,19 +321,13 @@ pub(crate) fn compile_class(
         };
         // Compute the static name (when known) for diagnostics +
         // the method's `.name` intrinsic.
-        let static_name: Option<String> = if !m.computed {
+        let is_private = matches!(m.key, oxc_ast::ast::PropertyKey::PrivateIdentifier(_));
+        let static_name: Option<String> = if !m.computed && !is_private {
             match &m.key {
                 oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                     Some(id.name.as_str().to_string())
                 }
                 oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
-                oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => Some(
-                    cx.mangle_private(pid.name.as_str())
-                        .ok_or(CompileError::Unsupported {
-                            node: "ClassDeclaration: private method outside class".to_string(),
-                            span: method_span,
-                        })?,
-                ),
                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                     Some(number_literal_property_name(lit.value))
                 }
@@ -325,9 +336,13 @@ pub(crate) fn compile_class(
         } else {
             None
         };
-        let body_name = static_name
-            .clone()
-            .unwrap_or_else(|| "<computed>".to_string());
+        let body_name = match (&m.key, &static_name) {
+            (_, Some(name)) => name.clone(),
+            (oxc_ast::ast::PropertyKey::PrivateIdentifier(pid), None) => {
+                format!("#{}", pid.name.as_str())
+            }
+            _ => "<computed>".to_string(),
+        };
         let (m_id, m_captures) = compile_function_full(
             cx,
             &body_name,
@@ -349,8 +364,11 @@ pub(crate) fn compile_class(
             // Resolve the property key into a register (literal vs
             // computed expression — both paths are observed by the
             // §13.2.5 ComputedPropertyName / IdentifierName rules).
-            let key_reg = match (&static_name, m.computed) {
-                (Some(name), false) => {
+            let key_reg = match (&m.key, &static_name, m.computed) {
+                (oxc_ast::ast::PropertyKey::PrivateIdentifier(pid), _, false) => {
+                    load_private_key(cx, pid.name.as_str(), method_span)?
+                }
+                (_, Some(name), false) => {
                     let r = cx.alloc_scratch();
                     let const_idx = cx.intern_string_constant(name);
                     cx.emit(
@@ -434,8 +452,11 @@ pub(crate) fn compile_class(
             );
             continue;
         }
-        let key_reg = match (&static_name, m.computed) {
-            (Some(name), false) => {
+        let key_reg = match (&m.key, &static_name, m.computed) {
+            (oxc_ast::ast::PropertyKey::PrivateIdentifier(pid), _, false) => {
+                load_private_key(cx, pid.name.as_str(), method_span)?
+            }
+            (_, Some(name), false) => {
                 let r = cx.alloc_scratch();
                 let const_idx = cx.intern_string_constant(name);
                 cx.emit(
@@ -538,13 +559,11 @@ pub(crate) fn compile_class(
                         oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                             number_literal_property_name(lit.value)
                         }
-                        oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => cx
-                            .mangle_private(pid.name.as_str())
-                            .ok_or(CompileError::Unsupported {
-                                node: "ClassDeclaration: private static field outside class"
-                                    .to_string(),
-                                span: pspan,
-                            })?,
+                        oxc_ast::ast::PropertyKey::PrivateIdentifier(pid) => {
+                            let key_reg = load_private_key(cx, pid.name.as_str(), pspan)?;
+                            cx.emit_store_element(statics_reg, key_reg, value_reg, pspan);
+                            continue;
+                        }
                         _ => {
                             return Err(CompileError::Unsupported {
                                 node: "ClassDeclaration: non-string static field key".to_string(),
@@ -677,4 +696,113 @@ pub(crate) fn load_synthetic_capture(
         node: format!("super used outside a class method (`{name}` not in scope)"),
         span,
     })
+}
+
+pub(crate) fn load_private_key(
+    cx: &mut Compiler,
+    name: &str,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let binding = cx
+        .private_key_binding_name(name)
+        .ok_or(CompileError::Unsupported {
+            node: "private name used outside a class body".to_string(),
+            span,
+        })?;
+    if let Some(info) = cx.lookup_binding(&binding) {
+        let dst = cx.alloc_scratch();
+        cx.emit_load_storage(dst, info.storage, span);
+        return Ok(dst);
+    }
+    if let Some(uv_idx) = cx.resolve_capture(&binding) {
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::LoadUpvalue,
+            [Operand::Register(dst), Operand::Imm32(uv_idx as i32)],
+            span,
+        );
+        return Ok(dst);
+    }
+    Err(CompileError::Unsupported {
+        node: format!("private name `#{name}` missing runtime key binding"),
+        span,
+    })
+}
+
+pub(crate) fn emit_private_has_throw(
+    cx: &mut Compiler,
+    obj_reg: u16,
+    key_reg: u16,
+    span: (u32, u32),
+) -> Result<(), CompileError> {
+    let found = cx.alloc_scratch();
+    cx.emit(
+        Op::HasProperty,
+        [
+            Operand::Register(found),
+            Operand::Register(key_reg),
+            Operand::Register(obj_reg),
+        ],
+        span,
+    );
+    let ok = cx.emit_branch_placeholder(Op::JumpIfTrue, Some(found), span);
+    let message_reg = cx.alloc_scratch();
+    let message = cx.intern_string_constant(
+        "Cannot write private member to an object whose class did not declare it",
+    );
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(message_reg), Operand::ConstIndex(message)],
+        span,
+    );
+    let error_reg = cx.alloc_scratch();
+    let kind = cx.intern_string_constant("TypeError");
+    cx.emit(
+        Op::NewBuiltinError,
+        [
+            Operand::Register(error_reg),
+            Operand::ConstIndex(kind),
+            Operand::Register(message_reg),
+        ],
+        span,
+    );
+    cx.emit(Op::Throw, [Operand::Register(error_reg)], span);
+    cx.patch_branch_to_here(ok);
+    Ok(())
+}
+
+fn emit_private_symbol_key(
+    cx: &mut Compiler,
+    name: &str,
+    span: (u32, u32),
+) -> Result<u16, CompileError> {
+    let symbol_reg = cx.alloc_scratch();
+    let symbol_const = cx.intern_string_constant("Symbol");
+    cx.emit(
+        Op::LoadGlobalOrThrow,
+        [
+            Operand::Register(symbol_reg),
+            Operand::ConstIndex(symbol_const),
+        ],
+        span,
+    );
+    let desc_reg = cx.alloc_scratch();
+    let desc = cx.intern_string_constant(&format!("#{name}"));
+    cx.emit(
+        Op::LoadString,
+        [Operand::Register(desc_reg), Operand::ConstIndex(desc)],
+        span,
+    );
+    let key_reg = cx.alloc_scratch();
+    cx.emit(
+        Op::Call,
+        [
+            Operand::Register(key_reg),
+            Operand::Register(symbol_reg),
+            Operand::ConstIndex(1),
+            Operand::Register(desc_reg),
+        ],
+        span,
+    );
+    Ok(key_reg)
 }

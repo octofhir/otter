@@ -361,7 +361,9 @@ fn construct_typed_array_with_roots(
                 let remaining = buf_len - byte_offset;
                 if !remaining.is_multiple_of(bpe) {
                     return Err(VmError::RangeError {
-                        message: format!("buffer length minus the offset must be a multiple of {bpe}"),
+                        message: format!(
+                            "buffer length minus the offset must be a multiple of {bpe}"
+                        ),
                     });
                 }
                 remaining / bpe
@@ -370,7 +372,9 @@ fn construct_typed_array_with_roots(
                 let remaining = buf_len - byte_offset;
                 if !remaining.is_multiple_of(bpe) {
                     return Err(VmError::RangeError {
-                        message: format!("buffer length minus the offset must be a multiple of {bpe}"),
+                        message: format!(
+                            "buffer length minus the offset must be a multiple of {bpe}"
+                        ),
                     });
                 }
                 remaining / bpe

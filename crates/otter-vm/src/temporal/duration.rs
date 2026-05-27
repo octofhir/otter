@@ -12,11 +12,11 @@ use std::str::FromStr;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
+use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::helpers::{
     arg_or_undef, js_string_value, make_temporal, opt_integer_if_integral, parse_rounding_options,
     require_construct, require_duration, temporal_err,
 };
-use crate::temporal::helpers::parse_to_string_rounding_options;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -291,13 +291,19 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     if let Some(v) = optional_field(&obj, "seconds", heap).map_err(|e| temporal_err(e, CLASS))? {
         p.seconds = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "milliseconds", heap).map_err(|e| temporal_err(e, CLASS))? {
+    if let Some(v) =
+        optional_field(&obj, "milliseconds", heap).map_err(|e| temporal_err(e, CLASS))?
+    {
         p.milliseconds = Some(v);
     }
-    if let Some(v) = optional_field(&obj, "microseconds", heap).map_err(|e| temporal_err(e, CLASS))? {
+    if let Some(v) =
+        optional_field(&obj, "microseconds", heap).map_err(|e| temporal_err(e, CLASS))?
+    {
         p.microseconds = Some(v as i128);
     }
-    if let Some(v) = optional_field(&obj, "nanoseconds", heap).map_err(|e| temporal_err(e, CLASS))? {
+    if let Some(v) =
+        optional_field(&obj, "nanoseconds", heap).map_err(|e| temporal_err(e, CLASS))?
+    {
         p.nanoseconds = Some(v as i128);
     }
     let result =

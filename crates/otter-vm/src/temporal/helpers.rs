@@ -381,13 +381,12 @@ pub fn parse_to_string_rounding_options(
         })?);
     }
     if let Some(name) = read_string_field(obj, "roundingMode", heap) {
-        opts.rounding_mode =
-            Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(|_| {
-                NativeError::RangeError {
-                    name: class,
-                    reason: "invalid `roundingMode`".to_string(),
-                }
-            })?);
+        opts.rounding_mode = Some(temporal_rs::options::RoundingMode::from_str(&name).map_err(
+            |_| NativeError::RangeError {
+                name: class,
+                reason: "invalid `roundingMode`".to_string(),
+            },
+        )?);
     }
     if let Some(val) = object::get(obj, heap, "fractionalSecondDigits")
         && !val.is_undefined()
@@ -667,19 +666,21 @@ pub fn parse_calendar_fields(
         f.day = Some(v.clamp(0, u8::MAX as i64) as u8);
     }
     if let Some(s) = read_string_field(obj, "monthCode", heap) {
-        let code =
-            temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| NativeError::TypeError {
+        let code = temporal_rs::MonthCode::try_from_utf8(s.as_bytes()).map_err(|_| {
+            NativeError::TypeError {
                 name: class,
                 reason: "invalid monthCode".to_string(),
-            })?;
+            }
+        })?;
         f.month_code = Some(code);
     }
     if let Some(s) = read_string_field(obj, "era", heap) {
-        let era =
-            temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| NativeError::RangeError {
+        let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
+            NativeError::RangeError {
                 name: class,
                 reason: "invalid era".to_string(),
-            })?;
+            }
+        })?;
         f.era = Some(era);
     }
     if let Some(v) = read_partial_integer(obj, "eraYear", heap, class)? {
@@ -721,11 +722,12 @@ pub fn parse_year_month_fields(
         f.month_code = Some(code);
     }
     if let Some(s) = read_string_field(obj, "era", heap) {
-        let era =
-            temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| NativeError::RangeError {
+        let era = temporal_rs::TinyAsciiStr::<19>::try_from_str(&s).map_err(|_| {
+            NativeError::RangeError {
                 name: class,
                 reason: "invalid era".to_string(),
-            })?;
+            }
+        })?;
         f.era = Some(era);
     }
     if let Some(v) = read_partial_integer(obj, "eraYear", heap, class)? {

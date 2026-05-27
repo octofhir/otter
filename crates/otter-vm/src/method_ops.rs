@@ -375,6 +375,15 @@ impl Interpreter {
             self.typed_array_slice_dispatch(stack, context, &t, &arg_values, dst)?;
             return Ok(());
         }
+        // §23.2.3.27 `%TypedArray%.prototype.subarray` likewise coerces
+        // its operands through `ToIntegerOrInfinity` and allocates its
+        // result view through `TypedArraySpeciesCreate`.
+        if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
+            && name == "subarray"
+        {
+            self.typed_array_subarray_dispatch(stack, context, &t, &arg_values, dst)?;
+            return Ok(());
+        }
         // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
         // `replaceAll` with a callable replaceValue dispatch through
         // the interpreter to invoke the callback. The intrinsic
@@ -1778,6 +1787,26 @@ impl Interpreter {
         exemplar: &crate::binary::typed_array::JsTypedArray,
         length: usize,
     ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
+        let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
+        argv.push(Value::number(NumberValue::from_f64(length as f64)));
+        self.typed_array_create_via_species(context, exemplar, argv, Some(length))
+    }
+
+    /// §23.2.4.2 `TypedArrayCreate(SpeciesConstructor(exemplar), argv)`.
+    /// Shared core for the length form (`map` / `filter` / `slice`,
+    /// `min_length = Some`) and the `« buffer, byteOffset, length »`
+    /// form (`subarray`, `min_length = None`): resolves the species
+    /// constructor, constructs the result, and validates it is a
+    /// non-detached TypedArray (plus the `[[ArrayLength]] >= length`
+    /// check that only applies when the argument list is a single
+    /// Number).
+    fn typed_array_create_via_species(
+        &mut self,
+        context: &ExecutionContext,
+        exemplar: &crate::binary::typed_array::JsTypedArray,
+        argv: SmallVec<[Value; 8]>,
+        min_length: Option<usize>,
+    ) -> Result<crate::binary::typed_array::JsTypedArray, VmError> {
         let exemplar_value = Value::typed_array(*exemplar);
         let default_name = exemplar.kind().name();
         let default_ctor =
@@ -1788,8 +1817,6 @@ impl Interpreter {
             })?;
         let constructor =
             self.species_constructor_value(context, &exemplar_value, &default_ctor)?;
-        let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
-        argv.push(Value::number(NumberValue::from_f64(length as f64)));
         let result = self.run_construct_sync(context, &constructor, constructor, argv)?;
         let Some(new_ta) = result.as_typed_array(&self.gc_heap) else {
             return Err(VmError::TypeError {
@@ -1802,13 +1829,57 @@ impl Interpreter {
                     .to_string(),
             });
         }
-        if new_ta.length(&self.gc_heap) < length {
+        if let Some(min) = min_length
+            && new_ta.length(&self.gc_heap) < min
+        {
             return Err(VmError::TypeError {
                 message: "Species constructor returned a TypedArray smaller than required"
                     .to_string(),
             });
         }
         Ok(new_ta)
+    }
+
+    /// §23.2.3.27 `%TypedArray%.prototype.subarray(begin, end)`. Builds
+    /// a new view over the *same* buffer: `begin` / `end` coerce
+    /// through `ToIntegerOrInfinity`, then
+    /// `TypedArraySpeciesCreate(O, « buffer, beginByteOffset, length »)`
+    /// (the buffer form, so no result-length check) allocates the view.
+    fn typed_array_subarray_dispatch(
+        &mut self,
+        stack: &mut SmallVec<[Frame; 8]>,
+        context: &ExecutionContext,
+        t: &crate::binary::typed_array::JsTypedArray,
+        args: &SmallVec<[Value; 8]>,
+        dst: u16,
+    ) -> Result<(), VmError> {
+        let buffer = t.buffer(&self.gc_heap);
+        // §23.2.3.27 step 4 — `[[ArrayLength]]` is `0` for a detached
+        // buffer; `subarray` does not itself throw on detachment.
+        let src_len = t.length(&self.gc_heap) as i64;
+        let begin = self.integer_or_infinity_for_arg(context, args.first())?;
+        let begin_index = relative_index_clamp(begin, src_len);
+        let relative_end = match args.get(1) {
+            None => src_len as f64,
+            Some(v) if v.is_undefined() => src_len as f64,
+            Some(_) => self.integer_or_infinity_for_arg(context, args.get(1))?,
+        };
+        let end_index = relative_index_clamp(relative_end, src_len);
+        let new_length = (end_index - begin_index).max(0) as usize;
+        let bpe = t.kind().bytes_per_element();
+        let begin_byte_offset = t.byte_offset(&self.gc_heap) + begin_index as usize * bpe;
+
+        let top_idx = stack.len() - 1;
+        stack[top_idx].advance_pc(self.current_byte_len)?;
+
+        let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
+        argv.push(Value::array_buffer(buffer));
+        argv.push(Value::number(NumberValue::from_f64(begin_byte_offset as f64)));
+        argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
+        let a = self.typed_array_create_via_species(context, t, argv, None)?;
+        let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
+        write_register(frame_top, dst, Value::typed_array(a))?;
+        Ok(())
     }
 
     /// §23.2.3.26 `%TypedArray%.prototype.slice(start, end)`. Coerces

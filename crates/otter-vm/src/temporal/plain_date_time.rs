@@ -100,21 +100,33 @@ fn parse_plain_date_time_arg(
     v: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::PlainDateTime, NativeError> {
+    // §ToTemporalDateTime: ZonedDateTime projects onto its wall-clock
+    // date-time; a plain object is read as a date-time property bag; a
+    // string is parsed as ISO.
     if let Some(t) = v.as_temporal(heap) {
         match t.payload_clone(heap) {
             TemporalPayload::PlainDateTime(v) => Ok(v),
+            TemporalPayload::ZonedDateTime(zdt) => Ok(zdt.to_plain_date_time()),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "argument must be a Temporal.PlainDateTime".to_string(),
             }),
         }
+    } else if let Some(obj) = v.as_object() {
+        let fields = parse_date_time_fields(obj, heap, CLASS)?;
+        let partial = temporal_rs::partial::PartialDateTime {
+            fields,
+            calendar: temporal_rs::Calendar::default(),
+        };
+        temporal_rs::PlainDateTime::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(heap) {
         temporal_rs::PlainDateTime::from_utf8(s.to_lossy_string(heap).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "argument must be a Temporal.PlainDateTime or ISO string".to_string(),
+            reason: "argument must be a Temporal.PlainDateTime, ISO string, or date-time-like object"
+                .to_string(),
         })
     }
 }

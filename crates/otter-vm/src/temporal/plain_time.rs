@@ -82,21 +82,30 @@ fn parse_plain_time_arg(
     v: &Value,
     heap: &otter_gc::GcHeap,
 ) -> Result<temporal_rs::PlainTime, NativeError> {
+    // §ToTemporalTime: PlainDateTime / ZonedDateTime project onto
+    // their wall-clock time; a plain object is read as a time
+    // property bag; a string is parsed as ISO.
     if let Some(t) = v.as_temporal(heap) {
         match t.payload_clone(heap) {
             TemporalPayload::PlainTime(v) => Ok(v),
+            TemporalPayload::PlainDateTime(pdt) => Ok(pdt.to_plain_time()),
+            TemporalPayload::ZonedDateTime(zdt) => Ok(zdt.to_plain_time()),
             _ => Err(NativeError::TypeError {
                 name: CLASS,
                 reason: "argument must be a Temporal.PlainTime".to_string(),
             }),
         }
+    } else if let Some(obj) = v.as_object() {
+        let partial = parse_partial_time(obj, heap, CLASS)?;
+        temporal_rs::PlainTime::from_partial(partial, None).map_err(|e| temporal_err(e, CLASS))
     } else if let Some(s) = v.as_string(heap) {
         temporal_rs::PlainTime::from_utf8(s.to_lossy_string(heap).as_bytes())
             .map_err(|e| temporal_err(e, CLASS))
     } else {
         Err(NativeError::TypeError {
             name: CLASS,
-            reason: "argument must be a Temporal.PlainTime or ISO string".to_string(),
+            reason: "argument must be a Temporal.PlainTime, ISO string, or time-like object"
+                .to_string(),
         })
     }
 }

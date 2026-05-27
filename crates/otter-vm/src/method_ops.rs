@@ -431,81 +431,20 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
-        // §23.1.3.30 — `sort` runs the re-entrant SortIndexedProperties
-        // driver (comparator validity, generic receiver, Get/Set/Delete
-        // + comparator re-entry, stable order).
-        if recv_value.is_array() && name == "sort" {
-            let comparefn = arg_values.first().copied().unwrap_or_else(Value::undefined);
-            let result =
-                self.array_sort(context, recv_value, comparefn, &[arg_values.as_slice()])?;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        // §23.1.3.1 — `concat` on an Array receiver funnels into the
-        // re-entrant driver (same path as `.call`), so spreadable
-        // arguments, `@@isConcatSpreadable`, and array-like `length` /
-        // indexed getters are observed.
-        if recv_value.is_array() && name == "concat" {
-            let result =
-                self.array_concat(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        // §23.1.3.26 / .34 — `shift` / `unshift` funnel through
-        // re-entrant drivers so inherited indices and strict
-        // length/set/delete failures match the `.call` bridge.
-        if recv_value.is_array() && matches!(name, "shift" | "unshift") {
-            let result = if name == "shift" {
-                self.array_shift(context, recv_value, &[arg_values.as_slice()])
-            } else {
-                self.array_unshift(context, recv_value, &arg_values, &[arg_values.as_slice()])
-            }?;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        // §23.1.3.4 — `copyWithin` reads length, coerces indices, then
-        // copies through live HasProperty/Get/Set/Delete.
-        if recv_value.is_array() && name == "copyWithin" {
-            let result =
-                self.array_copy_within(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        // §23.1.3.28 — `slice` allocates through ArraySpeciesCreate
-        // and copies with live HasProperty/Get semantics.
-        if recv_value.is_array() && name == "slice" {
-            let result =
-                self.array_slice(context, recv_value, &arg_values, &[arg_values.as_slice()])?;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` /
-        // `includes` on an Array receiver. The intrinsic-table impls
-        // walk only the dense element store, so they miss inherited /
-        // sparse indices and a getter that mutates the receiver
-        // mid-search. Route through the single re-entrant driver
-        // (shared with the `.call` path) while a context is in scope.
-        if recv_value.is_array() && matches!(name, "indexOf" | "lastIndexOf" | "includes") {
-            let search = arg_values.first().copied().unwrap_or_else(Value::undefined);
-            let from_arg = arg_values.get(1).copied();
-            let result = self.array_indexed_search(
+        // Non-callback Array methods that need live spec semantics all
+        // route through the same dispatcher used by the native
+        // `.call`/`.apply` bridge. This keeps the two VM entry ABIs
+        // but avoids maintaining two per-method switchboards.
+        if recv_value.is_array()
+            && let Some(result) = self.array_live_method_dispatch(
                 context,
-                recv_value,
                 name,
-                search,
-                from_arg,
+                recv_value,
+                &arg_values,
                 &[arg_values.as_slice()],
-            )?;
+            )
+        {
+            let result = result?;
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
             frame.advance_pc(self.current_byte_len)?;

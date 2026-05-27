@@ -71,6 +71,7 @@ fn array_or_object_length(args: &IntrinsicArgs<'_>) -> Result<usize, IntrinsicEr
 /// `RangeError` from the allocator is the spec-compliant outcome
 /// and we never reach a 4 GB pre-allocated `Vec`.
 const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
+const MAX_SPARSE_PREFIX_PROBE_LEN: usize = 1024;
 
 /// §7.3.18 LengthOfArrayLike — read `O.length`, ToLength-coerce,
 /// clamp to [`MAX_ARRAY_LIKE_PROBE_LEN`].
@@ -1928,113 +1929,13 @@ fn native_array_method(
         }
         out
     };
-    // §23.1.3.14 / .18 / .13 — `indexOf` / `lastIndexOf` / `includes`
-    // run through the single re-entrant driver so the `.call` /
-    // `.apply` path matches the Array-receiver fast path exactly
-    // (live per-index `[[Get]]`, observes getters / sparse / inherited
-    // indices). Falls through to the intrinsic table only when no
-    // execution context is available (cannot re-enter user code).
-    if matches!(name, "indexOf" | "lastIndexOf" | "includes") {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let search = args.first().copied().unwrap_or_else(Value::undefined);
-            let from_arg = coerced_args.get(1).copied();
-            let interp = ctx.interp_mut();
-            return interp
-                .array_indexed_search(&exec, receiver, name, search, from_arg, &[args])
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
-    // §23.1.3.16 — `join` on a non-Array receiver routes through the
-    // re-entrant driver so a `get length()` accessor, indexed getters,
-    // and user element `toString` are observed (and a primitive receiver
-    // boxes via `ToObject`). Dense `Value::Array` receivers fall through
-    // to the tight `impl_join` walk below.
-    if name == "join" && !receiver.is_array() {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let separator_arg = args.first().copied();
-            let interp = ctx.interp_mut();
-            return interp
-                .array_join(&exec, receiver, separator_arg, &[args])
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
-    // §23.1.3.1 — `concat` runs the re-entrant driver so
-    // `@@isConcatSpreadable`, a `length` getter, indexed getters, and
-    // array-like arguments are observed.
-    if name == "concat" {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let interp = ctx.interp_mut();
-            return interp
-                .array_concat(&exec, receiver, args, &[args])
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
-    // §23.1.3.30 — `sort` runs the re-entrant SortIndexedProperties driver.
-    if name == "sort" {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
-            let interp = ctx.interp_mut();
-            return interp
-                .array_sort(&exec, receiver, comparefn, &[args])
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
-    // §23.1.3.23 / .21 — `push` / `pop` on a non-Array receiver run the
-    // re-entrant driver (generic array-like `length`, Set/Delete + Set
-    // length throwing). Dense `Value::Array` keeps the fast intrinsic.
-    if matches!(name, "push" | "pop") && !receiver.is_array() {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let interp = ctx.interp_mut();
-            let result = if name == "push" {
-                interp.array_push(&exec, receiver, args, &[args])
-            } else {
-                interp.array_pop(&exec, receiver, &[args])
-            };
+    let exec = ctx.execution_context().cloned();
+    if let Some(exec) = exec {
+        let interp = ctx.interp_mut();
+        if let Some(result) =
+            interp.array_live_method_dispatch(&exec, name, receiver, &coerced_args, &[args])
+        {
             return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
-    // §23.1.3.26 / .34 — `shift` / `unshift` need the live `Get` /
-    // `HasProperty` / `Set` / `Delete` ladder so generic receivers,
-    // inherited indices, accessors, and frozen array length all behave
-    // like the spec path.
-    if matches!(name, "shift" | "unshift") {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let interp = ctx.interp_mut();
-            let result = if name == "shift" {
-                interp.array_shift(&exec, receiver, &[args])
-            } else {
-                interp.array_unshift(&exec, receiver, args, &[args])
-            };
-            return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
-    // §23.1.3.4 — `copyWithin` must read `length` before coercing
-    // target/start/end, then copy through live HasProperty/Get/Set/Delete.
-    if name == "copyWithin" {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let interp = ctx.interp_mut();
-            return interp
-                .array_copy_within(&exec, receiver, args, &[args])
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
-    // §23.1.3.28 — `slice` uses ArraySpeciesCreate, then copies
-    // only present indices through live HasProperty/Get and
-    // CreateDataPropertyOrThrow.
-    if name == "slice" {
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
-            let interp = ctx.interp_mut();
-            return interp
-                .array_slice(&exec, receiver, args, &[args])
-                .map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }
     }
     let allocation_roots = ctx.collect_native_roots();
@@ -2361,6 +2262,50 @@ impl Interpreter {
         } else {
             let idx = array_linear_search(self, context, o, name, search, from_arg)?;
             Ok(Value::number(NumberValue::from_f64(idx as f64)))
+        }
+    }
+
+    /// Shared router for non-callback Array methods whose spec
+    /// algorithms need interpreter re-entry. Both VM entry ABIs call
+    /// this one switchboard:
+    ///
+    /// - direct `arr.method(...)` through `CallMethodValue`
+    /// - reflective `Array.prototype.method.call(...)` through the
+    ///   native-function bridge
+    ///
+    /// Methods that are still safe on the intrinsic table return
+    /// `None`.
+    pub(crate) fn array_live_method_dispatch(
+        &mut self,
+        context: &ExecutionContext,
+        name: &str,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Option<Result<Value, VmError>> {
+        match name {
+            "indexOf" | "lastIndexOf" | "includes" => {
+                let search = args.first().copied().unwrap_or_else(Value::undefined);
+                let from_arg = args.get(1).copied();
+                Some(self.array_indexed_search(context, receiver, name, search, from_arg, roots))
+            }
+            "join" if !receiver.is_array() => {
+                let separator_arg = args.first().copied();
+                Some(self.array_join(context, receiver, separator_arg, roots))
+            }
+            "concat" => Some(self.array_concat(context, receiver, args, roots)),
+            "sort" => {
+                let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
+                Some(self.array_sort(context, receiver, comparefn, roots))
+            }
+            "push" if !receiver.is_array() => Some(self.array_push(context, receiver, args, roots)),
+            "pop" if !receiver.is_array() => Some(self.array_pop(context, receiver, roots)),
+            "shift" => Some(self.array_shift(context, receiver, roots)),
+            "unshift" => Some(self.array_unshift(context, receiver, args, roots)),
+            "copyWithin" => Some(self.array_copy_within(context, receiver, args, roots)),
+            "slice" => Some(self.array_slice(context, receiver, args, roots)),
+            "splice" => Some(self.array_splice(context, receiver, args, roots)),
+            _ => None,
         }
     }
 
@@ -2693,12 +2638,19 @@ impl Interpreter {
         o: Value,
         len: f64,
     ) -> Result<(), VmError> {
-        if let Some(arr) = o.as_array()
-            && !crate::array::length_writable(arr, self.gc_heap())
-        {
-            return Err(VmError::TypeError {
-                message: "Cannot assign to read only property 'length' of object".to_string(),
-            });
+        if let Some(arr) = o.as_array() {
+            if !crate::array::length_writable(arr, self.gc_heap()) {
+                return Err(VmError::TypeError {
+                    message: "Cannot assign to read only property 'length' of object".to_string(),
+                });
+            }
+        } else {
+            return self.array_set_property_throwing(
+                context,
+                o,
+                "length",
+                Value::number(NumberValue::from_f64(len)),
+            );
         }
         let ok = self.ordinary_set_data_value(
             context,
@@ -2823,6 +2775,22 @@ impl Interpreter {
         } else {
             Ok(n.min(len as f64) as usize)
         }
+    }
+
+    fn array_clamped_count(
+        &mut self,
+        context: &ExecutionContext,
+        arg: &Value,
+        max: usize,
+    ) -> Result<usize, VmError> {
+        let n = self.coerce_to_number(context, arg)?.as_f64();
+        if n.is_nan() || n <= 0.0 {
+            return Ok(0);
+        }
+        if n.is_infinite() {
+            return Ok(max);
+        }
+        Ok((n.trunc() as usize).min(max))
     }
 
     /// §23.1.3.23 `Array.prototype.push` over a generic array-like
@@ -3270,11 +3238,6 @@ impl Interpreter {
         length: usize,
         roots: &[&[Value]],
     ) -> Result<Value, VmError> {
-        if length > u32::MAX as usize {
-            return Err(VmError::RangeError {
-                message: "Invalid array length".to_string(),
-            });
-        }
         if !self.array_species_is_array(context, original)? {
             return self.array_create_with_length(original, length, roots);
         }
@@ -3297,6 +3260,11 @@ impl Interpreter {
         length: usize,
         roots: &[&[Value]],
     ) -> Result<Value, VmError> {
+        if length > u32::MAX as usize {
+            return Err(VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            });
+        }
         let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             receiver_root.trace_value_slots(visit);
             for root in roots {
@@ -3403,6 +3371,260 @@ impl Interpreter {
             }
         }
         Ok(offsets)
+    }
+
+    /// §23.1.3.31 `Array.prototype.splice`: copy the deleted range
+    /// into a species-created array, shift the tail in-place, write
+    /// inserted items, and update `length`, all through live
+    /// HasProperty/Get/Set/Delete operations.
+    pub(crate) fn array_splice(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let actual_start = if args.is_empty() {
+            0
+        } else {
+            self.array_relative_index(context, args.first(), 0.0, len)?
+        };
+        let insert_count = args.len().saturating_sub(2);
+        let actual_delete_count = match args.len() {
+            0 => 0,
+            1 => len.saturating_sub(actual_start),
+            _ => self.array_clamped_count(context, &args[1], len.saturating_sub(actual_start))?,
+        };
+        let new_len = len
+            .checked_sub(actual_delete_count)
+            .and_then(|n| n.checked_add(insert_count))
+            .ok_or_else(|| VmError::TypeError {
+                message: "Invalid array length".to_string(),
+            })?;
+        if new_len > 9_007_199_254_740_991usize {
+            return Err(VmError::TypeError {
+                message: "Invalid array length".to_string(),
+            });
+        }
+
+        let removed = self.array_species_create(context, o, actual_delete_count, roots)?;
+        if actual_delete_count <= MAX_ARRAY_LIKE_PROBE_LEN {
+            for n in 0..actual_delete_count {
+                self.splice_copy_deleted_index(context, o, removed, actual_start + n, n)?;
+            }
+        } else {
+            for n in self.splice_sparse_offsets(o, len, actual_start, actual_delete_count)? {
+                self.splice_copy_deleted_index(context, o, removed, actual_start + n, n)?;
+            }
+        }
+        self.array_set_property_throwing(
+            context,
+            removed,
+            "length",
+            Value::number(NumberValue::from_f64(actual_delete_count as f64)),
+        )?;
+
+        if insert_count < actual_delete_count {
+            self.splice_shift_left(
+                context,
+                o,
+                len,
+                actual_start,
+                actual_delete_count,
+                insert_count,
+            )?;
+        } else if insert_count > actual_delete_count {
+            self.splice_shift_right(
+                context,
+                o,
+                len,
+                actual_start,
+                actual_delete_count,
+                insert_count,
+            )?;
+        }
+
+        for (offset, value) in args.iter().skip(2).copied().enumerate() {
+            let key = format_index_key((actual_start + offset) as f64);
+            self.array_set_property_throwing(context, o, &key, value)?;
+        }
+        self.array_set_length_throwing(context, o, new_len as f64)?;
+        Ok(removed)
+    }
+
+    fn splice_copy_deleted_index(
+        &mut self,
+        context: &ExecutionContext,
+        from_object: Value,
+        to_object: Value,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<(), VmError> {
+        let from = format_index_key(from_index as f64);
+        if !self.array_method_has_property(context, from_object, &from)? {
+            return Ok(());
+        }
+        let value = self.array_method_get_property(context, from_object, &from)?;
+        let to = format_index_key(to_index as f64);
+        self.create_data_property_or_throw(context, to_object, &to, value)
+    }
+
+    fn splice_shift_left(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        len: usize,
+        actual_start: usize,
+        actual_delete_count: usize,
+        insert_count: usize,
+    ) -> Result<(), VmError> {
+        let shift = actual_delete_count - insert_count;
+        let tail_count = len.saturating_sub(actual_start + actual_delete_count);
+        if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
+            for k in actual_start..len.saturating_sub(actual_delete_count) {
+                self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+            }
+            for k in (len - shift)..len {
+                let key = format_index_key(k as f64);
+                self.array_delete_property_throwing(context, o, &key)?;
+            }
+            return Ok(());
+        }
+
+        let candidates =
+            self.splice_shift_candidates(o, len, actual_start, actual_delete_count, insert_count)?;
+        for k in candidates {
+            self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+        }
+        let own_indices = self.splice_own_indices(o, len)?;
+        for k in own_indices.range((len - shift)..len) {
+            let key = format_index_key(*k as f64);
+            self.array_delete_property_throwing(context, o, &key)?;
+        }
+        Ok(())
+    }
+
+    fn splice_shift_right(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        len: usize,
+        actual_start: usize,
+        actual_delete_count: usize,
+        insert_count: usize,
+    ) -> Result<(), VmError> {
+        let tail_count = len.saturating_sub(actual_start + actual_delete_count);
+        if tail_count <= MAX_ARRAY_LIKE_PROBE_LEN {
+            for k in (actual_start..len.saturating_sub(actual_delete_count)).rev() {
+                self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+            }
+            return Ok(());
+        }
+
+        let candidates =
+            self.splice_shift_candidates(o, len, actual_start, actual_delete_count, insert_count)?;
+        for k in candidates.into_iter().rev() {
+            self.splice_move_or_delete(context, o, k + actual_delete_count, k + insert_count)?;
+        }
+        Ok(())
+    }
+
+    fn splice_move_or_delete(
+        &mut self,
+        context: &ExecutionContext,
+        o: Value,
+        from_index: usize,
+        to_index: usize,
+    ) -> Result<(), VmError> {
+        let from = format_index_key(from_index as f64);
+        let to = format_index_key(to_index as f64);
+        if self.array_method_has_property(context, o, &from)? {
+            let value = self.array_method_get_property(context, o, &from)?;
+            self.array_set_property_throwing(context, o, &to, value)
+        } else {
+            self.array_delete_property_throwing(context, o, &to)
+        }
+    }
+
+    fn splice_sparse_offsets(
+        &mut self,
+        o: Value,
+        len: usize,
+        start: usize,
+        count: usize,
+    ) -> Result<std::collections::BTreeSet<usize>, VmError> {
+        let mut offsets = std::collections::BTreeSet::new();
+        offsets.extend(0..count.min(MAX_SPARSE_PREFIX_PROBE_LEN));
+        for index in self.splice_chain_indices(o, len)? {
+            if index >= start && index < start.saturating_add(count) {
+                offsets.insert(index - start);
+            }
+        }
+        Ok(offsets)
+    }
+
+    fn splice_shift_candidates(
+        &mut self,
+        o: Value,
+        len: usize,
+        actual_start: usize,
+        actual_delete_count: usize,
+        insert_count: usize,
+    ) -> Result<std::collections::BTreeSet<usize>, VmError> {
+        let mut candidates = std::collections::BTreeSet::new();
+        let tail_start = actual_start + actual_delete_count;
+        let tail_end = len;
+        let target_start = actual_start + insert_count;
+        let target_end = len - actual_delete_count + insert_count;
+        for index in self.splice_chain_indices(o, len.max(target_end))? {
+            if index >= tail_start && index < tail_end {
+                candidates.insert(index - actual_delete_count);
+            }
+            if index >= target_start && index < target_end {
+                candidates.insert(index - insert_count);
+            }
+        }
+        candidates.retain(|k| *k >= actual_start && *k < len.saturating_sub(actual_delete_count));
+        Ok(candidates)
+    }
+
+    fn splice_chain_indices(
+        &mut self,
+        o: Value,
+        len: usize,
+    ) -> Result<std::collections::BTreeSet<usize>, VmError> {
+        let mut indices = std::collections::BTreeSet::new();
+        let mut current = o;
+        let mut hops = 0usize;
+        loop {
+            collect_own_indices_below(self, &current, len, &mut indices);
+            if hops >= object::PROTO_CHAIN_HARD_CAP {
+                break;
+            }
+            let proto = self.get_prototype_for_op(&current)?;
+            if proto.is_null() || !proto.is_object_type() {
+                break;
+            }
+            current = proto;
+            hops += 1;
+        }
+        Ok(indices)
+    }
+
+    fn splice_own_indices(
+        &self,
+        o: Value,
+        len: usize,
+    ) -> Result<std::collections::BTreeSet<usize>, VmError> {
+        let mut indices = std::collections::BTreeSet::new();
+        collect_own_indices_below(self, &o, len, &mut indices);
+        Ok(indices)
     }
 }
 

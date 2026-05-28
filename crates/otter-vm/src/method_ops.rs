@@ -197,8 +197,10 @@ impl Interpreter {
             let promise = p;
             if let Some(bag) = promise.expando(&self.gc_heap)
                 && let Some(method) = crate::object::get(bag, &self.gc_heap, name)
-                && self.is_callable_runtime(&method)
             {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
                 let top_idx = stack.len() - 1;
                 stack[top_idx].advance_pc(self.current_byte_len)?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);

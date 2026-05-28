@@ -105,6 +105,10 @@ conformance-gated before the next starts.
     of undefined` instead of the internal `unknown intrinsic method`.
     Missing primitive / native-function methods likewise fall through to
     the shared non-callable TypeError path instead of `UnknownIntrinsic`.
+  - [x] Promise expando methods now shadow Promise.prototype even when
+    the own property is non-callable: `p.then = 1; p.then()` reports the
+    shared non-callable TypeError instead of falling through to the
+    builtin `then`.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

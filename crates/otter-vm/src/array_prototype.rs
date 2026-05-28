@@ -1,30 +1,30 @@
-//! `Array.prototype.*` non-callback intrinsic implementations.
+//! `Array.prototype.*` intrinsic table and interpreter-aware drivers.
 //!
-//! This module hosts methods that do **not** invoke a JS callback:
-//! `push`, `pop`, `shift`, `unshift`, `slice`, `concat`, `join`,
-//! `includes`, `indexOf`, `lastIndexOf`, `at`, `reverse`, `fill`,
-//! `flat`, `splice`, `sort` (default lexicographic). The callback-
-//! driven family (`forEach`, `map`, `filter`, `reduce`, `find`,
-//! `findIndex`, `every`, `some`, `flatMap`, `sort` with comparator)
-//! is dispatched by the interpreter in `do_call_method_value` so
-//! the callbacks run on the active VM stack via `run_callable_sync`.
+//! The legacy [`IntrinsicArgs`] table remains as the context-free
+//! fallback for simple methods. Methods whose algorithms observe user
+//! code (`Get`, `Set`, `LengthOfArrayLike`, species constructors,
+//! callbacks, comparators, or coercions) are routed through re-entrant
+//! `Interpreter::array_*` drivers so direct `arr.m()` calls and
+//! `Array.prototype.m.call(...)` share one implementation.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
+//! - `docs/method-dispatch-refactor.md`
 //!
 //! # Contents
 //! - [`ARRAY_PROTOTYPE_TABLE`] — declarative registry built with
-//!   the `intrinsics!` macro.
-//! - One private `impl_*` function per method.
+//!   the `intrinsics!` macro for the fallback path.
+//! - [`ARRAY_PROTOTYPE_METHODS`] — JS-visible native method specs.
+//! - `Interpreter::array_*` drivers for live generic Array semantics.
 //!
 //! # Invariants
-//! - Receivers must be `Value::Array`; `values()` also accepts
-//!   arguments-exotic objects because `%Array.prototype.values%`
-//!   is their spec `@@iterator`.
-//! - Other non-arrays raise `IntrinsicError::BadReceiver`.
-//! - Spec-mandated argument coercion (e.g., `slice` clamping
-//!   negatives) follows the foundation subset; rare edge cases
-//!   are documented inline.
+//! - Generic methods begin with `ToObject(this)` and
+//!   `LengthOfArrayLike` in the driver path.
+//! - Live drivers use VM property operations so accessors, inherited
+//!   indices, proxies, callbacks, and comparator calls re-enter through
+//!   the active [`ExecutionContext`].
+//! - Pathological array-like lengths are guarded before any dense
+//!   materialisation.
 
 use smallvec::SmallVec;
 
@@ -72,6 +72,7 @@ fn array_or_object_length(args: &IntrinsicArgs<'_>) -> Result<usize, IntrinsicEr
 /// and we never reach a 4 GB pre-allocated `Vec`.
 const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
 const MAX_SPARSE_PREFIX_PROBE_LEN: usize = 1024;
+const MAX_SAFE_ARRAY_LENGTH: usize = 9_007_199_254_740_991;
 
 /// §7.3.18 LengthOfArrayLike — read `O.length`, ToLength-coerce,
 /// clamp to [`MAX_ARRAY_LIKE_PROBE_LEN`].
@@ -2305,6 +2306,17 @@ impl Interpreter {
             "copyWithin" => Some(self.array_copy_within(context, receiver, args, roots)),
             "slice" => Some(self.array_slice(context, receiver, args, roots)),
             "splice" => Some(self.array_splice(context, receiver, args, roots)),
+            "toReversed" => Some(self.array_to_reversed(context, receiver, roots)),
+            "toSpliced" => Some(self.array_to_spliced(context, receiver, args, roots)),
+            "toSorted" => {
+                let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
+                Some(self.array_to_sorted(context, receiver, comparefn, roots))
+            }
+            "with" => {
+                let index = args.first().copied().unwrap_or_else(Value::undefined);
+                let value = args.get(1).copied().unwrap_or_else(Value::undefined);
+                Some(self.array_with(context, receiver, index, value, roots))
+            }
             _ => None,
         }
     }
@@ -3625,6 +3637,205 @@ impl Interpreter {
         let mut indices = std::collections::BTreeSet::new();
         collect_own_indices_below(self, &o, len, &mut indices);
         Ok(indices)
+    }
+
+    /// §23.1.3.39 `Array.prototype.toReversed`: copy every source
+    /// index with live `Get(O, from)` and materialise a fresh dense
+    /// Array. Unlike `reverse`, holes are read through as `undefined`.
+    pub(crate) fn array_to_reversed(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        self.ensure_change_by_copy_len(len)?;
+        let mut out = Vec::with_capacity(len);
+        for k in 0..len {
+            let from = format_index_key((len - k - 1) as f64);
+            out.push(self.array_method_get_property(context, o, &from)?);
+        }
+        self.array_create_from_dense_values(out)
+    }
+
+    /// §23.1.3.40 `Array.prototype.toSpliced`: non-mutating splice over
+    /// a live receiver. Head and tail slots use `Get`, so inherited
+    /// indices, accessors, and mutation caused by earlier coercions are
+    /// observed before the fresh dense result is allocated.
+    pub(crate) fn array_to_spliced(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let actual_start = self.array_relative_index(context, args.first(), 0.0, len)?;
+        let insert_count = args.len().saturating_sub(2);
+        let skip_count = match args.len() {
+            0 => 0,
+            1 => len.saturating_sub(actual_start),
+            _ => self.array_clamped_count(context, &args[1], len.saturating_sub(actual_start))?,
+        };
+        let new_len = len
+            .checked_sub(skip_count)
+            .and_then(|n| n.checked_add(insert_count))
+            .ok_or_else(|| VmError::TypeError {
+                message: "Invalid array length".to_string(),
+            })?;
+        if new_len > MAX_SAFE_ARRAY_LENGTH {
+            return Err(VmError::TypeError {
+                message: "Invalid array length".to_string(),
+            });
+        }
+        self.ensure_change_by_copy_len(new_len)?;
+
+        let mut out = Vec::with_capacity(new_len);
+        for k in 0..actual_start {
+            out.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
+        }
+        out.extend(args.iter().skip(2).copied());
+        for k in (actual_start + skip_count)..len {
+            out.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
+        }
+        self.array_create_from_dense_values(out)
+    }
+
+    /// §23.1.3.41 `Array.prototype.toSorted`: collect values with
+    /// read-through-holes semantics, run `SortCompare` through the
+    /// interpreter for comparator calls / `ToString`, then return a new
+    /// dense Array.
+    pub(crate) fn array_to_sorted(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        comparefn: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
+            return Err(VmError::TypeError {
+                message: "Array.prototype.toSorted comparator is not a function".to_string(),
+            });
+        }
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        self.ensure_change_by_copy_len(len)?;
+        let mut items = Vec::with_capacity(len);
+        for k in 0..len {
+            items.push(self.array_method_get_property(context, o, &format_index_key(k as f64))?);
+        }
+        let sorted = self.sort_merge(context, items, comparefn)?;
+        self.array_create_from_dense_values(sorted)
+    }
+
+    /// §23.1.3.42 `Array.prototype.with`: copy every index through
+    /// live `Get`, replacing one resolved relative index with `value`.
+    pub(crate) fn array_with(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        index: Value,
+        value: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        self.ensure_change_by_copy_len(len)?;
+        let actual = self.array_relative_index_strict(context, &index, len)?;
+        let mut out = Vec::with_capacity(len);
+        for k in 0..len {
+            if k == actual {
+                out.push(value);
+            } else {
+                out.push(self.array_method_get_property(
+                    context,
+                    o,
+                    &format_index_key(k as f64),
+                )?);
+            }
+        }
+        self.array_create_from_dense_values(out)
+    }
+
+    fn ensure_change_by_copy_len(&self, len: usize) -> Result<(), VmError> {
+        if len > u32::MAX as usize || len > MAX_ARRAY_LIKE_PROBE_LEN {
+            return Err(VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn array_relative_index_strict(
+        &mut self,
+        context: &ExecutionContext,
+        arg: &Value,
+        len: usize,
+    ) -> Result<usize, VmError> {
+        let n = self.coerce_to_number(context, arg)?.as_f64();
+        let relative = if n.is_nan() {
+            0.0
+        } else if n.is_infinite() {
+            n
+        } else {
+            n.trunc()
+        };
+        let actual = if relative < 0.0 {
+            len as f64 + relative
+        } else {
+            relative
+        };
+        if !actual.is_finite() || actual < 0.0 || actual >= len as f64 {
+            return Err(VmError::RangeError {
+                message: "index out of range".to_string(),
+            });
+        }
+        Ok(actual as usize)
+    }
+
+    fn array_create_from_dense_values(&mut self, values: Vec<Value>) -> Result<Value, VmError> {
+        if values.len() > u32::MAX as usize {
+            return Err(VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            });
+        }
+        let len = values.len();
+        let heap = self.gc_heap_mut();
+        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for value in &values {
+                value.trace_value_slots(visit);
+            }
+        };
+        let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
+            VmError::RangeError {
+                message: "Invalid array length".to_string(),
+            }
+        })?;
+        crate::array::with_elements_mut(arr, heap, |elements| {
+            elements.extend(values);
+        });
+        crate::array::set_length(arr, heap, len).map_err(|_| VmError::RangeError {
+            message: "Invalid array length".to_string(),
+        })?;
+        Ok(Value::array(arr))
     }
 }
 

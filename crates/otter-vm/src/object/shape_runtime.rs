@@ -145,7 +145,11 @@ impl ShapeRuntime {
         }
         let units: Vec<u16> = key.encode_utf16().collect();
         let id = JsStringId::new(self.next_string_id);
-        let handle = alloc_flat_string_body_with_roots(heap, id, &units, external_visit)?;
+        let mut visit_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            self.trace_roots(visitor);
+            external_visit(visitor);
+        };
+        let handle = alloc_flat_string_body_with_roots(heap, id, &units, &mut visit_roots)?;
         self.next_string_id = self.next_string_id.saturating_add(1);
         self.interned_keys.insert(key.to_owned(), handle);
         Ok(handle)
@@ -155,11 +159,16 @@ impl ShapeRuntime {
     pub(crate) fn child_with_roots(
         &mut self,
         heap: &mut GcHeap,
-        parent: ShapeHandle,
+        mut parent: ShapeHandle,
         key: &str,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-        let key_handle = self.intern_key_with_roots(heap, key, external_visit)?;
+        let mut visit_parent = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            let p = &mut parent as *mut ShapeHandle as *mut RawGc;
+            visitor(p);
+            external_visit(visitor);
+        };
+        let key_handle = self.intern_key_with_roots(heap, key, &mut visit_parent)?;
         let parent_id = heap.read_payload(parent, ShapeBody::id);
         let key_id = heap.read_payload(key_handle, JsStringBody::id);
         let transition_key = TransitionKey {
@@ -172,7 +181,12 @@ impl ShapeRuntime {
             return Ok(child);
         }
 
-        let child = alloc_child_shape_body_with_roots(heap, parent, key_handle, external_visit)?;
+        let mut visit_child_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            self.trace_roots(visitor);
+            external_visit(visitor);
+        };
+        let child =
+            alloc_child_shape_body_with_roots(heap, parent, key_handle, &mut visit_child_roots)?;
         self.transitions.insert(transition_key, child);
         self.notify_observer(heap, parent_id, child, key, false);
         Ok(child)

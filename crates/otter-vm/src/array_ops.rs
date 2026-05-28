@@ -205,6 +205,48 @@ impl Interpreter {
                     message: "iterator method is not callable".to_string(),
                 });
             }
+            if has_map && !is_builtin_iterable {
+                let (iterator, next_method) = self.get_iterator_sync(context, &items)?;
+                let anchor_base = self.push_iteration_anchor(iterator) - 1;
+                self.push_iteration_anchor(next_method);
+                self.push_iteration_anchor(items);
+                self.push_iteration_anchor(map_fn);
+                self.push_iteration_anchor(this_arg);
+                let mut mapped: Vec<Value> = Vec::new();
+                let mut index = 0usize;
+                let result = loop {
+                    match self.iterator_step_sync(context, &iterator, &next_method) {
+                        Ok(Some(value)) => {
+                            let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
+                            cb_args.push(value);
+                            cb_args.push(Value::number_i32(index as i32));
+                            match self.run_callable_sync(context, &map_fn, this_arg, cb_args) {
+                                Ok(mapped_value) => {
+                                    mapped.push(mapped_value);
+                                    self.push_iteration_anchor(mapped_value);
+                                    index = index.saturating_add(1);
+                                }
+                                Err(err) => {
+                                    let _ = self.iterator_close_sync(context, &iterator);
+                                    break Err(err);
+                                }
+                            }
+                        }
+                        Ok(None) => break Ok(mapped),
+                        Err(err) => {
+                            let _ = self.iterator_close_sync(context, &iterator);
+                            break Err(err);
+                        }
+                    }
+                };
+                self.pop_iteration_anchors_to(anchor_base);
+                let mapped = result?;
+                return Ok(Value::array(self.alloc_runtime_rooted_array_from_values(
+                    mapped,
+                    &[&items, &map_fn, &this_arg],
+                    &[],
+                )?));
+            }
             // `iterator_to_list_sync` short-circuits built-ins and
             // routes everything else through `GetIterator` /
             // `IteratorStep`.

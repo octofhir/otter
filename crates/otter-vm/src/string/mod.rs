@@ -115,11 +115,23 @@ impl JsString {
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn from_utf16_units(units: &[u16], heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
         let mut roots = no_extra_roots;
+        Self::from_utf16_units_with_roots(units, heap, &mut roots)
+    }
+
+    /// Construct a flat WTF-16 string body while exposing caller roots.
+    ///
+    /// # Errors
+    /// Surfaces [`OutOfMemory`] verbatim.
+    pub(crate) fn from_utf16_units_with_roots(
+        units: &[u16],
+        heap: &mut GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Self, OutOfMemory> {
         let handle = gc_body::alloc_flat_string_body_with_roots(
             heap,
             JsStringId::new(0),
             units,
-            &mut roots,
+            external_visit,
         )?;
         let cached_hash = hash_to_u32(gc_body::hash_utf16(units));
         Ok(Self {
@@ -136,6 +148,19 @@ impl JsString {
     pub fn from_str(s: &str, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
         let units: Vec<u16> = s.encode_utf16().collect();
         Self::from_utf16_units(&units, heap)
+    }
+
+    /// Construct from a Rust `&str` while exposing caller roots.
+    ///
+    /// # Errors
+    /// See [`Self::from_utf16_units_with_roots`].
+    pub(crate) fn from_str_with_roots(
+        s: &str,
+        heap: &mut GcHeap,
+        external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
+    ) -> Result<Self, OutOfMemory> {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        Self::from_utf16_units_with_roots(&units, heap, external_visit)
     }
 
     /// Construct from a Latin-1 / ASCII byte slice. Each byte

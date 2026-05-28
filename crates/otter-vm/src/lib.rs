@@ -1829,7 +1829,7 @@ impl Interpreter {
         parent: object::ShapeHandle,
         key: &str,
     ) -> Result<object::ShapeHandle, VmError> {
-        let roots = self.collect_runtime_roots();
+        let roots = self.collect_runtime_roots_without_shape_runtime();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -1865,7 +1865,7 @@ impl Interpreter {
         value: &Value,
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<object::ShapeHandle, VmError> {
-        let roots = self.collect_runtime_roots();
+        let roots = self.collect_runtime_roots_without_shape_runtime();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             extra_visit(visitor);
             for &slot in &roots {
@@ -1887,7 +1887,7 @@ impl Interpreter {
         obj: &mut object::JsObject,
         descriptor: &object::PropertyDescriptor,
     ) -> Result<object::ShapeHandle, VmError> {
-        let roots = self.collect_runtime_roots();
+        let roots = self.collect_runtime_roots_without_shape_runtime();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);

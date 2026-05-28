@@ -144,3 +144,28 @@ fn reserve_bytes_with_roots_preserves_external_stack_slot_during_emergency_gc() 
         "rooted leaf and reservation should both remain accounted"
     );
 }
+
+#[test]
+fn reserve_bytes_with_roots_rejects_impossible_request_without_gc() {
+    let mut heap = GcHeap::with_max_heap_bytes(8 * 1024).expect("heap");
+    let mut visited = false;
+    let mut external_visit = |_visitor: &mut dyn FnMut(*mut RawGc)| {
+        visited = true;
+    };
+
+    let err = heap
+        .reserve_bytes_with_roots(16 * 1024, &mut external_visit)
+        .expect_err("single reservation larger than cap cannot fit");
+
+    assert!(
+        !visited,
+        "impossible reservation should fail before emergency GC"
+    );
+    assert!(matches!(
+        err,
+        otter_gc::OutOfMemory::HeapCapExceeded {
+            requested_bytes: 16384,
+            heap_limit_bytes: 8192,
+        }
+    ));
+}

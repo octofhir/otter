@@ -52,6 +52,12 @@ impl Interpreter {
         roots
     }
 
+    pub(crate) fn collect_runtime_roots_without_shape_runtime(&self) -> Vec<*mut RawGc> {
+        let mut roots = Vec::new();
+        RuntimeState::new(self).trace_roots_without_shape_runtime(&mut |slot| roots.push(slot));
+        roots
+    }
+
     pub(crate) fn alloc_runtime_rooted_object_with_roots(
         &mut self,
         value_roots: &[&Value],

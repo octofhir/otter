@@ -47,7 +47,7 @@ impl FunctionKindPrototypes {
         let function_proto_value = Value::object(function_proto);
         let tag_sym = well_known.get(WellKnown::ToStringTag);
         let mut make = |tag: &'static str| -> Result<(JsObject, JsObject), JsSurfaceError> {
-            let proto = {
+            let mut proto = {
                 let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
                     function_proto_value.trace_value_slots(visitor);
                 };
@@ -55,12 +55,21 @@ impl FunctionKindPrototypes {
                     .map_err(|_| JsSurfaceError::OutOfMemory)?
             };
             object::set_prototype(proto, heap, Some(function_proto));
-            let tag_string =
-                JsString::from_str(tag, heap).map_err(|_| JsSurfaceError::OutOfMemory)?;
+            let tag_sym_root = tag_sym;
+            let tag_string = {
+                let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+                    function_proto_value.trace_value_slots(visitor);
+                    tag_sym_root.trace_value_slots(visitor);
+                    let p = &mut proto as *mut JsObject as *mut RawGc;
+                    visitor(p);
+                };
+                JsString::from_str_with_roots(tag, heap, &mut visit)
+                    .map_err(|_| JsSurfaceError::OutOfMemory)?
+            };
             object::define_own_symbol_property_partial(
                 proto,
                 heap,
-                tag_sym,
+                tag_sym_root,
                 object::PartialPropertyDescriptor {
                     value: Some(Value::string(tag_string)),
                     writable: Some(false),
@@ -124,15 +133,15 @@ impl FunctionKindPrototypes {
 
     pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
         for object in [
-            self.generator_constructor,
-            self.generator_prototype,
-            self.async_constructor,
-            self.async_prototype,
-            self.async_generator_constructor,
-            self.async_generator_prototype,
+            &self.generator_constructor,
+            &self.generator_prototype,
+            &self.async_constructor,
+            &self.async_prototype,
+            &self.async_generator_constructor,
+            &self.async_generator_prototype,
         ]
         .into_iter()
-        .flatten()
+        .filter_map(Option::as_ref)
         {
             object.trace_gc_roots(visitor);
         }

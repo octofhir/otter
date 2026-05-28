@@ -354,6 +354,10 @@ fn vm_to_native(err: VmError, name: &'static str) -> NativeError {
             name,
             reason: message,
         },
+        VmError::OutOfMemory { .. } => NativeError::RangeError {
+            name,
+            reason: err.to_string(),
+        },
         other => NativeError::TypeError {
             name,
             reason: other.to_string(),

@@ -97,11 +97,18 @@ impl Interpreter {
     ) -> Result<object::JsObject, VmError> {
         let proto = self.error_classes.prototype(kind);
         let proto_value = Value::object(proto);
-        let obj =
-            self.alloc_stack_rooted_object_with_extra_roots(stack, &[message_value, &proto_value])?;
+        let message_gc_value = message
+            .as_ref()
+            .map(|text| JsString::from_str(text, self.gc_heap_mut()).map(Value::string))
+            .transpose()?;
+        let mut extra_roots: SmallVec<[&Value; 4]> =
+            smallvec::smallvec![message_value, &proto_value];
+        if let Some(ref message_gc_value) = message_gc_value {
+            extra_roots.push(message_gc_value);
+        }
+        let obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &extra_roots)?;
         object::set_prototype(obj, &mut self.gc_heap, Some(proto));
-        if let Some(text) = message {
-            let s = JsString::from_str(&text, self.gc_heap_mut())?;
+        if let Some(message_gc_value) = message_gc_value {
             // §20.5.1.1 step 4.c — `msgDesc` is `{ [[Value]]: msg,
             // [[Writable]]: true, [[Enumerable]]: false,
             // [[Configurable]]: true }`. Ordinary `set` would install
@@ -111,7 +118,7 @@ impl Interpreter {
                 obj,
                 &mut self.gc_heap,
                 "message",
-                object::PropertyDescriptor::data(Value::string(s), true, false, true),
+                object::PropertyDescriptor::data(message_gc_value, true, false, true),
             );
         }
         Ok(obj)

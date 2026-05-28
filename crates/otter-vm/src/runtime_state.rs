@@ -75,6 +75,14 @@ impl<'a> RuntimeState<'a> {
     /// - function-user-prop bag;
     /// - pending generator / uncaught throw side-channels.
     pub fn trace_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_roots_inner(visitor, true);
+    }
+
+    pub(crate) fn trace_roots_without_shape_runtime(&self, visitor: &mut GcRootVisitor<'_>) {
+        self.trace_roots_inner(visitor, false);
+    }
+
+    fn trace_roots_inner(&self, visitor: &mut GcRootVisitor<'_>, include_shape_runtime: bool) {
         let interp = self.interp;
         // 1) Shared globalThis.
         interp.global_this().trace_gc_roots(visitor);
@@ -105,7 +113,9 @@ impl<'a> RuntimeState<'a> {
             value.trace_value_slots(visitor);
         }
         // 7) GC-managed hidden-class root/key/transition side tables.
-        interp.shape_runtime_for_trace().trace_roots(visitor);
+        if include_shape_runtime {
+            interp.shape_runtime_for_trace().trace_roots(visitor);
+        }
         // 7b) Store-property ICs can retain cached GC shape transitions.
         for ic in interp.store_property_ics_for_trace() {
             ic.trace_roots(visitor);

@@ -257,6 +257,13 @@ impl GcHeap {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
         }
+        if bytes > self.max_heap_bytes {
+            self.oom_flag.store(true, Ordering::Relaxed);
+            return Err(OutOfMemory::HeapCapExceeded {
+                requested_bytes: bytes,
+                heap_limit_bytes: self.max_heap_bytes,
+            });
+        }
         self.account_or_collect(bytes)?;
         self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
         Ok(())
@@ -284,6 +291,13 @@ impl GcHeap {
         if self.max_heap_bytes == 0 {
             self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);
             return Ok(());
+        }
+        if bytes > self.max_heap_bytes {
+            self.oom_flag.store(true, Ordering::Relaxed);
+            return Err(OutOfMemory::HeapCapExceeded {
+                requested_bytes: bytes,
+                heap_limit_bytes: self.max_heap_bytes,
+            });
         }
         self.account_or_collect_with_roots(bytes, external_visit)?;
         self.reserved_bytes = self.reserved_bytes.saturating_add(bytes);

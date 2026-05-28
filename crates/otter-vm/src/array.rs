@@ -856,7 +856,8 @@ pub fn set_named_property(
         if (new_len as f64) != number_len.as_f64() {
             return Ok(());
         }
-        return set_length(arr, heap, new_len as usize);
+        let _ = set_length_checked(arr, heap, new_len as usize)?;
+        return Ok(());
     }
     if let Some(idx) = crate::object::array_index_property_name(key) {
         return set(arr, heap, idx as usize, value);
@@ -1361,6 +1362,33 @@ mod tests {
         assert!(has_own_element(a, &heap, 2));
         // Out-of-range index is also absent.
         assert!(!has_own_element(a, &heap, 99));
+    }
+
+    #[test]
+    fn length_assignment_preserves_non_configurable_index() {
+        let mut heap = fresh_heap();
+        let a = from_elements_old_for_fixture(
+            &mut heap,
+            [
+                Value::number_i32(0),
+                Value::number_i32(1),
+                Value::number_i32(2),
+                Value::number_i32(3),
+            ],
+        )
+        .unwrap();
+        set_accessor(a, &mut heap, "2", Some(Value::undefined()), None);
+        set_property_flags(a, &mut heap, "2", PropertyFlags::new(false, false, false));
+
+        set_named_property(a, &mut heap, "length", Value::number_i32(2)).unwrap();
+
+        assert_eq!(len(a, &heap), 3);
+        assert!(get_accessor(a, &heap, "2").is_some());
+        assert_eq!(
+            get_property_flags(a, &heap, "2"),
+            Some(PropertyFlags::new(false, false, false))
+        );
+        assert!(!has_own_element(a, &heap, 3));
     }
 
     #[test]

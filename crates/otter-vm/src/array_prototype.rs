@@ -3945,6 +3945,24 @@ pub(crate) fn array_callback_native_dispatch(
             reason: "callback is not a function".to_string(),
         });
     }
+    let callback_roots = [receiver, callback, this_arg];
+    let output_target = match name {
+        "map" => Some(
+            interp
+                .array_species_create(&context, receiver, len, &[args, &callback_roots])
+                .map_err(|err| {
+                    crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+                })?,
+        ),
+        "filter" | "flatMap" => Some(
+            interp
+                .array_species_create(&context, receiver, 0, &[args, &callback_roots])
+                .map_err(|err| {
+                    crate::native_function::vm_to_native_error(err, "Array.prototype callback")
+                })?,
+        ),
+        _ => None,
+    };
     // `find` family visits every index `0..len` (an absent slot yields
     // `undefined` for the element); the rest skip absent indices.
     let visit_all = matches!(name, "find" | "findIndex" | "findLast" | "findLastIndex");
@@ -4000,10 +4018,10 @@ pub(crate) fn array_callback_native_dispatch(
     };
 
     let mut acc = Value::undefined();
-    let mut out: Vec<(usize, Value)> = Vec::new();
     let mut found_idx: Option<usize> = None;
     let mut found_val = Value::undefined();
     let mut bool_acc: bool = matches!(name, "every");
+    let mut target_index = 0usize;
     let mut reduce_has_init = args.len() >= 2;
     if (name == "reduce" || name == "reduceRight") && reduce_has_init {
         acc = args[1];
@@ -4099,9 +4117,26 @@ pub(crate) fn array_callback_native_dispatch(
             })?;
         match name {
             "forEach" => {}
-            "map" => out.push((idx, result)),
+            "map" => {
+                let target = output_target.ok_or(NativeError::TypeError {
+                    name: "map",
+                    reason: "missing output target".to_string(),
+                })?;
+                let key = format_index_key(idx as f64);
+                interp
+                    .create_data_property_or_throw(&context, target, &key, result)
+                    .map_err(|err| crate::native_function::vm_to_native_error(err, "map"))?;
+            }
             "filter" if result.to_boolean(interp.gc_heap()) => {
-                out.push((idx, v));
+                let target = output_target.ok_or(NativeError::TypeError {
+                    name: "filter",
+                    reason: "missing output target".to_string(),
+                })?;
+                let key = format_index_key(target_index as f64);
+                interp
+                    .create_data_property_or_throw(&context, target, &key, v)
+                    .map_err(|err| crate::native_function::vm_to_native_error(err, "filter"))?;
+                target_index += 1;
             }
             "find" | "findLast" if result.to_boolean(interp.gc_heap()) => {
                 found_val = v;
@@ -4134,10 +4169,30 @@ pub(crate) fn array_callback_native_dispatch(
                             els.iter().filter(|v| !v.is_hole()).cloned().collect()
                         });
                     for v in inner_vals {
-                        out.push((out.len(), v));
+                        let target = output_target.ok_or(NativeError::TypeError {
+                            name: "flatMap",
+                            reason: "missing output target".to_string(),
+                        })?;
+                        let key = format_index_key(target_index as f64);
+                        interp
+                            .create_data_property_or_throw(&context, target, &key, v)
+                            .map_err(|err| {
+                                crate::native_function::vm_to_native_error(err, "flatMap")
+                            })?;
+                        target_index += 1;
                     }
                 } else {
-                    out.push((out.len(), result));
+                    let target = output_target.ok_or(NativeError::TypeError {
+                        name: "flatMap",
+                        reason: "missing output target".to_string(),
+                    })?;
+                    let key = format_index_key(target_index as f64);
+                    interp
+                        .create_data_property_or_throw(&context, target, &key, result)
+                        .map_err(|err| {
+                            crate::native_function::vm_to_native_error(err, "flatMap")
+                        })?;
+                    target_index += 1;
                 }
             }
             _ => {}
@@ -4159,62 +4214,10 @@ pub(crate) fn array_callback_native_dispatch(
             }
             Ok(acc)
         }
-        "map" => {
-            // Densely materialise only up to the highest present
-            // index, then set the logical `length` to `len` (which is
-            // sparse-safe for huge lengths). Absent positions stay
-            // `undefined` in the dense region; the sparse tail is
-            // holes. Avoids a `len`-sized allocation when `len` is a
-            // pathological array-like length.
-            let dense_len = out.iter().map(|(i, _)| i + 1).max().unwrap_or(0).min(len);
-            let mut buf: Vec<Value> = vec![Value::undefined(); dense_len];
-            for (i, v) in out {
-                if i < dense_len {
-                    buf[i] = v;
-                }
-            }
-            let (interp, _) = ctx.interp_mut_and_context();
-            let heap = interp.gc_heap_mut();
-            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                for value in &buf {
-                    value.trace_value_slots(visit);
-                }
-            };
-            let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
-                NativeError::TypeError {
-                    name: "map",
-                    reason: "array allocation failed".to_string(),
-                }
-            })?;
-            crate::array::with_elements_mut(arr, heap, |elements| {
-                elements.extend(buf);
-            });
-            crate::array::set_length(arr, heap, len).map_err(|_| NativeError::RangeError {
-                name: "map",
-                reason: "Invalid array length".to_string(),
-            })?;
-            Ok(Value::array(arr))
-        }
-        "filter" | "flatMap" => {
-            let buf: Vec<Value> = out.into_iter().map(|(_, v)| v).collect();
-            let (interp, _) = ctx.interp_mut_and_context();
-            let heap = interp.gc_heap_mut();
-            let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                for value in &buf {
-                    value.trace_value_slots(visit);
-                }
-            };
-            let arr = crate::array::alloc_array_with_roots(heap, &mut visitor).map_err(|_| {
-                NativeError::TypeError {
-                    name: "filter",
-                    reason: "array allocation failed".to_string(),
-                }
-            })?;
-            crate::array::with_elements_mut(arr, heap, |elements| {
-                elements.extend(buf);
-            });
-            Ok(Value::array(arr))
-        }
+        "map" | "filter" | "flatMap" => output_target.ok_or(NativeError::TypeError {
+            name: "Array.prototype callback",
+            reason: "missing output target".to_string(),
+        }),
         _ => Err(NativeError::TypeError {
             name: "Array.prototype callback",
             reason: format!("unknown callback method '{name}'"),

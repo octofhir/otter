@@ -79,40 +79,21 @@ conformance-gated before the next starts.
       Latest broad gate: built-ins/Array 2776 pass, 222 fail,
       332 skip, 1 timeout, 0 crash.
     - [ ] TypedArray, Date, … same treatment.
-- [ ] **Stage 3** — single callback re-entry path (`invoke` →
-  `run_callable_sync`). **Array callback-dispatch map (measured
-  2026-05-27, the two mechanisms + their bugs):**
-  - **Dense fast path** `method_ops::array_callback_dispatch`
-    (`array_prototype.rs` body via the in-loop dispatcher) — used for
-    `arr.method(cb)` with a real `Value::Array` receiver. Uses a stack
-    frame per callback.
-  - **Generic path** `array_prototype::array_callback_native_dispatch`
-    (NativeCtx, `run_callable_sync`) — used for
-    `Array.prototype.X.call(arrayLike, cb)`. Builds a **one-shot
-    snapshot** via `collect_array_like_callback_entries`, then iterates.
-  - **Bug A (both paths): snapshot, not live.** Spec callback methods
-    read `length` once but re-`Get(O,k)` (and re-`HasProperty`) every
-    index *during* the walk, so a callback that mutates the receiver is
-    observed (`reduce/15.4.4.21-9-1`: `[1,2,,4,'5'].reduce` whose cb
-    sets `arr[2]=3` must yield `"105"`, we give `"75"`). Fix: replace
-    the snapshot with a live per-index `HasProperty(O,k)`+`Get(O,k)`
-    ladder bounded by the once-read `len` — mirror `array_linear_search`
-    (but no `fromIndex` escape, so guard pathological `length` before
-    enabling a `0..len` walk; confirm the suite has no huge-`length`
-    callback test that would time out).
-  - **Bug B (generic path): non-object receivers' indexed props
-    invisible.** `collect_own_indices_below` only enumerates
-    `as_array`/`as_object`/`as_string`; a **Function** receiver's
-    expando indices (`Array.prototype.reduce.call(fnObj, cb, init)` with
-    `fnObj[0]=…`) are dropped, so the walk sees no entries and returns
-    the initial value (`reduce/15.4.4.21-1-9`, the `-3-19`/`-3-2x`
-    cluster). A live `[[Get]]` ladder (Bug A's fix) subsumes this since
-    `Get(fnObj,"0")` already resolves the expando.
-  - Per-method Array failure counts (post-fix baseline): reduceRight 72,
-    reduce 68, map 51, filter 48, every 38, forEach 37, some 37 — the
-    callback cluster dominates the remaining ~691 `Array/prototype`
-    fails, so unifying the two dispatchers onto one live
-    `run_callable_sync` ladder is the next big lever.
+- [x] **Stage 3** — Array callback methods use one live
+  `run_callable_sync` path with per-index `HasProperty`/`Get`.
+  Function/exotic receivers and callback-side mutations are observed;
+  array `length` shrink now preserves non-configurable indexed
+  properties. `map`/`filter`/`flatMap` now create their result with
+  `ArraySpeciesCreate` before callback iteration and define outputs via
+  `CreateDataPropertyOrThrow`, so species/proxy target failures are
+  observed in spec order. Focused gates: `map` 210/210 runnable,
+  `reduce` 512/512 runnable, `reduceRight` 256/256 runnable,
+  `forEach` 186/186 runnable, `every` 214/214 runnable, `some` 215/215
+  runnable, `filter` 235/236 runnable. Broad gate:
+  built-ins/Array/prototype 2591 pass, 127 fail, 92 skip, 1 timeout,
+  0 crash (95.29%). Remaining callback failures are the Object.prototype
+  getter edge in `filter`, 2 `find` edge cases, and broader `flatMap`
+  proxy-flatten/new.target semantics.
 - [ ] **Stage 4** — `do_call_method_value` → GetMethod + Call with a
   call IC; receiver type-switch retires.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into

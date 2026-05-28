@@ -414,6 +414,13 @@ impl Interpreter {
         // `len` read once, then a live `Get(O, k)` per index (a callback
         // mutating the receiver is observed). `sort` keeps its dedicated
         // comparator dispatcher.
+        if let Some(method) = self.array_own_method_value_for_call(context, recv_value, name)? {
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         if recv_value.is_array()
             && matches!(
                 name,
@@ -1091,6 +1098,26 @@ impl Interpreter {
         Err(VmError::UnknownIntrinsic {
             name: name.to_string(),
         })
+    }
+
+    fn array_own_method_value_for_call(
+        &mut self,
+        context: &ExecutionContext,
+        recv_value: Value,
+        name: &str,
+    ) -> Result<Option<Value>, VmError> {
+        let Some(arr) = recv_value.as_array() else {
+            return Ok(None);
+        };
+        if let Some((getter, _setter)) = crate::array::get_accessor(arr, &self.gc_heap, name) {
+            return match getter {
+                Some(getter) if self.is_callable_runtime(&getter) => Ok(Some(
+                    self.run_callable_sync(context, &getter, recv_value, SmallVec::new())?,
+                )),
+                _ => Ok(Some(Value::undefined())),
+            };
+        }
+        Ok(crate::array::get_named_property(arr, &self.gc_heap, name))
     }
 
     /// Stage-4 `GetMethod` bridge for the slow `CallMethodValue`

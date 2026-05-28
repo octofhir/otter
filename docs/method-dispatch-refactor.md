@@ -109,6 +109,10 @@ conformance-gated before the next starts.
     the own property is non-callable: `p.then = 1; p.then()` reports the
     shared non-callable TypeError instead of falling through to the
     builtin `then`.
+  - [x] Array own data/accessor methods now shadow Array.prototype
+    before the specialized Array builtin arms: `arr.map = 1; arr.map()`
+    reports the shared non-callable TypeError instead of dispatching the
+    builtin callback path.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

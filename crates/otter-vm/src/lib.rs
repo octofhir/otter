@@ -6238,6 +6238,47 @@ mod tests {
     }
 
     #[test]
+    fn call_method_regexp_own_non_callable_shadows_builtin() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "exec".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let units: Vec<u16> = "x".encode_utf16().collect();
+        let regexp = JsRegExp::compile(interp.gc_heap_mut(), &units, "").expect("regexp");
+        let bag = property_dispatch::regexp_ensure_expando_pub(interp.gc_heap_mut(), &regexp)
+            .expect("regexp expando");
+        object::set(bag, interp.gc_heap_mut(), "exec", Value::number_i32(1));
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::regexp(regexp);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable own regexp method should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();

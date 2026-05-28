@@ -113,6 +113,9 @@ conformance-gated before the next starts.
     before the specialized Array builtin arms: `arr.map = 1; arr.map()`
     reports the shared non-callable TypeError instead of dispatching the
     builtin callback path.
+  - [x] RegExp expando methods now shadow RegExp.prototype before the
+    intrinsic table: `re.exec = 1; re.exec()` reports the shared
+    non-callable TypeError instead of calling the builtin matcher.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

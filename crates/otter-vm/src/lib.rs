@@ -6279,6 +6279,58 @@ mod tests {
     }
 
     #[test]
+    fn call_method_typed_array_own_non_callable_shadows_builtin() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "map".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let buffer =
+            crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
+                .expect("array buffer");
+        let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
+        let typed_array = crate::binary::JsTypedArray::new(
+            interp.gc_heap_mut(),
+            buffer,
+            crate::binary::TypedArrayKind::Int8,
+            0,
+            1,
+        )
+        .expect("typed array");
+        let bag =
+            property_dispatch::typed_array_ensure_expando_pub(interp.gc_heap_mut(), &typed_array)
+                .expect("typed array expando");
+        object::set(bag, interp.gc_heap_mut(), "map", Value::number_i32(1));
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::typed_array(typed_array);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable own typed array method should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();

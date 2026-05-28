@@ -496,6 +496,15 @@ impl Interpreter {
         // but routed through a TypedArray-specific dispatcher so
         // map / filter / etc. allocate a new TypedArray of the
         // receiver's kind instead of a plain Array.
+        if let Some(method) =
+            self.typed_array_own_method_value_for_call(context, recv_value, name)?
+        {
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
             && matches!(
                 name,
@@ -1125,6 +1134,30 @@ impl Interpreter {
             };
         }
         Ok(crate::array::get_named_property(arr, &self.gc_heap, name))
+    }
+
+    fn typed_array_own_method_value_for_call(
+        &mut self,
+        context: &ExecutionContext,
+        recv_value: Value,
+        name: &str,
+    ) -> Result<Option<Value>, VmError> {
+        let Some(t) = recv_value.as_typed_array(&self.gc_heap) else {
+            return Ok(None);
+        };
+        let Some(bag) = t.expando(&self.gc_heap) else {
+            return Ok(None);
+        };
+        match crate::object::lookup_own(bag, &self.gc_heap, name) {
+            crate::object::PropertyLookup::Data { value, .. } => Ok(Some(value)),
+            crate::object::PropertyLookup::Accessor { getter, .. } => match getter {
+                Some(getter) if self.is_callable_runtime(&getter) => Ok(Some(
+                    self.run_callable_sync(context, &getter, recv_value, SmallVec::new())?,
+                )),
+                _ => Ok(Some(Value::undefined())),
+            },
+            crate::object::PropertyLookup::Absent => Ok(None),
+        }
     }
 
     fn regexp_own_method_value_for_call(

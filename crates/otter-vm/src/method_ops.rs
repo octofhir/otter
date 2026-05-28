@@ -177,6 +177,16 @@ impl Interpreter {
             let r = register_operand(operands.get(4 + i))?;
             arg_values.push(*read_register(&stack[top_idx], r)?);
         }
+        if recv_value.is_nullish() {
+            let label = if recv_value.is_null() {
+                "null"
+            } else {
+                "undefined"
+            };
+            return Err(VmError::TypeError {
+                message: format!("Cannot read properties of {label}"),
+            });
+        }
 
         // Promise.prototype dispatches separately because it
         // needs `&mut self` to enqueue microtasks. User-installed
@@ -1052,93 +1062,7 @@ impl Interpreter {
             );
         }
 
-        // Property-bearing receivers — load the property first.
-        // For class constructors, `prototype` resolves to the
-        // instance prototype object (mirroring `Op::LoadProperty`'s
-        // class shape) and other names walk the static side. Only
-        // when the property lookup hands back a callable do we
-        // dispatch with `this = recv`; missing or non-callable
-        // properties surface as `NotCallable` so callers see the
-        // same error as `obj.notFn()`.
-        let is_property_bearing = recv_value.is_object()
-            || recv_value.is_proxy()
-            || recv_value.is_array()
-            || recv_value.is_regexp()
-            || recv_value.is_map()
-            || recv_value.is_set()
-            || recv_value.is_weak_map()
-            || recv_value.is_weak_set()
-            || recv_value.is_weak_ref()
-            || recv_value.is_finalization_registry()
-            || recv_value.is_promise()
-            || recv_value.is_array_buffer()
-            || recv_value.is_data_view()
-            || recv_value.is_typed_array()
-            || recv_value.is_iterator();
-        let lookup_via_property: Option<Value> = if is_property_bearing {
-            // Property-bearing exotic receivers route through
-            // `ordinary_get_value` so user-installed own properties
-            // shadow the intrinsic-table miss path.
-            let key = VmPropertyKey::String(name);
-            match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
-                VmGetOutcome::Value(value) => Some(value),
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    Some(self.run_callable_sync(context, &getter, recv_value, args)?)
-                }
-            }
-        } else if let Some(c) = recv_value.as_class_constructor() {
-            Some(if name == "prototype" {
-                Value::object(c.prototype(&self.gc_heap))
-            } else {
-                // Go through the full `[[Get]]` ladder so accessor
-                // descriptors on static members invoke their getter.
-                let statics = Value::object(c.statics(&self.gc_heap));
-                let key = VmPropertyKey::String(name);
-                match self.ordinary_get_value(context, statics, statics, &key, 0)? {
-                    VmGetOutcome::Value(v) => v,
-                    VmGetOutcome::InvokeGetter { getter } => {
-                        let args: SmallVec<[Value; 8]> = SmallVec::new();
-                        self.run_callable_sync(context, &getter, statics, args)?
-                    }
-                }
-            })
-        } else if let Some(fid) = recv_value.as_function().or_else(|| {
-            recv_value
-                .as_closure(&self.gc_heap)
-                .map(|c| c.cached_function_id)
-        }) {
-            // §10.1.8 OrdinaryGet on a callable receiver — user
-            // properties resolve via the function-properties side table.
-            Some(self.function_property_get_stack_rooted(context, stack, fid, name)?)
-        } else if let Some(native) = recv_value.as_native_function() {
-            // Native callable receiver — look up `name` on the function
-            // object's own-property table.
-            native
-                .own_property_descriptor(&mut self.gc_heap, name)?
-                .map(|desc| descriptor_value(&desc))
-        } else if recv_value.is_boolean()
-            || recv_value.is_number()
-            || recv_value.is_symbol()
-            || recv_value.is_big_int()
-            || recv_value.is_temporal()
-        {
-            // §7.1.18 ToObject — primitive receivers walk the
-            // constructor's prototype to surface inherited
-            // `Object.prototype.*` methods.
-            let key = VmPropertyKey::String(name);
-            match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
-                VmGetOutcome::Value(value) if !value.is_undefined() => Some(value),
-                VmGetOutcome::InvokeGetter { getter } => {
-                    let args: SmallVec<[Value; 8]> = SmallVec::new();
-                    Some(self.run_callable_sync(context, &getter, recv_value, args)?)
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-        if let Some(method) = lookup_via_property {
+        if let Some(method) = self.get_method_value_for_call(context, stack, recv_value, name)? {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
@@ -1165,6 +1089,109 @@ impl Interpreter {
         Err(VmError::UnknownIntrinsic {
             name: name.to_string(),
         })
+    }
+
+    /// Stage-4 `GetMethod` bridge for the slow `CallMethodValue`
+    /// fallback. Fast intrinsic arms still live above this helper; this
+    /// routine centralizes the ordinary property/getter path so the call
+    /// opcode can be collapsed behind one `GetMethod + Call` boundary in
+    /// smaller, reviewable steps.
+    fn get_method_value_for_call(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut SmallVec<[Frame; 8]>,
+        recv_value: Value,
+        name: &str,
+    ) -> Result<Option<Value>, VmError> {
+        let is_property_bearing = recv_value.is_object()
+            || recv_value.is_proxy()
+            || recv_value.is_array()
+            || recv_value.is_regexp()
+            || recv_value.is_map()
+            || recv_value.is_set()
+            || recv_value.is_weak_map()
+            || recv_value.is_weak_set()
+            || recv_value.is_weak_ref()
+            || recv_value.is_finalization_registry()
+            || recv_value.is_promise()
+            || recv_value.is_array_buffer()
+            || recv_value.is_data_view()
+            || recv_value.is_typed_array()
+            || recv_value.is_iterator();
+        if is_property_bearing {
+            // Property-bearing exotic receivers route through
+            // `ordinary_get_value` so user-installed own properties
+            // shadow the intrinsic-table miss path.
+            let key = VmPropertyKey::String(name);
+            return match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+                VmGetOutcome::Value(value) => Ok(Some(value)),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let args: SmallVec<[Value; 8]> = SmallVec::new();
+                    Ok(Some(
+                        self.run_callable_sync(context, &getter, recv_value, args)?,
+                    ))
+                }
+            };
+        }
+        if let Some(c) = recv_value.as_class_constructor() {
+            let value = if name == "prototype" {
+                Value::object(c.prototype(&self.gc_heap))
+            } else {
+                // Go through the full `[[Get]]` ladder so accessor
+                // descriptors on static members invoke their getter.
+                let statics = Value::object(c.statics(&self.gc_heap));
+                let key = VmPropertyKey::String(name);
+                match self.ordinary_get_value(context, statics, statics, &key, 0)? {
+                    VmGetOutcome::Value(v) => v,
+                    VmGetOutcome::InvokeGetter { getter } => {
+                        let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        self.run_callable_sync(context, &getter, statics, args)?
+                    }
+                }
+            };
+            return Ok(Some(value));
+        }
+        if let Some(fid) = recv_value.as_function().or_else(|| {
+            recv_value
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
+            // §10.1.8 OrdinaryGet on a callable receiver — user
+            // properties resolve via the function-properties side table.
+            return Ok(Some(
+                self.function_property_get_stack_rooted(context, stack, fid, name)?,
+            ));
+        }
+        if let Some(native) = recv_value.as_native_function() {
+            // Native callable receiver — look up `name` on the function
+            // object's own-property table.
+            let value = native
+                .own_property_descriptor(&mut self.gc_heap, name)?
+                .map(|desc| descriptor_value(&desc))
+                .unwrap_or_else(Value::undefined);
+            return Ok(Some(value));
+        }
+        if recv_value.is_boolean()
+            || recv_value.is_number()
+            || recv_value.is_symbol()
+            || recv_value.is_big_int()
+            || recv_value.is_temporal()
+        {
+            // §7.1.18 ToObject — primitive receivers walk the
+            // constructor's prototype to surface inherited
+            // `Object.prototype.*` methods.
+            let key = VmPropertyKey::String(name);
+            return match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+                VmGetOutcome::Value(value) => Ok(Some(value)),
+                VmGetOutcome::InvokeGetter { getter } => {
+                    let args: SmallVec<[Value; 8]> = SmallVec::new();
+                    Ok(Some(
+                        self.run_callable_sync(context, &getter, recv_value, args)?,
+                    ))
+                }
+            };
+        }
+        Ok(None)
     }
 
     /// §22.1.3.18 / §22.1.3.19 callable replaceValue path. Walks

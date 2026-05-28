@@ -94,8 +94,17 @@ conformance-gated before the next starts.
   0 crash (95.29%). Remaining callback failures are the Object.prototype
   getter edge in `filter`, 2 `find` edge cases, and broader `flatMap`
   proxy-flatten/new.target semantics.
-- [ ] **Stage 4** — `do_call_method_value` → GetMethod + Call with a
+- [~] **Stage 4** — `do_call_method_value` → GetMethod + Call with a
   call IC; receiver type-switch retires.
+  - [x] Slow fallback bridge extracted as `get_method_value_for_call`;
+    property-bearing receivers, class statics, functions, native
+    functions, and primitive wrappers now share one getter-observing
+    method lookup helper before the final `Call`.
+  - [x] Nullish method calls reject before the intrinsic fallback:
+    `(undefined).foo()` now reports `TypeError: Cannot read properties
+    of undefined` instead of the internal `unknown intrinsic method`.
+    Missing primitive / native-function methods likewise fall through to
+    the shared non-callable TypeError path instead of `UnknownIntrinsic`.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`
@@ -148,7 +157,7 @@ deviation everywhere the context-free intrinsic table runs:
 | `Array.prototype.join.call({0,1,get length})` | `"a-b"` | `""` | array-like `length` getter not observed; generic receiver dropped |
 | `/\d+/.exec({toString:()=>"x42y"})` | `"42"` | *throws* | `RegExp.prototype.exec` does not `ToString` its argument |
 | `Array.prototype.indexOf.call(new Uint8Array([5,6,7]),6)` | `1` | `-1` | TypedArray receiver invisible to generic Array methods (`[[HasProperty]]`/`[[Get]]` on integer-indexed exotics) |
-| `(undefined).foo()` | TypeError *"Cannot read properties of undefined"* | TypeError *"unknown intrinsic method"* | call on a missing/undefined method reports an internal error class/message |
+| `(undefined).foo()` | TypeError *"Cannot read properties of undefined"* | **fixed** | nullish method calls now reject before intrinsic fallback |
 
 Each row is the same failure mode arrays already had: a builtin runs in a
 context-free intrinsic path that cannot re-enter user code, so

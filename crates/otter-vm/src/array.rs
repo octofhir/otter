@@ -622,27 +622,43 @@ pub(crate) fn set_length_checked(
         return Ok(true);
     }
     let ok = heap.with_payload(arr, |body| {
-        for idx in (new_len..cur).rev() {
-            let key = idx.to_string();
-            let exists = body.elements.get(idx).is_some_and(|slot| !slot.is_hole())
-                || body
-                    .sparse_elements
-                    .as_ref()
-                    .is_some_and(|sparse| sparse.contains_key(&idx))
-                || body
-                    .accessors
-                    .as_ref()
-                    .is_some_and(|accessors| accessors.contains_key(&key));
-            if exists {
-                let configurable = body
-                    .property_flags
-                    .as_ref()
-                    .and_then(|flags| flags.get(&key))
-                    .is_none_or(|flags| flags.configurable());
-                if !configurable {
-                    truncate_array_body_to(body, idx + 1);
-                    return false;
+        // §10.4.2.4 deletes from `cur - 1` down to `new_len`, stopping at
+        // the highest non-configurable index. Only *present* indices can
+        // block or need deleting, so gather those instead of walking the
+        // whole `[new_len, cur)` range — a sparse `length` (e.g. `2**32-1`)
+        // would otherwise spin over billions of holes.
+        let mut present: Vec<usize> = Vec::new();
+        let dense_hi = body.elements.len().min(cur);
+        for idx in new_len..dense_hi {
+            if !body.elements[idx].is_hole() {
+                present.push(idx);
+            }
+        }
+        if let Some(sparse) = body.sparse_elements.as_ref() {
+            present.extend(sparse.keys().copied().filter(|&k| k >= new_len && k < cur));
+        }
+        if let Some(accessors) = body.accessors.as_ref() {
+            for key in accessors.keys() {
+                if let Some(idx) = crate::object::array_index_property_name(key) {
+                    let idx = idx as usize;
+                    if idx >= new_len && idx < cur {
+                        present.push(idx);
+                    }
                 }
+            }
+        }
+        present.sort_unstable();
+        present.dedup();
+        for &idx in present.iter().rev() {
+            let key = idx.to_string();
+            let configurable = body
+                .property_flags
+                .as_ref()
+                .and_then(|flags| flags.get(&key))
+                .is_none_or(|flags| flags.configurable());
+            if !configurable {
+                truncate_array_body_to(body, idx + 1);
+                return false;
             }
             delete_array_body_index(body, idx);
         }

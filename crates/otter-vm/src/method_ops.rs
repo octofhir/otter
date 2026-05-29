@@ -86,6 +86,13 @@ fn iterator_dispatch_method_name(name: &str) -> bool {
     )
 }
 
+fn object_prototype_dispatch_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
+    )
+}
+
 impl Interpreter {
     /// §22.1.3 — pre-coerce the arguments of a `String.prototype`
     /// method in place: index-like operands run full `ToNumber`
@@ -1136,6 +1143,18 @@ impl Interpreter {
                 .as_closure(&self.gc_heap)
                 .map(|c| c.cached_function_id)
         });
+        if fn_id_for_proto.is_some() && object_prototype_dispatch_method_name(name) {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if method.as_native_function().is_none() {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+        }
         if let Some(function_id) = fn_id_for_proto
             && matches!(
                 name,

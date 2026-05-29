@@ -144,6 +144,11 @@ conformance-gated before the next starts.
     non-callable `%Iterator.prototype%` shadows report the shared
     non-callable TypeError while default natives keep the specialized
     path.
+  - [x] Function and closure calls to inherited
+    `Object.prototype.{hasOwnProperty,propertyIsEnumerable,isPrototypeOf}`
+    now probe the function property path before the opcode-local
+    object-method intercept, so own non-callable function shadows
+    report the shared non-callable TypeError.
   - [x] Map/Set `forEach` now resolve through prototype `GetMethod`
     instead of the opcode-local callback helper, so non-callable
     prototype shadows on Map and Set report the shared non-callable

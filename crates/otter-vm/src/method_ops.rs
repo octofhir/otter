@@ -471,6 +471,26 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
+        if recv_value.is_map() && collections_prototype::lookup_map(name).is_some() {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
+        if recv_value.is_set() && collections_prototype::lookup_set(name).is_some() {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         // §23.2.3.{8,11,12,13,14,15,17,18,21,22,28} — TypedArray
         // prototype callback methods. Same shape as the Array set
         // but routed through a TypedArray-specific dispatcher so

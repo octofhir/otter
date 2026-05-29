@@ -1887,8 +1887,7 @@ fn native_array_method(
     let exec = ctx.execution_context().cloned();
     if let Some(exec) = &exec {
         let interp = ctx.interp_mut();
-        if let Some(result) =
-            interp.array_live_method_dispatch(exec, name, receiver, args, &[args])
+        if let Some(result) = interp.array_live_method_dispatch(exec, name, receiver, args, &[args])
         {
             return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
         }

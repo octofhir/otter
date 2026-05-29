@@ -52,11 +52,13 @@ fn prototype_override_is_invoked_with_receiver() {
 
 #[test]
 fn own_non_callable_map_shadow_is_not_callable() {
-    let err = run_throwing(r#"
+    let err = run_throwing(
+        r#"
         const a = [1];
         a.map = 1;
         a.map(x => x);
-        "#);
+        "#,
+    );
     let OtterError::Runtime { diagnostic } = err else {
         panic!("expected Runtime error, got {err:?}");
     };

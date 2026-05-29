@@ -1117,7 +1117,8 @@ impl Interpreter {
                 let result = (|interp: &mut Self| -> Result<(), VmError> {
                     for (i, value) in elements.into_iter().enumerate() {
                         let cb_args = build_array_cb_args(&value, i, &ta_value);
-                        let mapped = interp.run_callable_sync(context, &callee, this_arg, cb_args)?;
+                        let mapped =
+                            interp.run_callable_sync(context, &callee, this_arg, cb_args)?;
                         let coerced = crate::binary::dispatch::coerce_element_for_store(
                             &mut interp.gc_heap,
                             target_kind,

@@ -247,8 +247,23 @@ conformance-gated before the next starts.
   - [x] WeakRef and FinalizationRegistry prototype methods now resolve
     through the shared `GetMethod` path before invoking the native
     method body, so prototype shadows are observed.
+  - [x] **Plain-builtin dispatch unified.** The fourteen byte-identical
+    `GetMethod` + `Call` branches (String / Number / Boolean / BigInt /
+    Symbol / Map / Set / WeakMap / WeakSet / ArrayBuffer / DataView /
+    WeakRef / FinalizationRegistry / non-`set` Date) collapsed into one
+    branch gated by `has_plain_builtin_method`. Receivers needing extra
+    machinery (Array callbacks, TypedArray species, RegExp `exec`/`test`
+    coercion, Date `set*` captured time, String callable replace) keep
+    their dedicated paths. Pure dedup: built-ins/{String, Number,
+    Boolean, BigInt, Symbol, Map, Set, WeakMap, WeakSet, ArrayBuffer,
+    DataView, Date} all byte-identical before/after (4142 tests, 0
+    delta). `method_ops.rs` −69 net lines.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
-  prototype-installed callables.
+  prototype-installed callables. The dead intrinsic-table arms (every
+  family above resolves through `GetMethod` first and `return`s, so the
+  `lookup(name)` arm for it is unreachable) can retire once TypedArray /
+  Intl / Date-`set` are installed as real prototype natives — those three
+  are the only receivers still reaching the intrinsic-table block.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`
   / `throw` IteratorClose in non-generator frames (needs unwind
   integration with `active_iterator_closers`).

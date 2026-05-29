@@ -409,109 +409,14 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        // §7.3.11 GetMethod — primitive strings must observe
-        // `String.prototype` before invoking the native method body.
-        if recv_value.is_string() && string_prototype::lookup(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_number() && number::prototype_lookup(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_boolean() && boolean_prototype::lookup(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_big_int() && bigint::prototype::lookup(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_symbol() && symbol_prototype::lookup(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_map() && collections_prototype::lookup_map(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_set() && collections_prototype::lookup_set(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_weak_map() && collections_prototype::lookup_weak_map(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_weak_set() && collections_prototype::lookup_weak_set(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_array_buffer() && binary::array_buffer_prototype::lookup(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_data_view() && binary::data_view_prototype::lookup(name).is_some() {
+        // §7.3.11 GetMethod + §7.3.14 Call — primitives, collections,
+        // weak references, ArrayBuffer / DataView, and non-`set` Date
+        // methods all resolve their prototype method through the ordinary
+        // `[[Get]]` walk (so a user prototype shadow is observed) and
+        // dispatch the resolved callable uniformly. The realm natives
+        // carry their own re-entrant bodies, so no per-family arm is
+        // needed.
+        if self.has_plain_builtin_method(recv_value, name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
                 .unwrap_or_else(Value::undefined);
@@ -738,21 +643,10 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        if recv_value
-            .as_object()
-            .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
-            && date::prototype::lookup(name).is_some()
-            && !name.starts_with("set")
-        {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
+        // §21.4.4 Date `set*` — probe `Date.prototype` so a non-callable
+        // prototype shadow throws, but let the default native fall
+        // through to the captured-time coercion path in the intrinsic
+        // block below.
         if recv_value
             .as_object()
             .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
@@ -769,28 +663,6 @@ impl Interpreter {
                 stack[top_idx].advance_pc(self.current_byte_len)?;
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
-        }
-        if recv_value.is_weak_ref() && weak_refs::lookup_weak_ref(name).is_some() {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_finalization_registry()
-            && weak_refs::lookup_finalization_registry(name).is_some()
-        {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // Primitive prototypes go through the intrinsic table —
         // synchronous, no frame push, advance pc and write directly.
@@ -1321,6 +1193,65 @@ impl Interpreter {
         Err(VmError::UnknownIntrinsic {
             name: name.to_string(),
         })
+    }
+
+    /// `true` when `recv_value` belongs to a builtin family whose
+    /// prototype method `name` is a plain re-entrant native, dispatched
+    /// uniformly through §7.3.11 `GetMethod` + §7.3.14 `Call` with no
+    /// per-method argument coercion, species step, or captured-state
+    /// handling. These families (primitives, collections, weak
+    /// references, ArrayBuffer / DataView, and non-`set` Date methods)
+    /// share one dispatch branch; receivers needing extra machinery
+    /// (Array callbacks, TypedArray species, RegExp `exec`/`test`
+    /// coercion, Date `set*` captured time, String callable replace)
+    /// keep their dedicated paths.
+    fn has_plain_builtin_method(&self, recv_value: Value, name: &str) -> bool {
+        if recv_value.is_string() {
+            return string_prototype::lookup(name).is_some();
+        }
+        if recv_value.is_number() {
+            return number::prototype_lookup(name).is_some();
+        }
+        if recv_value.is_boolean() {
+            return boolean_prototype::lookup(name).is_some();
+        }
+        if recv_value.is_big_int() {
+            return bigint::prototype::lookup(name).is_some();
+        }
+        if recv_value.is_symbol() {
+            return symbol_prototype::lookup(name).is_some();
+        }
+        if recv_value.is_map() {
+            return collections_prototype::lookup_map(name).is_some();
+        }
+        if recv_value.is_set() {
+            return collections_prototype::lookup_set(name).is_some();
+        }
+        if recv_value.is_weak_map() {
+            return collections_prototype::lookup_weak_map(name).is_some();
+        }
+        if recv_value.is_weak_set() {
+            return collections_prototype::lookup_weak_set(name).is_some();
+        }
+        if recv_value.is_array_buffer() {
+            return binary::array_buffer_prototype::lookup(name).is_some();
+        }
+        if recv_value.is_data_view() {
+            return binary::data_view_prototype::lookup(name).is_some();
+        }
+        if recv_value.is_weak_ref() {
+            return weak_refs::lookup_weak_ref(name).is_some();
+        }
+        if recv_value.is_finalization_registry() {
+            return weak_refs::lookup_finalization_registry(name).is_some();
+        }
+        if recv_value
+            .as_object()
+            .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
+        {
+            return date::prototype::lookup(name).is_some() && !name.starts_with("set");
+        }
+        false
     }
 
     fn ordinary_method_value_for_call(

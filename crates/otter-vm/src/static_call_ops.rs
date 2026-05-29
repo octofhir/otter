@@ -896,7 +896,7 @@ impl Interpreter {
                 match desc {
                     Some(desc) => {
                         let obj =
-                            self.descriptor_to_object_stack_rooted(stack, &desc, &[], args)?;
+                            self.descriptor_to_object_stack_rooted(stack, &desc, &[], &[args])?;
                         Ok(Some(Value::object(obj)))
                     }
                     None => Ok(Some(Value::undefined())),
@@ -913,10 +913,19 @@ impl Interpreter {
                 // The result inherits from `%Object.prototype%` per
                 // step 2 (`OrdinaryObjectCreate(%Object.prototype%)`).
                 let object_proto = self.constructor_prototype_value("Object").ok();
-                let result = self.alloc_stack_rooted_object_with_value_roots(stack, &[], args)?;
+                let mut result_value_roots: SmallVec<[&Value; 1]> = SmallVec::new();
+                if let Some(proto) = object_proto.as_ref() {
+                    result_value_roots.push(proto);
+                }
+                let result = self.alloc_stack_rooted_object_with_value_roots(
+                    stack,
+                    result_value_roots.as_slice(),
+                    args,
+                )?;
                 if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
                     object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
                 }
+                let result_root = Value::object(result);
                 let Some(target) = args.first() else {
                     return Err(VmError::TypeError {
                         message: "Object.getOwnPropertyDescriptors called on null or undefined"
@@ -938,7 +947,6 @@ impl Interpreter {
                     // own keys reachable through the foundation surface.
                 } else if let Some(s) = target.as_string(&self.gc_heap) {
                     let units = s.to_utf16_vec(&self.gc_heap);
-                    let result_root = Value::object(result);
                     for (i, u) in units.iter().enumerate() {
                         let key = i.to_string();
                         let unit =
@@ -954,9 +962,10 @@ impl Interpreter {
                             stack,
                             &desc,
                             &[&result_root],
-                            args,
+                            &[args],
                         )?;
-                        self.set_property(result, &key, Value::object(desc_obj))?;
+                        let desc_value = Value::object(desc_obj);
+                        object::set(result, &mut self.gc_heap, &key, desc_value);
                     }
                     let length_desc = crate::object::PropertyDescriptor::data(
                         Value::number_f64(units.len() as f64),
@@ -968,18 +977,19 @@ impl Interpreter {
                         stack,
                         &length_desc,
                         &[&result_root],
-                        args,
+                        &[args],
                     )?;
-                    self.set_property(result, "length", Value::object(length_obj))?;
+                    let length_value = Value::object(length_obj);
+                    object::set(result, &mut self.gc_heap, "length", length_value);
                 } else if own_property_descriptors_uses_internal_methods(target) {
                     // §20.1.2.10.1 step 3 — drive the spec
                     // ladder via `own_property_keys_value`, then
                     // read each descriptor through the target's
                     // `[[GetOwnProperty]]`.
                     let target_value = *target;
-                    let result_root = Value::object(result);
                     let keys = self.own_property_keys_value(context, &target_value)?;
-                    for key in keys {
+                    for index in 0..keys.len() {
+                        let key = keys[index];
                         let vm_key = if let Some(s) = key.as_string(&self.gc_heap) {
                             crate::VmPropertyKey::OwnedString(s.to_lossy_string(&self.gc_heap))
                         } else if let Some(sym) = key.as_symbol(&self.gc_heap) {
@@ -987,12 +997,13 @@ impl Interpreter {
                         } else {
                             continue;
                         };
-                        let desc = self.ordinary_get_own_property_descriptor_value_stack_rooted(
+                        let desc = self.ordinary_get_own_property_descriptor_value_runtime_rooted(
                             context,
-                            stack,
                             target_value,
                             &vm_key,
                             0,
+                            &[&target_value, &result_root],
+                            &[args, keys.as_slice()],
                         )?;
                         let Some(desc) = desc else {
                             continue;
@@ -1001,15 +1012,14 @@ impl Interpreter {
                             stack,
                             &desc,
                             &[&target_value, &result_root],
-                            args,
+                            &[args, keys.as_slice()],
                         )?;
-                        if let Some(s) = key.as_string(&self.gc_heap) {
-                            self.set_property(
-                                result,
-                                &s.to_lossy_string(&self.gc_heap),
-                                Value::object(desc_obj),
-                            )?;
-                        } else if let Some(sym) = key.as_symbol(&self.gc_heap)
+                        let current_key = keys[index];
+                        let desc_value = Value::object(desc_obj);
+                        if let Some(s) = current_key.as_string(&self.gc_heap) {
+                            let key_string = s.to_lossy_string(&self.gc_heap);
+                            object::set(result, &mut self.gc_heap, &key_string, desc_value);
+                        } else if let Some(sym) = current_key.as_symbol(&self.gc_heap)
                             && !object::set_symbol(
                                 result,
                                 &mut self.gc_heap,
@@ -1225,10 +1235,14 @@ impl Interpreter {
         stack: &SmallVec<[Frame; 8]>,
         desc: &object::PropertyDescriptor,
         value_roots: &[&Value],
-        slice_roots: &[Value],
+        slice_roots: &[&[Value]],
     ) -> Result<object::JsObject, VmError> {
-        let mut roots = Vec::with_capacity(value_roots.len() + 2);
+        let object_proto = self.constructor_prototype_value("Object").ok();
+        let mut roots = Vec::with_capacity(value_roots.len() + 3);
         roots.extend_from_slice(value_roots);
+        if let Some(proto) = object_proto.as_ref() {
+            roots.push(proto);
+        }
         match &desc.kind {
             object::DescriptorKind::Data { value } => roots.push(value),
             object::DescriptorKind::Accessor { getter, setter } => {
@@ -1242,24 +1256,51 @@ impl Interpreter {
         }
         // §6.2.5.4 FromPropertyDescriptor step 2 — descriptor objects
         // inherit `%Object.prototype%`.
-        let object_proto = self.constructor_prototype_value("Object").ok();
-        let result =
-            self.alloc_stack_rooted_object_with_value_roots(stack, roots.as_slice(), slice_roots)?;
+        let result = self.alloc_stack_rooted_object_with_value_roots_and_slices(
+            stack,
+            roots.as_slice(),
+            slice_roots,
+        )?;
         if let Some(proto_obj) = object_proto.and_then(|v| v.as_object()) {
             object::set_prototype(result, &mut self.gc_heap, Some(proto_obj));
         }
         match &desc.kind {
             object::DescriptorKind::Data { value } => {
-                self.set_property(result, "value", *value)?;
-                self.set_property(result, "writable", Value::boolean(desc.writable()))?;
+                object::set(result, &mut self.gc_heap, "value", *value);
+                object::set(
+                    result,
+                    &mut self.gc_heap,
+                    "writable",
+                    Value::boolean(desc.writable()),
+                );
             }
             object::DescriptorKind::Accessor { getter, setter } => {
-                self.set_property(result, "get", (*getter).unwrap_or(Value::undefined()))?;
-                self.set_property(result, "set", (*setter).unwrap_or(Value::undefined()))?;
+                object::set(
+                    result,
+                    &mut self.gc_heap,
+                    "get",
+                    (*getter).unwrap_or(Value::undefined()),
+                );
+                object::set(
+                    result,
+                    &mut self.gc_heap,
+                    "set",
+                    (*setter).unwrap_or(Value::undefined()),
+                );
             }
         }
-        self.set_property(result, "enumerable", Value::boolean(desc.enumerable()))?;
-        self.set_property(result, "configurable", Value::boolean(desc.configurable()))?;
+        object::set(
+            result,
+            &mut self.gc_heap,
+            "enumerable",
+            Value::boolean(desc.enumerable()),
+        );
+        object::set(
+            result,
+            &mut self.gc_heap,
+            "configurable",
+            Value::boolean(desc.configurable()),
+        );
         Ok(result)
     }
 }

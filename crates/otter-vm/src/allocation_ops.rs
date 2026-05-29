@@ -351,6 +351,19 @@ impl Interpreter {
         value_roots: &[&Value],
         slice_roots: &[Value],
     ) -> Result<crate::object::JsObject, VmError> {
+        self.alloc_stack_rooted_object_with_value_roots_and_slices(
+            stack,
+            value_roots,
+            &[slice_roots],
+        )
+    }
+
+    pub(crate) fn alloc_stack_rooted_object_with_value_roots_and_slices(
+        &mut self,
+        stack: &SmallVec<[Frame; 8]>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::object::JsObject, VmError> {
         let roots = self.collect_allocation_roots(stack);
         let shape_root = self.shape_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -360,8 +373,10 @@ impl Interpreter {
             for value in value_roots {
                 value.trace_value_slots(visitor);
             }
-            for value in slice_roots {
-                value.trace_value_slots(visitor);
+            for slice in slice_roots {
+                for value in *slice {
+                    value.trace_value_slots(visitor);
+                }
             }
         };
         crate::object::alloc_object_with_shape_roots(

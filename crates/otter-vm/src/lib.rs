@@ -518,6 +518,19 @@ impl otter_gc::ExtraRootSource for Interpreter {
     }
 }
 
+fn trace_active_frame_roots(
+    stack: &SmallVec<[Frame; 8]>,
+    pool: &cold_frame::ColdFramePool,
+    visitor: &mut dyn FnMut(*mut RawGc),
+) {
+    for frame in stack {
+        frame.trace_frame_slots(visitor);
+        if let Some(idx) = frame.cold {
+            pool.get(idx).trace_cold_slots(visitor);
+        }
+    }
+}
+
 /// Compile-time options for dynamic source text.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EvalCompileOptions {
@@ -2714,55 +2727,69 @@ impl Interpreter {
     ) -> Result<Value, VmError> {
         self.ensure_property_ic_capacity(context);
         self.begin_runtime_budget_turn();
+        let frame_roots = otter_gc::RawFrameRoots::new(
+            stack as *const SmallVec<[Frame; 8]>,
+            &self.cold_frames as *const cold_frame::ColdFramePool,
+            trace_active_frame_roots,
+        );
+        let frame_root_provider: &dyn otter_gc::FrameRoots = &frame_roots;
+        let frame_root_depth = self
+            .gc_heap
+            .push_frame_roots(frame_root_provider as *const dyn otter_gc::FrameRoots);
         // Nested dispatch must not leak its last-instruction byte length
         // into the caller's PC advance: helpers like Op::Eval invoke
         // dispatch_loop on a sub-stack and then expect
         // self.current_byte_len to still describe the *outer* opcode
         // when they call frame.advance_pc(self.current_byte_len).
         let saved_byte_len = self.current_byte_len;
-        let result = loop {
-            match self.dispatch_loop_inner(context, stack) {
-                Ok(value) => break Ok(value),
-                Err(err) => {
-                    if matches!(err, VmError::Uncaught { .. })
-                        && !stack.is_empty()
-                        && let Some(thrown) = self.pending_uncaught_throw.take()
-                    {
-                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                        let unwind = self.unwind_throw(stack, thrown);
-                        if unwind.is_ok() {
-                            self.pending_uncaught_frames = None;
+        let result = (|| -> Result<Value, VmError> {
+            loop {
+                match self.dispatch_loop_inner(context, stack) {
+                    Ok(value) => break Ok(value),
+                    Err(err) => {
+                        if matches!(err, VmError::Uncaught { .. })
+                            && !stack.is_empty()
+                            && let Some(thrown) = self.pending_uncaught_throw.take()
+                        {
+                            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                            let unwind = self.unwind_throw(stack, thrown);
+                            if unwind.is_ok() {
+                                self.pending_uncaught_frames = None;
+                            }
+                            unwind?;
+                            if stack.is_empty() {
+                                break Ok(Value::undefined());
+                            }
+                            continue;
                         }
-                        unwind?;
-                        if stack.is_empty() {
-                            break Ok(Value::undefined());
+                        if let Some(thrown) =
+                            self.vm_error_to_throwable_with_stack_roots(stack, &err)
+                        {
+                            let uncaught = if matches!(
+                                err,
+                                VmError::OutOfMemory { .. } | VmError::JsonError { .. }
+                            ) {
+                                Some(err.clone())
+                            } else {
+                                None
+                            };
+                            self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
+                            let unwind = self.unwind_throw_with_uncaught(stack, thrown, uncaught);
+                            if unwind.is_ok() {
+                                self.pending_uncaught_frames = None;
+                            }
+                            unwind?;
+                            if stack.is_empty() {
+                                break Ok(Value::undefined());
+                            }
+                            continue;
                         }
-                        continue;
+                        break Err(err);
                     }
-                    if let Some(thrown) = self.vm_error_to_throwable_with_stack_roots(stack, &err) {
-                        let uncaught = if matches!(
-                            err,
-                            VmError::OutOfMemory { .. } | VmError::JsonError { .. }
-                        ) {
-                            Some(err.clone())
-                        } else {
-                            None
-                        };
-                        self.pending_uncaught_frames = Some(snapshot_frames(context, stack));
-                        let unwind = self.unwind_throw_with_uncaught(stack, thrown, uncaught);
-                        if unwind.is_ok() {
-                            self.pending_uncaught_frames = None;
-                        }
-                        unwind?;
-                        if stack.is_empty() {
-                            break Ok(Value::undefined());
-                        }
-                        continue;
-                    }
-                    break Err(err);
                 }
             }
-        };
+        })();
+        self.gc_heap.pop_frame_roots_to(frame_root_depth - 1);
         self.finish_runtime_budget_turn();
         self.current_byte_len = saved_byte_len;
         result

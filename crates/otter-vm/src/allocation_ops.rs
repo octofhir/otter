@@ -36,11 +36,16 @@ impl Interpreter {
     pub(crate) fn collect_allocation_roots(&self, stack: &SmallVec<[Frame; 8]>) -> Vec<*mut RawGc> {
         let mut roots = Vec::new();
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
-        let pool = self.cold_frames();
-        for frame in stack {
-            frame.trace_frame_slots(&mut |slot| roots.push(slot));
-            if let Some(idx) = frame.cold {
-                pool.get(idx).trace_cold_slots(&mut |slot| roots.push(slot));
+        let has_registered_frames = self.gc_heap.has_frame_root_providers();
+        self.gc_heap
+            .trace_frame_root_providers(&mut |slot| roots.push(slot));
+        if !has_registered_frames {
+            let pool = self.cold_frames();
+            for frame in stack {
+                frame.trace_frame_slots(&mut |slot| roots.push(slot));
+                if let Some(idx) = frame.cold {
+                    pool.get(idx).trace_cold_slots(&mut |slot| roots.push(slot));
+                }
             }
         }
         roots
@@ -49,6 +54,8 @@ impl Interpreter {
     pub(crate) fn collect_runtime_roots(&self) -> Vec<*mut RawGc> {
         let mut roots = Vec::new();
         RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
+        self.gc_heap
+            .trace_frame_root_providers(&mut |slot| roots.push(slot));
         roots
     }
 

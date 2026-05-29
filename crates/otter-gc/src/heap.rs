@@ -210,6 +210,12 @@ impl GcHeap {
         self.frame_root_providers.trace(visitor);
     }
 
+    /// `true` when an active interpreter frame stack is registered.
+    #[must_use]
+    pub fn has_frame_root_providers(&self) -> bool {
+        !self.frame_root_providers.is_empty()
+    }
+
     /// Configured per-heap cap in bytes (`0` = disabled).
     pub fn max_heap_bytes(&self) -> u64 {
         self.max_heap_bytes

@@ -135,6 +135,10 @@ conformance-gated before the next starts.
     prototype `GetMethod` before invoking the native method body, so
     non-callable prototype shadows report the shared non-callable
     TypeError.
+  - [x] ArrayBuffer and DataView prototype methods now resolve through
+    prototype `GetMethod` before invoking the native method body, so
+    non-callable prototype shadows report the shared non-callable
+    TypeError.
   - [x] Callable receivers now let own/prototype properties shadow
     `Function.prototype.{call,apply,bind,toString}` before falling back
     to the canonical Function prototype dispatch.

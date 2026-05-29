@@ -6962,6 +6962,105 @@ mod tests {
     }
 
     #[test]
+    fn call_method_array_buffer_prototype_non_callable_shadows_builtin() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "slice".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("ArrayBuffer")
+            .expect("ArrayBuffer.prototype")
+            .as_object()
+            .expect("ArrayBuffer.prototype object");
+        object::set(proto, interp.gc_heap_mut(), "slice", Value::number_i32(1));
+        let buffer =
+            crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
+                .expect("array buffer");
+        let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::array_buffer(buffer);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable ArrayBuffer.prototype.slice should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
+    fn call_method_data_view_prototype_non_callable_shadows_builtin() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "getUint8".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("DataView")
+            .expect("DataView.prototype")
+            .as_object()
+            .expect("DataView.prototype object");
+        object::set(
+            proto,
+            interp.gc_heap_mut(),
+            "getUint8",
+            Value::number_i32(1),
+        );
+        let buffer =
+            crate::binary::alloc_local_array_buffer(interp.gc_heap_mut(), vec![0], None, None)
+                .expect("array buffer");
+        let buffer = crate::binary::JsArrayBuffer::from_local_handle(buffer);
+        let view =
+            crate::binary::JsDataView::new(interp.gc_heap_mut(), buffer, 0, 1).expect("data view");
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::data_view(view);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable DataView.prototype.getUint8 should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn call_method_set_prototype_non_callable_shadows_es_set_method() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),

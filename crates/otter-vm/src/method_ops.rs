@@ -545,6 +545,31 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
+        if recv_value.is_typed_array()
+            && matches!(
+                name,
+                "forEach"
+                    | "map"
+                    | "filter"
+                    | "find"
+                    | "findIndex"
+                    | "findLast"
+                    | "findLastIndex"
+                    | "every"
+                    | "some"
+                    | "reduce"
+                    | "reduceRight"
+            )
+        {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
             && matches!(
                 name,

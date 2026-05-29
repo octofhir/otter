@@ -96,6 +96,25 @@ conformance-gated before the next starts.
   proxy-flatten/new.target semantics.
 - [~] **Stage 4** — `do_call_method_value` → GetMethod + Call with a
   call IC; receiver type-switch retires.
+  - [~] **Course correction** — do not grow more per-family
+    hardcoded method-name preflight lists in `method_ops.rs`. Mature JS
+    engines split method calls into a property load plus a call: the
+    property-load IC proves the receiver/prototype shape and returns the
+    actual method value, then the call IC dispatches that value. Otter's
+    Stage 4 target is the same shape: resolve the method once through
+    `GetMethod`; run a specialized Array/String/TypedArray/etc. driver
+    only when the resolved method is the canonical builtin for that
+    receiver family; otherwise use the shared non-callable check and
+    `Call`.
+  - [ ] Add a small canonical-builtin identity guard for one specialized
+    family before touching more receiver branches. The first slice should
+    prove the pattern on a narrow Array callback method (for example
+    `Array.prototype.map`): `arr.map()` resolves `map` through
+    `GetMethod`; if it equals the realm's canonical Array `map` native,
+    keep the existing re-entrant Array driver; if it is a user function,
+    call it with `this = arr`; if it is non-callable, throw the shared
+    non-callable TypeError. Do not add a standalone list of Array method
+    names in `method_ops.rs`.
   - [x] Slow fallback bridge extracted as `get_method_value_for_call`;
     property-bearing receivers, class statics, functions, native
     functions, and primitive wrappers now share one getter-observing

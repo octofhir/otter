@@ -410,11 +410,12 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        // §23.2.3.{8,11,12,13,14,15,17,18,21,22,28} — TypedArray
-        // prototype callback methods. Same shape as the Array set
-        // but routed through a TypedArray-specific dispatcher so
-        // map / filter / etc. allocate a new TypedArray of the
-        // receiver's kind instead of a plain Array.
+        // TypedArray own-property shadows (expando bag) take precedence
+        // over every prototype method, including the callback methods now
+        // installed as real `%TypedArray%.prototype` natives. A canonical
+        // callback (`map` / `filter` / `reduce` / …) has no own property
+        // here, so it falls through to the shared `GetMethod` + `Call`
+        // fallback which resolves the installed native.
         if let Some(method) =
             self.typed_array_own_method_value_for_call(context, recv_value, name)?
         {
@@ -423,50 +424,6 @@ impl Interpreter {
             }
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_typed_array()
-            && matches!(
-                name,
-                "forEach"
-                    | "map"
-                    | "filter"
-                    | "find"
-                    | "findIndex"
-                    | "findLast"
-                    | "findLastIndex"
-                    | "every"
-                    | "some"
-                    | "reduce"
-                    | "reduceRight"
-            )
-        {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
-            && matches!(
-                name,
-                "forEach"
-                    | "map"
-                    | "filter"
-                    | "find"
-                    | "findIndex"
-                    | "findLast"
-                    | "findLastIndex"
-                    | "every"
-                    | "some"
-                    | "reduce"
-                    | "reduceRight"
-            )
-            && self.typed_array_callback_dispatch(stack, context, &t, name, &arg_values, dst)?
-        {
-            return Ok(());
         }
         if recv_value.is_typed_array() && matches!(name, "slice" | "subarray") {
             let method = self
@@ -1305,15 +1262,21 @@ impl Interpreter {
     ///
     /// <https://tc39.es/ecma262/#sec-typedarray.prototype-objects>
     #[allow(clippy::too_many_arguments)]
-    fn typed_array_callback_dispatch(
+    /// §23.2.3 TypedArray prototype callback methods, value-returning
+    /// form for the real-native dispatch path (`bootstrap_typed_array`'s
+    /// `ta_*` callback wrappers call this through `NativeCtx`). Mirrors
+    /// the Array callback driver: elements are snapshot once, then each
+    /// callback re-enters through `run_callable_sync`. For `map` /
+    /// `filter` the species result is allocated per §23.2.3.20 / .10 and
+    /// pinned on the iteration-anchor stack so a GC triggered inside a
+    /// callback cannot reclaim it.
+    pub(crate) fn typed_array_callback_value_dispatch(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
         name: &str,
-        args: &SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<bool, VmError> {
+        args: &[Value],
+    ) -> Result<Value, VmError> {
         let ta_value = Value::typed_array(*t);
         let len = t.length(&self.gc_heap);
         let elements: Vec<Value> = {
@@ -1323,52 +1286,49 @@ impl Interpreter {
             }
             tmp
         };
-
-        let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
-
         let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
 
-        let result = match name {
+        match name {
             "forEach" => {
                 let callee = require_callable(args.first())?;
                 for (i, value) in elements.into_iter().enumerate() {
                     let cb_args = build_array_cb_args(&value, i, &ta_value);
                     self.run_callable_sync(context, &callee, this_arg, cb_args)?;
                 }
-                Value::undefined()
+                Ok(Value::undefined())
             }
             "map" => {
                 // §23.2.3.20 — `A = ? TypedArraySpeciesCreate(O, « len »)`
-                // (step 5) runs before any callback, so a throwing /
-                // overriding species constructor is observed first. `A`
-                // is parked in `dst` immediately so it is GC-rooted (via
-                // the frame register scan) across each callback re-entry.
+                // (step 5) runs before any callback. `A` is pinned on the
+                // iteration-anchor stack so it stays GC-rooted across each
+                // callback re-entry.
                 let callee = require_callable(args.first())?;
                 let a = self.typed_array_species_create(context, t, len)?;
                 let a_value = Value::typed_array(a);
                 let target_kind = a.kind();
-                {
-                    let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame_top, dst, a_value)?;
-                }
-                for (i, value) in elements.into_iter().enumerate() {
-                    let cb_args = build_array_cb_args(&value, i, &ta_value);
-                    let mapped = self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-                    let coerced = crate::binary::dispatch::coerce_element_for_store(
-                        &mut self.gc_heap,
-                        target_kind,
-                        &mapped,
-                    )?;
-                    a.set(&mut self.gc_heap, i, &coerced);
-                }
-                return Ok(true);
+                let anchor = self.push_iteration_anchor(a_value);
+                let result = (|interp: &mut Self| -> Result<(), VmError> {
+                    for (i, value) in elements.into_iter().enumerate() {
+                        let cb_args = build_array_cb_args(&value, i, &ta_value);
+                        let mapped = interp.run_callable_sync(context, &callee, this_arg, cb_args)?;
+                        let coerced = crate::binary::dispatch::coerce_element_for_store(
+                            &mut interp.gc_heap,
+                            target_kind,
+                            &mapped,
+                        )?;
+                        a.set(&mut interp.gc_heap, i, &coerced);
+                    }
+                    Ok(())
+                })(self);
+                self.pop_iteration_anchors_to(anchor - 1);
+                result?;
+                Ok(a_value)
             }
             "filter" => {
                 // §23.2.3.10 — run the predicate over every element,
-                // collecting kept values, *then* call
-                // `TypedArraySpeciesCreate(O, « captured »)` (step 9)
-                // with the kept count and copy the survivors in.
+                // collecting kept values, then call
+                // `TypedArraySpeciesCreate(O, « captured »)` (step 9) with
+                // the kept count and copy the survivors in.
                 let callee = require_callable(args.first())?;
                 let mut kept: Vec<Value> = Vec::new();
                 for (i, value) in elements.into_iter().enumerate() {
@@ -1379,12 +1339,7 @@ impl Interpreter {
                     }
                 }
                 let a = self.typed_array_species_create(context, t, kept.len())?;
-                let a_value = Value::typed_array(a);
                 let target_kind = a.kind();
-                {
-                    let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-                    write_register(frame_top, dst, a_value)?;
-                }
                 for (i, value) in kept.iter().enumerate() {
                     let coerced = crate::binary::dispatch::coerce_element_for_store(
                         &mut self.gc_heap,
@@ -1393,7 +1348,7 @@ impl Interpreter {
                     )?;
                     a.set(&mut self.gc_heap, i, &coerced);
                 }
-                return Ok(true);
+                Ok(Value::typed_array(a))
             }
             "find" => {
                 let callee = require_callable(args.first())?;
@@ -1406,7 +1361,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                found
+                Ok(found)
             }
             "findIndex" => {
                 let callee = require_callable(args.first())?;
@@ -1419,7 +1374,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::number_i32(idx)
+                Ok(Value::number_i32(idx))
             }
             "findLast" => {
                 let callee = require_callable(args.first())?;
@@ -1433,7 +1388,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                found
+                Ok(found)
             }
             "findLastIndex" => {
                 let callee = require_callable(args.first())?;
@@ -1447,7 +1402,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::number_i32(idx)
+                Ok(Value::number_i32(idx))
             }
             "every" => {
                 let callee = require_callable(args.first())?;
@@ -1460,7 +1415,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::boolean(all)
+                Ok(Value::boolean(all))
             }
             "some" => {
                 let callee = require_callable(args.first())?;
@@ -1473,7 +1428,7 @@ impl Interpreter {
                         break;
                     }
                 }
-                Value::boolean(any)
+                Ok(Value::boolean(any))
             }
             "reduce" | "reduceRight" => {
                 let callee = require_callable(args.first())?;
@@ -1500,14 +1455,10 @@ impl Interpreter {
                     acc = self.run_callable_sync(context, &callee, Value::undefined(), cb_args)?;
                     i += step;
                 }
-                acc
+                Ok(acc)
             }
-            _ => return Ok(false),
-        };
-
-        let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-        write_register(frame_top, dst, result)?;
-        Ok(true)
+            _ => Err(VmError::TypeMismatch),
+        }
     }
 
     /// §23.2.4.1 `TypedArraySpeciesCreate(exemplar, « length »)`.

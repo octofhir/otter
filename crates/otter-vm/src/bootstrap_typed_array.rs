@@ -1069,6 +1069,56 @@ fn ta_proto_dispatch(
 }
 
 // ---------------------------------------------------------------
+// Callback-driven prototype methods (`map` / `filter` / `forEach` /
+// `every` / `some` / `find*` / `reduce*`). These need a live
+// interpreter to drive synchronous callbacks and to run
+// `TypedArraySpeciesCreate`, so they re-enter through
+// `Interpreter::typed_array_callback_value_dispatch`.
+// ---------------------------------------------------------------
+
+macro_rules! ta_cb_method {
+    ($name:ident, $method:expr) => {
+        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            ta_callback_dispatch(ctx, args, $method)
+        }
+    };
+}
+
+ta_cb_method!(ta_map, "map");
+ta_cb_method!(ta_filter, "filter");
+ta_cb_method!(ta_for_each, "forEach");
+ta_cb_method!(ta_every, "every");
+ta_cb_method!(ta_some, "some");
+ta_cb_method!(ta_find, "find");
+ta_cb_method!(ta_find_index, "findIndex");
+ta_cb_method!(ta_find_last, "findLast");
+ta_cb_method!(ta_find_last_index, "findLastIndex");
+ta_cb_method!(ta_reduce, "reduce");
+ta_cb_method!(ta_reduce_right, "reduceRight");
+
+fn ta_callback_dispatch(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    method_name: &'static str,
+) -> Result<Value, NativeError> {
+    let receiver = *ctx.this_value();
+    let Some(t) = receiver.as_typed_array(ctx.heap()) else {
+        return Err(NativeError::TypeError {
+            name: method_name,
+            reason: "method called on a non-TypedArray receiver".to_string(),
+        });
+    };
+    let (interp, ctx_opt) = ctx.interp_mut_and_context();
+    let context = ctx_opt.ok_or(NativeError::TypeError {
+        name: method_name,
+        reason: "missing execution context".to_string(),
+    })?;
+    interp
+        .typed_array_callback_value_dispatch(&context, &t, method_name, args)
+        .map_err(|err| crate::native_function::vm_to_native_error(err, method_name))
+}
+
+// ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
 
@@ -1145,6 +1195,17 @@ otter_macros::couch! {
             "keys"           / 0 => ta_keys,
             "values"         / 0 => ta_values,
             "entries"        / 0 => ta_entries,
+            "map"            / 1 => ta_map,
+            "filter"         / 1 => ta_filter,
+            "forEach"        / 1 => ta_for_each,
+            "every"          / 1 => ta_every,
+            "some"           / 1 => ta_some,
+            "find"           / 1 => ta_find,
+            "findIndex"      / 1 => ta_find_index,
+            "findLast"       / 1 => ta_find_last,
+            "findLastIndex"  / 1 => ta_find_last_index,
+            "reduce"         / 1 => ta_reduce,
+            "reduceRight"    / 1 => ta_reduce_right,
         },
     },
 }

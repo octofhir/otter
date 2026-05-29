@@ -134,6 +134,11 @@ conformance-gated before the next starts.
     shared `GetMethod` path before the opcode-local callback dispatcher,
     so non-callable per-kind prototype shadows report the shared
     non-callable TypeError.
+  - [x] TypedArray `slice` / `subarray` now probe the prototype path
+    before their opcode-local species/coercion dispatchers, so
+    non-callable per-kind prototype shadows report the shared
+    non-callable TypeError while default natives keep the specialized
+    path.
   - [x] Map/Set `forEach` now resolve through prototype `GetMethod`
     instead of the opcode-local callback helper, so non-callable
     prototype shadows on Map and Set report the shared non-callable

@@ -589,6 +589,18 @@ impl Interpreter {
         {
             return Ok(());
         }
+        if recv_value.is_typed_array() && matches!(name, "slice" | "subarray") {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if method.as_native_function().is_none() {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+        }
         // §23.2.3.26 `%TypedArray%.prototype.slice` allocates its
         // result through `TypedArraySpeciesCreate` and coerces its
         // `start` / `end` operands through `ToIntegerOrInfinity`

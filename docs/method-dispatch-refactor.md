@@ -154,6 +154,10 @@ conformance-gated before the next starts.
     object-method intercept, so null-prototype objects and deleted /
     non-callable prototype shadows report the shared non-callable
     TypeError.
+  - [x] Native and bound function calls to inherited
+    `Object.prototype` methods now probe the real prototype path before
+    their opcode-local object-method intercepts, so non-callable
+    prototype shadows report the shared non-callable TypeError.
   - [x] Map/Set `forEach` now resolve through prototype `GetMethod`
     instead of the opcode-local callback helper, so non-callable
     prototype shadows on Map and Set report the shared non-callable

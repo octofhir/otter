@@ -1210,6 +1210,29 @@ impl Interpreter {
             return Ok(());
         }
         if let Some(native) = recv_value.as_native_function()
+            && object_prototype_dispatch_method_name(name)
+        {
+            let method = self.ordinary_method_value_for_call(context, recv_value, name)?;
+            if method.as_native_function().is_none() {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+            if let Some(result) = native_function_object_prototype_intercept(
+                &native,
+                name,
+                &arg_values,
+                &mut self.gc_heap,
+            )? {
+                let frame = &mut stack[top_idx];
+                write_register(frame, dst, result)?;
+                frame.advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
+        }
+        if let Some(native) = recv_value.as_native_function()
             && let Some(result) = native_function_object_prototype_intercept(
                 &native,
                 name,
@@ -1221,6 +1244,26 @@ impl Interpreter {
             write_register(frame, dst, result)?;
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
+        }
+        if let Some(bound) = recv_value.as_bound_function()
+            && object_prototype_dispatch_method_name(name)
+        {
+            let method = self.ordinary_method_value_for_call(context, recv_value, name)?;
+            if method.as_native_function().is_none() {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+            if let Some(result) =
+                bound_function_object_prototype_intercept(&bound, name, &arg_values, &self.gc_heap)?
+            {
+                let frame = &mut stack[top_idx];
+                write_register(frame, dst, result)?;
+                frame.advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
         }
         if let Some(bound) = recv_value.as_bound_function()
             && let Some(result) =
@@ -1302,6 +1345,22 @@ impl Interpreter {
         Err(VmError::UnknownIntrinsic {
             name: name.to_string(),
         })
+    }
+
+    fn ordinary_method_value_for_call(
+        &mut self,
+        context: &ExecutionContext,
+        recv_value: Value,
+        name: &str,
+    ) -> Result<Value, VmError> {
+        let key = VmPropertyKey::String(name);
+        match self.ordinary_get_value(context, recv_value, recv_value, &key, 0)? {
+            VmGetOutcome::Value(value) => Ok(value),
+            VmGetOutcome::InvokeGetter { getter } => {
+                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                self.run_callable_sync(context, &getter, recv_value, args)
+            }
+        }
     }
 
     fn array_own_method_value_for_call(

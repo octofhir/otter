@@ -66,6 +66,26 @@ fn relative_index_clamp(relative: f64, len: i64) -> i64 {
     }
 }
 
+fn iterator_dispatch_method_name(name: &str) -> bool {
+    matches!(
+        name,
+        "map"
+            | "filter"
+            | "take"
+            | "drop"
+            | "flatMap"
+            | "toArray"
+            | "forEach"
+            | "reduce"
+            | "some"
+            | "every"
+            | "find"
+            | "next"
+            | "return"
+            | "throw"
+    )
+}
+
 impl Interpreter {
     /// §22.1.3 — pre-coerce the arguments of a `String.prototype`
     /// method in place: index-like operands run full `ToNumber`
@@ -196,6 +216,21 @@ impl Interpreter {
             }
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
+
+        if (recv_value.is_iterator() || recv_value.is_generator())
+            && iterator_dispatch_method_name(name)
+        {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if method.as_native_function().is_none() {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
         }
 
         // Iterator-helpers proposal — when receiver is an iterator
@@ -1351,6 +1386,7 @@ impl Interpreter {
             || recv_value.is_array_buffer()
             || recv_value.is_data_view()
             || recv_value.is_typed_array()
+            || recv_value.is_generator()
             || recv_value.is_iterator();
         if is_property_bearing {
             // Property-bearing exotic receivers route through

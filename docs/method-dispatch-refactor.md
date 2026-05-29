@@ -139,6 +139,11 @@ conformance-gated before the next starts.
     non-callable per-kind prototype shadows report the shared
     non-callable TypeError while default natives keep the specialized
     path.
+  - [x] Iterator helper and generator method calls now probe the
+    prototype path before the opcode-local iterator dispatchers, so
+    non-callable `%Iterator.prototype%` shadows report the shared
+    non-callable TypeError while default natives keep the specialized
+    path.
   - [x] Map/Set `forEach` now resolve through prototype `GetMethod`
     instead of the opcode-local callback helper, so non-callable
     prototype shadows on Map and Set report the shared non-callable

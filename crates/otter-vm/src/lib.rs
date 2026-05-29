@@ -6948,6 +6948,57 @@ mod tests {
     }
 
     #[test]
+    fn call_method_iterator_prototype_non_callable_shadows_helper() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 3, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "toArray".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("Iterator")
+            .expect("Iterator.prototype")
+            .as_object()
+            .expect("Iterator.prototype object");
+        object::set(proto, interp.gc_heap_mut(), "toArray", Value::number_i32(1));
+        let source = crate::array::from_elements_old_for_fixture(
+            interp.gc_heap_mut(),
+            [Value::number(NumberValue::from_i32(1))],
+        )
+        .expect("source array");
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::array(source);
+        stack.push(frame);
+        interp
+            .run_get_iterator_regs(&mut stack, 0, 1, 0)
+            .expect("array iterator");
+        stack[0].registers[0] = stack[0].registers[1];
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(2),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable Iterator.prototype.toArray should shadow helper");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),

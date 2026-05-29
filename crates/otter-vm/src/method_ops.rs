@@ -187,38 +187,6 @@ impl Interpreter {
             });
         }
 
-        // Promise.prototype dispatches separately because it
-        // needs `&mut self` to enqueue microtasks. User-installed
-        // expando overrides (`p.then = fn`) take priority and
-        // route through the ordinary callable path so test262
-        // can observe Symbol.species / custom-then plumbing.
-        if let Some(p) = recv_value.as_promise() {
-            let promise = p;
-            if let Some(bag) = promise.expando(&self.gc_heap)
-                && let Some(method) = crate::object::get(bag, &self.gc_heap, name)
-            {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                let top_idx = stack.len() - 1;
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-            }
-            let result = promise_dispatch::prototype_call(
-                self,
-                Some(context.clone()),
-                &promise,
-                name,
-                arg_values.as_slice(),
-            )
-            .map_err(native_to_vm_error)?;
-            let top_idx = stack.len() - 1;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-
         if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?

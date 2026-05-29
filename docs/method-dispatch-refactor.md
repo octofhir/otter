@@ -130,6 +130,9 @@ conformance-gated before the next starts.
   - [x] Callable receivers now let own/prototype properties shadow
     `Function.prototype.{call,apply,bind,toString}` before falling back
     to the canonical Function prototype dispatch.
+  - [x] Promise prototype methods now resolve through the shared
+    `GetMethod` path; expando and prototype shadows are observed before
+    the native Promise method body runs.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

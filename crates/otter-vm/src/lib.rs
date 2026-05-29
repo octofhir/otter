@@ -6460,6 +6460,46 @@ mod tests {
     }
 
     #[test]
+    fn call_method_function_own_non_callable_shadows_call() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(1, "target", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "call".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::function(1);
+        stack.push(frame);
+        let function_value = Value::function(1);
+        let bag = interp
+            .function_user_bag_stack_rooted(&stack, 1, &[&function_value])
+            .expect("function user bag");
+        object::set(bag, interp.gc_heap_mut(), "call", Value::number_i32(1));
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable own function call should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();

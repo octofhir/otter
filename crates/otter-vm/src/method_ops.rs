@@ -1047,28 +1047,6 @@ impl Interpreter {
             return Ok(());
         }
 
-        // §20.2.3 Function.prototype canonical methods —
-        // `call` / `apply` / `bind` / `toString`. They are
-        // unconditionally available on any callable, even when the
-        // receiver is a ClassConstructor whose statics object
-        // hasn't installed them. The intercept runs before the
-        // property-lookup so user-installed shadows take precedence
-        // only when the receiver is a plain Object. Callable
-        // receivers go straight here.
-        // <https://tc39.es/ecma262/#sec-properties-of-the-function-prototype-object>
-        if matches!(name, "call" | "apply" | "bind" | "toString")
-            && self.is_callable_runtime(&recv_value)
-        {
-            return self.dispatch_function_method(
-                stack,
-                context,
-                &recv_value,
-                name,
-                arg_values,
-                dst,
-            );
-        }
-
         if let Some(method) = self.get_method_value_for_call(context, stack, recv_value, name)? {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);

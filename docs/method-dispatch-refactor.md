@@ -127,6 +127,9 @@ conformance-gated before the next starts.
     predicates) now resolve through prototype `GetMethod` before the
     re-entrant native body, so non-callable prototype shadows report the
     shared non-callable TypeError.
+  - [x] Callable receivers now let own/prototype properties shadow
+    `Function.prototype.{call,apply,bind,toString}` before falling back
+    to the canonical Function prototype dispatch.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

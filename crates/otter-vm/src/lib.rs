@@ -6379,6 +6379,112 @@ mod tests {
     }
 
     #[test]
+    fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "deref".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("WeakRef")
+            .expect("WeakRef.prototype")
+            .as_object()
+            .expect("WeakRef.prototype object");
+        object::set(proto, interp.gc_heap_mut(), "deref", Value::number_i32(1));
+        let target = Value::object(
+            crate::object::alloc_object_old_for_fixture(interp.gc_heap_mut())
+                .expect("target object"),
+        );
+        let weak_ref =
+            crate::test_support::alloc_weak_ref(interp.gc_heap_mut(), &target).expect("weak ref");
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::weak_ref(weak_ref);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable WeakRef.prototype.deref should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
+    fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
+        fn cleanup(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::undefined())
+        }
+
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "unregister".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("FinalizationRegistry")
+            .expect("FinalizationRegistry.prototype")
+            .as_object()
+            .expect("FinalizationRegistry.prototype object");
+        object::set(
+            proto,
+            interp.gc_heap_mut(),
+            "unregister",
+            Value::number_i32(1),
+        );
+        let cleanup = native_value_static(interp.gc_heap_mut(), "cleanup", 0, cleanup)
+            .expect("cleanup function");
+        let registry =
+            crate::test_support::alloc_finalization_registry(interp.gc_heap_mut(), cleanup)
+                .expect("registry");
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::finalization_registry(registry);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err(
+                "non-callable FinalizationRegistry.prototype.unregister should shadow builtin",
+            );
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn call_method_promise_expando_non_callable_shadows_builtin() {
         let module = BytecodeModule {
             module: "test.ts".to_string(),

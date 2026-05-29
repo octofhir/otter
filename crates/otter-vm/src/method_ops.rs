@@ -629,6 +629,28 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
+        if recv_value.is_weak_ref() && weak_refs::lookup_weak_ref(name).is_some() {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
+        if recv_value.is_finalization_registry()
+            && weak_refs::lookup_finalization_registry(name).is_some()
+        {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         // Primitive prototypes go through the intrinsic table —
         // synchronous, no frame push, advance pc and write directly.
         let intrinsic = if recv_value.is_string() {

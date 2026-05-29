@@ -143,8 +143,8 @@ pub use frame_state::{
 };
 pub use property_ic::PropertyIcStats;
 pub use run_control::{
-    DEFAULT_MAX_STACK_DEPTH, InterruptFlag, NO_HANDLER_OFFSET, RunError, StackFrameSnapshot,
-    VmError,
+    DEFAULT_MAX_STACK_DEPTH, DEFAULT_MAX_SYNC_REENTRY_DEPTH, InterruptFlag, NO_HANDLER_OFFSET,
+    RunError, StackFrameSnapshot, VmError,
 };
 
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
@@ -297,6 +297,7 @@ pub struct Interpreter {
     /// transition/cache tables here.
     shape_runtime: object::ShapeRuntime,
     max_stack_depth: u32,
+    sync_reentry_depth: u32,
     /// Per-interpreter microtask queue. Plain field — accessed
     /// only through `&mut self`. The dispatch loop threads
     /// `&mut self.microtasks` alongside `&mut stack` (split-borrow)
@@ -679,6 +680,7 @@ impl Interpreter {
             gc_heap,
             shape_runtime,
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
+            sync_reentry_depth: 0,
             microtasks: MicrotaskQueue::new(),
             module_environments: std::collections::HashMap::new(),
             module_resolution_cache: std::collections::HashMap::new(),
@@ -1398,6 +1400,20 @@ impl Interpreter {
         } else {
             depth
         };
+    }
+
+    fn enter_sync_reentry(&mut self) -> Result<(), VmError> {
+        let limit = self.max_stack_depth.min(DEFAULT_MAX_SYNC_REENTRY_DEPTH);
+        if self.sync_reentry_depth >= limit {
+            return Err(VmError::StackOverflow { limit });
+        }
+        self.sync_reentry_depth += 1;
+        Ok(())
+    }
+
+    fn leave_sync_reentry(&mut self) {
+        debug_assert!(self.sync_reentry_depth > 0);
+        self.sync_reentry_depth = self.sync_reentry_depth.saturating_sub(1);
     }
 
     /// Install the parse + compile callback used by `Op::Eval` and

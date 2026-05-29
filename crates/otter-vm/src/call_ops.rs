@@ -1298,6 +1298,19 @@ impl Interpreter {
         this_value: Value,
         args: SmallVec<[Value; 8]>,
     ) -> Result<Value, VmError> {
+        self.enter_sync_reentry()?;
+        let result = self.run_callable_sync_inner(context, callee, this_value, args);
+        self.leave_sync_reentry();
+        result
+    }
+
+    fn run_callable_sync_inner(
+        &mut self,
+        context: &ExecutionContext,
+        callee: &Value,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
         let mut current = *callee;
         let mut effective_this = this_value;
         let mut effective_args = args;
@@ -1458,6 +1471,19 @@ impl Interpreter {
     /// bound function as itself exposes the bound target as
     /// `new.target` inside the target body.
     pub(crate) fn run_construct_sync(
+        &mut self,
+        context: &ExecutionContext,
+        target: &Value,
+        new_target: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        self.enter_sync_reentry()?;
+        let result = self.run_construct_sync_inner(context, target, new_target, args);
+        self.leave_sync_reentry();
+        result
+    }
+
+    fn run_construct_sync_inner(
         &mut self,
         context: &ExecutionContext,
         target: &Value,

@@ -46,6 +46,7 @@ use otter_vm::{DynamicImportLoader, TimerScheduler};
 use crate::promise_registry::{HostSettleOutcome, PromiseId};
 
 const DEFAULT_COMMAND_CAPACITY: usize = 64;
+const ISOLATE_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 type RunReply = oneshot::Sender<Result<ExecutionResult, OtterError>>;
 type CheckReply = oneshot::Sender<Result<(), OtterError>>;
@@ -290,6 +291,7 @@ impl RuntimeHandle {
         let scheduler_event_loop = event_loop.clone();
         let runner = std::thread::Builder::new()
             .name("otter-isolate".to_string())
+            .stack_size(ISOLATE_THREAD_STACK_BYTES)
             .spawn(move || {
                 run_isolate(
                     config,

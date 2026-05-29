@@ -247,6 +247,9 @@ impl From<otter_gc::OutOfMemory> for VmError {
 /// [`VmError::StackOverflow`].
 pub const DEFAULT_MAX_STACK_DEPTH: u32 = 1024;
 
+/// Default synchronous re-entry limit for host-driven JS callbacks.
+pub const DEFAULT_MAX_SYNC_REENTRY_DEPTH: u32 = 256;
+
 /// Re-export of the bytecode-defined sentinel for "this try block
 /// has no catch / finally clause". Kept on the VM surface so
 /// embedders that want to hand-build EnterTry operands have one

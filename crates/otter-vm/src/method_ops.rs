@@ -407,6 +407,17 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
+        // §7.3.11 GetMethod + §7.3.14 Call.
+        if recv_value.is_typed_array() {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
         // `replaceAll` with a callable replaceValue dispatch through
         // the interpreter to invoke the callback. The intrinsic
@@ -533,67 +544,17 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        // `slice` / `subarray` carry §23.2.4.1 `TypedArraySpeciesCreate`,
-        // so they dispatch as natives, not through the table.
         let intrinsic = if recv_value.is_intl() {
             intl::lookup_prototype(&recv_value, &self.gc_heap, name)
-        } else if recv_value.is_typed_array() && !matches!(name, "slice" | "subarray") {
-            binary::typed_array_prototype::lookup(name)
         } else {
             None
         };
         if let Some(entry) = intrinsic {
-            let mut small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
-            // §23.2.3.{8,5,18,16,17} `fill` / `copyWithin` /
-            // `includes` / `indexOf` / `lastIndexOf` open with
-            // `ToNumber` / `ToIntegerOrInfinity` on their operands; the
-            // intrinsic-table impls read raw `Value`s and cannot
-            // re-enter. Pre-coerce here (a re-entrant interpreter
-            // handle is in scope) so user `@@toPrimitive` / `valueOf`
-            // fire in spec order — `fill` coerces its value (step 3)
-            // before the `start` / `end` indices (steps 4-7) — and
-            // abrupt completions surface.
-            if recv_value.is_typed_array() {
-                let is_bigint_kind = recv_value
-                    .as_typed_array(&self.gc_heap)
-                    .is_some_and(|t| t.kind().is_bigint());
-                if name == "fill"
-                    && let Some(value) = small_args.first().copied()
-                {
-                    if is_bigint_kind {
-                        let b = crate::coerce::to_big_int_or_throw(self, context, &value)?;
-                        small_args[0] = Value::big_int(b);
-                    } else if !value.is_number() {
-                        let n = self.coerce_to_number(context, &value)?;
-                        small_args[0] = Value::number(n);
-                    }
-                }
-                // NOTE: `copyWithin` is intentionally excluded — its
-                // detached-during-coercion path (a `valueOf` that
-                // detaches the backing buffer) hangs the conformance
-                // runner today; re-enable once that path is fixed.
-                let ta_int_coerce: &[usize] = match name {
-                    "fill" => &[1, 2],
-                    "copyWithin" => &[0, 1, 2],
-                    "includes" | "indexOf" | "lastIndexOf" => &[1],
-                    _ => &[],
-                };
-                for &idx in ta_int_coerce {
-                    let Some(value) = small_args.get(idx).copied() else {
-                        continue;
-                    };
-                    if value.is_number() || value.is_undefined() {
-                        continue;
-                    }
-                    let n = self.coerce_to_number(context, &value)?;
-                    small_args[idx] = Value::number(n);
-                }
-            }
             let result = {
                 let allocation_roots = self.collect_allocation_roots(stack);
                 (entry.impl_fn)(&mut IntrinsicArgs {
                     receiver: &recv_value,
-                    args: &small_args,
+                    args: &arg_values,
                     gc_heap: &mut self.gc_heap,
                     allocation_roots: allocation_roots.as_slice(),
                 })

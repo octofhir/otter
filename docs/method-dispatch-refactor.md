@@ -271,13 +271,27 @@ conformance-gated before the next starts.
     built-ins/{String, Number, RegExp, DataView, TypedArray, Date}
     byte-identical before/after (6996 tests, 0 delta). `method_ops.rs`
     −164 net lines.
-- [ ] **Stage 5** — collapse the remaining three `lookup(name)` tables
-  (`date` `set*`, `intl`, `typed_array`) into prototype-installed
-  callables. Once TypedArray / Intl / Date-`set` are real prototype
-  natives the intrinsic-table block retires entirely and the dispatch
-  function reduces to the special VM-intrinsic paths (generators,
-  iterator helpers, async, callback drivers) plus one terminal
-  `GetMethod` + `Call`.
+- [~] **Stage 5** — collapse the per-type `lookup(name)` tables into
+  prototype-installed callables.
+  - [x] **Date** — `set*` captured-time coercion moved into
+    `native_date_method`; the whole Date surface dispatches through
+    `GetMethod` + `Call`. Date arm removed from the intrinsic block.
+  - [x] **TypedArray** — every `%TypedArray%.prototype` method is now a
+    real native: callback methods (`map` / `filter` / `forEach` /
+    `every` / `some` / `find*` / `reduce*`) via
+    `typed_array_callback_value_dispatch` with the species result pinned
+    on the iteration-anchor stack; `slice` / `subarray` via the
+    value-returning species dispatchers; the pure-functional methods via
+    `ta_proto_dispatch` with `ToNumber` / `ToIntegerOrInfinity` operand
+    coercion done re-entrantly. All TypedArray inline branches (callback,
+    slice/subarray, coercion preamble) and the intrinsic-block TA arm are
+    gone; TypedArray dispatches through `GetMethod` + `Call`.
+    built-ins/TypedArray 1476/458 byte-identical across all three steps.
+  - [ ] **Intl** is the only remaining intrinsic-table resident; the
+    block retires once its prototype methods are real natives, after
+    which the dispatch function is the special VM-intrinsic paths
+    (generators, iterator helpers, async) plus one terminal `GetMethod` +
+    `Call`.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`
   / `throw` IteratorClose in non-generator frames (needs unwind
   integration with `active_iterator_closers`).

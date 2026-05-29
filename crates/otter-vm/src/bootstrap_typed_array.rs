@@ -1045,13 +1045,61 @@ fn ta_proto_dispatch(
     args: &[Value],
     method_name: &str,
 ) -> Result<Value, NativeError> {
+    const NAME: &str = "TypedArray.prototype";
     let entry =
         typed_array_prototype::lookup(method_name).ok_or_else(|| NativeError::TypeError {
-            name: "TypedArray.prototype",
+            name: NAME,
             reason: format!("method {method_name} missing"),
         })?;
     let receiver = *ctx.this_value();
-    let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    let mut small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+
+    // §23.2.3.{8,5,18,16,17} — `fill` / `copyWithin` / `includes` /
+    // `indexOf` / `lastIndexOf` open with `ToNumber` /
+    // `ToIntegerOrInfinity` on their operands (and `fill` coerces its
+    // value first, as a BigInt for bigint element kinds). The intrinsic
+    // impl reads raw `Value`s, so coerce here in spec order.
+    let int_coerce: &[usize] = match method_name {
+        "fill" => &[1, 2],
+        "copyWithin" => &[0, 1, 2],
+        "includes" | "indexOf" | "lastIndexOf" => &[1],
+        _ => &[],
+    };
+    if method_name == "fill" || !int_coerce.is_empty() {
+        let is_bigint = receiver
+            .as_typed_array(ctx.heap())
+            .is_some_and(|t| t.kind().is_bigint());
+        let (interp, ctx_opt) = ctx.interp_mut_and_context();
+        if let Some(context) = ctx_opt {
+            if method_name == "fill"
+                && let Some(value) = small_args.first().copied()
+            {
+                if is_bigint {
+                    let b = crate::coerce::to_big_int_or_throw(interp, &context, &value)
+                        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+                    small_args[0] = Value::big_int(b);
+                } else if !value.is_number() {
+                    let n = interp
+                        .coerce_to_number(&context, &value)
+                        .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+                    small_args[0] = Value::number(n);
+                }
+            }
+            for &idx in int_coerce {
+                let Some(value) = small_args.get(idx).copied() else {
+                    continue;
+                };
+                if value.is_number() || value.is_undefined() {
+                    continue;
+                }
+                let n = interp
+                    .coerce_to_number(&context, &value)
+                    .map_err(|e| crate::native_function::vm_to_native_error(e, NAME))?;
+                small_args[idx] = Value::number(n);
+            }
+        }
+    }
+
     let allocation_roots = ctx.collect_native_roots();
     let gc_heap = ctx.heap_mut();
     let mut intrinsic_args = IntrinsicArgs {
@@ -1061,7 +1109,7 @@ fn ta_proto_dispatch(
         allocation_roots: allocation_roots.as_slice(),
     };
     (entry.impl_fn)(&mut intrinsic_args).map_err(|e| NativeError::TypeError {
-        name: "TypedArray.prototype",
+        name: NAME,
         reason: e.to_string(),
     })
 }

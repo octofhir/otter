@@ -926,33 +926,6 @@ pub(crate) fn is_set_method_name(name: &str) -> bool {
     )
 }
 
-/// Native dispatch entry used by `Op::CallMethodValue` for direct
-/// `set.method(...)` calls. The intrinsic table cannot re-enter JS,
-/// while these algorithms must execute `GetSetRecord`.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-getsetrecord>
-/// - <https://tc39.es/ecma262/#sec-properties-of-the-set-prototype-object>
-pub(crate) fn set_method_call(
-    ctx: &mut NativeCtx<'_>,
-    name: &str,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    match name {
-        "union" => set_proto_union(ctx, args),
-        "intersection" => set_proto_intersection(ctx, args),
-        "difference" => set_proto_difference(ctx, args),
-        "symmetricDifference" => set_proto_symmetric_difference(ctx, args),
-        "isSubsetOf" => set_proto_is_subset_of(ctx, args),
-        "isSupersetOf" => set_proto_is_superset_of(ctx, args),
-        "isDisjointFrom" => set_proto_is_disjoint_from(ctx, args),
-        _ => Err(NativeError::TypeError {
-            name: "Set.prototype",
-            reason: format!("unknown Set method {name}"),
-        }),
-    }
-}
-
 /// §24.2.4.7 `Set.prototype.union`.
 ///
 /// # See also

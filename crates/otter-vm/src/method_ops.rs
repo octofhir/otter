@@ -219,25 +219,15 @@ impl Interpreter {
             return Ok(());
         }
 
-        // §24.2.4 Set methods use `GetSetRecord(other)`, so they
-        // may call user-visible `other.has` / `other.keys`. Route
-        // through the native context path instead of the synchronous
-        // intrinsic table, which has no interpreter re-entry handle.
-        // <https://tc39.es/ecma262/#sec-getsetrecord>
         if recv_value.is_set() && bootstrap_collections::is_set_method_name(name) {
-            let result = {
-                let mut ctx = NativeCtx::new_with_call_info_and_context(
-                    self,
-                    NativeCallInfo::call(recv_value),
-                    Some(context.clone()),
-                );
-                bootstrap_collections::set_method_call(&mut ctx, name, &arg_values)
-                    .map_err(native_to_vm_error)?
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
         // Iterator-helpers proposal — when receiver is an iterator

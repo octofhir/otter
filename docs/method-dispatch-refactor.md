@@ -123,6 +123,10 @@ conformance-gated before the next starts.
     instead of the opcode-local callback helper, so non-callable
     prototype shadows on Map and Set report the shared non-callable
     TypeError.
+  - [x] ES Set methods (`union`, `intersection`, `difference`, and
+    predicates) now resolve through prototype `GetMethod` before the
+    re-entrant native body, so non-callable prototype shadows report the
+    shared non-callable TypeError.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

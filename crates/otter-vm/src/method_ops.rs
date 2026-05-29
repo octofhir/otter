@@ -1282,6 +1282,24 @@ impl Interpreter {
         // primitive shape: String exposes integer indices in
         // `[0, length)` plus `"length"`; every other primitive has
         // no own properties.
+        if object_prototype_dispatch_method_name(name)
+            && (recv_value.is_string()
+                || recv_value.is_number()
+                || recv_value.is_boolean()
+                || recv_value.is_symbol()
+                || recv_value.is_big_int())
+        {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if method.as_native_function().is_none() {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+        }
         if matches!(
             name,
             "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"

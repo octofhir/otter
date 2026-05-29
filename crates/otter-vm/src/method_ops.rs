@@ -374,15 +374,7 @@ impl Interpreter {
             }
         }
 
-        // §7.3.11 GetMethod + §7.3.14 Call — an Array receiver resolves
-        // its method through the ordinary prototype walk (own shadows,
-        // user `Array.prototype` overrides, and inherited
-        // `Object.prototype` methods all observed) and dispatches the
-        // resolved callable uniformly. The realm's canonical
-        // `Array.prototype` natives (`ARRAY_PROTOTYPE_METHODS`) carry the
-        // re-entrant live driver themselves (`array_live_method_dispatch`
-        // / `array_callback_native_dispatch` via `native_array_method`),
-        // so no receiver-type switch or per-method arm is needed here.
+        // §7.3.11 GetMethod + §7.3.14 Call.
         if recv_value.is_array() {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
@@ -393,13 +385,7 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        // §7.3.11 GetMethod + §7.3.14 Call — primitives, collections,
-        // weak references, ArrayBuffer / DataView, and non-`set` Date
-        // methods all resolve their prototype method through the ordinary
-        // `[[Get]]` walk (so a user prototype shadow is observed) and
-        // dispatch the resolved callable uniformly. The realm natives
-        // carry their own re-entrant bodies, so no per-family arm is
-        // needed.
+        // §7.3.11 GetMethod + §7.3.14 Call.
         if self.has_plain_builtin_method(recv_value, name) {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
@@ -410,12 +396,8 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        // TypedArray own-property shadows (expando bag) take precedence
-        // over every prototype method, including the callback methods now
-        // installed as real `%TypedArray%.prototype` natives. A canonical
-        // callback (`map` / `filter` / `reduce` / …) has no own property
-        // here, so it falls through to the shared `GetMethod` + `Call`
-        // fallback which resolves the installed native.
+        // §9.4.5 integer-indexed exotic: an own expando property shadows
+        // any inherited prototype method.
         if let Some(method) =
             self.typed_array_own_method_value_for_call(context, recv_value, name)?
         {
@@ -424,39 +406,6 @@ impl Interpreter {
             }
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_typed_array() && matches!(name, "slice" | "subarray") {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-            }
-        }
-        // §23.2.3.26 `%TypedArray%.prototype.slice` allocates its
-        // result through `TypedArraySpeciesCreate` and coerces its
-        // `start` / `end` operands through `ToIntegerOrInfinity`
-        // (which observes user `@@toPrimitive` / `valueOf`). The
-        // intrinsic-table impl can do neither, so intercept here while
-        // a re-entrant interpreter handle is in scope.
-        if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
-            && name == "slice"
-        {
-            self.typed_array_slice_dispatch(stack, context, &t, &arg_values, dst)?;
-            return Ok(());
-        }
-        // §23.2.3.27 `%TypedArray%.prototype.subarray` likewise coerces
-        // its operands through `ToIntegerOrInfinity` and allocates its
-        // result view through `TypedArraySpeciesCreate`.
-        if let Some(t) = recv_value.as_typed_array(&self.gc_heap)
-            && name == "subarray"
-        {
-            self.typed_array_subarray_dispatch(stack, context, &t, &arg_values, dst)?;
-            return Ok(());
         }
         // §22.1.3.18 / §22.1.3.19 — `String.prototype.replace` and
         // `replaceAll` with a callable replaceValue dispatch through
@@ -584,15 +533,11 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        // Intrinsic-table fallback — only the receivers whose prototype
-        // methods are not yet real natives reach here: Intl and
-        // TypedArray pure-functional methods. Every other family resolves
-        // through `GetMethod` + `Call` in a branch above and returns
-        // before this point, so its `lookup(name)` arm would be
-        // unreachable.
+        // `slice` / `subarray` carry §23.2.4.1 `TypedArraySpeciesCreate`,
+        // so they dispatch as natives, not through the table.
         let intrinsic = if recv_value.is_intl() {
             intl::lookup_prototype(&recv_value, &self.gc_heap, name)
-        } else if recv_value.is_typed_array() {
+        } else if recv_value.is_typed_array() && !matches!(name, "slice" | "subarray") {
             binary::typed_array_prototype::lookup(name)
         } else {
             None
@@ -907,17 +852,10 @@ impl Interpreter {
         })
     }
 
-    /// `true` when `recv_value` belongs to a builtin family whose
-    /// prototype method `name` is a plain re-entrant native, dispatched
-    /// uniformly through §7.3.11 `GetMethod` + §7.3.14 `Call` with no
-    /// per-method argument coercion or species step at the call site —
-    /// each native carries its own re-entrant coercion. These families
-    /// (primitives, collections, weak references, ArrayBuffer / DataView,
-    /// and Date — including `set*`, whose captured-time coercion lives in
-    /// `native_date_method`) share one dispatch branch; receivers needing
-    /// extra call-site machinery (Array callbacks, TypedArray species,
-    /// RegExp `exec`/`test` coercion, String callable replace) keep their
-    /// dedicated paths.
+    /// `true` when `recv_value`'s prototype defines a builtin method
+    /// `name` that dispatches through §7.3.11 `GetMethod` + §7.3.14 `Call`
+    /// without call-site coercion or a species step (the native handles
+    /// those itself).
     fn has_plain_builtin_method(&self, recv_value: Value, name: &str) -> bool {
         if recv_value.is_string() {
             return string_prototype::lookup(name).is_some();
@@ -1529,14 +1467,17 @@ impl Interpreter {
     /// through `ToIntegerOrInfinity`, then
     /// `TypedArraySpeciesCreate(O, « buffer, beginByteOffset, length »)`
     /// (the buffer form, so no result-length check) allocates the view.
-    fn typed_array_subarray_dispatch(
+    /// §23.2.3.27 `%TypedArray%.prototype.subarray(begin, end)`,
+    /// value-returning form for the real-native dispatch path. Builds a
+    /// new view over the *same* buffer through `TypedArraySpeciesCreate`
+    /// (the buffer form); `begin` / `end` coerce through
+    /// `ToIntegerOrInfinity`, observing user `@@toPrimitive` / `valueOf`.
+    pub(crate) fn typed_array_subarray_value_dispatch(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
-        args: &SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
+        args: &[Value],
+    ) -> Result<Value, VmError> {
         let buffer = t.buffer(&self.gc_heap);
         // §23.2.3.27 step 4 — `[[ArrayLength]]` is `0` for a detached
         // buffer; `subarray` does not itself throw on detachment.
@@ -1553,9 +1494,6 @@ impl Interpreter {
         let bpe = t.kind().bytes_per_element();
         let begin_byte_offset = t.byte_offset(&self.gc_heap) + begin_index as usize * bpe;
 
-        let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
-
         let mut argv: SmallVec<[Value; 8]> = SmallVec::new();
         argv.push(Value::array_buffer(buffer));
         argv.push(Value::number(NumberValue::from_f64(
@@ -1563,27 +1501,23 @@ impl Interpreter {
         )));
         argv.push(Value::number(NumberValue::from_f64(new_length as f64)));
         let a = self.typed_array_create_via_species(context, t, argv, None)?;
-        let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-        write_register(frame_top, dst, Value::typed_array(a))?;
-        Ok(())
+        Ok(Value::typed_array(a))
     }
 
-    /// §23.2.3.26 `%TypedArray%.prototype.slice(start, end)`. Coerces
+    /// §23.2.3.26 `%TypedArray%.prototype.slice(start, end)`,
+    /// value-returning form for the real-native dispatch path. Coerces
     /// both operands through `ToIntegerOrInfinity` (observing user
     /// `@@toPrimitive` / `valueOf`), allocates the result via
-    /// `TypedArraySpeciesCreate(O, « count »)`, then copies the
-    /// in-range elements. The result is parked in `dst` before the
-    /// copy so it stays GC-rooted, and the source buffer is re-checked
-    /// for detachment after the (potentially re-entrant) species
-    /// constructor runs.
-    fn typed_array_slice_dispatch(
+    /// `TypedArraySpeciesCreate(O, « count »)`, then copies the in-range
+    /// elements. The source buffer is re-checked for detachment after the
+    /// (potentially re-entrant) species constructor runs; the element
+    /// copy itself does not re-enter, so the result stays live as a local.
+    pub(crate) fn typed_array_slice_value_dispatch(
         &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
-        args: &SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
+        args: &[Value],
+    ) -> Result<Value, VmError> {
         if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
             return Err(VmError::TypeError {
                 message: "Cannot slice a TypedArray backed by a detached buffer".to_string(),
@@ -1600,15 +1534,7 @@ impl Interpreter {
         let final_index = relative_index_clamp(relative_end, len);
         let count = (final_index - k).max(0) as usize;
 
-        let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
-
         let a = self.typed_array_species_create(context, t, count)?;
-        let a_value = Value::typed_array(a);
-        {
-            let frame_top = stack.last_mut().ok_or(VmError::InvalidOperand)?;
-            write_register(frame_top, dst, a_value)?;
-        }
         if count > 0 {
             if t.buffer(&self.gc_heap).is_detached(&self.gc_heap) {
                 return Err(VmError::TypeError {
@@ -1629,7 +1555,7 @@ impl Interpreter {
                 a.set(&mut self.gc_heap, n, &coerced);
             }
         }
-        Ok(())
+        Ok(Value::typed_array(a))
     }
 
     /// §7.1.5 `ToIntegerOrInfinity` applied to an optional argument

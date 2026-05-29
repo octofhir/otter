@@ -1022,8 +1022,6 @@ macro_rules! ta_proto_method {
 }
 
 ta_proto_method!(ta_at, "at");
-ta_proto_method!(ta_subarray, "subarray");
-ta_proto_method!(ta_slice, "slice");
 ta_proto_method!(ta_fill, "fill");
 ta_proto_method!(ta_copy_within, "copyWithin");
 ta_proto_method!(ta_reverse, "reverse");
@@ -1068,13 +1066,8 @@ fn ta_proto_dispatch(
     })
 }
 
-// ---------------------------------------------------------------
-// Callback-driven prototype methods (`map` / `filter` / `forEach` /
-// `every` / `some` / `find*` / `reduce*`). These need a live
-// interpreter to drive synchronous callbacks and to run
-// `TypedArraySpeciesCreate`, so they re-enter through
-// `Interpreter::typed_array_callback_value_dispatch`.
-// ---------------------------------------------------------------
+// §23.2.3 callback-driven prototype methods re-enter the interpreter to
+// drive synchronous callbacks and `TypedArraySpeciesCreate`.
 
 macro_rules! ta_cb_method {
     ($name:ident, $method:expr) => {
@@ -1095,6 +1088,41 @@ ta_cb_method!(ta_find_last, "findLast");
 ta_cb_method!(ta_find_last_index, "findLastIndex");
 ta_cb_method!(ta_reduce, "reduce");
 ta_cb_method!(ta_reduce_right, "reduceRight");
+
+/// §23.2.3.26 / §23.2.3.27 `slice` / `subarray` — both run
+/// `TypedArraySpeciesCreate` and `ToIntegerOrInfinity` operand coercion.
+fn ta_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    ta_species_dispatch(ctx, args, "slice")
+}
+
+fn ta_subarray(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    ta_species_dispatch(ctx, args, "subarray")
+}
+
+fn ta_species_dispatch(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    method_name: &'static str,
+) -> Result<Value, NativeError> {
+    let receiver = *ctx.this_value();
+    let Some(t) = receiver.as_typed_array(ctx.heap()) else {
+        return Err(NativeError::TypeError {
+            name: method_name,
+            reason: "method called on a non-TypedArray receiver".to_string(),
+        });
+    };
+    let (interp, ctx_opt) = ctx.interp_mut_and_context();
+    let context = ctx_opt.ok_or(NativeError::TypeError {
+        name: method_name,
+        reason: "missing execution context".to_string(),
+    })?;
+    let result = if method_name == "slice" {
+        interp.typed_array_slice_value_dispatch(&context, &t, args)
+    } else {
+        interp.typed_array_subarray_value_dispatch(&context, &t, args)
+    };
+    result.map_err(|err| crate::native_function::vm_to_native_error(err, method_name))
+}
 
 fn ta_callback_dispatch(
     ctx: &mut NativeCtx<'_>,

@@ -116,6 +116,10 @@ conformance-gated before the next starts.
   - [x] RegExp expando methods now shadow RegExp.prototype before the
     intrinsic table: `re.exec = 1; re.exec()` reports the shared
     non-callable TypeError instead of calling the builtin matcher.
+  - [x] RegExp prototype methods now resolve through the
+    `RegExp.prototype` property path before the intrinsic table, so
+    non-callable prototype shadows report the shared non-callable
+    TypeError.
   - [x] TypedArray expando methods now shadow `%TypedArray%.prototype`
     before callback/slice/subarray/intrinsic arms: `ta.map = 1; ta.map()`
     reports the shared non-callable TypeError.

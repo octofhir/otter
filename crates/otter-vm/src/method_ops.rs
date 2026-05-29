@@ -689,6 +689,16 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
+        if recv_value.is_regexp() && regexp_prototype::lookup(name).is_some() {
+            let method = self
+                .regexp_prototype_method_value_for_call(context, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         if recv_value.is_weak_ref() && weak_refs::lookup_weak_ref(name).is_some() {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
@@ -1221,6 +1231,28 @@ impl Interpreter {
                 _ => Ok(Some(Value::undefined())),
             },
             crate::object::PropertyLookup::Absent => Ok(None),
+        }
+    }
+
+    fn regexp_prototype_method_value_for_call(
+        &mut self,
+        context: &ExecutionContext,
+        recv_value: Value,
+        name: &str,
+    ) -> Result<Option<Value>, VmError> {
+        let proto = self.constructor_prototype_value("RegExp")?;
+        if proto.is_nullish() {
+            return Ok(None);
+        }
+        let key = VmPropertyKey::String(name);
+        match self.ordinary_get_value(context, proto, recv_value, &key, 0)? {
+            VmGetOutcome::Value(value) => Ok(Some(value)),
+            VmGetOutcome::InvokeGetter { getter } => {
+                let args: SmallVec<[Value; 8]> = SmallVec::new();
+                Ok(Some(
+                    self.run_callable_sync(context, &getter, recv_value, args)?,
+                ))
+            }
         }
     }
 

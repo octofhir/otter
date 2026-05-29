@@ -258,12 +258,26 @@ conformance-gated before the next starts.
     Boolean, BigInt, Symbol, Map, Set, WeakMap, WeakSet, ArrayBuffer,
     DataView, Date} all byte-identical before/after (4142 tests, 0
     delta). `method_ops.rs` −69 net lines.
-- [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
-  prototype-installed callables. The dead intrinsic-table arms (every
-  family above resolves through `GetMethod` first and `return`s, so the
-  `lookup(name)` arm for it is unreachable) can retire once TypedArray /
-  Intl / Date-`set` are installed as real prototype natives — those three
-  are the only receivers still reaching the intrinsic-table block.
+  - [x] **Dead intrinsic-table arms + arg-coercion preambles removed.**
+    The `let intrinsic = if/else if` chain shrank from sixteen arms to
+    three (`date` `set*`, `intl`, `typed_array`) — every other arm was
+    unreachable (the family returns via a `GetMethod` branch above, or
+    its `lookup(name)` is `None` exactly when the arm is reached). The
+    String / Number `toFixed` / Array-Object / DataView / RegExp
+    `exec`-`test` coercion preambles were likewise dead (their receivers
+    no longer reach the block; the resolved natives do their own
+    coercion) and were deleted along with the now-unused
+    `needs_to_primitive` helper. Verified no behavior change:
+    built-ins/{String, Number, RegExp, DataView, TypedArray, Date}
+    byte-identical before/after (6996 tests, 0 delta). `method_ops.rs`
+    −164 net lines.
+- [ ] **Stage 5** — collapse the remaining three `lookup(name)` tables
+  (`date` `set*`, `intl`, `typed_array`) into prototype-installed
+  callables. Once TypedArray / Intl / Date-`set` are real prototype
+  natives the intrinsic-table block retires entirely and the dispatch
+  function reduces to the special VM-intrinsic paths (generators,
+  iterator helpers, async, callback drivers) plus one terminal
+  `GetMethod` + `Call`.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`
   / `throw` IteratorClose in non-generator frames (needs unwind
   integration with `active_iterator_closers`).

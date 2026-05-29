@@ -35,22 +35,6 @@ use crate::{
     symbol_prototype, weak_refs, write_register,
 };
 
-/// Object-like family that needs §7.1.1 `ToPrimitive` coercion before
-/// numeric / string arithmetic. Mirrors the matches! variant list used
-/// throughout `CallMethodValue` arg-coercion preambles: every object-
-/// shaped value plus `RegExp` (which carries an expando bag).
-fn needs_to_primitive(v: &Value) -> bool {
-    v.is_object()
-        || v.is_array()
-        || v.is_function()
-        || v.is_closure()
-        || v.is_native_function()
-        || v.is_bound_function()
-        || v.is_class_constructor()
-        || v.is_proxy()
-        || v.is_regexp()
-}
-
 /// Clamp a `ToIntegerOrInfinity` result to an absolute index within
 /// `[0, len]` per the relative-index convention shared by §23.2.3
 /// `slice` / `subarray` (negative counts from the end, `±Infinity`
@@ -664,146 +648,31 @@ impl Interpreter {
                 return self.invoke(stack, context, &method, recv_value, arg_values, dst);
             }
         }
-        // Primitive prototypes go through the intrinsic table —
-        // synchronous, no frame push, advance pc and write directly.
-        let intrinsic = if recv_value.is_string() {
-            string_prototype::lookup(name)
-        } else if recv_value.is_number() {
-            number::prototype_lookup(name)
-        } else if recv_value.is_boolean() {
-            boolean_prototype::lookup(name)
-        } else if recv_value.is_big_int() {
-            bigint::prototype::lookup(name)
-        } else if recv_value
+        // Intrinsic-table fallback — only the receivers whose prototype
+        // methods are not yet real natives reach here: Date `set*` (the
+        // captured-time path falls through from its probe above), Intl,
+        // and TypedArray pure-functional methods. Every other family
+        // resolves through `GetMethod` + `Call` in a branch above and
+        // returns before this point, so its `lookup(name)` arm would be
+        // unreachable.
+        let intrinsic = if recv_value
             .as_object()
             .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
         {
             // Date instances are ordinary objects with a
-            // `[[DateValue]]` internal slot — when the receiver
-            // is an Object we probe `crate::object::date_data` to
-            // brand-check and route through the Date intrinsic
-            // table.
+            // `[[DateValue]]` internal slot — probe `date_data` to
+            // brand-check and route `set*` through the Date intrinsic
+            // table's captured-time path.
             date::prototype::lookup(name)
-        } else if recv_value.is_regexp() {
-            regexp_prototype::lookup(name)
-        } else if recv_value.is_symbol() {
-            symbol_prototype::lookup(name)
-        } else if recv_value.is_map() {
-            collections_prototype::lookup_map(name)
-        } else if recv_value.is_set() {
-            collections_prototype::lookup_set(name)
-        } else if recv_value.is_weak_map() {
-            collections_prototype::lookup_weak_map(name)
-        } else if recv_value.is_weak_set() {
-            collections_prototype::lookup_weak_set(name)
-        } else if recv_value.is_weak_ref() {
-            weak_refs::lookup_weak_ref(name)
-        } else if recv_value.is_finalization_registry() {
-            weak_refs::lookup_finalization_registry(name)
         } else if recv_value.is_intl() {
             intl::lookup_prototype(&recv_value, &self.gc_heap, name)
-        } else if recv_value.is_array_buffer() {
-            binary::array_buffer_prototype::lookup(name)
-        } else if recv_value.is_data_view() {
-            binary::data_view_prototype::lookup(name)
         } else if recv_value.is_typed_array() {
             binary::typed_array_prototype::lookup(name)
         } else {
             None
         };
         if let Some(entry) = intrinsic {
-            // §21.1.3.{3,4,5} — `Number.prototype.{toFixed,
-            // toExponential, toPrecision}` start with
-            // `ToIntegerOrInfinity` on their argument, which runs
-            // `ToNumber` → `ToPrimitive(arg, "number")`. Non-
-            // primitive arguments must observe `@@toPrimitive` /
-            // `valueOf` / `toString`. Pre-coerce here before the
-            // intrinsic so the spec ladder fires and Symbol / BigInt
-            // surface the correct error class.
             let mut small_args: SmallVec<[Value; 4]> = arg_values.iter().cloned().collect();
-            if recv_value.is_number() && matches!(name, "toFixed" | "toExponential" | "toPrecision")
-            {
-                for slot in small_args.iter_mut() {
-                    if needs_to_primitive(slot) {
-                        let primitive = self.evaluate_to_primitive(
-                            context,
-                            slot,
-                            crate::abstract_ops::ToPrimitiveHint::Number,
-                        )?;
-                        *slot = primitive;
-                    }
-                }
-            }
-            // Pre-coerce integer-typed args through the
-            // `ToNumber` → `ToPrimitive(Number)` ladder so the
-            // intrinsic's `arg_signed_index` strict guard observes
-            // user `@@toPrimitive` / `valueOf` / `toString` side
-            // effects per spec rather than tripping
-            // `TypeMismatch`. Each tuple lists the argument indices
-            // whose `ToIntegerOrInfinity(…)` invocation lives at
-            // the top of the algorithm header. Method receivers are
-            // intentionally restricted to Array / Object — the
-            // primitive-receiver short-circuit returns the unmodified
-            // value before the intrinsic body runs.
-            let int_coerce_indices: &[usize] = match name {
-                // §23.1.3.14 / .17 / .15
-                "indexOf" | "lastIndexOf" | "includes" => &[1],
-                // §23.1.3.7 fill(value, start, end)
-                "fill" => &[1, 2],
-                // §23.1.3.1 at(index)
-                "at" => &[0],
-                _ => &[],
-            };
-            if !int_coerce_indices.is_empty() && (recv_value.is_array() || recv_value.is_object()) {
-                for &idx in int_coerce_indices {
-                    let Some(slot) = small_args.get_mut(idx) else {
-                        continue;
-                    };
-                    if !needs_to_primitive(slot) {
-                        continue;
-                    }
-                    let primitive = self.evaluate_to_primitive(
-                        context,
-                        slot,
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    )?;
-                    *slot = primitive;
-                }
-            }
-            // §22.1.3.* String.prototype.* `position` / `start` /
-            // `end` args run `ToIntegerOrInfinity(arg)`; searchString
-            // operands run `ToString(arg)` which itself starts with
-            // `ToPrimitive(arg, "string")`. Pre-coerce both shapes
-            // when the receiver is a String primitive so user
-            // `@@toPrimitive` / `valueOf` / `toString` fires per spec.
-            // §24.3.1.{1,2} GetViewValue / SetViewValue on
-            // `DataView.prototype.*` — pre-coerce `byteOffset` (and
-            // setter `value`) through `ToPrimitive(Number)` so user
-            // `@@toPrimitive` / `valueOf` / `toString` fire before
-            // the intrinsic's strict numeric guard.
-            if recv_value.is_data_view() {
-                let dv_int_coerce: &[usize] = if name.starts_with("get") {
-                    &[0]
-                } else if name.starts_with("set") {
-                    &[0, 1]
-                } else {
-                    &[]
-                };
-                for &idx in dv_int_coerce {
-                    let Some(slot) = small_args.get_mut(idx) else {
-                        continue;
-                    };
-                    if !needs_to_primitive(slot) {
-                        continue;
-                    }
-                    let primitive = self.evaluate_to_primitive(
-                        context,
-                        slot,
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    )?;
-                    *slot = primitive;
-                }
-            }
             // §23.2.3.{8,5,18,16,17} `fill` / `copyWithin` /
             // `includes` / `indexOf` / `lastIndexOf` open with
             // `ToNumber` / `ToIntegerOrInfinity` on their operands; the
@@ -848,39 +717,6 @@ impl Interpreter {
                     let n = self.coerce_to_number(context, &value)?;
                     small_args[idx] = Value::number(n);
                 }
-            }
-            if recv_value.is_string() {
-                self.coerce_string_method_args(context, name, &mut small_args)?;
-            }
-            // §22.2.7.1 / .2 `RegExp.prototype.exec` / `test` —
-            // step `S = ? ToString(string)` on the argument. The
-            // intrinsic's `arg_to_string_primitive` only inspects
-            // slots, so an Object arg with a user `toString` was
-            // stringified to `"[object Object]"` (matching nothing).
-            // Pre-coerce through `ToPrimitive(String)` so the user
-            // callback fires; the intrinsic then finishes ToString.
-            if recv_value.is_regexp()
-                && matches!(name, "exec" | "test")
-                && let Some(slot) = small_args.get_mut(0)
-                && (slot.is_object()
-                    || slot.is_array()
-                    || slot.is_function()
-                    || slot.is_closure()
-                    || slot.is_native_function()
-                    || slot.is_bound_function()
-                    || slot.is_class_constructor()
-                    || slot.is_proxy()
-                    || slot.is_regexp()
-                    || slot.is_promise()
-                    || slot.is_map()
-                    || slot.is_set())
-            {
-                let primitive = self.evaluate_to_primitive(
-                    context,
-                    slot,
-                    crate::abstract_ops::ToPrimitiveHint::String,
-                )?;
-                *slot = primitive;
             }
             // §21.4.4.x `Date.prototype.set*` — capture `t` from
             // `[[DateValue]]` BEFORE coercing args (step 3), run

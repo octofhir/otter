@@ -120,6 +120,9 @@ conformance-gated before the next starts.
     `RegExp.prototype` property path before the intrinsic table, so
     non-callable prototype shadows report the shared non-callable
     TypeError.
+  - [x] Non-mutating Date prototype methods now resolve through the
+    shared `GetMethod` path before the intrinsic table, so non-callable
+    prototype shadows report the shared non-callable TypeError.
   - [x] TypedArray expando methods now shadow `%TypedArray%.prototype`
     before callback/slice/subarray/intrinsic arms: `ta.map = 1; ta.map()`
     reports the shared non-callable TypeError.

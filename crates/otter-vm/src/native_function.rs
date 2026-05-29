@@ -851,19 +851,6 @@ impl NativeFunction {
         )
     }
 
-    /// `true` when this callable is the static builtin backed by
-    /// `target`. Realm-canonical identity guard for §7.3.11
-    /// `GetMethod` + `Call` lowering: the resolved method value can be
-    /// matched against the engine's canonical builtin function pointer
-    /// without a name allowlist.
-    #[must_use]
-    pub fn is_static_fn(&self, heap: &otter_gc::GcHeap, target: NativeFastFn) -> bool {
-        heap.read_payload(
-            self.inner,
-            |body| matches!(body.call, NativeCallStorage::Static(f) if std::ptr::fn_addr_eq(f, target)),
-        )
-    }
-
     /// Trace this handle as a root slot.
     pub(crate) fn trace_value_slots(&self, visitor: &mut SlotVisitor<'_>) {
         let p = self as *const NativeFunction as *mut RawGc;

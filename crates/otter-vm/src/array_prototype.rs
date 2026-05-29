@@ -1749,28 +1749,6 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
     ARRAY_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Array, name)
 }
 
-/// §7.3.11 canonical-builtin identity guard for the callback
-/// `Array.prototype` methods. Returns `true` only when `method` is the
-/// realm's original native for `name`, so a `GetMethod`-resolved value
-/// can be matched against the engine's own function pointer instead of
-/// a method-name allowlist. A user override (`Array.prototype.map = fn`)
-/// or own shadow resolves to a different value and falls out here.
-#[must_use]
-pub(crate) fn is_canonical_callback_method(
-    method: &Value,
-    heap: &otter_gc::GcHeap,
-    name: &str,
-) -> bool {
-    let Some(native) = method.as_native_function() else {
-        return false;
-    };
-    let target: crate::native_function::NativeFastFn = match name {
-        "map" => native_map,
-        _ => return false,
-    };
-    native.is_static_fn(heap, target)
-}
-
 /// Static `Array.prototype` methods whose implementations do not
 /// require JS callback dispatch.
 pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
@@ -1902,14 +1880,24 @@ fn native_array_method(
             reason: "Array.prototype method called on null or undefined".to_string(),
         });
     }
-    // Pre-coerce integer-typed args via `ToPrimitive(Number)` so the
-    // intrinsic's strict `arg_signed_index` guard observes user
-    // `@@toPrimitive` / `valueOf` / `toString` side effects per spec.
-    // Mirrors the matching arm in `Op::CallMethodValue`; this path
-    // handles `Array.prototype.<x>.call(...)` / `.apply(...)` /
-    // `.bind(...)` invocations that bypass the receiver fast path.
+    // §22.1.3 — the re-entrant live driver runs first with the raw
+    // arguments so methods that coerce in spec order (e.g. `indexOf` /
+    // `includes` check `len` before `ToInteger(fromIndex)`) keep that
+    // order; abrupt completions propagate without being reclassified.
+    let exec = ctx.execution_context().cloned();
+    if let Some(exec) = &exec {
+        let interp = ctx.interp_mut();
+        if let Some(result) =
+            interp.array_live_method_dispatch(exec, name, receiver, args, &[args])
+        {
+            return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
+        }
+    }
+    // Intrinsic-table fallback only (`fill` / `at` / …): the context-free
+    // impl can't re-enter, so pre-coerce its integer-typed args through
+    // `ToPrimitive(Number)` here, preserving the thrown value on abrupt
+    // completion.
     let int_coerce_indices: &[usize] = match name {
-        "indexOf" | "lastIndexOf" | "includes" => &[1],
         "fill" => &[1, 2],
         "at" => &[0],
         _ => &[],
@@ -1918,8 +1906,7 @@ fn native_array_method(
         args.iter().cloned().collect()
     } else {
         let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
-        let exec = ctx.execution_context().cloned();
-        if let Some(exec) = exec {
+        if let Some(exec) = &exec {
             for &idx in int_coerce_indices {
                 let Some(slot) = out.get_mut(idx) else {
                     continue;
@@ -1938,29 +1925,13 @@ fn native_array_method(
                 }
                 let interp = ctx.interp_mut();
                 let primitive = interp
-                    .evaluate_to_primitive(
-                        &exec,
-                        slot,
-                        crate::abstract_ops::ToPrimitiveHint::Number,
-                    )
-                    .map_err(|e| NativeError::TypeError {
-                        name,
-                        reason: e.to_string(),
-                    })?;
+                    .evaluate_to_primitive(exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
+                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
                 *slot = primitive;
             }
         }
         out
     };
-    let exec = ctx.execution_context().cloned();
-    if let Some(exec) = exec {
-        let interp = ctx.interp_mut();
-        if let Some(result) =
-            interp.array_live_method_dispatch(&exec, name, receiver, &coerced_args, &[args])
-        {
-            return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
-    }
     let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,

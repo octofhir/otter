@@ -106,19 +106,31 @@ conformance-gated before the next starts.
     only when the resolved method is the canonical builtin for that
     receiver family; otherwise use the shared non-callable check and
     `Call`.
-  - [x] Canonical-builtin identity guard, first slice — `Array.prototype.map`.
-    `arr.map()` now resolves `map` through `GetMethod`
-    (`get_method_value_for_call`'s ordinary prototype walk); the resolved
-    value is matched against the realm's canonical native via
-    `NativeFunction::is_static_fn` (fn-pointer identity, no name
-    allowlist) behind `array_prototype::is_canonical_callback_method`.
-    Canonical → existing re-entrant `array_callback_native_dispatch`
-    driver; user function → shared `invoke` with `this = arr` (fixes a
-    prior gap where `Array.prototype.map = fn` was ignored); non-callable
-    → shared `NotCallable`. `map` dropped from the inline `matches!`
-    family list. Gates: built-ins/Array/prototype/map 210/210 runnable
-    (100%); broad built-ins/Array/prototype 2590 pass / 128 fail / 92
-    skip / 1 timeout / 0 crash — byte-identical to the HEAD baseline (the
+  - [x] **Array family collapsed to `GetMethod` + `Call`.** The entire
+    Array receiver-type cluster in `do_call_method_value` (own-method
+    probe, callback `matches!` arm, `array_live_method_dispatch` arm, and
+    the Array arm of the intrinsic-table switch) is replaced by one
+    branch: an Array receiver resolves its method through
+    `get_method_value_for_call` (ordinary prototype walk — own shadows,
+    `Array.prototype` overrides, and inherited `Object.prototype` methods
+    all observed) and dispatches the resolved callable through the shared
+    `invoke`; non-callable → shared `NotCallable`. No canonical-identity
+    guard or per-method arm is needed: the realm's `ARRAY_PROTOTYPE_METHODS`
+    natives carry the re-entrant live driver themselves
+    (`native_array_method` → `array_live_method_dispatch` /
+    `array_callback_native_dispatch`), and `invoke` builds the native's
+    `NativeCtx` with the live `ExecutionContext`, so callback / getter
+    observation is identical to the old inline path. `native_array_method`
+    was corrected to run the live driver first with raw args (so
+    `indexOf` / `includes` / `lastIndexOf` keep §22.1.3 `len`-before-
+    `ToInteger(fromIndex)` ordering) and to propagate abrupt completions
+    through `vm_to_native_error` instead of reclassifying a thrown value
+    as a TypeError. Removed: `array_own_method_value_for_call`, the
+    transitional `is_canonical_callback_method` /
+    `NativeFunction::is_static_fn` identity guard. Gates:
+    built-ins/Array/prototype/map 210/210 (100%); broad
+    built-ins/Array/prototype 2598 pass / 120 fail / 92 skip / 1 timeout /
+    0 crash — **+8 vs the 2590/128 HEAD baseline, 0 regressions** (the
     earlier 2591/127 figure was a stale Stage-3 snapshot). Unit cover:
     `crates/otter-runtime/tests/array_map_canonical_guard.rs`.
   - [x] Slow fallback bridge extracted as `get_method_value_for_call`;

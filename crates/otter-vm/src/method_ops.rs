@@ -24,13 +24,11 @@ use smallvec::SmallVec;
 
 use crate::{
     BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IntrinsicArgs,
-    JsString, NativeCallInfo, NativeCtx, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey,
-    array_prototype, bigint, binary,
+    JsString, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint, binary,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, bound_function_object_prototype_intercept, build_array_cb_args,
     collections_prototype, date, descriptor_value, function_metadata, intl, intrinsic_to_vm_error,
-    native_function_object_prototype_intercept, native_to_vm_error, number,
-    object_prototype_intercept,
+    native_function_object_prototype_intercept, number, object_prototype_intercept,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
@@ -392,103 +390,24 @@ impl Interpreter {
             }
         }
 
-        // §23.1.3 callback-driven Array.prototype methods. The
-        // intrinsic table can't drive callbacks, so the foundation
-        // dispatches them here via `run_callable_sync`. Each method
-        // matches its ECMA-262 algorithm with sloppy edge handling
-        // (sparse holes, throwing comparators, length mutation
-        // mid-walk) deferred to follow-ups.
-        // Callback-driven `Array.prototype` methods on an Array receiver
-        // funnel into the single live driver
-        // (`array_callback_native_dispatch`), the same path the `.call` /
-        // property bridge uses, so `arr.map(cb)` and
-        // `Array.prototype.map.call(arr, cb)` run identical spec logic:
-        // `len` read once, then a live `Get(O, k)` per index (a callback
-        // mutating the receiver is observed). `sort` keeps its dedicated
-        // comparator dispatcher.
-        // §7.3.11 GetMethod + §7.3.14 Call — resolve `map` through the
-        // ordinary prototype walk, then keep the re-entrant Array driver
-        // only when the resolved value is the realm's canonical
-        // `Array.prototype.map` native. A user override or own shadow is
-        // called (or rejected as non-callable) through the shared path.
-        if recv_value.is_array() && name == "map" {
+        // §7.3.11 GetMethod + §7.3.14 Call — an Array receiver resolves
+        // its method through the ordinary prototype walk (own shadows,
+        // user `Array.prototype` overrides, and inherited
+        // `Object.prototype` methods all observed) and dispatches the
+        // resolved callable uniformly. The realm's canonical
+        // `Array.prototype` natives (`ARRAY_PROTOTYPE_METHODS`) carry the
+        // re-entrant live driver themselves (`array_live_method_dispatch`
+        // / `array_callback_native_dispatch` via `native_array_method`),
+        // so no receiver-type switch or per-method arm is needed here.
+        if recv_value.is_array() {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
                 .unwrap_or_else(Value::undefined);
-            if array_prototype::is_canonical_callback_method(&method, &self.gc_heap, name) {
-                let result = {
-                    let mut ctx = NativeCtx::new_with_call_info_and_context(
-                        self,
-                        NativeCallInfo::call(recv_value),
-                        Some(context.clone()),
-                    );
-                    array_prototype::array_callback_native_dispatch(name, &mut ctx, &arg_values)
-                        .map_err(native_to_vm_error)?
-                };
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, result)?;
-                frame.advance_pc(self.current_byte_len)?;
-                return Ok(());
-            }
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
             }
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if let Some(method) = self.array_own_method_value_for_call(context, recv_value, name)? {
-            if !self.is_callable_runtime(&method) {
-                return Err(VmError::NotCallable);
-            }
-            stack[top_idx].advance_pc(self.current_byte_len)?;
-            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-        }
-        if recv_value.is_array()
-            && matches!(
-                name,
-                "forEach"
-                    | "filter"
-                    | "reduce"
-                    | "reduceRight"
-                    | "find"
-                    | "findIndex"
-                    | "every"
-                    | "some"
-                    | "flatMap"
-            )
-        {
-            let result = {
-                let mut ctx = NativeCtx::new_with_call_info_and_context(
-                    self,
-                    NativeCallInfo::call(recv_value),
-                    Some(context.clone()),
-                );
-                array_prototype::array_callback_native_dispatch(name, &mut ctx, &arg_values)
-                    .map_err(native_to_vm_error)?
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        // Non-callback Array methods that need live spec semantics all
-        // route through the same dispatcher used by the native
-        // `.call`/`.apply` bridge. This keeps the two VM entry ABIs
-        // but avoids maintaining two per-method switchboards.
-        if recv_value.is_array()
-            && let Some(result) = self.array_live_method_dispatch(
-                context,
-                name,
-                recv_value,
-                &arg_values,
-                &[arg_values.as_slice()],
-            )
-        {
-            let result = result?;
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
         }
         // §7.3.11 GetMethod — primitive strings must observe
         // `String.prototype` before invoking the native method body.
@@ -877,8 +796,6 @@ impl Interpreter {
         // synchronous, no frame push, advance pc and write directly.
         let intrinsic = if recv_value.is_string() {
             string_prototype::lookup(name)
-        } else if recv_value.is_array() {
-            array_prototype::lookup(name)
         } else if recv_value.is_number() {
             number::prototype_lookup(name)
         } else if recv_value.is_boolean() {
@@ -1420,26 +1337,6 @@ impl Interpreter {
                 self.run_callable_sync(context, &getter, recv_value, args)
             }
         }
-    }
-
-    fn array_own_method_value_for_call(
-        &mut self,
-        context: &ExecutionContext,
-        recv_value: Value,
-        name: &str,
-    ) -> Result<Option<Value>, VmError> {
-        let Some(arr) = recv_value.as_array() else {
-            return Ok(None);
-        };
-        if let Some((getter, _setter)) = crate::array::get_accessor(arr, &self.gc_heap, name) {
-            return match getter {
-                Some(getter) if self.is_callable_runtime(&getter) => Ok(Some(
-                    self.run_callable_sync(context, &getter, recv_value, SmallVec::new())?,
-                )),
-                _ => Ok(Some(Value::undefined())),
-            };
-        }
-        Ok(crate::array::get_named_property(arr, &self.gc_heap, name))
     }
 
     fn typed_array_own_method_value_for_call(

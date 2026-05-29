@@ -119,6 +119,10 @@ conformance-gated before the next starts.
   - [x] TypedArray expando methods now shadow `%TypedArray%.prototype`
     before callback/slice/subarray/intrinsic arms: `ta.map = 1; ta.map()`
     reports the shared non-callable TypeError.
+  - [x] Map/Set `forEach` now resolve through prototype `GetMethod`
+    instead of the opcode-local callback helper, so non-callable
+    prototype shadows on Map and Set report the shared non-callable
+    TypeError.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

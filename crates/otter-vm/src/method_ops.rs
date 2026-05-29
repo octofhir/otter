@@ -7,7 +7,6 @@
 //!
 //! # Contents
 //! - `CallMethodValue` executable operand decoding.
-//! - Collection `forEach` callback dispatch.
 //! - Callback-driven Array prototype methods.
 //!
 //! # Invariants
@@ -30,7 +29,7 @@ use crate::{
     boolean::prototype as boolean_prototype,
     bootstrap_collections, bound_function_object_prototype_intercept, build_array_cb_args,
     collections_prototype, date, descriptor_value, function_metadata, intl, intrinsic_to_vm_error,
-    is_callable, native_function_object_prototype_intercept, native_to_vm_error, number,
+    native_function_object_prototype_intercept, native_to_vm_error, number,
     object_prototype_intercept,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
@@ -218,13 +217,6 @@ impl Interpreter {
             write_register(frame, dst, result)?;
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
-        }
-
-        // `forEach` on a collection requires a callback dispatch
-        // that pushes a frame; lives outside the static intrinsic
-        // table so it can drive `self.invoke`.
-        if name == "forEach" && (recv_value.is_map() || recv_value.is_set()) {
-            return self.do_collection_for_each(stack, context, &recv_value, &arg_values, dst);
         }
 
         // §24.2.4 Set methods use `GetSetRecord(other)`, so they
@@ -1379,94 +1371,6 @@ impl Interpreter {
             JsString::from_utf16_units(&out, &mut self.gc_heap)
                 .map_err(|_| VmError::TypeMismatch)?,
         ))
-    }
-
-    /// Dispatch `call` / `apply` / `bind` on a callable receiver.
-    /// Foundation handles only the literal-array shape of `apply`
-    /// — non-array second arguments raise `TypeMismatch` so callers
-    /// learn quickly that the foundation slice rejects dynamic
-    /// argument arrays.
-    /// Drive `Map.prototype.forEach` / `Set.prototype.forEach` —
-    /// invoke the callback on each entry in insertion order.
-    ///
-    /// # Algorithm
-    /// 1. For each live Map/Set entry, enqueue an inline call: every callback is
-    ///    invoked synchronously through `self.invoke`. Because each
-    ///    invoke pushes a frame and returns through the dispatch
-    ///    loop, the foundation chains them by stashing the iteration
-    ///    state in a tiny native closure that re-enters this helper.
-    /// 2. Foundation simplification: rather than a re-entrant
-    ///    chain, walk the receiver here and synchronously invoke
-    ///    each callback via a fresh dispatch_loop run on a new
-    ///    stack. This matches the synchronous-callback model the
-    ///    rest of the foundation already uses (see
-    ///    [`Interpreter::run_callable_sync`]).
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-map.prototype.foreach>
-    /// - <https://tc39.es/ecma262/#sec-set.prototype.foreach>
-    fn do_collection_for_each(
-        &mut self,
-        stack: &mut SmallVec<[Frame; 8]>,
-        context: &ExecutionContext,
-        recv: &Value,
-        args: &SmallVec<[Value; 8]>,
-        dst: u16,
-    ) -> Result<(), VmError> {
-        let callee = match args.first() {
-            Some(c) if is_callable(c) => *c,
-            _ => return Err(VmError::NotCallable),
-        };
-        // §24.1.3.5 / §24.2.3.6 step 4 — when `thisArg` is supplied,
-        // bind it as the callback's `this`; otherwise let
-        // `OrdinaryCallBindThis` default to undefined / globalObject.
-        let this_arg = args.get(1).cloned().unwrap_or(Value::undefined());
-        if !(recv.is_map() || recv.is_set()) {
-            return Err(VmError::TypeMismatch);
-        }
-        // Advance pc *before* invoking the callbacks so each
-        // callback returns to the next instruction in the caller
-        // frame.
-        let top_idx = stack.len() - 1;
-        stack[top_idx].advance_pc(self.current_byte_len)?;
-        // Write `undefined` into the dst slot — `forEach` returns
-        // `undefined` synchronously, even if the callback chain
-        // produces values.
-        write_register(&mut stack[top_idx], dst, Value::undefined())?;
-        let recv_for_callback = *recv;
-        if let Some(m) = recv.as_map() {
-            let mut index = 0;
-            while index < crate::collections::map_raw_len(m, &self.gc_heap) {
-                let Some((key, value)) = crate::collections::map_entry_at(m, &self.gc_heap, index)
-                else {
-                    index += 1;
-                    continue;
-                };
-                index += 1;
-                let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                cb_args.push(value);
-                cb_args.push(key);
-                cb_args.push(recv_for_callback);
-                self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-            }
-        } else if let Some(s) = recv.as_set() {
-            let mut index = 0;
-            while index < crate::collections::set_raw_len(s, &self.gc_heap) {
-                let Some(value) = crate::collections::set_value_at(s, &self.gc_heap, index) else {
-                    index += 1;
-                    continue;
-                };
-                index += 1;
-                let mut cb_args: SmallVec<[Value; 8]> = SmallVec::new();
-                cb_args.push(value);
-                cb_args.push(value);
-                cb_args.push(recv_for_callback);
-                self.run_callable_sync(context, &callee, this_arg, cb_args)?;
-            }
-        } else {
-            unreachable!();
-        }
-        Ok(())
     }
 
     /// §23.2.3 TypedArray prototype callback methods —

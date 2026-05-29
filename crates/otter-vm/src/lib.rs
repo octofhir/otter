@@ -6331,6 +6331,92 @@ mod tests {
     }
 
     #[test]
+    fn call_method_map_prototype_non_callable_shadows_builtin_for_each() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "forEach".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("Map")
+            .expect("Map.prototype")
+            .as_object()
+            .expect("Map.prototype object");
+        object::set(proto, interp.gc_heap_mut(), "forEach", Value::number_i32(1));
+        let map = crate::collections::alloc_map(interp.gc_heap_mut()).expect("map");
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::map(map);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable Map.prototype.forEach should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
+    fn call_method_set_prototype_non_callable_shadows_builtin_for_each() {
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 2, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "forEach".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("Set")
+            .expect("Set.prototype")
+            .as_object()
+            .expect("Set.prototype object");
+        object::set(proto, interp.gc_heap_mut(), "forEach", Value::number_i32(1));
+        let set = crate::collections::alloc_set(interp.gc_heap_mut()).expect("set");
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::set(set);
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(0),
+                ],
+            )
+            .expect_err("non-callable Set.prototype.forEach should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();

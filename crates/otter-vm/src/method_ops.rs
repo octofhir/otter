@@ -89,7 +89,7 @@ fn iterator_dispatch_method_name(name: &str) -> bool {
 fn object_prototype_dispatch_method_name(name: &str) -> bool {
     matches!(
         name,
-        "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
+        "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf" | "toString" | "valueOf"
     )
 }
 
@@ -1118,6 +1118,21 @@ impl Interpreter {
             return Ok(());
         }
 
+        if let Some(obj) = recv_value.as_object()
+            && self.object_prototype_object_opt() != Some(obj)
+            && object_prototype_dispatch_method_name(name)
+        {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if method.as_native_function().is_none() {
+                if !self.is_callable_runtime(&method) {
+                    return Err(VmError::NotCallable);
+                }
+                stack[top_idx].advance_pc(self.current_byte_len)?;
+                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            }
+        }
         if let Some(obj) = recv_value.as_object()
             && self.object_prototype_object_opt() != Some(obj)
             && matches!(

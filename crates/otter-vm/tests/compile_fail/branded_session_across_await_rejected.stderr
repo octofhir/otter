@@ -45,3 +45,27 @@ note: required by a bound in `assert_send_static_future`
  4 | where
  5 |     F: std::future::Future<Output = ()> + Send + 'static,
    |                                           ^^^^ required by this bound in `assert_send_static_future`
+
+error: future cannot be sent between threads safely
+  --> tests/compile_fail/branded_session_across_await_rejected.rs:11:9
+   |
+11 | /         assert_send_static_future(async move {
+12 | |             std::future::pending::<()>().await;
+13 | |             std::hint::black_box(session);
+14 | |         });
+   | |__________^ future created by async block is not `Send`
+   |
+   = help: within `{async block@$DIR/tests/compile_fail/branded_session_across_await_rejected.rs:11:35: 11:45}`, the trait `Send` is not implemented for `*const (dyn FrameRoots + 'static)`
+note: captured value is not `Send`
+  --> tests/compile_fail/branded_session_across_await_rejected.rs:13:34
+   |
+13 |             std::hint::black_box(session);
+   |                                  ^^^^^^^ has type `GcSession<'_, '_>` which is not `Send`
+note: required by a bound in `assert_send_static_future`
+  --> tests/compile_fail/branded_session_across_await_rejected.rs:5:43
+   |
+ 3 | fn assert_send_static_future<F>(_future: F)
+   |    ------------------------- required by a bound in this function
+ 4 | where
+ 5 |     F: std::future::Future<Output = ()> + Send + 'static,
+   |                                           ^^^^ required by this bound in `assert_send_static_future`

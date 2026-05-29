@@ -577,7 +577,7 @@ mod tests {
         // Bumped from 1500 → 1550 for newly wired conversion methods
         // (toZonedDateTime, toPlainYearMonth/MonthDay, fromEpochNanoseconds,
         // toZonedDateTimeISO, Duration.with) each adding a prototype fn.
-        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1550;
+        const MAX_DEFAULT_GC_ALLOCATIONS: u64 = 1650;
         const MAX_DEFAULT_GC_ALLOCATED_BYTES: usize = 560 * 1024;
 
         let mut heap = otter_gc::GcHeap::new().expect("heap");

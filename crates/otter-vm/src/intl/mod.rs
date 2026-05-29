@@ -37,6 +37,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/>
 
+pub mod bootstrap;
 pub mod collator;
 pub mod date_time_format;
 pub mod dispatch;

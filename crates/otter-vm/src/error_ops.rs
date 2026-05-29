@@ -20,9 +20,8 @@
 use smallvec::SmallVec;
 
 use crate::{
-    ErrorKind, ExecutionContext, Frame, Interpreter, IntrinsicError, JsString, NativeError,
-    StackFrameSnapshot, Value, VmError, error_classes, object, read_register, symbol_dispatch,
-    write_register,
+    ErrorKind, ExecutionContext, Frame, Interpreter, JsString, NativeError, StackFrameSnapshot,
+    Value, VmError, error_classes, object, read_register, symbol_dispatch, write_register,
 };
 
 impl Interpreter {
@@ -392,26 +391,6 @@ pub(crate) fn vm_err_to_value(err: &VmError, heap: &mut otter_gc::GcHeap) -> Val
     )
 }
 
-pub(crate) fn intrinsic_to_vm_error(err: IntrinsicError) -> VmError {
-    match err {
-        IntrinsicError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => VmError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        IntrinsicError::BadReceiver { .. } | IntrinsicError::BadArgument { .. } => {
-            VmError::TypeMismatch
-        }
-        IntrinsicError::OutOfRange { index, reason } => VmError::RangeError {
-            message: format!("argument {index} out of range: {reason}"),
-        },
-        IntrinsicError::UnknownMethod { name } => VmError::UnknownIntrinsic {
-            name: name.to_string(),
-        },
-    }
-}
 
 /// Render an uncaught JS value for diagnostic output. Routes
 /// Error-shaped objects through [`error_classes::render_error_to_string`]

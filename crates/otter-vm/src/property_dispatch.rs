@@ -962,6 +962,16 @@ impl Interpreter {
             }
         } else if receiver.is_big_int() {
             self.load_from_constructor_prototype(context, "BigInt", &receiver, name)?
+        } else if receiver.is_intl() {
+            // ECMA-402: methods resolve through `Intl.<Kind>.prototype`;
+            // `ordinary_get_value` walks the kind prototype.
+            let key = VmPropertyKey::String(name);
+            match self.ordinary_get_value(context, receiver, receiver, &key, 0)? {
+                VmGetOutcome::Value(v) => v,
+                VmGetOutcome::InvokeGetter { getter } => {
+                    self.run_callable_sync(context, &getter, receiver, smallvec::SmallVec::new())?
+                }
+            }
         } else {
             return Err(VmError::TypeMismatchAt {
                 op: "property read",

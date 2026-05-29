@@ -150,13 +150,11 @@ pub use run_control::{
 use otter_bytecode::{ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, Op};
 use smallvec::SmallVec;
 
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError};
 use arithmetic_dispatch::{
     bigint_and_op, bigint_mul_op, bigint_or_op, bigint_sub_op, bigint_xor_op,
 };
 pub(crate) use error_ops::{
-    intrinsic_to_vm_error, native_to_vm_error, render_thrown_value, snapshot_frames,
-    symbol_to_vm_error, vm_err_to_value,
+    native_to_vm_error, render_thrown_value, snapshot_frames, symbol_to_vm_error, vm_err_to_value,
 };
 use executable::ExecutableFunction;
 use operand_decode::{apply_branch, register_operand};

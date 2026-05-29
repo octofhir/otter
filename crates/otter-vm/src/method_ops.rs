@@ -23,11 +23,11 @@ use otter_bytecode::Operand;
 use smallvec::SmallVec;
 
 use crate::{
-    BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, IntrinsicArgs,
-    JsString, NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint, binary,
+    BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, JsString,
+    NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint, binary,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, bound_function_object_prototype_intercept, build_array_cb_args,
-    collections_prototype, date, descriptor_value, function_metadata, intl, intrinsic_to_vm_error,
+    collections_prototype, date, descriptor_value, function_metadata, intl,
     native_function_object_prototype_intercept, number,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
@@ -527,28 +527,6 @@ impl Interpreter {
             write_register(frame, dst, result)?;
             return Ok(());
         }
-        let intrinsic = if recv_value.is_intl() {
-            intl::lookup_prototype(&recv_value, &self.gc_heap, name)
-        } else {
-            None
-        };
-        if let Some(entry) = intrinsic {
-            let result = {
-                let allocation_roots = self.collect_allocation_roots(stack);
-                (entry.impl_fn)(&mut IntrinsicArgs {
-                    receiver: &recv_value,
-                    args: &arg_values,
-                    gc_heap: &mut self.gc_heap,
-                    allocation_roots: allocation_roots.as_slice(),
-                })
-                .map_err(intrinsic_to_vm_error)?
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-
         // Functions / closures inherit Object.prototype-style
         // methods. Foundation routes the call through the user-
         // properties bag attached to the compiled function.
@@ -811,6 +789,9 @@ impl Interpreter {
         if recv_value.is_finalization_registry() {
             return weak_refs::lookup_finalization_registry(name).is_some();
         }
+        if recv_value.is_intl() {
+            return intl::lookup_prototype(&recv_value, &self.gc_heap, name).is_some();
+        }
         if recv_value
             .as_object()
             .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
@@ -886,6 +867,7 @@ impl Interpreter {
             || recv_value.is_array_buffer()
             || recv_value.is_data_view()
             || recv_value.is_typed_array()
+            || recv_value.is_intl()
             || recv_value.is_generator()
             || recv_value.is_iterator();
         if is_property_bearing {

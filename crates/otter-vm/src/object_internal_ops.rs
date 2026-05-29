@@ -831,6 +831,9 @@ impl Interpreter {
                 ),
             };
         }
+        if let Some(intl) = value.as_intl(&self.gc_heap) {
+            return Ok(self.intl_kind_prototype_value(intl.kind().class_name()));
+        }
         if value.is_object_type() {
             return self.get_prototype_for_op(&value);
         }
@@ -3261,7 +3264,42 @@ impl Interpreter {
             }
             return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
         }
+        if let Some(intl) = base.as_intl(&self.gc_heap) {
+            // ECMA-402: an `Intl.<Kind>` instance inherits its methods
+            // from `Intl.<Kind>.prototype`. The instance carries no
+            // own-property storage, so resolution walks straight to the
+            // kind prototype installed by `crate::intl::bootstrap`.
+            let proto = self.intl_kind_prototype_value(intl.kind().class_name());
+            if proto.is_nullish() {
+                return Ok(VmGetOutcome::Value(Value::undefined()));
+            }
+            return self.ordinary_get_value(context, proto, receiver, key, hops + 1);
+        }
         Err(VmError::TypeMismatch)
+    }
+
+    /// Resolve `Intl.<class_name>.prototype` by walking
+    /// `globalThis.Intl.<class_name>.prototype`. Returns `null` when
+    /// the namespace or constructor is missing.
+    fn intl_kind_prototype_value(&mut self, class_name: &str) -> Value {
+        let Some(intl_ns) = object::get(self.global_this, &self.gc_heap, "Intl")
+            .and_then(|v| v.as_object())
+        else {
+            return Value::null();
+        };
+        let Some(ctor) = object::get(intl_ns, &self.gc_heap, class_name) else {
+            return Value::null();
+        };
+        if let Some(native) = ctor.as_native_function() {
+            return match native.own_property_descriptor(&mut self.gc_heap, "prototype") {
+                Ok(Some(descriptor)) => descriptor_value(&descriptor),
+                _ => Value::null(),
+            };
+        }
+        if let Some(obj) = ctor.as_object() {
+            return object::get(obj, &self.gc_heap, "prototype").unwrap_or_else(Value::null);
+        }
+        Value::null()
     }
 
     pub(crate) fn ordinary_has_property_value(

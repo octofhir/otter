@@ -64,8 +64,8 @@ conformance-gated before the next starts.
     - [x] **String unified** — extracted the shared argument coercion
       into `Interpreter::coerce_string_method_args`; both the
       primitive-string fast path in `do_call_method_value` and the
-      `.call`/property bridge now funnel through one entry
-      (`string_method_call` → `native_string_method`) with identical
+      `.call`/property bridge now funnel through the JS-visible
+      `String.prototype` native methods with identical
       receiver + argument coercion. Fixed a `replaceAll` slice OOB
       panic (`"a".replaceAll("aa", fn)`) exposed by the funnel.
       built-ins/String 1147→1152, 0 crash. (The 46 `impl_*` bodies
@@ -133,6 +133,9 @@ conformance-gated before the next starts.
   - [x] Promise prototype methods now resolve through the shared
     `GetMethod` path; expando and prototype shadows are observed before
     the native Promise method body runs.
+  - [x] Primitive String method calls now resolve `String.prototype`
+    through the shared `GetMethod` path before invoking the native
+    method body, so prototype shadows are observed.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

@@ -1602,26 +1602,6 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
     STRING_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::String, name)
 }
 
-/// Single re-entrant entry for `String.prototype.*`, shared by the
-/// primitive-string fast path in `do_call_method_value` and the
-/// `.call` / property bridge. Resolves the `'static` method name, then
-/// runs [`native_string_method`] so every invocation style takes one
-/// path: `RequireObjectCoercible` + `ToString(this)`, the shared
-/// argument coercion, callable `replace`, and `@@`-method delegation.
-/// `TypeError` for an unknown name lets the caller fall back to the
-/// ordinary property/prototype walk.
-pub(crate) fn string_method_call(
-    ctx: &mut NativeCtx<'_>,
-    name: &str,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let entry = lookup(name).ok_or(NativeError::TypeError {
-        name: "String.prototype",
-        reason: "unknown String.prototype method".to_string(),
-    })?;
-    native_string_method(entry.name, ctx, args)
-}
-
 /// Generic bridge that exposes a `String.prototype.<name>` intrinsic
 /// as a JS-visible NativeFunction so user code reading the property
 /// directly (`const f = "".split; f.call(s, ",")`) resolves to a

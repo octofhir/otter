@@ -419,27 +419,17 @@ impl Interpreter {
             frame.advance_pc(self.current_byte_len)?;
             return Ok(());
         }
-        // §22.1.3 — a primitive-string receiver routes every known
-        // `String.prototype` method through the single re-entrant
-        // `string_method_call`, the same path the `.call` / property
-        // bridge uses. Receiver `ToString`, argument coercion (the
-        // shared `coerce_string_method_args`), callable `replace`, and
-        // `@@`-method delegation all live there now. Unknown names fall
-        // through to the ordinary property / prototype walk below.
+        // §7.3.11 GetMethod — primitive strings must observe
+        // `String.prototype` before invoking the native method body.
         if recv_value.is_string() && string_prototype::lookup(name).is_some() {
-            let result = {
-                let mut ctx = NativeCtx::new_with_call_info_and_context(
-                    self,
-                    NativeCallInfo::call(recv_value),
-                    Some(context.clone()),
-                );
-                string_prototype::string_method_call(&mut ctx, name, &arg_values)
-                    .map_err(native_to_vm_error)?
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §23.2.3.{8,11,12,13,14,15,17,18,21,22,28} — TypedArray
         // prototype callback methods. Same shape as the Array set
@@ -1194,6 +1184,7 @@ impl Interpreter {
         }
         if recv_value.is_boolean()
             || recv_value.is_number()
+            || recv_value.is_string()
             || recv_value.is_symbol()
             || recv_value.is_big_int()
             || recv_value.is_temporal()

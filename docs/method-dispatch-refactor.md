@@ -142,6 +142,12 @@ conformance-gated before the next starts.
   - [x] Primitive Boolean method calls now resolve `Boolean.prototype`
     through the shared `GetMethod` path before invoking the native
     method body, so prototype shadows are observed.
+  - [x] Primitive BigInt method calls now resolve `BigInt.prototype`
+    through the shared `GetMethod` path before invoking the native
+    method body, so prototype shadows are observed.
+  - [x] Primitive Symbol method calls now resolve `Symbol.prototype`
+    through the shared `GetMethod` path before invoking the native
+    method body, so prototype shadows are observed.
 - [ ] **Stage 5** — collapse the 13 per-type `lookup(name)` tables into
   prototype-installed callables.
 - [ ] **Follow-ups (not dispatch)**: `for await` IteratorClose; `return`

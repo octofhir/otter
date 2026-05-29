@@ -106,15 +106,21 @@ conformance-gated before the next starts.
     only when the resolved method is the canonical builtin for that
     receiver family; otherwise use the shared non-callable check and
     `Call`.
-  - [ ] Add a small canonical-builtin identity guard for one specialized
-    family before touching more receiver branches. The first slice should
-    prove the pattern on a narrow Array callback method (for example
-    `Array.prototype.map`): `arr.map()` resolves `map` through
-    `GetMethod`; if it equals the realm's canonical Array `map` native,
-    keep the existing re-entrant Array driver; if it is a user function,
-    call it with `this = arr`; if it is non-callable, throw the shared
-    non-callable TypeError. Do not add a standalone list of Array method
-    names in `method_ops.rs`.
+  - [x] Canonical-builtin identity guard, first slice — `Array.prototype.map`.
+    `arr.map()` now resolves `map` through `GetMethod`
+    (`get_method_value_for_call`'s ordinary prototype walk); the resolved
+    value is matched against the realm's canonical native via
+    `NativeFunction::is_static_fn` (fn-pointer identity, no name
+    allowlist) behind `array_prototype::is_canonical_callback_method`.
+    Canonical → existing re-entrant `array_callback_native_dispatch`
+    driver; user function → shared `invoke` with `this = arr` (fixes a
+    prior gap where `Array.prototype.map = fn` was ignored); non-callable
+    → shared `NotCallable`. `map` dropped from the inline `matches!`
+    family list. Gates: built-ins/Array/prototype/map 210/210 runnable
+    (100%); broad built-ins/Array/prototype 2590 pass / 128 fail / 92
+    skip / 1 timeout / 0 crash — byte-identical to the HEAD baseline (the
+    earlier 2591/127 figure was a stale Stage-3 snapshot). Unit cover:
+    `crates/otter-runtime/tests/array_map_canonical_guard.rs`.
   - [x] Slow fallback bridge extracted as `get_method_value_for_call`;
     property-bearing receivers, class statics, functions, native
     functions, and primitive wrappers now share one getter-observing

@@ -406,6 +406,36 @@ impl Interpreter {
         // `len` read once, then a live `Get(O, k)` per index (a callback
         // mutating the receiver is observed). `sort` keeps its dedicated
         // comparator dispatcher.
+        // §7.3.11 GetMethod + §7.3.14 Call — resolve `map` through the
+        // ordinary prototype walk, then keep the re-entrant Array driver
+        // only when the resolved value is the realm's canonical
+        // `Array.prototype.map` native. A user override or own shadow is
+        // called (or rejected as non-callable) through the shared path.
+        if recv_value.is_array() && name == "map" {
+            let method = self
+                .get_method_value_for_call(context, stack, recv_value, name)?
+                .unwrap_or_else(Value::undefined);
+            if array_prototype::is_canonical_callback_method(&method, &self.gc_heap, name) {
+                let result = {
+                    let mut ctx = NativeCtx::new_with_call_info_and_context(
+                        self,
+                        NativeCallInfo::call(recv_value),
+                        Some(context.clone()),
+                    );
+                    array_prototype::array_callback_native_dispatch(name, &mut ctx, &arg_values)
+                        .map_err(native_to_vm_error)?
+                };
+                let frame = &mut stack[top_idx];
+                write_register(frame, dst, result)?;
+                frame.advance_pc(self.current_byte_len)?;
+                return Ok(());
+            }
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
+            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+        }
         if let Some(method) = self.array_own_method_value_for_call(context, recv_value, name)? {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -417,7 +447,6 @@ impl Interpreter {
             && matches!(
                 name,
                 "forEach"
-                    | "map"
                     | "filter"
                     | "reduce"
                     | "reduceRight"

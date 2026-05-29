@@ -1749,6 +1749,28 @@ pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> 
     ARRAY_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Array, name)
 }
 
+/// §7.3.11 canonical-builtin identity guard for the callback
+/// `Array.prototype` methods. Returns `true` only when `method` is the
+/// realm's original native for `name`, so a `GetMethod`-resolved value
+/// can be matched against the engine's own function pointer instead of
+/// a method-name allowlist. A user override (`Array.prototype.map = fn`)
+/// or own shadow resolves to a different value and falls out here.
+#[must_use]
+pub(crate) fn is_canonical_callback_method(
+    method: &Value,
+    heap: &otter_gc::GcHeap,
+    name: &str,
+) -> bool {
+    let Some(native) = method.as_native_function() else {
+        return false;
+    };
+    let target: crate::native_function::NativeFastFn = match name {
+        "map" => native_map,
+        _ => return false,
+    };
+    native.is_static_fn(heap, target)
+}
+
 /// Static `Array.prototype` methods whose implementations do not
 /// require JS callback dispatch.
 pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[

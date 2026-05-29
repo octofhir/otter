@@ -687,6 +687,18 @@ impl Interpreter {
             && self.is_callable_runtime(&arg_values[1])
             && !arg_values.first().is_some_and(|v| v.is_regexp())
         {
+            if recv_value.as_object().is_some() {
+                let method = self
+                    .get_method_value_for_call(context, stack, recv_value, name)?
+                    .unwrap_or_else(Value::undefined);
+                if method.as_native_function().is_none() {
+                    if !self.is_callable_runtime(&method) {
+                        return Err(VmError::NotCallable);
+                    }
+                    stack[top_idx].advance_pc(self.current_byte_len)?;
+                    return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+                }
+            }
             let recv_value = string_recv;
             // §22.1.3.18 step 7 — `searchString = ? ToString(searchValue)`.
             // Coerce non-String searchValues (null, undefined, numbers,

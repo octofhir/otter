@@ -162,6 +162,10 @@ conformance-gated before the next starts.
     methods now probe the wrapper prototype path before the opcode-local
     primitive-shape intercept, so non-callable prototype shadows report
     the shared non-callable TypeError.
+  - [x] String wrapper `replace` / `replaceAll` calls with callable
+    replacers now probe the wrapper method path before the opcode-local
+    callable-replacer bridge, so own non-callable wrapper shadows report
+    the shared non-callable TypeError.
   - [x] Map/Set `forEach` now resolve through prototype `GetMethod`
     instead of the opcode-local callback helper, so non-callable
     prototype shadows on Map and Set report the shared non-callable

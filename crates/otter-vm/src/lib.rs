@@ -7625,6 +7625,64 @@ mod tests {
     }
 
     #[test]
+    fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
+        fn replacement(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+            Ok(Value::undefined())
+        }
+
+        let module = BytecodeModule {
+            module: "test.ts".to_string(),
+            source_kind: BcSourceKind::TypeScript,
+            functions: vec![test_function(0, "<main>", 0, 4, Vec::new())],
+            constants: vec![Constant::String {
+                utf16: "replace".encode_utf16().collect(),
+            }],
+            module_resolutions: Vec::new(),
+            module_inits: Vec::new(),
+        };
+        let mut interp = Interpreter::new();
+        let proto = interp
+            .constructor_prototype_value("String")
+            .expect("String.prototype")
+            .as_object()
+            .expect("String.prototype object");
+        let obj =
+            object::alloc_object_old_for_fixture(interp.gc_heap_mut()).expect("string wrapper");
+        object::set_prototype(obj, interp.gc_heap_mut(), Some(proto));
+        let data = JsString::from_str("abc", interp.gc_heap_mut()).expect("string data");
+        object::set_string_data(obj, interp.gc_heap_mut(), data);
+        object::set(obj, interp.gc_heap_mut(), "replace", Value::number_i32(1));
+        let search = Value::string(JsString::from_str("a", interp.gc_heap_mut()).expect("search"));
+        let repl =
+            native_value_static(interp.gc_heap_mut(), "replacement", 1, replacement).expect("repl");
+
+        let context = ExecutionContext::from_module(module.clone());
+        let mut stack: SmallVec<[Frame; 8]> = SmallVec::new();
+        let mut frame = Frame::for_function(&module.functions[0]);
+        frame.registers[0] = Value::object(obj);
+        frame.registers[1] = search;
+        frame.registers[2] = repl;
+        stack.push(frame);
+
+        let err = interp
+            .do_call_method_value(
+                &mut stack,
+                &context,
+                &[
+                    Operand::Register(3),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::ConstIndex(2),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            )
+            .expect_err("non-callable own String wrapper replace should shadow builtin");
+
+        assert!(matches!(err, VmError::NotCallable));
+    }
+
+    #[test]
     fn iterator_helper_to_array_uses_stack_rooted_result_allocation() {
         let module = module_with(Vec::new(), 4);
         let mut interp = Interpreter::new();

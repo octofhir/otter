@@ -25,6 +25,7 @@
 //! - [`heap`] — `GcHeap` orchestrator.
 //! - [`external`] — RAII accounting for native backing stores.
 //! - [`extra_roots`] — heap-registered callbacks for runtime-owned roots.
+//! - [`frame_roots`] — active interpreter frame-stack root registry.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`oom`] — `OutOfMemory` error.
 //! - [`stats`] — per-heap counters and per-type rows.
@@ -69,6 +70,7 @@ pub mod external;
 pub mod extra_roots;
 #[doc(hidden)]
 pub mod finalize;
+pub mod frame_roots;
 pub mod handle;
 pub mod header;
 pub mod heap;
@@ -90,6 +92,7 @@ pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
 pub use compressed::{CageStats, Gc, cage_base, cage_size, cage_stats, init_cage_with_size};
 pub use external::{ExternalMemory, SharedExternalMemory};
 pub use extra_roots::{ExtraRootSource, ExtraRoots};
+pub use frame_roots::{FrameRootProviders, FrameRoots, RawFrameRoots};
 pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
 pub use heap::{EmptyRoots, GcHeap, HeapStats};

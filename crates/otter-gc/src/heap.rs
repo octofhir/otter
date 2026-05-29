@@ -41,6 +41,7 @@ use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
 use crate::extra_roots::ExtraRoots;
 use crate::finalize::WeakFinalizationRegistry;
+use crate::frame_roots::{FrameRootProviders, FrameRoots};
 use crate::handle::{GlobalHandleTable, HandleStack};
 use crate::header::{GcHeader, MarkColor};
 use crate::marking::MarkingState;
@@ -126,6 +127,7 @@ pub struct GcHeap {
     handle_stack: Box<HandleStack>,
     global_handles: Box<GlobalHandleTable>,
     extra_roots: Option<ExtraRoots>,
+    frame_root_providers: FrameRootProviders,
     ephemerons: EphemeronRegistry,
     weak_finalization: WeakFinalizationRegistry,
     shared_external: Arc<SharedExternalState>,
@@ -177,6 +179,7 @@ impl GcHeap {
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
             extra_roots: None,
+            frame_root_providers: FrameRootProviders::new(),
             ephemerons: EphemeronRegistry::default(),
             weak_finalization: WeakFinalizationRegistry::default(),
             shared_external: Arc::new(SharedExternalState::default()),
@@ -187,6 +190,24 @@ impl GcHeap {
             reserved_bytes: 0,
             oom_flag: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Register an active interpreter frame-stack root provider.
+    ///
+    /// Returns the new provider depth; callers pass `depth - 1` to
+    /// [`Self::pop_frame_roots_to`] when leaving the matching dispatch scope.
+    pub fn push_frame_roots(&mut self, provider: *const dyn FrameRoots) -> usize {
+        self.frame_root_providers.push(provider)
+    }
+
+    /// Truncate active frame-root providers back to `depth`.
+    pub fn pop_frame_roots_to(&mut self, depth: usize) {
+        self.frame_root_providers.pop_to(depth);
+    }
+
+    /// Visit every active interpreter frame-stack root provider.
+    pub fn trace_frame_root_providers(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        self.frame_root_providers.trace(visitor);
     }
 
     /// Configured per-heap cap in bytes (`0` = disabled).
@@ -912,6 +933,7 @@ impl GcHeap {
         let handle_stack: *const HandleStack = &*self.handle_stack;
         let global_handles: *const GlobalHandleTable = &*self.global_handles;
         let extra_roots = self.extra_roots;
+        let frame_root_providers: *const FrameRootProviders = &self.frame_root_providers;
         let mut combined = move |visitor: &mut dyn FnMut(*mut RawGc)| {
             // SAFETY: STW pause; raw pointers reconstituted to
             // shared references.
@@ -923,6 +945,9 @@ impl GcHeap {
             if let Some(extra) = extra_roots {
                 extra.visit(visitor);
             }
+            // SAFETY: STW pause; the heap owns the registry for the duration of
+            // this root walk.
+            unsafe { (*frame_root_providers).trace(visitor) };
         };
         let ephemeron_registry_slots = self.ephemerons.handle_slots();
         let weak_registry_slots = self.weak_finalization.handle_slots();
@@ -1103,6 +1128,7 @@ impl GcHeap {
         if let Some(extra) = self.extra_roots {
             extra.visit(&mut shade);
         }
+        self.frame_root_providers.trace(&mut shade);
     }
 
     /// Mark additional raw objects during an active mark phase and

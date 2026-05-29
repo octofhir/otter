@@ -123,6 +123,10 @@ conformance-gated before the next starts.
   - [x] Non-mutating Date prototype methods now resolve through the
     shared `GetMethod` path before the intrinsic table, so non-callable
     prototype shadows report the shared non-callable TypeError.
+  - [x] Date setter methods now probe `Date.prototype` before the
+    intrinsic setter path, so non-callable prototype shadows report the
+    shared non-callable TypeError while default native setters keep the
+    existing captured-time coercion path.
   - [x] TypedArray expando methods now shadow `%TypedArray%.prototype`
     before callback/slice/subarray/intrinsic arms: `ta.map = 1; ta.map()`
     reports the shared non-callable TypeError.

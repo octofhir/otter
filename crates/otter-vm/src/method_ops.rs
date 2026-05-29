@@ -627,44 +627,13 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        // §21.4.4 Date `set*` — probe `Date.prototype` so a non-callable
-        // prototype shadow throws, but let the default native fall
-        // through to the captured-time coercion path in the intrinsic
-        // block below.
-        if recv_value
-            .as_object()
-            .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
-            && date::prototype::lookup(name).is_some()
-            && name.starts_with("set")
-        {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-            }
-        }
         // Intrinsic-table fallback — only the receivers whose prototype
-        // methods are not yet real natives reach here: Date `set*` (the
-        // captured-time path falls through from its probe above), Intl,
-        // and TypedArray pure-functional methods. Every other family
-        // resolves through `GetMethod` + `Call` in a branch above and
-        // returns before this point, so its `lookup(name)` arm would be
+        // methods are not yet real natives reach here: Intl and
+        // TypedArray pure-functional methods. Every other family resolves
+        // through `GetMethod` + `Call` in a branch above and returns
+        // before this point, so its `lookup(name)` arm would be
         // unreachable.
-        let intrinsic = if recv_value
-            .as_object()
-            .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
-        {
-            // Date instances are ordinary objects with a
-            // `[[DateValue]]` internal slot — probe `date_data` to
-            // brand-check and route `set*` through the Date intrinsic
-            // table's captured-time path.
-            date::prototype::lookup(name)
-        } else if recv_value.is_intl() {
+        let intrinsic = if recv_value.is_intl() {
             intl::lookup_prototype(&recv_value, &self.gc_heap, name)
         } else if recv_value.is_typed_array() {
             binary::typed_array_prototype::lookup(name)
@@ -717,56 +686,6 @@ impl Interpreter {
                     let n = self.coerce_to_number(context, &value)?;
                     small_args[idx] = Value::number(n);
                 }
-            }
-            // §21.4.4.x `Date.prototype.set*` — capture `t` from
-            // `[[DateValue]]` BEFORE coercing args (step 3), run
-            // `ToNumber` on every provided arg in declaration order
-            // (steps 4–7), then restore captured `t` so the intrinsic
-            // body sees the value spec step 3 captured — `ToNumber`
-            // callbacks may have mutated `[[DateValue]]` via
-            // `dt.setTime(...)`, but the spec NaN-check (step 8) and
-            // component math operate on the captured value. The
-            // intrinsic's final assignment in step 12 then overwrites
-            // any in-callback mutation.
-            if let Some(obj) = recv_value.as_object()
-                && let Some(captured_t) = crate::object::date_data(obj, &self.gc_heap)
-                && name.starts_with("set")
-            {
-                for slot in small_args.iter_mut() {
-                    let coerced = self.coerce_to_number(context, slot)?;
-                    *slot = Value::number(coerced);
-                }
-                // §21.4.4.{20..36} step 8 — `setMonth` / `setDate` /
-                // `setHours` / `setMinutes` / `setSeconds` /
-                // `setMilliseconds` (and UTC variants) **return
-                // NaN without writing** when the captured time was
-                // NaN, even though `ToNumber` callbacks may have
-                // mutated `[[DateValue]]` mid-flight. `setFullYear`,
-                // `setUTCFullYear`, `setTime` and Annex B `setYear`
-                // always write through, so they fall into the
-                // normal restore-and-dispatch path below.
-                let nan_preserving = matches!(
-                    name,
-                    "setMonth"
-                        | "setUTCMonth"
-                        | "setDate"
-                        | "setUTCDate"
-                        | "setHours"
-                        | "setUTCHours"
-                        | "setMinutes"
-                        | "setUTCMinutes"
-                        | "setSeconds"
-                        | "setUTCSeconds"
-                        | "setMilliseconds"
-                        | "setUTCMilliseconds"
-                );
-                if captured_t.is_nan() && nan_preserving {
-                    let frame = &mut stack[top_idx];
-                    write_register(frame, dst, Value::number(NumberValue::from_f64(f64::NAN)))?;
-                    frame.advance_pc(self.current_byte_len)?;
-                    return Ok(());
-                }
-                crate::object::set_date_data(obj, &mut self.gc_heap, captured_t);
             }
             let result = {
                 let allocation_roots = self.collect_allocation_roots(stack);
@@ -1034,13 +953,14 @@ impl Interpreter {
     /// `true` when `recv_value` belongs to a builtin family whose
     /// prototype method `name` is a plain re-entrant native, dispatched
     /// uniformly through §7.3.11 `GetMethod` + §7.3.14 `Call` with no
-    /// per-method argument coercion, species step, or captured-state
-    /// handling. These families (primitives, collections, weak
-    /// references, ArrayBuffer / DataView, and non-`set` Date methods)
-    /// share one dispatch branch; receivers needing extra machinery
-    /// (Array callbacks, TypedArray species, RegExp `exec`/`test`
-    /// coercion, Date `set*` captured time, String callable replace)
-    /// keep their dedicated paths.
+    /// per-method argument coercion or species step at the call site —
+    /// each native carries its own re-entrant coercion. These families
+    /// (primitives, collections, weak references, ArrayBuffer / DataView,
+    /// and Date — including `set*`, whose captured-time coercion lives in
+    /// `native_date_method`) share one dispatch branch; receivers needing
+    /// extra call-site machinery (Array callbacks, TypedArray species,
+    /// RegExp `exec`/`test` coercion, String callable replace) keep their
+    /// dedicated paths.
     fn has_plain_builtin_method(&self, recv_value: Value, name: &str) -> bool {
         if recv_value.is_string() {
             return string_prototype::lookup(name).is_some();
@@ -1085,7 +1005,7 @@ impl Interpreter {
             .as_object()
             .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
         {
-            return date::prototype::lookup(name).is_some() && !name.starts_with("set");
+            return date::prototype::lookup(name).is_some();
         }
         false
     }

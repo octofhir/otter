@@ -501,14 +501,59 @@ fn native_date_method(
     args: &[Value],
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
-    let allocation_roots = ctx.collect_native_roots();
     let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
         name,
         reason: "unknown Date.prototype method".to_string(),
     })?;
+    // §21.4.4.x `Date.prototype.set*` — capture `t` from `[[DateValue]]`
+    // (step 3) before running `ToNumber` on the arguments in declaration
+    // order (steps 4–7); a `valueOf` callback may mutate `[[DateValue]]`
+    // via `setTime`, but the NaN check (step 8) and component math run on
+    // the captured value, and the intrinsic's final assignment overwrites
+    // any in-callback mutation. The context-free impl cannot re-enter, so
+    // the coercion happens here with a live interpreter handle.
+    let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    if name.starts_with("set")
+        && let Some(obj) = receiver.as_object()
+        && let Some(captured_t) = object::date_data(obj, ctx.heap())
+    {
+        if let Some(exec) = ctx.execution_context().cloned() {
+            let interp = ctx.interp_mut();
+            for slot in coerced.iter_mut() {
+                let n = interp
+                    .coerce_to_number(&exec, slot)
+                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
+                *slot = Value::number(n);
+            }
+        }
+        // §21.4.4.{20..36} step 8 — the component setters return NaN
+        // without writing when the captured time was NaN; `setFullYear`
+        // / `setUTCFullYear` / `setTime` / Annex B `setYear` always write
+        // through and fall to the normal restore-and-dispatch path.
+        let nan_preserving = matches!(
+            name,
+            "setMonth"
+                | "setUTCMonth"
+                | "setDate"
+                | "setUTCDate"
+                | "setHours"
+                | "setUTCHours"
+                | "setMinutes"
+                | "setUTCMinutes"
+                | "setSeconds"
+                | "setUTCSeconds"
+                | "setMilliseconds"
+                | "setUTCMilliseconds"
+        );
+        if captured_t.is_nan() && nan_preserving {
+            return Ok(Value::number_f64(f64::NAN));
+        }
+        object::set_date_data(obj, ctx.heap_mut(), captured_t);
+    }
+    let allocation_roots = ctx.collect_native_roots();
     (entry.impl_fn)(&mut IntrinsicArgs {
         receiver: &receiver,
-        args,
+        args: &coerced,
         gc_heap: ctx.heap_mut(),
         allocation_roots: allocation_roots.as_slice(),
     })

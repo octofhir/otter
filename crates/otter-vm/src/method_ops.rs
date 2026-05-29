@@ -28,7 +28,7 @@ use crate::{
     boolean::prototype as boolean_prototype,
     bootstrap_collections, bound_function_object_prototype_intercept, build_array_cb_args,
     collections_prototype, date, descriptor_value, function_metadata, intl, intrinsic_to_vm_error,
-    native_function_object_prototype_intercept, number, object_prototype_intercept,
+    native_function_object_prototype_intercept, number,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
@@ -543,38 +543,6 @@ impl Interpreter {
                 })
                 .map_err(intrinsic_to_vm_error)?
             };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-
-        if let Some(obj) = recv_value.as_object()
-            && self.object_prototype_object_opt() != Some(obj)
-            && object_prototype_dispatch_method_name(name)
-        {
-            let method = self
-                .get_method_value_for_call(context, stack, recv_value, name)?
-                .unwrap_or_else(Value::undefined);
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
-            }
-        }
-        if let Some(obj) = recv_value.as_object()
-            && self.object_prototype_object_opt() != Some(obj)
-            && matches!(
-                crate::object::lookup(obj, &self.gc_heap, name),
-                crate::object::PropertyLookup::Absent
-            )
-            && let Some(result) = {
-                let fn_proto = self.function_prototype_object().ok();
-                object_prototype_intercept(&obj, name, &arg_values, &mut self.gc_heap, fn_proto)
-            }?
-        {
             let frame = &mut stack[top_idx];
             write_register(frame, dst, result)?;
             frame.advance_pc(self.current_byte_len)?;

@@ -86,6 +86,8 @@ impl<'a> RuntimeState<'a> {
         let interp = self.interp;
         // 1) Shared globalThis.
         interp.global_this().trace_gc_roots(visitor);
+        // 1b) Cached realm intrinsic prototypes.
+        interp.realm_intrinsics().trace_roots(visitor);
         // 2) Module environments.
         for env in interp.module_environments_for_trace() {
             env.trace_gc_roots(visitor);
@@ -105,6 +107,9 @@ impl<'a> RuntimeState<'a> {
         interp.error_classes_for_trace().trace_gc_roots(visitor);
         // 6) Function user-property bag.
         for obj in interp.function_user_props_for_trace() {
+            obj.trace_gc_roots(visitor);
+        }
+        for obj in interp.iterator_prototypes_for_trace() {
             obj.trace_gc_roots(visitor);
         }
         interp.trace_function_kind_roots(visitor);

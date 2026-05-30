@@ -91,12 +91,12 @@ pub(crate) fn compile_function_full(
         Vec::new()
     };
 
-    // Bind self-name for recursion. Emit a MakeFunction (no
-    // captures yet — the function value referencing itself doesn't
-    // need its own captures bound here).
+    // Bind self-name for recursion. Capture operands are finalized after
+    // body lowering because parent captures are discovered lazily.
     let self_storage = parent.declare_binding(name, false, span)?;
     let const_idx = parent.intern_function_id(function_id);
     let tmp = parent.alloc_scratch();
+    let self_make_idx = parent.code.len();
     parent.emit(
         Op::MakeFunction,
         [Operand::Register(tmp), Operand::ConstIndex(const_idx)],
@@ -145,8 +145,19 @@ pub(crate) fn compile_function_full(
     // Implicit `return undefined;` at the function tail.
     parent.emit(Op::ReturnUndefined, vec![], span);
 
-    let child = parent.pop();
+    let mut child = parent.pop();
     let captures = child.parent_captures.clone();
+    if !captures.is_empty() {
+        let self_captures: Vec<u32> = (0..captures.len())
+            .map(|idx| child.own_upvalue_count as u32 + idx as u32)
+            .collect();
+        let instruction = child
+            .code
+            .get_mut(self_make_idx)
+            .expect("self binding instruction is emitted before body");
+        instruction.op = Op::MakeClosure;
+        instruction.operands = make_closure_operands(tmp, const_idx, &self_captures, span)?.into();
+    }
     let mut module_mut = module.borrow_mut();
     let slot = module_mut
         .functions
@@ -321,6 +332,17 @@ pub(crate) fn emit_make_callable(
         );
         return Ok(());
     }
+    let operands = make_closure_operands(dst, function_const, captures, span)?;
+    cx.emit(Op::MakeClosure, operands, span);
+    Ok(())
+}
+
+fn make_closure_operands(
+    dst: u16,
+    function_const: u32,
+    captures: &[u32],
+    span: (u32, u32),
+) -> Result<Vec<Operand>, CompileError> {
     // `MakeClosure` operand layout is `[dst, fn_const, count,
     // capture0, …, captureN-1]`; the wire encoder caps the total
     // operand count at `u8::MAX` (255), so the capture-count payload
@@ -344,6 +366,5 @@ pub(crate) fn emit_make_callable(
     for &parent_idx in captures {
         operands.push(Operand::Imm32(parent_idx as i32));
     }
-    cx.emit(Op::MakeClosure, operands, span);
-    Ok(())
+    Ok(operands)
 }

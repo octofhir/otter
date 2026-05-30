@@ -1822,6 +1822,19 @@ impl Interpreter {
         self.function_user_props.values()
     }
 
+    /// Iterator over cached per-kind iterator prototypes.
+    pub fn iterator_prototypes_for_trace(&self) -> impl Iterator<Item = &JsObject> {
+        [
+            self.array_iterator_prototype.as_ref(),
+            self.map_iterator_prototype.as_ref(),
+            self.set_iterator_prototype.as_ref(),
+            self.string_iterator_prototype.as_ref(),
+            self.regexp_string_iterator_prototype.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
     /// Iterator over non-GC exotic prototype override values.
     /// Used by the GC root walker because the side table can retain
     /// subclass prototype objects for `ArrayBuffer`, `DataView`, and
@@ -2211,7 +2224,6 @@ impl Interpreter {
     /// Borrow the per-realm typed intrinsic slots.
     #[inline]
     #[must_use]
-    #[allow(dead_code)] // currently consumed only via direct field reads in lookup helpers + tests.
     pub(crate) fn realm_intrinsics(&self) -> &realm_intrinsics::RealmIntrinsics {
         &self.realm_intrinsics
     }

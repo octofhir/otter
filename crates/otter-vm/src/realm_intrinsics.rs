@@ -19,9 +19,10 @@
 //!   populate runs.
 //! - The dispatch path treats `None` as a cache miss and falls back to
 //!   the original string-lookup helper.
-//! - Slots hold `JsObject` handles; tracing rides on the global object
-//!   the bootstrap already roots.
+//! - Slots hold `JsObject` handles and are traced as runtime roots so
+//!   moving GC rewrites the cached handles in place.
 
+use crate::gc_trace::{GcRootVisitor, GcTrace};
 use crate::object::{self, JsObject};
 
 /// Look up `<name>.prototype` on `globalThis`, accepting either a
@@ -71,6 +72,20 @@ impl RealmIntrinsics {
         self.array_prototype = resolve_prototype(global, heap, "Array");
     }
 
+    /// Trace cached prototype handles as root slots.
+    pub(crate) fn trace_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+        for object in [
+            &self.object_prototype,
+            &self.function_prototype,
+            &self.array_prototype,
+        ]
+        .into_iter()
+        .filter_map(Option::as_ref)
+        {
+            object.trace_gc_roots(visitor);
+        }
+    }
+
     /// All slots empty?
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
@@ -84,6 +99,19 @@ impl RealmIntrinsics {
 mod tests {
     use super::*;
     use crate::Interpreter;
+    use crate::runtime_state::RuntimeState;
+
+    fn collect_minor_with_runtime_roots(interp: &mut Interpreter) {
+        let mut roots = Vec::new();
+        RuntimeState::new(interp).trace_roots(&mut |slot| roots.push(slot));
+        interp
+            .gc_heap_mut()
+            .collect_minor_with_roots(&mut |visitor| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+            });
+    }
 
     #[test]
     fn bootstrap_populates_well_known_slots() {
@@ -120,6 +148,44 @@ mod tests {
             slot_proto, walked,
             "RealmIntrinsics slot must point at the same %Function.prototype% \
              that the global-walk resolves"
+        );
+    }
+
+    #[test]
+    fn slots_are_forwarded_by_minor_gc() {
+        let mut interp = Interpreter::new();
+        let global = *interp.global_this();
+
+        collect_minor_with_runtime_roots(&mut interp);
+
+        let object_slot = interp.realm_intrinsics().object_prototype.unwrap();
+        let function_slot = interp.realm_intrinsics().function_prototype.unwrap();
+        let array_slot = interp.realm_intrinsics().array_prototype.unwrap();
+        assert_eq!(
+            object_slot,
+            resolve_prototype(global, &mut interp.gc_heap, "Object").unwrap(),
+            "Object.prototype cache must be forwarded with globalThis"
+        );
+        assert_eq!(
+            function_slot,
+            resolve_prototype(global, &mut interp.gc_heap, "Function").unwrap(),
+            "Function.prototype cache must be forwarded with globalThis"
+        );
+        assert_eq!(
+            array_slot,
+            resolve_prototype(global, &mut interp.gc_heap, "Array").unwrap(),
+            "Array.prototype cache must be forwarded with globalThis"
+        );
+
+        let obj = interp
+            .alloc_host_object_with_roots(&[], &[])
+            .expect("alloc object after scavenge");
+        let cached_proto = interp.object_prototype_object_opt().unwrap();
+        crate::object::set_prototype(obj, interp.gc_heap_mut(), Some(cached_proto));
+        assert_eq!(
+            crate::object::prototype(obj, interp.gc_heap()),
+            Some(object_slot),
+            "new objects must receive the forwarded cached Object.prototype"
         );
     }
 

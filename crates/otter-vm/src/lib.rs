@@ -4577,52 +4577,6 @@ fn function_value_has_prototype_in_chain(
     function_prototype == target || object::has_in_proto_chain(function_prototype, gc_heap, target)
 }
 
-fn native_function_object_prototype_intercept(
-    native: &NativeFunction,
-    name: &str,
-    args: &SmallVec<[Value; 8]>,
-    gc_heap: &mut otter_gc::GcHeap,
-) -> Result<Option<Value>, VmError> {
-    match name {
-        "hasOwnProperty" => {
-            let key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::boolean(
-                native.own_property_descriptor(gc_heap, &key)?.is_some(),
-            )))
-        }
-        "propertyIsEnumerable" => {
-            let _key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::boolean(false)))
-        }
-        "isPrototypeOf" => Ok(Some(Value::boolean(false))),
-        _ => Ok(None),
-    }
-}
-
-fn bound_function_object_prototype_intercept(
-    bound: &BoundFunction,
-    name: &str,
-    args: &SmallVec<[Value; 8]>,
-    gc_heap: &otter_gc::GcHeap,
-) -> Result<Option<Value>, VmError> {
-    match name {
-        "hasOwnProperty" => {
-            let key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::boolean(
-                function_metadata::bound_has_own_property(bound, gc_heap, &key),
-            )))
-        }
-        "propertyIsEnumerable" => {
-            let key = property_key_from_arg(args.first(), gc_heap)?;
-            Ok(Some(Value::boolean(
-                function_metadata::bound_own_property_is_enumerable(bound, gc_heap, &key),
-            )))
-        }
-        "isPrototypeOf" => Ok(Some(Value::boolean(false))),
-        _ => Ok(None),
-    }
-}
-
 fn descriptor_value(desc: &crate::object::PropertyDescriptor) -> Value {
     match &desc.kind {
         crate::object::DescriptorKind::Data { value } => *value,

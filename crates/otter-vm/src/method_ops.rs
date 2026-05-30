@@ -26,11 +26,10 @@ use crate::{
     BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, JsString,
     NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint, binary,
     boolean::prototype as boolean_prototype,
-    bootstrap_collections, bound_function_object_prototype_intercept, build_array_cb_args,
-    collections_prototype, date, descriptor_value, function_metadata, intl,
-    native_function_object_prototype_intercept, number,
+    bootstrap_collections, build_array_cb_args, collections_prototype, date, descriptor_value,
+    function_metadata, intl, number,
     operand_decode::{const_operand, register_operand},
-    promise_dispatch, property_key_from_arg, read_register, regexp_prototype, require_callable,
+    promise_dispatch, read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
     symbol_prototype, weak_refs, write_register,
 };
@@ -539,117 +538,27 @@ impl Interpreter {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
                 .unwrap_or_else(Value::undefined);
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
             }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        if let Some(function_id) = fn_id_for_proto
-            && matches!(
-                name,
-                "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
-            )
-        {
-            let result = match name {
-                "hasOwnProperty" => {
-                    let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
-                    if key == "prototype" {
-                        let _ = self.function_property_get(context, function_id, "prototype")?;
-                    }
-                    self.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        function_id,
-                        &key,
-                    )?
-                    .is_some()
-                }
-                "propertyIsEnumerable" => {
-                    let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
-                    if key == "prototype" {
-                        let _ = self.function_property_get(context, function_id, "prototype")?;
-                    }
-                    self.ordinary_function_own_property_descriptor(
-                        Some(context),
-                        function_id,
-                        &key,
-                    )?
-                    .is_some_and(|desc| desc.enumerable())
-                }
-                "isPrototypeOf" => false,
-                _ => unreachable!("guarded by method-name match"),
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::boolean(result))?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        if let Some(native) = recv_value.as_native_function()
-            && object_prototype_dispatch_method_name(name)
-        {
+        if recv_value.as_native_function().is_some() && object_prototype_dispatch_method_name(name) {
             let method = self.ordinary_method_value_for_call(context, recv_value, name)?;
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
             }
-            if let Some(result) = native_function_object_prototype_intercept(
-                &native,
-                name,
-                &arg_values,
-                &mut self.gc_heap,
-            )? {
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, result)?;
-                frame.advance_pc(self.current_byte_len)?;
-                return Ok(());
-            }
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        if let Some(native) = recv_value.as_native_function()
-            && let Some(result) = native_function_object_prototype_intercept(
-                &native,
-                name,
-                &arg_values,
-                &mut self.gc_heap,
-            )?
-        {
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
-        }
-        if let Some(bound) = recv_value.as_bound_function()
-            && object_prototype_dispatch_method_name(name)
-        {
+        if recv_value.as_bound_function().is_some() && object_prototype_dispatch_method_name(name) {
             let method = self.ordinary_method_value_for_call(context, recv_value, name)?;
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
             }
-            if let Some(result) =
-                bound_function_object_prototype_intercept(&bound, name, &arg_values, &self.gc_heap)?
-            {
-                let frame = &mut stack[top_idx];
-                write_register(frame, dst, result)?;
-                frame.advance_pc(self.current_byte_len)?;
-                return Ok(());
-            }
-        }
-        if let Some(bound) = recv_value.as_bound_function()
-            && let Some(result) =
-                bound_function_object_prototype_intercept(&bound, name, &arg_values, &self.gc_heap)?
-        {
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, result)?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
         // §7.1.18 ToObject — `String.prototype.hasOwnProperty(idx)`,
         // `(0).propertyIsEnumerable("toString")`, etc. inherit
@@ -669,48 +578,11 @@ impl Interpreter {
             let method = self
                 .get_method_value_for_call(context, stack, recv_value, name)?
                 .unwrap_or_else(Value::undefined);
-            if method.as_native_function().is_none() {
-                if !self.is_callable_runtime(&method) {
-                    return Err(VmError::NotCallable);
-                }
-                stack[top_idx].advance_pc(self.current_byte_len)?;
-                return self.invoke(stack, context, &method, recv_value, arg_values, dst);
+            if !self.is_callable_runtime(&method) {
+                return Err(VmError::NotCallable);
             }
-        }
-        if matches!(
-            name,
-            "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
-        ) && (recv_value.is_string()
-            || recv_value.is_number()
-            || recv_value.is_boolean()
-            || recv_value.is_symbol()
-            || recv_value.is_big_int())
-        {
-            let result = match name {
-                "hasOwnProperty" | "propertyIsEnumerable" => {
-                    let key = property_key_from_arg(arg_values.first(), &self.gc_heap)?;
-                    if let Some(s) = recv_value.as_string(&self.gc_heap) {
-                        if key == "length" {
-                            // propertyIsEnumerable is false for
-                            // String wrapper's `length`; hasOwn
-                            // is true.
-                            name == "hasOwnProperty"
-                        } else if let Ok(idx) = key.parse::<u32>() {
-                            idx < s.len()
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                }
-                "isPrototypeOf" => false,
-                _ => unreachable!("guarded by method-name match"),
-            };
-            let frame = &mut stack[top_idx];
-            write_register(frame, dst, Value::boolean(result))?;
-            frame.advance_pc(self.current_byte_len)?;
-            return Ok(());
+            stack[top_idx].advance_pc(self.current_byte_len)?;
+            return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
         if let Some(method) = self.get_method_value_for_call(context, stack, recv_value, name)? {

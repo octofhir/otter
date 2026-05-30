@@ -6,6 +6,7 @@
 
 - [Overview](contributing/overview.md)
 - [Porting Process](contributing/porting.md)
+- [Adding a Built-in Method](contributing/builtin-methods.md)
 - [Test Harness](contributing/test-harness.md)
 
 # Engine Internals

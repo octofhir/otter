@@ -9,9 +9,6 @@
 
 use crate::Value;
 use crate::object::JsObject;
-use crate::string::JsString;
-
-use super::dispatch::IntlError;
 
 /// BCP-47 fallback locale used whenever the requested tag fails to
 /// parse. Picks `"en-US"` because every shipped ICU formatter
@@ -88,18 +85,4 @@ pub fn read_u8_option(
         .and_then(|v| v.as_number().map(|n| n.as_f64() as i64))
         .unwrap_or(default as i64);
     v.clamp(lo as i64, hi as i64) as u8
-}
-
-/// Build a `Value::String` from a Rust string via the active heap.
-pub fn js_string(value: &str, heap: &mut otter_gc::GcHeap) -> Result<Value, IntlError> {
-    Ok(Value::string(JsString::from_str(value, heap)?))
-}
-
-/// Map an arbitrary error reason into an `IntlError::Engine`.
-pub fn engine_err(class: &'static str, method: &'static str, reason: &str) -> IntlError {
-    IntlError::Engine {
-        class,
-        method,
-        message: reason.to_string(),
-    }
 }

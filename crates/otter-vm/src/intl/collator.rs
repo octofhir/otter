@@ -1,27 +1,25 @@
 //! `Intl.Collator` — locale-aware string comparison.
 //!
 //! Backed by [`icu_collator::Collator`]. Collator instances are
-//! constructed lazily inside [`compare`] from the resolved options
-//! cached on the [`crate::intl::payload::CollatorPayload`].
+//! constructed lazily inside [`collator_compare`] from the resolved
+//! options cached on the [`crate::intl::payload::CollatorPayload`].
 //!
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-collator-objects>
 
 use std::cmp::Ordering;
 use std::str::FromStr;
-use std::sync::LazyLock;
 
 use icu_collator::options::CollatorOptions;
 use icu_collator::{Collator, CollatorPreferences};
 use icu_locale::Locale;
 
-use crate::Value;
-use crate::intl::dispatch::IntlError;
 use crate::intl::helpers::{
     DEFAULT_LOCALE, coerce_locale, options_object, read_bool_option, read_string_option,
 };
 use crate::intl::payload::{CollatorPayload, IntlPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 /// Resolve the constructor option bag.
 pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> CollatorPayload {
@@ -37,12 +35,16 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> C
     }
 }
 
-fn require_collator(args: &IntrinsicArgs<'_>) -> Result<CollatorPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.Collator",
+fn require_collator(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<CollatorPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.Collator receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::Collator(c) => Ok(c),
         _ => Err(bad()),
     }
@@ -62,32 +64,36 @@ fn coerce_compare_arg(value: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<
     None
 }
 
-fn impl_compare(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_collator(args)?;
-    let Some(x) = coerce_compare_arg(args.args.first(), args.gc_heap) else {
+/// §10.3.4 `Intl.Collator.prototype.compare(x, y)`.
+pub(crate) fn collator_compare(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_collator(ctx, "compare")?;
+    let Some(x) = coerce_compare_arg(args.first(), ctx.heap()) else {
         return Ok(Value::number_i32(0));
     };
-    let Some(y) = coerce_compare_arg(args.args.get(1), args.gc_heap) else {
+    let Some(y) = coerce_compare_arg(args.get(1), ctx.heap()) else {
         return Ok(Value::number_i32(0));
     };
     let n = compare_with_payload(&x, &y, &payload);
     Ok(Value::number_i32(n))
 }
 
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_collator(args)?;
-    let payload_locale = payload.locale.clone();
-    let payload_usage = payload.usage.clone();
-    let payload_sensitivity = payload.sensitivity.clone();
-    let payload_case_first = payload.case_first.clone();
-    let locale = js_string_value(&payload_locale, args)?;
-    let usage = js_string_value(&payload_usage, args)?;
-    let sensitivity = js_string_value(&payload_sensitivity, args)?;
-    let case_first = js_string_value(&payload_case_first, args)?;
+/// §10.3.5 `Intl.Collator.prototype.resolvedOptions()`.
+pub(crate) fn collator_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_collator(ctx, "resolvedOptions")?;
+    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let usage = Value::string(JsString::from_str(&payload.usage, ctx.heap_mut())?);
+    let sensitivity = Value::string(JsString::from_str(&payload.sensitivity, ctx.heap_mut())?);
+    let case_first = Value::string(JsString::from_str(&payload.case_first, ctx.heap_mut())?);
     let ignore_punctuation = payload.ignore_punctuation;
     let numeric = payload.numeric;
-    let obj = args.alloc_object_rooted(&[&locale, &usage, &sensitivity, &case_first], &[])?;
-    let heap = &mut *args.gc_heap;
+    let obj = ctx.alloc_object_with_roots(&[&locale, &usage, &sensitivity, &case_first], &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "usage", usage);
     crate::object::set(obj, heap, "sensitivity", sensitivity);
@@ -100,13 +106,6 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     crate::object::set(obj, heap, "numeric", Value::boolean(numeric));
     crate::object::set(obj, heap, "caseFirst", case_first);
     Ok(Value::object(obj))
-}
-
-fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::string(crate::string::JsString::from_str(
-        s,
-        args.gc_heap,
-    )?))
 }
 
 /// Run an ICU comparison with the resolved options. Falls back to
@@ -134,28 +133,4 @@ fn compare_with_payload(x: &str, y: &str, payload: &CollatorPayload) -> i32 {
             Ordering::Greater => 1,
         },
     }
-}
-
-/// `Intl.Collator.prototype` table.
-pub static COLLATOR_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "compare"          / 2 => impl_compare,
-        "resolvedOptions"  / 0 => impl_resolved_options,
-    )
-});
-
-/// Convenience accessor used by [`super::lookup_prototype`].
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    COLLATOR_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
-}
-
-/// Static side: `Intl.Collator.<member>`. No statics today; reserved
-/// for `supportedLocalesOf` once a locale-list helper lands.
-pub fn dispatch_static(method: &str, _args: &[Value]) -> Result<Value, IntlError> {
-    Err(IntlError::UnknownMember {
-        class: "Collator",
-        method: method.to_string(),
-    })
 }

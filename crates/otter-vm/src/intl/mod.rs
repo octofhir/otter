@@ -55,27 +55,3 @@ pub use payload::{
     CollatorPayload, DateTimeFormatPayload, INTL_BODY_TYPE_TAG, IntlBody, IntlHandle, IntlKind,
     IntlPayload, JsIntl, NumberFormatPayload, alloc_intl,
 };
-
-use crate::Value;
-use crate::intrinsics::IntrinsicEntry;
-
-/// Resolve `<receiver-kind>.prototype.<name>` to the matching
-/// intrinsic entry.
-#[must_use]
-pub fn lookup_prototype(
-    receiver: &Value,
-    gc_heap: &otter_gc::GcHeap,
-    name: &str,
-) -> Option<&'static IntrinsicEntry> {
-    let intl = receiver.as_intl(gc_heap)?;
-    match intl.kind() {
-        IntlKind::Collator => collator::lookup(name),
-        IntlKind::NumberFormat => number_format::lookup(name),
-        IntlKind::DateTimeFormat => date_time_format::lookup(name),
-        IntlKind::PluralRules => plural_rules::lookup(name),
-        IntlKind::RelativeTimeFormat => relative_time_format::lookup(name),
-        IntlKind::ListFormat => list_format::lookup(name),
-        IntlKind::DisplayNames => display_names::lookup(name),
-        IntlKind::Segmenter => segmenter::lookup(name),
-    }
-}

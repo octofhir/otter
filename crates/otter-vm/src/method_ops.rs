@@ -27,7 +27,7 @@ use crate::{
     NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, build_array_cb_args, collections_prototype, date, descriptor_value,
-    function_metadata, intl, number,
+    function_metadata, number,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
@@ -655,9 +655,6 @@ impl Interpreter {
         }
         if recv_value.is_finalization_registry() {
             return weak_refs::lookup_finalization_registry(name).is_some();
-        }
-        if recv_value.is_intl() {
-            return intl::lookup_prototype(&recv_value, &self.gc_heap, name).is_some();
         }
         if recv_value
             .as_object()

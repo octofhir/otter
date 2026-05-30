@@ -10,21 +10,20 @@
 //! - <https://tc39.es/ecma402/#sec-intl-numberformat-objects>
 
 use std::str::FromStr;
-use std::sync::LazyLock;
 
 use fixed_decimal::Decimal;
 use icu_decimal::DecimalFormatter;
 use icu_decimal::options::{DecimalFormatterOptions, GroupingStrategy};
 use icu_locale::Locale;
 
-use crate::Value;
 use crate::intl::dispatch::IntlError;
 use crate::intl::helpers::{
-    DEFAULT_LOCALE, coerce_locale, js_string, options_object, read_bool_option, read_string_option,
+    DEFAULT_LOCALE, coerce_locale, options_object, read_bool_option, read_string_option,
     read_u8_option,
 };
 use crate::intl::payload::{IntlPayload, NumberFormatPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 /// Resolve the `(locale, options)` argument pair to a payload.
 ///
@@ -92,24 +91,32 @@ pub fn resolve(
     })
 }
 
-fn require_number_format(args: &IntrinsicArgs<'_>) -> Result<NumberFormatPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.NumberFormat",
+fn require_number_format(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<NumberFormatPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.NumberFormat receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::NumberFormat(n) => Ok(n),
         _ => Err(bad()),
     }
 }
 
-fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_number_format(args)?;
-    let first = args.args.first();
+/// §11.1.6 `Intl.NumberFormat.prototype.format(value)`.
+pub(crate) fn number_format_format(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_number_format(ctx, "format")?;
+    let first = args.first();
     let n = if let Some(num) = first.and_then(|v| v.as_number()) {
         num.as_f64()
-    } else if let Some(s) = first.and_then(|v| v.as_string(args.gc_heap)) {
-        s.to_lossy_string(args.gc_heap)
+    } else if let Some(s) = first.and_then(|v| v.as_string(ctx.heap())) {
+        s.to_lossy_string(ctx.heap())
             .parse::<f64>()
             .unwrap_or(f64::NAN)
     } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
@@ -120,18 +127,22 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         f64::NAN
     };
     let rendered = format_number(n, &payload);
-    js_string(&rendered, args.gc_heap).map_err(intl_to_intrinsic)
+    Ok(Value::string(JsString::from_str(
+        &rendered,
+        ctx.heap_mut(),
+    )?))
 }
 
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_number_format(args)?;
-    let payload_locale = payload.locale.clone();
-    let payload_style = payload.style.clone();
-    let payload_currency = payload.currency.clone();
-    let locale = js_string_value(&payload_locale, args)?;
-    let style = js_string_value(&payload_style, args)?;
-    let currency_val = match &payload_currency {
-        Some(c) => Some(js_string_value(c, args)?),
+/// §11.1.7 `Intl.NumberFormat.prototype.resolvedOptions()`.
+pub(crate) fn number_format_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_number_format(ctx, "resolvedOptions")?;
+    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
+    let currency_val = match &payload.currency {
+        Some(c) => Some(Value::string(JsString::from_str(c, ctx.heap_mut())?)),
         None => None,
     };
     let min_fd = payload.minimum_fraction_digits as i32;
@@ -141,8 +152,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     if let Some(c) = &currency_val {
         value_roots.push(c);
     }
-    let obj = args.alloc_object_rooted(&value_roots, &[])?;
-    let heap = &mut *args.gc_heap;
+    let obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "style", style);
     if let Some(c) = currency_val {
@@ -162,21 +173,6 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     );
     crate::object::set(obj, heap, "useGrouping", Value::boolean(use_grouping));
     Ok(Value::object(obj))
-}
-
-fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::string(crate::string::JsString::from_str(
-        s,
-        args.gc_heap,
-    )?))
-}
-
-fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
-    let _ = err;
-    IntrinsicError::BadArgument {
-        index: 0,
-        reason: "format failed",
-    }
 }
 
 /// Render `n` per the resolved option bag.
@@ -323,27 +319,4 @@ fn format_currency(core: &str, payload: &NumberFormatPayload, is_negative: bool)
     } else {
         format!("{symbol}{core_unsigned}")
     }
-}
-
-/// `Intl.NumberFormat.prototype` table.
-pub static NUMBER_FORMAT_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "format"          / 1 => impl_format,
-        "resolvedOptions" / 0 => impl_resolved_options,
-    )
-});
-
-/// Convenience accessor used by [`super::lookup_prototype`].
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    NUMBER_FORMAT_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
-}
-
-/// Static-side dispatch (none today).
-pub fn dispatch_static(method: &str, _args: &[Value]) -> Result<Value, IntlError> {
-    Err(IntlError::UnknownMember {
-        class: "NumberFormat",
-        method: method.to_string(),
-    })
 }

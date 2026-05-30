@@ -7,13 +7,12 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#relativetimeformat-objects>
 
-use std::sync::LazyLock;
+use otter_gc::raw::RawGc;
 
-use crate::Value;
-use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{coerce_locale, js_string, options_object, read_string_option};
+use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
 use crate::intl::payload::{IntlPayload, RelativeTimeFormatPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 /// Resolve constructor options for this Intl class.
 pub fn resolve(
@@ -30,12 +29,16 @@ pub fn resolve(
     }
 }
 
-fn require_payload(args: &IntrinsicArgs<'_>) -> Result<RelativeTimeFormatPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.RelativeTimeFormat",
+fn require_payload(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<RelativeTimeFormatPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.RelativeTimeFormat receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::RelativeTimeFormat(p) => Ok(p),
         _ => Err(bad()),
     }
@@ -96,10 +99,13 @@ fn format_number(n: f64) -> String {
     }
 }
 
-/// §17.5.3 `format(value, unit)`.
-fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let first = args.args.first();
+/// §18.4.3 `Intl.RelativeTimeFormat.prototype.format(value, unit)`.
+pub(crate) fn relative_time_format_format(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "format")?;
+    let first = args.first();
     let value = if let Some(n) = first.and_then(|v| v.as_number()) {
         n.as_f64()
     } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
@@ -109,80 +115,64 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     } else {
         f64::NAN
     };
-    let Some(unit_str) = args.args.get(1).and_then(|v| v.as_string(args.gc_heap)) else {
-        return Err(IntrinsicError::BadArgument {
-            index: 1,
-            reason: "must be a string unit",
+    let Some(unit_str) = args.get(1).and_then(|v| v.as_string(ctx.heap())) else {
+        return Err(NativeError::TypeError {
+            name: "format",
+            reason: "argument 1 must be a string unit".to_string(),
         });
     };
-    let unit = unit_str.to_lossy_string(args.gc_heap);
+    let unit = unit_str.to_lossy_string(ctx.heap());
     let rendered = render_format(value, &unit, &payload);
-    Ok(Value::string(crate::string::JsString::from_str(
+    Ok(Value::string(JsString::from_str(
         &rendered,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-/// §17.5.4 `formatToParts(value, unit)` — foundation returns a
-/// single `{ type: "literal", value: <full string> }` part. The
-/// shape is spec-compatible; per-token splitting arrives with the
-/// full ICU integration.
-fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let s = impl_format(args)?;
-    let literal = Value::string(crate::string::JsString::from_str("literal", args.gc_heap)?);
-    let part = args.alloc_object_rooted(&[&literal, &s], &[])?;
-    {
-        let heap = &mut *args.gc_heap;
-        crate::object::set(part, heap, "type", literal);
-        crate::object::set(part, heap, "value", s);
-    }
-    Ok(Value::array(args.array_from_elements_rooted(
-        [Value::object(part)],
-        &[],
-        &[],
-    )?))
+/// §18.4.4 `Intl.RelativeTimeFormat.prototype.formatToParts(value, unit)`
+/// — foundation returns a single `{ type: "literal", value: <full
+/// string> }` part. The shape is spec-compatible; per-token splitting
+/// arrives with the full ICU integration.
+pub(crate) fn relative_time_format_format_to_parts(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let s = relative_time_format_format(ctx, args)?;
+    let literal = Value::string(JsString::from_str("literal", ctx.heap_mut())?);
+    let part = ctx.alloc_object_with_roots(&[&literal, &s], &[])?;
+    crate::object::set(part, ctx.heap_mut(), "type", literal);
+    crate::object::set(part, ctx.heap_mut(), "value", s);
+    let elements = vec![Value::object(part)];
+    let roots = ctx.collect_native_roots();
+    let this_value = *ctx.this_value();
+    let element_roots = elements.clone();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for &slot in &roots {
+            visitor(slot);
+        }
+        this_value.trace_value_slots(visitor);
+        for v in &element_roots {
+            v.trace_value_slots(visitor);
+        }
+    };
+    let arr =
+        crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut external_visit)?;
+    Ok(Value::array(arr))
 }
 
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let style = js_string(&payload.style, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let numeric = js_string(&payload.numeric, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let obj = args.alloc_object_rooted(&[&locale, &style, &numeric], &[])?;
-    let heap = &mut *args.gc_heap;
+/// §18.4.5 `Intl.RelativeTimeFormat.prototype.resolvedOptions()`.
+pub(crate) fn relative_time_format_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "resolvedOptions")?;
+    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
+    let numeric = Value::string(JsString::from_str(&payload.numeric, ctx.heap_mut())?);
+    let obj = ctx.alloc_object_with_roots(&[&locale, &style, &numeric], &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "style", style);
     crate::object::set(obj, heap, "numeric", numeric);
     Ok(Value::object(obj))
-}
-
-fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
-    match err {
-        IntlError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => IntrinsicError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        _ => IntrinsicError::BadReceiver {
-            expected: "Intl.RelativeTimeFormat",
-        },
-    }
-}
-
-/// `Intl.RelativeTimeFormat.prototype` table.
-pub static RELATIVE_TIME_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "format"           / 2 => impl_format,
-        "formatToParts"    / 2 => impl_format_to_parts,
-        "resolvedOptions"  / 0 => impl_resolved_options,
-    )
-});
-
-#[must_use]
-/// Convenience accessor used by [`super::lookup_prototype`].
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    RELATIVE_TIME_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
 }

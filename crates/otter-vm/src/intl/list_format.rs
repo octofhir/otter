@@ -8,13 +8,12 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#listformat-objects>
 
-use std::sync::LazyLock;
+use otter_gc::raw::RawGc;
 
-use crate::Value;
-use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{coerce_locale, js_string, options_object, read_string_option};
+use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
 use crate::intl::payload::{IntlPayload, ListFormatPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 /// Resolve constructor options for this Intl class.
 pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> ListFormatPayload {
@@ -27,12 +26,16 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> L
     }
 }
 
-fn require_payload(args: &IntrinsicArgs<'_>) -> Result<ListFormatPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.ListFormat",
+fn require_payload(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<ListFormatPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.ListFormat receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::ListFormat(p) => Ok(p),
         _ => Err(bad()),
     }
@@ -69,11 +72,11 @@ fn join(items: &[String], payload: &ListFormatPayload) -> String {
 fn collect_items(
     value: Option<&Value>,
     gc_heap: &otter_gc::GcHeap,
-) -> Result<Vec<String>, IntrinsicError> {
+) -> Result<Vec<String>, NativeError> {
     let Some(arr) = value.and_then(|v| v.as_array()) else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "argument must be an Array",
+        return Err(NativeError::TypeError {
+            name: "format",
+            reason: "argument 0 must be an Array".to_string(),
         });
     };
     let values = crate::array::with_elements(arr, gc_heap, |elements| elements.to_vec());
@@ -86,84 +89,71 @@ fn collect_items(
         } else if let Some(b) = v.as_boolean() {
             out.push((if b { "true" } else { "false" }).to_string());
         } else {
-            return Err(IntrinsicError::BadArgument {
-                index: 0,
-                reason: "list elements must be strings",
+            return Err(NativeError::TypeError {
+                name: "format",
+                reason: "argument 0 list elements must be strings".to_string(),
             });
         }
     }
     Ok(out)
 }
 
-/// §13.5.3 `format(list)`.
-fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let heap = &*args.gc_heap;
-    let items = collect_items(args.args.first(), heap)?;
+/// §13.5.3 `Intl.ListFormat.prototype.format(list)`.
+pub(crate) fn list_format_format(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "format")?;
+    let items = collect_items(args.first(), ctx.heap())?;
     let rendered = join(&items, &payload);
-    Ok(Value::string(crate::string::JsString::from_str(
+    Ok(Value::string(JsString::from_str(
         &rendered,
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-/// §13.5.4 `formatToParts(list)` — single-literal-part fallback.
-fn impl_format_to_parts(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let s = impl_format(args)?;
-    let literal = Value::string(crate::string::JsString::from_str("literal", args.gc_heap)?);
-    let part = args.alloc_object_rooted(&[&literal, &s], &[])?;
-    {
-        let heap = &mut *args.gc_heap;
-        crate::object::set(part, heap, "type", literal);
-        crate::object::set(part, heap, "value", s);
-    }
-    Ok(Value::array(args.array_from_elements_rooted(
-        [Value::object(part)],
-        &[],
-        &[],
-    )?))
+/// §13.5.4 `Intl.ListFormat.prototype.formatToParts(list)` —
+/// single-literal-part fallback.
+pub(crate) fn list_format_format_to_parts(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let s = list_format_format(ctx, args)?;
+    let literal = Value::string(JsString::from_str("literal", ctx.heap_mut())?);
+    let part = ctx.alloc_object_with_roots(&[&literal, &s], &[])?;
+    crate::object::set(part, ctx.heap_mut(), "type", literal);
+    crate::object::set(part, ctx.heap_mut(), "value", s);
+    let elements = vec![Value::object(part)];
+    let roots = ctx.collect_native_roots();
+    let this_value = *ctx.this_value();
+    let element_roots = elements.clone();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for &slot in &roots {
+            visitor(slot);
+        }
+        this_value.trace_value_slots(visitor);
+        for v in &element_roots {
+            v.trace_value_slots(visitor);
+        }
+    };
+    let arr =
+        crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut external_visit)?;
+    Ok(Value::array(arr))
 }
 
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let kind = js_string(&payload.kind, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let style = js_string(&payload.style, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let obj = args.alloc_object_rooted(&[&locale, &kind, &style], &[])?;
-    let heap = &mut *args.gc_heap;
+/// §13.5.5 `Intl.ListFormat.prototype.resolvedOptions()`.
+pub(crate) fn list_format_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "resolvedOptions")?;
+    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
+    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
+    let obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style], &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
     crate::object::set(obj, heap, "style", style);
     Ok(Value::object(obj))
-}
-
-fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
-    match err {
-        IntlError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => IntrinsicError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        _ => IntrinsicError::BadReceiver {
-            expected: "Intl.ListFormat",
-        },
-    }
-}
-
-/// `Intl.ListFormat.prototype` table.
-pub static LIST_FORMAT_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "format"           / 1 => impl_format,
-        "formatToParts"    / 1 => impl_format_to_parts,
-        "resolvedOptions"  / 0 => impl_resolved_options,
-    )
-});
-
-#[must_use]
-/// Convenience accessor used by [`super::lookup_prototype`].
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    LIST_FORMAT_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
 }

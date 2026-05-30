@@ -12,15 +12,11 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-datetimeformat-objects>
 
-use std::sync::LazyLock;
-
-use crate::Value;
-use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{coerce_locale, js_string, options_object, read_string_option};
+use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
 use crate::intl::payload::{DateTimeFormatPayload, IntlPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
-use crate::number::NumberValue;
+use crate::string::JsString;
 use crate::temporal::TemporalPayload;
+use crate::{NativeCtx, NativeError, Value};
 
 /// Resolve the constructor option bag.
 pub fn resolve(
@@ -57,31 +53,39 @@ pub fn resolve(
     }
 }
 
-fn require_date_time(args: &IntrinsicArgs<'_>) -> Result<DateTimeFormatPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.DateTimeFormat",
+fn require_date_time(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<DateTimeFormatPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.DateTimeFormat receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::DateTimeFormat(d) => Ok(d),
         _ => Err(bad()),
     }
 }
 
-fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_date_time(args)?;
-    let first = args.args.first();
+/// §12.1.5 `Intl.DateTimeFormat.prototype.format(date)`.
+pub(crate) fn date_time_format_format(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_date_time(ctx, "format")?;
+    let first = args.first();
     let formatted = if let Some(n) = first.and_then(|v| v.as_number()) {
         format_epoch_ms(n.as_f64() as i64, &payload)
-    } else if let Some(t) = first.and_then(|v| v.as_temporal(args.gc_heap)) {
-        match t.payload_clone(args.gc_heap) {
+    } else if let Some(t) = first.and_then(|v| v.as_temporal(ctx.heap())) {
+        match t.payload_clone(ctx.heap()) {
             TemporalPayload::PlainDateTime(pdt) => format_pdt(&pdt, &payload),
             TemporalPayload::PlainDate(pd) => format_pd(&pd, &payload),
             TemporalPayload::Instant(inst) => format_epoch_ms(inst.epoch_milliseconds(), &payload),
             _ => {
-                return Err(IntrinsicError::BadArgument {
-                    index: 0,
-                    reason: "must be a Number, Temporal.Instant, Temporal.PlainDate, or Temporal.PlainDateTime",
+                return Err(NativeError::TypeError {
+                    name: "format",
+                    reason: "argument 0 must be a Number, Temporal.Instant, Temporal.PlainDate, or Temporal.PlainDateTime".to_string(),
                 });
             }
         }
@@ -92,56 +96,61 @@ fn impl_format(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
             .unwrap_or(0);
         format_epoch_ms(now, &payload)
     } else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a Number or Temporal value",
+        return Err(NativeError::TypeError {
+            name: "format",
+            reason: "argument 0 must be a Number or Temporal value".to_string(),
         });
     };
-    js_string(&formatted, args.gc_heap).map_err(intl_to_intrinsic)
+    Ok(Value::string(JsString::from_str(
+        &formatted,
+        ctx.heap_mut(),
+    )?))
 }
 
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_date_time(args)?;
-    let component = |present: bool| {
-        if present {
-            "numeric".to_string()
-        } else {
-            "".to_string()
-        }
+/// §12.1.6 `Intl.DateTimeFormat.prototype.resolvedOptions()`.
+pub(crate) fn date_time_format_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_date_time(ctx, "resolvedOptions")?;
+    let numeric = |ctx: &mut NativeCtx<'_>| -> Result<Value, NativeError> {
+        Ok(Value::string(JsString::from_str(
+            "numeric",
+            ctx.heap_mut(),
+        )?))
     };
-    let payload_locale = payload.locale.clone();
-    let locale_value = js_string_value(&payload_locale, args)?;
+    let locale_value = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
     let yr = if payload.year {
-        Some(js_string_value(&component(true), args)?)
+        Some(numeric(ctx)?)
     } else {
         None
     };
     let mo = if payload.month {
-        Some(js_string_value(&component(true), args)?)
+        Some(numeric(ctx)?)
     } else {
         None
     };
     let da = if payload.day {
-        Some(js_string_value(&component(true), args)?)
+        Some(numeric(ctx)?)
     } else {
         None
     };
     let hr = if payload.hour {
-        Some(js_string_value(&component(true), args)?)
+        Some(numeric(ctx)?)
     } else {
         None
     };
     let mi = if payload.minute {
-        Some(js_string_value(&component(true), args)?)
+        Some(numeric(ctx)?)
     } else {
         None
     };
     let se = if payload.second {
-        Some(js_string_value(&component(true), args)?)
+        Some(numeric(ctx)?)
     } else {
         None
     };
-    let calendar = Value::string(crate::string::JsString::from_str("iso8601", args.gc_heap)?);
+    let calendar = Value::string(JsString::from_str("iso8601", ctx.heap_mut())?);
     let mut value_roots = vec![&locale_value, &calendar];
     if let Some(v) = &yr {
         value_roots.push(v);
@@ -161,8 +170,8 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
     if let Some(v) = &se {
         value_roots.push(v);
     }
-    let obj = args.alloc_object_rooted(&value_roots, &[])?;
-    let heap = &mut *args.gc_heap;
+    let obj = ctx.alloc_object_with_roots(&value_roots, &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale_value);
     if let Some(v) = yr {
         crate::object::set(obj, heap, "year", v);
@@ -183,23 +192,7 @@ fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, Intrinsi
         crate::object::set(obj, heap, "second", v);
     }
     crate::object::set(obj, heap, "calendar", calendar);
-    let _ = NumberValue::from_i32; // keep import live
     Ok(Value::object(obj))
-}
-
-fn js_string_value(s: &str, args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::string(crate::string::JsString::from_str(
-        s,
-        args.gc_heap,
-    )?))
-}
-
-fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
-    let _ = err;
-    IntrinsicError::BadArgument {
-        index: 0,
-        reason: "format failed",
-    }
 }
 
 /// Render a `(year, month, day, hour, minute, second)` tuple per
@@ -302,29 +295,6 @@ fn epoch_to_civil(epoch_secs: i64) -> (i32, u8, u8, u8, u8, u8) {
     let minute = ((secs_of_day % 3600) / 60) as u8;
     let second = (secs_of_day % 60) as u8;
     (year, m, d, hour, minute, second)
-}
-
-/// `Intl.DateTimeFormat.prototype` table.
-pub static DATE_TIME_FORMAT_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "format"          / 1 => impl_format,
-        "resolvedOptions" / 0 => impl_resolved_options,
-    )
-});
-
-/// Convenience accessor used by [`super::lookup_prototype`].
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    DATE_TIME_FORMAT_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
-}
-
-/// Static-side dispatch (none today).
-pub fn dispatch_static(method: &str, _args: &[Value]) -> Result<Value, IntlError> {
-    Err(IntlError::UnknownMember {
-        class: "DateTimeFormat",
-        method: method.to_string(),
-    })
 }
 
 #[cfg(test)]

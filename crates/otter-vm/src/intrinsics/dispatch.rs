@@ -118,13 +118,6 @@ pub enum IntrinsicReceiver {
     /// # See also
     /// - <https://tc39.es/proposal-temporal/>
     Temporal,
-    /// `Intl.<Class>.prototype.<name>`. Receiver is a
-    /// [`crate::Value::Intl`]. Per-kind routing happens in
-    /// [`crate::intl::lookup_prototype`].
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma402/>
-    Intl,
     /// `ArrayBuffer.prototype.<name>`. Receiver is a
     /// [`crate::Value::ArrayBuffer`].
     ///

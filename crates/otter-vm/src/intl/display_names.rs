@@ -9,13 +9,10 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-displaynames-objects>
 
-use std::sync::LazyLock;
-
-use crate::Value;
-use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{coerce_locale, js_string, options_object, read_string_option};
+use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
 use crate::intl::payload::{DisplayNamesPayload, IntlPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 /// Resolve constructor options for this Intl class.
 pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> DisplayNamesPayload {
@@ -29,12 +26,16 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> D
     }
 }
 
-fn require_payload(args: &IntrinsicArgs<'_>) -> Result<DisplayNamesPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.DisplayNames",
+fn require_payload(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<DisplayNamesPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.DisplayNames receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::DisplayNames(p) => Ok(p),
         _ => Err(bad()),
     }
@@ -130,75 +131,46 @@ fn lookup_name(kind: &str, code: &str) -> Option<&'static str> {
     }
 }
 
-/// §12.5.5 `of(code)`.
-fn impl_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let code = if let Some(s) = args.args.first().and_then(|v| v.as_string(args.gc_heap)) {
-        s.to_lossy_string(args.gc_heap)
-    } else if let Some(n) = args.args.first().and_then(|v| v.as_number()) {
+/// §12.4.3 `Intl.DisplayNames.prototype.of(code)`.
+pub(crate) fn display_names_of(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "of")?;
+    let code = if let Some(s) = args.first().and_then(|v| v.as_string(ctx.heap())) {
+        s.to_lossy_string(ctx.heap())
+    } else if let Some(n) = args.first().and_then(|v| v.as_number()) {
         n.to_display_string()
     } else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a string code",
+        return Err(NativeError::TypeError {
+            name: "of",
+            reason: "argument 0 must be a string code".to_string(),
         });
     };
     if let Some(name) = lookup_name(&payload.kind, &code) {
-        return Ok(Value::string(crate::string::JsString::from_str(
-            name,
-            args.gc_heap,
-        )?));
+        return Ok(Value::string(JsString::from_str(name, ctx.heap_mut())?));
     }
     if payload.fallback == "none" {
         return Ok(Value::undefined());
     }
-    Ok(Value::string(crate::string::JsString::from_str(
-        &code,
-        args.gc_heap,
-    )?))
+    Ok(Value::string(JsString::from_str(&code, ctx.heap_mut())?))
 }
 
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let kind = js_string(&payload.kind, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let style = js_string(&payload.style, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let fallback = js_string(&payload.fallback, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let obj = args.alloc_object_rooted(&[&locale, &kind, &style, &fallback], &[])?;
-    let heap = &mut *args.gc_heap;
+/// §12.4.4 `Intl.DisplayNames.prototype.resolvedOptions()`.
+pub(crate) fn display_names_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "resolvedOptions")?;
+    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
+    let style = Value::string(JsString::from_str(&payload.style, ctx.heap_mut())?);
+    let fallback = Value::string(JsString::from_str(&payload.fallback, ctx.heap_mut())?);
+    let obj = ctx.alloc_object_with_roots(&[&locale, &kind, &style, &fallback], &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
     crate::object::set(obj, heap, "style", style);
     crate::object::set(obj, heap, "fallback", fallback);
     Ok(Value::object(obj))
-}
-
-fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
-    match err {
-        IntlError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => IntrinsicError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        _ => IntrinsicError::BadReceiver {
-            expected: "Intl.DisplayNames",
-        },
-    }
-}
-
-/// `Intl.DisplayNames.prototype` table.
-pub static DISPLAY_NAMES_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "of"               / 1 => impl_of,
-        "resolvedOptions"  / 0 => impl_resolved_options,
-    )
-});
-
-#[must_use]
-/// Convenience accessor used by [`super::lookup_prototype`].
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    DISPLAY_NAMES_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
 }

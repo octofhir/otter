@@ -9,13 +9,12 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#segmenter-objects>
 
-use std::sync::LazyLock;
+use otter_gc::raw::RawGc;
 
-use crate::Value;
-use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{coerce_locale, js_string, options_object, read_string_option};
+use crate::intl::helpers::{coerce_locale, options_object, read_string_option};
 use crate::intl::payload::{IntlPayload, SegmenterPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 /// Resolve constructor options for this Intl class.
 pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> SegmenterPayload {
@@ -27,12 +26,16 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> S
     }
 }
 
-fn require_payload(args: &IntrinsicArgs<'_>) -> Result<SegmenterPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.Segmenter",
+fn require_payload(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<SegmenterPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.Segmenter receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::Segmenter(p) => Ok(p),
         _ => Err(bad()),
     }
@@ -86,34 +89,35 @@ fn segment(text: &str, granularity: &str) -> Vec<(usize, String)> {
     }
 }
 
-/// §18.5.3 `segment(string)` — returns an array of segment-data
-/// objects. Spec returns a live `Segments` iterator; foundation
-/// returns an array (each element is a `{segment, index, input,
-/// isWordLike?}` plain object) which is iterable through the
-/// existing iterator-protocol path.
-fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let first = args.args.first();
-    let text = if let Some(s) = first.and_then(|v| v.as_string(args.gc_heap)) {
-        s.to_lossy_string(args.gc_heap)
+/// §18.4.3 `Intl.Segmenter.prototype.segment(string)` — returns an
+/// array of segment-data objects. Spec returns a live `Segments`
+/// iterator; foundation returns an array (each element is a
+/// `{segment, index, input, isWordLike?}` plain object) which is
+/// iterable through the existing iterator-protocol path.
+pub(crate) fn segmenter_segment(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "segment")?;
+    let first = args.first();
+    let text = if let Some(s) = first.and_then(|v| v.as_string(ctx.heap())) {
+        s.to_lossy_string(ctx.heap())
     } else if let Some(n) = first.and_then(|v| v.as_number()) {
         n.to_display_string()
     } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
         (if b { "true" } else { "false" }).to_string()
     } else {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "must be a string",
+        return Err(NativeError::TypeError {
+            name: "segment",
+            reason: "argument 0 must be a string".to_string(),
         });
     };
     let segments = segment(&text, &payload.granularity);
-    let input_value = Value::string(crate::string::JsString::from_str(&text, args.gc_heap)?);
+    let input_value = Value::string(JsString::from_str(&text, ctx.heap_mut())?);
     let granularity_word = payload.granularity == "word";
-    // Pre-allocate JsString values; once gc_heap is borrowed we can
-    // only call object:: APIs.
     let mut prepared: Vec<(Value, i32, bool)> = Vec::with_capacity(segments.len());
     for (idx, seg) in segments {
-        let seg_str = Value::string(crate::string::JsString::from_str(&seg, args.gc_heap)?);
+        let seg_str = Value::string(JsString::from_str(&seg, ctx.heap_mut())?);
         let wordlike = granularity_word && seg.chars().any(char::is_alphanumeric);
         prepared.push((seg_str, idx as i32, wordlike));
     }
@@ -121,8 +125,8 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     let mut elements: Vec<Value> = Vec::with_capacity(prepared.len());
     for (seg_str, idx, wordlike) in &prepared {
         let obj =
-            args.alloc_object_rooted(&[seg_str, &input_value], &[&prepared_values, &elements])?;
-        let heap = &mut *args.gc_heap;
+            ctx.alloc_object_with_roots(&[seg_str, &input_value], &[&prepared_values, &elements])?;
+        let heap = ctx.heap_mut();
         crate::object::set(obj, heap, "segment", *seg_str);
         crate::object::set(obj, heap, "index", Value::number_i32(*idx));
         crate::object::set(obj, heap, "input", input_value);
@@ -131,90 +135,38 @@ fn impl_segment(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
         }
         elements.push(Value::object(obj));
     }
-    Ok(Value::array(args.array_from_elements_rooted(
-        elements,
-        &[&input_value],
-        &[&prepared_values],
-    )?))
+    let roots = ctx.collect_native_roots();
+    let this_value = *ctx.this_value();
+    let element_roots = elements.clone();
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for &slot in &roots {
+            visitor(slot);
+        }
+        this_value.trace_value_slots(visitor);
+        input_value.trace_value_slots(visitor);
+        for v in &prepared_values {
+            v.trace_value_slots(visitor);
+        }
+        for v in &element_roots {
+            v.trace_value_slots(visitor);
+        }
+    };
+    let arr =
+        crate::array::from_elements_with_roots(ctx.heap_mut(), elements, &mut external_visit)?;
+    Ok(Value::array(arr))
 }
 
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let granularity = js_string(&payload.granularity, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let obj = args.alloc_object_rooted(&[&locale, &granularity], &[])?;
-    let heap = &mut *args.gc_heap;
+/// §18.3.4 `Intl.Segmenter.prototype.resolvedOptions()`.
+pub(crate) fn segmenter_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "resolvedOptions")?;
+    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let granularity = Value::string(JsString::from_str(&payload.granularity, ctx.heap_mut())?);
+    let obj = ctx.alloc_object_with_roots(&[&locale, &granularity], &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "granularity", granularity);
     Ok(Value::object(obj))
-}
-
-fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
-    match err {
-        IntlError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => IntrinsicError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        _ => IntrinsicError::BadReceiver {
-            expected: "Intl.Segmenter",
-        },
-    }
-}
-
-/// `Intl.Segmenter.prototype` table.
-pub static SEGMENTER_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "segment"          / 1 => impl_segment,
-        "resolvedOptions"  / 0 => impl_resolved_options,
-    )
-});
-
-#[must_use]
-/// Convenience accessor used by [`super::lookup_prototype`].
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    SEGMENTER_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::intl::payload::JsIntl;
-    use crate::string::JsString;
-
-    #[test]
-    fn segment_uses_intrinsic_rooted_young_allocation() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let receiver = Value::intl(
-            JsIntl::new(
-                &mut gc_heap,
-                IntlPayload::Segmenter(SegmenterPayload {
-                    locale: "en-US".to_string(),
-                    granularity: "word".to_string(),
-                }),
-            )
-            .expect("intl"),
-        );
-        let input = Value::string(JsString::from_str("alpha beta", &mut gc_heap).expect("input"));
-        let args = [input];
-        let before = gc_heap.stats().new_allocated_bytes;
-
-        let result = impl_segment(&mut IntrinsicArgs {
-            receiver: &receiver,
-            args: &args,
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .expect("segment");
-
-        let after = gc_heap.stats().new_allocated_bytes;
-        assert!(
-            after > before,
-            "Intl.Segmenter.prototype.segment should allocate segment objects and result array in young space"
-        );
-        assert!(result.is_array());
-    }
 }

@@ -14,15 +14,10 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#pluralrules-objects>
 
-use std::sync::LazyLock;
-
-use crate::Value;
-use crate::intl::dispatch::IntlError;
-use crate::intl::helpers::{
-    coerce_locale, js_string, options_object, read_string_option, read_u8_option,
-};
+use crate::intl::helpers::{coerce_locale, options_object, read_string_option, read_u8_option};
 use crate::intl::payload::{IntlPayload, PluralRulesPayload};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::string::JsString;
+use crate::{NativeCtx, NativeError, Value};
 
 /// §15.2.1 — resolve constructor options.
 pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> PluralRulesPayload {
@@ -51,21 +46,28 @@ pub fn resolve(locale: &Value, options: &Value, gc_heap: &otter_gc::GcHeap) -> P
     }
 }
 
-fn require_payload(args: &IntrinsicArgs<'_>) -> Result<PluralRulesPayload, IntrinsicError> {
-    let bad = || IntrinsicError::BadReceiver {
-        expected: "Intl.PluralRules",
+fn require_payload(
+    ctx: &NativeCtx<'_>,
+    name: &'static str,
+) -> Result<PluralRulesPayload, NativeError> {
+    let bad = || NativeError::TypeError {
+        name,
+        reason: "intrinsic called on a non-Intl.PluralRules receiver".to_string(),
     };
-    let intl = args.receiver.as_intl(args.gc_heap).ok_or_else(bad)?;
-    match intl.payload_clone(args.gc_heap) {
+    let intl = ctx.this_value().as_intl(ctx.heap()).ok_or_else(bad)?;
+    match intl.payload_clone(ctx.heap()) {
         IntlPayload::PluralRules(p) => Ok(p),
         _ => Err(bad()),
     }
 }
 
-/// §15.5.4 — `Intl.PluralRules.prototype.select(value)`.
-fn impl_select(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let first = args.args.first();
+/// §16.3.3 `Intl.PluralRules.prototype.select(value)`.
+pub(crate) fn plural_rules_select(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "select")?;
+    let first = args.first();
     let n = if let Some(n) = first.and_then(|v| v.as_number()) {
         n.as_f64()
     } else if let Some(b) = first.and_then(|v| v.as_boolean()) {
@@ -75,22 +77,25 @@ fn impl_select(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
     } else {
         f64::NAN
     };
-    Ok(Value::string(crate::string::JsString::from_str(
+    Ok(Value::string(JsString::from_str(
         plural_category_en(n, &payload.kind),
-        args.gc_heap,
+        ctx.heap_mut(),
     )?))
 }
 
-/// §15.5.5 — `Intl.PluralRules.prototype.resolvedOptions()`.
-fn impl_resolved_options(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let payload = require_payload(args)?;
-    let locale = js_string(&payload.locale, args.gc_heap).map_err(intl_to_intrinsic)?;
-    let kind = js_string(&payload.kind, args.gc_heap).map_err(intl_to_intrinsic)?;
+/// §16.3.4 `Intl.PluralRules.prototype.resolvedOptions()`.
+pub(crate) fn plural_rules_resolved_options(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let payload = require_payload(ctx, "resolvedOptions")?;
+    let locale = Value::string(JsString::from_str(&payload.locale, ctx.heap_mut())?);
+    let kind = Value::string(JsString::from_str(&payload.kind, ctx.heap_mut())?);
     let mid = payload.minimum_integer_digits as i32;
     let mfd = payload.minimum_fraction_digits as i32;
     let xfd = payload.maximum_fraction_digits as i32;
-    let obj = args.alloc_object_rooted(&[&locale, &kind], &[])?;
-    let heap = &mut *args.gc_heap;
+    let obj = ctx.alloc_object_with_roots(&[&locale, &kind], &[])?;
+    let heap = ctx.heap_mut();
     crate::object::set(obj, heap, "locale", locale);
     crate::object::set(obj, heap, "type", kind);
     crate::object::set(obj, heap, "minimumIntegerDigits", Value::number_i32(mid));
@@ -126,34 +131,4 @@ fn plural_category_en(n: f64, kind: &str) -> &'static str {
     } else {
         "other"
     }
-}
-
-fn intl_to_intrinsic(err: IntlError) -> IntrinsicError {
-    match err {
-        IntlError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        } => IntrinsicError::OutOfMemory {
-            requested_bytes,
-            heap_limit_bytes,
-        },
-        _ => IntrinsicError::BadReceiver {
-            expected: "Intl.PluralRules",
-        },
-    }
-}
-
-/// `Intl.PluralRules.prototype` table.
-pub static PLURAL_RULES_PROTOTYPE_TABLE: LazyLock<IntrinsicTable> = LazyLock::new(|| {
-    crate::intrinsics!(
-        Intl,
-        "select"           / 1 => impl_select,
-        "resolvedOptions"  / 0 => impl_resolved_options,
-    )
-});
-
-/// Convenience accessor used by [`super::lookup_prototype`].
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    PLURAL_RULES_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Intl, name)
 }

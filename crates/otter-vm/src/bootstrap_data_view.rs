@@ -19,10 +19,8 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-dataview-prototype-object>
 
 use otter_bytecode::method_id::DataViewMethod;
-use smallvec::SmallVec;
 
 use crate::binary::data_view_prototype;
-use crate::intrinsics::IntrinsicArgs;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -37,26 +35,26 @@ otter_macros::couch! {
     constructor = (length = 1, call = data_view_ctor_call),
     prototype = {
         methods = {
-            "getInt8"      / 1 => dv_get_int8,
-            "getUint8"     / 1 => dv_get_uint8,
-            "getInt16"     / 1 => dv_get_int16,
-            "getUint16"    / 1 => dv_get_uint16,
-            "getInt32"     / 1 => dv_get_int32,
-            "getUint32"    / 1 => dv_get_uint32,
-            "getFloat32"   / 1 => dv_get_float32,
-            "getFloat64"   / 1 => dv_get_float64,
-            "getBigInt64"  / 1 => dv_get_bigint64,
-            "getBigUint64" / 1 => dv_get_biguint64,
-            "setInt8"      / 2 => dv_set_int8,
-            "setUint8"     / 2 => dv_set_uint8,
-            "setInt16"     / 2 => dv_set_int16,
-            "setUint16"    / 2 => dv_set_uint16,
-            "setInt32"     / 2 => dv_set_int32,
-            "setUint32"    / 2 => dv_set_uint32,
-            "setFloat32"   / 2 => dv_set_float32,
-            "setFloat64"   / 2 => dv_set_float64,
-            "setBigInt64"  / 2 => dv_set_bigint64,
-            "setBigUint64" / 2 => dv_set_biguint64,
+            "getInt8"      / 1 => data_view_prototype::dv_get_int8,
+            "getUint8"     / 1 => data_view_prototype::dv_get_uint8,
+            "getInt16"     / 1 => data_view_prototype::dv_get_int16,
+            "getUint16"    / 1 => data_view_prototype::dv_get_uint16,
+            "getInt32"     / 1 => data_view_prototype::dv_get_int32,
+            "getUint32"    / 1 => data_view_prototype::dv_get_uint32,
+            "getFloat32"   / 1 => data_view_prototype::dv_get_float32,
+            "getFloat64"   / 1 => data_view_prototype::dv_get_float64,
+            "getBigInt64"  / 1 => data_view_prototype::dv_get_bigint64,
+            "getBigUint64" / 1 => data_view_prototype::dv_get_biguint64,
+            "setInt8"      / 2 => data_view_prototype::dv_set_int8,
+            "setUint8"     / 2 => data_view_prototype::dv_set_uint8,
+            "setInt16"     / 2 => data_view_prototype::dv_set_int16,
+            "setUint16"    / 2 => data_view_prototype::dv_set_uint16,
+            "setInt32"     / 2 => data_view_prototype::dv_set_int32,
+            "setUint32"    / 2 => data_view_prototype::dv_set_uint32,
+            "setFloat32"   / 2 => data_view_prototype::dv_set_float32,
+            "setFloat64"   / 2 => data_view_prototype::dv_set_float64,
+            "setBigInt64"  / 2 => data_view_prototype::dv_set_bigint64,
+            "setBigUint64" / 2 => data_view_prototype::dv_set_biguint64,
         },
         accessors = [
             ("buffer",     get = dv_get_buffer),
@@ -134,137 +132,6 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 }
 
 // ---------------------------------------------------------------
-// Prototype methods (thin wrappers over the intrinsic table)
-// ---------------------------------------------------------------
-
-fn dv_get_int8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getInt8")
-}
-fn dv_get_uint8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getUint8")
-}
-fn dv_get_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getInt16")
-}
-fn dv_get_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getUint16")
-}
-fn dv_get_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getInt32")
-}
-fn dv_get_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getUint32")
-}
-fn dv_get_float32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getFloat32")
-}
-fn dv_get_float64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getFloat64")
-}
-fn dv_get_bigint64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getBigInt64")
-}
-fn dv_get_biguint64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "getBigUint64")
-}
-fn dv_set_int8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setInt8")
-}
-fn dv_set_uint8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setUint8")
-}
-fn dv_set_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setInt16")
-}
-fn dv_set_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setUint16")
-}
-fn dv_set_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setInt32")
-}
-fn dv_set_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setUint32")
-}
-fn dv_set_float32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setFloat32")
-}
-fn dv_set_float64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setFloat64")
-}
-fn dv_set_bigint64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setBigInt64")
-}
-fn dv_set_biguint64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "setBigUint64")
-}
-
-fn dispatch_method(
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    method_name: &str,
-) -> Result<Value, NativeError> {
-    let entry = data_view_prototype::lookup(method_name).ok_or_else(|| NativeError::TypeError {
-        name: "DataView.prototype",
-        reason: format!("method {method_name} missing"),
-    })?;
-    let receiver = *ctx.this_value();
-    // §24.3.1.1 GetViewValue / §24.3.1.2 SetViewValue both start with
-    // `ToIndex(byteOffset)`, which runs `ToPrimitive(Number)` →
-    // `ToIntegerOrInfinity` per spec. For setters the third arg
-    // (value) needs ToNumber / ToBigInt before the intrinsic's
-    // strict guard runs. Pre-coerce non-primitive args here so user
-    // `@@toPrimitive` / `valueOf` / `toString` hooks fire.
-    let exec = ctx.execution_context().cloned();
-    let small_args: SmallVec<[Value; 4]> = if let Some(exec) = &exec {
-        let mut out: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-        let coerce_indices: &[usize] = if method_name.starts_with("get") {
-            &[0]
-        } else if method_name.starts_with("set") {
-            &[0, 1]
-        } else {
-            &[]
-        };
-        for &idx in coerce_indices {
-            let Some(slot) = out.get_mut(idx) else {
-                continue;
-            };
-            let is_object_like = slot.is_object()
-                || slot.is_array()
-                || slot.is_function()
-                || slot.is_closure()
-                || slot.is_native_function()
-                || slot.is_bound_function()
-                || slot.is_class_constructor()
-                || slot.is_proxy()
-                || slot.is_regexp();
-            if !is_object_like {
-                continue;
-            }
-            let interp = ctx.interp_mut();
-            let primitive = interp
-                .evaluate_to_primitive(exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
-                .map_err(|e| NativeError::TypeError {
-                    name: "DataView.prototype",
-                    reason: e.to_string(),
-                })?;
-            *slot = primitive;
-        }
-        out
-    } else {
-        args.iter().cloned().collect()
-    };
-    let allocation_roots = ctx.collect_native_roots();
-    let gc_heap = ctx.heap_mut();
-    let mut intrinsic_args = IntrinsicArgs {
-        receiver: &receiver,
-        args: &small_args,
-        gc_heap,
-        allocation_roots: allocation_roots.as_slice(),
-    };
-    (entry.impl_fn)(&mut intrinsic_args).map_err(|e| intrinsic_to_native(e, method_name))
-}
-
-// ---------------------------------------------------------------
 // Accessors
 // ---------------------------------------------------------------
 
@@ -304,18 +171,6 @@ fn receiver_dv(
             name,
             reason: "this is not a DataView".to_string(),
         })
-    }
-}
-
-// ---------------------------------------------------------------
-// Error coercion
-// ---------------------------------------------------------------
-
-fn intrinsic_to_native(err: crate::intrinsics::IntrinsicError, name: &str) -> NativeError {
-    let _ = name;
-    NativeError::TypeError {
-        name: "DataView.prototype",
-        reason: err.to_string(),
     }
 }
 

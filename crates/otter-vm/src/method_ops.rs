@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 
 use crate::{
     BoundFunction, ExecutionContext, Frame, GeneratorResumeKind, Interpreter, JsString,
-    NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint, binary,
+    NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, build_array_cb_args, collections_prototype, date, descriptor_value,
     function_metadata, intl, number,
@@ -649,9 +649,6 @@ impl Interpreter {
         }
         if recv_value.is_weak_set() {
             return collections_prototype::lookup_weak_set(name).is_some();
-        }
-        if recv_value.is_data_view() {
-            return binary::data_view_prototype::lookup(name).is_some();
         }
         if recv_value.is_weak_ref() {
             return weak_refs::lookup_weak_ref(name).is_some();

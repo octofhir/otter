@@ -61,6 +61,12 @@ pub static BOOLEAN_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("valueOf", 0, boolean_value_of),
 ];
 
+/// Whether `name` is an installed `Boolean.prototype` method.
+#[must_use]
+pub fn is_builtin_method(name: &str) -> bool {
+    BOOLEAN_PROTOTYPE_METHODS.iter().any(|m| m.name == name)
+}
+
 const fn method(
     name: &'static str,
     length: u8,

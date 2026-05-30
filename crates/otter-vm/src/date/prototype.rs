@@ -1,27 +1,24 @@
-//! `Date.prototype.<name>` intrinsic table.
+//! `Date.prototype.<name>` native implementations.
 //!
 //! Date instances are ordinary objects with a `[[DateValue]]`
 //! internal slot per §21.4.5. The receiver helpers in this module
-//! validate that brand by checking
-//! [`crate::object::date_data`]; ordinary objects without the
-//! slot trigger `TypeError`.
+//! validate that brand by checking [`crate::object::date_data`];
+//! ordinary objects without the slot trigger `TypeError`.
 //!
 //! Foundation surface (UTC-only — host timezone integration is
-//! filed). Every accessor returns the broken-down UTC component
-//! per ECMA-262 §21.4.4.x; the `getUTC*` and "local" `get*` shapes
-//! intentionally share one implementation since the foundation
-//! treats local time as UTC.
+//! filed). Every accessor returns the broken-down UTC component per
+//! ECMA-262 §21.4.4.x; the `getUTC*` and "local" `get*` shapes
+//! intentionally share one implementation since the foundation treats
+//! local time as UTC.
 //!
 //! # Contents
-//! - [`DATE_PROTOTYPE_TABLE`] — declarative table built with the
-//!   [`crate::intrinsics!`] macro.
-//! - [`lookup`] — convenience accessor used by the dispatcher.
-//! - [`DATE_PROTOTYPE_METHODS`] — JS-visible method specs installed
-//!   on `Date.prototype` during bootstrap.
-//! - [`DATE_PROTOTYPE_EXTRA_METHODS`] — JS-visible specs that need
-//!   the full [`crate::lib::Interpreter`] entry path (currently
-//!   `toJSON`, which must run a generic `Invoke(O, "toISOString")`
-//!   per §21.4.4.41 step 4).
+//! - [`DATE_PROTOTYPE_METHODS`] — JS-visible method specs installed on
+//!   `Date.prototype` during bootstrap. Each spec points at a thin
+//!   `bridge_*` native that binds the JS method name to one of the
+//!   shared `*_impl` bodies.
+//! - [`DATE_PROTOTYPE_EXTRA_METHODS`] — specs that re-enter the full
+//!   interpreter (currently `toJSON`, which runs a generic
+//!   `Invoke(O, "toISOString")` per §21.4.4.41 step 4).
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-date-prototype-object>
@@ -32,7 +29,6 @@ use smallvec::SmallVec;
 use super::{broken_down, to_iso_string};
 use crate::Value;
 use crate::abstract_ops::{self, ToPrimitiveHint};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
@@ -40,20 +36,23 @@ use crate::string::JsString;
 use crate::{NativeCtx, NativeError, VmError, VmGetOutcome, VmPropertyKey};
 
 /// `thisTimeValue` (§21.4.1.1): validate the receiver brand and
-/// extract the `[[DateValue]]` slot. Returns the JsObject handle
-/// (for setters that need to write back) and the current time.
-fn receiver_handle(args: &IntrinsicArgs<'_>) -> Result<(JsObject, f64), IntrinsicError> {
-    if let Some(o) = args.receiver.as_object()
-        && let Some(time) = object::date_data(o, args.gc_heap)
+/// extract the `[[DateValue]]` slot. Returns the JsObject handle (for
+/// setters that need to write back) and the current time.
+fn this_handle(ctx: &NativeCtx<'_>, name: &'static str) -> Result<(JsObject, f64), NativeError> {
+    if let Some(o) = ctx.this_value().as_object()
+        && let Some(time) = object::date_data(o, ctx.heap())
     {
         return Ok((o, time));
     }
-    Err(IntrinsicError::BadReceiver { expected: "date" })
+    Err(NativeError::TypeError {
+        name,
+        reason: "Date.prototype method called on incompatible receiver".to_string(),
+    })
 }
 
 /// Read-only `thisTimeValue` — getters only need the time.
-fn receiver_time(args: &IntrinsicArgs<'_>) -> Result<f64, IntrinsicError> {
-    receiver_handle(args).map(|(_, t)| t)
+fn this_time(ctx: &NativeCtx<'_>, name: &'static str) -> Result<f64, NativeError> {
+    this_handle(ctx, name).map(|(_, t)| t)
 }
 
 fn nan() -> Value {
@@ -64,141 +63,179 @@ fn smi(n: i32) -> Value {
     Value::number_i32(n)
 }
 
-/// §21.4.4.10 / §21.4.4.44 — `getTime()` / `valueOf()` return the
-/// raw time value.
-fn impl_get_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(Value::number_f64(receiver_time(args)?))
+/// §21.4.4.10 / §21.4.4.44 — `getTime()` / `valueOf()`.
+fn get_time_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(Value::number_f64(this_time(ctx, name)?))
 }
 
-fn impl_get_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_full_year_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.year))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_month_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.month as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_date(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_date_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.day as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_day(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_day_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.weekday as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_hours_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.hour as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_minutes_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.minute as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_seconds_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.second as i32))
         .unwrap_or_else(nan))
 }
 
-fn impl_get_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    Ok(broken_down(receiver_time(args)?)
+fn get_milliseconds_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    Ok(broken_down(this_time(ctx, name)?)
         .map(|bd| smi(bd.millisecond as i32))
         .unwrap_or_else(nan))
 }
 
-/// §21.4.4.21 — `getTimezoneOffset()`. Foundation treats local time
-/// as UTC, so the offset is always `0`.
-fn impl_get_timezone_offset(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // Validate brand even though the result is constant — `Date.prototype.getTimezoneOffset.call({})`
-    // must throw, not return 0.
-    receiver_time(args)?;
+/// §21.4.4.21 — `getTimezoneOffset()`. Foundation treats local time as
+/// UTC, so the offset is always `0`. The brand is still validated.
+fn get_timezone_offset_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    this_time(ctx, name)?;
     Ok(smi(0))
 }
 
 /// §B.2.4 (Temporal proposal) — `Date.prototype.toTemporalInstant()`.
-/// Returns a `Temporal.Instant` corresponding to this Date's
-/// `[[DateValue]]`. Throws `RangeError` for Invalid Date (NaN).
-fn impl_to_temporal_instant(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let time = receiver_time(args)?;
+fn to_temporal_instant_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let time = this_time(ctx, name)?;
     if !time.is_finite() {
-        return Err(IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "Invalid Date",
+        return Err(NativeError::RangeError {
+            name,
+            reason: "Invalid Date".to_string(),
         });
     }
     let ms = time as i64;
-    let inst = temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|_| {
-        IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "Temporal.Instant out of range",
-        }
-    })?;
+    let inst =
+        temporal_rs::Instant::from_epoch_milliseconds(ms).map_err(|_| NativeError::RangeError {
+            name,
+            reason: "Temporal.Instant out of range".to_string(),
+        })?;
     let handle = crate::temporal::payload::JsTemporal::new(
-        args.gc_heap,
+        ctx.heap_mut(),
         crate::temporal::payload::TemporalPayload::Instant(inst),
-    )
-    .map_err(IntrinsicError::from)?;
+    )?;
     Ok(Value::temporal(handle))
 }
 
-/// §21.4.4.36 — `toISOString()`. Throws RangeError on Invalid Date
-/// per spec; the foundation surfaces that via `BadArgument`.
-fn impl_to_iso_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let time = receiver_time(args)?;
-    let s = to_iso_string(time).ok_or(IntrinsicError::OutOfRange {
-        index: 0,
-        reason: "Invalid Date",
+/// §21.4.4.36 — `toISOString()`. `RangeError` on Invalid Date.
+fn to_iso_string_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let time = this_time(ctx, name)?;
+    let s = to_iso_string(time).ok_or(NativeError::RangeError {
+        name,
+        reason: "Invalid Date".to_string(),
     })?;
-    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
 }
 
-/// §21.4.4.41 — `toJSON()`. Returns `toISOString()` for finite
-/// dates and `null` for Invalid Date.
-fn impl_to_json(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let time = receiver_time(args)?;
-    match to_iso_string(time) {
-        Some(s) => Ok(Value::string(JsString::from_str(&s, args.gc_heap)?)),
-        None => Ok(Value::null()),
-    }
-}
-
-/// §21.4.4.42 — `toString()`. Foundation returns the ISO string
-/// (matching `toISOString` shape; spec uses a locale-friendly
-/// rendering that requires host integration).
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let time = receiver_time(args)?;
+/// §21.4.4.42 — `toString()` / `toUTCString` / `toLocaleString`.
+/// Foundation returns the ISO string.
+fn to_string_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let time = this_time(ctx, name)?;
     let s = to_iso_string(time).unwrap_or_else(|| "Invalid Date".to_string());
-    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
 }
 
-/// §21.4.4.27 / §21.4.4.43 / §21.4.4.40 — `toDateString` /
-/// `toTimeString` / `toLocaleString` / `toLocaleDateString` /
-/// `toLocaleTimeString`. Foundation form returns the ISO string
-/// for backward compatibility with `toString`. Locale-aware
-/// rendering ships once Intl lands.
-fn impl_to_date_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let time = receiver_time(args)?;
+/// §21.4.4.27 — `toDateString` / `toLocaleDateString`.
+fn to_date_string_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let time = this_time(ctx, name)?;
     let s = match broken_down(time) {
         Some(bd) => format!("{:04}-{:02}-{:02}", bd.year, bd.month + 1, bd.day),
         None => "Invalid Date".to_string(),
     };
-    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
 }
 
-fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let time = receiver_time(args)?;
+/// §21.4.4.43 — `toTimeString` / `toLocaleTimeString`.
+fn to_time_string_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let time = this_time(ctx, name)?;
     let s = match broken_down(time) {
         Some(bd) => format!(
             "{:02}:{:02}:{:02}.{:03}Z",
@@ -206,42 +243,52 @@ fn impl_to_time_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicE
         ),
         None => "Invalid Date".to_string(),
     };
-    Ok(Value::string(JsString::from_str(&s, args.gc_heap)?))
+    Ok(Value::string(JsString::from_str(&s, ctx.heap_mut())?))
 }
 
-/// Helper for `setX`-family methods. Reads each `args.args[idx]` as
-/// a `f64` value. The bridge in `method_ops.rs` pre-coerces every
-/// provided slot through the §7.1.4 `ToNumber` ladder so this fn
-/// only sees primitives; missing positional slots fall back to the
-/// component-from-time value supplied by `fallback` (§21.4.4.x
-/// "if X is present" branch).
-fn read_arg_number(args: &IntrinsicArgs<'_>, idx: usize, fallback: f64) -> f64 {
-    let Some(v) = args.args.get(idx) else {
+/// §21.4.4.x `Date.prototype.set*` — `ToNumber` every provided
+/// argument in declaration order. A `valueOf` callback may mutate the
+/// receiver's `[[DateValue]]` via `setTime`; the captured time is read
+/// by the caller before this runs, the component math uses it, and the
+/// final assignment overwrites any in-callback mutation.
+fn coerce_set_args(
+    ctx: &mut NativeCtx<'_>,
+    name: &'static str,
+    args: &[Value],
+) -> Result<SmallVec<[Value; 4]>, NativeError> {
+    let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
+    if let Some(exec) = ctx.execution_context().cloned() {
+        let interp = ctx.interp_mut();
+        for slot in coerced.iter_mut() {
+            let n = interp
+                .coerce_to_number(&exec, slot)
+                .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
+            *slot = Value::number(n);
+        }
+    }
+    Ok(coerced)
+}
+
+/// Read `coerced[idx]` as `f64`; a missing slot falls back to the
+/// component-from-time value (§21.4.4.x "if X is present" branch).
+fn read_arg_number(args: &[Value], idx: usize, fallback: f64) -> f64 {
+    let Some(v) = args.get(idx) else {
         return fallback;
     };
-    if let Some(n) = v.as_number() {
-        n.as_f64()
-    } else if v.is_boolean() {
-        if v.as_boolean() == Some(true) {
-            1.0
-        } else {
-            0.0
-        }
-    } else if v.is_null() {
-        0.0
-    } else {
-        f64::NAN
-    }
+    primitive_to_number(v)
 }
 
-/// First-arg helper for `setX`-family methods. Spec treats the
-/// leading parameter as always-present (§21.4.4.x step 2 always
-/// runs `ToNumber(value)`), so a missing arg becomes
+/// First-arg helper. Spec treats the leading parameter as always
+/// present (`ToNumber(value)` always runs), so a missing arg becomes
 /// `ToNumber(undefined) = NaN` rather than the component fallback.
-fn read_primary_arg_number(args: &IntrinsicArgs<'_>) -> f64 {
-    let Some(v) = args.args.first() else {
+fn read_primary_arg_number(args: &[Value]) -> f64 {
+    let Some(v) = args.first() else {
         return f64::NAN;
     };
+    primitive_to_number(v)
+}
+
+fn primitive_to_number(v: &Value) -> f64 {
     if let Some(n) = v.as_number() {
         n.as_f64()
     } else if v.is_boolean() {
@@ -257,18 +304,7 @@ fn read_primary_arg_number(args: &IntrinsicArgs<'_>) -> f64 {
     }
 }
 
-/// §21.4.4.27 — `setTime(ms)`. Direct write, returns the time value.
-fn impl_set_time(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, _) = receiver_handle(args)?;
-    let ms = read_primary_arg_number(args);
-    object::set_date_data(obj, args.gc_heap, ms);
-    let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
-    Ok(Value::number_f64(written))
-}
-
-/// Broken-down components packaged as a 7-tuple for the setter
-/// closure pattern. Avoids needing to capture mutable component
-/// references across the `args` borrow.
+/// Broken-down components packaged as a 7-tuple for the setter pattern.
 type Components = (f64, f64, f64, f64, f64, f64, f64);
 
 fn current_components(time: f64) -> Components {
@@ -286,137 +322,188 @@ fn current_components(time: f64) -> Components {
     }
 }
 
-fn finish_set(
-    obj: JsObject,
-    args: &mut IntrinsicArgs<'_>,
-    c: Components,
-) -> Result<Value, IntrinsicError> {
+fn finish_set(obj: JsObject, ctx: &mut NativeCtx<'_>, c: Components) -> Result<Value, NativeError> {
     let (year, month, day, hour, minute, second, ms) = c;
     let new_ms = super::make_date(year, month, day, hour, minute, second, ms);
-    object::set_date_data(obj, args.gc_heap, new_ms);
-    let written = object::date_data(obj, args.gc_heap).unwrap_or(f64::NAN);
+    object::set_date_data(obj, ctx.heap_mut(), new_ms);
+    let written = object::date_data(obj, ctx.heap()).unwrap_or(f64::NAN);
     Ok(Value::number_f64(written))
 }
 
-fn impl_set_full_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
-    // §21.4.4.21 step 3 — `If t is NaN, set t to +0`. setFullYear is
-    // the rare setter that writes through an invalid Date; rebase
-    // components to the epoch so a NaN receiver becomes a real date.
+/// §21.4.4.27 — `setTime(ms)`. Direct write.
+fn set_time_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, _) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    let ms = read_primary_arg_number(&coerced);
+    object::set_date_data(obj, ctx.heap_mut(), ms);
+    let written = object::date_data(obj, ctx.heap()).unwrap_or(f64::NAN);
+    Ok(Value::number_f64(written))
+}
+
+/// §21.4.4.{20,38} `setFullYear` / `setUTCFullYear` — always writes
+/// through; a NaN receiver rebases to the epoch (step 3).
+fn set_full_year_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
     let base_time = if time.is_nan() { 0.0 } else { time };
     let mut c = current_components(base_time);
-    c.0 = read_primary_arg_number(args);
-    if args.args.len() >= 2 {
-        c.1 = read_arg_number(args, 1, c.1);
+    c.0 = read_primary_arg_number(&coerced);
+    if coerced.len() >= 2 {
+        c.1 = read_arg_number(&coerced, 1, c.1);
     }
-    if args.args.len() >= 3 {
-        c.2 = read_arg_number(args, 2, c.2);
+    if coerced.len() >= 3 {
+        c.2 = read_arg_number(&coerced, 2, c.2);
     }
-    finish_set(obj, args, c)
+    finish_set(obj, ctx, c)
 }
 
-fn impl_set_month(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
+/// §21.4.4.x component setters (`setMonth` … `setMilliseconds`) — step
+/// 8 returns NaN without writing when the captured time was NaN.
+fn set_month_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    if time.is_nan() {
+        return Ok(nan());
+    }
     let mut c = current_components(time);
-    c.1 = read_primary_arg_number(args);
-    if args.args.len() >= 2 {
-        c.2 = read_arg_number(args, 1, c.2);
+    c.1 = read_primary_arg_number(&coerced);
+    if coerced.len() >= 2 {
+        c.2 = read_arg_number(&coerced, 1, c.2);
     }
-    finish_set(obj, args, c)
+    finish_set(obj, ctx, c)
 }
 
-fn impl_set_date(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
+fn set_date_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    if time.is_nan() {
+        return Ok(nan());
+    }
     let mut c = current_components(time);
-    c.2 = read_primary_arg_number(args);
-    finish_set(obj, args, c)
+    c.2 = read_primary_arg_number(&coerced);
+    finish_set(obj, ctx, c)
 }
 
-fn impl_set_hours(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
+fn set_hours_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    if time.is_nan() {
+        return Ok(nan());
+    }
     let mut c = current_components(time);
-    c.3 = read_primary_arg_number(args);
-    if args.args.len() >= 2 {
-        c.4 = read_arg_number(args, 1, c.4);
+    c.3 = read_primary_arg_number(&coerced);
+    if coerced.len() >= 2 {
+        c.4 = read_arg_number(&coerced, 1, c.4);
     }
-    if args.args.len() >= 3 {
-        c.5 = read_arg_number(args, 2, c.5);
+    if coerced.len() >= 3 {
+        c.5 = read_arg_number(&coerced, 2, c.5);
     }
-    if args.args.len() >= 4 {
-        c.6 = read_arg_number(args, 3, c.6);
+    if coerced.len() >= 4 {
+        c.6 = read_arg_number(&coerced, 3, c.6);
     }
-    finish_set(obj, args, c)
+    finish_set(obj, ctx, c)
 }
 
-fn impl_set_minutes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
+fn set_minutes_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    if time.is_nan() {
+        return Ok(nan());
+    }
     let mut c = current_components(time);
-    c.4 = read_primary_arg_number(args);
-    if args.args.len() >= 2 {
-        c.5 = read_arg_number(args, 1, c.5);
+    c.4 = read_primary_arg_number(&coerced);
+    if coerced.len() >= 2 {
+        c.5 = read_arg_number(&coerced, 1, c.5);
     }
-    if args.args.len() >= 3 {
-        c.6 = read_arg_number(args, 2, c.6);
+    if coerced.len() >= 3 {
+        c.6 = read_arg_number(&coerced, 2, c.6);
     }
-    finish_set(obj, args, c)
+    finish_set(obj, ctx, c)
 }
 
-fn impl_set_seconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
+fn set_seconds_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    if time.is_nan() {
+        return Ok(nan());
+    }
     let mut c = current_components(time);
-    c.5 = read_primary_arg_number(args);
-    if args.args.len() >= 2 {
-        c.6 = read_arg_number(args, 1, c.6);
+    c.5 = read_primary_arg_number(&coerced);
+    if coerced.len() >= 2 {
+        c.6 = read_arg_number(&coerced, 1, c.6);
     }
-    finish_set(obj, args, c)
+    finish_set(obj, ctx, c)
 }
 
-fn impl_set_milliseconds(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
+fn set_milliseconds_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    if time.is_nan() {
+        return Ok(nan());
+    }
     let mut c = current_components(time);
-    c.6 = read_primary_arg_number(args);
-    finish_set(obj, args, c)
+    c.6 = read_primary_arg_number(&coerced);
+    finish_set(obj, ctx, c)
 }
 
-/// §B.2.4.1 — `Date.prototype.getYear()`. Returns
-/// `YearFromTime(LocalTime(t)) - 1900`, or `NaN` if the receiver's
-/// `[[DateValue]]` is `NaN`. The foundation treats LocalTime as
-/// UTC, mirroring the rest of the `getUTC*` / `get*` impls.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-date.prototype.getyear>
-fn impl_get_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let time = receiver_time(args)?;
+/// §B.2.4.1 — `Date.prototype.getYear()` returns `year - 1900`.
+fn get_year_impl(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let time = this_time(ctx, name)?;
     Ok(broken_down(time)
         .map(|bd| smi(bd.year - 1900))
         .unwrap_or_else(nan))
 }
 
 /// §B.2.4.2 — `Date.prototype.setYear(year)`.
-///
-/// 1. Let `t` be `thisTimeValue(this)`.
-/// 2. If `t` is `NaN`, set `t` to `+0`; otherwise `t = LocalTime(t)`.
-/// 3. Let `y` be `ToNumber(year)`.
-/// 4. If `y` is `NaN`, `[[DateValue]] = NaN`, return `NaN`.
-/// 5. If `y` is finite and `0 ≤ ToInteger(y) ≤ 99`,
-///    `yyyy = ToInteger(y) + 1900`.
-/// 6. Else `yyyy = y`.
-/// 7. `d = MakeDay(yyyy, MonthFromTime(t), DateFromTime(t))`.
-/// 8. `date = UTC(MakeDate(d, TimeWithinDay(t)))`.
-/// 9. `[[DateValue]] = TimeClip(date)`; return `TimeClip(date)`.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-date.prototype.setyear>
-fn impl_set_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let (obj, time) = receiver_handle(args)?;
-    let y = read_primary_arg_number(args);
+fn set_year_impl(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    name: &'static str,
+) -> Result<Value, NativeError> {
+    let (obj, time) = this_handle(ctx, name)?;
+    let coerced = coerce_set_args(ctx, name, args)?;
+    let y = read_primary_arg_number(&coerced);
     if y.is_nan() {
-        object::set_date_data(obj, args.gc_heap, f64::NAN);
+        object::set_date_data(obj, ctx.heap_mut(), f64::NAN);
         return Ok(Value::number_f64(f64::NAN));
     }
-    // §B.2.4.2 step 2: t = NaN → +0; else LocalTime(t) (== t under UTC).
     let base_time = if time.is_nan() { 0.0 } else { time };
-    // §B.2.4.2 step 5–6.
     let y_int = y.trunc();
     let yyyy = if (0.0..=99.0).contains(&y_int) {
         y_int + 1900.0
@@ -425,162 +512,21 @@ fn impl_set_year(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> 
     };
     let mut c = current_components(base_time);
     c.0 = yyyy;
-    finish_set(obj, args, c)
+    finish_set(obj, ctx, c)
 }
 
-/// Declarative `Date.prototype` table. Local-time getters share
-/// the UTC implementations.
-pub static DATE_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            Date,
-            "getTime"             / 0 => impl_get_time,
-            "valueOf"             / 0 => impl_get_time,
-            "getFullYear"         / 0 => impl_get_full_year,
-            "getUTCFullYear"      / 0 => impl_get_full_year,
-            "getMonth"            / 0 => impl_get_month,
-            "getUTCMonth"         / 0 => impl_get_month,
-            "getDate"             / 0 => impl_get_date,
-            "getUTCDate"          / 0 => impl_get_date,
-            "getDay"              / 0 => impl_get_day,
-            "getUTCDay"           / 0 => impl_get_day,
-            "getHours"            / 0 => impl_get_hours,
-            "getUTCHours"         / 0 => impl_get_hours,
-            "getMinutes"          / 0 => impl_get_minutes,
-            "getUTCMinutes"       / 0 => impl_get_minutes,
-            "getSeconds"          / 0 => impl_get_seconds,
-            "getUTCSeconds"       / 0 => impl_get_seconds,
-            "getMilliseconds"     / 0 => impl_get_milliseconds,
-            "getUTCMilliseconds"  / 0 => impl_get_milliseconds,
-            "getTimezoneOffset"   / 0 => impl_get_timezone_offset,
-            "toISOString"         / 0 => impl_to_iso_string,
-            "toJSON"              / 0 => impl_to_json,
-            "toTemporalInstant"   / 0 => impl_to_temporal_instant,
-            "toString"            / 0 => impl_to_string,
-            "toUTCString"         / 0 => impl_to_string,
-            "toGMTString"         / 0 => impl_to_string,
-            "toDateString"        / 0 => impl_to_date_string,
-            "toTimeString"        / 0 => impl_to_time_string,
-            "toLocaleString"      / 0 => impl_to_string,
-            "toLocaleDateString"  / 0 => impl_to_date_string,
-            "toLocaleTimeString"  / 0 => impl_to_time_string,
-            "setTime"             / 1 => impl_set_time,
-            "setFullYear"         / 3 => impl_set_full_year,
-            "setUTCFullYear"      / 3 => impl_set_full_year,
-            "setMonth"            / 2 => impl_set_month,
-            "setUTCMonth"         / 2 => impl_set_month,
-            "setDate"             / 1 => impl_set_date,
-            "setUTCDate"          / 1 => impl_set_date,
-            "setHours"            / 4 => impl_set_hours,
-            "setUTCHours"         / 4 => impl_set_hours,
-            "setMinutes"          / 3 => impl_set_minutes,
-            "setUTCMinutes"       / 3 => impl_set_minutes,
-            "setSeconds"          / 2 => impl_set_seconds,
-            "setUTCSeconds"       / 2 => impl_set_seconds,
-            "setMilliseconds"     / 1 => impl_set_milliseconds,
-            "setUTCMilliseconds"  / 1 => impl_set_milliseconds,
-            "getYear"             / 0 => impl_get_year,
-            "setYear"             / 1 => impl_set_year,
-        )
-    });
-
-/// Convenience accessor used by the dispatcher.
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    DATE_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Date, name)
-}
-
-/// Generic bridge that exposes a `Date.prototype.<name>` intrinsic
-/// as a JS-visible NativeFunction so user code reading the property
-/// directly (`const f = d.getTime; f.call(d)`) resolves to a real
-/// callable. The compiler's `CallDate` fast path keeps using the
-/// table directly.
-fn native_date_method(
-    name: &'static str,
-    ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-) -> Result<Value, NativeError> {
-    let receiver = *ctx.this_value();
-    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
-        name,
-        reason: "unknown Date.prototype method".to_string(),
-    })?;
-    // §21.4.4.x `Date.prototype.set*` — capture `t` from `[[DateValue]]`
-    // (step 3) before running `ToNumber` on the arguments in declaration
-    // order (steps 4–7); a `valueOf` callback may mutate `[[DateValue]]`
-    // via `setTime`, but the NaN check (step 8) and component math run on
-    // the captured value, and the intrinsic's final assignment overwrites
-    // any in-callback mutation. The context-free impl cannot re-enter, so
-    // the coercion happens here with a live interpreter handle.
-    let mut coerced: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    if name.starts_with("set")
-        && let Some(obj) = receiver.as_object()
-        && let Some(captured_t) = object::date_data(obj, ctx.heap())
-    {
-        if let Some(exec) = ctx.execution_context().cloned() {
-            let interp = ctx.interp_mut();
-            for slot in coerced.iter_mut() {
-                let n = interp
-                    .coerce_to_number(&exec, slot)
-                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
-                *slot = Value::number(n);
-            }
-        }
-        // §21.4.4.{20..36} step 8 — the component setters return NaN
-        // without writing when the captured time was NaN; `setFullYear`
-        // / `setUTCFullYear` / `setTime` / Annex B `setYear` always write
-        // through and fall to the normal restore-and-dispatch path.
-        let nan_preserving = matches!(
-            name,
-            "setMonth"
-                | "setUTCMonth"
-                | "setDate"
-                | "setUTCDate"
-                | "setHours"
-                | "setUTCHours"
-                | "setMinutes"
-                | "setUTCMinutes"
-                | "setSeconds"
-                | "setUTCSeconds"
-                | "setMilliseconds"
-                | "setUTCMilliseconds"
-        );
-        if captured_t.is_nan() && nan_preserving {
-            return Ok(Value::number_f64(f64::NAN));
-        }
-        object::set_date_data(obj, ctx.heap_mut(), captured_t);
-    }
-    let allocation_roots = ctx.collect_native_roots();
-    (entry.impl_fn)(&mut IntrinsicArgs {
-        receiver: &receiver,
-        args: &coerced,
-        gc_heap: ctx.heap_mut(),
-        allocation_roots: allocation_roots.as_slice(),
-    })
-    .map_err(|err| match err {
-        IntrinsicError::OutOfRange { .. } => NativeError::RangeError {
-            name,
-            reason: err.to_string(),
-        },
-        _ => NativeError::TypeError {
-            name,
-            reason: err.to_string(),
-        },
-    })
-}
-
-/// Per-method trampoline + spec-table entry generator. Same shape as
-/// the `string_prototype_methods!` macro in `crate::string::prototype`.
+/// Generates a thin `bridge_*` native per JS method name (binding the
+/// name to a shared `*_impl` body) plus the installed `MethodSpec` list.
 macro_rules! date_prototype_methods {
-    ($($bridge:ident => $name:literal, $length:literal;)*) => {
+    ($($bridge:ident => $imp:ident, $name:literal, $length:literal;)*) => {
         $(
             fn $bridge(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-                native_date_method($name, ctx, args)
+                $imp(ctx, args, $name)
             }
         )*
 
-        /// Declarative `Date.prototype` method specs installed as
-        /// JS-visible own properties during the `Date` bootstrap.
+        /// Method specs installed as JS-visible own properties on
+        /// `Date.prototype` during the `Date` bootstrap.
         pub static DATE_PROTOTYPE_METHODS: &[MethodSpec] = &[
             $(MethodSpec {
                 name: $name,
@@ -593,52 +539,52 @@ macro_rules! date_prototype_methods {
 }
 
 date_prototype_methods!(
-    bridge_get_time              => "getTime",             0;
-    bridge_value_of              => "valueOf",             0;
-    bridge_get_full_year         => "getFullYear",         0;
-    bridge_get_utc_full_year     => "getUTCFullYear",      0;
-    bridge_get_month             => "getMonth",            0;
-    bridge_get_utc_month         => "getUTCMonth",         0;
-    bridge_get_date              => "getDate",             0;
-    bridge_get_utc_date          => "getUTCDate",          0;
-    bridge_get_day               => "getDay",              0;
-    bridge_get_utc_day           => "getUTCDay",           0;
-    bridge_get_hours             => "getHours",            0;
-    bridge_get_utc_hours         => "getUTCHours",         0;
-    bridge_get_minutes           => "getMinutes",          0;
-    bridge_get_utc_minutes       => "getUTCMinutes",       0;
-    bridge_get_seconds           => "getSeconds",          0;
-    bridge_get_utc_seconds       => "getUTCSeconds",       0;
-    bridge_get_milliseconds      => "getMilliseconds",     0;
-    bridge_get_utc_milliseconds  => "getUTCMilliseconds",  0;
-    bridge_get_timezone_offset   => "getTimezoneOffset",   0;
-    bridge_to_iso_string         => "toISOString",         0;
-    bridge_to_temporal_instant   => "toTemporalInstant",   0;
-    bridge_to_string             => "toString",            0;
-    bridge_to_utc_string         => "toUTCString",         0;
-    bridge_to_gmt_string         => "toGMTString",         0;
-    bridge_to_date_string        => "toDateString",        0;
-    bridge_to_time_string        => "toTimeString",        0;
-    bridge_to_locale_string      => "toLocaleString",      0;
-    bridge_to_locale_date_string => "toLocaleDateString",  0;
-    bridge_to_locale_time_string => "toLocaleTimeString",  0;
-    bridge_set_time              => "setTime",             1;
-    bridge_set_full_year         => "setFullYear",         3;
-    bridge_set_utc_full_year     => "setUTCFullYear",      3;
-    bridge_set_month             => "setMonth",            2;
-    bridge_set_utc_month         => "setUTCMonth",         2;
-    bridge_set_date              => "setDate",             1;
-    bridge_set_utc_date          => "setUTCDate",          1;
-    bridge_set_hours             => "setHours",            4;
-    bridge_set_utc_hours         => "setUTCHours",         4;
-    bridge_set_minutes           => "setMinutes",          3;
-    bridge_set_utc_minutes       => "setUTCMinutes",       3;
-    bridge_set_seconds           => "setSeconds",          2;
-    bridge_set_utc_seconds       => "setUTCSeconds",       2;
-    bridge_set_milliseconds      => "setMilliseconds",     1;
-    bridge_set_utc_milliseconds  => "setUTCMilliseconds",  1;
-    bridge_get_year              => "getYear",             0;
-    bridge_set_year              => "setYear",             1;
+    bridge_get_time              => get_time_impl,             "getTime",             0;
+    bridge_value_of              => get_time_impl,             "valueOf",             0;
+    bridge_get_full_year         => get_full_year_impl,        "getFullYear",         0;
+    bridge_get_utc_full_year     => get_full_year_impl,        "getUTCFullYear",      0;
+    bridge_get_month             => get_month_impl,            "getMonth",            0;
+    bridge_get_utc_month         => get_month_impl,            "getUTCMonth",         0;
+    bridge_get_date              => get_date_impl,             "getDate",             0;
+    bridge_get_utc_date          => get_date_impl,             "getUTCDate",          0;
+    bridge_get_day               => get_day_impl,              "getDay",              0;
+    bridge_get_utc_day           => get_day_impl,              "getUTCDay",           0;
+    bridge_get_hours             => get_hours_impl,            "getHours",            0;
+    bridge_get_utc_hours         => get_hours_impl,            "getUTCHours",         0;
+    bridge_get_minutes           => get_minutes_impl,          "getMinutes",          0;
+    bridge_get_utc_minutes       => get_minutes_impl,          "getUTCMinutes",       0;
+    bridge_get_seconds           => get_seconds_impl,          "getSeconds",          0;
+    bridge_get_utc_seconds       => get_seconds_impl,          "getUTCSeconds",       0;
+    bridge_get_milliseconds      => get_milliseconds_impl,     "getMilliseconds",     0;
+    bridge_get_utc_milliseconds  => get_milliseconds_impl,     "getUTCMilliseconds",  0;
+    bridge_get_timezone_offset   => get_timezone_offset_impl,  "getTimezoneOffset",   0;
+    bridge_to_iso_string         => to_iso_string_impl,        "toISOString",         0;
+    bridge_to_temporal_instant   => to_temporal_instant_impl,  "toTemporalInstant",   0;
+    bridge_to_string             => to_string_impl,            "toString",            0;
+    bridge_to_utc_string         => to_string_impl,            "toUTCString",         0;
+    bridge_to_gmt_string         => to_string_impl,            "toGMTString",         0;
+    bridge_to_date_string        => to_date_string_impl,       "toDateString",        0;
+    bridge_to_time_string        => to_time_string_impl,       "toTimeString",        0;
+    bridge_to_locale_string      => to_string_impl,            "toLocaleString",      0;
+    bridge_to_locale_date_string => to_date_string_impl,       "toLocaleDateString",  0;
+    bridge_to_locale_time_string => to_time_string_impl,       "toLocaleTimeString",  0;
+    bridge_set_time              => set_time_impl,             "setTime",             1;
+    bridge_set_full_year         => set_full_year_impl,        "setFullYear",         3;
+    bridge_set_utc_full_year     => set_full_year_impl,        "setUTCFullYear",      3;
+    bridge_set_month             => set_month_impl,            "setMonth",            2;
+    bridge_set_utc_month         => set_month_impl,            "setUTCMonth",         2;
+    bridge_set_date              => set_date_impl,             "setDate",             1;
+    bridge_set_utc_date          => set_date_impl,             "setUTCDate",          1;
+    bridge_set_hours             => set_hours_impl,            "setHours",            4;
+    bridge_set_utc_hours         => set_hours_impl,            "setUTCHours",         4;
+    bridge_set_minutes           => set_minutes_impl,          "setMinutes",          3;
+    bridge_set_utc_minutes       => set_minutes_impl,          "setUTCMinutes",       3;
+    bridge_set_seconds           => set_seconds_impl,          "setSeconds",          2;
+    bridge_set_utc_seconds       => set_seconds_impl,          "setUTCSeconds",       2;
+    bridge_set_milliseconds      => set_milliseconds_impl,     "setMilliseconds",     1;
+    bridge_set_utc_milliseconds  => set_milliseconds_impl,     "setUTCMilliseconds",  1;
+    bridge_get_year              => get_year_impl,             "getYear",             0;
+    bridge_set_year              => set_year_impl,             "setYear",             1;
 );
 
 /// §21.4.4.41 — generic `Date.prototype.toJSON(key)`.
@@ -648,12 +594,10 @@ date_prototype_methods!(
 /// 3. If `tv` is a Number and `tv` is not finite, return `null`.
 /// 4. Return `? Invoke(O, "toISOString")`.
 ///
-/// The implementation routes coercion through
-/// [`Interpreter::evaluate_to_primitive`] (so user-installed
-/// `@@toPrimitive` / `valueOf` / `toString` overrides fire per spec)
-/// and re-enters the interpreter to call `toISOString` so subclass
-/// overrides and primitive wrappers (`Number.prototype.toISOString`,
-/// `Symbol.prototype.toISOString`) are observable.
+/// Coercion routes through [`Interpreter::evaluate_to_primitive`] (so a
+/// user `@@toPrimitive` / `valueOf` / `toString` fires) and re-enters
+/// the interpreter to call `toISOString` so subclass overrides and
+/// primitive wrappers are observable.
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-date.prototype.tojson>
@@ -692,9 +636,6 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         || receiver.is_string()
         || receiver.is_symbol();
     let method = if receiver_is_primitive {
-        // Primitive: walk the per-realm wrapper prototype so
-        // `Number.prototype.toISOString` / similar resolve, but
-        // pass the primitive as the observable `this`.
         let proto = interp
             .intrinsic_prototype_object_for(&receiver)
             .ok_or_else(|| NativeError::TypeError {
@@ -735,9 +676,8 @@ fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
         .map_err(|err| vm_to_native(NAME, err))
 }
 
-/// `VmError → NativeError` mapper used by the generic `toJSON` bridge.
-/// Preserves user-thrown values via `NativeError::Thrown` so the
-/// outer runtime mapper rebuilds the original JS exception payload.
+/// `VmError → NativeError` mapper for the generic `toJSON` bridge.
+/// Preserves user-thrown values via `NativeError::Thrown`.
 fn vm_to_native(name: &'static str, err: VmError) -> NativeError {
     match err {
         VmError::Uncaught { value } => NativeError::Thrown {
@@ -759,12 +699,25 @@ fn vm_to_native(name: &'static str, err: VmError) -> NativeError {
     }
 }
 
-/// Extra method specs that need the full interpreter entry path
-/// (cannot be expressed through the
-/// [`IntrinsicArgs`]-based `native_date_method` bridge).
+/// Extra method specs that re-enter the full interpreter entry path.
 pub static DATE_PROTOTYPE_EXTRA_METHODS: &[MethodSpec] = &[MethodSpec {
     name: "toJSON",
     length: 1,
     attrs: Attr::builtin_function(),
     call: NativeCall::Static(date_prototype_to_json),
 }];
+
+static DATE_METHOD_NAMES: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        DATE_PROTOTYPE_METHODS
+            .iter()
+            .chain(DATE_PROTOTYPE_EXTRA_METHODS)
+            .map(|m| m.name)
+            .collect()
+    });
+
+/// Whether `name` is an installed `Date.prototype` method.
+#[must_use]
+pub fn is_builtin_method(name: &str) -> bool {
+    DATE_METHOD_NAMES.contains(name)
+}

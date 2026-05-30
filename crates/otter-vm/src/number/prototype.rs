@@ -186,7 +186,10 @@ fn to_string_radix(
         )?));
     }
     let rendered = super::dragon4::number_to_string_radix(recv.as_f64(), radix);
-    Ok(Value::string(JsString::from_str(&rendered, ctx.heap_mut())?))
+    Ok(Value::string(JsString::from_str(
+        &rendered,
+        ctx.heap_mut(),
+    )?))
 }
 
 fn number_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -313,6 +316,12 @@ pub static NUMBER_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("toLocaleString", 0, number_to_locale_string),
     method("valueOf", 0, number_value_of),
 ];
+
+/// Whether `name` is an installed `Number.prototype` method.
+#[must_use]
+pub fn is_builtin_method(name: &str) -> bool {
+    NUMBER_PROTOTYPE_METHODS.iter().any(|m| m.name == name)
+}
 
 const fn method(
     name: &'static str,

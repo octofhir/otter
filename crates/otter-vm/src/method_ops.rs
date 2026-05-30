@@ -544,7 +544,8 @@ impl Interpreter {
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
-        if recv_value.as_native_function().is_some() && object_prototype_dispatch_method_name(name) {
+        if recv_value.as_native_function().is_some() && object_prototype_dispatch_method_name(name)
+        {
             let method = self.ordinary_method_value_for_call(context, recv_value, name)?;
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
@@ -623,14 +624,10 @@ impl Interpreter {
             return string_prototype::lookup(name).is_some();
         }
         if recv_value.is_number() {
-            return number::prototype::NUMBER_PROTOTYPE_METHODS
-                .iter()
-                .any(|m| m.name == name);
+            return number::prototype::is_builtin_method(name);
         }
         if recv_value.is_boolean() {
-            return boolean_prototype::BOOLEAN_PROTOTYPE_METHODS
-                .iter()
-                .any(|m| m.name == name);
+            return boolean_prototype::is_builtin_method(name);
         }
         if recv_value.is_big_int() {
             return bigint::prototype::lookup(name).is_some();
@@ -672,7 +669,7 @@ impl Interpreter {
             .as_object()
             .is_some_and(|o| crate::object::date_data(o, &self.gc_heap).is_some())
         {
-            return date::prototype::lookup(name).is_some();
+            return date::prototype::is_builtin_method(name);
         }
         false
     }

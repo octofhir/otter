@@ -696,7 +696,7 @@ impl Interpreter {
             return bigint::prototype::lookup(name).is_some();
         }
         if recv_value.is_symbol() {
-            return symbol_prototype::lookup(name).is_some();
+            return symbol_prototype::is_builtin_method(name);
         }
         if recv_value.is_regexp() {
             return regexp_prototype::lookup(name).is_some();

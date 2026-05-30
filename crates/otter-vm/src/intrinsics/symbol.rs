@@ -30,10 +30,7 @@ otter_macros::couch! {
         "keyFor" / 1 => symbol_key_for_call,
     },
     prototype = {
-        methods = {
-            "toString" / 0 => symbol_proto_to_string,
-            "valueOf"  / 0 => symbol_proto_value_of,
-        },
+        method_specs = [crate::symbol_prototype::SYMBOL_PROTOTYPE_METHODS],
         accessors = [
             ("description", get = symbol_proto_description_get),
         ],
@@ -163,54 +160,6 @@ fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
         }
         None => Ok(Value::undefined()),
     }
-}
-
-// ---------------------------------------------------------------
-// Prototype methods
-// ---------------------------------------------------------------
-
-fn symbol_proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let this = *ctx.this_value();
-    let sym = if let Some(sym) = this.as_symbol(ctx.heap()) {
-        sym
-    } else if let Some(obj) = this.as_object() {
-        let heap = ctx.interp_mut().gc_heap();
-        crate::object::symbol_data(obj, heap).ok_or_else(|| NativeError::TypeError {
-            name: "Symbol.prototype.toString",
-            reason: "this is not a Symbol".to_string(),
-        })?
-    } else {
-        return Err(NativeError::TypeError {
-            name: "Symbol.prototype.toString",
-            reason: "this is not a Symbol".to_string(),
-        });
-    };
-    let s = crate::string::JsString::from_str(&sym.descriptive_string(ctx.heap()), ctx.heap_mut())
-        .map_err(|_| NativeError::TypeError {
-            name: "Symbol.prototype.toString",
-            reason: "out of memory".to_string(),
-        })?;
-    Ok(Value::string(s))
-}
-
-fn symbol_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let this = *ctx.this_value();
-    if let Some(sym) = this.as_symbol(ctx.heap()) {
-        return Ok(Value::symbol(sym));
-    }
-    if let Some(obj) = this.as_object() {
-        let heap = ctx.interp_mut().gc_heap();
-        return crate::object::symbol_data(obj, heap)
-            .map(Value::symbol)
-            .ok_or_else(|| NativeError::TypeError {
-                name: "Symbol.prototype.valueOf",
-                reason: "this is not a Symbol".to_string(),
-            });
-    }
-    Err(NativeError::TypeError {
-        name: "Symbol.prototype.valueOf",
-        reason: "this is not a Symbol".to_string(),
-    })
 }
 
 fn symbol_proto_description_get(

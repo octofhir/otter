@@ -1,54 +1,86 @@
-//! `Symbol.prototype.*` intrinsic implementations.
+//! `Symbol.prototype.*` native implementations.
 //!
-//! The methods exposed here are invoked through
-//! [`Op::CallMethodValue`](otter_bytecode::Op::CallMethodValue) when
-//! the receiver is a [`Value::Symbol`]; see
-//! [`crate::intrinsics::IntrinsicReceiver::Symbol`].
+//! The methods exposed here are installed on the realm
+//! `Symbol.prototype` as NativeCtx natives. Primitive symbol method
+//! calls front-run through `method_ops` only to decide whether the
+//! prototype lookup should be attempted; invocation still uses
+//! §7.3.11 `GetMethod` + §7.3.14 `Call`.
 //!
 //! # Contents
-//! - [`SYMBOL_PROTOTYPE_TABLE`] — declarative method registry.
+//! - [`SYMBOL_PROTOTYPE_METHODS`] — native method specs installed on
+//!   the global `Symbol.prototype`.
 //! - [`load_property`] — accessor reads (`description`).
-//! - [`lookup`] — convenience for the dispatcher.
 //!
 //! # Invariants
-//! - Receivers must be [`Value::Symbol`]; the foundation does not
-//!   wrap symbols in a Symbol object yet, so all methods reject
-//!   non-symbol receivers up-front.
-//! - Methods return primitive [`Value`]s; nothing here allocates a
-//!   wrapper object.
+//! - Receivers must be primitive symbols or Symbol wrapper objects.
+//! - Methods return primitive [`Value`]s.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-symbol-prototype-object>
 
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
+use crate::js_surface::{Attr, MethodSpec};
 use crate::string::JsString;
-use crate::{JsSymbol, Value};
+use crate::{JsSymbol, NativeCall, NativeCtx, NativeError, Value};
 
-fn receiver_symbol(args: &IntrinsicArgs<'_>) -> Result<JsSymbol, IntrinsicError> {
-    args.receiver
-        .as_symbol(args.gc_heap)
-        .ok_or(IntrinsicError::BadReceiver { expected: "symbol" })
+/// Native `Symbol.prototype` method specs.
+pub static SYMBOL_PROTOTYPE_METHODS: &[MethodSpec] = &[
+    method("toString", 0, symbol_to_string),
+    method("valueOf", 0, symbol_value_of),
+];
+
+const fn method(
+    name: &'static str,
+    length: u8,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+) -> MethodSpec {
+    MethodSpec {
+        name,
+        length,
+        attrs: Attr::builtin_function(),
+        call: NativeCall::Static(call),
+    }
 }
 
-/// `Symbol.prototype.toString` — Spec §20.4.3.3. Returns
-/// `"Symbol(<desc>)"`, with no description rendered as `"Symbol()"`.
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let sym = receiver_symbol(args)?;
-    let s = JsString::from_str(&sym.descriptive_string(args.gc_heap), args.gc_heap)?;
+/// `true` when `name` is installed on `Symbol.prototype`.
+#[must_use]
+pub fn is_builtin_method(name: &str) -> bool {
+    SYMBOL_PROTOTYPE_METHODS
+        .iter()
+        .any(|method| method.name == name)
+}
+
+fn this_symbol_value(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsSymbol, NativeError> {
+    let this = *ctx.this_value();
+    if let Some(sym) = this.as_symbol(ctx.heap()) {
+        return Ok(sym);
+    }
+    if let Some(obj) = this.as_object()
+        && let Some(sym) = crate::object::symbol_data(obj, ctx.heap())
+    {
+        return Ok(sym);
+    }
+    Err(NativeError::TypeError {
+        name,
+        reason: "this is not a Symbol".to_string(),
+    })
+}
+
+/// §20.4.3.3 `Symbol.prototype.toString`.
+fn symbol_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let sym = this_symbol_value(ctx, "Symbol.prototype.toString")?;
+    let s =
+        JsString::from_str(&sym.descriptive_string(ctx.heap()), ctx.heap_mut()).map_err(|_| {
+            NativeError::TypeError {
+                name: "Symbol.prototype.toString",
+                reason: "out of memory".to_string(),
+            }
+        })?;
     Ok(Value::string(s))
 }
 
-/// `Symbol.prototype.valueOf` — Spec §20.4.3.4. Returns the
-/// receiver symbol primitive.
-fn impl_value_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let sym = receiver_symbol(args)?;
-    Ok(Value::symbol(sym))
-}
-
-/// `Symbol.prototype[@@toPrimitive]` — Spec §20.4.3.5. The hint is
-/// ignored; the symbol primitive is returned for every hint.
-fn impl_to_primitive(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let sym = receiver_symbol(args)?;
+/// §20.4.3.4 `Symbol.prototype.valueOf`.
+fn symbol_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let sym = this_symbol_value(ctx, "Symbol.prototype.valueOf")?;
     Ok(Value::symbol(sym))
 }
 
@@ -73,46 +105,9 @@ pub fn load_property(sym: JsSymbol, name: &str) -> Value {
     }
 }
 
-/// Declarative `Symbol.prototype` table.
-pub static SYMBOL_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            Symbol,
-            "toString" / 0 => impl_to_string,
-            "valueOf"  / 0 => impl_value_of,
-            // The well-known method exposes the Symbol body through
-            // both the primitive name `[Symbol.toPrimitive]` and the
-            // descriptive string (which a literal `"Symbol(@@toPrimitive)"`
-            // member access would yield) — see test fixtures.
-            "@@toPrimitive" / 1 => impl_to_primitive,
-        )
-    });
-
-/// Convenience accessor used by the dispatcher.
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    SYMBOL_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Symbol, name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn to_string_renders_descriptive_form() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let desc = JsString::from_str("ok", &mut gc_heap).unwrap();
-        let sym = JsSymbol::new(&mut gc_heap, Some(desc)).unwrap();
-        let entry = lookup("toString").unwrap();
-        let result = (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &Value::symbol(sym),
-            args: &[],
-            gc_heap: &mut gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap();
-        assert_eq!(result.display_string(&gc_heap), "Symbol(ok)");
-    }
 
     #[test]
     fn description_accessor() {

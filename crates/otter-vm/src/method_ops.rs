@@ -27,7 +27,9 @@ use crate::{
     NumberValue, Value, VmError, VmGetOutcome, VmPropertyKey, bigint,
     boolean::prototype as boolean_prototype,
     bootstrap_collections, build_array_cb_args, collections_prototype, date, descriptor_value,
-    function_metadata, number,
+    function_metadata,
+    native_function::VmIntrinsicFunction,
+    number,
     operand_decode::{const_operand, register_operand},
     promise_dispatch, read_register, regexp_prototype, require_callable,
     string::prototype as string_prototype,
@@ -72,6 +74,35 @@ fn object_prototype_dispatch_method_name(name: &str) -> bool {
         name,
         "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf" | "toString" | "valueOf"
     )
+}
+
+fn function_prototype_intrinsic_name(name: &str) -> bool {
+    matches!(name, "call" | "apply" | "bind" | "toString")
+}
+
+fn function_prototype_intrinsic(name: &str) -> VmIntrinsicFunction {
+    match name {
+        "call" => VmIntrinsicFunction::FunctionPrototypeCall,
+        "apply" => VmIntrinsicFunction::FunctionPrototypeApply,
+        "bind" => VmIntrinsicFunction::FunctionPrototypeBind,
+        "toString" => VmIntrinsicFunction::FunctionPrototypeToString,
+        _ => unreachable!("guarded by function_prototype_intrinsic_name"),
+    }
+}
+
+fn is_function_prototype_intrinsic_value(
+    value: Value,
+    heap: &otter_gc::GcHeap,
+    intrinsic: VmIntrinsicFunction,
+) -> bool {
+    value
+        .as_native_function()
+        .is_some_and(|native| native.is_vm_intrinsic(heap, intrinsic))
+        || value
+            .as_object()
+            .and_then(|obj| crate::object::call_native(obj, heap))
+            .and_then(|native_value| native_value.as_native_function())
+            .is_some_and(|native| native.is_vm_intrinsic(heap, intrinsic))
 }
 
 impl Interpreter {
@@ -586,9 +617,41 @@ impl Interpreter {
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
         }
 
+        if self.is_callable_runtime(&recv_value)
+            && !recv_value.is_proxy()
+            && function_prototype_intrinsic_name(name)
+            && !self.callable_has_own_function_method_shadow(context, recv_value, name)?
+        {
+            return self.dispatch_function_method(
+                stack,
+                context,
+                &recv_value,
+                name,
+                arg_values,
+                dst,
+            );
+        }
+
         if let Some(method) = self.get_method_value_for_call(context, stack, recv_value, name)? {
             if !self.is_callable_runtime(&method) {
                 return Err(VmError::NotCallable);
+            }
+            if self.is_callable_runtime(&recv_value)
+                && function_prototype_intrinsic_name(name)
+                && is_function_prototype_intrinsic_value(
+                    method,
+                    &self.gc_heap,
+                    function_prototype_intrinsic(name),
+                )
+            {
+                return self.dispatch_function_method(
+                    stack,
+                    context,
+                    &recv_value,
+                    name,
+                    arg_values,
+                    dst,
+                );
             }
             stack[top_idx].advance_pc(self.current_byte_len)?;
             return self.invoke(stack, context, &method, recv_value, arg_values, dst);
@@ -663,6 +726,43 @@ impl Interpreter {
             return date::prototype::is_builtin_method(name);
         }
         false
+    }
+
+    fn callable_has_own_function_method_shadow(
+        &mut self,
+        context: &ExecutionContext,
+        recv_value: Value,
+        name: &str,
+    ) -> Result<bool, VmError> {
+        if let Some(function_id) = recv_value.as_function().or_else(|| {
+            recv_value
+                .as_closure(&self.gc_heap)
+                .map(|c| c.cached_function_id)
+        }) {
+            return self.ordinary_function_has_own_string_property_for_extensibility(
+                context,
+                function_id,
+                name,
+            );
+        }
+        if let Some(native) = recv_value.as_native_function() {
+            return Ok(native
+                .own_property_descriptor(&mut self.gc_heap, name)
+                .ok()
+                .flatten()
+                .is_some());
+        }
+        if let Some(bound) = recv_value.as_bound_function() {
+            return Ok(crate::function_metadata::bound_has_own_property(
+                &bound,
+                &self.gc_heap,
+                name,
+            ));
+        }
+        if let Some(obj) = recv_value.as_object() {
+            return Ok(crate::object::get_own_descriptor(obj, &self.gc_heap, name).is_some());
+        }
+        Ok(false)
     }
 
     fn ordinary_method_value_for_call(

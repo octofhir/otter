@@ -603,6 +603,19 @@ impl Interpreter {
         context: &ExecutionContext,
         value: Value,
     ) -> Result<SmallVec<[Value; 8]>, VmError> {
+        if let Some(arr) = value.as_array() {
+            // §7.3.18 step 4-5 — substitute holes with `undefined`.
+            return Ok(crate::array::with_elements(
+                arr,
+                &self.gc_heap,
+                |elements| {
+                    elements
+                        .iter()
+                        .map(|v| if v.is_hole() { Value::undefined() } else { *v })
+                        .collect()
+                },
+            ));
+        }
         // §7.3.18 — `Type(obj) must be Object`. Cover every shape
         // the VM models as a JS Object: ordinary objects, arrays,
         // proxies, every callable variant (so `Reflect.apply(fn,

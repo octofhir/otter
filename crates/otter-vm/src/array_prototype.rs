@@ -1,20 +1,19 @@
-//! `Array.prototype.*` intrinsic table and interpreter-aware drivers.
+//! `Array.prototype.*` interpreter-aware drivers.
 //!
-//! The legacy [`IntrinsicArgs`] table remains as the context-free
-//! fallback for simple methods. Methods whose algorithms observe user
-//! code (`Get`, `Set`, `LengthOfArrayLike`, species constructors,
-//! callbacks, comparators, or coercions) are routed through re-entrant
-//! `Interpreter::array_*` drivers so direct `arr.m()` calls and
-//! `Array.prototype.m.call(...)` share one implementation.
+//! Every `Array.prototype` method is a [`NativeCtx`] native that
+//! re-enters the matching `Interpreter::array_*` driver, so direct
+//! `arr.m()` calls and `Array.prototype.m.call(...)` share one
+//! implementation. The drivers run the spec algorithms with live VM
+//! property operations (`Get`, `Set`, `LengthOfArrayLike`, species
+//! constructors, callbacks, comparators, coercions).
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-array-prototype-object>
 //! - `docs/method-dispatch-refactor.md`
 //!
 //! # Contents
-//! - [`ARRAY_PROTOTYPE_TABLE`] — declarative registry built with
-//!   the `intrinsics!` macro for the fallback path.
 //! - [`ARRAY_PROTOTYPE_METHODS`] — JS-visible native method specs.
+//! - `native_array_method` — null/undefined guard then driver dispatch.
 //! - `Interpreter::array_*` drivers for live generic Array semantics.
 //!
 //! # Invariants
@@ -29,34 +28,12 @@
 use smallvec::SmallVec;
 
 use crate::Value;
-use crate::array::{self, JsArray};
-use crate::intrinsics::{IntrinsicArgs, IntrinsicError, IntrinsicReceiver, IntrinsicTable};
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
 use crate::number::NumberValue;
 use crate::object::{self, PartialPropertyDescriptor};
 use crate::string::JsString;
 use crate::symbol::{WellKnown, WellKnownSymbols};
 use crate::{ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, VmError};
-
-fn receiver_array(args: &IntrinsicArgs<'_>) -> Result<JsArray, IntrinsicError> {
-    args.receiver
-        .as_array()
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-/// §22.1.3 LengthOfArrayLike dispatch for the dense-Array fast path /
-/// generic Object array-like fallback. Returns
-/// `BadReceiver { expected: "array" }` for non-Array / non-Object
-/// receivers.
-fn array_or_object_length(args: &IntrinsicArgs<'_>) -> Result<usize, IntrinsicError> {
-    if let Some(arr) = args.receiver.as_array() {
-        return Ok(array::len(arr, &*args.gc_heap));
-    }
-    if args.receiver.is_object() {
-        return Ok(array_like_length(args.receiver, &*args.gc_heap));
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
 
 /// Defensive upper bound on the materialised length of an
 /// array-like Object receiver before we'd refuse to expand a
@@ -74,1683 +51,7 @@ const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
 const MAX_SPARSE_PREFIX_PROBE_LEN: usize = 1024;
 const MAX_SAFE_ARRAY_LENGTH: usize = 9_007_199_254_740_991;
 
-/// §7.3.18 LengthOfArrayLike — read `O.length`, ToLength-coerce,
-/// clamp to [`MAX_ARRAY_LIKE_PROBE_LEN`].
-fn read_array_like_length(obj: crate::object::JsObject, heap: &otter_gc::GcHeap) -> usize {
-    let len_val = crate::object::get(obj, heap, "length").unwrap_or(Value::undefined());
-    // §7.1.20 ToLength(? ToNumber(length)). `length` is routinely a
-    // string / boolean / float in array-like receivers, so coerce
-    // through the primitive ToNumber ladder (which parses numeric
-    // strings, maps booleans, etc.) rather than only accepting an
-    // existing Number.
-    let f = crate::number::parse::to_number_value(&len_val, heap);
-    if f.is_nan() || f <= 0.0 {
-        0
-    } else if f >= MAX_ARRAY_LIKE_PROBE_LEN as f64 {
-        MAX_ARRAY_LIKE_PROBE_LEN
-    } else {
-        f as usize
-    }
-}
-
-/// Sparse-aware walk of **present** indexed own properties of an
-/// array-like object receiver, returning `(index, value)` pairs in
-/// ascending-index order.
-///
-/// Mirrors the V8 / JSC strategy for generic Array.prototype methods:
-/// instead of iterating `0..len` and probing `HasProperty(O, k)` for
-/// each slot (which is `O(len)` even when the object is sparse), we
-/// enumerate the receiver's own string-keyed property bag, filter for
-/// numeric indices `< len`, and visit those only. Per §22.1.3 generic
-/// algorithms, an `HasProperty(O, k)` returning `false` is observably
-/// indistinguishable from "skip k", so this is spec-faithful for
-/// objects without inherited indexed properties — the same caveat
-/// V8 / JSC carry in their dense-vs-dictionary fast paths.
-///
-/// Returns `None` when `receiver` is not array-like (caller surfaces
-/// the spec's `RequireObjectCoercible` TypeError).
-pub(crate) fn array_like_present_entries(
-    receiver: &Value,
-    heap: &mut otter_gc::GcHeap,
-) -> Option<Vec<(usize, Value)>> {
-    if let Some(arr) = receiver.as_array() {
-        // Dense Array path — Value::Hole encodes "absent"; the
-        // sparse-aware filter drops it so the index/value pairs
-        // match what HasProperty would observe.
-        return Some(array::with_elements(arr, heap, |els| {
-            els.iter()
-                .enumerate()
-                .filter_map(|(i, v)| if v.is_hole() { None } else { Some((i, *v)) })
-                .collect()
-        }));
-    }
-    if let Some(obj) = receiver.as_object() {
-        // §10.4.3 String-exotic wrappers (`new String("…")`) expose
-        // their `length` and each code unit through `[[StringData]]`,
-        // not the ordinary property table. Seed entries from the
-        // backing string, then overlay any own indexed props.
-        if let Some(s) = crate::object::string_data(obj, heap) {
-            let units = s.to_utf16_vec(heap);
-            let mut entries: Vec<(usize, Value)> = units
-                .iter()
-                .enumerate()
-                .map(|(i, &u)| {
-                    let ch = crate::string::JsString::from_utf16_units(&[u], heap)
-                        .map(Value::string)
-                        .unwrap_or(Value::undefined());
-                    (i, ch)
-                })
-                .collect();
-            let extra: Vec<usize> = crate::object::with_properties(obj, heap, |p| {
-                p.keys()
-                    .filter_map(|k| k.parse::<usize>().ok())
-                    .filter(|&i| i >= entries.len())
-                    .collect()
-            });
-            for i in extra {
-                let v = crate::object::get(obj, heap, &i.to_string()).unwrap_or(Value::undefined());
-                entries.push((i, v));
-            }
-            entries.sort_unstable_by_key(|(i, _)| *i);
-            entries.dedup_by_key(|(i, _)| *i);
-            return Some(entries);
-        }
-        let len = read_array_like_length(obj, heap);
-        if len == 0 {
-            return Some(Vec::new());
-        }
-        let mut idx_keys: Vec<usize> = crate::object::with_properties(obj, heap, |p| {
-            p.keys()
-                .filter_map(|k| k.parse::<usize>().ok())
-                .filter(|&i| i < len)
-                .collect()
-        });
-        idx_keys.sort_unstable();
-        idx_keys.dedup();
-        return Some(
-            idx_keys
-                .into_iter()
-                .map(|i| {
-                    let key = i.to_string();
-                    let v = crate::object::get(obj, heap, &key).unwrap_or(Value::undefined());
-                    (i, v)
-                })
-                .collect(),
-        );
-    }
-    // §7.1.18 ToObject — primitive receivers coerce to their wrapper.
-    if receiver.is_boolean()
-        || receiver.is_number()
-        || receiver.is_symbol()
-        || receiver.is_big_int()
-    {
-        return Some(Vec::new());
-    }
-    // Callable receivers — empty array-like view.
-    if receiver.is_function()
-        || receiver.is_closure()
-        || receiver.is_native_function()
-        || receiver.is_bound_function()
-        || receiver.is_class_constructor()
-    {
-        return Some(Vec::new());
-    }
-    // §7.1.18 ToObject for object-shaped exotic values that
-    // expose user properties through a lazy expando bag.
-    if let Some(r) = receiver.as_regexp() {
-        return match r.expando(heap) {
-            Some(bag) => array_like_present_entries(&Value::object(bag), heap),
-            None => Some(Vec::new()),
-        };
-    }
-    if let Some(p) = receiver.as_promise() {
-        return match p.expando(heap) {
-            Some(bag) => array_like_present_entries(&Value::object(bag), heap),
-            None => Some(Vec::new()),
-        };
-    }
-    // Map / Set / WeakMap / WeakSet / WeakRef / FinalizationRegistry
-    // / Generator / Iterator / DataView / ArrayBuffer — empty walk.
-    if receiver.is_map()
-        || receiver.is_set()
-        || receiver.is_weak_map()
-        || receiver.is_weak_set()
-        || receiver.is_weak_ref()
-        || receiver.is_finalization_registry()
-        || receiver.is_generator()
-        || receiver.is_iterator()
-        || receiver.is_data_view()
-        || receiver.is_array_buffer()
-    {
-        return Some(Vec::new());
-    }
-    if let Some(s) = receiver.as_string(heap) {
-        let units = s.to_utf16_vec(heap);
-        return Some(
-            units
-                .into_iter()
-                .enumerate()
-                .map(|(i, u)| {
-                    let s = crate::string::JsString::from_utf16_units(&[u], heap)
-                        .map(Value::string)
-                        .unwrap_or(Value::undefined());
-                    (i, s)
-                })
-                .collect(),
-        );
-    }
-    None
-}
-
-/// §7.3.18 reachable length helper for receivers whose `.length`
-/// we trust to be observable but where we only need the upper bound
-/// for `fromIndex` clamping — does not allocate, just reads.
-pub(crate) fn array_like_length(receiver: &Value, heap: &otter_gc::GcHeap) -> usize {
-    if let Some(arr) = receiver.as_array() {
-        return array::len(arr, heap);
-    }
-    if let Some(obj) = receiver.as_object() {
-        if let Some(s) = crate::object::string_data(obj, heap) {
-            return s.len() as usize;
-        }
-        return read_array_like_length(obj, heap);
-    }
-    if let Some(s) = receiver.as_string(heap) {
-        return s.len() as usize;
-    }
-    if let Some(r) = receiver.as_regexp() {
-        return r
-            .expando(heap)
-            .map_or(0, |bag| read_array_like_length(bag, heap));
-    }
-    if let Some(p) = receiver.as_promise() {
-        return p
-            .expando(heap)
-            .map_or(0, |bag| read_array_like_length(bag, heap));
-    }
-    0
-}
-
-/// Convert a possibly-negative numeric index into an absolute
-/// element index, clamped to `[0, len]`. Mirrors the spec's
-/// `ToIntegerOrInfinity` + clamping rule for `slice` / `indexOf`.
-fn clamp_index(raw: i64, len: usize) -> usize {
-    if raw < 0 {
-        let from_end = len as i64 + raw;
-        if from_end < 0 { 0 } else { from_end as usize }
-    } else if (raw as usize) > len {
-        len
-    } else {
-        raw as usize
-    }
-}
-
-fn arg_signed_index(
-    args: &IntrinsicArgs<'_>,
-    index: u16,
-    default: i64,
-) -> Result<i64, IntrinsicError> {
-    // §7.1.5 ToIntegerOrInfinity — coerce the spec-relevant operand
-    // set (Number / Boolean / Null / String) before treating
-    // non-finite / NaN / non-integer as defaults.
-    let Some(arg) = args.args.get(index as usize) else {
-        return Ok(default);
-    };
-    if arg.is_undefined() {
-        return Ok(default);
-    }
-    if let Some(n) = arg.as_number() {
-        return Ok(match n.as_smi() {
-            Some(v) => v as i64,
-            None => {
-                let f = n.as_f64();
-                if f.is_nan() {
-                    0
-                } else if f.is_infinite() {
-                    if f.is_sign_negative() {
-                        i64::MIN
-                    } else {
-                        i64::MAX
-                    }
-                } else {
-                    f.trunc() as i64
-                }
-            }
-        });
-    }
-    if let Some(b) = arg.as_boolean() {
-        return Ok(if b { 1 } else { 0 });
-    }
-    if arg.is_null() {
-        return Ok(0);
-    }
-    if let Some(s) = arg.as_string(args.gc_heap) {
-        let text = s.to_lossy_string(args.gc_heap);
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return Ok(0);
-        }
-        return Ok(trimmed.parse::<i64>().unwrap_or(0));
-    }
-    Err(IntrinsicError::BadArgument {
-        index,
-        reason: "must be a number",
-    })
-}
-
-fn impl_push(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.20 — `len = ? LengthOfArrayLike(O)`; for each item set
-    // `O[len + idx]` then update `O.length`. Iterates only the
-    // argument list (no `0..len` scan), so safe for any `len`.
-    if let Some(arr) = args.receiver.as_array() {
-        let mut new_len = array::len(arr, &*args.gc_heap);
-        let values: Vec<Value> = args.args.to_vec();
-        for v in values {
-            new_len = args.array_push_rooted(arr, v)?;
-        }
-        return Ok(Value::number(NumberValue::from_i32(new_len as i32)));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let heap = &mut *args.gc_heap;
-        let base_len = read_array_like_length(obj, heap);
-        let added = args.args.len();
-        // §22.1.3.20 step 5.b — RangeError when the resulting length
-        // would exceed 2^53 - 1. We surface the inner heap cap via
-        // `read_array_like_length`'s ToLength clamp; the explicit
-        // check here guards the final write to `length`.
-        let new_len = base_len.saturating_add(added);
-        for (i, v) in args.args.iter().enumerate() {
-            let key = (base_len + i).to_string();
-            crate::object::set(obj, heap, &key, *v);
-        }
-        crate::object::set(obj, heap, "length", Value::number_f64(new_len as f64));
-        return Ok(Value::number(NumberValue::from_f64(new_len as f64)));
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-fn impl_pop(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.19 — read length, peel the last present element, write
-    // length back. For Array we keep the existing dense fast path
-    // (`array::pop`).
-    if let Some(arr) = args.receiver.as_array() {
-        let heap = &mut *args.gc_heap;
-        return Ok(array::pop(arr, heap));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let heap = &mut *args.gc_heap;
-        let len = read_array_like_length(obj, heap);
-        if len == 0 {
-            crate::object::set(obj, heap, "length", Value::number_i32(0));
-            return Ok(Value::undefined());
-        }
-        let last_idx = len - 1;
-        let key = last_idx.to_string();
-        let element = crate::object::get(obj, heap, &key).unwrap_or(Value::undefined());
-        let _ = crate::object::delete(obj, heap, &key);
-        crate::object::set(obj, heap, "length", Value::number_f64(last_idx as f64));
-        return Ok(element);
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-fn impl_shift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.26 — read element at 0, shift indices 1..len down by 1
-    // (skipping absent slots), drop the last, decrement length. For
-    // Array we keep the existing dense `Vec::remove(0)` path.
-    if let Some(arr) = args.receiver.as_array() {
-        let heap = &mut *args.gc_heap;
-        return Ok(array::with_elements_mut(arr, heap, |elements| {
-            if elements.is_empty() {
-                Value::undefined()
-            } else {
-                // §23.1.3.26: a leading hole shifts to `undefined`.
-                let removed = elements.remove(0);
-                if removed.is_hole() {
-                    Value::undefined()
-                } else {
-                    removed
-                }
-            }
-        }));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let heap_ref = &mut *args.gc_heap;
-        let len = read_array_like_length(obj, heap_ref);
-        if len == 0 {
-            let heap = &mut *args.gc_heap;
-            crate::object::set(obj, heap, "length", Value::number_i32(0));
-            return Ok(Value::undefined());
-        }
-        // Walk pre-shift present own indices in ascending order. The
-        // post-shift state is the same set with each index decremented
-        // by 1 (and the element at index 0 returned). Indices that
-        // were present pre-shift but whose decremented form clashes
-        // with nothing post-shift have their original key deleted to
-        // match HasProperty results.
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        let pre_present: std::collections::BTreeSet<usize> =
-            entries.iter().map(|(i, _)| *i).collect();
-        let heap = &mut *args.gc_heap;
-        let mut first: Option<Value> = None;
-        let mut post_present: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        for (i, v) in &entries {
-            if *i == 0 {
-                first = Some(*v);
-                continue;
-            }
-            if *i < len {
-                let new_idx = *i - 1;
-                let new_key = new_idx.to_string();
-                crate::object::set(obj, heap, &new_key, *v);
-                post_present.insert(new_idx);
-            }
-        }
-        // Pre-present indices whose shifted twin isn't being written
-        // need their original slot deleted. Walk pre_present (size
-        // proportional to actual present count, never `len`).
-        for &i in &pre_present {
-            // The shift writes to (i - 1) for i >= 1. Any pre-present
-            // i that doesn't appear in post_present needs deletion at
-            // its original index.
-            if !post_present.contains(&i) {
-                let _ = crate::object::delete(obj, heap, &i.to_string());
-            }
-        }
-        // Always remove the trailing slot — even if it wasn't present,
-        // delete is idempotent.
-        let _ = crate::object::delete(obj, heap, &(len - 1).to_string());
-        crate::object::set(obj, heap, "length", Value::number_f64((len - 1) as f64));
-        return Ok(first.unwrap_or(Value::undefined()));
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-fn impl_unshift(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.34 — prepend the argument list; existing indices shift
-    // up by `argCount`, length grows by the same amount. Dense Array
-    // keeps the existing vec-rebuild path. Object receiver walks
-    // pre-present indices in **descending** order so writing to
-    // `i + N` doesn't clobber a not-yet-relocated `i + N`.
-    let arg_count = args.args.len();
-    if let Some(arr) = args.receiver.as_array() {
-        let heap = &mut *args.gc_heap;
-        let existing_len = array::len(arr, heap);
-        let mut values: Vec<Value> = args.args.to_vec();
-        array::with_elements(arr, heap, |elements| {
-            values.extend(elements.iter().cloned())
-        });
-        array::with_elements_mut(arr, heap, |elements| {
-            elements.clear();
-            elements.extend(values);
-        });
-        return Ok(Value::number(NumberValue::from_i32(
-            (existing_len + arg_count) as i32,
-        )));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let heap_ref = &mut *args.gc_heap;
-        let existing_len = read_array_like_length(obj, heap_ref);
-        if arg_count == 0 {
-            // Spec still requires writing `length` back (no-op if it
-            // already equals `existing_len`).
-            let heap = &mut *args.gc_heap;
-            crate::object::set(obj, heap, "length", Value::number_f64(existing_len as f64));
-            return Ok(Value::number(NumberValue::from_f64(existing_len as f64)));
-        }
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        let pre_present: std::collections::BTreeSet<usize> =
-            entries.iter().map(|(i, _)| *i).collect();
-        let heap = &mut *args.gc_heap;
-        // Walk descending so destination slot is never live yet.
-        for (i, v) in entries.into_iter().rev() {
-            let new_idx = i + arg_count;
-            crate::object::set(obj, heap, &new_idx.to_string(), v);
-        }
-        // Positions in `[0, arg_count)` that originally held a
-        // pre-present value but whose post-shift writer doesn't
-        // overwrite them need explicit delete. After the shift, the
-        // new present positions are `{i + arg_count for i in
-        // pre_present}`; positions in pre_present \ post_present
-        // must be cleared.
-        let post_present: std::collections::BTreeSet<usize> =
-            pre_present.iter().map(|&i| i + arg_count).collect();
-        for &i in &pre_present {
-            if !post_present.contains(&i) && i < arg_count {
-                // Will be overwritten by the prepend below, no need
-                // to delete.
-                continue;
-            }
-            if !post_present.contains(&i) {
-                let _ = crate::object::delete(obj, heap, &i.to_string());
-            }
-        }
-        // Prepend the new items at indices 0..arg_count.
-        for (i, v) in args.args.iter().enumerate() {
-            crate::object::set(obj, heap, &i.to_string(), *v);
-        }
-        let new_len = existing_len + arg_count;
-        crate::object::set(obj, heap, "length", Value::number_f64(new_len as f64));
-        return Ok(Value::number(NumberValue::from_f64(new_len as f64)));
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-fn impl_slice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.28 — generic over array-likes via ToObject(this) +
-    // LengthOfArrayLike. The dense `Value::Array` path stays on the
-    // contiguous slice copy; non-array receivers walk present indexed
-    // own keys and materialise undefined for absent positions inside
-    // the requested range (matching `HasProperty` + `Get` semantics).
-    if let Some(arr) = args.receiver.as_array() {
-        let len = array::len(arr, &*args.gc_heap);
-        let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
-        let end_default = len as i64;
-        let end_raw = arg_signed_index(args, 1, end_default)?;
-        let end = clamp_index(end_raw, len);
-        let slice: Vec<Value> = array::with_elements(arr, &*args.gc_heap, |elements| {
-            if start >= end {
-                Vec::new()
-            } else {
-                elements[start..end].to_vec()
-            }
-        });
-        return Ok(Value::array(args.array_from_elements_rooted(
-            slice.iter().cloned(),
-            &[],
-            &[slice.as_slice()],
-        )?));
-    }
-    let len = array_like_length(args.receiver, &*args.gc_heap);
-    let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
-    let end_default = len as i64;
-    let end_raw = arg_signed_index(args, 1, end_default)?;
-    let end = clamp_index(end_raw, len);
-    let entries = array_like_present_entries(args.receiver, args.gc_heap)
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    let slice_len = end.saturating_sub(start);
-    let mut out = vec![Value::undefined(); slice_len];
-    for (i, v) in entries {
-        if i < start || i >= end {
-            continue;
-        }
-        out[i - start] = v;
-    }
-    Ok(Value::array(args.array_from_elements_rooted(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
-    )?))
-}
-
-fn impl_concat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.2 — start with a copy of the receiver, then for each
-    // argument: if it's an Array (foundation: §22.1.2 IsConcatSpreadable
-    // short-circuits to IsArray), spread its dense elements; otherwise
-    // append as a single value. Array-like receivers spread via the
-    // sparse walker; arguments that are plain Objects are NOT spread
-    // (matches IsArray-only spread until full @@isConcatSpreadable
-    // wiring lands).
-    let mut combined: Vec<Value> = if let Some(arr) = args.receiver.as_array() {
-        array::with_elements(arr, &*args.gc_heap, |elements| elements.to_vec())
-    } else if args.receiver.is_object() {
-        let len = array_like_length(args.receiver, &*args.gc_heap);
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        let mut out = vec![Value::undefined(); len];
-        for (i, v) in entries {
-            if i < len {
-                out[i] = v;
-            }
-        }
-        out
-    } else {
-        return Err(IntrinsicError::BadReceiver { expected: "array" });
-    };
-    for v in args.args {
-        if let Some(other) = v.as_array() {
-            array::with_elements(other, &*args.gc_heap, |elements| {
-                combined.extend(elements.iter().cloned());
-            });
-        } else {
-            combined.push(*v);
-        }
-    }
-    Ok(Value::array(args.array_from_elements_rooted(
-        combined.iter().cloned(),
-        &[],
-        &[combined.as_slice()],
-    )?))
-}
-
-/// §23.1.3.36 `Array.prototype.toString` — delegate to `join()` with
-/// the default `","` separator. Spec step 1 is "Let array be ?
-/// ToObject(this value)"; step 4 reads `func = array.join`, falling
-/// back to `%Object.prototype.toString%` when `join` is not
-/// callable. Foundation: always call our concrete join helper.
-///
-/// <https://tc39.es/ecma262/#sec-array.prototype.tostring>
-fn impl_to_string(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    impl_join(args)
-}
-
-fn impl_join(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.16 — generic via ToObject + LengthOfArrayLike. Holes
-    // and `null` / `undefined` serialise as the empty string. Dense
-    // `Value::Array` keeps the existing tight walk; Object receivers
-    // walk indices `[0, len)` materialising absent slots as empty
-    // strings (matches HasProperty result).
-    let separator = match args.args.first() {
-        None => ",".to_string(),
-        Some(v) if v.is_undefined() => ",".to_string(),
-        Some(v) => {
-            if let Some(s) = v.as_string(args.gc_heap) {
-                s.to_lossy_string(&*args.gc_heap)
-            } else {
-                v.display_string(&*args.gc_heap)
-            }
-        }
-    };
-    if let Some(arr) = args.receiver.as_array() {
-        let parts: Vec<String> = array::with_elements(arr, &*args.gc_heap, |elements| {
-            elements
-                .iter()
-                .map(|v| {
-                    if v.is_undefined() || v.is_null() || v.is_hole() {
-                        String::new()
-                    } else {
-                        v.display_string(&*args.gc_heap)
-                    }
-                })
-                .collect()
-        });
-        let joined = parts.join(&separator);
-        return Ok(Value::string(JsString::from_str(&joined, args.gc_heap)?));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let len = read_array_like_length(obj, &*args.gc_heap);
-        if len == 0 {
-            return Ok(Value::string(JsString::from_str("", args.gc_heap)?));
-        }
-        // Materialise present indices into a sparse lookup; absent
-        // slots produce empty-string parts so the final `join` keeps
-        // separator placement correct. We bound the `parts` length by
-        // `len` (already clamped to `MAX_ARRAY_LIKE_PROBE_LEN`); no
-        // unbounded probe.
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        let mut parts: Vec<String> = vec![String::new(); len];
-        for (i, v) in entries {
-            if i >= len {
-                continue;
-            }
-            parts[i] = if v.is_undefined() || v.is_null() || v.is_hole() {
-                String::new()
-            } else {
-                v.display_string(&*args.gc_heap)
-            };
-        }
-        let joined = parts.join(&separator);
-        return Ok(Value::string(JsString::from_str(&joined, args.gc_heap)?));
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-fn impl_includes(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.13 Array.prototype.includes — generic over array-likes
-    // via ToObject(this) + LengthOfArrayLike. Comparison is
-    // §7.2.12 SameValueZero, so `NaN` matches `NaN` and `±0` collapse.
-    // Holes compare as SameValueZero against `undefined`, so
-    // `[,,].includes(undefined) === true`. The dense Array path keeps
-    // the existing tight `with_elements` walk; the array-like
-    // fallback uses the sparse iterator.
-    let needle = args.args.first().cloned().unwrap_or(Value::undefined());
-    let needle_is_undefined = needle.is_undefined();
-    if let Some(arr) = args.receiver.as_array() {
-        let found = array::with_elements(arr, &*args.gc_heap, |elements| {
-            elements.iter().any(|v| {
-                if v.is_hole() {
-                    needle_is_undefined
-                } else {
-                    crate::abstract_ops::same_value_zero(v, &needle, &*args.gc_heap)
-                }
-            })
-        });
-        return Ok(Value::boolean(found));
-    }
-    let entries = array_like_present_entries(args.receiver, args.gc_heap)
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    let found = entries
-        .iter()
-        .any(|(_, v)| crate::abstract_ops::same_value_zero(v, &needle, args.gc_heap));
-    Ok(Value::boolean(found))
-}
-
-fn impl_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.14 — generic over array-likes. The dense `Value::Array`
-    // path keeps the existing tight `with_elements` walk so common
-    // dense-array calls don't pay a snapshot allocation.
-    let needle = args.args.first().cloned().unwrap_or(Value::undefined());
-    let from_raw = arg_signed_index(args, 1, 0)?;
-    let heap = &mut *args.gc_heap;
-    if let Some(arr) = args.receiver.as_array() {
-        let len = array::len(arr, heap);
-        let from = clamp_index(from_raw, len);
-        let found = array::with_elements(arr, heap, |elements| {
-            elements.iter().enumerate().skip(from).find_map(|(i, v)| {
-                if crate::abstract_ops::is_strictly_equal(v, &needle, heap) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-        });
-        if let Some(i) = found {
-            return Ok(Value::number(NumberValue::from_i32(i as i32)));
-        }
-        return Ok(Value::number(NumberValue::from_i32(-1)));
-    }
-    let len = array_like_length(args.receiver, heap);
-    let from = clamp_index(from_raw, len);
-    let entries = array_like_present_entries(args.receiver, args.gc_heap)
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    for (i, v) in entries {
-        if i < from {
-            continue;
-        }
-        if crate::abstract_ops::is_strictly_equal(&v, &needle, args.gc_heap) {
-            return Ok(Value::number(NumberValue::from_i32(i as i32)));
-        }
-    }
-    Ok(Value::number(NumberValue::from_i32(-1)))
-}
-
-/// §23.1.3.1 `Array.prototype.at(index)` — clamp negative indexing.
-/// <https://tc39.es/ecma262/#sec-array.prototype.at>
-fn impl_at(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // §23.1.3.1 — generic via ToObject(this) + LengthOfArrayLike,
-    // then a single indexed Get. Constant-time regardless of `len`.
-    if let Some(arr) = args.receiver.as_array() {
-        let len = array::len(arr, &*args.gc_heap) as i64;
-        let raw = arg_signed_index(args, 0, 0)?;
-        let idx = if raw < 0 { len + raw } else { raw };
-        if idx < 0 || idx >= len {
-            return Ok(Value::undefined());
-        }
-        let heap = &mut *args.gc_heap;
-        return Ok(array::get(arr, heap, idx as usize));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let len = read_array_like_length(obj, &*args.gc_heap) as i64;
-        let raw = arg_signed_index(args, 0, 0)?;
-        let idx = if raw < 0 { len + raw } else { raw };
-        if idx < 0 || idx >= len {
-            return Ok(Value::undefined());
-        }
-        let key = (idx as usize).to_string();
-        let heap = &mut *args.gc_heap;
-        return Ok(crate::object::get(obj, heap, &key).unwrap_or(Value::undefined()));
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-/// §23.1.3.18 `Array.prototype.lastIndexOf(value, fromIndex?)`.
-/// Generic over array-likes; dense `Value::Array` keeps the existing
-/// tight reverse walk to avoid a snapshot allocation on hot paths.
-/// <https://tc39.es/ecma262/#sec-array.prototype.lastindexof>
-fn impl_last_index_of(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let needle = args.args.first().cloned().unwrap_or(Value::undefined());
-    if let Some(arr) = args.receiver.as_array() {
-        let len = array::len(arr, &*args.gc_heap);
-        let from_default = (len as i64).saturating_sub(1);
-        let from_raw = arg_signed_index(args, 1, from_default)?;
-        let from = if from_raw < 0 {
-            let v = (len as i64) + from_raw;
-            if v < 0 {
-                return Ok(Value::number(NumberValue::from_i32(-1)));
-            }
-            v as usize
-        } else if (from_raw as usize) >= len {
-            len.saturating_sub(1)
-        } else {
-            from_raw as usize
-        };
-        let found = array::with_elements(arr, &*args.gc_heap, |elements| {
-            if elements.is_empty() {
-                return None;
-            }
-            // §23.1.3.18 step 6 — clamp the cursor to the elements
-            // backing-store length so a sparse array with a spec
-            // length larger than `elements.len()` (e.g.
-            // `arr.length = 2**31`) does not index out of bounds.
-            // Trailing slots beyond `elements.len()` are holes that
-            // can never `===` the needle.
-            let mut i = from.min(elements.len() - 1) as i64;
-            while i >= 0 {
-                if crate::abstract_ops::is_strictly_equal(
-                    &elements[i as usize],
-                    &needle,
-                    &*args.gc_heap,
-                ) {
-                    return Some(i as i32);
-                }
-                i -= 1;
-            }
-            None
-        });
-        if let Some(i) = found {
-            return Ok(Value::number(NumberValue::from_i32(i)));
-        }
-        return Ok(Value::number(NumberValue::from_i32(-1)));
-    }
-    let len = array_like_length(args.receiver, &*args.gc_heap);
-    let from_default = (len as i64).saturating_sub(1);
-    let from_raw = arg_signed_index(args, 1, from_default)?;
-    let from = if from_raw < 0 {
-        let v = (len as i64) + from_raw;
-        if v < 0 {
-            return Ok(Value::number(NumberValue::from_i32(-1)));
-        }
-        v as usize
-    } else if (from_raw as usize) >= len {
-        len.saturating_sub(1)
-    } else {
-        from_raw as usize
-    };
-    let entries = array_like_present_entries(args.receiver, args.gc_heap)
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    // Reverse walk over the sorted entries; first hit with `i <= from`
-    // wins. Entries are ascending so we iterate in reverse.
-    for (i, v) in entries.into_iter().rev() {
-        if i > from {
-            continue;
-        }
-        if crate::abstract_ops::is_strictly_equal(&v, &needle, args.gc_heap) {
-            return Ok(Value::number(NumberValue::from_i32(i as i32)));
-        }
-    }
-    Ok(Value::number(NumberValue::from_i32(-1)))
-}
-
-/// §23.1.3.27 `Array.prototype.reverse()` — in-place.
-/// Generic over array-likes; sparse Object receivers swap only the
-/// pairs `(i, len-1-i)` where at least one side is present (matching
-/// the spec's `HasProperty` short-circuit).
-/// <https://tc39.es/ecma262/#sec-array.prototype.reverse>
-fn impl_reverse(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    if let Some(arr) = args.receiver.as_array() {
-        let heap = &mut *args.gc_heap;
-        array::with_elements_mut(arr, heap, |elements| elements.reverse());
-        return Ok(Value::array(arr));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let heap_ref = &mut *args.gc_heap;
-        let len = read_array_like_length(obj, heap_ref);
-        if len < 2 {
-            return Ok(*args.receiver);
-        }
-        let entries = array_like_present_entries(args.receiver, heap_ref)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        let pre_present: std::collections::BTreeSet<usize> =
-            entries.iter().map(|(i, _)| *i).collect();
-        let heap = &mut *args.gc_heap;
-        // Walk only present indices ≤ middle; pair each with its
-        // mirror `len-1-i`. Spec §23.1.3.27 step 5: if one side is
-        // present and the other isn't, the present side migrates
-        // (Set + Delete); both-present → swap; both-absent → skip.
-        for &i in pre_present.iter().filter(|&&i| i < len) {
-            let mirror = len - 1 - i;
-            if mirror <= i {
-                break;
-            }
-            let key_i = i.to_string();
-            let key_m = mirror.to_string();
-            let v_i = crate::object::get(obj, heap, &key_i).unwrap_or(Value::undefined());
-            let mirror_present = pre_present.contains(&mirror);
-            if mirror_present {
-                let v_m = crate::object::get(obj, heap, &key_m).unwrap_or(Value::undefined());
-                crate::object::set(obj, heap, &key_i, v_m);
-                crate::object::set(obj, heap, &key_m, v_i);
-            } else {
-                // Mirror absent — migrate i → mirror, delete i.
-                crate::object::set(obj, heap, &key_m, v_i);
-                let _ = crate::object::delete(obj, heap, &key_i);
-            }
-        }
-        // Also walk present indices > middle whose mirror was absent
-        // (the mirror walk above misses them since we iterated i <
-        // mirror only).
-        for &i in pre_present.iter().filter(|&&i| i < len) {
-            let mirror = len - 1 - i;
-            if mirror >= i {
-                continue;
-            }
-            if pre_present.contains(&mirror) {
-                // Already handled when we processed `mirror` from the
-                // lower half.
-                continue;
-            }
-            // Mirror absent → i migrates down to mirror; delete i.
-            let key_i = i.to_string();
-            let key_m = mirror.to_string();
-            let v_i = crate::object::get(obj, heap, &key_i).unwrap_or(Value::undefined());
-            crate::object::set(obj, heap, &key_m, v_i);
-            let _ = crate::object::delete(obj, heap, &key_i);
-        }
-        return Ok(*args.receiver);
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-/// §23.1.3.7 `Array.prototype.fill(value, start?, end?)` — in-place.
-/// Generic over array-likes via ToObject(this) + LengthOfArrayLike.
-/// <https://tc39.es/ecma262/#sec-array.prototype.fill>
-fn impl_fill(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let value = args.args.first().cloned().unwrap_or(Value::undefined());
-    if let Some(arr) = args.receiver.as_array() {
-        let len = array::len(arr, &*args.gc_heap);
-        let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
-        let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
-        if start < end {
-            let heap = &mut *args.gc_heap;
-            array::with_elements_mut(arr, heap, |elements| {
-                for slot in elements.iter_mut().take(end).skip(start) {
-                    *slot = value;
-                }
-            });
-        }
-        return Ok(Value::array(arr));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let len = read_array_like_length(obj, &*args.gc_heap);
-        let start = clamp_index(arg_signed_index(args, 1, 0)?, len);
-        let end = clamp_index(arg_signed_index(args, 2, len as i64)?, len);
-        // Cap defensively — `MAX_ARRAY_LIKE_PROBE_LEN` is already
-        // applied to `len` via `read_array_like_length`, so the
-        // bounded `start..end` walk is safe.
-        let heap = &mut *args.gc_heap;
-        for k in start..end {
-            crate::object::set(obj, heap, &k.to_string(), value);
-        }
-        return Ok(*args.receiver);
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-/// §23.1.3.11 `Array.prototype.flat(depth?)` — flattens at most
-/// `depth` levels (default 1). Sparse holes are dropped — foundation
-/// arrays are dense, so the spec's `IsConcatSpreadable` short-circuit
-/// reduces to "is `Value::Array`".
-/// <https://tc39.es/ecma262/#sec-array.prototype.flat>
-fn impl_flat(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let heap = &mut *args.gc_heap;
-    let depth = if let Some(arg) = args.args.first() {
-        if arg.is_undefined() {
-            1i64
-        } else if let Some(n) = arg.as_number() {
-            match n.as_smi() {
-                Some(v) if v >= 0 => v as i64,
-                Some(_) => 0,
-                None => n.as_f64() as i64,
-            }
-        } else {
-            1
-        }
-    } else {
-        1i64
-    };
-    fn walk(out: &mut Vec<Value>, heap: &otter_gc::GcHeap, body: &[Value], depth: i64) {
-        for v in body {
-            if v.is_hole() {
-                continue;
-            }
-            if let Some(a) = v.as_array()
-                && depth > 0
-            {
-                array::with_elements(a, heap, |inner| walk(out, heap, inner, depth - 1));
-            } else {
-                out.push(*v);
-            }
-        }
-    }
-    let elements: Vec<Value> = if let Some(arr) = args.receiver.as_array() {
-        array::with_elements(arr, heap, |els| els.to_vec())
-    } else if let Some(obj) = args.receiver.as_object() {
-        let len = read_array_like_length(obj, heap);
-        (0..len)
-            .map(|i| crate::object::get(obj, heap, &i.to_string()).unwrap_or(Value::undefined()))
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut out: Vec<Value> = Vec::with_capacity(elements.len());
-    walk(&mut out, heap, &elements, depth);
-    Ok(Value::array(args.array_from_elements_rooted(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
-    )?))
-}
-
-/// §23.1.3.31 `Array.prototype.splice(start, deleteCount?, ...items)`.
-/// Mutates the receiver in place; returns the removed elements.
-/// Generic over array-likes; Object receivers use a sparse-aware
-/// shift so pathological `length` values never trigger an `O(len)`
-/// walk.
-/// <https://tc39.es/ecma262/#sec-array.prototype.splice>
-fn impl_splice(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    if let Some(arr) = args.receiver.as_array() {
-        let len = array::len(arr, &*args.gc_heap);
-        let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
-        let delete_count = {
-            let arg1 = args.args.get(1);
-            if arg1.is_none() || arg1.is_some_and(|v| v.is_undefined()) {
-                len.saturating_sub(start)
-            } else if let Some(n) = arg1.and_then(|v| v.as_number()) {
-                let raw = match n.as_smi() {
-                    Some(v) => v as i64,
-                    None => n.as_f64() as i64,
-                };
-                if raw < 0 {
-                    0
-                } else if (raw as usize) > len.saturating_sub(start) {
-                    len.saturating_sub(start)
-                } else {
-                    raw as usize
-                }
-            } else {
-                0
-            }
-        };
-        let inserts: Vec<Value> = args.args.iter().skip(2).cloned().collect();
-        let heap = &mut *args.gc_heap;
-        let removed = array::with_elements_mut(arr, heap, |elements| {
-            let mut removed: Vec<Value> = Vec::with_capacity(delete_count);
-            for _ in 0..delete_count {
-                removed.push(elements.remove(start));
-            }
-            for (i, v) in inserts.into_iter().enumerate() {
-                elements.insert(start + i, v);
-            }
-            removed
-        });
-        return Ok(Value::array(args.array_from_elements_rooted(
-            removed.iter().cloned(),
-            &[],
-            &[removed.as_slice()],
-        )?));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        let len = read_array_like_length(obj, &*args.gc_heap);
-        let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
-        let delete_count = {
-            let arg1 = args.args.get(1);
-            if arg1.is_none() || arg1.is_some_and(|v| v.is_undefined()) {
-                len.saturating_sub(start)
-            } else if let Some(n) = arg1.and_then(|v| v.as_number()) {
-                let raw = match n.as_smi() {
-                    Some(v) => v as i64,
-                    None => n.as_f64() as i64,
-                };
-                if raw < 0 {
-                    0
-                } else if (raw as usize) > len.saturating_sub(start) {
-                    len.saturating_sub(start)
-                } else {
-                    raw as usize
-                }
-            } else {
-                0
-            }
-        };
-        let item_count = args.args.len().saturating_sub(2);
-        let inserts: Vec<Value> = args.args.iter().skip(2).cloned().collect();
-        // Pre-shift present indices.
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        let pre_present: std::collections::BTreeSet<usize> =
-            entries.iter().map(|(i, _)| *i).collect();
-        // Snapshot the deleted region so we can return it.
-        let mut removed: Vec<Value> = vec![Value::undefined(); delete_count];
-        for (i, v) in &entries {
-            if *i >= start && *i < start + delete_count {
-                removed[*i - start] = *v;
-            }
-        }
-        let heap = &mut *args.gc_heap;
-        // Shift tail.
-        if item_count < delete_count {
-            // Shrink — walk present indices in [start+delete_count, len)
-            // ascending; new index = i - (delete_count - item_count).
-            let shift = delete_count - item_count;
-            for (i, v) in entries
-                .iter()
-                .filter(|(i, _)| *i >= start + delete_count && *i < len)
-            {
-                let new_idx = i - shift;
-                crate::object::set(obj, heap, &new_idx.to_string(), *v);
-            }
-            // Delete pre-present positions that no longer hold a
-            // value. Post-present positions = {i - shift for i in
-            // pre_present where i >= start + delete_count} ∪
-            // {i for i in pre_present where i < start} ∪
-            // {start..start+item_count from inserts}.
-            let mut post_present: std::collections::BTreeSet<usize> =
-                std::collections::BTreeSet::new();
-            for &i in &pre_present {
-                if i < start {
-                    post_present.insert(i);
-                } else if i >= start + delete_count && i < len {
-                    post_present.insert(i - shift);
-                }
-            }
-            for k in 0..item_count {
-                post_present.insert(start + k);
-            }
-            for &i in &pre_present {
-                if !post_present.contains(&i) {
-                    let _ = crate::object::delete(obj, heap, &i.to_string());
-                }
-            }
-        } else if item_count > delete_count {
-            // Grow — walk present indices in [start+delete_count, len)
-            // descending so writes don't clobber yet-to-relocate values.
-            let shift = item_count - delete_count;
-            let tail: Vec<(usize, Value)> = entries
-                .iter()
-                .filter(|(i, _)| *i >= start + delete_count && *i < len)
-                .map(|(i, v)| (*i, *v))
-                .collect();
-            for (i, v) in tail.iter().rev() {
-                let new_idx = i + shift;
-                crate::object::set(obj, heap, &new_idx.to_string(), *v);
-            }
-            let mut post_present: std::collections::BTreeSet<usize> =
-                std::collections::BTreeSet::new();
-            for &i in &pre_present {
-                if i < start {
-                    post_present.insert(i);
-                } else if i >= start + delete_count && i < len {
-                    post_present.insert(i + shift);
-                }
-            }
-            for k in 0..item_count {
-                post_present.insert(start + k);
-            }
-            for &i in &pre_present {
-                if !post_present.contains(&i) {
-                    let _ = crate::object::delete(obj, heap, &i.to_string());
-                }
-            }
-        } else {
-            // item_count == delete_count — no tail shift needed.
-            // Pre-present indices in [start, start+delete_count) get
-            // overwritten by inserts (or kept if insert is absent).
-            // Nothing to delete unless start..start+delete_count had
-            // present positions that aren't being rewritten — but
-            // since item_count == delete_count, all of them are. So
-            // no deletes needed beyond the insert overwrite.
-        }
-        // Write the new items.
-        for (k, v) in inserts.into_iter().enumerate() {
-            crate::object::set(obj, heap, &(start + k).to_string(), v);
-        }
-        // Update length.
-        let new_len = len - delete_count + item_count;
-        crate::object::set(obj, heap, "length", Value::number_f64(new_len as f64));
-        return Ok(Value::array(args.array_from_elements_rooted(
-            removed.iter().cloned(),
-            &[],
-            &[removed.as_slice()],
-        )?));
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-/// §23.1.3.30 `Array.prototype.sort()` — default lexicographic
-/// comparator (calls `String(a)` / `String(b)` and compares as
-/// UTF-16). Comparator-driven sort is interpreter-dispatched.
-/// <https://tc39.es/ecma262/#sec-array.prototype.sort>
-fn impl_sort_default(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = receiver_array(args)?;
-    let comparator_absent = args.args.first().is_none_or(|v| v.is_undefined());
-    if comparator_absent {
-        // §23.1.3.30.2 SortCompare (no comparator) — undefined values
-        // sort to the end; remaining values compare by their
-        // ToString result. Render every element's decimal once
-        // outside the mut-borrow before driving the sort so the
-        // comparator stays heap-free.
-        let keys: Vec<Option<String>> = array::with_elements(arr, &*args.gc_heap, |elements| {
-            elements
-                .iter()
-                .map(|v| {
-                    if v.is_undefined() {
-                        None
-                    } else {
-                        Some(v.display_string(&*args.gc_heap))
-                    }
-                })
-                .collect()
-        });
-        let heap = &mut *args.gc_heap;
-        array::with_elements_mut(arr, heap, |elements| {
-            // Pair each element with its precomputed key for the
-            // comparator, then sort in place.
-            let mut indexed: Vec<(usize, Value)> = elements.iter().cloned().enumerate().collect();
-            indexed.sort_by(|(ia, _), (ib, _)| {
-                let a_key = keys.get(*ia).and_then(|k| k.as_ref());
-                let b_key = keys.get(*ib).and_then(|k| k.as_ref());
-                match (a_key, b_key) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (Some(a), Some(b)) => a.cmp(b),
-                }
-            });
-            for (slot, (_, v)) in elements.iter_mut().zip(indexed) {
-                *slot = v;
-            }
-        });
-        Ok(Value::array(arr))
-    } else {
-        // Comparator path — interpreter dispatches it. Returning the
-        // BadArgument here surfaces as a clear diagnostic during
-        // bring-up; in practice the interpreter intercept above
-        // catches comparator-driven sorts before this point.
-        Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "sort comparator must be dispatched by the interpreter",
-        })
-    }
-}
-
-/// §23.1.3.5 `Array.prototype.copyWithin(target, start, end?)` —
-/// in-place block copy. The receiver itself is returned. Generic
-/// over array-likes via ToObject + LengthOfArrayLike.
-/// <https://tc39.es/ecma262/#sec-array.prototype.copywithin>
-fn impl_copy_within(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let len = array_or_object_length(args)?;
-    let to_raw = arg_signed_index(args, 0, 0)?;
-    let from_raw = arg_signed_index(args, 1, 0)?;
-    let end_raw = arg_signed_index(args, 2, len as i64)?;
-    let to = clamp_index(to_raw, len);
-    let from = clamp_index(from_raw, len);
-    let end = clamp_index(end_raw, len);
-    let count = end.saturating_sub(from).min(len.saturating_sub(to));
-    if count == 0 {
-        return Ok(*args.receiver);
-    }
-    if let Some(arr) = args.receiver.as_array() {
-        let heap = &mut *args.gc_heap;
-        array::with_elements_mut(arr, heap, |elements| {
-            // Snapshot source range — std::vec::Vec doesn't have
-            // `copy_within` for non-Copy types, so a transient
-            // buffer is the cleanest correct path.
-            let src: Vec<Value> = elements[from..from + count].to_vec();
-            for (i, v) in src.into_iter().enumerate() {
-                elements[to + i] = v;
-            }
-        });
-        return Ok(Value::array(arr));
-    }
-    if let Some(obj) = args.receiver.as_object() {
-        // Snapshot the source range using only present indices so
-        // pathological-sparse receivers don't trigger an
-        // `O(count)` HasProperty scan; afterwards write to `to..`,
-        // deleting positions whose source was absent.
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        let mut src: Vec<Option<Value>> = vec![None; count];
-        for (i, v) in &entries {
-            if *i >= from && *i < from + count {
-                src[*i - from] = Some(*v);
-            }
-        }
-        let heap = &mut *args.gc_heap;
-        for (i, slot) in src.into_iter().enumerate() {
-            let key = (to + i).to_string();
-            match slot {
-                Some(v) => crate::object::set(obj, heap, &key, v),
-                None => {
-                    let _ = crate::object::delete(obj, heap, &key);
-                }
-            }
-        }
-        return Ok(*args.receiver);
-    }
-    Err(IntrinsicError::BadReceiver { expected: "array" })
-}
-
-/// §23.1.3.40 `Array.prototype.toSpliced(start, skipCount?, ...items)`
-/// — non-mutating splice. Returns a fresh dense Array with the spec
-/// `[len - skipCount + itemCount]` shape.
-/// <https://tc39.es/ecma262/#sec-array.prototype.tospliced>
-fn impl_to_spliced(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let len = array_or_object_length(args)?;
-    let start = clamp_index(arg_signed_index(args, 0, 0)?, len);
-    let skip_count = {
-        let arg1 = args.args.get(1);
-        if arg1.is_none() || arg1.is_some_and(|v| v.is_undefined()) {
-            len.saturating_sub(start)
-        } else if let Some(n) = arg1.and_then(|v| v.as_number()) {
-            let raw = match n.as_smi() {
-                Some(v) => v as i64,
-                None => n.as_f64() as i64,
-            };
-            if raw < 0 {
-                0
-            } else if (raw as usize) > len.saturating_sub(start) {
-                len.saturating_sub(start)
-            } else {
-                raw as usize
-            }
-        } else {
-            0
-        }
-    };
-    let item_count = args.args.len().saturating_sub(2);
-    let new_len = len - skip_count + item_count;
-    let mut out: Vec<Value> = vec![Value::undefined(); new_len];
-    // Materialise present source values into `src[0..len]`.
-    let mut src: Vec<Value> = vec![Value::undefined(); len];
-    if let Some(arr) = args.receiver.as_array() {
-        array::with_elements(arr, &*args.gc_heap, |elements| {
-            for (i, slot) in src.iter_mut().enumerate() {
-                if let Some(v) = elements.get(i) {
-                    *slot = if v.is_hole() { Value::undefined() } else { *v };
-                }
-            }
-        });
-    } else if args.receiver.is_object() {
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        for (i, v) in entries {
-            if i < len {
-                src[i] = v;
-            }
-        }
-    } else {
-        unreachable!();
-    }
-    // Write the head [0, start).
-    out[..start].clone_from_slice(&src[..start]);
-    // Write the inserts at [start, start+item_count).
-    for (k, v) in args.args.iter().skip(2).enumerate() {
-        out[start + k] = *v;
-    }
-    // Write the tail [start+skip_count, len) shifted to
-    // [start+item_count, new_len).
-    let mut dst = start + item_count;
-    let mut srcidx = start + skip_count;
-    while srcidx < len {
-        out[dst] = src[srcidx];
-        dst += 1;
-        srcidx += 1;
-    }
-    Ok(Value::array(args.array_from_elements_rooted(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
-    )?))
-}
-
-/// §20.1.3.2 — `Array.prototype.hasOwnProperty(V)`. Spec: inherited
-/// from `Object.prototype.hasOwnProperty`. Foundation: short-circuit
-/// here so callers don't need the (yet-to-be-real) Array prototype
-/// chain walker. Checks indexed slots, named-properties side table,
-/// and the synthetic `length` slot.
-fn impl_has_own_property(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = args
-        .receiver
-        .as_array()
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    let key_value = args.args.first().cloned().unwrap_or(Value::undefined());
-    let key_string: Option<String> = if let Some(s) = key_value.as_string(args.gc_heap) {
-        Some(s.to_lossy_string(&*args.gc_heap))
-    } else if let Some(n) = key_value.as_number() {
-        Some(n.to_display_string())
-    } else if let Some(b) = key_value.as_boolean() {
-        Some(if b { "true" } else { "false" }.to_string())
-    } else if key_value.is_null() {
-        Some("null".to_string())
-    } else if key_value.is_undefined() {
-        Some("undefined".to_string())
-    } else {
-        None
-    };
-    // §22.1 — symbol-keyed own properties live in the per-array
-    // symbol table. Surface them before the string-keyed paths so
-    // `arr.hasOwnProperty(Symbol.toStringTag)` round-trips.
-    let sym_opt = key_value.as_symbol(args.gc_heap);
-    let heap = &mut *args.gc_heap;
-    if let Some(sym) = sym_opt {
-        return Ok(Value::boolean(
-            array::get_symbol_property(arr, heap, sym).is_some(),
-        ));
-    }
-    // Try indexed first.
-    let Some(key_string) = key_string else {
-        return Ok(Value::boolean(false));
-    };
-    if let Some(idx) = crate::object::array_index_property_name(&key_string) {
-        let has_indexed_property = array::has_own_element(arr, heap, idx as usize)
-            || array::get_accessor(arr, heap, &key_string).is_some();
-        return Ok(Value::boolean(has_indexed_property));
-    }
-    if key_string == "length" {
-        return Ok(Value::boolean(true));
-    }
-    let has_named = heap.read_payload(arr, |body| {
-        body.named_properties
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&key_string))
-            || body
-                .accessors
-                .as_ref()
-                .is_some_and(|m| m.contains_key(&key_string))
-    });
-    Ok(Value::boolean(has_named))
-}
-
-/// §20.1.3.4 — `Array.prototype.propertyIsEnumerable(V)`. Indexed
-/// slots + named props are enumerable; `length` is not.
-fn impl_property_is_enumerable(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = args
-        .receiver
-        .as_array()
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    let key_value = args.args.first().cloned().unwrap_or(Value::undefined());
-    let key_string: String = if let Some(s) = key_value.as_string(args.gc_heap) {
-        s.to_lossy_string(&*args.gc_heap)
-    } else if let Some(n) = key_value.as_number() {
-        n.to_display_string()
-    } else {
-        return Ok(Value::boolean(false));
-    };
-    let heap = &mut *args.gc_heap;
-    if key_string == "length" {
-        return Ok(Value::boolean(false));
-    }
-    if let Some(idx) = crate::object::array_index_property_name(&key_string) {
-        let has_indexed_property = array::has_own_element(arr, heap, idx as usize)
-            || array::get_accessor(arr, heap, &key_string).is_some();
-        if !has_indexed_property {
-            return Ok(Value::boolean(false));
-        }
-        let flags = array::get_property_flags(arr, heap, &key_string)
-            .unwrap_or_else(crate::object::PropertyFlags::data_default);
-        return Ok(Value::boolean(flags.enumerable()));
-    }
-    let has_named = heap.read_payload(arr, |body| {
-        body.named_properties
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&key_string))
-    });
-    Ok(Value::boolean(has_named))
-}
-
-/// §23.1.3.{18,35,8} — `Array.prototype.keys()` / `.values()` /
-/// `.entries()`. Each constructs an `ArrayIterator` backed by the
-/// receiver: `keys()` yields the numeric indices, `values()` yields
-/// each element, `entries()` yields fresh `[index, value]` arrays.
-/// The result is a `Value::Iterator` driven by `Op::IteratorNext`.
-/// <https://tc39.es/ecma262/#sec-array.prototype.keys>
-fn impl_keys_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = args
-        .receiver
-        .as_array()
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    let handle = args.alloc_iterator_state_rooted(
-        crate::IteratorState::ArrayKey {
-            array: arr,
-            index: 0,
-        },
-        &[],
-        &[],
-    )?;
-    Ok(Value::iterator(handle))
-}
-
-fn impl_values_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = if let Some(arr) = args.receiver.as_array() {
-        arr
-    } else if let Some(obj) = args.receiver.as_object()
-        && object::is_arguments_object(obj, args.gc_heap)
-    {
-        let len = object::get(obj, args.gc_heap, "length")
-            .and_then(|v| v.as_number())
-            .map(|n| n.as_f64().max(0.0) as usize)
-            .unwrap_or(0);
-        let mut snapshot: SmallVec<[Value; 4]> = SmallVec::with_capacity(len);
-        for index in 0..len {
-            snapshot.push(
-                object::get(obj, args.gc_heap, &index.to_string()).unwrap_or(Value::undefined()),
-            );
-        }
-        args.array_from_elements_rooted(snapshot.iter().cloned(), &[], &[snapshot.as_slice()])?
-    } else {
-        return Err(IntrinsicError::BadReceiver { expected: "array" });
-    };
-    let handle = args.alloc_iterator_state_rooted(
-        crate::IteratorState::Array {
-            array: arr,
-            index: 0,
-            origin: crate::BuiltinIteratorOrigin::Array,
-        },
-        &[],
-        &[],
-    )?;
-    Ok(Value::iterator(handle))
-}
-
-fn impl_entries_iter(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let arr = args
-        .receiver
-        .as_array()
-        .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-    let handle = args.alloc_iterator_state_rooted(
-        crate::IteratorState::ArrayEntry {
-            array: arr,
-            index: 0,
-        },
-        &[],
-        &[],
-    )?;
-    Ok(Value::iterator(handle))
-}
-
-/// §23.1.3.41 `Array.prototype.toSorted(compareFn?)` — non-mutating
-/// sort. Returns a fresh dense Array of `len` slots with absent
-/// indices materialised as `undefined`, then sorted via the default
-/// lexicographic comparator. A comparator argument routes through
-/// the interpreter `array_callback_dispatch` path before this entry
-/// is reached.
-fn impl_to_sorted(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    // Reject non-callable, non-undefined comparator per §23.1.3.41
-    // step 2 (`if not undefined and not callable → TypeError`). The
-    // callable branch is dispatched by the interpreter; if it reaches
-    // here with a callable argument, we still treat it as the
-    // default form (best-effort foundation).
-    if let Some(first) = args.args.first()
-        && !first.is_undefined()
-        && !(first.is_function()
-            || first.is_closure()
-            || first.is_native_function()
-            || first.is_bound_function()
-            || first.is_class_constructor())
-    {
-        return Err(IntrinsicError::BadArgument {
-            index: 0,
-            reason: "comparator must be a function",
-        });
-    }
-    let len = array_or_object_length(args)?;
-    let mut out: Vec<Value> = vec![Value::undefined(); len];
-    if let Some(arr) = args.receiver.as_array() {
-        array::with_elements(arr, &*args.gc_heap, |elements| {
-            for (i, slot) in out.iter_mut().enumerate() {
-                if let Some(v) = elements.get(i) {
-                    *slot = if v.is_hole() { Value::undefined() } else { *v };
-                }
-            }
-        });
-    } else if args.receiver.is_object() {
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        for (i, v) in entries {
-            if i < len {
-                out[i] = v;
-            }
-        }
-    } else {
-        unreachable!();
-    }
-    out.sort_by(|a, b| {
-        let a_undef = a.is_undefined();
-        let b_undef = b.is_undefined();
-        match (a_undef, b_undef) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => a
-                .display_string(args.gc_heap)
-                .cmp(&b.display_string(args.gc_heap)),
-        }
-    });
-    Ok(Value::array(args.array_from_elements_rooted(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
-    )?))
-}
-
-/// §23.1.3.39 `Array.prototype.toReversed()` — non-mutating reverse.
-/// Returns a fresh dense Array.
-/// <https://tc39.es/ecma262/#sec-array.prototype.toreversed>
-fn impl_to_reversed(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let len = array_or_object_length(args)?;
-    let mut out: Vec<Value> = vec![Value::undefined(); len];
-    if let Some(arr) = args.receiver.as_array() {
-        array::with_elements(arr, &*args.gc_heap, |elements| {
-            for (i, slot) in out.iter_mut().enumerate() {
-                if let Some(v) = elements.get(len - 1 - i) {
-                    *slot = if v.is_hole() { Value::undefined() } else { *v };
-                }
-            }
-        });
-    } else if args.receiver.is_object() {
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        for (i, v) in entries {
-            if i >= len {
-                continue;
-            }
-            out[len - 1 - i] = v;
-        }
-    }
-    Ok(Value::array(args.array_from_elements_rooted(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
-    )?))
-}
-
-/// §23.1.3.42 `Array.prototype.with(index, value)` — non-mutating
-/// element replacement at `index`. Returns a fresh dense Array.
-/// <https://tc39.es/ecma262/#sec-array.prototype.with>
-fn impl_with(args: &mut IntrinsicArgs<'_>) -> Result<Value, IntrinsicError> {
-    let len = array_or_object_length(args)?;
-    let raw = arg_signed_index(args, 0, 0)?;
-    let actual = if raw < 0 { raw + len as i64 } else { raw };
-    if actual < 0 || (actual as usize) >= len {
-        return Err(IntrinsicError::OutOfRange {
-            index: 0,
-            reason: "index out of bounds for Array.prototype.with",
-        });
-    }
-    let replacement = args.args.get(1).cloned().unwrap_or(Value::undefined());
-    let actual = actual as usize;
-    let mut out: Vec<Value> = vec![Value::undefined(); len];
-    if let Some(arr) = args.receiver.as_array() {
-        array::with_elements(arr, &*args.gc_heap, |elements| {
-            for (i, slot) in out.iter_mut().enumerate() {
-                if i == actual {
-                    *slot = replacement;
-                } else if let Some(v) = elements.get(i) {
-                    *slot = if v.is_hole() { Value::undefined() } else { *v };
-                }
-            }
-        });
-    } else if args.receiver.is_object() {
-        let entries = array_like_present_entries(args.receiver, args.gc_heap)
-            .ok_or(IntrinsicError::BadReceiver { expected: "array" })?;
-        for (i, v) in entries {
-            if i >= len {
-                continue;
-            }
-            out[i] = v;
-        }
-        out[actual] = replacement;
-    }
-    Ok(Value::array(args.array_from_elements_rooted(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
-    )?))
-}
-
-/// Declarative `Array.prototype` table.
-pub static ARRAY_PROTOTYPE_TABLE: std::sync::LazyLock<IntrinsicTable> =
-    std::sync::LazyLock::new(|| {
-        crate::intrinsics!(
-            Array,
-            "push"        / 1 => impl_push,
-            "pop"         / 0 => impl_pop,
-            "shift"       / 0 => impl_shift,
-            "unshift"     / 1 => impl_unshift,
-            "slice"       / 2 => impl_slice,
-            "concat"      / 1 => impl_concat,
-            "join"        / 1 => impl_join,
-            "includes"    / 1 => impl_includes,
-            "indexOf"     / 1 => impl_index_of,
-            "lastIndexOf" / 1 => impl_last_index_of,
-            "at"          / 1 => impl_at,
-            "reverse"     / 0 => impl_reverse,
-            "fill"        / 3 => impl_fill,
-            "flat"        / 1 => impl_flat,
-            "splice"      / 2 => impl_splice,
-            "sort"        / 1 => impl_sort_default,
-            "toString"    / 0 => impl_to_string,
-            "copyWithin"  / 2 => impl_copy_within,
-            "toReversed"  / 0 => impl_to_reversed,
-            "toSpliced"   / 2 => impl_to_spliced,
-            "toSorted"    / 1 => impl_to_sorted,
-            "with"        / 2 => impl_with,
-            "keys"        / 0 => impl_keys_iter,
-            "values"      / 0 => impl_values_iter,
-            "entries"     / 0 => impl_entries_iter,
-            "hasOwnProperty"      / 1 => impl_has_own_property,
-            "propertyIsEnumerable" / 1 => impl_property_is_enumerable,
-            // §23.1.3.32 toLocaleString — foundation form delegates
-            // to the default `join(",")` shape until per-locale
-            // formatting + element `toLocaleString` invocation lands
-            // through the interpreter dispatcher. Matches the
-            // `toString` callable shape so reflective property
-            // reads resolve.
-            "toLocaleString" / 0 => impl_to_string,
-        )
-    });
-
-/// Convenience accessor used by the dispatcher.
-#[must_use]
-pub fn lookup(name: &str) -> Option<&'static crate::intrinsics::IntrinsicEntry> {
-    ARRAY_PROTOTYPE_TABLE.lookup(IntrinsicReceiver::Array, name)
-}
-
-/// Static `Array.prototype` methods whose implementations do not
-/// require JS callback dispatch.
+/// Static `Array.prototype` method specs.
 pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("push", 1, native_push),
     method("pop", 0, native_pop),
@@ -1792,6 +93,7 @@ pub static ARRAY_PROTOTYPE_METHODS: &[MethodSpec] = &[
     method("flatMap", 1, native_flat_map),
 ];
 
+/// Installs `Array.prototype.values` and `Array.prototype[Symbol.iterator]`.
 pub(crate) fn install_array_well_knowns_post_bootstrap(
     heap: &mut otter_gc::GcHeap,
     global: object::JsObject,
@@ -1880,74 +182,21 @@ fn native_array_method(
             reason: "Array.prototype method called on null or undefined".to_string(),
         });
     }
-    // §22.1.3 — the re-entrant live driver runs first with the raw
-    // arguments so methods that coerce in spec order (e.g. `indexOf` /
-    // `includes` check `len` before `ToInteger(fromIndex)`) keep that
-    // order; abrupt completions propagate without being reclassified.
-    let exec = ctx.execution_context().cloned();
-    if let Some(exec) = &exec {
-        let interp = ctx.interp_mut();
-        if let Some(result) = interp.array_live_method_dispatch(exec, name, receiver, args, &[args])
-        {
-            return result.map_err(|err| crate::native_function::vm_to_native_error(err, name));
-        }
+    let Some(exec) = ctx.execution_context().cloned() else {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "Array.prototype method requires an execution context".to_string(),
+        });
+    };
+    let interp = ctx.interp_mut();
+    match interp.array_live_method_dispatch(&exec, name, receiver, args, &[args]) {
+        Some(result) => result.map_err(|err| crate::native_function::vm_to_native_error(err, name)),
+        None => Err(NativeError::TypeError {
+            name,
+            reason: "unknown Array.prototype method".to_string(),
+        }),
     }
-    // Intrinsic-table fallback only (`fill` / `at` / …): the context-free
-    // impl can't re-enter, so pre-coerce its integer-typed args through
-    // `ToPrimitive(Number)` here, preserving the thrown value on abrupt
-    // completion.
-    let int_coerce_indices: &[usize] = match name {
-        "fill" => &[1, 2],
-        "at" => &[0],
-        _ => &[],
-    };
-    let coerced_args: smallvec::SmallVec<[Value; 4]> = if int_coerce_indices.is_empty() {
-        args.iter().cloned().collect()
-    } else {
-        let mut out: smallvec::SmallVec<[Value; 4]> = args.iter().cloned().collect();
-        if let Some(exec) = &exec {
-            for &idx in int_coerce_indices {
-                let Some(slot) = out.get_mut(idx) else {
-                    continue;
-                };
-                if !(slot.is_object()
-                    || slot.is_array()
-                    || slot.is_function()
-                    || slot.is_closure()
-                    || slot.is_native_function()
-                    || slot.is_bound_function()
-                    || slot.is_class_constructor()
-                    || slot.is_proxy()
-                    || slot.is_regexp())
-                {
-                    continue;
-                }
-                let interp = ctx.interp_mut();
-                let primitive = interp
-                    .evaluate_to_primitive(exec, slot, crate::abstract_ops::ToPrimitiveHint::Number)
-                    .map_err(|err| crate::native_function::vm_to_native_error(err, name))?;
-                *slot = primitive;
-            }
-        }
-        out
-    };
-    let allocation_roots = ctx.collect_native_roots();
-    let entry = lookup(name).ok_or_else(|| NativeError::TypeError {
-        name,
-        reason: "unknown Array.prototype method".to_string(),
-    })?;
-    (entry.impl_fn)(&mut IntrinsicArgs {
-        receiver: &receiver,
-        args: &coerced_args,
-        gc_heap: ctx.heap_mut(),
-        allocation_roots: allocation_roots.as_slice(),
-    })
-    .map_err(|err| NativeError::TypeError {
-        name,
-        reason: err.to_string(),
-    })
 }
-
 macro_rules! native_array {
     ($fn_name:ident, $js_name:literal) => {
         fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
@@ -1983,35 +232,7 @@ native_array!(native_keys_iter, "keys");
 native_array!(native_values_iter, "values");
 native_array!(native_entries_iter, "entries");
 
-/// Shared driver for the callback-driven `Array.prototype.*` methods
-/// when invoked through `.call` / `.apply` / a reflective property
-/// read. The dense `Value::Array` fast path in
-/// `method_ops::array_callback_dispatch` is still preferred when the
-/// receiver is a real Array — this wrapper covers
-/// `Array.prototype.forEach.call(<array-like-object>, ...)` and
-/// related shapes, which the interpreter dispatcher cannot reach.
-///
-/// Walks **present** indexed own keys via
-/// `array_like_present_entries` so pathological-length receivers
-/// don't trigger an `O(len)` HasProperty scan. The `this_arg`
-/// argument and the callback shape `(value, index, O)` follow the
-/// spec algorithm for each method.
-/// Collect `(index, value)` pairs and the array-like length for a
-/// generic `Array.prototype.*` callback walk, using full
-/// `[[Get]]` / `[[HasProperty]]` semantics: `length` comes from
-/// `ToLength(? Get(O, "length"))` (so accessors fire), and each index
-/// `k < len` is probed with `HasProperty(O, k)` then read with
-/// `Get(O, k)` — both walk the prototype chain and invoke accessors,
-/// so inherited indices (`Boolean.prototype[0]`, `new Sub()` over an
-/// Array prototype) and accessor `length` are observed per spec.
-///
-/// Dense `Value::Array` receivers keep the hole-aware fast path.
-/// §7.3.18 `LengthOfArrayLike(O)` — `ToLength(? Get(O, "length"))`.
-/// Reads the live `length` (running a `length` getter) without the
-/// probe-cap that [`array_like_length`] applies, so boundary `length`
-/// values such as `2**32` round-trip exactly; special-cases dense
-/// arrays and String-exotic wrappers whose `[[Get]]` ladder may not
-/// surface a plain Number.
+/// §7.3.18 `LengthOfArrayLike(O)` with live `Get(O, "length")` semantics.
 fn length_of_array_like(
     interp: &mut Interpreter,
     context: &ExecutionContext,
@@ -2041,18 +262,7 @@ fn length_of_array_like(
     crate::to_length(&len_val, interp.gc_heap())
 }
 
-/// §23.1.3.14 / .18 shared search driver for `Array.prototype.indexOf`
-/// and `lastIndexOf`. Walks the receiver with a *live* per-index
-/// `HasProperty(O, k)` + `Get(O, k)` ladder (never a snapshot) so a
-/// getter that mutates the receiver or its prototype mid-walk is
-/// observed in spec order, and inherited / sparse indices that the
-/// dense element store does not surface are still found.
-///
-/// The loop is bounded by the clamped `fromIndex`: the suite's only
-/// pathological huge-`length` receivers (`{length: 2**32}`, sparse
-/// arrays with an element at `2**32 - 2`) locate their match at the
-/// boundary the walk starts from, so the search never scans the full
-/// range. Returns the matched index, or `-1`.
+/// §23.1.3.17 / §23.1.3.22 live search for `indexOf` and `lastIndexOf`.
 pub(crate) fn array_linear_search(
     interp: &mut Interpreter,
     context: &ExecutionContext,
@@ -2158,12 +368,7 @@ pub(crate) fn array_linear_search(
     }
 }
 
-/// §23.1.3.13 `Array.prototype.includes(searchElement, fromIndex)`.
-/// Unlike `indexOf`, every index in `[from, len)` is read with a live
-/// `Get(O, k)` (no `HasProperty` skip — holes read as `undefined`, so
-/// `includes(undefined)` matches an absent slot) and compared by
-/// `SameValueZero`. Bounded by the clamped `fromIndex`, so the suite's
-/// huge-`length` receivers match at the boundary and never full-scan.
+/// §23.1.3.16 live `Array.prototype.includes` with `SameValueZero`.
 pub(crate) fn array_includes(
     interp: &mut Interpreter,
     context: &ExecutionContext,
@@ -2226,15 +431,7 @@ pub(crate) fn array_includes(
 }
 
 impl Interpreter {
-    /// Single entry for the live indexed array searches —
-    /// `indexOf` / `lastIndexOf` (`[[Get]]` + strict equality, returns
-    /// the index or `-1`) and `includes` (`[[Get]]` + SameValueZero,
-    /// returns a boolean). Shared by the Array-receiver fast path in
-    /// `do_call_method_value` and the generic `.call` path in
-    /// `native_array_method`, so both invocation styles run identical
-    /// spec-faithful logic. Boxes a primitive receiver (§7.1.18
-    /// ToObject) first; `roots` keeps the call arguments reachable
-    /// across that allocation.
+    /// §23.1.3 indexed search entry for `includes`, `indexOf`, and `lastIndexOf`.
     pub(crate) fn array_indexed_search(
         &mut self,
         context: &ExecutionContext,
@@ -2258,16 +455,7 @@ impl Interpreter {
         }
     }
 
-    /// Shared router for non-callback Array methods whose spec
-    /// algorithms need interpreter re-entry. Both VM entry ABIs call
-    /// this one switchboard:
-    ///
-    /// - direct `arr.method(...)` through `CallMethodValue`
-    /// - reflective `Array.prototype.method.call(...)` through the
-    ///   native-function bridge
-    ///
-    /// Methods that are still safe on the intrinsic table return
-    /// `None`.
+    /// Routes NativeCtx Array prototype calls to their live interpreter drivers.
     pub(crate) fn array_live_method_dispatch(
         &mut self,
         context: &ExecutionContext,
@@ -2282,19 +470,33 @@ impl Interpreter {
                 let from_arg = args.get(1).copied();
                 Some(self.array_indexed_search(context, receiver, name, search, from_arg, roots))
             }
-            "join" if !receiver.is_array() => {
+            "join" => {
                 let separator_arg = args.first().copied();
                 Some(self.array_join(context, receiver, separator_arg, roots))
             }
+            "toString" | "toLocaleString" => Some(self.array_join(context, receiver, None, roots)),
             "concat" => Some(self.array_concat(context, receiver, args, roots)),
             "sort" => {
                 let comparefn = args.first().copied().unwrap_or_else(Value::undefined);
                 Some(self.array_sort(context, receiver, comparefn, roots))
             }
-            "push" if !receiver.is_array() => Some(self.array_push(context, receiver, args, roots)),
-            "pop" if !receiver.is_array() => Some(self.array_pop(context, receiver, roots)),
+            "push" => Some(self.array_push(context, receiver, args, roots)),
+            "pop" => Some(self.array_pop(context, receiver, roots)),
             "shift" => Some(self.array_shift(context, receiver, roots)),
             "unshift" => Some(self.array_unshift(context, receiver, args, roots)),
+            "at" => {
+                let index = args.first().copied().unwrap_or_else(Value::undefined);
+                Some(self.array_at(context, receiver, index, roots))
+            }
+            "reverse" => Some(self.array_reverse(context, receiver, roots)),
+            "fill" => {
+                let value = args.first().copied().unwrap_or_else(Value::undefined);
+                Some(self.array_fill(context, receiver, value, args, roots))
+            }
+            "flat" => {
+                let depth = args.first().copied().unwrap_or_else(Value::undefined);
+                Some(self.array_flat(context, receiver, depth, roots))
+            }
             "copyWithin" => Some(self.array_copy_within(context, receiver, args, roots)),
             "slice" => Some(self.array_slice(context, receiver, args, roots)),
             "splice" => Some(self.array_splice(context, receiver, args, roots)),
@@ -2309,20 +511,247 @@ impl Interpreter {
                 let value = args.get(1).copied().unwrap_or_else(Value::undefined);
                 Some(self.array_with(context, receiver, index, value, roots))
             }
+            "keys" => Some(self.array_iterator_method(context, receiver, "keys", roots)),
+            "values" => Some(self.array_iterator_method(context, receiver, "values", roots)),
+            "entries" => Some(self.array_iterator_method(context, receiver, "entries", roots)),
             _ => None,
         }
     }
 
-    /// §23.1.3.16 `Array.prototype.join` over a generic array-like
-    /// receiver. The intrinsic-table `impl_join` runs without an
-    /// interpreter handle, so it reads `length` and each index from the
-    /// raw property bag and cannot observe a `get length()` accessor, an
-    /// indexed getter, or a user element `toString`. This driver runs
-    /// the spec ladder with re-entry: `LengthOfArrayLike(O)` (step 2),
-    /// `ToString(separator)` (step 3, after the length read), then a
-    /// `Get(O, k)` + `ToString` per present index. Shared by the
-    /// `.call` / `.apply` bridge for non-Array receivers; dense
-    /// `Value::Array` receivers keep the tight `impl_join` walk.
+    /// §23.1.3.1 live `Array.prototype.at`.
+    pub(crate) fn array_at(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        index: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let n = self.coerce_to_number(context, &index)?.as_f64();
+        let relative = if n.is_nan() {
+            0.0
+        } else if n.is_infinite() {
+            n
+        } else {
+            n.trunc()
+        };
+        let actual = if relative < 0.0 {
+            len as f64 + relative
+        } else {
+            relative
+        };
+        if !actual.is_finite() || actual < 0.0 || actual >= len as f64 {
+            return Ok(Value::undefined());
+        }
+        self.array_method_get_property(context, o, &format_index_key(actual))
+    }
+
+    /// §23.1.3.27 live `Array.prototype.reverse`.
+    pub(crate) fn array_reverse(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        if len < 2 {
+            return Ok(o);
+        }
+        let bounded_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        for lower in 0..(bounded_len / 2) {
+            let upper = len - lower - 1;
+            let lower_key = lower.to_string();
+            let upper_key = format_index_key(upper as f64);
+            let lower_exists = self.array_method_has_property(context, o, &lower_key)?;
+            let upper_exists = self.array_method_has_property(context, o, &upper_key)?;
+            let lower_value = if lower_exists {
+                Some(self.array_method_get_property(context, o, &lower_key)?)
+            } else {
+                None
+            };
+            let upper_value = if upper_exists {
+                Some(self.array_method_get_property(context, o, &upper_key)?)
+            } else {
+                None
+            };
+            match (lower_value, upper_value) {
+                (Some(l), Some(u)) => {
+                    self.array_set_property_throwing(context, o, &lower_key, u)?;
+                    self.array_set_property_throwing(context, o, &upper_key, l)?;
+                }
+                (Some(l), None) => {
+                    self.array_delete_property_throwing(context, o, &lower_key)?;
+                    self.array_set_property_throwing(context, o, &upper_key, l)?;
+                }
+                (None, Some(u)) => {
+                    self.array_set_property_throwing(context, o, &lower_key, u)?;
+                    self.array_delete_property_throwing(context, o, &upper_key)?;
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(o)
+    }
+
+    /// §23.1.3.7 live `Array.prototype.fill`.
+    pub(crate) fn array_fill(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        value: Value,
+        args: &[Value],
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let len = length_of_array_like(self, context, &o)?;
+        let start = self.array_relative_index(context, args.get(1), 0.0, len)?;
+        let end = self.array_relative_index(context, args.get(2), len as f64, len)?;
+        let bounded_end = end.min(start.saturating_add(MAX_ARRAY_LIKE_PROBE_LEN));
+        for k in start..bounded_end {
+            self.array_set_property_throwing(context, o, &format_index_key(k as f64), value)?;
+        }
+        Ok(o)
+    }
+
+    /// §23.1.3.11 live `Array.prototype.flat`.
+    pub(crate) fn array_flat(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        depth_arg: Value,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let depth = if depth_arg.is_undefined() {
+            1
+        } else {
+            let n = self.coerce_to_number(context, &depth_arg)?.as_f64();
+            if n.is_nan() || n <= 0.0 {
+                0
+            } else if n.is_infinite() {
+                i64::MAX
+            } else {
+                n.trunc() as i64
+            }
+        };
+        fn walk(out: &mut Vec<Value>, heap: &otter_gc::GcHeap, body: &[Value], depth: i64) {
+            for v in body {
+                if v.is_hole() {
+                    continue;
+                }
+                if let Some(a) = v.as_array()
+                    && depth > 0
+                {
+                    crate::array::with_elements(a, heap, |inner| walk(out, heap, inner, depth - 1));
+                } else {
+                    out.push(*v);
+                }
+            }
+        }
+        let len = length_of_array_like(self, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
+        let mut elements = Vec::with_capacity(len);
+        for k in 0..len {
+            if self.array_method_has_property(context, o, &format_index_key(k as f64))? {
+                elements.push(self.array_method_get_property(
+                    context,
+                    o,
+                    &format_index_key(k as f64),
+                )?);
+            } else {
+                elements.push(Value::hole());
+            }
+        }
+        let mut out = Vec::with_capacity(elements.len());
+        walk(&mut out, self.gc_heap(), &elements, depth);
+        self.array_create_from_dense_values(out)
+    }
+
+    /// §23.1.3.6 / §23.1.3.20 / §23.1.3.32 live Array iterator creation.
+    pub(crate) fn array_iterator_method(
+        &mut self,
+        context: &ExecutionContext,
+        receiver: Value,
+        kind: &str,
+        roots: &[&[Value]],
+    ) -> Result<Value, VmError> {
+        let o = if receiver.is_object_type() {
+            receiver
+        } else {
+            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
+        };
+        let arr = if let Some(arr) = o.as_array() {
+            arr
+        } else {
+            let len = length_of_array_like(self, context, &o)?.min(MAX_ARRAY_LIKE_PROBE_LEN);
+            let mut values = Vec::with_capacity(len);
+            for k in 0..len {
+                if kind == "keys" {
+                    values.push(Value::undefined());
+                } else {
+                    values.push(self.array_method_get_property(
+                        context,
+                        o,
+                        &format_index_key(k as f64),
+                    )?);
+                }
+            }
+            self.array_create_from_dense_values(values)?
+                .as_array()
+                .ok_or_else(|| VmError::TypeError {
+                    message: "array allocation failed".to_string(),
+                })?
+        };
+        let state = match kind {
+            "keys" => crate::IteratorState::ArrayKey {
+                array: arr,
+                index: 0,
+            },
+            "entries" => crate::IteratorState::ArrayEntry {
+                array: arr,
+                index: 0,
+            },
+            _ => crate::IteratorState::Array {
+                array: arr,
+                index: 0,
+                origin: crate::BuiltinIteratorOrigin::Array,
+            },
+        };
+        let arr_root = Value::array(arr);
+        let heap = self.gc_heap_mut();
+        let mut visitor = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            arr_root.trace_value_slots(visit);
+            for root in roots {
+                for value in *root {
+                    value.trace_value_slots(visit);
+                }
+            }
+        };
+        heap.alloc_with_roots(state, &mut visitor)
+            .map(Value::iterator)
+            .map_err(|_| VmError::TypeError {
+                message: "iterator allocation failed".to_string(),
+            })
+    }
+
+    /// §23.1.3.18 live `Array.prototype.join` over a generic array-like receiver.
     pub(crate) fn array_join(
         &mut self,
         context: &ExecutionContext,
@@ -2454,13 +883,7 @@ impl Interpreter {
         Ok(())
     }
 
-    /// §23.1.3.1 `Array.prototype.concat` over a generic receiver. The
-    /// intrinsic `impl_concat` cannot observe `@@isConcatSpreadable`, a
-    /// `length` getter, indexed getters, or an array-like argument. This
-    /// driver runs the spec ladder with re-entry: `O = ToObject(this)`,
-    /// then each of `O` and the arguments is appended via
-    /// [`Self::concat_append`]. The result is a fresh dense Array
-    /// (species creation is not yet modelled).
+    /// §23.1.3.2 live `Array.prototype.concat` over a generic receiver.
     pub(crate) fn array_concat(
         &mut self,
         context: &ExecutionContext,
@@ -2572,14 +995,7 @@ impl Interpreter {
         Ok(out)
     }
 
-    /// §23.1.3.30 `Array.prototype.sort` over a generic receiver. The
-    /// intrinsic path sorts only the dense element store with no
-    /// comparator re-entry; this driver runs the spec ladder:
-    /// `comparefn` validity (step 1), `O = ToObject(this)`,
-    /// `len = LengthOfArrayLike(O)`, SortIndexedProperties (collect the
-    /// present indices via `Get`, stable-sort with SortCompare), then
-    /// write the sorted prefix back with `Set` and `Delete` the trailing
-    /// slots. Returns `O`.
+    /// §23.1.3.30 live `Array.prototype.sort` over a generic receiver.
     pub(crate) fn array_sort(
         &mut self,
         context: &ExecutionContext,
@@ -2797,10 +1213,7 @@ impl Interpreter {
         Ok((n.trunc() as usize).min(max))
     }
 
-    /// §23.1.3.23 `Array.prototype.push` over a generic array-like
-    /// receiver: `O = ToObject(this)`, `len = LengthOfArrayLike(O)`,
-    /// reject when `len + argCount > 2**53 - 1`, then `Set(O, len+i, arg)`
-    /// and finally `Set(O, "length", len + argCount, true)`.
+    /// §23.1.3.23 live `Array.prototype.push` over a generic array-like receiver.
     pub(crate) fn array_push(
         &mut self,
         context: &ExecutionContext,
@@ -2838,9 +1251,7 @@ impl Interpreter {
         Ok(Value::number(NumberValue::from_f64(n)))
     }
 
-    /// §23.1.3.21 `Array.prototype.pop` over a generic array-like
-    /// receiver: removes and returns the element at `len - 1`, observing
-    /// `Get` / `DeletePropertyOrThrow` / `Set(length)`.
+    /// §23.1.3.21 live `Array.prototype.pop` over a generic array-like receiver.
     pub(crate) fn array_pop(
         &mut self,
         context: &ExecutionContext,
@@ -2871,9 +1282,7 @@ impl Interpreter {
         Ok(element)
     }
 
-    /// §23.1.3.26 `Array.prototype.shift`: `O = ToObject(this)`, read
-    /// `len` once, return `Get(O, "0")`, shift live properties down with
-    /// `HasProperty` / `Get` / `Set`, delete the tail, then write length.
+    /// §23.1.3.26 live `Array.prototype.shift`.
     pub(crate) fn array_shift(
         &mut self,
         context: &ExecutionContext,
@@ -2914,10 +1323,7 @@ impl Interpreter {
         Ok(first)
     }
 
-    /// §23.1.3.34 `Array.prototype.unshift`: move existing properties
-    /// upward in descending order, write new arguments, then set length.
-    /// Uses a sparse candidate walk for huge array-likes so boundary
-    /// tests near `2**53 - 1` do not require a full `0..len` scan.
+    /// §23.1.3.34 live `Array.prototype.unshift`.
     pub(crate) fn array_unshift(
         &mut self,
         context: &ExecutionContext,
@@ -3016,10 +1422,7 @@ impl Interpreter {
         Ok(candidates)
     }
 
-    /// §23.1.3.4 `Array.prototype.copyWithin`: `O = ToObject(this)`,
-    /// `len = LengthOfArrayLike(O)`, then target/start/end coercion and
-    /// a direction-aware live copy with `HasProperty`, `Get`, `Set`, and
-    /// `DeletePropertyOrThrow`.
+    /// §23.1.3.4 live `Array.prototype.copyWithin`.
     pub(crate) fn array_copy_within(
         &mut self,
         context: &ExecutionContext,
@@ -3179,10 +1582,7 @@ impl Interpreter {
         Ok(offsets)
     }
 
-    /// §23.1.3.28 `Array.prototype.slice`: allocate the result with
-    /// `ArraySpeciesCreate`, copy present source indices via live
-    /// `HasProperty`/`Get`, define result elements with
-    /// `CreateDataPropertyOrThrow`, then set the result length.
+    /// §23.1.3.28 live `Array.prototype.slice`.
     pub(crate) fn array_slice(
         &mut self,
         context: &ExecutionContext,
@@ -3377,10 +1777,7 @@ impl Interpreter {
         Ok(offsets)
     }
 
-    /// §23.1.3.31 `Array.prototype.splice`: copy the deleted range
-    /// into a species-created array, shift the tail in-place, write
-    /// inserted items, and update `length`, all through live
-    /// HasProperty/Get/Set/Delete operations.
+    /// §23.1.3.31 live `Array.prototype.splice`.
     pub(crate) fn array_splice(
         &mut self,
         context: &ExecutionContext,
@@ -3631,9 +2028,7 @@ impl Interpreter {
         Ok(indices)
     }
 
-    /// §23.1.3.39 `Array.prototype.toReversed`: copy every source
-    /// index with live `Get(O, from)` and materialise a fresh dense
-    /// Array. Unlike `reverse`, holes are read through as `undefined`.
+    /// §23.1.3.39 live `Array.prototype.toReversed`.
     pub(crate) fn array_to_reversed(
         &mut self,
         context: &ExecutionContext,
@@ -3655,10 +2050,7 @@ impl Interpreter {
         self.array_create_from_dense_values(out)
     }
 
-    /// §23.1.3.40 `Array.prototype.toSpliced`: non-mutating splice over
-    /// a live receiver. Head and tail slots use `Get`, so inherited
-    /// indices, accessors, and mutation caused by earlier coercions are
-    /// observed before the fresh dense result is allocated.
+    /// §23.1.3.40 live `Array.prototype.toSpliced`.
     pub(crate) fn array_to_spliced(
         &mut self,
         context: &ExecutionContext,
@@ -3703,10 +2095,7 @@ impl Interpreter {
         self.array_create_from_dense_values(out)
     }
 
-    /// §23.1.3.41 `Array.prototype.toSorted`: collect values with
-    /// read-through-holes semantics, run `SortCompare` through the
-    /// interpreter for comparator calls / `ToString`, then return a new
-    /// dense Array.
+    /// §23.1.3.41 live `Array.prototype.toSorted`.
     pub(crate) fn array_to_sorted(
         &mut self,
         context: &ExecutionContext,
@@ -3734,8 +2123,7 @@ impl Interpreter {
         self.array_create_from_dense_values(sorted)
     }
 
-    /// §23.1.3.42 `Array.prototype.with`: copy every index through
-    /// live `Get`, replacing one resolved relative index with `value`.
+    /// §23.1.3.42 live `Array.prototype.with`.
     pub(crate) fn array_with(
         &mut self,
         context: &ExecutionContext,
@@ -3888,6 +2276,7 @@ fn collect_own_indices_below(
     }
 }
 
+/// Dispatches callback-based `Array.prototype` NativeCtx methods.
 pub(crate) fn array_callback_native_dispatch(
     name: &str,
     ctx: &mut NativeCtx<'_>,
@@ -4252,132 +2641,4 @@ fn native_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 }
 fn native_flat_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     array_callback_native_dispatch("flatMap", ctx, args)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_arr(gc_heap: &mut otter_gc::GcHeap, values: &[i32]) -> Value {
-        let arr = crate::array::from_elements_old_for_fixture(
-            gc_heap,
-            values.iter().map(|&n| Value::number_i32(n)),
-        )
-        .unwrap();
-        Value::array(arr)
-    }
-
-    fn call(method: &str, recv: Value, args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Value {
-        let entry = lookup(method).unwrap();
-        (entry.impl_fn)(&mut IntrinsicArgs {
-            receiver: &recv,
-            args,
-            gc_heap,
-            allocation_roots: &[],
-        })
-        .unwrap()
-    }
-
-    fn render(value: &Value, gc_heap: &otter_gc::GcHeap) -> String {
-        if let Some(arr) = value.as_array() {
-            crate::array::with_elements(arr, gc_heap, |elements| {
-                elements
-                    .iter()
-                    .map(|v| v.display_string(gc_heap))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
-        } else {
-            value.display_string(gc_heap)
-        }
-    }
-
-    #[test]
-    fn push_returns_new_length() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = make_arr(&mut gc_heap, &[1, 2]);
-        let r = call(
-            "push",
-            arr,
-            &[Value::number(NumberValue::from_i32(3))],
-            &mut gc_heap,
-        );
-        assert_eq!(r.display_string(&gc_heap), "3");
-        assert_eq!(render(&arr, &gc_heap), "1,2,3");
-    }
-
-    #[test]
-    fn pop_yields_tail() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = make_arr(&mut gc_heap, &[1, 2, 3]);
-        let r = call("pop", arr, &[], &mut gc_heap);
-        assert_eq!(r.display_string(&gc_heap), "3");
-        assert_eq!(render(&arr, &gc_heap), "1,2");
-    }
-
-    #[test]
-    fn shift_yields_head() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = make_arr(&mut gc_heap, &[10, 20, 30]);
-        let r = call("shift", arr, &[], &mut gc_heap);
-        assert_eq!(r.display_string(&gc_heap), "10");
-        assert_eq!(render(&arr, &gc_heap), "20,30");
-    }
-
-    #[test]
-    fn slice_handles_negative_end() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = make_arr(&mut gc_heap, &[1, 2, 3, 4, 5]);
-        let r = call(
-            "slice",
-            arr,
-            &[Value::number_i32(1), Value::number_i32(-1)],
-            &mut gc_heap,
-        );
-        assert_eq!(render(&r, &gc_heap), "2,3,4");
-    }
-
-    #[test]
-    fn concat_flattens_one_level() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = make_arr(&mut gc_heap, &[1, 2]);
-        let other = make_arr(&mut gc_heap, &[3, 4]);
-        let r = call("concat", arr, &[other, Value::number_i32(5)], &mut gc_heap);
-        assert_eq!(render(&r, &gc_heap), "1,2,3,4,5");
-    }
-
-    #[test]
-    fn join_with_default_separator() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = make_arr(&mut gc_heap, &[1, 2, 3]);
-        let r = call("join", arr, &[], &mut gc_heap);
-        assert_eq!(r.display_string(&gc_heap), "1,2,3");
-    }
-
-    #[test]
-    fn includes_and_index_of() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let arr = make_arr(&mut gc_heap, &[10, 20, 30]);
-        let yes = call(
-            "includes",
-            arr,
-            &[Value::number(NumberValue::from_i32(20))],
-            &mut gc_heap,
-        );
-        let no = call(
-            "includes",
-            arr,
-            &[Value::number(NumberValue::from_i32(99))],
-            &mut gc_heap,
-        );
-        assert_eq!(yes, Value::boolean(true));
-        assert_eq!(no, Value::boolean(false));
-        let idx = call(
-            "indexOf",
-            arr,
-            &[Value::number(NumberValue::from_i32(30))],
-            &mut gc_heap,
-        );
-        assert_eq!(idx.display_string(&gc_heap), "2");
-    }
 }

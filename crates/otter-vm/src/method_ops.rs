@@ -650,9 +650,6 @@ impl Interpreter {
         if recv_value.is_weak_set() {
             return collections_prototype::lookup_weak_set(name).is_some();
         }
-        if recv_value.is_array_buffer() {
-            return binary::array_buffer_prototype::lookup(name).is_some();
-        }
         if recv_value.is_data_view() {
             return binary::data_view_prototype::lookup(name).is_some();
         }

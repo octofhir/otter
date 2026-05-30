@@ -39,8 +39,8 @@ use std::marker::PhantomData;
 use otter_gc::raw::RawGc;
 
 use crate::{
-    ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, VmError,
     array, collections, native_function, object, promise::JsPromiseHandle, weak_refs,
+    ExecutionContext, Interpreter, IteratorHandle, IteratorState, NativeError, Value, VmError,
 };
 
 /// Internal VM context. Carried explicitly through the dispatch
@@ -790,6 +790,65 @@ impl<'rt> NativeCtx<'rt> {
         self.cx.interp.collect_runtime_roots()
     }
 
+    /// Allocate a fixed-length `ArrayBuffer` backing store, keeping the
+    /// receiver, call arguments, and caller-supplied roots reachable
+    /// across the reservation.
+    pub fn array_buffer_from_bytes_rooted(
+        &mut self,
+        bytes: Vec<u8>,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<crate::binary::JsArrayBuffer, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = *self.this_value();
+        let new_target = self.new_target().cloned();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        crate::binary::JsArrayBuffer::from_bytes_with_roots(
+            bytes,
+            self.cx.heap_mut(),
+            &mut external_visit,
+        )
+    }
+
+    /// Allocate a resizable `ArrayBuffer` backing store under the same
+    /// root contract as [`Self::array_buffer_from_bytes_rooted`].
+    pub fn array_buffer_resizable_rooted(
+        &mut self,
+        len: usize,
+        max_byte_length: usize,
+        value_roots: &[&Value],
+        slice_roots: &[&[Value]],
+    ) -> Result<Option<crate::binary::JsArrayBuffer>, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = *self.this_value();
+        let new_target = self.new_target().cloned();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                value_roots,
+                slice_roots,
+            );
+        };
+        crate::binary::JsArrayBuffer::new_resizable_with_roots(
+            len,
+            max_byte_length,
+            self.cx.heap_mut(),
+            &mut external_visit,
+        )
+    }
+
     /// Queue an isolate-local microtask for the current execution
     /// context.
     ///
@@ -852,7 +911,7 @@ pub(crate) fn visit_native_roots(
 #[cfg(test)]
 mod tests {
     use super::{NativeCallInfo, NativeCtx};
-    use crate::{Interpreter, NativeError, Value, error_classes::ErrorKind, native_value_static};
+    use crate::{error_classes::ErrorKind, native_value_static, Interpreter, NativeError, Value};
 
     #[test]
     fn native_ctx_object_allocation_uses_young_space() {
@@ -965,9 +1024,7 @@ mod tests {
             let error = registry
                 .make_instance_native_rooted(&mut ctx, ErrorKind::TypeError, Some("boom"), &[], &[])
                 .expect("native error allocation");
-            assert!(
-                crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string())
-            );
+            assert!(crate::object::get(error, ctx.heap(), "message").is_some_and(|v| v.is_string()));
         }
         let after = interp.gc_heap().stats().new_allocated_bytes;
         assert!(

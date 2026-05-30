@@ -14,10 +14,8 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-arraybuffer-prototype-object>
 
 use otter_bytecode::method_id::{ArrayBufferMethod, SharedArrayBufferMethod};
-use smallvec::SmallVec;
 
-use crate::binary::{array_buffer_prototype, dispatch};
-use crate::intrinsics::IntrinsicArgs;
+use crate::binary::dispatch;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, VmError};
@@ -113,10 +111,35 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(value)
 }
 
+/// §25.2.5.4 — `SharedArrayBuffer.prototype.grow(newByteLength)`.
 fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    // SAB.prototype.grow shares the same intrinsic-table body as
-    // AB.prototype.resize (both flow through `grow_buffer`).
-    dispatch_method(ctx, args, "grow")
+    const NAME: &str = "SharedArrayBuffer.prototype.grow";
+    let buf = receiver_ab(ctx, NAME)?;
+    if !buf.is_shared() {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "receiver is not a growable shared arraybuffer".to_string(),
+        });
+    }
+    let new_len = match crate::binary::to_index(
+        args.first().unwrap_or(&Value::undefined()),
+        ctx.heap(),
+    ) {
+        Some(n) => n as usize,
+        None => {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "newByteLength must be a non-negative integer".to_string(),
+            });
+        }
+    };
+    if !buf.grow(ctx.heap_mut(), new_len) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "cannot grow".to_string(),
+        });
+    }
+    Ok(Value::undefined())
 }
 
 fn sab_growable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
@@ -257,46 +280,160 @@ fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 // Prototype methods
 // ---------------------------------------------------------------
 
+/// §25.1.5.4 `slice(start, end)` — half-open range, clamps to
+/// `[0, byteLength]`, returns a fresh fixed-length buffer.
 fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "slice")
+    const NAME: &str = "ArrayBuffer.prototype.slice";
+    let buf = receiver_ab(ctx, NAME)?;
+    if buf.is_detached(ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "buffer is detached".to_string(),
+        });
+    }
+    let len = buf.byte_length(ctx.heap()) as i64;
+    let start = clamp_relative_index(args.first(), 0, len);
+    let end = clamp_relative_index(args.get(1), len, len);
+    let clamped_start = start.clamp(0, len) as usize;
+    let clamped_end = end.clamp(clamped_start as i64, len) as usize;
+    let copy: Vec<u8> = buf.with_bytes(ctx.heap(), |b| b[clamped_start..clamped_end].to_vec());
+    let new_buf = ctx.array_buffer_from_bytes_rooted(copy, &[], &[args])?;
+    Ok(Value::array_buffer(new_buf))
 }
+
+/// §25.1.5.6 `resize(newByteLength)` — only valid for resizable,
+/// non-detached buffers.
 fn ab_resize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "resize")
+    const NAME: &str = "ArrayBuffer.prototype.resize";
+    let buf = receiver_ab(ctx, NAME)?;
+    if !buf.is_resizable(ctx.heap()) || buf.is_detached(ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "buffer is not resizable or is detached".to_string(),
+        });
+    }
+    let new_len = match crate::binary::to_index(
+        args.first().unwrap_or(&Value::undefined()),
+        ctx.heap(),
+    ) {
+        Some(n) => n as usize,
+        None => {
+            return Err(NativeError::TypeError {
+                name: NAME,
+                reason: "newByteLength must be a non-negative integer".to_string(),
+            });
+        }
+    };
+    if !buf.resize(ctx.heap_mut(), new_len) {
+        return Err(NativeError::TypeError {
+            name: NAME,
+            reason: "newByteLength exceeds maxByteLength".to_string(),
+        });
+    }
+    Ok(Value::undefined())
 }
+
+/// §25.1.5.8 `transfer(newLength?)` — copy + detach; the new buffer is
+/// resizable iff this one was.
 fn ab_transfer(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "transfer")
+    ab_transfer_inner(ctx, args, false, "ArrayBuffer.prototype.transfer")
 }
+
+/// §25.1.5.9 `transferToFixedLength(newLength?)` — as `transfer` but the
+/// result is fixed-length.
 fn ab_transfer_to_fixed_length(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
 ) -> Result<Value, NativeError> {
-    dispatch_method(ctx, args, "transferToFixedLength")
+    ab_transfer_inner(ctx, args, true, "ArrayBuffer.prototype.transferToFixedLength")
 }
 
-fn dispatch_method(
+fn ab_transfer_inner(
     ctx: &mut NativeCtx<'_>,
     args: &[Value],
-    method_name: &str,
+    fixed: bool,
+    name: &'static str,
 ) -> Result<Value, NativeError> {
-    let entry =
-        array_buffer_prototype::lookup(method_name).ok_or_else(|| NativeError::TypeError {
-            name: "ArrayBuffer.prototype",
-            reason: format!("method {method_name} missing"),
-        })?;
-    let receiver = *ctx.this_value();
-    let small_args: SmallVec<[Value; 4]> = args.iter().cloned().collect();
-    let allocation_roots = ctx.collect_native_roots();
-    let gc_heap = ctx.heap_mut();
-    let mut intrinsic_args = IntrinsicArgs {
-        receiver: &receiver,
-        args: &small_args,
-        gc_heap,
-        allocation_roots: allocation_roots.as_slice(),
+    let buf = receiver_ab(ctx, name)?;
+    if buf.is_detached(ctx.heap()) {
+        return Err(NativeError::TypeError {
+            name,
+            reason: "buffer is detached".to_string(),
+        });
+    }
+    let cur_len = buf.byte_length(ctx.heap());
+    let new_len = match args.first() {
+        None => cur_len,
+        Some(v) if v.is_undefined() => cur_len,
+        Some(v) => match crate::binary::to_index(v, ctx.heap()) {
+            Some(n) => n as usize,
+            None => {
+                return Err(NativeError::TypeError {
+                    name,
+                    reason: "newLength must be a non-negative integer".to_string(),
+                });
+            }
+        },
     };
-    (entry.impl_fn)(&mut intrinsic_args).map_err(|e| NativeError::TypeError {
-        name: "ArrayBuffer.prototype",
-        reason: e.to_string(),
-    })
+    let mut new_bytes = vec![0u8; new_len];
+    let copy_len = new_len.min(cur_len);
+    buf.with_bytes(ctx.heap(), |src| {
+        new_bytes[..copy_len].copy_from_slice(&src[..copy_len]);
+    });
+    let resizable = buf.is_resizable(ctx.heap());
+    let max = if resizable {
+        buf.max_byte_length(ctx.heap()).max(new_len)
+    } else {
+        0
+    };
+    let new_buffer = if fixed {
+        ctx.array_buffer_from_bytes_rooted(new_bytes, &[], &[args])?
+    } else if resizable {
+        let result = ctx
+            .array_buffer_resizable_rooted(new_len, max, &[], &[args])?
+            .ok_or(NativeError::TypeError {
+                name,
+                reason: "allocation failed".to_string(),
+            })?;
+        result.with_bytes_mut(ctx.heap_mut(), |dst| dst.copy_from_slice(&new_bytes));
+        result
+    } else {
+        ctx.array_buffer_from_bytes_rooted(new_bytes, &[], &[args])?
+    };
+    buf.detach(ctx.heap_mut());
+    Ok(Value::array_buffer(new_buffer))
+}
+
+/// `ToIntegerOrInfinity`-style relative-index clamp for `slice`
+/// (negative counts from the end; non-finite saturates).
+fn clamp_relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
+    let Some(v) = arg else {
+        return default;
+    };
+    if v.is_undefined() {
+        return default;
+    }
+    let n = if let Some(n) = v.as_number() {
+        n.as_f64()
+    } else if let Some(b) = v.as_boolean() {
+        if b { 1.0 } else { 0.0 }
+    } else if v.is_null() {
+        0.0
+    } else {
+        return default;
+    };
+    if !n.is_finite() {
+        if n.is_nan() {
+            return 0;
+        }
+        return if n.is_sign_positive() { len } else { 0 };
+    }
+    let truncated = n.trunc() as i64;
+    if truncated < 0 {
+        (len + truncated).max(0)
+    } else {
+        truncated.min(len)
+    }
 }
 
 // ---------------------------------------------------------------
